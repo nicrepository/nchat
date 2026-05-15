@@ -1,0 +1,83 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+
+# Secrets, private keys, certificates, and dumps
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.dump
+*.sql.gz
+*.bak
+*.backup
+*.enc
+secrets/
+private/
+
+# Logs and runtime files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Go
+bin/
+dist/
+coverage.out
+*.coverprofile
+*.test
+vendor/
+
+# Node, React, and TypeScript
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.turbo/
+.vite/
+.next/
+coverage/
+build/
+storybook-static/
+*.tsbuildinfo
+
+# Docker and containers
+.docker/
+docker-compose.override.yml
+compose.override.yml
+*.pid
+
+# Kubernetes and local cluster tooling
+.kube/
+kubeconfig
+*.kubeconfig
+kind-kubeconfig*
+*.sealed-secret.local.yaml
+
+# IDEs and editors
+.idea/
+.vscode/
+*.code-workspace
+
+# OS and tooling caches
+.cache/
+.pytest_cache/
+.ruff_cache/
+.scannerwork/
