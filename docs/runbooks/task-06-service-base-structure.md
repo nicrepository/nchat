@@ -10,8 +10,8 @@
 - [x] Testes adicionados.
 - [x] README atualizado.
 - [x] Runbook criado.
-- [ ] CI passando.
-- [ ] PR aberto.
+- [x] CI passando.
+- [x] PR aberto: `https://github.com/nicrepository/nchat/pull/19`.
 
 ## Objetivo
 
@@ -87,5 +87,5 @@ Criar uma estrutura base consistente para os servicos Go do NChat.
 - [x] Testes adicionados
 - [x] README atualizado
 - [x] Runbook criado
-- [ ] CI passando
-- [ ] PR aberto
+- [x] CI passando
+- [x] PR aberto
