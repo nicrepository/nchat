@@ -1,0 +1,29 @@
+{
+  "name": "nchat",
+  "private": true,
+  "version": "0.0.0",
+  "description": "NChat corporate internal chat monorepo",
+  "packageManager": "pnpm@11.1.2",
+  "scripts": {
+    "dev:web": "pnpm --filter @nchat/web dev",
+    "build:web": "pnpm --filter @nchat/web build",
+    "lint:web": "pnpm --filter @nchat/web lint",
+    "test:web": "pnpm --filter @nchat/web test",
+    "typecheck:web": "pnpm --filter @nchat/web typecheck",
+    "test:go": "bash scripts/ci/go-test.sh",
+    "vet:go": "bash scripts/ci/go-vet.sh",
+    "fmt:go": "bash scripts/ci/go-fmt-check.sh",
+    "test": "pnpm test:web && pnpm test:go",
+    "lint": "pnpm lint:web && pnpm fmt:go && pnpm vet:go",
+    "build": "pnpm build:web"
+  },
+  "engines": {
+    "node": ">=24 <25",
+    "pnpm": ">=11 <12"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
