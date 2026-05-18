@@ -3,32 +3,26 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
+	"strconv"
 	"time"
 
-	"github.com/nicrepository/nchat/services/auth-service/internal/server"
-)
-
-const (
-	serviceName = "auth-service"
-	defaultPort = "8081"
+	"github.com/nicrepository/nchat/services/auth-service/internal/app"
+	"github.com/nicrepository/nchat/services/auth-service/internal/config"
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = defaultPort
-	}
+	cfg := config.Load()
+	application := app.New(cfg)
 
-	addr := ":" + port
+	addr := ":" + strconv.Itoa(cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           server.NewHandler(serviceName),
-		ReadHeaderTimeout: 5 * time.Second,
+		Handler:           application.Handler,
+		ReadHeaderTimeout: time.Duration(cfg.ReadHeaderTimeoutSeconds) * time.Second,
 	}
 
-	log.Printf("%s listening on %s", serviceName, addr)
+	application.Logger.Info("service starting", "port", cfg.Port)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("%s failed: %v", serviceName, err)
+		log.Fatalf("%s failed: %v", cfg.ServiceName, err)
 	}
 }
