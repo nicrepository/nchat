@@ -14,7 +14,7 @@
 - [x] CI frontend criado.
 - [x] Testes minimos criados.
 - [x] Validacao local concluida.
-- [ ] PR aberto para `develop`.
+- [x] PR aberto para `develop`: `https://github.com/nicrepository/nchat/pull/17`.
 
 ## Objetivo
 
@@ -97,4 +97,4 @@ Criar a base tecnica compilavel e testavel do monorepo NChat.
 - [x] CI backend criado
 - [x] CI frontend criado
 - [x] README atualizado
-- [ ] PR aberto para `develop`
+- [x] PR aberto para `develop`
