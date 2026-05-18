@@ -41,3 +41,42 @@ Este repositorio sera desenvolvido inicialmente por uma pessoa com apoio de IAs.
 ## Seguranca
 
 Nao commitar secrets. Arquivos `.env`, tokens, senhas, chaves privadas, certificados privados, dumps reais e logs sensiveis devem permanecer fora do Git. Use somente arquivos de exemplo quando necessario.
+
+## Development bootstrap
+
+Versoes base:
+
+- Node 24
+- pnpm 11
+- Go 1.25
+
+Instalacao:
+
+```bash
+corepack enable
+pnpm install
+```
+
+Rodar o frontend:
+
+```bash
+make dev-web
+```
+
+Validacao:
+
+```bash
+make test
+make test-go
+make test-web
+```
+
+Portas padrao dos servicos:
+
+- `auth-service`: 8081
+- `chat-service`: 8082
+- `file-service`: 8083
+- `notification-service`: 8084
+- `admin-service`: 8085
+- `search-service`: 8086
+- `media-service`: 8087
