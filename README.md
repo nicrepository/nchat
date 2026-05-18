@@ -80,3 +80,25 @@ Portas padrao dos servicos:
 - `admin-service`: 8085
 - `search-service`: 8086
 - `media-service`: 8087
+
+## Services base structure
+
+Os servicos Go seguem uma estrutura interna padronizada:
+
+- `cmd/`: entrada do binario do servico.
+- `internal/app`: composicao da aplicacao, logger e handler HTTP.
+- `internal/config`: configuracao do servico por ambiente com fallbacks seguros.
+- `internal/http`: rotas, handlers HTTP, middlewares e respostas JSON.
+- `internal/domain`: entidades e regras de dominio futuras.
+- `internal/service`: casos de uso futuros.
+- `internal/storage`: persistencia futura.
+- `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
+
+| Service | Default port | Current endpoints |
+|---|---:|---|
+| auth-service | 8081 | /healthz, /readyz, /version |
+| chat-service | 8082 | /healthz, /readyz, /version |
+| file-service | 8083 | /healthz, /readyz, /version |
+| notification-service | 8084 | /healthz, /readyz, /version |
+| admin-service | 8085 | /healthz, /readyz, /version |
+| media-service | 8087 | /healthz, /readyz, /version |
