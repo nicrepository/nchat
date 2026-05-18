@@ -9,7 +9,7 @@
 - [x] Issues adicionadas ao Project: 13 itens.
 - [x] Campos criados/reutilizados: campos principais existentes e validados.
 - [x] Documentacao versionada neste arquivo.
-- [ ] PR aberto para `develop`.
+- [x] PR aberto para `develop`: `https://github.com/nicrepository/nchat/pull/15`.
 
 ## Project
 
@@ -19,6 +19,7 @@
 - Numero: `2`
 - ID: `PVT_kwHOD1Ztz84BYDrN`
 - Repositorio vinculado: `nicrepository/nchat`
+- Pull Request da documentacao: `https://github.com/nicrepository/nchat/pull/15`
 
 ## Milestones
 
@@ -104,4 +105,4 @@ Regras:
 - [x] Issues adicionadas ao Project
 - [x] Campos principais criados
 - [x] Documentacao versionada
-- [ ] PR aberto para `develop`
+- [x] PR aberto para `develop`
