@@ -1,3 +1,4 @@
+// Package httputil provides shared HTTP response and middleware helpers.
 package httputil
 
 const (

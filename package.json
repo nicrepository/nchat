@@ -8,14 +8,26 @@
     "dev:web": "pnpm --filter @nchat/web dev",
     "build:web": "pnpm --filter @nchat/web build",
     "lint:web": "pnpm --filter @nchat/web lint",
+    "format:web": "prettier \"apps/web/**/*.{ts,tsx,js,jsx,json,css,md}\" --write",
+    "format:check:web": "prettier \"apps/web/**/*.{ts,tsx,js,jsx,json,css,md}\" --check",
+    "format:docs": "prettier \"**/*.{md,yml,yaml,json}\" --write",
+    "format:check:docs": "prettier \"**/*.{md,yml,yaml,json}\" --check",
     "test:web": "pnpm --filter @nchat/web test",
+    "test:coverage:web": "pnpm --filter @nchat/web test:coverage",
     "typecheck:web": "pnpm --filter @nchat/web typecheck",
     "test:go": "bash scripts/ci/go-test.sh",
+    "test:coverage:go": "bash scripts/ci/go-coverage.sh",
     "vet:go": "bash scripts/ci/go-vet.sh",
     "fmt:go": "bash scripts/ci/go-fmt-check.sh",
+    "lint:go": "bash scripts/ci/go-lint.sh",
+    "format:go": "bash scripts/dev/go-format.sh",
+    "format": "pnpm format:go && pnpm format:web && pnpm format:docs",
+    "format:check": "pnpm fmt:go && pnpm format:check:web && pnpm format:check:docs",
     "test": "pnpm test:web && pnpm test:go",
-    "lint": "pnpm lint:web && pnpm fmt:go && pnpm vet:go",
-    "build": "pnpm build:web"
+    "test:coverage": "pnpm test:coverage:web && pnpm test:coverage:go",
+    "lint": "pnpm lint:web && pnpm lint:go && pnpm vet:go",
+    "build": "pnpm build:web",
+    "ci": "pnpm format:check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm build"
   },
   "engines": {
     "node": ">=24 <25",
@@ -25,5 +37,8 @@
     "onlyBuiltDependencies": [
       "esbuild"
     ]
+  },
+  "devDependencies": {
+    "prettier": "^3.8.3"
   }
 }

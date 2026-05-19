@@ -41,6 +41,7 @@ Thumbs.db
 bin/
 dist/
 coverage.out
+*.out
 *.coverprofile
 *.test
 vendor/

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -15,6 +15,8 @@ const (
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = defaultPort
@@ -27,8 +29,9 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("%s listening on %s", serviceName, addr)
+	logger.Info("service starting", "service", serviceName, "port", port)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("%s failed: %v", serviceName, err)
+		logger.Error("service failed", "service", serviceName, "error", err)
+		os.Exit(1)
 	}
 }

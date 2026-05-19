@@ -1,3 +1,4 @@
+// Package health provides standard health response helpers.
 package health
 
 type Response struct {

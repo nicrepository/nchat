@@ -36,15 +36,15 @@ Criar a base tecnica compilavel e testavel do monorepo NChat.
 
 ## Servicos Go criados
 
-| Servico | Modulo | Porta |
-| --- | --- | --- |
-| `auth-service` | `github.com/nicrepository/nchat/services/auth-service` | 8081 |
-| `chat-service` | `github.com/nicrepository/nchat/services/chat-service` | 8082 |
-| `file-service` | `github.com/nicrepository/nchat/services/file-service` | 8083 |
-| `notification-service` | `github.com/nicrepository/nchat/services/notification-service` | 8084 |
-| `admin-service` | `github.com/nicrepository/nchat/services/admin-service` | 8085 |
-| `search-service` | `github.com/nicrepository/nchat/services/search-service` | 8086 |
-| `media-service` | `github.com/nicrepository/nchat/services/media-service` | 8087 |
+| Servico                | Modulo                                                         | Porta |
+| ---------------------- | -------------------------------------------------------------- | ----- |
+| `auth-service`         | `github.com/nicrepository/nchat/services/auth-service`         | 8081  |
+| `chat-service`         | `github.com/nicrepository/nchat/services/chat-service`         | 8082  |
+| `file-service`         | `github.com/nicrepository/nchat/services/file-service`         | 8083  |
+| `notification-service` | `github.com/nicrepository/nchat/services/notification-service` | 8084  |
+| `admin-service`        | `github.com/nicrepository/nchat/services/admin-service`        | 8085  |
+| `search-service`       | `github.com/nicrepository/nchat/services/search-service`       | 8086  |
+| `media-service`        | `github.com/nicrepository/nchat/services/media-service`        | 8087  |
 
 ## Frontend
 

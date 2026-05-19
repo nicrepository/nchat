@@ -1,3 +1,4 @@
+// Package config provides environment configuration helpers.
 package config
 
 import (
