@@ -24,6 +24,7 @@
     "typecheck:web": "pnpm --filter @nchat/web typecheck",
     "test:go": "bash scripts/ci/go-test.sh",
     "test:coverage:go": "bash scripts/ci/go-coverage.sh",
+    "test:coverage:go:check": "bash scripts/ci/go-coverage-check.sh",
     "vet:go": "bash scripts/ci/go-vet.sh",
     "fmt:go": "bash scripts/ci/go-fmt-check.sh",
     "lint:go": "bash scripts/ci/go-lint.sh",
@@ -31,10 +32,10 @@
     "format": "pnpm format:go && pnpm format:web && pnpm format:docs",
     "format:check": "pnpm fmt:go && pnpm format:check:web && pnpm format:check:docs",
     "test": "pnpm test:web && pnpm test:go",
-    "test:coverage": "pnpm test:coverage:web && pnpm test:coverage:go",
+    "test:coverage": "pnpm test:coverage:web && pnpm test:coverage:go:check",
     "lint": "pnpm lint:web && pnpm lint:go && pnpm vet:go",
     "build": "pnpm build:web",
-    "ci": "pnpm format:check && pnpm dev:env:config-check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm build"
+    "ci": "pnpm format:check && pnpm dev:env:config-check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build"
   },
   "engines": {
     "node": ">=24 <25",
