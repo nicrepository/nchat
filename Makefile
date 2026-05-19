@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage web-coverage coverage lint test build ci
+.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build ci
 
 help:
 	@echo "NChat development commands"
@@ -17,6 +17,7 @@ help:
 	@echo "  make format-check Check formatting"
 	@echo "  make lint-go     Run golangci-lint"
 	@echo "  make coverage    Run Go and web coverage"
+	@echo "  make go-coverage-check Run Go coverage threshold check"
 	@echo "  make lint        Run lint checks"
 	@echo "  make test        Run all tests"
 	@echo "  make build       Build all buildable targets"
@@ -78,6 +79,9 @@ lint-go:
 
 go-coverage:
 	pnpm test:coverage:go
+
+go-coverage-check:
+	pnpm test:coverage:go:check
 
 web-coverage:
 	pnpm test:coverage:web

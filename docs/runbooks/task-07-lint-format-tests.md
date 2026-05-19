@@ -58,6 +58,7 @@ Padronizar qualidade de codigo, formatacao e testes do monorepo.
 - `scripts/ci/go-test.sh`: executa `go test ./...` por modulo Go.
 - `scripts/ci/go-lint.sh`: executa `golangci-lint run ./...` por modulo Go.
 - `scripts/ci/go-coverage.sh`: gera coverage por modulo em `coverage/go`.
+- `scripts/ci/go-coverage-check.sh`: aplica threshold de statement coverage por modulo.
 - `.golangci.yml`: habilita um conjunto inicial de linters pragmatico.
 
 O `gosec` permanece ativo. Apenas `G104` foi excluido porque pode gerar ruido inicial em
@@ -70,11 +71,16 @@ writes HTTP simples; `errcheck` continua ativo para preservar a verificacao de e
 - Prettier roda no root para web, docs, YAML e JSON.
 - TypeScript e validado por `pnpm typecheck:web`.
 - Vitest usa `jsdom`, `src/setupTests.ts` e coverage com provider `v8`.
-- Thresholds iniciais de coverage web:
-  - lines: 60
-  - functions: 60
-  - branches: 50
-  - statements: 60
+- Thresholds de coverage web:
+  - lines: 90%
+  - functions: 90%
+  - branches: 90%
+  - statements: 90%
+
+O coverage Go exige statement coverage total >= 90% por modulo para pacotes de biblioteca
+e `internal`. Pacotes `cmd` ficam fora do threshold unitario porque inicializam processos e
+servidores; o relatorio bruto de `scripts/ci/go-coverage.sh` continua incluindo esses
+entrypoints.
 
 ## CI
 

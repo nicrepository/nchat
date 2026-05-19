@@ -81,6 +81,8 @@ make format-check
 make lint
 make test
 make coverage
+make go-coverage-check
+make web-coverage
 make build
 make ci
 ```
@@ -89,12 +91,17 @@ Todo PR deve passar por formatacao, lint, typecheck, testes e build antes de mer
 Go deve passar por `gofmt`, `go vet`, `go test` e `golangci-lint`. O frontend deve passar
 por ESLint, Prettier, TypeScript e Vitest.
 
-O coverage minimo inicial do web e:
+O coverage minimo do frontend e:
 
-- lines: 60
-- functions: 60
-- branches: 50
-- statements: 60
+- lines >= 90%
+- functions >= 90%
+- branches >= 90%
+- statements >= 90%
+
+O coverage minimo Go e statement coverage total >= 90% por modulo Go para pacotes de
+biblioteca e `internal`. Pacotes `cmd` ficam fora do threshold unitario porque sao
+entrypoints de processo; o relatorio bruto de `pnpm test:coverage:go` continua incluindo
+esses pacotes.
 
 ## Local development infrastructure
 

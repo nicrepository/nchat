@@ -47,3 +47,18 @@ func TestUnknownRouteReturnsNotFound(t *testing.T) {
 		t.Fatalf("expected status 404, got %d", response.Code)
 	}
 }
+
+func TestHealthzRejectsUnsupportedMethod(t *testing.T) {
+	handler := NewHandler("search-service")
+	request := httptest.NewRequest(http.MethodPost, "/healthz", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status 405, got %d", response.Code)
+	}
+	if response.Body.String() != "method not allowed\n" {
+		t.Fatalf("expected method not allowed body, got %q", response.Body.String())
+	}
+}
