@@ -10,7 +10,7 @@ func TestNewReturnsLogger(t *testing.T) {
 	}
 }
 
-func TestNewLoggerEmitsWithoutPanic(t *testing.T) {
+func TestNewLoggerEmitsWithoutPanic(_ *testing.T) {
 	logger := New("auth-service", "test")
 
 	logger.Info("test log")

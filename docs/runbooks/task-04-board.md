@@ -28,21 +28,21 @@
 
 ## Epicos criados
 
-| Numero | Titulo | URL | Milestone | Labels |
-| --- | --- | --- | --- | --- |
-| #2 | `[EPIC-01] Auth` | `https://github.com/nicrepository/nchat/issues/2` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:auth`, `mvp` |
-| #3 | `[EPIC-02] Chat Core` | `https://github.com/nicrepository/nchat/issues/3` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:chat-core`, `mvp` |
-| #4 | `[EPIC-03] Realtime/WebSocket` | `https://github.com/nicrepository/nchat/issues/4` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:realtime`, `mvp` |
-| #5 | `[EPIC-04] Arquivos, Preview e ClamAV` | `https://github.com/nicrepository/nchat/issues/5` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:files`, `mvp` |
-| #6 | `[EPIC-05] Busca` | `https://github.com/nicrepository/nchat/issues/6` | `MVP Interno` | `type:feature`, `priority:high`, `epic:search`, `mvp` |
-| #7 | `[EPIC-06] Notificacoes` | `https://github.com/nicrepository/nchat/issues/7` | `MVP Interno` | `type:feature`, `priority:high`, `epic:notifications`, `mvp` |
-| #8 | `[EPIC-07] Perfil e Presenca` | `https://github.com/nicrepository/nchat/issues/8` | `MVP Interno` | `type:feature`, `priority:medium`, `epic:presence`, `mvp` |
-| #9 | `[EPIC-08] Admin e RBAC` | `https://github.com/nicrepository/nchat/issues/9` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:admin`, `mvp` |
-| #10 | `[EPIC-09] Voz MVP com LiveKit` | `https://github.com/nicrepository/nchat/issues/10` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:voice`, `mvp` |
-| #11 | `[EPIC-10] Observabilidade` | `https://github.com/nicrepository/nchat/issues/11` | `MVP Interno` | `type:infra`, `priority:high`, `epic:observability`, `mvp` |
-| #12 | `[EPIC-11] Seguranca e Hardening` | `https://github.com/nicrepository/nchat/issues/12` | `MVP Interno` | `type:security`, `priority:critical`, `epic:security`, `mvp` |
-| #13 | `[EPIC-12] QA e Release` | `https://github.com/nicrepository/nchat/issues/13` | `MVP Interno` | `type:test`, `priority:critical`, `epic:qa`, `mvp` |
-| #14 | `[EPIC-13] Documentacao` | `https://github.com/nicrepository/nchat/issues/14` | `MVP Interno` | `type:docs`, `priority:medium`, `epic:docs`, `mvp` |
+| Numero | Titulo                                 | URL                                                | Milestone     | Labels                                                       |
+| ------ | -------------------------------------- | -------------------------------------------------- | ------------- | ------------------------------------------------------------ |
+| #2     | `[EPIC-01] Auth`                       | `https://github.com/nicrepository/nchat/issues/2`  | `MVP Interno` | `type:feature`, `priority:critical`, `epic:auth`, `mvp`      |
+| #3     | `[EPIC-02] Chat Core`                  | `https://github.com/nicrepository/nchat/issues/3`  | `MVP Interno` | `type:feature`, `priority:critical`, `epic:chat-core`, `mvp` |
+| #4     | `[EPIC-03] Realtime/WebSocket`         | `https://github.com/nicrepository/nchat/issues/4`  | `MVP Interno` | `type:feature`, `priority:critical`, `epic:realtime`, `mvp`  |
+| #5     | `[EPIC-04] Arquivos, Preview e ClamAV` | `https://github.com/nicrepository/nchat/issues/5`  | `MVP Interno` | `type:feature`, `priority:critical`, `epic:files`, `mvp`     |
+| #6     | `[EPIC-05] Busca`                      | `https://github.com/nicrepository/nchat/issues/6`  | `MVP Interno` | `type:feature`, `priority:high`, `epic:search`, `mvp`        |
+| #7     | `[EPIC-06] Notificacoes`               | `https://github.com/nicrepository/nchat/issues/7`  | `MVP Interno` | `type:feature`, `priority:high`, `epic:notifications`, `mvp` |
+| #8     | `[EPIC-07] Perfil e Presenca`          | `https://github.com/nicrepository/nchat/issues/8`  | `MVP Interno` | `type:feature`, `priority:medium`, `epic:presence`, `mvp`    |
+| #9     | `[EPIC-08] Admin e RBAC`               | `https://github.com/nicrepository/nchat/issues/9`  | `MVP Interno` | `type:feature`, `priority:critical`, `epic:admin`, `mvp`     |
+| #10    | `[EPIC-09] Voz MVP com LiveKit`        | `https://github.com/nicrepository/nchat/issues/10` | `MVP Interno` | `type:feature`, `priority:critical`, `epic:voice`, `mvp`     |
+| #11    | `[EPIC-10] Observabilidade`            | `https://github.com/nicrepository/nchat/issues/11` | `MVP Interno` | `type:infra`, `priority:high`, `epic:observability`, `mvp`   |
+| #12    | `[EPIC-11] Seguranca e Hardening`      | `https://github.com/nicrepository/nchat/issues/12` | `MVP Interno` | `type:security`, `priority:critical`, `epic:security`, `mvp` |
+| #13    | `[EPIC-12] QA e Release`               | `https://github.com/nicrepository/nchat/issues/13` | `MVP Interno` | `type:test`, `priority:critical`, `epic:qa`, `mvp`           |
+| #14    | `[EPIC-13] Documentacao`               | `https://github.com/nicrepository/nchat/issues/14` | `MVP Interno` | `type:docs`, `priority:medium`, `epic:docs`, `mvp`           |
 
 ## Campos do Project
 

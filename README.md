@@ -71,6 +71,31 @@ make test-go
 make test-web
 ```
 
+## Quality gates
+
+Comandos locais:
+
+```bash
+make format
+make format-check
+make lint
+make test
+make coverage
+make build
+make ci
+```
+
+Todo PR deve passar por formatacao, lint, typecheck, testes e build antes de merge. Codigo
+Go deve passar por `gofmt`, `go vet`, `go test` e `golangci-lint`. O frontend deve passar
+por ESLint, Prettier, TypeScript e Vitest.
+
+O coverage minimo inicial do web e:
+
+- lines: 60
+- functions: 60
+- branches: 50
+- statements: 60
+
 Portas padrao dos servicos:
 
 - `auth-service`: 8081
@@ -94,11 +119,11 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service | Default port | Current endpoints |
-|---|---:|---|
-| auth-service | 8081 | /healthz, /readyz, /version |
-| chat-service | 8082 | /healthz, /readyz, /version |
-| file-service | 8083 | /healthz, /readyz, /version |
-| notification-service | 8084 | /healthz, /readyz, /version |
-| admin-service | 8085 | /healthz, /readyz, /version |
-| media-service | 8087 | /healthz, /readyz, /version |
+| Service              | Default port | Current endpoints           |
+| -------------------- | -----------: | --------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version |
+| chat-service         |         8082 | /healthz, /readyz, /version |
+| file-service         |         8083 | /healthz, /readyz, /version |
+| notification-service |         8084 | /healthz, /readyz, /version |
+| admin-service        |         8085 | /healthz, /readyz, /version |
+| media-service        |         8087 | /healthz, /readyz, /version |

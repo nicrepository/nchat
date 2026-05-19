@@ -8,7 +8,7 @@ import (
 )
 
 func TestSecurityHeadersAppliesAPIHeaders(t *testing.T) {
-	handler := SecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := SecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	response := httptest.NewRecorder()
@@ -30,7 +30,7 @@ func TestSecurityHeadersAppliesAPIHeaders(t *testing.T) {
 }
 
 func TestRequestIDGeneratesMissingID(t *testing.T) {
-	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	response := httptest.NewRecorder()
@@ -43,7 +43,7 @@ func TestRequestIDGeneratesMissingID(t *testing.T) {
 }
 
 func TestRequestIDReusesIncomingID(t *testing.T) {
-	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -58,7 +58,7 @@ func TestRequestIDReusesIncomingID(t *testing.T) {
 }
 
 func TestRecoverReturnsGenericInternalError(t *testing.T) {
-	handler := Recover(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Recover(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		panic("secret panic")
 	}))
 	response := httptest.NewRecorder()
@@ -77,7 +77,7 @@ func TestRecoverReturnsGenericInternalError(t *testing.T) {
 }
 
 func TestMethodNotAllowedRejectsInvalidMethod(t *testing.T) {
-	handler := MethodNotAllowed(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := MethodNotAllowed(http.MethodGet, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	response := httptest.NewRecorder()
