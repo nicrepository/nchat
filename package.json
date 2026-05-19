@@ -6,6 +6,13 @@
   "packageManager": "pnpm@11.1.2",
   "scripts": {
     "dev:web": "pnpm --filter @nchat/web dev",
+    "dev:env:up": "bash scripts/dev/dev-env-up.sh",
+    "dev:env:down": "bash scripts/dev/dev-env-down.sh",
+    "dev:env:reset": "bash scripts/dev/dev-env-reset.sh",
+    "dev:env:status": "bash scripts/dev/dev-env-status.sh",
+    "dev:env:logs": "bash scripts/dev/dev-env-logs.sh",
+    "dev:env:validate": "bash scripts/dev/dev-env-validate.sh",
+    "dev:env:config-check": "bash scripts/ci/dev-env-config-check.sh",
     "build:web": "pnpm --filter @nchat/web build",
     "lint:web": "pnpm --filter @nchat/web lint",
     "format:web": "prettier \"apps/web/**/*.{ts,tsx,js,jsx,json,css,md}\" --write",
@@ -27,7 +34,7 @@
     "test:coverage": "pnpm test:coverage:web && pnpm test:coverage:go",
     "lint": "pnpm lint:web && pnpm lint:go && pnpm vet:go",
     "build": "pnpm build:web",
-    "ci": "pnpm format:check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm build"
+    "ci": "pnpm format:check && pnpm dev:env:config-check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm build"
   },
   "engines": {
     "node": ">=24 <25",

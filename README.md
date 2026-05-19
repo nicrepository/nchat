@@ -96,6 +96,49 @@ O coverage minimo inicial do web e:
 - branches: 50
 - statements: 60
 
+## Local development infrastructure
+
+Prerequisites:
+
+- Docker
+- Docker Compose v2 (`docker compose`)
+
+Start the local data services:
+
+```bash
+cp infra/compose/.env.dev.example infra/compose/.env.dev
+make dev-env-up
+make dev-env-validate
+```
+
+Stop services without deleting data:
+
+```bash
+make dev-env-down
+```
+
+Reset local volumes:
+
+```bash
+make dev-env-reset
+```
+
+Services and default ports:
+
+| Service          | Local endpoint          |
+| ---------------- | ----------------------- |
+| PostgreSQL       | `localhost:5432`        |
+| Valkey           | `localhost:6379`        |
+| SeaweedFS master | `http://localhost:9333` |
+| SeaweedFS volume | `http://localhost:8088` |
+| SeaweedFS filer  | `http://localhost:8888` |
+| SeaweedFS S3     | `http://localhost:8333` |
+
+This environment is only for local development. Do not use the example passwords in
+production. Patroni, real HA, TLS, scheduled backup/restore, Traefik/Nginx and production
+hardening are outside this local stack. SeaweedFS is provisional in Sprint 0 and depends on
+full validation by the end of Sprint 3.
+
 Portas padrao dos servicos:
 
 - `auth-service`: 8081

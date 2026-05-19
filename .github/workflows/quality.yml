@@ -45,6 +45,9 @@ jobs:
       - name: Check formatting
         run: pnpm format:check
 
+      - name: Check dev environment config
+        run: pnpm dev:env:config-check
+
       - name: Lint
         run: pnpm lint
 
