@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nchat
+  labels:
+    app.kubernetes.io/instance: k3s-dev
+    nchat.nicrepository.io/environment: k3s-dev
+  annotations:
+    nchat.nicrepository.io/overlay: k3s-dev

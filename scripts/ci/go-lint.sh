@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 if ! command -v golangci-lint >/dev/null 2>&1; then
+  GOLANGCI_LINT_FALLBACK="${GOPATH:-$HOME/go}/bin/golangci-lint"
+  if [[ -x "$GOLANGCI_LINT_FALLBACK" ]]; then
+    export PATH="$(dirname "$GOLANGCI_LINT_FALLBACK"):$PATH"
+  fi
+fi
+
+if ! command -v golangci-lint >/dev/null 2>&1; then
   echo "golangci-lint is not installed." >&2
   echo "Install it with:" >&2
   echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest" >&2

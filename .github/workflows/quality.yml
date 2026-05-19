@@ -39,6 +39,11 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.3
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -47,6 +52,9 @@ jobs:
 
       - name: Check dev environment config
         run: pnpm dev:env:config-check
+
+      - name: Check Kubernetes manifests
+        run: pnpm k8s:ci
 
       - name: Lint
         run: pnpm lint

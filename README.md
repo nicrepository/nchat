@@ -156,6 +156,22 @@ Portas padrao dos servicos:
 - `search-service`: 8086
 - `media-service`: 8087
 
+## Kubernetes/k3s manifests
+
+Os manifests iniciais para Kubernetes/k3s ficam em `infra/k8s`. Eles cobrem dev/staging inicial com Kustomize base e overlay `k3s-dev`, usando imagens placeholder versionadas `0.0.0`.
+
+Comandos principais:
+
+```bash
+make k8s-render
+make k8s-validate
+make k8s-apply-dev
+make k8s-status-dev
+make k8s-delete-dev
+```
+
+Esses manifests nao sao de producao. Secrets reais nao sao versionados; `infra/k8s/base/secrets.example.yaml` e apenas modelo e nao entra no kustomization. O overlay `k3s-dev` assume Traefik disponivel no k3s e expoe `nchat.local` sem TLS real. TLS/cert-manager, Sealed Secrets, ArgoCD, Dockerfiles, build/push de imagens e data services em K8s entram em tarefas futuras.
+
 ## Services base structure
 
 Os servicos Go seguem uma estrutura interna padronizada:
