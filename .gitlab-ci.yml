@@ -1,0 +1,143 @@
+stages:
+  - governance
+  - quality
+  - backend
+  - frontend
+  - manifests
+  - security
+
+variables:
+  NODE_VERSION: "24"
+  GO_VERSION: "1.25.10"
+  PNPM_VERSION: "11.1.2"
+  GOTOOLCHAIN: "auto"
+  PNPM_HOME: "$CI_PROJECT_DIR/.pnpm"
+  PNPM_STORE_PATH: "$CI_PROJECT_DIR/.pnpm-store"
+  GOCACHE: "$CI_PROJECT_DIR/.cache/go-build"
+  GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .pnpm-store/
+    - .go/pkg/mod/
+    - .cache/go-build/
+
+governance:
+  stage: governance
+  image: alpine:latest
+  script:
+    - |
+      set -eu
+      required_files="
+      README.md
+      CONTRIBUTING.md
+      SECURITY.md
+      .github/pull_request_template.md
+      .github/CODEOWNERS
+      .gitlab-ci.yml
+      "
+      for file in $required_files; do
+        if [ ! -f "$file" ]; then
+          echo "Missing required file: $file" >&2
+          exit 1
+        fi
+      done
+    - test ! -f .env
+    - test ! -f .env.dev
+    - test ! -f infra/compose/.env.dev
+
+quality:
+  stage: quality
+  image: node:${NODE_VERSION}-bookworm
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends bash ca-certificates
+    - rm -rf /var/lib/apt/lists/*
+    - corepack enable
+    - corepack prepare pnpm@${PNPM_VERSION} --activate
+    - pnpm config set store-dir ${PNPM_STORE_PATH}
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm format:check
+    - pnpm typecheck:web
+    - pnpm test:web
+    - pnpm build:web
+
+backend:
+  stage: backend
+  image: golang:1.25-bookworm
+  before_script:
+    - export PATH="$(go env GOPATH)/bin:$PATH"
+    - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+  script:
+    - bash scripts/ci/go-fmt-check.sh
+    - bash scripts/ci/go-vet.sh
+    - bash scripts/ci/go-test.sh
+    - bash scripts/ci/go-coverage-check.sh
+    - bash scripts/ci/go-lint.sh
+
+frontend:
+  stage: frontend
+  image: node:${NODE_VERSION}-bookworm
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@${PNPM_VERSION} --activate
+    - pnpm config set store-dir ${PNPM_STORE_PATH}
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm format:check:web
+    - pnpm lint:web
+    - pnpm typecheck:web
+    - pnpm test:coverage:web
+    - pnpm build:web
+
+manifests:
+  stage: manifests
+  image: node:${NODE_VERSION}-bookworm
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends bash ca-certificates curl
+    - rm -rf /var/lib/apt/lists/*
+    - curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.32.3/bin/linux/amd64/kubectl
+    - chmod +x /usr/local/bin/kubectl
+    - corepack enable
+    - corepack prepare pnpm@${PNPM_VERSION} --activate
+    - pnpm config set store-dir ${PNPM_STORE_PATH}
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm dev:env:config-check
+    - pnpm k8s:ci
+
+security-govulncheck:
+  stage: security
+  image: golang:1.25-bookworm
+  before_script:
+    - export PATH="$(go env GOPATH)/bin:$PATH"
+    - go install golang.org/x/vuln/cmd/govulncheck@latest
+  script:
+    - bash scripts/security/govulncheck.sh
+
+security-secrets:
+  stage: security
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  script:
+    - gitleaks detect --source . --no-banner --redact
+
+security-trivy-fs:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy fs --severity HIGH,CRITICAL --exit-code 1 --no-progress .
+
+security-trivy-config:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy config --severity HIGH,CRITICAL --exit-code 1 --no-progress .

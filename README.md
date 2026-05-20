@@ -103,6 +103,42 @@ biblioteca e `internal`. Pacotes `cmd` ficam fora do threshold unitario porque s
 entrypoints de processo; o relatorio bruto de `pnpm test:coverage:go` continua incluindo
 esses pacotes.
 
+## CI/CD
+
+GitHub Actions e o pipeline principal do NChat. GitLab CI foi adicionado como espelho futuro para um mirror GitLab, sem deploy automatico nesta etapa.
+
+Workflows GitHub Actions:
+
+- `Governance`: valida governanca basica do repositorio.
+- `Backend`: valida formatacao, vet, testes, coverage e lint Go.
+- `Frontend`: valida formatacao, lint, typecheck, testes, coverage e build web.
+- `Quality`: executa o gate agregado local.
+- `CI`: agrega metadata, quality, backend, frontend e manifests para facilitar required checks futuros.
+- `Security`: executa secret scan, `govulncheck` e Trivy em PR, push e schedule semanal.
+
+Comandos locais:
+
+```bash
+make ci
+make security
+make ci-config-check
+```
+
+Equivalentes pnpm:
+
+```bash
+pnpm run ci
+pnpm security
+pnpm ci:config-check
+```
+
+Ainda nao existe nesta etapa:
+
+- deploy automatico;
+- ArgoCD;
+- build/push de imagens;
+- ambientes staging/prod.
+
 ## Local development infrastructure
 
 Prerequisites:

@@ -2,10 +2,21 @@ name: Backend
 
 on:
   pull_request:
+    branches:
+      - main
+      - develop
   push:
     branches:
       - main
       - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   go:
@@ -19,8 +30,8 @@ jobs:
         with:
           go-version: "1.25.10"
           cache-dependency-path: |
-            services/*/go.sum
-            libs/go/*/go.sum
+            services/*/go.mod
+            libs/go/*/go.mod
 
       - name: Add Go bin to PATH
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
@@ -33,6 +44,9 @@ jobs:
 
       - name: Test
         run: bash scripts/ci/go-test.sh
+
+      - name: Test coverage
+        run: bash scripts/ci/go-coverage-check.sh
 
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest

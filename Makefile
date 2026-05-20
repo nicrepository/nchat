@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check k8s-render k8s-validate k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build ci
+.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check k8s-render k8s-validate k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci ci-config-check build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config ci
 
 help:
 	@echo "NChat development commands"
@@ -13,6 +13,7 @@ help:
 	@echo "  make k8s-status-dev Show k3s-dev resources"
 	@echo "  make k8s-delete-dev Delete k3s-dev manifests"
 	@echo "  make k8s-ci      Run Kubernetes manifest CI check"
+	@echo "  make ci-config-check Run CI config validation"
 	@echo "  make build-web   Build web app"
 	@echo "  make test-web    Run frontend tests"
 	@echo "  make lint-web    Run frontend lint"
@@ -27,6 +28,7 @@ help:
 	@echo "  make lint        Run lint checks"
 	@echo "  make test        Run all tests"
 	@echo "  make build       Build all buildable targets"
+	@echo "  make security    Run local security scans"
 	@echo "  make ci          Run local CI gate"
 
 install:
@@ -73,6 +75,9 @@ k8s-status-dev:
 
 k8s-ci:
 	pnpm k8s:ci
+
+ci-config-check:
+	pnpm ci:config-check
 
 build-web:
 	pnpm build:web
@@ -121,6 +126,21 @@ test:
 
 build:
 	pnpm build
+
+security:
+	pnpm security
+
+security-secrets:
+	pnpm security:secrets
+
+security-govulncheck:
+	pnpm security:govulncheck
+
+security-trivy-fs:
+	pnpm security:trivy:fs
+
+security-trivy-config:
+	pnpm security:trivy:config
 
 ci:
 	pnpm run ci
