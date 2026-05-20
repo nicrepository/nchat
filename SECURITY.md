@@ -31,6 +31,25 @@ trivy config .
 gitleaks detect --source .
 ```
 
+## Security CI
+
+O pipeline de seguranca executa:
+
+- `govulncheck` por modulo Go para vulnerabilidades conhecidas com analise de codigo.
+- Secret scanning com gitleaks no GitHub Actions e fallback local para Trivy quando gitleaks nao estiver instalado.
+- Trivy filesystem scan para dependencias e artefatos versionados.
+- Trivy config scan para IaC e manifests Kubernetes.
+
+Os scans de Trivy devem falhar para severidades HIGH e CRITICAL quando configurados no CI.
+
+Falsos positivos devem ser tratados explicitamente:
+
+1. Abrir issue com evidencia do achado.
+2. Justificar por que o achado e falso positivo ou nao exploravel.
+3. Definir prazo de correcao ou mitigacao.
+4. Registrar qualquer ignore com escopo minimo e motivo.
+5. Nunca ignorar silenciosamente.
+
 ## Regras para segredos
 
 E proibido commitar:
