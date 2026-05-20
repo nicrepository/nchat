@@ -107,6 +107,7 @@ manifests:
     - pnpm install --frozen-lockfile
   script:
     - pnpm dev:env:config-check
+    - pnpm gateway:config-check
     - pnpm k8s:ci
 
 security-govulncheck:

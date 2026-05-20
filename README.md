@@ -192,6 +192,47 @@ Portas padrao dos servicos:
 - `search-service`: 8086
 - `media-service`: 8087
 
+## Local gateway
+
+O gateway local usa Traefik como padrao. Nginx permanece alternativa futura. O Traefik roda pelo Docker Compose com o profile `gateway` e roteia para a web e os servicos Go executando no host.
+
+Comandos:
+
+```bash
+make dev-gateway-up
+make dev-gateway-status
+make dev-gateway-validate
+make dev-gateway-logs
+make dev-gateway-down
+```
+
+Adicione no `/etc/hosts`:
+
+```text
+127.0.0.1 nchat.local
+```
+
+Rotas locais:
+
+- `http://nchat.local:8080/`
+- `http://nchat.local:8080/api/auth/healthz`
+- `http://nchat.local:8080/api/chat/healthz`
+- `http://nchat.local:8080/api/files/healthz`
+- `http://nchat.local:8080/api/notifications/healthz`
+- `http://nchat.local:8080/api/admin/healthz`
+- `http://nchat.local:8080/api/search/healthz`
+- `http://nchat.local:8080/api/media/healthz`
+- Dashboard: `http://localhost:8090/dashboard/`
+
+Avisos:
+
+- Local only.
+- Sem TLS real.
+- Dashboard inseguro apenas local.
+- Nao usar configuracao em producao.
+- Docker socket nao e montado.
+- Web e servicos precisam estar rodando no host para as rotas responderem.
+
 ## Kubernetes/k3s manifests
 
 Os manifests iniciais para Kubernetes/k3s ficam em `infra/k8s`. Eles cobrem dev/staging inicial com Kustomize base e overlay `k3s-dev`, usando imagens placeholder versionadas `0.0.0`.

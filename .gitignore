@@ -84,3 +84,7 @@ kind-kubeconfig*
 .pytest_cache/
 .ruff_cache/
 .scannerwork/
+# Local agent/tooling artifacts
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
