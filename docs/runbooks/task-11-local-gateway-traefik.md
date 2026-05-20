@@ -2,7 +2,7 @@
 
 ## Status
 
-Validado localmente na branch `chore/task-011-local-gateway-traefik`; PR pendente.
+Validado localmente na branch `chore/task-011-local-gateway-traefik`; PR #31 aberto contra `develop`.
 
 ## Decisao
 
@@ -120,4 +120,4 @@ Observacoes locais:
 - [x] Runbook criado
 - [x] `make gateway-config-check` passa
 - [x] `make ci` passa
-- [ ] PR aberto
+- [x] PR aberto
