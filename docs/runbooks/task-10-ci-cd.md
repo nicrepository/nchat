@@ -2,7 +2,7 @@
 
 ## Status
 
-Validado localmente na branch `chore/task-010-ci-cd-pipelines`; PR pendente no momento deste runbook.
+Validado localmente na branch `chore/task-010-ci-cd-pipelines`; PR #29 aberto para `develop`.
 
 ## Objetivo
 
@@ -98,6 +98,7 @@ Executado nesta maquina:
 - `pnpm run ci`.
 - `make ci-config-check`.
 - `make ci`.
+- `gh pr checks --repo nicrepository/nchat 29`.
 
 Observacoes locais:
 
@@ -120,5 +121,5 @@ Observacoes locais:
 - [x] README atualizado
 - [x] runbook criado
 - [x] `make ci` passa
-- [ ] PR aberto
-- [ ] checks passam
+- [x] PR aberto
+- [x] checks passam
