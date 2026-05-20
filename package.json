@@ -12,7 +12,13 @@
     "dev:env:status": "bash scripts/dev/dev-env-status.sh",
     "dev:env:logs": "bash scripts/dev/dev-env-logs.sh",
     "dev:env:validate": "bash scripts/dev/dev-env-validate.sh",
+    "dev:gateway:up": "bash scripts/dev/dev-gateway-up.sh",
+    "dev:gateway:down": "bash scripts/dev/dev-gateway-down.sh",
+    "dev:gateway:status": "bash scripts/dev/dev-gateway-status.sh",
+    "dev:gateway:logs": "bash scripts/dev/dev-gateway-logs.sh",
+    "dev:gateway:validate": "bash scripts/dev/dev-gateway-validate.sh",
     "dev:env:config-check": "bash scripts/ci/dev-env-config-check.sh",
+    "gateway:config-check": "bash scripts/ci/gateway-config-check.sh",
     "k8s:render": "bash scripts/k8s/k8s-render.sh",
     "k8s:validate": "bash scripts/k8s/k8s-validate.sh",
     "k8s:apply:dev": "bash scripts/k8s/k8s-apply-dev.sh",
@@ -47,7 +53,7 @@
     "security:trivy:config": "bash scripts/security/trivy-config.sh",
     "security:secrets": "bash scripts/security/secrets-scan.sh",
     "security": "pnpm security:secrets && pnpm security:govulncheck && pnpm security:trivy:fs && pnpm security:trivy:config",
-    "ci": "pnpm format:check && pnpm ci:config-check && pnpm dev:env:config-check && pnpm k8s:ci && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build"
+    "ci": "pnpm format:check && pnpm ci:config-check && pnpm dev:env:config-check && pnpm gateway:config-check && pnpm k8s:ci && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build"
   },
   "engines": {
     "node": ">=24 <25",

@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check k8s-render k8s-validate k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci ci-config-check build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config ci
+.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate k8s-render k8s-validate k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci ci-config-check gateway-config-check build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config ci
 
 help:
 	@echo "NChat development commands"
@@ -7,6 +7,10 @@ help:
 	@echo "  make dev-env-up  Start local data services"
 	@echo "  make dev-env-down Stop local data services"
 	@echo "  make dev-env-validate Validate local data services"
+	@echo "  make dev-gateway-up Start local Traefik gateway"
+	@echo "  make dev-gateway-status Show local Traefik gateway status"
+	@echo "  make dev-gateway-validate Validate local Traefik gateway"
+	@echo "  make dev-gateway-down Stop local Traefik gateway"
 	@echo "  make k8s-render  Render k3s-dev manifests"
 	@echo "  make k8s-validate Validate k3s-dev manifests"
 	@echo "  make k8s-apply-dev Apply k3s-dev manifests"
@@ -14,6 +18,7 @@ help:
 	@echo "  make k8s-delete-dev Delete k3s-dev manifests"
 	@echo "  make k8s-ci      Run Kubernetes manifest CI check"
 	@echo "  make ci-config-check Run CI config validation"
+	@echo "  make gateway-config-check Run gateway config validation"
 	@echo "  make build-web   Build web app"
 	@echo "  make test-web    Run frontend tests"
 	@echo "  make lint-web    Run frontend lint"
@@ -58,6 +63,21 @@ dev-env-validate:
 dev-env-config-check:
 	pnpm dev:env:config-check
 
+dev-gateway-up:
+	pnpm dev:gateway:up
+
+dev-gateway-down:
+	pnpm dev:gateway:down
+
+dev-gateway-status:
+	pnpm dev:gateway:status
+
+dev-gateway-logs:
+	pnpm dev:gateway:logs
+
+dev-gateway-validate:
+	pnpm dev:gateway:validate
+
 k8s-render:
 	pnpm k8s:render
 
@@ -78,6 +98,9 @@ k8s-ci:
 
 ci-config-check:
 	pnpm ci:config-check
+
+gateway-config-check:
+	pnpm gateway:config-check
 
 build-web:
 	pnpm build:web
