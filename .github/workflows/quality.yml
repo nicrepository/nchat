@@ -76,6 +76,9 @@ jobs:
       - name: Check Kubernetes manifests
         run: pnpm k8s:ci
 
+      - name: Check health contract
+        run: pnpm health:contract-check
+
       - name: Lint
         run: pnpm lint
 

@@ -5,54 +5,176 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/health"
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
 )
 
-func TestBaseRoutes(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("notification-service", "test"))
-	for _, path := range []string{RouteHealthz, RouteReadyz, RouteVersion} {
-		response := httptest.NewRecorder()
-		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
-		if response.Code != http.StatusOK {
-			t.Fatalf("expected %s to return 200, got %d", path, response.Code)
-		}
-		if response.Header().Get("Content-Type") != "application/json" {
-			t.Fatalf("expected JSON content type, got %q", response.Header().Get("Content-Type"))
-		}
-	}
-}
-
-func TestHealthzResponse(t *testing.T) {
+func TestHealthzContract(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("notification-service", "test"))
 	response := httptest.NewRecorder()
+
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
-	var body httputil.Envelope
-	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
+
+	assertJSONResponse(t, response, http.StatusOK)
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Service != "notification-service" {
+		t.Fatalf("expected service notification-service, got %q", body.Data.Service)
 	}
-	data := body.Data.(map[string]any)
-	if data["service"] != "notification-service" || data["status"] != "ok" {
-		t.Fatalf("unexpected health data: %+v", data)
+	if body.Data.Probe != health.ProbeLiveness {
+		t.Fatalf("expected liveness probe, got %q", body.Data.Probe)
+	}
+	if body.Data.Status != health.StatusOK {
+		t.Fatalf("expected ok status, got %q", body.Data.Status)
+	}
+	if body.Data.Version != "0.0.0" {
+		t.Fatalf("expected version 0.0.0, got %q", body.Data.Version)
+	}
+	if body.Data.Commit != "dev" {
+		t.Fatalf("expected commit dev, got %q", body.Data.Commit)
+	}
+	assertRFC3339(t, body.Data.CheckedAt)
+	if len(body.Data.Checks) != 0 {
+		t.Fatalf("expected no liveness checks, got %d", len(body.Data.Checks))
 	}
 }
 
-func TestRouterErrorsAndMiddleware(t *testing.T) {
+func TestReadyzContract(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("notification-service", "test"))
-	missing := httptest.NewRecorder()
-	router.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/missing", nil))
-	if missing.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", missing.Code)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusOK)
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Service != "notification-service" {
+		t.Fatalf("expected service notification-service, got %q", body.Data.Service)
 	}
-	method := httptest.NewRecorder()
-	router.ServeHTTP(method, httptest.NewRequest(http.MethodPost, RouteHealthz, nil))
-	if method.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405, got %d", method.Code)
+	if body.Data.Probe != health.ProbeReadiness {
+		t.Fatalf("expected readiness probe, got %q", body.Data.Probe)
 	}
-	if method.Header().Get("X-Request-ID") == "" || method.Header().Get("X-Content-Type-Options") != "nosniff" {
-		t.Fatalf("expected middleware headers, got %+v", method.Header())
+	if body.Data.Status != health.StatusReady {
+		t.Fatalf("expected ready status, got %q", body.Data.Status)
+	}
+	if body.Data.Version != "0.0.0" {
+		t.Fatalf("expected version 0.0.0, got %q", body.Data.Version)
+	}
+	if body.Data.Commit != "dev" {
+		t.Fatalf("expected commit dev, got %q", body.Data.Commit)
+	}
+	assertRFC3339(t, body.Data.CheckedAt)
+	assertReadinessCheck(t, body.Data.Checks, "service-bootstrap")
+	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
+}
+
+func TestVersionRouteStillWorks(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("notification-service", "test"))
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
+
+	assertJSONResponse(t, response, http.StatusOK)
+	var body struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode version response: %v", err)
+	}
+	if body.Data["service"] != "notification-service" || body.Data["version"] != "0.0.0" || body.Data["commit"] != "dev" {
+		t.Fatalf("unexpected version response: %+v", body.Data)
+	}
+}
+
+func TestMethodAndNotFoundBehavior(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("notification-service", "test"))
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		want   int
+	}{
+		{name: "post healthz", method: http.MethodPost, path: RouteHealthz, want: http.StatusMethodNotAllowed},
+		{name: "post readyz", method: http.MethodPost, path: RouteReadyz, want: http.StatusMethodNotAllowed},
+		{name: "missing", method: http.MethodGet, path: "/missing", want: http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(tt.method, tt.path, nil))
+			assertJSONResponse(t, response, tt.want)
+		})
+	}
+}
+
+type healthEnvelope struct {
+	Data health.Response `json:"data"`
+}
+
+func decodeHealthEnvelope(t *testing.T, response *httptest.ResponseRecorder) healthEnvelope {
+	t.Helper()
+
+	var generic httputil.Envelope
+	if err := json.Unmarshal(response.Body.Bytes(), &generic); err != nil {
+		t.Fatalf("decode generic envelope: %v", err)
+	}
+	if generic.Error != nil {
+		t.Fatalf("expected data envelope, got error %+v", generic.Error)
+	}
+
+	var body healthEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode health envelope: %v", err)
+	}
+	return body
+}
+
+func assertJSONResponse(t *testing.T, response *httptest.ResponseRecorder, wantStatus int) {
+	t.Helper()
+
+	if response.Code != wantStatus {
+		t.Fatalf("expected status %d, got %d", wantStatus, response.Code)
+	}
+	if response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("expected application/json content type, got %q", response.Header().Get("Content-Type"))
+	}
+	if response.Header().Get("X-Request-ID") == "" {
+		t.Fatal("expected X-Request-ID")
+	}
+	if response.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("expected X-Content-Type-Options nosniff, got %q", response.Header().Get("X-Content-Type-Options"))
+	}
+}
+
+func assertReadinessCheck(t *testing.T, checks []health.CheckResult, name string) {
+	t.Helper()
+
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != health.CheckPass {
+				t.Fatalf("expected %s to pass, got %q", name, check.Status)
+			}
+			if !check.Critical {
+				t.Fatalf("expected %s to be critical", name)
+			}
+			if check.DurationMS < 0 {
+				t.Fatalf("expected %s duration to be non-negative, got %d", name, check.DurationMS)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected readiness check %s in %+v", name, checks)
+}
+
+func assertRFC3339(t *testing.T, value string) {
+	t.Helper()
+
+	if _, err := time.Parse(time.RFC3339, value); err != nil {
+		t.Fatalf("expected RFC3339 timestamp, got %q: %v", value, err)
 	}
 }
 

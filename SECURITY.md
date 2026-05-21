@@ -82,6 +82,11 @@ Sealed Secrets e obrigatorio para versionar secrets do MVP:
 - Rotacao manual deve seguir `docs/runbooks/sealed-secrets-rotation.md`.
 - CI bloqueia manifests unsealed e marcadores obvios de secrets plaintext em locais proibidos.
 
+## Health endpoints
+
+- `/healthz` e `/readyz` nao devem retornar secrets, DSNs, tokens, stack traces, hostnames internos, variaveis de ambiente sensiveis ou detalhes de topologia sensivel.
+- Readiness pode indicar status geral (`ready`, `degraded`, `unready`) e nomes de checks operacionais aprovados, mas nao deve revelar credenciais nem infraestrutura interna.
+
 ## Regras para WebSocket
 
 - Validar token no handshake.
