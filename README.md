@@ -388,3 +388,37 @@ Os servicos Go seguem uma estrutura interna padronizada:
 | admin-service        |         8085 | /healthz, /readyz, /version |
 | search-service       |         8086 | /healthz, /readyz, /version |
 | media-service        |         8087 | /healthz, /readyz, /version |
+
+## Local infrastructure PoCs
+
+> PoCs locais não são benchmark final de produção. Resultados servem para decisão técnica incremental.
+
+### SeaweedFS
+
+```bash
+make poc-seaweedfs
+```
+
+- Usa Docker Compose local com perfil `seaweed-replication`.
+- Sobe segundo volume server (`seaweed-volume-2`) para validar replicação básica.
+- Valida upload/download pequeno e grande, integridade SHA-256 e latência.
+- Gera resultados em `poc-results/seaweedfs/` (não versionado).
+
+### Valkey
+
+```bash
+make poc-valkey
+```
+
+- Valida Pub/Sub, Streams (XADD/XREAD/XRANGE), SETNX lock, TTL/EXPIRE e sliding window.
+- Mede latência básica das operações principais.
+- Gera resultados em `poc-results/valkey/` (não versionado).
+
+### CI-safe config check
+
+```bash
+make poc-config-check
+```
+
+Valida scripts, sintaxe, configurações e .gitignore sem subir containers.
+Incluído automaticamente em `make ci`.

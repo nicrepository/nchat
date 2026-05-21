@@ -109,3 +109,7 @@ kind-kubeconfig*
 agentdb.rvf
 agentdb.rvf.lock
 ruvector.db
+
+# Local PoC outputs
+poc-results/*
+!poc-results/.gitkeep
