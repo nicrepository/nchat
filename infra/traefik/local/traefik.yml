@@ -1,11 +1,13 @@
 api:
   dashboard: true
-  insecure: true
+  insecure: false
 
 entryPoints:
   web:
     address: ":8080"
-  traefik:
+  websecure:
+    address: ":8443"
+  dashboard:
     address: ":8081"
 
 providers:

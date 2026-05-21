@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-Esta pasta contem os manifests iniciais Kubernetes/k3s do NChat para ambientes dev/staging revisaveis. A entrega prepara o repositorio para uma futura adocao de GitOps, mas nao configura ArgoCD, Helm, Sealed Secrets, cert-manager ou manifests de producao.
+Esta pasta contem os manifests iniciais Kubernetes/k3s do NChat para ambientes dev/staging revisaveis. A entrega prepara o repositorio para uma futura adocao de GitOps, mas nao configura ArgoCD, Helm, cert-manager ou manifests de producao.
 
 ## Estrutura
 
@@ -19,15 +19,21 @@ infra/k8s/
 │   ├── web/
 │   └── services/
 └── overlays/
-    └── k3s-dev/
+    ├── k3s-dev/
+    │   ├── kustomization.yaml
+    │   ├── ingress.yaml
+    │   ├── namespace-patch.yaml
+    │   ├── configmap-patch.yaml
+    │   └── patches/
+    └── k3s-staging/
         ├── kustomization.yaml
         ├── ingress.yaml
         ├── namespace-patch.yaml
-        ├── configmap-patch.yaml
+        ├── tls-option.yaml
         └── patches/
 ```
 
-O arquivo `labels.yaml` foi omitido porque os labels sao declarados diretamente nos recursos e o overlay adiciona `app.kubernetes.io/instance: k3s-dev` via o transformador `labels` do Kustomize. Tags de imagem tambem ficam em `overlays/k3s-dev/kustomization.yaml` no bloco `images`.
+O arquivo `labels.yaml` foi omitido porque os labels sao declarados diretamente nos recursos e os overlays adicionam `app.kubernetes.io/instance` via o transformador `labels` do Kustomize. Tags de imagem tambem ficam nos `kustomization.yaml` dos overlays no bloco `images`.
 
 ## Renderizacao
 
@@ -46,7 +52,7 @@ make k8s-validate
 make k8s-ci
 ```
 
-A validacao renderiza o overlay `infra/k8s/overlays/k3s-dev` para `/tmp`. Quando `kubectl` esta disponivel e o API server configurado responde rapidamente, o script executa `kubectl apply --dry-run=client --validate=false`. Se o cluster configurado estiver inacessivel, o dry-run e pulado para manter a validacao independente de cluster real. Se `kubeconform` existir localmente, ele tambem e executado.
+A validacao CI renderiza `k3s-dev` e `k3s-staging` para `/tmp`. Use `K8S_OVERLAY=infra/k8s/overlays/k3s-staging make k8s-ci` para validar apenas um overlay. Quando `kubectl` esta disponivel e o API server configurado responde rapidamente, o script executa `kubectl apply --dry-run=client --validate=false`. Se o cluster configurado estiver inacessivel, o dry-run e pulado para manter a validacao independente de cluster real. Se `kubeconform` existir localmente, ele tambem e executado com `-ignore-missing-schemas` para permitir CRDs como Traefik `TLSOption`.
 
 ## Aplicar em k3s dev
 
@@ -62,6 +68,17 @@ O overlay assume Traefik padrao do k3s e cria o Ingress `nchat-k3s-dev` para o h
 ```
 
 Depois acesse `http://nchat.local/` ou use `curl` com header `Host: nchat.local`.
+
+## Staging TLS placeholder
+
+O overlay `k3s-staging` expoe `staging.nchat.local` via Ingress Traefik com TLS habilitado e referencia o Secret `nchat-staging-tls`. O recurso `TLSOption` define `VersionTLS13` e `sniStrict: true`.
+
+```bash
+make k8s-render-staging
+make k8s-validate-staging
+```
+
+Esse overlay exige Traefik CRDs para aplicar `TLSOption`. Em k3s com Traefik padrao, eles normalmente existem. Se nao existirem, aplique apenas o Ingress TLS ou instale os CRDs do Traefik para o cluster. Cert-manager nao esta configurado nesta tarefa.
 
 ## Remocao
 
@@ -90,7 +107,7 @@ As imagens sao placeholders versionados. Dockerfiles reais, build e push de imag
 
 `base/configmap.yaml` contem apenas dados nao sensiveis. As referencias para PostgreSQL, Valkey e SeaweedFS apontam para nomes de servicos placeholder (`postgres`, `valkey`, `seaweedfs-filer`, `seaweedfs-s3`). Esses data services nao sao criados nesta tarefa; serao modelados em tarefa futura ou apontados para servicos externos.
 
-`base/secrets.example.yaml` e apenas modelo e nao entra no `base/kustomization.yaml`. Nao aplique esse arquivo em producao. Secrets reais devem ficar fora do repositorio e futuramente serao substituidos por Sealed Secrets ou External Secrets.
+`base/secrets.example.yaml` e apenas modelo e nao entra no `base/kustomization.yaml`. Nao aplique esse arquivo em producao. Secrets reais devem ficar fora do repositorio. Para o MVP, secrets versionados devem ser gerados como SealedSecrets com escopo `strict`; External Secrets fica fora desta tarefa.
 
 ## Seguranca inicial
 
@@ -106,9 +123,9 @@ As imagens sao placeholders versionados. Dockerfiles reais, build e push de imag
 ## Limitacoes
 
 - Nao e producao.
-- Sem TLS real.
+- Sem TLS publico real.
 - Sem cert-manager.
-- Sem Sealed Secrets.
+- Sealed Secrets estruturado, mas sem controller aplicado por CI.
 - Sem ArgoCD.
 - Sem Helm.
 - Sem Istio.
@@ -122,7 +139,7 @@ As imagens sao placeholders versionados. Dockerfiles reais, build e push de imag
 
 - Criar Dockerfiles dos servicos Go e do web.
 - Criar pipeline de build/push de imagens.
-- Substituir secrets manuais por Sealed Secrets ou External Secrets.
+- Aplicar controller Sealed Secrets em clusters dev/staging.
 - Configurar TLS publico com cert-manager ou mecanismo definido para o MVP.
 - Adotar GitOps/ArgoCD.
 - Definir manifests de data services ou contratos para servicos externos.

@@ -2,14 +2,15 @@
 
 ## Objetivo
 
-Este diretorio configura o Traefik como gateway local padrao do NChat. Ele existe apenas para desenvolvimento e roteia requisicoes HTTP de `nchat.local` para processos rodando no host.
+Este diretorio configura o Traefik como gateway local padrao do NChat. Ele existe apenas para desenvolvimento e roteia requisicoes HTTP e HTTPS de `nchat.local` para processos rodando no host.
 
 Nginx permanece como alternativa futura porque os requisitos aceitam Traefik ou Nginx.
 
 ## Arquivos
 
 - `traefik.yml`: configuracao estatica do Traefik, entrypoints, file provider, logs, dashboard e ping.
-- `dynamic.yml`: routers, services e middlewares para web e APIs locais.
+- `dynamic.yml`: routers HTTP/HTTPS, services, middlewares e opcoes TLS para web e APIs locais.
+- `certs/`: certificados locais gerados fora do Git por `make dev-tls-generate`.
 
 ## Rotas
 
@@ -24,7 +25,7 @@ Nginx permanece como alternativa futura porque os requisitos aceitam Traefik ou 
 | `/api/search`        | `http://host.docker.internal:8086` |
 | `/api/media`         | `http://host.docker.internal:8087` |
 
-Os routers de API aplicam `StripPrefix`, entao `http://nchat.local:8080/api/auth/healthz` chega ao `auth-service` como `/healthz`.
+Os routers de API aplicam `StripPrefix`, entao `http://nchat.local:8080/api/auth/healthz` e `https://nchat.local:8443/api/auth/healthz` chegam ao `auth-service` como `/healthz`.
 
 WebSocket nao exige configuracao especial no Traefik para o caso basico; headers `Upgrade` e `Connection` sao encaminhados pelo proxy. Esta tarefa nao implementa WebSocket real nos servicos.
 
@@ -33,13 +34,15 @@ WebSocket nao exige configuracao especial no Traefik para o caso basico; headers
 - O Docker provider nao e habilitado.
 - O Docker socket do host nao e montado.
 - O dashboard fica publicado apenas em `127.0.0.1` via Docker Compose.
-- Nao ha TLS real nesta configuracao.
+- HTTPS local usa certificados gerados por `mkcert` ou fallback self-signed com `openssl`.
+- `VersionTLS13` e configurado como minimo nos routers HTTPS quando suportado pelo Traefik local.
 - Headers basicos de seguranca sao aplicados por middleware.
 - Esta configuracao nao deve ser usada em producao.
 
 ## Como validar
 
 ```bash
+make dev-tls-generate
 make gateway-config-check
 make dev-gateway-up
 make dev-gateway-validate
@@ -55,7 +58,7 @@ Para resolver `nchat.local`, adicione no host:
 ## Limitacoes
 
 - Ambiente local apenas.
-- Sem TLS real.
+- Sem TLS publico real.
 - Sem cert-manager.
 - Sem Kubernetes.
 - Sem Dockerfiles.
@@ -66,7 +69,7 @@ Para resolver `nchat.local`, adicione no host:
 
 ## Proximos passos
 
-- TLS local opcional com mkcert.
+- Staging/producao com CA/cert-manager definidos em tarefa futura.
 - Rate limiting.
 - Headers avancados.
 - WebSocket real.

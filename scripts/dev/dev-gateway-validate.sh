@@ -9,8 +9,12 @@ ENV_EXAMPLE="$ROOT_DIR/infra/compose/.env.dev.example"
 GATEWAY_ENV_KEYS=(
   TRAEFIK_IMAGE
   TRAEFIK_HTTP_HOST_PORT
+  TRAEFIK_HTTPS_HOST_PORT
   TRAEFIK_DASHBOARD_HOST_PORT
+  TRAEFIK_TLS_CERT_FILE
+  TRAEFIK_TLS_KEY_FILE
   NCHAT_LOCAL_HOST
+  NCHAT_LOCAL_HTTPS_URL
   WEB_HOST_PORT
   AUTH_SERVICE_HOST_PORT
   CHAT_SERVICE_HOST_PORT
@@ -103,6 +107,13 @@ fi
 
 curl --fail --silent --show-error "http://localhost:${TRAEFIK_HTTP_HOST_PORT}/ping" >/dev/null
 curl --fail --silent --show-error "http://localhost:${TRAEFIK_DASHBOARD_HOST_PORT}/dashboard/" >/dev/null
+
+https_probe() {
+  curl --insecure --silent --show-error --max-time 5 \
+    --resolve "${NCHAT_LOCAL_HOST}:${TRAEFIK_HTTPS_HOST_PORT}:127.0.0.1" \
+    "https://${NCHAT_LOCAL_HOST}:${TRAEFIK_HTTPS_HOST_PORT}/" >/dev/null
+}
+https_probe
 
 probe_route() {
   local name="$1"
