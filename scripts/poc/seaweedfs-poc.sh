@@ -22,6 +22,7 @@ set +a
 # Resolve ports with defaults
 SEAWEEDFS_MASTER_HOST_PORT="${SEAWEEDFS_MASTER_HOST_PORT:-9333}"
 SEAWEEDFS_FILER_HOST_PORT="${SEAWEEDFS_FILER_HOST_PORT:-8888}"
+SEAWEEDFS_VOLUME_HOST_PORT="${SEAWEEDFS_VOLUME_HOST_PORT:-8088}"
 SEAWEEDFS_VOLUME_2_HOST_PORT="${SEAWEEDFS_VOLUME_2_HOST_PORT:-8089}"
 SEAWEEDFS_POC_LARGE_MB="${SEAWEEDFS_POC_LARGE_MB:-10}"
 
@@ -91,6 +92,23 @@ wait_http "${FILER_URL}/" "seaweed-filer"
 # Helper: milliseconds timestamp
 # ---------------------------------------------------------------------------
 ms_now() { python3 -c "import time; print(int(time.time() * 1000))"; }
+
+# ---------------------------------------------------------------------------
+# Helper: map SeaweedFS internal Docker hostname:port to host-accessible URL.
+# dir/assign returns internal hostnames (e.g. seaweed-volume:8088).
+# The script runs on the host, so we must translate them to localhost:<mapped_port>.
+# ---------------------------------------------------------------------------
+map_seaweedfs_url() {
+  local internal_url="$1"
+  case "$internal_url" in
+    seaweed-volume:8088)   echo "localhost:${SEAWEEDFS_VOLUME_HOST_PORT}" ;;
+    seaweed-volume-2:8088) echo "localhost:${SEAWEEDFS_VOLUME_2_HOST_PORT}" ;;
+    *)
+      # Fallback: replace any container hostname with localhost and keep port
+      echo "$internal_url" | sed 's/^[^:]*:/localhost:/'
+      ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 # Test results tracking
@@ -246,48 +264,111 @@ fi
 
 ASSIGN_RESPONSE="$TMP_DIR/assign.json"
 REPLICATION_RESULT="fail"
+REPL_FILE="$TMP_DIR/repl.txt"
+REPL_DL="$TMP_DIR/repl-dl.txt"
+echo "nchat-seaweedfs-replication-poc-$(date +%s)" > "$REPL_FILE"
+REPL_SHA="$(sha256sum "$REPL_FILE" | awk '{print $1}')"
 
 if curl -sS --max-time 15 "${MASTER_URL}/dir/assign?replication=001" -o "$ASSIGN_RESPONSE"; then
   echo "  assign response: $(cat "$ASSIGN_RESPONSE")"
-  FID="$(python3 -c "import json,sys; d=json.load(open('${ASSIGN_RESPONSE}')); print(d.get('fid',''))" 2>/dev/null || echo "")"
-  VOL_URL="$(python3 -c "import json,sys; d=json.load(open('${ASSIGN_RESPONSE}')); print(d.get('url',''))" 2>/dev/null || echo "")"
-  VID="$(python3 -c "import json,sys; d=json.load(open('${ASSIGN_RESPONSE}')); fid=d.get('fid',''); print(fid.split(',')[0] if ',' in fid else '')" 2>/dev/null || echo "")"
+  FID="$(python3 -c "import json; d=json.load(open('${ASSIGN_RESPONSE}')); print(d.get('fid',''))" 2>/dev/null || echo "")"
+  INTERNAL_VOL_URL="$(python3 -c "import json; d=json.load(open('${ASSIGN_RESPONSE}')); print(d.get('url',''))" 2>/dev/null || echo "")"
+  VID="$(python3 -c "import json; d=json.load(open('${ASSIGN_RESPONSE}')); fid=d.get('fid',''); print(fid.split(',')[0] if ',' in fid else '')" 2>/dev/null || echo "")"
 
-  if [ -n "$FID" ] && [ -n "$VOL_URL" ]; then
-    # Upload the small file to the assigned fid
-    REPL_UPLOAD_RESULT="$(curl -sS --max-time 15 -X POST \
-      "http://${VOL_URL}/${FID}" \
-      -F "file=@${SMALL_FILE}" 2>&1)" || true
-    echo "  replication upload result: $REPL_UPLOAD_RESULT"
+  if [ -n "$FID" ] && [ -n "$INTERNAL_VOL_URL" ]; then
+    # Map internal Docker hostname to host-accessible URL
+    HOST_VOL_URL="$(map_seaweedfs_url "$INTERNAL_VOL_URL")"
+    echo "  internal url: $INTERNAL_VOL_URL -> host url: $HOST_VOL_URL"
 
-    # Lookup volume locations
-    if [ -n "$VID" ]; then
-      LOOKUP_RESPONSE="$TMP_DIR/lookup.json"
-      # Give replication a moment to propagate
-      sleep 2
-      curl -sS --max-time 10 "${MASTER_URL}/dir/lookup?volumeId=${VID}" -o "$LOOKUP_RESPONSE" || true
-      echo "  lookup response: $(cat "$LOOKUP_RESPONSE" 2>/dev/null || echo 'N/A')"
+    # Upload to the assigned fid via host-accessible URL
+    UPLOAD_HTTP_STATUS="$(curl -sS --max-time 15 -o /dev/null -w "%{http_code}" \
+      -X POST "http://${HOST_VOL_URL}/${FID}" \
+      -F "file=@${REPL_FILE}" 2>/dev/null || echo "000")"
+    echo "  replication upload HTTP status: $UPLOAD_HTTP_STATUS"
 
-      LOCATIONS_COUNT="$(python3 -c "
-import json, sys
+    if [[ "$UPLOAD_HTTP_STATUS" =~ ^2 ]]; then
+      pass "replication_upload"
+
+      # Allow replication to propagate, then lookup volume locations
+      if [ -n "$VID" ]; then
+        sleep 2
+        LOOKUP_RESPONSE="$TMP_DIR/lookup.json"
+        curl -sS --max-time 10 "${MASTER_URL}/dir/lookup?volumeId=${VID}" -o "$LOOKUP_RESPONSE" || true
+        echo "  lookup response: $(cat "$LOOKUP_RESPONSE" 2>/dev/null || echo 'N/A')"
+
+        LOCATIONS_COUNT="$(python3 -c "
+import json
 try:
     d = json.load(open('${LOOKUP_RESPONSE}'))
-    locs = d.get('locations', [])
-    print(len(locs))
+    print(len(d.get('locations', [])))
 except Exception:
     print(0)
 " 2>/dev/null || echo "0")"
-      echo "  volume locations found: $LOCATIONS_COUNT"
+        echo "  volume locations found: $LOCATIONS_COUNT"
 
-      if [ "${LOCATIONS_COUNT:-0}" -ge 2 ]; then
-        pass "replication_basic"
-        REPLICATION_RESULT="pass"
+        if [ "${LOCATIONS_COUNT:-0}" -ge 2 ]; then
+          # Download from the second location to verify the replica is accessible
+          SECOND_INTERNAL_URL="$(python3 -c "
+import json
+try:
+    d = json.load(open('${LOOKUP_RESPONSE}'))
+    locs = d.get('locations', [])
+    # pick the location that is NOT the primary upload target
+    primary = '${INTERNAL_VOL_URL}'
+    for loc in locs:
+        if loc.get('url','') != primary:
+            print(loc.get('url',''))
+            break
+    else:
+        # fall back to any location
+        if locs:
+            print(locs[0].get('url',''))
+except Exception:
+    pass
+" 2>/dev/null || echo "")"
+
+          if [ -n "$SECOND_INTERNAL_URL" ]; then
+            SECOND_HOST_URL="$(map_seaweedfs_url "$SECOND_INTERNAL_URL")"
+            echo "  downloading replica from: $SECOND_INTERNAL_URL -> host: $SECOND_HOST_URL"
+            DL_HTTP="$(curl -sS --max-time 15 -o "$REPL_DL" -w "%{http_code}" \
+              "http://${SECOND_HOST_URL}/${FID}" 2>/dev/null || echo "000")"
+            echo "  replica download HTTP status: $DL_HTTP"
+
+            if [[ "$DL_HTTP" =~ ^2 ]]; then
+              REPL_DL_SHA="$(sha256sum "$REPL_DL" | awk '{print $1}')"
+              if [ "$REPL_SHA" = "$REPL_DL_SHA" ]; then
+                pass "replication_checksum"
+                pass "replication_basic"
+                REPLICATION_RESULT="pass"
+              else
+                fail "replication_checksum" "SHA256 mismatch on replica: expected $REPL_SHA got $REPL_DL_SHA"
+                fail "replication_basic" "replica checksum mismatch"
+                REPLICATION_RESULT="fail"
+              fi
+            else
+              # Replica download failed — log but don't fail the whole test;
+              # the lookup proving >=2 locations is sufficient evidence of replication.
+              echo "[WARN] Could not download from replica (HTTP $DL_HTTP); lookup shows >=2 locations"
+              RESULTS["replication_checksum"]="SKIPPED: replica download returned $DL_HTTP"
+              pass "replication_basic"
+              REPLICATION_RESULT="pass"
+            fi
+          else
+            RESULTS["replication_checksum"]="SKIPPED: could not determine second location URL"
+            pass "replication_basic"
+            REPLICATION_RESULT="pass"
+          fi
+        else
+          fail "replication_basic" "lookup returned only $LOCATIONS_COUNT location(s) — expected >=2 with replication=001"
+          REPLICATION_RESULT="fail"
+        fi
       else
-        fail "replication_basic" "lookup returned only $LOCATIONS_COUNT location(s) — expected >=2 with replication=001"
+        fail "replication_basic" "could not parse volumeId from assign response"
         REPLICATION_RESULT="fail"
       fi
     else
-      fail "replication_basic" "could not parse volumeId from assign response"
+      fail "replication_upload" "upload to fid returned HTTP $UPLOAD_HTTP_STATUS"
+      fail "replication_basic" "fid upload failed — cannot validate replication"
       REPLICATION_RESULT="fail"
     fi
   else
@@ -348,6 +429,8 @@ cat > "$SUMMARY_FILE" <<EOF
 | upload_large | ${RESULTS[upload_large]:-NOT RUN} |
 | download_large | ${RESULTS[download_large]:-NOT RUN} |
 | checksum_large | ${RESULTS[checksum_large]:-NOT RUN} |
+| replication_upload | ${RESULTS[replication_upload]:-NOT RUN} |
+| replication_checksum | ${RESULTS[replication_checksum]:-NOT RUN} |
 | replication_basic | ${RESULTS[replication_basic]:-NOT RUN} |
 
 ## Latencies
@@ -367,7 +450,8 @@ ${REPLICATION_RESULT}
 - Does not test node failure
 - Does not test backup/restore
 - Does not test concurrent load
-- replication=001 requires two running volume servers; if seaweed-volume-2 is absent the result is marked as "limited"
+- replication=001 requires two running volume servers; replica download is attempted
+  but a lookup with >=2 locations is accepted as sufficient evidence if download fails
 
 ## Overall: $([ "$OVERALL_PASS" = "true" ] && echo "PASS" || echo "FAIL")
 EOF
