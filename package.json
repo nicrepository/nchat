@@ -53,7 +53,17 @@
     "security:trivy:config": "bash scripts/security/trivy-config.sh",
     "security:secrets": "bash scripts/security/secrets-scan.sh",
     "security": "pnpm security:secrets && pnpm security:govulncheck && pnpm security:trivy:fs && pnpm security:trivy:config",
-    "ci": "pnpm format:check && pnpm ci:config-check && pnpm dev:env:config-check && pnpm gateway:config-check && pnpm k8s:ci && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build"
+    "ci": "pnpm format:check && pnpm ci:config-check && pnpm dev:env:config-check && pnpm gateway:config-check && pnpm tls:config-check && pnpm sealed-secrets:policy-check && pnpm k8s:ci && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build",
+    "tls:generate": "bash scripts/dev/dev-tls-generate.sh",
+    "tls:status": "bash scripts/dev/dev-tls-status.sh",
+    "tls:clean": "bash scripts/dev/dev-tls-clean.sh",
+    "tls:config-check": "bash scripts/ci/tls-config-check.sh",
+    "sealed-secrets:validate": "bash scripts/secrets/sealed-secrets-validate.sh",
+    "sealed-secrets:policy-check": "bash scripts/ci/sealed-secrets-policy-check.sh",
+    "sealed-secrets:install-controller": "bash scripts/secrets/sealed-secrets-install-controller.sh",
+    "sealed-secrets:fetch-cert": "bash scripts/secrets/sealed-secrets-fetch-cert.sh",
+    "k8s:render:staging": "bash scripts/k8s/k8s-render.sh infra/k8s/overlays/k3s-staging",
+    "k8s:validate:staging": "bash scripts/k8s/k8s-validate.sh infra/k8s/overlays/k3s-staging"
   },
   "engines": {
     "node": ">=24 <25",

@@ -209,5 +209,11 @@ jobs:
       - name: Check local gateway config
         run: pnpm gateway:config-check
 
+      - name: Check TLS config
+        run: pnpm tls:config-check
+
+      - name: Check Sealed Secrets policy
+        run: pnpm sealed-secrets:policy-check
+
       - name: Check Kubernetes manifests
         run: pnpm k8s:ci

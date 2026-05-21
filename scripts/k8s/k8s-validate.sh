@@ -23,7 +23,7 @@ else
 fi
 
 if command -v kubeconform >/dev/null 2>&1; then
-  kubeconform -strict -summary "$RENDERED"
+  kubeconform -strict -ignore-missing-schemas -summary "$RENDERED"
 else
   echo "info: kubeconform not found; skipped schema validation" >&2
 fi

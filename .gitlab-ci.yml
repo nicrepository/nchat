@@ -60,6 +60,8 @@ quality:
     - pnpm install --frozen-lockfile
   script:
     - pnpm format:check
+    - pnpm tls:config-check
+    - pnpm sealed-secrets:policy-check
     - pnpm typecheck:web
     - pnpm test:web
     - pnpm build:web
@@ -108,6 +110,8 @@ manifests:
   script:
     - pnpm dev:env:config-check
     - pnpm gateway:config-check
+    - pnpm tls:config-check
+    - pnpm sealed-secrets:policy-check
     - pnpm k8s:ci
 
 security-govulncheck:
@@ -118,6 +122,17 @@ security-govulncheck:
     - go install golang.org/x/vuln/cmd/govulncheck@latest
   script:
     - bash scripts/security/govulncheck.sh
+
+security-sealed-secrets-policy:
+  stage: security
+  image: node:${NODE_VERSION}-bookworm
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@${PNPM_VERSION} --activate
+    - pnpm config set store-dir ${PNPM_STORE_PATH}
+    - pnpm install --frozen-lockfile
+  script:
+    - pnpm sealed-secrets:policy-check
 
 security-secrets:
   stage: security

@@ -1,5 +1,20 @@
+tls:
+  certificates:
+    - certFile: /certs/nchat.local.pem
+      keyFile: /certs/nchat.local-key.pem
+  options:
+    default:
+      minVersion: VersionTLS13
+      sniStrict: true
+
 http:
   routers:
+    traefik-dashboard:
+      entryPoints:
+        - dashboard
+      rule: PathPrefix(`/api`) || PathPrefix(`/dashboard`)
+      service: api@internal
+
     nchat-auth:
       entryPoints:
         - web
@@ -10,6 +25,18 @@ http:
         - security-headers
         - compress
         - strip-auth-prefix
+
+    nchat-auth-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 100
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-auth-prefix
+      tls: {}
 
     nchat-chat:
       entryPoints:
@@ -22,6 +49,18 @@ http:
         - compress
         - strip-chat-prefix
 
+    nchat-chat-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/chat`)
+      priority: 100
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
+      tls: {}
+
     nchat-files:
       entryPoints:
         - web
@@ -32,6 +71,18 @@ http:
         - security-headers
         - compress
         - strip-files-prefix
+
+    nchat-files-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/files`)
+      priority: 100
+      service: file-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-files-prefix
+      tls: {}
 
     nchat-notifications:
       entryPoints:
@@ -44,6 +95,18 @@ http:
         - compress
         - strip-notifications-prefix
 
+    nchat-notifications-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/notifications`)
+      priority: 100
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-notifications-prefix
+      tls: {}
+
     nchat-admin:
       entryPoints:
         - web
@@ -54,6 +117,18 @@ http:
         - security-headers
         - compress
         - strip-admin-prefix
+
+    nchat-admin-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/admin`)
+      priority: 100
+      service: admin-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-admin-prefix
+      tls: {}
 
     nchat-search:
       entryPoints:
@@ -66,6 +141,18 @@ http:
         - compress
         - strip-search-prefix
 
+    nchat-search-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/search`)
+      priority: 100
+      service: search-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-search-prefix
+      tls: {}
+
     nchat-media:
       entryPoints:
         - web
@@ -77,6 +164,18 @@ http:
         - compress
         - strip-media-prefix
 
+    nchat-media-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/media`)
+      priority: 100
+      service: media-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-media-prefix
+      tls: {}
+
     nchat-web:
       entryPoints:
         - web
@@ -86,6 +185,17 @@ http:
       middlewares:
         - security-headers
         - compress
+
+    nchat-web-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: web
+      middlewares:
+        - security-headers
+        - compress
+      tls: {}
 
   services:
     web:

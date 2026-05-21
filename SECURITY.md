@@ -50,6 +50,15 @@ Falsos positivos devem ser tratados explicitamente:
 4. Registrar qualquer ignore com escopo minimo e motivo.
 5. Nunca ignorar silenciosamente.
 
+## TLS dev/staging
+
+- Endpoints publicos do MVP devem exigir TLS 1.3.
+- O ambiente local usa Traefik HTTPS em `https://nchat.local:8443` com `VersionTLS13` como minimo quando suportado.
+- Certificados locais devem ser gerados com `make dev-tls-generate` e permanecer fora do Git.
+- O fallback `openssl` e apenas self-signed local e nao representa confianca publica.
+- O overlay `k3s-staging` usa Ingress TLS placeholder com Secret `nchat-staging-tls`.
+- Cert-manager e TLS publico real nao estao configurados nesta etapa.
+
 ## Regras para segredos
 
 E proibido commitar:
@@ -63,6 +72,15 @@ E proibido commitar:
 - logs sensiveis.
 
 Use arquivos de exemplo sem valores reais quando necessario.
+
+Sealed Secrets e obrigatorio para versionar secrets do MVP:
+
+- Escopo `strict` e o padrao.
+- `namespace-wide` exige justificativa no PR.
+- `cluster-wide` e proibido sem excecao aprovada.
+- Todo secret deve ter owner em `docs/security/secrets-owners.md`.
+- Rotacao manual deve seguir `docs/runbooks/sealed-secrets-rotation.md`.
+- CI bloqueia manifests unsealed e marcadores obvios de secrets plaintext em locais proibidos.
 
 ## Regras para WebSocket
 

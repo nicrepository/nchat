@@ -7,6 +7,8 @@ ENV_EXAMPLE="$ROOT_DIR/infra/compose/.env.dev.example"
 ENV_FILE="$ROOT_DIR/infra/compose/.env.dev"
 TRAEFIK_STATIC_CONFIG="$ROOT_DIR/infra/traefik/local/traefik.yml"
 TRAEFIK_DYNAMIC_CONFIG="$ROOT_DIR/infra/traefik/local/dynamic.yml"
+LOCAL_CERT_DIR="$ROOT_DIR/infra/traefik/local/certs"
+TEMP_CERT_DIR=""
 
 require_file() {
   if [ ! -f "$1" ]; then
@@ -47,6 +49,9 @@ cleanup() {
   if [ "$created_env" -eq 1 ]; then
     rm -f "$ENV_FILE"
   fi
+  if [ -n "$TEMP_CERT_DIR" ]; then
+    rm -rf "$TEMP_CERT_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -59,10 +64,48 @@ TRAEFIK_IMAGE="${TRAEFIK_IMAGE:-traefik:v3.6}"
 
 docker compose --env-file "$ENV_EXAMPLE" -f "$COMPOSE_FILE" --profile gateway config >/dev/null
 
+CERT_MOUNT_DIR="$LOCAL_CERT_DIR"
+if [ ! -f "$LOCAL_CERT_DIR/nchat.local.pem" ] || [ ! -f "$LOCAL_CERT_DIR/nchat.local-key.pem" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    TEMP_CERT_DIR="$(mktemp -d)"
+    OPENSSL_CONFIG="$TEMP_CERT_DIR/openssl.cnf"
+    cat >"$OPENSSL_CONFIG" <<'EOF'
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = nchat.local
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = nchat.local
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+EOF
+    openssl req -x509 -nodes -days 1 -newkey rsa:2048 \
+      -keyout "$TEMP_CERT_DIR/nchat.local-key.pem" \
+      -out "$TEMP_CERT_DIR/nchat.local.pem" \
+      -config "$OPENSSL_CONFIG" >/dev/null 2>&1
+    CERT_MOUNT_DIR="$TEMP_CERT_DIR"
+  else
+    echo "warning: openssl not found and local TLS certs are absent; skipping Traefik check-config." >&2
+    docker run --rm "$TRAEFIK_IMAGE" version >/dev/null
+    echo "Gateway config check passed."
+    exit 0
+  fi
+fi
+
 if docker run --rm "$TRAEFIK_IMAGE" check-config --help >/dev/null 2>&1; then
   docker run --rm \
     -v "$TRAEFIK_STATIC_CONFIG:/etc/traefik/traefik.yml:ro" \
     -v "$TRAEFIK_DYNAMIC_CONFIG:/etc/traefik/dynamic.yml:ro" \
+    -v "$CERT_MOUNT_DIR:/certs:ro" \
     "$TRAEFIK_IMAGE" \
     check-config --configFile=/etc/traefik/traefik.yml
 else

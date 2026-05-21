@@ -9,8 +9,12 @@ ENV_EXAMPLE="$ROOT_DIR/infra/compose/.env.dev.example"
 GATEWAY_ENV_KEYS=(
   TRAEFIK_IMAGE
   TRAEFIK_HTTP_HOST_PORT
+  TRAEFIK_HTTPS_HOST_PORT
   TRAEFIK_DASHBOARD_HOST_PORT
+  TRAEFIK_TLS_CERT_FILE
+  TRAEFIK_TLS_KEY_FILE
   NCHAT_LOCAL_HOST
+  NCHAT_LOCAL_HTTPS_URL
   WEB_HOST_PORT
   AUTH_SERVICE_HOST_PORT
   CHAT_SERVICE_HOST_PORT
@@ -74,6 +78,13 @@ require_command() {
 ensure_env_file
 load_gateway_env
 
+TLS_CERT_PATH="$ROOT_DIR/infra/traefik/local/certs/nchat.local.pem"
+TLS_KEY_PATH="$ROOT_DIR/infra/traefik/local/certs/nchat.local-key.pem"
+if [ ! -f "$TLS_CERT_PATH" ] || [ ! -f "$TLS_KEY_PATH" ]; then
+  echo "Local TLS certificate is missing. Run: make dev-tls-generate" >&2
+  exit 1
+fi
+
 require_command docker
 docker compose version >/dev/null
 
@@ -83,7 +94,8 @@ compose ps traefik
 cat <<EOF
 
 Local gateway endpoints:
-- Web/API gateway: http://${NCHAT_LOCAL_HOST}:${TRAEFIK_HTTP_HOST_PORT}
+- HTTP gateway: http://${NCHAT_LOCAL_HOST}:${TRAEFIK_HTTP_HOST_PORT}
+- HTTPS gateway: ${NCHAT_LOCAL_HTTPS_URL}
 - Traefik dashboard: http://localhost:${TRAEFIK_DASHBOARD_HOST_PORT}/dashboard/
 
 Add this to /etc/hosts if it is not present yet:

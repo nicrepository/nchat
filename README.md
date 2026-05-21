@@ -137,7 +137,7 @@ Ainda nao existe nesta etapa:
 - deploy automatico;
 - ArgoCD;
 - build/push de imagens;
-- ambientes staging/prod.
+- ambientes staging/prod reais.
 
 ## Local development infrastructure
 
@@ -227,11 +227,71 @@ Rotas locais:
 Avisos:
 
 - Local only.
-- Sem TLS real.
-- Dashboard inseguro apenas local.
+- HTTPS local e preferencial. HTTP permanece disponivel para compatibilidade de dev.
+- Dashboard local exposto apenas em loopback.
 - Nao usar configuracao em producao.
 - Docker socket nao e montado.
 - Web e servicos precisam estar rodando no host para as rotas responderem.
+
+## TLS dev/staging
+
+TLS local usa Traefik com certificados gerados fora do Git. O caminho preferencial e `mkcert`; se ele nao estiver instalado, o script usa `openssl` para gerar um certificado self-signed que o navegador nao confia automaticamente.
+
+Prepare o host local:
+
+```text
+127.0.0.1 nchat.local
+```
+
+Gere o certificado e suba o gateway:
+
+```bash
+make dev-tls-generate
+make dev-gateway-up
+```
+
+Endpoints locais:
+
+- `http://nchat.local:8080`
+- `https://nchat.local:8443`
+
+Comandos uteis:
+
+```bash
+make dev-tls-status
+make tls-config-check
+make dev-tls-clean
+```
+
+O Traefik local configura `VersionTLS13` como minimo nos roteadores HTTPS quando suportado pela versao em uso. Certificados e chaves ficam em `infra/traefik/local/certs/` e nao devem ser versionados.
+
+Staging inicial usa o overlay `infra/k8s/overlays/k3s-staging` com Ingress TLS para `staging.nchat.local` e Secret placeholder `nchat-staging-tls`. TLS publico real e cert-manager ficam para tarefas futuras.
+
+## Sealed Secrets
+
+Sealed Secrets permite versionar secrets apenas de forma criptografada para o cluster alvo. A politica do NChat exige escopo `strict` por padrao, owner por secret e rotacao manual documentada.
+
+Comandos principais:
+
+```bash
+make sealed-secrets-install-controller
+make sealed-secrets-validate
+make sealed-secrets-fetch-cert
+scripts/secrets/sealed-secrets-seal.sh \
+  infra/k8s/secrets/unsealed/nchat-secrets.yaml \
+  infra/k8s/secrets/sealed/nchat-secrets.sealed.yaml \
+  nchat
+make sealed-secrets-policy-check
+```
+
+Fluxo esperado:
+
+1. Copiar um template de `infra/k8s/secrets/templates/` para `infra/k8s/secrets/unsealed/`.
+2. Preencher valores reais apenas localmente.
+3. Selar com `kubeseal --scope strict` via script.
+4. Commitar apenas o `SealedSecret` em `infra/k8s/secrets/sealed/`.
+
+Nunca commitar secrets unsealed, private keys, kubeconfig, certificados reais ou valores sensiveis em logs, issues ou PRs.
 
 ## Kubernetes/k3s manifests
 
@@ -247,7 +307,7 @@ make k8s-status-dev
 make k8s-delete-dev
 ```
 
-Esses manifests nao sao de producao. Secrets reais nao sao versionados; `infra/k8s/base/secrets.example.yaml` e apenas modelo e nao entra no kustomization. O overlay `k3s-dev` assume Traefik disponivel no k3s e expoe `nchat.local` sem TLS real. TLS/cert-manager, Sealed Secrets, ArgoCD, Dockerfiles, build/push de imagens e data services em K8s entram em tarefas futuras.
+Esses manifests nao sao de producao. Secrets reais nao sao versionados; `infra/k8s/base/secrets.example.yaml` e apenas modelo e nao entra no kustomization. O overlay `k3s-dev` assume Traefik disponivel no k3s e expoe `nchat.local` sem TLS real. O overlay `k3s-staging` adiciona Ingress TLS placeholder para `staging.nchat.local` com `VersionTLS13` via Traefik TLSOption quando os CRDs existem. Cert-manager, ArgoCD, Dockerfiles, build/push de imagens, producao real e data services em K8s entram em tarefas futuras.
 
 ## Services base structure
 

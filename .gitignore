@@ -16,6 +16,8 @@ infra/compose/.env.dev
 *.csr
 *.jks
 *.keystore
+!*.example.pem
+!*.example.crt
 id_rsa
 id_dsa
 id_ecdsa
@@ -27,6 +29,25 @@ id_ed25519
 *.enc
 secrets/
 private/
+!infra/k8s/secrets/
+!infra/k8s/secrets/**
+!scripts/secrets/
+!scripts/secrets/**
+
+# Local TLS material
+infra/traefik/local/certs/*
+!infra/traefik/local/certs/.gitkeep
+!infra/traefik/local/certs/README.md
+
+# Kubernetes unsealed secrets
+infra/k8s/secrets/unsealed/*
+!infra/k8s/secrets/unsealed/.gitkeep
+!infra/k8s/secrets/unsealed/README.md
+
+# Local Sealed Secrets public cert cache
+infra/k8s/secrets/public-certs/*
+!infra/k8s/secrets/public-certs/.gitkeep
+!infra/k8s/secrets/public-certs/README.md
 
 # Logs and runtime files
 *.log
