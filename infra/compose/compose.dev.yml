@@ -129,6 +129,23 @@ services:
     networks:
       - nchat-dev
 
+  seaweed-volume-2:
+    image: ${SEAWEEDFS_IMAGE}
+    env_file:
+      - .env.dev
+    profiles:
+      - seaweed-replication
+    command: "volume -mserver=seaweed-master:9333 -ip=seaweed-volume-2 -ip.bind=0.0.0.0 -dir=/data -port=8088"
+    ports:
+      - "${SEAWEEDFS_VOLUME_2_HOST_PORT:-8089}:8088"
+    volumes:
+      - nchat_seaweed_volume_2_data:/data
+    depends_on:
+      seaweed-master:
+        condition: service_started
+    networks:
+      - nchat-dev
+
   traefik:
     image: ${TRAEFIK_IMAGE}
     container_name: nchat-traefik
@@ -160,3 +177,4 @@ volumes:
   nchat_seaweed_master_data:
   nchat_seaweed_volume_data:
   nchat_seaweed_filer_data:
+  nchat_seaweed_volume_2_data:
