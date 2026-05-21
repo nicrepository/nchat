@@ -6,6 +6,21 @@ NChat e um chat corporativo interno para comunicacao segura, rastreavel e operav
 
 MVP em desenvolvimento.
 
+## Architecture decisions
+
+As decisões arquiteturais do NChat são registradas como ADRs em `docs/adr/`.
+
+- [ADR-0001 — Estratégia de repositório](docs/adr/0001-repository-strategy.md)
+- [ADR-0002 — Decisão provisória da stack tecnológica](docs/adr/0002-provisional-stack-decision.md)
+- [Stack provisória consolidada](docs/architecture/provisional-stack.md)
+
+A stack atual está registrada no ADR-0002. Destaques:
+
+- SeaweedFS é **decisão provisória** até Sprint 3, quando será confirmado ou substituído.
+- Valkey 8 foi **validado no Sprint 0** para Pub/Sub, Streams, locks, TTL e sliding window.
+- Chamadas de áudio/vídeo (LiveKit) estão fora do MVP conforme requisitos v5.0; integram na V1.0.
+- Próximas decisões críticas serão registradas via ADR antes de serem implementadas.
+
 ## Stack planejada
 
 - Frontend: React, TypeScript
