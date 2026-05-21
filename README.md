@@ -192,6 +192,63 @@ Portas padrao dos servicos:
 - `search-service`: 8086
 - `media-service`: 8087
 
+## Health and readiness
+
+Os servicos Go expõem probes padronizadas para Kubernetes e operacao local. As respostas usam o envelope JSON compartilhado `{"data": ...}` e nao incluem secrets, DSNs, tokens, hostname interno, stack traces nem detalhes sensiveis de infraestrutura.
+
+- `/healthz` e liveness. Ele confirma que o processo HTTP responde e nao verifica PostgreSQL, Valkey, SeaweedFS ou qualquer dependencia externa.
+- `/readyz` e readiness. Ele indica se o servico pode receber trafego. Hoje executa apenas checks locais (`service-bootstrap` e `config-loaded`); checks reais de PostgreSQL, Valkey e SeaweedFS entram quando essas integracoes forem implementadas.
+- Readiness retorna `503` quando um check critico falha. Falhas apenas em checks nao criticos resultam em `degraded` com HTTP `200`.
+
+| Endpoint   | Purpose           | External dependencies                | Success            | Failure                                 |
+| ---------- | ----------------- | ------------------------------------ | ------------------ | --------------------------------------- |
+| `/healthz` | Process liveness  | No                                   | 200 ok             | 500 only on unexpected internal failure |
+| `/readyz`  | Traffic readiness | Local checks now, dependencies later | 200 ready/degraded | 503 unready                             |
+
+Exemplo `/healthz`:
+
+```json
+{
+  "data": {
+    "service": "auth-service",
+    "probe": "liveness",
+    "status": "ok",
+    "version": "0.0.0",
+    "commit": "dev",
+    "checkedAt": "2026-05-21T12:00:00Z"
+  }
+}
+```
+
+Exemplo `/readyz`:
+
+```json
+{
+  "data": {
+    "service": "auth-service",
+    "probe": "readiness",
+    "status": "ready",
+    "version": "0.0.0",
+    "commit": "dev",
+    "checkedAt": "2026-05-21T12:00:00Z",
+    "checks": [
+      {
+        "name": "service-bootstrap",
+        "status": "pass",
+        "critical": true,
+        "durationMs": 0
+      },
+      {
+        "name": "config-loaded",
+        "status": "pass",
+        "critical": true,
+        "durationMs": 0
+      }
+    ]
+  }
+}
+```
+
 ## Local gateway
 
 O gateway local usa Traefik como padrao. Nginx permanece alternativa futura. O Traefik roda pelo Docker Compose com o profile `gateway` e roteia para a web e os servicos Go executando no host.
@@ -329,4 +386,5 @@ Os servicos Go seguem uma estrutura interna padronizada:
 | file-service         |         8083 | /healthz, /readyz, /version |
 | notification-service |         8084 | /healthz, /readyz, /version |
 | admin-service        |         8085 | /healthz, /readyz, /version |
+| search-service       |         8086 | /healthz, /readyz, /version |
 | media-service        |         8087 | /healthz, /readyz, /version |

@@ -1,24 +1,44 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
+	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/buildinfo"
 	"github.com/nicrepository/nchat/libs/go/platform/health"
+	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 )
 
-func NewHandler(serviceName string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+const readinessTimeout = time.Second
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(health.New(serviceName))
+func NewHandler(serviceName string) http.Handler {
+	info := buildinfo.Current()
+
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", httputil.MethodNotAllowed(http.MethodGet, health.LivenessHandler(serviceName, info.Version, info.Commit)))
+	mux.Handle("/readyz", httputil.MethodNotAllowed(http.MethodGet, health.ReadinessHandler(serviceName, info.Version, info.Commit, readinessChecks(), readinessTimeout)))
+	mux.Handle("/version", httputil.MethodNotAllowed(http.MethodGet, versionHandler(serviceName)))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	})
 
-	return mux
+	return httputil.Recover(httputil.RequestID(httputil.SecurityHeaders(mux)))
+}
+
+func versionHandler(serviceName string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		info := buildinfo.Current()
+		httputil.WriteJSON(w, http.StatusOK, map[string]string{
+			"service": serviceName,
+			"version": info.Version,
+			"commit":  info.Commit,
+		})
+	})
+}
+
+func readinessChecks() []health.Checker {
+	return []health.Checker{
+		health.NewStaticChecker("service-bootstrap", true, health.CheckPass, ""),
+		health.NewStaticChecker("config-loaded", true, health.CheckPass, ""),
+	}
 }

@@ -76,6 +76,7 @@ backend:
     - bash scripts/ci/go-fmt-check.sh
     - bash scripts/ci/go-vet.sh
     - bash scripts/ci/go-test.sh
+    - bash scripts/ci/health-contract-check.sh
     - bash scripts/ci/go-coverage-check.sh
     - bash scripts/ci/go-lint.sh
 
