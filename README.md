@@ -21,6 +21,16 @@ A stack atual está registrada no ADR-0002. Destaques:
 - Chamadas de áudio/vídeo (LiveKit) estão fora do MVP conforme requisitos v5.0; integram na V1.0.
 - Próximas decisões críticas serão registradas via ADR antes de serem implementadas.
 
+## Project tracking
+
+O cronograma macro do NChat está na planilha `Cronograma NChat.ods`. O controle operacional
+ocorre no **GitHub Project "NChat MVP — 17 Ago 2026"** (Project #2).
+
+- Cada tarefa do cronograma tem uma issue com prefixo `[TASK-XX]`.
+- PRs devem referenciar a issue com `Closes #N` ou `Refs #N`.
+- RFs são rastreados por épicos e tarefas — não individualmente como issues.
+- Detalhes: [docs/runbooks/task-gov-project-sync.md](docs/runbooks/task-gov-project-sync.md)
+
 ## Stack planejada
 
 - Frontend: React, TypeScript
