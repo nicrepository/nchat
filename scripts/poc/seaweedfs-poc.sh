@@ -218,10 +218,36 @@ echo "  upload_large_ms=${LATENCIES[upload_large_ms]:-N/A}  download_large_ms=${
 echo ""
 echo "--- TEST 4: Basic replication (replication=001) ---"
 
-ASSIGN_RESPONSE="$TMP_DIR/assign.json"
-REPLICATION_RESULT="limited"
+# Ensure seaweed-volume-2 is running — required for replication=001 to work.
+# The master blocks on dir/assign?replication=001 until enough volumes are available.
+echo "[INFO] Ensuring seaweed-volume-2 is running (profile seaweed-replication)..."
+"${COMPOSE_CMD[@]}" --profile seaweed-replication up -d seaweed-master seaweed-volume seaweed-volume-2 seaweed-filer
 
-if curl -sS --max-time 10 "${MASTER_URL}/dir/assign?replication=001" -o "$ASSIGN_RESPONSE"; then
+VOLUME2_URL="http://localhost:${SEAWEEDFS_VOLUME_2_HOST_PORT}/status"
+wait_http "$VOLUME2_URL" "seaweed-volume-2" 30
+
+# Wait for volume-2 to register with the master (it reports in cluster/status)
+echo "[WAIT] Waiting for seaweed-volume-2 to register with master..."
+REGISTERED=false
+for i in $(seq 1 20); do
+  DATA_NODES="$(curl -sf --max-time 3 "${MASTER_URL}/cluster/status" \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('DataNodes', d.get('Topology', {}).get('DataNodes', []))))" 2>/dev/null || echo "0")"
+  echo "  attempt $i: data nodes visible = ${DATA_NODES}"
+  if [ "${DATA_NODES:-0}" -ge 2 ] 2>/dev/null; then
+    REGISTERED=true
+    break
+  fi
+  sleep 3
+done
+
+if [ "$REGISTERED" = "false" ]; then
+  echo "[WARN] Only ${DATA_NODES:-0} data node(s) visible after wait; proceeding anyway"
+fi
+
+ASSIGN_RESPONSE="$TMP_DIR/assign.json"
+REPLICATION_RESULT="fail"
+
+if curl -sS --max-time 15 "${MASTER_URL}/dir/assign?replication=001" -o "$ASSIGN_RESPONSE"; then
   echo "  assign response: $(cat "$ASSIGN_RESPONSE")"
   FID="$(python3 -c "import json,sys; d=json.load(open('${ASSIGN_RESPONSE}')); print(d.get('fid',''))" 2>/dev/null || echo "")"
   VOL_URL="$(python3 -c "import json,sys; d=json.load(open('${ASSIGN_RESPONSE}')); print(d.get('url',''))" 2>/dev/null || echo "")"
@@ -237,41 +263,32 @@ if curl -sS --max-time 10 "${MASTER_URL}/dir/assign?replication=001" -o "$ASSIGN
     # Lookup volume locations
     if [ -n "$VID" ]; then
       LOOKUP_RESPONSE="$TMP_DIR/lookup.json"
+      # Give replication a moment to propagate
+      sleep 2
       curl -sS --max-time 10 "${MASTER_URL}/dir/lookup?volumeId=${VID}" -o "$LOOKUP_RESPONSE" || true
       echo "  lookup response: $(cat "$LOOKUP_RESPONSE" 2>/dev/null || echo 'N/A')"
 
-      LOCATIONS_COUNT="$(python3 - <<PYEOF2
+      LOCATIONS_COUNT="$(python3 -c "
 import json, sys
 try:
-    d = json.load(open("${LOOKUP_RESPONSE}"))
-    locs = d.get("locations", [])
+    d = json.load(open('${LOOKUP_RESPONSE}'))
+    locs = d.get('locations', [])
     print(len(locs))
-except Exception as e:
+except Exception:
     print(0)
-PYEOF2
-)"
+" 2>/dev/null || echo "0")"
       echo "  volume locations found: $LOCATIONS_COUNT"
 
       if [ "${LOCATIONS_COUNT:-0}" -ge 2 ]; then
         pass "replication_basic"
         REPLICATION_RESULT="pass"
       else
-        # Could be single volume if seaweed-volume-2 isn't running or not registered yet
-        VOL2_RUNNING="$(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" --profile seaweed-replication ps seaweed-volume-2 --format '{{.State}}' 2>/dev/null || echo "unknown")"
-        echo "  seaweed-volume-2 state: $VOL2_RUNNING"
-        if echo "$VOL2_RUNNING" | grep -qi "running"; then
-          fail "replication_basic" "volume-2 running but lookup returned only $LOCATIONS_COUNT location(s)"
-          REPLICATION_RESULT="fail"
-        else
-          RESULTS["replication_basic"]="LIMITED: seaweed-volume-2 not running; lookup returned $LOCATIONS_COUNT location(s)"
-          echo "[LIMITED] replication_basic — seaweed-volume-2 not running; start with profile seaweed-replication to test"
-          REPLICATION_RESULT="limited"
-        fi
+        fail "replication_basic" "lookup returned only $LOCATIONS_COUNT location(s) — expected >=2 with replication=001"
+        REPLICATION_RESULT="fail"
       fi
     else
-      RESULTS["replication_basic"]="LIMITED: could not parse volumeId from assign response"
-      echo "[LIMITED] replication_basic — could not parse volumeId"
-      REPLICATION_RESULT="limited"
+      fail "replication_basic" "could not parse volumeId from assign response"
+      REPLICATION_RESULT="fail"
     fi
   else
     fail "replication_basic" "assign response missing fid or url"
@@ -369,9 +386,8 @@ $(for k in "${!RESULTS[@]}"; do echo "        \"$k\": \"${RESULTS[$k]}\","; done
 $(for k in "${!LATENCIES[@]}"; do echo "        \"$k\": \"${LATENCIES[$k]}\","; done)
     },
     "replication_result": "${REPLICATION_RESULT}",
-    "overall_pass": $( [ "$OVERALL_PASS" = "true" ] && echo "true" || echo "false" )
+    "overall_pass": $( [ "$OVERALL_PASS" = "true" ] && echo "True" || echo "False" )
 }
-# Remove trailing commas inside dicts (simple approach: re-dump)
 with open("${METRICS_FILE}", "w") as f:
     json.dump(data, f, indent=2)
 print(f"Metrics written to ${METRICS_FILE}")

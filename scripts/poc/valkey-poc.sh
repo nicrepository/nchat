@@ -371,7 +371,7 @@ $(for k in "${!RESULTS[@]}"; do echo "        \"$k\": \"${RESULTS[$k]}\","; done
     "latencies_avg_ms": {
 $(for k in "${!LATENCIES[@]}"; do echo "        \"$k\": \"${LATENCIES[$k]}\","; done)
     },
-    "overall_pass": $( [ "$OVERALL_PASS" = "true" ] && echo "true" || echo "false" )
+    "overall_pass": $( [ "$OVERALL_PASS" = "true" ] && echo "True" || echo "False" )
 }
 with open("${METRICS_FILE}", "w") as f:
     json.dump(data, f, indent=2)
