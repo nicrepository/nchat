@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementado e validado localmente em `chore/task-014-health-readiness-checks`. PR pendente de abertura.
+Implementado e validado localmente em `chore/task-014-health-readiness-checks`. PR aberto: https://github.com/nicrepository/nchat/pull/37.
 
 ## Objetivo
 
@@ -127,4 +127,4 @@ Os manifests base foram revisados e ja usam:
 - [x] README atualizado
 - [x] Runbook criado
 - [x] make ci passa
-- [ ] PR aberto
+- [x] PR aberto
