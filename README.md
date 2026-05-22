@@ -447,3 +447,75 @@ make poc-config-check
 
 Valida scripts, sintaxe, configurações e .gitignore sem subir containers.
 Incluído automaticamente em `make ci`.
+
+## Observability
+
+NChat Go services expose Prometheus metrics at `/metrics` and send OpenTelemetry traces to Jaeger via OTLP HTTP. Observability is opt-in via environment variables.
+
+### Local stack
+
+Start the full observability stack (Prometheus, Grafana, Jaeger):
+
+```bash
+cp infra/compose/.env.dev.example infra/compose/.env.dev
+make dev-observability-up
+make dev-observability-status
+make dev-observability-validate
+```
+
+| Service    | URL                    | Purpose                    |
+| ---------- | ---------------------- | -------------------------- |
+| Prometheus | http://localhost:9090  | Metrics scraping and query |
+| Grafana    | http://localhost:3000  | Dashboards and datasources |
+| Jaeger     | http://localhost:16686 | Distributed traces UI      |
+
+Stop the stack (volumes are preserved):
+
+```bash
+make dev-observability-down
+```
+
+### Go service metrics
+
+All services expose `/metrics` (Prometheus text format). Enable HTTP instrumentation:
+
+```bash
+PROMETHEUS_METRICS_ENABLED=true go run ./cmd/<service>
+```
+
+Metrics emitted:
+
+| Metric                                | Type      | Labels                        |
+| ------------------------------------- | --------- | ----------------------------- |
+| `nchat_service_info`                  | Gauge     | service, version, commit, env |
+| `nchat_http_requests_total`           | Counter   | service, method, path, status |
+| `nchat_http_request_duration_seconds` | Histogram | service, method, path, status |
+| `nchat_http_in_flight_requests`       | Gauge     | service                       |
+
+### Go service tracing
+
+Enable OpenTelemetry traces (sent via OTLP HTTP to Jaeger):
+
+```bash
+OTEL_ENABLED=true \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+go run ./cmd/<service>
+```
+
+Services use span names `<METHOD> <path>` and record `http.method`, `http.route`, and `service.name` attributes. Authorization headers, Cookies, and request bodies are never recorded.
+
+### CI config check
+
+```bash
+make observability-config-check
+```
+
+Validates Prometheus config, Grafana datasources, Compose config and security properties — no containers started. Included automatically in `make ci`.
+
+### Dashboards
+
+Grafana datasources (Prometheus and Jaeger) are provisioned automatically. Dashboard definitions will be added in **TASK-19**.
+
+### Logs
+
+Centralised log aggregation (Loki or OpenSearch) will be added in a future task.

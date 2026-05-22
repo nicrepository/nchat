@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"strconv"
@@ -22,7 +23,9 @@ func main() {
 	}
 
 	application.Logger.Info("service starting", "port", cfg.Port)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("%s failed: %v", cfg.ServiceName, err)
+	serveErr := httpServer.ListenAndServe()
+	_ = application.TracingShutdown(context.Background())
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatalf("%s failed: %v", cfg.ServiceName, serveErr)
 	}
 }

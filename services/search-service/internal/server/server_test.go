@@ -168,3 +168,18 @@ func assertRFC3339(t *testing.T, value string) {
 		t.Fatalf("expected RFC3339 timestamp, got %q: %v", value, err)
 	}
 }
+
+func TestMetricsRouteReturns200(t *testing.T) {
+	handler := NewHandler("search-service")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	body := response.Body.String()
+	if body == "" {
+		t.Fatal("expected non-empty metrics body")
+	}
+}
