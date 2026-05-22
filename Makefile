@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate ci
+.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate ci
 
 help:
 	@echo "NChat development commands"
@@ -46,6 +46,7 @@ help:
 	@echo "  make poc-valkey     Run Valkey PoC (requires Docker)"
 	@echo "  make poc-config-check Validate PoC scripts and config (CI-safe)"
 	@echo "  make observability-config-check Validate observability config (CI-safe)"
+	@echo "  make grafana-dashboard-check Validate Grafana dashboard provisioning"
 	@echo "  make dev-observability-up    Start Prometheus, Grafana, Jaeger"
 	@echo "  make dev-observability-down  Stop observability stack"
 	@echo "  make dev-observability-status Show observability stack status"
@@ -227,6 +228,9 @@ poc-config-check:
 
 observability-config-check:
 	pnpm observability:config-check
+
+grafana-dashboard-check:
+	pnpm grafana:dashboard-check
 
 dev-observability-up:
 	pnpm dev:observability:up

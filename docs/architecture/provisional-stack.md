@@ -7,12 +7,12 @@ Este documento consolida a stack tecnológica do NChat após as validações do 
 **O que está confirmado:** Go + React monorepo, PostgreSQL 16, Valkey 8, Traefik (dev/k3s),
 Sealed Secrets, TLS 1.3 (dev/staging), GitHub Actions + GitLab CI, Kubernetes/k3s manifests
 com Kustomize, health/readiness em todos os serviços Go, observabilidade base local (Prometheus,
-Grafana, Jaeger, OpenTelemetry SDK — TASK-18).
+Grafana, Jaeger, OpenTelemetry SDK — TASK-18), dashboard inicial de observabilidade (TASK-19).
 
 **O que é provisório:** SeaweedFS como solução de armazenamento de arquivos. Aceito após PoC
 do Sprint 0, mas a decisão definitiva depende de validações mais completas no Sprint 3.
 
-**O que está planejado:** Dashboards Grafana detalhados (TASK-19), Loki ou OpenSearch para logs,
+**O que está planejado:** Loki ou OpenSearch para logs,
 ClamAV para antimalware, ArgoCD para GitOps, Dockerfiles e imagens reais.
 
 **O que está fora do MVP:** E2E com MLS RFC 9420, chamadas de áudio/vídeo (LiveKit + coturn),
@@ -78,13 +78,13 @@ Istio mTLS.
 
 ### Observabilidade
 
-| Componente     | Tecnologia             | Status                        | Observações                                       |
-| -------------- | ---------------------- | ----------------------------- | ------------------------------------------------- |
-| Métricas       | Prometheus + Grafana   | Base local / TASK-18 completo | Stack Docker Compose local; dashboards em TASK-19 |
-| Tracing        | OpenTelemetry + Jaeger | Base local / TASK-18 completo | OTLP HTTP; spans básicos por request HTTP         |
-| Instrumentação | OpenTelemetry SDK      | Implementado                  | Pacote `libs/go/platform/observability`; opt-in   |
-| /metrics       | Prometheus             | Implementado                  | Todos os serviços Go expõem `/metrics`            |
-| Logs           | Loki ou OpenSearch     | Planejado                     | Decisão adiada; tarefa futura                     |
+| Componente     | Tecnologia             | Status                         | Observações                                                    |
+| -------------- | ---------------------- | ------------------------------ | -------------------------------------------------------------- |
+| Métricas       | Prometheus + Grafana   | Base local + dashboard inicial | Stack Docker Compose local; NChat Overview dashboard (TASK-19) |
+| Tracing        | OpenTelemetry + Jaeger | Base local / TASK-18 completo  | OTLP HTTP; spans básicos por request HTTP                      |
+| Instrumentação | OpenTelemetry SDK      | Implementado                   | Pacote `libs/go/platform/observability`; opt-in                |
+| /metrics       | Prometheus             | Implementado                   | Todos os serviços Go expõem `/metrics`                         |
+| Logs           | Loki ou OpenSearch     | Planejado                      | Decisão adiada; tarefa futura                                  |
 
 ### Fora do MVP
 
@@ -105,20 +105,20 @@ Interno. Serão abordados em versões futuras:
 
 ## Matriz de maturidade
 
-| Componente       | Status     | Maturidade                   | Próxima validação                        |
-| ---------------- | ---------- | ---------------------------- | ---------------------------------------- |
-| Go services      | Confirmado | Base criada                  | Integração com dados (PG, Valkey, SeaWF) |
-| React web        | Confirmado | Bootstrap completo           | Design system / frontend shell           |
-| PostgreSQL       | Confirmado | Dev env provisionado         | Migrations e schema                      |
-| Valkey           | Confirmado | PoC completa Sprint 0        | Integração chat/notification             |
-| SeaweedFS        | Provisório | PoC inicial Sprint 0         | Sprint 3 — validação completa            |
-| Traefik          | Confirmado | Local/dev operacional        | Staging/prod hardening                   |
-| Sealed Secrets   | Confirmado | Estrutura operacional + CI   | Cluster real                             |
-| TLS              | Confirmado | Dev/staging configurado      | Produção + cert-manager                  |
-| CI/CD            | Confirmado | Workflows completos + checks | Deploy automático futuro                 |
-| Health/readiness | Confirmado | Todos os serviços            | Checks reais (PG, Valkey, SeaWF)         |
-| Observabilidade  | Planejado  | Não iniciado                 | Próxima tarefa                           |
-| ClamAV           | Planejado  | Não iniciado                 | Sprint 3                                 |
+| Componente       | Status     | Maturidade                     | Próxima validação                             |
+| ---------------- | ---------- | ------------------------------ | --------------------------------------------- |
+| Go services      | Confirmado | Base criada                    | Integração com dados (PG, Valkey, SeaWF)      |
+| React web        | Confirmado | Bootstrap completo             | Design system / frontend shell                |
+| PostgreSQL       | Confirmado | Dev env provisionado           | Migrations e schema                           |
+| Valkey           | Confirmado | PoC completa Sprint 0          | Integração chat/notification                  |
+| SeaweedFS        | Provisório | PoC inicial Sprint 0           | Sprint 3 — validação completa                 |
+| Traefik          | Confirmado | Local/dev operacional          | Staging/prod hardening                        |
+| Sealed Secrets   | Confirmado | Estrutura operacional + CI     | Cluster real                                  |
+| TLS              | Confirmado | Dev/staging configurado        | Produção + cert-manager                       |
+| CI/CD            | Confirmado | Workflows completos + checks   | Deploy automático futuro                      |
+| Health/readiness | Confirmado | Todos os serviços              | Checks reais (PG, Valkey, SeaWF)              |
+| Observabilidade  | Confirmado | Base local + dashboard inicial | Alertas, logs e dashboards de produto futuros |
+| ClamAV           | Planejado  | Não iniciado                   | Sprint 3                                      |
 
 ---
 
@@ -145,10 +145,9 @@ definidas sem um ADR explícito:
 
 Com base no Sprint 0 concluído e no cronograma do projeto:
 
-1. **Observabilidade (próxima tarefa):** configurar Prometheus, Grafana, Jaeger e
-   instrumentação OpenTelemetry nos serviços Go.
-2. **Dashboard inicial:** criar dashboard de métricas de saúde dos serviços.
-3. **Revisão semanal:** retrospectiva do Sprint 0 e planejamento do Sprint 1.
+1. **Alertas e Alertmanager:** configurar regras de alerta Prometheus e Alertmanager.
+2. **Logs centralizados:** decisão e configuração de Loki ou OpenSearch.
+3. **Revisão semanal:** retrospectiva e planejamento do próximo sprint.
 4. **Dockerfiles e GHCR:** quando o cronograma demandar ou for necessário para deploy.
 5. **Integração PostgreSQL:** migrations, schema e queries nos serviços Go.
 6. **Integração Valkey:** Pub/Sub e Streams no chat-service; rate limit no middleware.

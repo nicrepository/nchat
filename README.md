@@ -514,7 +514,31 @@ Validates Prometheus config, Grafana datasources, Compose config and security pr
 
 ### Dashboards
 
-Grafana datasources (Prometheus and Jaeger) are provisioned automatically. Dashboard definitions will be added in **TASK-19**.
+Grafana datasources (Prometheus and Jaeger) and the **NChat Overview** dashboard are provisioned
+automatically on startup.
+
+| Item      | Detail                                 |
+| --------- | -------------------------------------- |
+| Folder    | NChat                                  |
+| Dashboard | NChat Overview (`uid: nchat-overview`) |
+| URL       | http://localhost:3000                  |
+
+The initial dashboard covers:
+
+- **Service health** — `up` status and service inventory from `nchat_service_info`
+- **Traffic** — request rate per service and per HTTP status code
+- **Latency** — p50 / p95 / p99 histograms per service
+- **Errors** — 4xx and 5xx rates; 5xx error-ratio stat panel
+- **Concurrency** — in-flight requests per service
+- **Tracing** — link/instructions to open Jaeger at http://localhost:16686
+
+Validate dashboard provisioning files (no containers needed):
+
+```bash
+make grafana-dashboard-check
+```
+
+Alerts and product/business dashboards (MAU/DAU/storage) will be added in future tasks.
 
 ### Logs
 
