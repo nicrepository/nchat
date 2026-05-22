@@ -4,10 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 COMPOSE_FILE="$ROOT_DIR/infra/compose/compose.dev.yml"
 
-ENV_FILE="$ROOT_DIR/infra/compose/.env.dev"
-if [ ! -f "$ENV_FILE" ]; then
-  ENV_FILE="$ROOT_DIR/infra/compose/.env.dev.example"
-fi
+# shellcheck source=_observability_env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_observability_env.sh"
 
 PROMETHEUS_PORT="${PROMETHEUS_HOST_PORT:-9090}"
 GRAFANA_PORT="${GRAFANA_HOST_PORT:-3000}"

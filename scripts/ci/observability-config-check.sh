@@ -132,6 +132,26 @@ else
   echo "  [OK]   observability ports bound to 127.0.0.1"
 fi
 
+# Verify dev scripts use the shared env fallback helper.
+echo
+echo "--- Dev script env fallback ---"
+HELPER="$ROOT_DIR/scripts/dev/_observability_env.sh"
+if [ -f "$HELPER" ]; then
+  echo "  [OK]   _observability_env.sh helper exists"
+  for script in dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate; do
+    script_path="$ROOT_DIR/scripts/dev/${script}.sh"
+    if grep -q "_observability_env.sh" "$script_path" 2>/dev/null; then
+      echo "  [OK]   ${script}.sh sources helper"
+    else
+      echo "  [FAIL] ${script}.sh does not source _observability_env.sh" >&2
+      ERRORS=$((ERRORS + 1))
+    fi
+  done
+else
+  echo "  [FAIL] missing: $HELPER" >&2
+  ERRORS=$((ERRORS + 1))
+fi
+
 echo
 
 if [ "$ERRORS" -gt 0 ]; then
