@@ -33,6 +33,15 @@ require_file "$ENV_EXAMPLE"
 echo
 echo "--- Docker Compose config validation ---"
 if command -v docker > /dev/null 2>&1; then
+  COMPOSE_DIR="$(dirname "$COMPOSE_FILE")"
+  ENV_DEV="$COMPOSE_DIR/.env.dev"
+  TEMP_ENV_DEV=""
+  # If .env.dev doesn't exist (CI), create a temporary stub from .env.dev.example.
+  if [ ! -f "$ENV_DEV" ]; then
+    TEMP_ENV_DEV="$(mktemp)"
+    cp "$ENV_EXAMPLE" "$TEMP_ENV_DEV"
+    cp "$TEMP_ENV_DEV" "$ENV_DEV"
+  fi
   if docker compose \
     --env-file "$ENV_EXAMPLE" \
     -f "$COMPOSE_FILE" \
@@ -42,6 +51,10 @@ if command -v docker > /dev/null 2>&1; then
   else
     echo "  [FAIL] compose config invalid" >&2
     ERRORS=$((ERRORS + 1))
+  fi
+  # Clean up temp stub if we created one.
+  if [ -n "$TEMP_ENV_DEV" ]; then
+    rm -f "$ENV_DEV" "$TEMP_ENV_DEV"
   fi
 else
   echo "  [SKIP] docker not available"
