@@ -6,12 +6,13 @@ Este documento consolida a stack tecnológica do NChat após as validações do 
 
 **O que está confirmado:** Go + React monorepo, PostgreSQL 16, Valkey 8, Traefik (dev/k3s),
 Sealed Secrets, TLS 1.3 (dev/staging), GitHub Actions + GitLab CI, Kubernetes/k3s manifests
-com Kustomize, health/readiness em todos os serviços Go.
+com Kustomize, health/readiness em todos os serviços Go, observabilidade base local (Prometheus,
+Grafana, Jaeger, OpenTelemetry SDK — TASK-18).
 
 **O que é provisório:** SeaweedFS como solução de armazenamento de arquivos. Aceito após PoC
 do Sprint 0, mas a decisão definitiva depende de validações mais completas no Sprint 3.
 
-**O que está planejado:** Observabilidade (Prometheus, Grafana, Jaeger, Loki ou OpenSearch),
+**O que está planejado:** Dashboards Grafana detalhados (TASK-19), Loki ou OpenSearch para logs,
 ClamAV para antimalware, ArgoCD para GitOps, Dockerfiles e imagens reais.
 
 **O que está fora do MVP:** E2E com MLS RFC 9420, chamadas de áudio/vídeo (LiveKit + coturn),
@@ -77,12 +78,13 @@ Istio mTLS.
 
 ### Observabilidade
 
-| Componente     | Tecnologia             | Status    | Observações             |
-| -------------- | ---------------------- | --------- | ----------------------- |
-| Métricas       | Prometheus + Grafana   | Planejado | Próxima etapa           |
-| Tracing        | OpenTelemetry + Jaeger | Planejado | Próxima etapa           |
-| Logs           | Loki ou OpenSearch     | Planejado | Decisão adiada          |
-| Instrumentação | OpenTelemetry SDK      | Planejado | Integração futura em Go |
+| Componente     | Tecnologia             | Status                        | Observações                                       |
+| -------------- | ---------------------- | ----------------------------- | ------------------------------------------------- |
+| Métricas       | Prometheus + Grafana   | Base local / TASK-18 completo | Stack Docker Compose local; dashboards em TASK-19 |
+| Tracing        | OpenTelemetry + Jaeger | Base local / TASK-18 completo | OTLP HTTP; spans básicos por request HTTP         |
+| Instrumentação | OpenTelemetry SDK      | Implementado                  | Pacote `libs/go/platform/observability`; opt-in   |
+| /metrics       | Prometheus             | Implementado                  | Todos os serviços Go expõem `/metrics`            |
+| Logs           | Loki ou OpenSearch     | Planejado                     | Decisão adiada; tarefa futura                     |
 
 ### Fora do MVP
 

@@ -115,3 +115,12 @@ Sealed Secrets e obrigatorio para versionar secrets do MVP:
 5. Rodar scanners.
 6. Fazer merge via PR.
 7. Criar release/hotfix se necessario.
+
+## Observability
+
+- Observability must not collect secrets, credentials or personally identifiable information.
+- `Authorization`, `Cookie`, `Set-Cookie` headers, tokens and request bodies must never be recorded in metrics labels, span attributes or logs emitted by the observability middleware.
+- Metrics labels must avoid high cardinality and must not include raw URL paths with user IDs or other variable segments.
+- Grafana credentials in `infra/compose/.env.dev.example` are dev-only placeholders. Do not use them in staging or production. Real credentials must be stored in Sealed Secrets or the organisation secret manager.
+- The `/metrics` endpoint must be protected in staging and production (firewall, network policy, or authentication). In local dev it is only accessible on `127.0.0.1`.
+- Prometheus and Jaeger UI must not be exposed publicly. In local dev they bind to `127.0.0.1`. Kubernetes-level network policies will be added when deploying observability to k3s.

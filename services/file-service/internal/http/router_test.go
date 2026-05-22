@@ -181,3 +181,18 @@ func assertRFC3339(t *testing.T, value string) {
 func testConfig() config.Config {
 	return config.Config{ServiceName: "file-service", Env: "test", Port: 8083, ReadHeaderTimeoutSeconds: 5}
 }
+
+func TestMetricsRouteReturns200(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("file-service", "test"))
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	body := response.Body.String()
+	if body == "" {
+		t.Fatal("expected non-empty metrics body")
+	}
+}
