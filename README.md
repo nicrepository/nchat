@@ -543,3 +543,12 @@ Alerts and product/business dashboards (MAU/DAU/storage) will be added in future
 ### Logs
 
 Centralised log aggregation (Loki or OpenSearch) will be added in a future task.
+
+## Weekly reviews
+
+Weekly reviews consolidate deliveries, risks, decisions and recommended next steps.
+The GitHub Project remains the operational source of truth. ADRs record architectural decisions.
+
+| Review | Document                                                       |
+| ------ | -------------------------------------------------------------- |
+| Week 1 | [docs/reviews/week-1-review.md](docs/reviews/week-1-review.md) |
