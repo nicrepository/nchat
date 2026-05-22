@@ -12,18 +12,40 @@ GRAFANA_PORT="${GRAFANA_HOST_PORT:-3000}"
 JAEGER_PORT="${JAEGER_UI_HOST_PORT:-16686}"
 
 ERRORS=0
+_HEALTH_TMP="$(mktemp /tmp/nchat_obs_health_XXXXXX)"
+trap 'rm -f "$_HEALTH_TMP"' EXIT
 
-check_http() {
+# wait_for_http <name> <url> [timeout_seconds]
+# Polls <url> until HTTP 200, or fails after timeout.
+# Prints the last status code + first 200 chars of body on failure.
+wait_for_http() {
   local name="$1"
   local url="$2"
-  if curl -sf --max-time 5 "$url" > /dev/null 2>&1; then
-    echo "  [OK]   $name — $url"
-  else
-    echo "  [FAIL] $name — $url"
-    ERRORS=$((ERRORS + 1))
-  fi
+  local timeout="${3:-60}"
+  local interval=3
+  local elapsed=0
+  local http_status=""
+
+  while [ "$elapsed" -lt "$timeout" ]; do
+    http_status=$(curl -s -o "$_HEALTH_TMP" -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000")
+    if [ "$http_status" = "200" ]; then
+      echo "  [OK]   $name — $url  (ready in ${elapsed}s)"
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+
+  echo "  [FAIL] $name — $url  (timeout after ${timeout}s)" >&2
+  echo "         last HTTP status : $http_status" >&2
+  local body
+  body=$(head -c 200 "$_HEALTH_TMP" 2>/dev/null | tr -d '\n' || true)
+  [ -n "$body" ] && echo "         last body        : $body" >&2
+  return 1
 }
 
+# check_http_once <name> <url>
+# Single attempt, no retry. Used for Go services that may not be running.
 skip_http() {
   local name="$1"
   local url="$2"
@@ -37,10 +59,10 @@ skip_http() {
 echo "==> Validating observability stack..."
 echo
 
-echo "--- Core stack ---"
-check_http "Prometheus /-/ready"  "http://localhost:${PROMETHEUS_PORT}/-/ready"
-check_http "Grafana /api/health"  "http://localhost:${GRAFANA_PORT}/api/health"
-check_http "Jaeger /"             "http://localhost:${JAEGER_PORT}/"
+echo "--- Core stack (retrying up to 60s each) ---"
+wait_for_http "Prometheus /-/ready" "http://localhost:${PROMETHEUS_PORT}/-/ready" 60 || ERRORS=$((ERRORS + 1))
+wait_for_http "Grafana /api/health"  "http://localhost:${GRAFANA_PORT}/api/health"  60 || ERRORS=$((ERRORS + 1))
+wait_for_http "Jaeger /"             "http://localhost:${JAEGER_PORT}/"             60 || ERRORS=$((ERRORS + 1))
 
 echo
 echo "--- Go services (skipped if not running) ---"

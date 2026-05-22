@@ -78,5 +78,5 @@ _obs_export_ports() {
 _obs_export_ports "$EFFECTIVE_ENV_FILE"
 
 # Register cleanup of temp file on EXIT (safe even if already empty).
-_obs_cleanup() { [ -n "$TEMP_ENV_FILE" ] && rm -f "$TEMP_ENV_FILE"; }
+_obs_cleanup() { [ -n "$TEMP_ENV_FILE" ] && rm -f "$TEMP_ENV_FILE"; return 0; }
 trap _obs_cleanup EXIT

@@ -152,6 +152,17 @@ else
   ERRORS=$((ERRORS + 1))
 fi
 
+# Verify dev-observability-validate.sh contains retry/wait logic.
+echo
+echo "--- Validate script retry check ---"
+VALIDATE_SCRIPT="$ROOT_DIR/scripts/dev/dev-observability-validate.sh"
+if grep -q "wait_for_http" "$VALIDATE_SCRIPT" 2>/dev/null; then
+  echo "  [OK]   dev-observability-validate.sh contains wait_for_http retry logic"
+else
+  echo "  [FAIL] dev-observability-validate.sh is missing retry logic (wait_for_http)" >&2
+  ERRORS=$((ERRORS + 1))
+fi
+
 echo
 
 if [ "$ERRORS" -gt 0 ]; then
