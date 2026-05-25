@@ -79,6 +79,9 @@ jobs:
       - name: Check health contract
         run: pnpm health:contract-check
 
+      - name: Check migrations
+        run: pnpm migrations:check
+
       - name: Lint
         run: pnpm lint
 

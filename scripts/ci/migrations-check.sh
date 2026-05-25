@@ -67,16 +67,46 @@ echo
 
 # ---------------------------------------------------------------------------
 # 4. No plaintext token or password columns
-#    Rejects column definitions named: password, token, secret, api_key
-#    (token_hash, password_hash are fine)
+#    Rejects suspicious credential column names such as raw_token,
+#    password_raw, api_key, secret, or token columns without _hash.
 # ---------------------------------------------------------------------------
 echo "--- no plaintext token/password columns ---"
+is_plaintext_credential_column() {
+  local column="$1"
+
+  case "$column" in
+    *_hash)
+      return 1
+      ;;
+    token|*_token|token_*|*_token_*|raw_token|*_raw_token*)
+      return 0
+      ;;
+    secret|*_secret|secret_*|*_secret_*|api_key|*_api_key|api_key_*|*_api_key_*)
+      return 0
+      ;;
+    password|raw_password|password_raw|plain_password|password_plain|plaintext_password|password_plaintext|cleartext_password|password_cleartext|*_raw_password|*_password_raw|*_plain_password|*_password_plain|*_plaintext_password|*_password_plaintext|*_cleartext_password|*_password_cleartext)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
 for f in "${UP_FILES[@]}"; do
-  # Match lines that look like column definitions with forbidden names
-  # Allow: token_hash, password_hash, password_changed_at, password_expires_at, must_change_password
-  if grep -inE '^\s+(password|token|secret|api_key)\s' "$f" | grep -ivE '_hash|_at|must_change'; then
-    fail "possible plaintext credential column in: $(basename "$f")"
-  else
+  bad_columns=0
+
+  while IFS= read -r line; do
+    line="${line%%--*}"
+    if [[ "$line" =~ ^[[:space:]]*([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]+ ]]; then
+      column="${BASH_REMATCH[1],,}"
+      if is_plaintext_credential_column "$column"; then
+        fail "possible plaintext credential column in $(basename "$f"): $column"
+        bad_columns=$((bad_columns + 1))
+      fi
+    fi
+  done <"$f"
+
+  if [ "$bad_columns" -eq 0 ]; then
     ok "no plaintext credentials: $(basename "$f")"
   fi
 done

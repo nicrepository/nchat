@@ -1,20 +1,21 @@
 # Auth Service — Data Model
 
 Migration: `migrations/auth/000001_auth_identity_schema`
+Schema: `auth`
 
 ## Table summary
 
 ```
-users
-├── user_password_credentials  (1:1, CASCADE delete)
-├── user_invites               (invited_by / accepted_by, SET NULL on user delete)
-├── user_sessions              (CASCADE delete)
-│   └── user_devices           (SET NULL on device delete)
-├── user_devices               (CASCADE delete)
-├── login_attempts             (SET NULL on user delete)
-└── password_reset_tokens      (CASCADE delete)
+auth.users
+├── auth.user_password_credentials  (1:1, CASCADE delete)
+├── auth.user_invites               (invited_by / accepted_by, SET NULL on user delete)
+├── auth.user_sessions              (CASCADE delete; device must belong to same user)
+│   └── auth.user_devices           (SET NULL on device delete)
+├── auth.user_devices               (CASCADE delete)
+├── auth.login_attempts             (SET NULL on user delete)
+└── auth.password_reset_tokens      (CASCADE delete)
 
-auth_policy_settings           (singleton, no FK)
+auth.auth_policy_settings           (singleton, no FK)
 ```
 
 ## Schema reference
@@ -30,7 +31,7 @@ auth_policy_settings           (singleton, no FK)
 | avatar_url              | text        | Optional, PII                                   |
 | status                  | text        | active / invited / suspended / locked / deleted |
 | auth_source             | text        | manual / oidc / imported                        |
-| external_subject        | text        | OIDC sub claim (RF-44)                          |
+| external_subject        | text        | Required and unique for OIDC users (RF-44)      |
 | email_verified_at       | timestamptz |                                                 |
 | last_login_at           | timestamptz |                                                 |
 | deleted_at              | timestamptz | Soft delete (RF-55)                             |
@@ -62,16 +63,16 @@ auth_policy_settings           (singleton, no FK)
 
 ### user_sessions
 
-| Column                      | Type        | Notes                          |
-| --------------------------- | ----------- | ------------------------------ |
-| id                          | uuid        | PK                             |
-| user_id                     | uuid        | FK → users (CASCADE)           |
-| device_id                   | uuid        | FK → user_devices (SET NULL)   |
-| refresh_token_hash          | text        | Unique; raw token never stored |
-| ip_address                  | inet        |                                |
-| idle_expires_at             | timestamptz | RF-51                          |
-| absolute_expires_at         | timestamptz | RF-51                          |
-| revoked_at / revoked_reason |             |                                |
+| Column                      | Type        | Notes                              |
+| --------------------------- | ----------- | ---------------------------------- |
+| id                          | uuid        | PK                                 |
+| user_id                     | uuid        | FK → users (CASCADE)               |
+| device_id                   | uuid        | FK → same user's device (SET NULL) |
+| refresh_token_hash          | text        | Unique; raw token never stored     |
+| ip_address                  | inet        |                                    |
+| idle_expires_at             | timestamptz | RF-51                              |
+| absolute_expires_at         | timestamptz | RF-51                              |
+| revoked_at / revoked_reason |             |                                    |
 
 ### user_devices
 
@@ -122,11 +123,11 @@ auth_policy_settings           (singleton, no FK)
 
 | Index                               | Columns                    | Rationale                    |
 | ----------------------------------- | -------------------------- | ---------------------------- |
-| idx_users_email                     | email                      | Login lookup                 |
 | idx_users_status                    | status                     | Filter active/suspended      |
 | idx_users_deleted_at                | deleted_at                 | Soft-delete filter           |
+| idx_users_oidc_subject_unique       | external_subject           | OIDC identity uniqueness     |
 | idx_user_sessions_user_revoked      | (user_id, revoked_at)      | Active-session list per user |
-| idx_user_sessions_id_revoked        | (id, revoked_at)           | Token validation             |
+| idx_user_sessions_user_device       | (user_id, device_id)       | Session-device FK checks     |
 | idx_user_devices_user_revoked       | (user_id, revoked_at)      | Device list per user         |
 | idx_user_invites_email_status       | (email, status)            | Pending invite lookup        |
 | idx_login_attempts_email_time       | (email, created_at DESC)   | Brute-force detection        |
@@ -144,15 +145,18 @@ auth_policy_settings           (singleton, no FK)
 3. **inet for IP**: native PostgreSQL type; supports IPv4/IPv6; avoids injection
    via string parsing.
 
-4. **Cascade strategy**: sensitive child data (sessions, devices, credentials,
+4. **Schema namespace**: auth tables are created in the existing `auth` schema,
+   not in `public`.
+
+5. **Cascade strategy**: sensitive child data (sessions, devices, credentials,
    reset tokens) cascade on user delete. Audit data (login_attempts) and
    relational references (invites) use SET NULL to preserve audit trail.
 
-5. **Soft delete first (RF-55)**: `deleted_at` + `status = 'deleted'`. Hard
+6. **Soft delete first (RF-55)**: `deleted_at` + `status = 'deleted'`. Hard
    delete deferred to V1.0 (RF-56); FK cascades are already correct for it.
 
 ## V1.0 hard delete note (RF-56)
 
 No schema changes are needed. The existing `ON DELETE CASCADE` constraints on
-`user_id` foreign keys ensure a `DELETE FROM users WHERE id = $1` propagates
+`user_id` foreign keys ensure a `DELETE FROM auth.users WHERE id = $1` propagates
 correctly. Hard-delete implementation requires only application-layer code in V1.0.

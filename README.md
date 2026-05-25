@@ -416,8 +416,9 @@ Os servicos Go seguem uma estrutura interna padronizada:
 
 ## Auth data model
 
-The initial PostgreSQL identity schema for `auth-service` covers users, credentials,
-invites, sessions, devices, login attempts, password reset tokens, and policy settings.
+The initial PostgreSQL identity schema for `auth-service` creates the `auth` schema
+model for users, credentials, invites, sessions, devices, login attempts, password reset
+tokens, and policy settings.
 
 - Architecture: [docs/architecture/auth-data-model.md](docs/architecture/auth-data-model.md)
 - Runbook: [docs/runbooks/task-21-auth-postgres-models.md](docs/runbooks/task-21-auth-postgres-models.md)
