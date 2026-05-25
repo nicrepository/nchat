@@ -414,6 +414,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 | search-service       |         8086 | /healthz, /readyz, /version |
 | media-service        |         8087 | /healthz, /readyz, /version |
 
+## Auth data model
+
+The initial PostgreSQL identity schema for `auth-service` covers users, credentials,
+invites, sessions, devices, login attempts, password reset tokens, and policy settings.
+
+- Architecture: [docs/architecture/auth-data-model.md](docs/architecture/auth-data-model.md)
+- Runbook: [docs/runbooks/task-21-auth-postgres-models.md](docs/runbooks/task-21-auth-postgres-models.md)
+- Migration: `migrations/auth/000001_auth_identity_schema.{up,down}.sql`
+
 ## Local infrastructure PoCs
 
 > PoCs locais não são benchmark final de produção. Resultados servem para decisão técnica incremental.
