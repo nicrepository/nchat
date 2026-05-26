@@ -27,21 +27,40 @@ func New(cfg config.Config) *App {
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
 
 	var users service.UserCreator
+	var auth service.AuthSessionManager
+	var pool storage.Pool
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
 		defer cancel()
-		pool, err := storage.OpenDB(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
+		openedPool, err := storage.OpenDB(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
 		if err != nil {
-			logger.Warn("database unavailable; admin endpoint disabled", "reason", "open_db_failed")
+			logger.Warn("database unavailable; auth database endpoints disabled", "reason", "open_db_failed")
 		} else {
+			pool = openedPool
 			users = service.NewUserService(storage.NewPGXUserStore(pool))
 		}
+	}
+
+	tokens, err := service.NewTokenManager(service.TokenConfig{
+		HMACSecret: cfg.AuthJWTHMACSecret,
+		Issuer:     cfg.AuthJWTIssuer,
+		Audience:   cfg.AuthJWTAudience,
+		AccessTTL:  time.Duration(cfg.AuthAccessTokenTTLSeconds) * time.Second,
+		RefreshTTL: time.Duration(cfg.AuthRefreshTokenTTLSeconds) * time.Second,
+	})
+	switch {
+	case err != nil:
+		logger.Warn("auth token endpoints disabled", "reason", "invalid_jwt_config")
+	case pool == nil:
+		logger.Warn("auth token endpoints disabled", "reason", "database_not_configured")
+	default:
+		auth = service.NewAuthService(tokens, storage.NewPGXSessionStore(pool))
 	}
 
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth),
 		TracingShutdown: shutdown,
 	}
 }

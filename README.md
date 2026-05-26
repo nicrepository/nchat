@@ -404,15 +404,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service              | Default port | Current endpoints           |
-| -------------------- | -----------: | --------------------------- |
-| auth-service         |         8081 | /healthz, /readyz, /version |
-| chat-service         |         8082 | /healthz, /readyz, /version |
-| file-service         |         8083 | /healthz, /readyz, /version |
-| notification-service |         8084 | /healthz, /readyz, /version |
-| admin-service        |         8085 | /healthz, /readyz, /version |
-| search-service       |         8086 | /healthz, /readyz, /version |
-| media-service        |         8087 | /healthz, /readyz, /version |
+| Service              | Default port | Current endpoints                                        |
+| -------------------- | -----------: | -------------------------------------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version, /auth/refresh, /auth/logout |
+| chat-service         |         8082 | /healthz, /readyz, /version                              |
+| file-service         |         8083 | /healthz, /readyz, /version                              |
+| notification-service |         8084 | /healthz, /readyz, /version                              |
+| admin-service        |         8085 | /healthz, /readyz, /version                              |
+| search-service       |         8086 | /healthz, /readyz, /version                              |
+| media-service        |         8087 | /healthz, /readyz, /version                              |
 
 ## Auth data model
 
@@ -432,6 +432,19 @@ tokens, and policy settings.
 - Endpoint: `POST /admin/users` (auth-service, port 8081)
 - Guard: `X-NChat-Admin-Token` header (temporary bootstrap token, not final RBAC)
 - Runbook: [docs/runbooks/task-23-admin-manual-user-create.md](docs/runbooks/task-23-admin-manual-user-create.md)
+
+## JWT access and refresh tokens
+
+`POST /auth/refresh` issues a short-lived HS256 JWT access token and rotates an opaque
+refresh token stored as an HMAC-SHA-256 hash in `auth.user_sessions`. `POST /auth/logout`
+revokes a refresh token by marking its session revoked.
+
+- Endpoints: `POST /auth/refresh`, `POST /auth/logout` (auth-service, port 8081)
+- Access token TTL: `AUTH_ACCESS_TOKEN_TTL_SECONDS` (default `900`)
+- Refresh token TTL: `AUTH_REFRESH_TOKEN_TTL_SECONDS` (default `2592000`)
+- Secret: `AUTH_JWT_HMAC_SECRET` is required, has no default, and must be at least 32 bytes
+- Runbook: [docs/runbooks/task-jwt-access-refresh.md](docs/runbooks/task-jwt-access-refresh.md)
+- Out of scope: login, OAuth/OIDC, RBAC, and frontend auth flows
 
 ## Database migrations
 

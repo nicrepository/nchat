@@ -7,3 +7,5 @@ var (
 	ErrPasswordPolicy = errors.New("password does not meet policy requirements")
 	ErrInvalidInput   = errors.New("invalid input")
 )
+
+var ErrInvalidRefreshToken = errors.New("invalid refresh token")
