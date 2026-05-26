@@ -28,12 +28,12 @@ func TestNewCreatesApp(t *testing.T) {
 func TestNewWithUnreachableDB_DisablesAdminEndpoint(t *testing.T) {
 	// Port 9 is discard protocol — connections are refused immediately.
 	cfg := config.Config{
-		ServiceName:             "auth-service",
-		Env:                     "test",
-		Port:                    8081,
+		ServiceName:              "auth-service",
+		Env:                      "test",
+		Port:                     8081,
 		ReadHeaderTimeoutSeconds: 5,
-		DatabaseURL:             "postgres://nchat:pass@localhost:9/nonexistent?sslmode=disable",
-		DBConnectTimeoutSeconds: 1,
+		DatabaseURL:              "postgres://nchat:pass@localhost:9/nonexistent?sslmode=disable",
+		DBConnectTimeoutSeconds:  1,
 	}
 
 	app := New(cfg)
