@@ -108,6 +108,98 @@ func TestPGXUserStore_CreateUser_Success(t *testing.T) {
 	}
 }
 
+func TestPGXUserStore_CreateUser_WithFullName(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	userID := "550e8400-e29b-41d4-a716-446655440001"
+	now := time.Now()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO auth\.users`).
+		WithArgs("user@example.com", "User Name", "Full Name").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "full_name", "status", "auth_source",
+			"email_verified_at", "created_at", "updated_at",
+		}).AddRow(userID, "user@example.com", "User Name", "Full Name", "active", "manual", now, now, now))
+	mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).
+		WithArgs(userID, "hash", false).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXUserStore(mock)
+	input := domain.CreateUserInput{
+		Email: "user@example.com", DisplayName: "User Name", FullName: "Full Name",
+	}
+	user, err := store.CreateUser(context.Background(), input, "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if user.FullName != "Full Name" {
+		t.Fatalf("expected 'Full Name', got %q", user.FullName)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXUserStore_CreateUser_CredentialInsertError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	userID := "550e8400-e29b-41d4-a716-446655440002"
+	now := time.Now()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO auth\.users`).
+		WithArgs("user@example.com", "User", nil).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "full_name", "status", "auth_source",
+			"email_verified_at", "created_at", "updated_at",
+		}).AddRow(userID, "user@example.com", "User", "", "active", "manual", now, now, now))
+	mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).
+		WithArgs(userID, "hash", false).
+		WillReturnError(errors.New("credential insert failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXUserStore(mock)
+	input := domain.CreateUserInput{Email: "user@example.com", DisplayName: "User"}
+	_, err = store.CreateUser(context.Background(), input, "hash")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXUserStore_CreateUser_BeginTxError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin().WillReturnError(errors.New("begin tx failed"))
+
+	store := storage.NewPGXUserStore(mock)
+	input := domain.CreateUserInput{Email: "user@example.com", DisplayName: "User"}
+	_, err = store.CreateUser(context.Background(), input, "hash")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestPGXUserStore_CreateUser_DuplicateEmail(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
