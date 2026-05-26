@@ -15,6 +15,7 @@ policy stored in `auth.auth_policy_settings`.
 - Invite flow
 - Frontend admin UI
 - Full RBAC (see temporary guard below)
+- Brute-force/rate-limit controls for the bootstrap token (gap documented below)
 
 ## Endpoint
 
@@ -76,6 +77,7 @@ Error responses:
 `X-NChat-Admin-Token` is a **dev/bootstrap-only** mechanism. It is NOT final RBAC.
 Replace with proper auth middleware before production.
 The token is never logged by the service.
+Brute-force/rate-limit controls are not implemented in this task; keep the endpoint behind trusted access, use a high-entropy bootstrap token, and add rate limiting with the final auth middleware before production exposure.
 
 ## Running locally
 
@@ -87,7 +89,7 @@ make dev-env-up
 make migrations-up
 
 # Run auth-service with required env
-export DATABASE_URL="postgres://nchat:nchat@localhost:5432/nchat?sslmode=disable"
+export DATABASE_URL="postgres://nchat:nchat_dev_password_change_me@localhost:5432/nchat?sslmode=disable"
 export ADMIN_BOOTSTRAP_TOKEN="replace-with-secure-token"
 cd services/auth-service && go run ./cmd/auth-service/
 
