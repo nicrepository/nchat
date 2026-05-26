@@ -424,6 +424,32 @@ tokens, and policy settings.
 - Runbook: [docs/runbooks/task-21-auth-postgres-models.md](docs/runbooks/task-21-auth-postgres-models.md)
 - Migration: `migrations/auth/000001_auth_identity_schema.{up,down}.sql`
 
+## Database migrations
+
+Plain SQL migrations managed by a `psql`-based runner (no external tools required).
+
+```bash
+# Static validation — no database needed (runs in CI)
+make migrations-check
+
+# Apply all pending migrations (requires local DB)
+make dev-env-up
+make migrations-up
+
+# Show migration status
+make migrations-status
+
+# Roll back last migration
+make migrations-down
+
+# End-to-end smoke test (apply → verify → rollback)
+make migrations-smoke
+```
+
+- Convention: `migrations/<domain>/NNNNNN_<name>.(up|down).sql`
+- Architecture: [docs/architecture/database-migrations.md](docs/architecture/database-migrations.md)
+- Runbook: [docs/runbooks/task-22-initial-migrations.md](docs/runbooks/task-22-initial-migrations.md)
+
 ## Local infrastructure PoCs
 
 > PoCs locais não são benchmark final de produção. Resultados servem para decisão técnica incremental.

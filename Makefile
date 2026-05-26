@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate ci
+.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-up migrations-down migrations-status migrations-reset migrations-smoke dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate ci
 
 help:
 	@echo "NChat development commands"
@@ -48,6 +48,11 @@ help:
 	@echo "  make observability-config-check Validate observability config (CI-safe)"
 	@echo "  make grafana-dashboard-check Validate Grafana dashboard provisioning"
 	@echo "  make migrations-check        Validate SQL migration files (no DB required)"
+	@echo "  make migrations-up           Apply all pending migrations (requires DB)"
+	@echo "  make migrations-down         Roll back last migration (requires DB)"
+	@echo "  make migrations-status       Show migration status (requires DB)"
+	@echo "  make migrations-reset        Roll back all migrations interactively (requires DB)"
+	@echo "  make migrations-smoke        Run migration smoke test (requires Docker Compose)"
 	@echo "  make dev-observability-up    Start Prometheus, Grafana, Jaeger"
 	@echo "  make dev-observability-down  Stop observability stack"
 	@echo "  make dev-observability-status Show observability stack status"
@@ -235,6 +240,21 @@ grafana-dashboard-check:
 
 migrations-check:
 	pnpm migrations:check
+
+migrations-up:
+	pnpm migrations:up
+
+migrations-down:
+	pnpm migrations:down
+
+migrations-status:
+	pnpm migrations:status
+
+migrations-reset:
+	pnpm migrations:reset
+
+migrations-smoke:
+	pnpm migrations:smoke
 
 dev-observability-up:
 	pnpm dev:observability:up

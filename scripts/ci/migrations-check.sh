@@ -142,6 +142,68 @@ done
 echo
 
 # ---------------------------------------------------------------------------
+# 7. Down migrations must not DROP EXTENSION
+#    Extensions are database-wide; dropping them would break other schemas.
+# ---------------------------------------------------------------------------
+echo "--- down migrations do not DROP EXTENSION ---"
+for up in "${UP_FILES[@]}"; do
+  down="${up/.up.sql/.down.sql}"
+  [ -f "$down" ] || continue
+  if grep -qiE "DROP[[:space:]]+EXTENSION" "$down"; then
+    fail "down migration must not DROP EXTENSION (database-wide side effect): $(basename "$down")"
+  else
+    ok "no DROP EXTENSION: $(basename "$down")"
+  fi
+done
+echo
+
+# ---------------------------------------------------------------------------
+# 8. CREATE TABLE must be schema-qualified
+#    Allowlisted: schema_migrations (lives in public by design)
+# ---------------------------------------------------------------------------
+echo "--- CREATE TABLE schema qualification ---"
+schema_qual_ok=true
+for f in "${UP_FILES[@]}"; do
+  while IFS= read -r line; do
+    clean="${line%%--*}"
+    echo "$clean" | grep -qiE "CREATE[[:space:]]+TABLE[[:space:]]" || continue
+    # Extract the table name token (last word before whitespace/paren)
+    tname=$(echo "$clean" \
+      | grep -oiE "CREATE[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[a-zA-Z_][a-zA-Z0-9_.]*" \
+      | grep -oiE "[a-zA-Z_][a-zA-Z0-9_.]*$" \
+      | head -1)
+    [ -z "$tname" ] && continue
+    if echo "$tname" | grep -q '\.'; then
+      continue  # schema-qualified
+    fi
+    case "${tname}" in
+      schema_migrations) ;;  # allowlisted: public.schema_migrations
+      *)
+        fail "unqualified CREATE TABLE '$tname' in $(basename "$f") — use schema.tablename"
+        schema_qual_ok=false
+        ;;
+    esac
+  done < "$f"
+done
+$schema_qual_ok && ok "all CREATE TABLE statements are schema-qualified"
+echo
+
+# ---------------------------------------------------------------------------
+# 9. Auth domain migrations must reference auth. schema
+# ---------------------------------------------------------------------------
+echo "--- auth domain schema consistency ---"
+for f in "${UP_FILES[@]}"; do
+  domain_dir="$(basename "$(dirname "$f")")"
+  [ "$domain_dir" = "auth" ] || continue
+  if grep -qi "auth\." "$f"; then
+    ok "references auth. schema: $(basename "$f")"
+  else
+    fail "auth domain migration does not reference auth. schema: $(basename "$f")"
+  fi
+done
+echo
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 if [ "$ERRORS" -gt 0 ]; then
