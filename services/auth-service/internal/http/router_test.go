@@ -14,7 +14,7 @@ import (
 )
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -43,7 +43,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -71,7 +71,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -89,7 +89,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
 
 	tests := []struct {
 		name   string
@@ -183,7 +183,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -194,5 +194,24 @@ func TestMetricsRouteReturns200(t *testing.T) {
 	body := response.Body.String()
 	if body == "" {
 		t.Fatal("expected non-empty metrics body")
+	}
+}
+
+func TestAdminUsersDisabledWithNoToken(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, RouteAdminUsers, nil))
+	// testConfig has no ADMIN_BOOTSTRAP_TOKEN => 503
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+}
+
+func TestAdminUsersMethodNotAllowed(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAdminUsers, nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", rec.Code)
 	}
 }

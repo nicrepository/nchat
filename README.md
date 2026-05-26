@@ -424,6 +424,15 @@ tokens, and policy settings.
 - Runbook: [docs/runbooks/task-21-auth-postgres-models.md](docs/runbooks/task-21-auth-postgres-models.md)
 - Migration: `migrations/auth/000001_auth_identity_schema.{up,down}.sql`
 
+## Admin user creation
+
+`POST /admin/users` allows an admin to create a manual user with an Argon2id-hashed password.
+
+- Implements: RF-45 (cadastro manual pelo admin)
+- Endpoint: `POST /admin/users` (auth-service, port 8081)
+- Guard: `X-NChat-Admin-Token` header (temporary bootstrap token, not final RBAC)
+- Runbook: [docs/runbooks/task-23-admin-manual-user-create.md](docs/runbooks/task-23-admin-manual-user-create.md)
+
 ## Database migrations
 
 Plain SQL migrations managed by a `psql`-based runner (no external tools required).

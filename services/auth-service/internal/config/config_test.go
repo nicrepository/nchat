@@ -32,3 +32,40 @@ func TestLoadUsesEnvironmentOverrides(t *testing.T) {
 		t.Fatalf("expected port 18081, got %d", cfg.Port)
 	}
 }
+
+func TestLoadDatabaseURLDefault(t *testing.T) {
+	cfg := Load()
+	if cfg.DatabaseURL != "" {
+		t.Fatalf("expected empty DatabaseURL, got %q", cfg.DatabaseURL)
+	}
+}
+
+func TestLoadDatabaseURLFromEnv(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://nchat:pass@localhost/nchat")
+	cfg := Load()
+	if cfg.DatabaseURL != "postgres://nchat:pass@localhost/nchat" { //nolint:gosec
+		t.Fatalf("unexpected DatabaseURL %q", cfg.DatabaseURL)
+	}
+}
+
+func TestLoadDBConnectTimeoutDefault(t *testing.T) {
+	cfg := Load()
+	if cfg.DBConnectTimeoutSeconds != 5 {
+		t.Fatalf("expected 5, got %d", cfg.DBConnectTimeoutSeconds)
+	}
+}
+
+func TestLoadAdminBootstrapTokenDefault(t *testing.T) {
+	cfg := Load()
+	if cfg.AdminBootstrapToken != "" {
+		t.Fatalf("expected empty AdminBootstrapToken, got %q", cfg.AdminBootstrapToken)
+	}
+}
+
+func TestLoadAdminBootstrapTokenFromEnv(t *testing.T) {
+	t.Setenv("ADMIN_BOOTSTRAP_TOKEN", "super-secret")
+	cfg := Load()
+	if cfg.AdminBootstrapToken != "super-secret" {
+		t.Fatalf("unexpected AdminBootstrapToken %q", cfg.AdminBootstrapToken)
+	}
+}
