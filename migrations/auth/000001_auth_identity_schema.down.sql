@@ -5,6 +5,8 @@
 
 BEGIN;
 
+SET LOCAL search_path = auth, public;
+
 DROP TABLE IF EXISTS auth.auth_policy_settings;
 DROP TABLE IF EXISTS auth.password_reset_tokens;
 DROP TABLE IF EXISTS auth.login_attempts;

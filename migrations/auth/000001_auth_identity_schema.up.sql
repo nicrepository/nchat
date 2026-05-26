@@ -13,13 +13,14 @@
 BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS auth;
+SET LOCAL search_path = auth, public;
 
 -- ---------------------------------------------------------------------------
 -- Extensions
 -- ---------------------------------------------------------------------------
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA public;
 
 -- ---------------------------------------------------------------------------
 -- users

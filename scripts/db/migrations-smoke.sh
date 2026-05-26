@@ -35,7 +35,7 @@ PGPORT="5432"
 PGDATABASE="nchat"
 PGUSER="nchat"
 
-while IFS= read -r line; do
+while IFS= read -r line || [[ -n "$line" ]]; do
   [[ "$line" =~ ^[[:space:]]*# ]] && continue
   [[ "$line" =~ ^POSTGRES_ ]] || continue
   key="${line%%=*}"
@@ -98,11 +98,10 @@ echo "--- verify auth tables ---"
 for tbl in \
   "auth.users" \
   "auth.user_password_credentials" \
-  "auth.user_oidc_identities" \
-  "auth.user_invitations" \
+  "auth.user_invites" \
   "auth.user_sessions" \
   "auth.user_devices" \
-  "auth.login_attempt_logs" \
+  "auth.login_attempts" \
   "auth.password_reset_tokens" \
   "auth.auth_policy_settings"; do
   if table_exists "$tbl"; then
@@ -137,11 +136,10 @@ if [[ "$applied_this_run" -gt 0 ]]; then
   for tbl in \
     "auth.users" \
     "auth.user_password_credentials" \
-    "auth.user_oidc_identities" \
-    "auth.user_invitations" \
+    "auth.user_invites" \
     "auth.user_sessions" \
     "auth.user_devices" \
-    "auth.login_attempt_logs" \
+    "auth.login_attempts" \
     "auth.password_reset_tokens" \
     "auth.auth_policy_settings"; do
     if ! table_exists "$tbl"; then

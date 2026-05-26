@@ -58,25 +58,31 @@ cross-domain dependencies must be avoided; use separate PRs if needed.
 
 ```sql
 CREATE TABLE public.schema_migrations (
-  id         SERIAL PRIMARY KEY,
-  domain     TEXT        NOT NULL,
-  filename   TEXT        NOT NULL,    -- e.g. "000001_auth_identity_schema"
-  applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  id              SERIAL PRIMARY KEY,
+  domain          TEXT        NOT NULL,
+  filename        TEXT        NOT NULL,    -- e.g. "000001_auth_identity_schema"
+  checksum_sha256 TEXT        NOT NULL,
+  dirty           BOOLEAN     NOT NULL DEFAULT false,
+  in_progress     BOOLEAN     NOT NULL DEFAULT false,
+  applied_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT schema_migrations_uq UNIQUE (domain, filename)
 );
 ```
 
 The table lives in `public` so it is accessible regardless of which schemas
-have been migrated. It is never included in application auth logic.
+have been migrated. It is never included in application auth logic. Checksums
+prevent silent migration edits, while dirty/in-progress flags stop later runs
+after interrupted apply or rollback attempts until manual repair is performed.
 
 ## Schema map
 
-| Domain          | PostgreSQL schema | Service                 |
-| --------------- | ----------------- | ----------------------- |
-| `auth`          | `auth`            | auth-service            |
-| `chat`          | `chat`            | chat-service (planned)  |
-| `files`         | `files`           | media-service (planned) |
-| `notifications` | `notifications`   | notif-service (planned) |
+| Domain          | PostgreSQL schema | Service                                                   |
+| --------------- | ----------------- | --------------------------------------------------------- |
+| `auth`          | `auth`            | auth-service data model only; service integration planned |
+| `chat`          | `chat`            | chat-service (planned)                                    |
+| `files`         | `files`           | media-service (planned)                                   |
+| `notifications` | `notifications`   | notif-service (planned)                                   |
 
 ## Tooling
 
@@ -103,7 +109,7 @@ Target: **PostgreSQL 16**. Migrations use:
 
 1. Determine the next version number for the domain.
 2. Create `migrations/<domain>/NNNNNN_<name>.up.sql` and `.down.sql`.
-3. Wrap SQL in `BEGIN; ... COMMIT;`.
+3. Wrap SQL in `BEGIN; ... COMMIT;` and set an explicit transaction-local `search_path` when the migration relies on schema lookup.
 4. Run `pnpm migrations:check` to validate offline.
 5. Run `pnpm migrations:up` against a local DB to verify execution.
 6. Open a PR; CI runs `migrations:check` automatically.

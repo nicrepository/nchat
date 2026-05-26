@@ -436,13 +436,13 @@ make migrations-check
 make dev-env-up
 make migrations-up
 
-# Show migration status
+# Show migration status (requires local DB)
 make migrations-status
 
-# Roll back last migration
+# Roll back last migration (requires local DB; destructive for the last migration)
 make migrations-down
 
-# End-to-end smoke test (apply → verify → rollback)
+# End-to-end smoke test (requires Docker/PostgreSQL; not CI-blocking)
 make migrations-smoke
 ```
 
