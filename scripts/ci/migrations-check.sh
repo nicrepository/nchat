@@ -22,12 +22,12 @@ validate_domain_name() {
 }
 
 trim_sql_token() {
-  local token="$1"
-  token="${token#${token%%[![:space:]]*}}"
-  token="${token%${token##*[![:space:]]}}"
-  token="${token%;}"
-  token="${token%,}"
-  printf '%s' "$token"
+  local value="$1"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  value="${value%;}"
+  value="${value%,}"
+  printf '%s' "$value"
 }
 
 statement_stream_check() {
