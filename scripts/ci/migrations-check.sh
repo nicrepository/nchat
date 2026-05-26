@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CI validation for SQL migration files — no database connection required.
+# CI validation for SQL migration files: no database connection required.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -16,13 +16,44 @@ ok() {
   echo "  [OK]   $*"
 }
 
+validate_domain_name() {
+  local domain="$1"
+  [[ "$domain" =~ ^[a-z][a-z0-9_]*$ ]]
+}
+
+trim_sql_token() {
+  local value="$1"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  value="${value%;}"
+  value="${value%,}"
+  printf '%s' "$value"
+}
+
+statement_stream_check() {
+  local file="$1" callback="$2" statement="" line clean current
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    clean="${line%%--*}"
+    statement+=" $clean"
+    while [[ "$statement" == *";"* ]]; do
+      current="${statement%%;*};"
+      "$callback" "$file" "$current"
+      statement="${statement#*;}"
+    done
+  done < "$file"
+  if [[ -n "${statement//[[:space:]]/}" ]]; then
+    "$callback" "$file" "$statement"
+  fi
+}
+
 echo "=== migrations check ==="
 echo
 
 # ---------------------------------------------------------------------------
-# 1. Collect all up migration files
+# 1. Collect migration files
 # ---------------------------------------------------------------------------
-mapfile -t UP_FILES < <(find "$MIGRATIONS_DIR" -name "*.up.sql" | sort)
+mapfile -t UP_FILES < <(if [[ -d "$MIGRATIONS_DIR" ]]; then find "$MIGRATIONS_DIR" -name "*.up.sql" | sort; fi)
+mapfile -t DOWN_FILES < <(if [[ -d "$MIGRATIONS_DIR" ]]; then find "$MIGRATIONS_DIR" -name "*.down.sql" | sort; fi)
 
 if [ ${#UP_FILES[@]} -eq 0 ]; then
   fail "No *.up.sql files found under $MIGRATIONS_DIR"
@@ -32,10 +63,44 @@ if [ ${#UP_FILES[@]} -eq 0 ]; then
 fi
 
 echo "Found ${#UP_FILES[@]} up migration(s)."
+echo "Found ${#DOWN_FILES[@]} down migration(s)."
 echo
 
 # ---------------------------------------------------------------------------
-# 2. Each up migration must have a corresponding down migration
+# 2. Domains and filenames must be safe
+# ---------------------------------------------------------------------------
+echo "--- domain and filename convention ---"
+for f in "${UP_FILES[@]}" "${DOWN_FILES[@]}"; do
+  domain_dir="$(basename "$(dirname "$f")")"
+  base="$(basename "$f")"
+
+  if validate_domain_name "$domain_dir"; then
+    ok "domain ok: $domain_dir"
+  else
+    fail "domain convention violation (expected ^[a-z][a-z0-9_]*$): $domain_dir"
+  fi
+
+  case "$base" in
+    *.up.sql)
+      if [[ "$base" =~ ^[0-9]{6}_[a-z0-9_]+\.up\.sql$ ]]; then
+        ok "up filename ok: $base"
+      else
+        fail "up filename convention violation: $base"
+      fi
+      ;;
+    *.down.sql)
+      if [[ "$base" =~ ^[0-9]{6}_[a-z0-9_]+\.down\.sql$ ]]; then
+        ok "down filename ok: $base"
+      else
+        fail "down filename convention violation: $base"
+      fi
+      ;;
+  esac
+done
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Each up migration must have a corresponding down migration
 # ---------------------------------------------------------------------------
 echo "--- down migration exists ---"
 for up in "${UP_FILES[@]}"; do
@@ -46,27 +111,36 @@ for up in "${UP_FILES[@]}"; do
     ok "$(basename "$down") exists"
   fi
 done
-echo
-
-# ---------------------------------------------------------------------------
-# 3. Migration files must be non-empty
-# ---------------------------------------------------------------------------
-echo "--- files are non-empty ---"
-for f in "${UP_FILES[@]}"; do
-  down="${f/.up.sql/.down.sql}"
-  for check in "$f" "$down"; do
-    [ -f "$check" ] || continue
-    if [ ! -s "$check" ]; then
-      fail "empty file: $(basename "$check")"
-    else
-      ok "non-empty: $(basename "$check")"
-    fi
-  done
+for down in "${DOWN_FILES[@]}"; do
+  up="${down/.down.sql/.up.sql}"
+  if [ ! -f "$up" ]; then
+    fail "orphan down migration without matching up: $(basename "$down")"
+  fi
 done
 echo
 
 # ---------------------------------------------------------------------------
-# 4. No plaintext token or password columns
+# 4. Migration files must be non-empty and transactional
+# ---------------------------------------------------------------------------
+echo "--- files are non-empty and transactional ---"
+for check in "${UP_FILES[@]}" "${DOWN_FILES[@]}"; do
+  [ -f "$check" ] || continue
+  base="$(basename "$check")"
+  if [ ! -s "$check" ]; then
+    fail "empty file: $base"
+    continue
+  fi
+  ok "non-empty: $base"
+  if grep -Eq '^[[:space:]]*BEGIN[[:space:]]*;' "$check" && grep -Eq '^[[:space:]]*COMMIT[[:space:]]*;' "$check"; then
+    ok "transaction wrapper: $base"
+  else
+    fail "missing BEGIN; / COMMIT; transaction wrapper: $base"
+  fi
+done
+echo
+
+# ---------------------------------------------------------------------------
+# 5. No plaintext token or password columns
 #    Rejects suspicious credential column names such as raw_token,
 #    password_raw, api_key, secret, or token columns without _hash.
 # ---------------------------------------------------------------------------
@@ -95,7 +169,7 @@ is_plaintext_credential_column() {
 for f in "${UP_FILES[@]}"; do
   bad_columns=0
 
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%--*}"
     if [[ "$line" =~ ^[[:space:]]*([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]+ ]]; then
       column="${BASH_REMATCH[1],,}"
@@ -113,11 +187,10 @@ done
 echo
 
 # ---------------------------------------------------------------------------
-# 5. Down migrations must contain at least one DROP statement
+# 6. Down migrations must contain at least one DROP statement
 # ---------------------------------------------------------------------------
 echo "--- down migrations contain DROP statements ---"
-for up in "${UP_FILES[@]}"; do
-  down="${up/.up.sql/.down.sql}"
+for down in "${DOWN_FILES[@]}"; do
   [ -f "$down" ] || continue
   if ! grep -qi "DROP" "$down"; then
     fail "down migration has no DROP statement: $(basename "$down")"
@@ -128,15 +201,104 @@ done
 echo
 
 # ---------------------------------------------------------------------------
-# 6. Naming convention: NNN_<name>.(up|down).sql
+# 7. Down migrations must avoid broad/destructive SQL and stay domain scoped.
 # ---------------------------------------------------------------------------
-echo "--- naming convention ---"
+echo "--- down migrations are domain-scoped and safe ---"
+check_down_statement() {
+  local file="$1" statement="$2" domain_dir targets target table schema
+  domain_dir="$(basename "$(dirname "$file")")"
+  shopt -s nocasematch
+
+  if [[ "$statement" =~ DROP[[:space:]]+DATABASE ]]; then
+    fail "down migration must not DROP DATABASE: $(basename "$file")"
+  fi
+  if [[ "$statement" =~ DROP[[:space:]]+SCHEMA ]]; then
+    fail "down migration must not DROP SCHEMA: $(basename "$file")"
+  fi
+  if [[ "$statement" =~ DROP[[:space:]]+OWNED ]]; then
+    fail "down migration must not DROP OWNED: $(basename "$file")"
+  fi
+  if [[ "$statement" =~ TRUNCATE([[:space:]]|$) ]]; then
+    fail "down migration must not TRUNCATE: $(basename "$file")"
+  fi
+  if [[ "$statement" =~ DROP[[:space:]]+EXTENSION ]]; then
+    fail "down migration must not DROP EXTENSION (database-wide side effect): $(basename "$file")"
+  fi
+
+  if [[ "$statement" =~ DROP[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+EXISTS[[:space:]]+)?(.+) ]]; then
+    targets="${BASH_REMATCH[2]}"
+    targets="${targets//;/}"
+    IFS=',' read -r -a drop_targets <<< "$targets"
+    for target in "${drop_targets[@]}"; do
+      target="$(trim_sql_token "$target")"
+      [ -z "$target" ] && continue
+      set -- $target
+      table="${1:-}"
+      table="${table%;}"
+      table="${table%,}"
+      if [[ "$table" != *.* ]]; then
+        fail "unqualified DROP TABLE '$table' in $(basename "$file") - use $domain_dir.<table>"
+        continue
+      fi
+      schema="${table%%.*}"
+      if [[ "$schema" == "public" ]]; then
+        fail "down migration must not DROP TABLE public.* in $(basename "$file")"
+      elif [[ "$schema" != "$domain_dir" ]]; then
+        fail "DROP TABLE '$table' is outside domain '$domain_dir' in $(basename "$file")"
+      fi
+    done
+  fi
+
+  shopt -u nocasematch
+}
+
+for down in "${DOWN_FILES[@]}"; do
+  [ -f "$down" ] || continue
+  statement_stream_check "$down" check_down_statement
+done
+ok "down migration destructive SQL guard executed"
+echo
+
+# ---------------------------------------------------------------------------
+# 8. CREATE TABLE must be schema-qualified, including multiline statements.
+#    Allowlisted: schema_migrations (lives in public by design).
+# ---------------------------------------------------------------------------
+echo "--- CREATE TABLE schema qualification ---"
+schema_qual_ok=true
+check_create_table_statement() {
+  local file="$1" statement="$2" tname
+  shopt -s nocasematch
+  if [[ "$statement" =~ CREATE[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?([a-zA-Z_][a-zA-Z0-9_.]*) ]]; then
+    tname="${BASH_REMATCH[2]}"
+    if [[ "$tname" == "schema_migrations" || "$tname" == "public.schema_migrations" ]]; then
+      shopt -u nocasematch
+      return
+    fi
+    if [[ "$tname" != *.* ]]; then
+      fail "unqualified CREATE TABLE '$tname' in $(basename "$file") - use schema.tablename"
+      schema_qual_ok=false
+    fi
+  fi
+  shopt -u nocasematch
+}
+
 for f in "${UP_FILES[@]}"; do
-  base="$(basename "$f")"
-  if ! echo "$base" | grep -qE '^[0-9]{6}_[a-z0-9_]+\.up\.sql$'; then
-    fail "naming convention violation (expected 000NNN_name.up.sql): $base"
+  statement_stream_check "$f" check_create_table_statement
+done
+$schema_qual_ok && ok "all CREATE TABLE statements are schema-qualified"
+echo
+
+# ---------------------------------------------------------------------------
+# 9. Auth domain migrations must reference auth. schema
+# ---------------------------------------------------------------------------
+echo "--- auth domain schema consistency ---"
+for f in "${UP_FILES[@]}"; do
+  domain_dir="$(basename "$(dirname "$f")")"
+  [ "$domain_dir" = "auth" ] || continue
+  if grep -qi "auth\." "$f"; then
+    ok "references auth. schema: $(basename "$f")"
   else
-    ok "naming ok: $base"
+    fail "auth domain migration does not reference auth. schema: $(basename "$f")"
   fi
 done
 echo
