@@ -6,7 +6,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 )
 
-const adminTokenHeader = "X-NChat-Admin-Token"
+const adminTokenHeader = "X-NChat-Admin-Token" //nolint:gosec
 
 // AdminBootstrapGuard is a temporary dev-only guard — NOT final RBAC.
 // Returns 503 if the bootstrap token is not configured in the environment.

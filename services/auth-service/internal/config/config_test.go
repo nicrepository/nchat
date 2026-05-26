@@ -43,7 +43,7 @@ func TestLoadDatabaseURLDefault(t *testing.T) {
 func TestLoadDatabaseURLFromEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://nchat:pass@localhost/nchat")
 	cfg := Load()
-	if cfg.DatabaseURL != "postgres://nchat:pass@localhost/nchat" {
+	if cfg.DatabaseURL != "postgres://nchat:pass@localhost/nchat" { //nolint:gosec
 		t.Fatalf("unexpected DatabaseURL %q", cfg.DatabaseURL)
 	}
 }

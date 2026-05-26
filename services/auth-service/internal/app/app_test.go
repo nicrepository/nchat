@@ -32,7 +32,7 @@ func TestNewWithUnreachableDB_DisablesAdminEndpoint(t *testing.T) {
 		Env:                      "test",
 		Port:                     8081,
 		ReadHeaderTimeoutSeconds: 5,
-		DatabaseURL:              "postgres://nchat:pass@localhost:9/nonexistent?sslmode=disable",
+		DatabaseURL:              "postgres://nchat:pass@localhost:9/nonexistent?sslmode=disable", //nolint:gosec
 		DBConnectTimeoutSeconds:  1,
 	}
 
