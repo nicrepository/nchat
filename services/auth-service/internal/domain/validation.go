@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 var emailRE = regexp.MustCompile(`(?i)^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)
@@ -24,7 +25,7 @@ func NormalizeEmail(email string) string {
 }
 
 func ValidatePassword(password string, policy PolicySettings) error {
-	if len(password) < policy.MinPasswordLength {
+	if utf8.RuneCountInString(password) < policy.MinPasswordLength {
 		return fmt.Errorf("%w: minimum length is %d characters", ErrPasswordPolicy, policy.MinPasswordLength)
 	}
 	if policy.RequireUppercase && !containsUppercase(password) {

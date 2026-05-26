@@ -54,6 +54,14 @@ func TestValidatePassword_MeetsPolicy(t *testing.T) {
 	}
 }
 
+func TestValidatePassword_MinLengthCountsCharacters(t *testing.T) {
+	policy := domain.PolicySettings{MinPasswordLength: 9}
+	err := domain.ValidatePassword("Áb1!Áb1!", policy)
+	if !errors.Is(err, domain.ErrPasswordPolicy) {
+		t.Fatalf("expected ErrPasswordPolicy for 8-character password, got %v", err)
+	}
+}
+
 func TestValidatePassword_TooShort(t *testing.T) {
 	policy := domain.PolicySettings{MinPasswordLength: 12}
 	err := domain.ValidatePassword("short", policy)
