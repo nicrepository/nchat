@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"net/http"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
@@ -20,11 +22,17 @@ func AdminBootstrapGuard(token string) func(http.Handler) http.Handler {
 				return
 			}
 			provided := r.Header.Get(adminTokenHeader)
-			if provided == "" || provided != token {
+			if !tokensEqual(provided, token) {
 				httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
 				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func tokensEqual(provided string, expected string) bool {
+	providedHash := sha256.Sum256([]byte(provided))
+	expectedHash := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(providedHash[:], expectedHash[:]) == 1
 }

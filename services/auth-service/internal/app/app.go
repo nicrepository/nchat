@@ -32,7 +32,7 @@ func New(cfg config.Config) *App {
 		defer cancel()
 		pool, err := storage.OpenDB(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
 		if err != nil {
-			logger.Warn("database unavailable; admin endpoint disabled", "error", err)
+			logger.Warn("database unavailable; admin endpoint disabled", "reason", "open_db_failed")
 		} else {
 			users = service.NewUserService(storage.NewPGXUserStore(pool))
 		}
