@@ -107,7 +107,7 @@ As imagens sao placeholders versionados. Dockerfiles reais, build e push de imag
 
 `base/configmap.yaml` contem apenas dados nao sensiveis. As referencias para PostgreSQL, Valkey e SeaweedFS apontam para nomes de servicos placeholder (`postgres`, `valkey`, `seaweedfs-filer`, `seaweedfs-s3`). Esses data services nao sao criados nesta tarefa; serao modelados em tarefa futura ou apontados para servicos externos.
 
-`base/secrets.example.yaml` e apenas modelo e nao entra no `base/kustomization.yaml`. Nao aplique esse arquivo em producao. Secrets reais devem ficar fora do repositorio. Para o MVP, secrets versionados devem ser gerados como SealedSecrets com escopo `strict`; External Secrets fica fora desta tarefa.
+`base/secrets.example.yaml` e apenas modelo com chaves vazias e nao entra no `base/kustomization.yaml`. Nao aplique esse arquivo em producao. Secrets reais devem ficar fora do repositorio. Para o MVP, secrets versionados devem ser gerados como SealedSecrets com escopo `strict`; External Secrets fica fora desta tarefa.
 
 ## Seguranca inicial
 

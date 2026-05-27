@@ -29,7 +29,7 @@ while IFS= read -r tracked; do
   esac
 done < <(git -C "$ROOT_DIR" ls-files infra/k8s/secrets/unsealed)
 
-if grep -R 'POSTGRES_PASSWORD:' "$ROOT_DIR/infra/k8s/secrets/templates" | grep -v 'REPLACE_ME' >/dev/null; then
+if grep -R -E 'POSTGRES_PASSWORD:[[:space:]]*"?[^"[:space:]]+' "$ROOT_DIR/infra/k8s/secrets/templates" | grep -v 'REPLACE_ME' >/dev/null; then
   echo "Secret templates must not contain real POSTGRES_PASSWORD values." >&2
   exit 1
 fi

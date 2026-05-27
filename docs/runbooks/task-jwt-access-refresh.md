@@ -126,6 +126,10 @@ Behavior:
   reuse detection to the client.
 - Token endpoint rate limiting uses `RemoteAddr` directly. It intentionally does
   not trust `X-Forwarded-For` because there is no trusted proxy helper yet.
+- The Kubernetes base relies on the built-in defaults for optional token TTL and
+  token endpoint rate-limit settings. Keep real `AUTH_JWT_HMAC_SECRET` and
+  `DATABASE_URL` values out of versioned YAML; provision them through a strict
+  SealedSecret generated from a local unsealed manifest.
 
 ## Known limitations
 
