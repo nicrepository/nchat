@@ -9,3 +9,5 @@ var (
 )
 
 var ErrInvalidRefreshToken = errors.New("invalid refresh token")
+
+var ErrInvalidCredentials = errors.New("invalid credentials")

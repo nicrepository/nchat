@@ -7,4 +7,5 @@ const (
 	RouteAdminUsers  = "/admin/users"
 	RouteAuthRefresh = "/auth/refresh"
 	RouteAuthLogout  = "/auth/logout"
+	RouteAuthLogin   = "/auth/login"
 )

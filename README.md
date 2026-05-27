@@ -404,15 +404,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service              | Default port | Current endpoints                                        |
-| -------------------- | -----------: | -------------------------------------------------------- |
-| auth-service         |         8081 | /healthz, /readyz, /version, /auth/refresh, /auth/logout |
-| chat-service         |         8082 | /healthz, /readyz, /version                              |
-| file-service         |         8083 | /healthz, /readyz, /version                              |
-| notification-service |         8084 | /healthz, /readyz, /version                              |
-| admin-service        |         8085 | /healthz, /readyz, /version                              |
-| search-service       |         8086 | /healthz, /readyz, /version                              |
-| media-service        |         8087 | /healthz, /readyz, /version                              |
+| Service              | Default port | Current endpoints                                                     |
+| -------------------- | -----------: | --------------------------------------------------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout |
+| chat-service         |         8082 | /healthz, /readyz, /version                                           |
+| file-service         |         8083 | /healthz, /readyz, /version                                           |
+| notification-service |         8084 | /healthz, /readyz, /version                                           |
+| admin-service        |         8085 | /healthz, /readyz, /version                                           |
+| search-service       |         8086 | /healthz, /readyz, /version                                           |
+| media-service        |         8087 | /healthz, /readyz, /version                                           |
 
 ## Auth data model
 
@@ -433,6 +433,28 @@ tokens, and policy settings.
 - Guard: `X-NChat-Admin-Token` header (temporary bootstrap token, not final RBAC)
 - Runbook: [docs/runbooks/task-23-admin-manual-user-create.md](docs/runbooks/task-23-admin-manual-user-create.md)
 
+## Email/password login
+
+`POST /auth/login` authenticates manual email/password users, enforces a temporary
+failed-login lockout, optionally tracks devices, and returns an access/refresh token pair.
+
+- Endpoint: `POST /auth/login` (auth-service, port 8081)
+- Body cap: 4 KiB
+- Rate limit: shared with `/auth/refresh` and `/auth/logout`
+- Lockout policy columns and defaults (table `auth.auth_policy_settings`):
+
+| Column                         | Default | Description                                    |
+| ------------------------------ | ------- | ---------------------------------------------- |
+| `failed_login_limit`           | 5       | Max failures before temporary lockout          |
+| `failed_login_window_minutes`  | 15      | Rolling window (minutes) for counting failures |
+| `failed_login_lockout_minutes` | 15      | Lockout duration (same as window by default)   |
+| `session_idle_timeout_minutes` | 60      | Session idle TTL used for `idle_expires_at`    |
+| `max_devices_per_user`         | 5       | Max active (non-revoked) devices per user      |
+
+- Lockout note: automatic brute-force lockout does **not** set `auth.users.status = 'locked'`. That status is reserved for a future admin lock flow.
+- Runbook: [docs/runbooks/task-email-password-login.md](docs/runbooks/task-email-password-login.md)
+- Out of scope: MFA, CAPTCHA, email verification gate, account unlock UI
+
 ## JWT access and refresh tokens
 
 `POST /auth/refresh` issues a short-lived HS256 JWT access token and rotates an opaque
@@ -447,7 +469,7 @@ refresh token stored as an HMAC-SHA-256 hash in `auth.user_sessions` and
 - Reuse detection: rotated refresh token reuse revokes the session family with `refresh_token_reuse_detected`
 - Secret: `AUTH_JWT_HMAC_SECRET` is required, has no default, and must be at least 32 bytes
 - Runbook: [docs/runbooks/task-jwt-access-refresh.md](docs/runbooks/task-jwt-access-refresh.md)
-- Out of scope: login, OAuth/OIDC, RBAC, and frontend auth flows
+- Out of scope: OAuth/OIDC, RBAC, and frontend auth flows
 
 ## Database migrations
 

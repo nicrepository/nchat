@@ -246,3 +246,150 @@ func TestAuthLogout_InvalidJSONReturns400(t *testing.T) {
 		t.Fatalf("expected 400, got %d", rec.Code)
 	}
 }
+
+// --- Login handler tests ---
+
+type fakeLoginService struct {
+	result domain.LoginResult
+	err    error
+	got    domain.LoginInput
+}
+
+func (f *fakeLoginService) Login(_ context.Context, input domain.LoginInput) (domain.LoginResult, error) {
+	f.got = input
+	return f.result, f.err
+}
+
+func TestAuthLogin_SuccessReturnsTokenAndSafeUser(t *testing.T) {
+	svc := &fakeLoginService{result: domain.LoginResult{
+		AccessToken:  "at",
+		RefreshToken: "rt",
+		TokenType:    "Bearer",
+		ExpiresIn:    900,
+		User:         domain.LoginUser{ID: "u1", Email: "user@example.com", DisplayName: "User", MustChangePassword: true},
+	}}
+	handler := httpapi.AuthLogin(svc)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresIn    int    `json:"expires_in"`
+		User         struct {
+			ID                 string `json:"id"`
+			Email              string `json:"email"`
+			DisplayName        string `json:"display_name"`
+			MustChangePassword bool   `json:"must_change_password"`
+		} `json:"user"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.AccessToken != "at" || body.RefreshToken != "rt" || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
+		t.Fatalf("unexpected tokens: %+v", body)
+	}
+	if body.User.ID != "u1" || body.User.Email != "user@example.com" || !body.User.MustChangePassword {
+		t.Fatalf("unexpected user: %+v", body.User)
+	}
+}
+
+func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {
+	handler := httpapi.AuthLogin(&fakeLoginService{err: domain.ErrInvalidCredentials})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"wrong"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_credentials") {
+		t.Fatalf("expected invalid_credentials code in body: %s", rec.Body.String())
+	}
+}
+
+func TestAuthLogin_InvalidJSONReturns400(t *testing.T) {
+	handler := httpapi.AuthLogin(&fakeLoginService{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin, strings.NewReader(`not-json`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestAuthLogin_TrailingJSONReturns400(t *testing.T) {
+	handler := httpapi.AuthLogin(&fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"e","password":"p"}{"extra":"junk"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestAuthLogin_OversizedBodyReturns413(t *testing.T) {
+	handler := httpapi.AuthLogin(&fakeLoginService{})
+	rec := httptest.NewRecorder()
+	body := `{"email":"user@example.com","password":"` + strings.Repeat("a", 5000) + `"}`
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin, strings.NewReader(body))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", rec.Code)
+	}
+}
+
+func TestAuthLogin_ServiceNilReturns503(t *testing.T) {
+	handler := httpapi.AuthLogin(nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+}
+
+func TestAuthLogin_ResponseDoesNotLeakSensitiveFields(t *testing.T) {
+	svc := &fakeLoginService{result: domain.LoginResult{
+		AccessToken:  "at",
+		RefreshToken: "rt",
+		TokenType:    "Bearer",
+		ExpiresIn:    900,
+		User:         domain.LoginUser{ID: "u1", Email: "user@example.com"},
+	}}
+	handler := httpapi.AuthLogin(svc)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	// Verify no raw password material or hash fields are leaked.
+	// Note: "must_change_password" is an intentional boolean field — we check for sensitive
+	// key names that would expose credential data, not the bool flag.
+	for _, sensitive := range []string{"password_hash", "device_fingerprint_hash", `"password":`, `"raw_password"`} {
+		if strings.Contains(body, sensitive) {
+			t.Fatalf("response must not include %q: %s", sensitive, body)
+		}
+	}
+}
