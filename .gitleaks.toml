@@ -1,0 +1,26 @@
+title = "nchat gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Historical Kubernetes Secret templates used an inert JWT secret placeholder; real secret values remain disallowed."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['AUTH_JWT_HMAC_SECRET:\s*"REPLACE_ME_MIN_32_BYTES"']
+  paths = [
+    '^infra/k8s/base/secrets\.example\.yaml$',
+    '^infra/k8s/secrets/templates/nchat-secrets\.template\.yaml$',
+  ]
+
+  [[rules.allowlists]]
+  description = "Historical auth config test uses an inert 32-byte JWT HMAC fixture to assert env loading; real secret values remain disallowed."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['t\.Setenv\("AUTH_JWT_HMAC_SECRET", "abcdefghijklmnopqrstuvwxyz123456"\)']
+  paths = [
+    '^services/auth-service/internal/config/config_test\.go$',
+  ]

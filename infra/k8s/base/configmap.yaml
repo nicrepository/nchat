@@ -12,6 +12,8 @@ data:
   APP_ENV: development
   LOG_LEVEL: info
   READ_HEADER_TIMEOUT_SECONDS: "5"
+  AUTH_JWT_ISSUER: nchat-auth
+  AUTH_JWT_AUDIENCE: nchat-api
   POSTGRES_HOST: postgres
   POSTGRES_PORT: "5432"
   POSTGRES_DB: nchat

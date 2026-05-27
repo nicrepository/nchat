@@ -69,3 +69,102 @@ func TestLoadAdminBootstrapTokenFromEnv(t *testing.T) {
 		t.Fatalf("unexpected AdminBootstrapToken %q", cfg.AdminBootstrapToken)
 	}
 }
+
+func TestLoadAuthJWTDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.AuthJWTHMACSecret != "" {
+		t.Fatalf("expected empty AuthJWTHMACSecret, got %q", cfg.AuthJWTHMACSecret)
+	}
+	if cfg.AuthJWTIssuer != "nchat-auth" {
+		t.Fatalf("expected nchat-auth issuer, got %q", cfg.AuthJWTIssuer)
+	}
+	if cfg.AuthJWTAudience != "nchat-api" {
+		t.Fatalf("expected nchat-api audience, got %q", cfg.AuthJWTAudience)
+	}
+	if cfg.AuthAccessTokenTTLSeconds != 900 {
+		t.Fatalf("expected access ttl 900, got %d", cfg.AuthAccessTokenTTLSeconds)
+	}
+	if cfg.AuthRefreshTokenTTLSeconds != 2592000 {
+		t.Fatalf("expected refresh ttl 2592000, got %d", cfg.AuthRefreshTokenTTLSeconds)
+	}
+}
+
+func TestLoadAuthJWTOverrides(t *testing.T) {
+	t.Setenv("AUTH_JWT_HMAC_SECRET", "abcdefghijklmnopqrstuvwxyz123456")
+	t.Setenv("AUTH_JWT_ISSUER", "issuer")
+	t.Setenv("AUTH_JWT_AUDIENCE", "audience")
+	t.Setenv("AUTH_ACCESS_TOKEN_TTL_SECONDS", "60")
+	t.Setenv("AUTH_REFRESH_TOKEN_TTL_SECONDS", "120")
+
+	cfg := Load()
+
+	if cfg.AuthJWTHMACSecret != "abcdefghijklmnopqrstuvwxyz123456" {
+		t.Fatal("expected AuthJWTHMACSecret from environment")
+	}
+	if cfg.AuthJWTIssuer != "issuer" {
+		t.Fatalf("expected issuer override, got %q", cfg.AuthJWTIssuer)
+	}
+	if cfg.AuthJWTAudience != "audience" {
+		t.Fatalf("expected audience override, got %q", cfg.AuthJWTAudience)
+	}
+	if cfg.AuthAccessTokenTTLSeconds != 60 {
+		t.Fatalf("expected access ttl 60, got %d", cfg.AuthAccessTokenTTLSeconds)
+	}
+	if cfg.AuthRefreshTokenTTLSeconds != 120 {
+		t.Fatalf("expected refresh ttl 120, got %d", cfg.AuthRefreshTokenTTLSeconds)
+	}
+}
+
+func TestLoadAuthJWTInvalidTTLUsesDefault(t *testing.T) {
+	t.Setenv("AUTH_ACCESS_TOKEN_TTL_SECONDS", "0")
+	t.Setenv("AUTH_REFRESH_TOKEN_TTL_SECONDS", "-1")
+
+	cfg := Load()
+
+	if cfg.AuthAccessTokenTTLSeconds != 900 {
+		t.Fatalf("expected default access ttl 900, got %d", cfg.AuthAccessTokenTTLSeconds)
+	}
+	if cfg.AuthRefreshTokenTTLSeconds != 2592000 {
+		t.Fatalf("expected default refresh ttl 2592000, got %d", cfg.AuthRefreshTokenTTLSeconds)
+	}
+}
+
+func TestLoadAuthTokenEndpointRateLimitDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.AuthTokenEndpointRateLimitPerMinute != 60 {
+		t.Fatalf("expected token endpoint rate limit 60, got %d", cfg.AuthTokenEndpointRateLimitPerMinute)
+	}
+	if cfg.AuthTokenEndpointRateLimitBurst != 10 {
+		t.Fatalf("expected token endpoint burst 10, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}
+
+func TestLoadAuthTokenEndpointRateLimitOverrides(t *testing.T) {
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE", "5")
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST", "2")
+
+	cfg := Load()
+
+	if cfg.AuthTokenEndpointRateLimitPerMinute != 5 {
+		t.Fatalf("expected token endpoint rate limit 5, got %d", cfg.AuthTokenEndpointRateLimitPerMinute)
+	}
+	if cfg.AuthTokenEndpointRateLimitBurst != 2 {
+		t.Fatalf("expected token endpoint burst 2, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}
+
+func TestLoadAuthTokenEndpointRateLimitInvalidUsesDefault(t *testing.T) {
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE", "0")
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST", "-1")
+
+	cfg := Load()
+
+	if cfg.AuthTokenEndpointRateLimitPerMinute != 60 {
+		t.Fatalf("expected default token endpoint rate limit 60, got %d", cfg.AuthTokenEndpointRateLimitPerMinute)
+	}
+	if cfg.AuthTokenEndpointRateLimitBurst != 10 {
+		t.Fatalf("expected default token endpoint burst 10, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}

@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,10 +13,11 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/auth-service/internal/config"
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -43,7 +46,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -71,7 +74,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -89,7 +92,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 
 	tests := []struct {
 		name   string
@@ -183,7 +186,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -198,7 +201,7 @@ func TestMetricsRouteReturns200(t *testing.T) {
 }
 
 func TestAdminUsersDisabledWithNoToken(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, RouteAdminUsers, nil))
 	// testConfig has no ADMIN_BOOTSTRAP_TOKEN => 503
@@ -208,10 +211,80 @@ func TestAdminUsersDisabledWithNoToken(t *testing.T) {
 }
 
 func TestAdminUsersMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAdminUsers, nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+type routerAuthStub struct{}
+
+func (routerAuthStub) Refresh(_ context.Context, _ string) (domain.TokenPair, error) {
+	return domain.TokenPair{AccessToken: "access-token", RefreshToken: "refresh-token", TokenType: "Bearer", ExpiresIn: 900}, nil
+}
+
+func (routerAuthStub) Logout(_ context.Context, _ string) error {
+	return nil
+}
+
+func TestAuthTokenEndpointRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 2
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{})
+
+	for i := 0; i < 2; i++ {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"refresh-token"}`))
+		req.RemoteAddr = "203.0.113.10:12345"
+
+		router.ServeHTTP(response, req)
+
+		assertJSONResponse(t, response, http.StatusOK)
+	}
+}
+
+func TestAuthTokenEndpointRateLimiterRejectsRequestsOverLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{})
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"secret-refresh-token"}`))
+	firstReq.RemoteAddr = "203.0.113.20:12345"
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, strings.NewReader(`{"refresh_token":"secret-refresh-token"}`))
+	secondReq.RemoteAddr = "203.0.113.20:12345"
+	router.ServeHTTP(second, secondReq)
+
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), "secret-refresh-token") {
+		t.Fatalf("rate limit response must not include refresh token: %s", second.Body.String())
+	}
+}
+
+func TestAuthRoutesMethodNotAllowed(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "refresh", path: RouteAuthRefresh},
+		{name: "logout", path: RouteAuthLogout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, tt.path, nil))
+			assertJSONResponse(t, response, http.StatusMethodNotAllowed)
+		})
 	}
 }

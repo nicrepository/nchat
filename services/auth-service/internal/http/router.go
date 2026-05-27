@@ -12,7 +12,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator, auth service.AuthSessionManager) http.Handler {
 	_ = logger
 
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
@@ -23,6 +23,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator
 	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
+	tokenEndpointLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst)
+	mux.Handle(RouteAuthRefresh, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthRefresh(auth))))
+	mux.Handle(RouteAuthLogout, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthLogout(auth))))
 	mux.Handle(RouteAdminUsers, httputil.MethodNotAllowed(http.MethodPost,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateUser(users)),
 	))
