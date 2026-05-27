@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
@@ -10,7 +11,11 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/service"
 )
 
-const errCodeInvalidRefreshToken = "invalid_refresh_token"
+const (
+	errCodeInvalidRefreshToken       = "invalid_refresh_token"
+	errCodeRequestTooLarge           = "request_too_large"
+	maxAuthRequestBodyBytes    int64 = 4 * 1024
+)
 
 type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
@@ -31,8 +36,7 @@ func AuthRefresh(auth service.AuthSessionManager) http.Handler {
 		}
 
 		var req refreshRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid JSON body")
+		if !decodeRefreshRequest(w, r, &req) {
 			return
 		}
 
@@ -59,17 +63,43 @@ func AuthLogout(auth service.AuthSessionManager) http.Handler {
 		}
 
 		var req refreshRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid JSON body")
+		if !decodeRefreshRequest(w, r, &req) {
 			return
 		}
 
 		if err := auth.Logout(r.Context(), req.RefreshToken); err != nil {
+			if errors.Is(err, domain.ErrInvalidRefreshToken) {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			writeAuthError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+}
+
+func decodeRefreshRequest(w http.ResponseWriter, r *http.Request, req *refreshRequest) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAuthRequestBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(req); err != nil {
+		writeDecodeError(w, err)
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeDecodeError(w, err)
+		return false
+	}
+	return true
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		httputil.WriteError(w, http.StatusRequestEntityTooLarge, errCodeRequestTooLarge, "request body too large")
+		return
+	}
+	httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid JSON body")
 }
 
 func writeAuthError(w http.ResponseWriter, err error) {

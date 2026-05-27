@@ -13,7 +13,7 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
-func TestPGXSessionStore_RotateRefreshToken_Success(t *testing.T) {
+func TestPGXSessionStore_RotateRefreshToken_SuccessRecordsHistory(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -25,9 +25,15 @@ func TestPGXSessionStore_RotateRefreshToken_Success(t *testing.T) {
 	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
 		WithArgs("old-hash").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-1", "user-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1", "old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectExec(`UPDATE auth\.user_sessions`).
 		WithArgs("new-hash", expiresAt, "session-1", "old-hash").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`INSERT INTO auth\.refresh_token_history`).
+		WithArgs("session-1", "new-hash").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 	mock.ExpectRollback()
 
@@ -44,7 +50,7 @@ func TestPGXSessionStore_RotateRefreshToken_Success(t *testing.T) {
 	}
 }
 
-func TestPGXSessionStore_RotateRefreshToken_NotFoundRejected(t *testing.T) {
+func TestPGXSessionStore_RotateRefreshToken_ReusedTokenRevokesSessionFamily(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -53,6 +59,94 @@ func TestPGXSessionStore_RotateRefreshToken_NotFoundRejected(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"session_id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if !errors.Is(err, domain.ErrInvalidRefreshToken) {
+		t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_ActiveTokenAfterFamilyRevocationRejected(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"session_id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("active-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("active-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if !errors.Is(err, domain.ErrInvalidRefreshToken) {
+		t.Fatalf("expected ErrInvalidRefreshToken for reused token, got %v", err)
+	}
+	_, err = store.RotateRefreshToken(context.Background(), "active-hash", "newer-hash", time.Now())
+	if !errors.Is(err, domain.ErrInvalidRefreshToken) {
+		t.Fatalf("expected ErrInvalidRefreshToken for active token after revocation, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_UnknownTokenRejected(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("missing-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
 		WithArgs("missing-hash").
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
@@ -67,7 +161,7 @@ func TestPGXSessionStore_RotateRefreshToken_NotFoundRejected(t *testing.T) {
 	}
 }
 
-func TestPGXSessionStore_LogoutRevokesToken(t *testing.T) {
+func TestPGXSessionStore_LogoutRevokesSessionAndTokenHistory(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -75,8 +169,14 @@ func TestPGXSessionStore_LogoutRevokesToken(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+	mock.ExpectQuery(`SELECT s\.id`).
 		WithArgs("token-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit()
 	mock.ExpectRollback()
@@ -98,9 +198,9 @@ func TestPGXSessionStore_LogoutRejectsUnknownToken(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+	mock.ExpectQuery(`SELECT s\.id`).
 		WithArgs("unknown-hash").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 
 	store := storage.NewPGXSessionStore(mock)
@@ -132,111 +232,6 @@ func TestPGXSessionStore_RotateRefreshToken_BeginError(t *testing.T) {
 	}
 }
 
-func TestPGXSessionStore_RotateRefreshToken_SelectError(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
-		WithArgs("old-hash").
-		WillReturnError(errors.New("select failed"))
-	mock.ExpectRollback()
-
-	store := storage.NewPGXSessionStore(mock)
-	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXSessionStore_RotateRefreshToken_UpdateError(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	expiresAt := time.Now().Add(30 * 24 * time.Hour)
-	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
-		WithArgs("old-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-1", "user-1"))
-	mock.ExpectExec(`UPDATE auth\.user_sessions`).
-		WithArgs("new-hash", expiresAt, "session-1", "old-hash").
-		WillReturnError(errors.New("update failed"))
-	mock.ExpectRollback()
-
-	store := storage.NewPGXSessionStore(mock)
-	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", expiresAt)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXSessionStore_RotateRefreshToken_UpdateZeroRows(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	expiresAt := time.Now().Add(30 * 24 * time.Hour)
-	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
-		WithArgs("old-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-1", "user-1"))
-	mock.ExpectExec(`UPDATE auth\.user_sessions`).
-		WithArgs("new-hash", expiresAt, "session-1", "old-hash").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-	mock.ExpectRollback()
-
-	store := storage.NewPGXSessionStore(mock)
-	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", expiresAt)
-	if !errors.Is(err, domain.ErrInvalidRefreshToken) {
-		t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXSessionStore_RotateRefreshToken_CommitError(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	expiresAt := time.Now().Add(30 * 24 * time.Hour)
-	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
-		WithArgs("old-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-1", "user-1"))
-	mock.ExpectExec(`UPDATE auth\.user_sessions`).
-		WithArgs("new-hash", expiresAt, "session-1", "old-hash").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
-	mock.ExpectRollback()
-
-	store := storage.NewPGXSessionStore(mock)
-	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", expiresAt)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
 func TestPGXSessionStore_RevokeRefreshToken_BeginError(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -256,7 +251,7 @@ func TestPGXSessionStore_RevokeRefreshToken_BeginError(t *testing.T) {
 	}
 }
 
-func TestPGXSessionStore_RevokeRefreshToken_ExecError(t *testing.T) {
+func TestPGXSessionStore_RotateRefreshToken_QueryError(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -264,9 +259,127 @@ func TestPGXSessionStore_RevokeRefreshToken_ExecError(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(errors.New("db down"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_RotatedHistoryRowsAffectedZero(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-1", "user-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1", "old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if !errors.Is(err, domain.ErrInvalidRefreshToken) {
+		t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_InsertHistoryError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	expiresAt := time.Now().Add(30 * 24 * time.Hour)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-1", "user-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1", "old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("new-hash", expiresAt, "session-1", "old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`INSERT INTO auth\.refresh_token_history`).
+		WithArgs("session-1", "new-hash").
+		WillReturnError(errors.New("insert failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", expiresAt)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_ReusedTokenCommitError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"session_id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RevokeRefreshToken_QueryError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id`).
 		WithArgs("token-hash").
-		WillReturnError(errors.New("exec failed"))
+		WillReturnError(errors.New("db down"))
 	mock.ExpectRollback()
 
 	store := storage.NewPGXSessionStore(mock)
@@ -287,10 +400,141 @@ func TestPGXSessionStore_RevokeRefreshToken_CommitError(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+	mock.ExpectQuery(`SELECT s\.id`).
 		WithArgs("token-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	err = store.RevokeRefreshToken(context.Background(), "token-hash")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_ReusedTokenMarkReusedError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"session_id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("old-hash").
+		WillReturnError(errors.New("update failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_ReusedTokenRevokeSessionError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"session_id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnError(errors.New("revoke failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RotateRefreshToken_ReusedTokenRevokeActiveHistoryError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id, s\.user_id`).
+		WithArgs("old-hash").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT h\.session_id`).
+		WithArgs("old-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"session_id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("old-hash").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
+		WillReturnError(errors.New("history revoke failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXSessionStore(mock)
+	_, err = store.RotateRefreshToken(context.Background(), "old-hash", "new-hash", time.Now())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXSessionStore_RevokeRefreshToken_HistoryUpdateError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT s\.id`).
+		WithArgs("token-hash").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("session-1"))
+	mock.ExpectExec(`UPDATE auth\.user_sessions`).
+		WithArgs("session-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE auth\.refresh_token_history`).
+		WithArgs("session-1").
+		WillReturnError(errors.New("history update failed"))
 	mock.ExpectRollback()
 
 	store := storage.NewPGXSessionStore(mock)

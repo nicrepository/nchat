@@ -129,3 +129,42 @@ func TestLoadAuthJWTInvalidTTLUsesDefault(t *testing.T) {
 		t.Fatalf("expected default refresh ttl 2592000, got %d", cfg.AuthRefreshTokenTTLSeconds)
 	}
 }
+
+func TestLoadAuthTokenEndpointRateLimitDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.AuthTokenEndpointRateLimitPerMinute != 60 {
+		t.Fatalf("expected token endpoint rate limit 60, got %d", cfg.AuthTokenEndpointRateLimitPerMinute)
+	}
+	if cfg.AuthTokenEndpointRateLimitBurst != 10 {
+		t.Fatalf("expected token endpoint burst 10, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}
+
+func TestLoadAuthTokenEndpointRateLimitOverrides(t *testing.T) {
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE", "5")
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST", "2")
+
+	cfg := Load()
+
+	if cfg.AuthTokenEndpointRateLimitPerMinute != 5 {
+		t.Fatalf("expected token endpoint rate limit 5, got %d", cfg.AuthTokenEndpointRateLimitPerMinute)
+	}
+	if cfg.AuthTokenEndpointRateLimitBurst != 2 {
+		t.Fatalf("expected token endpoint burst 2, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}
+
+func TestLoadAuthTokenEndpointRateLimitInvalidUsesDefault(t *testing.T) {
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE", "0")
+	t.Setenv("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST", "-1")
+
+	cfg := Load()
+
+	if cfg.AuthTokenEndpointRateLimitPerMinute != 60 {
+		t.Fatalf("expected default token endpoint rate limit 60, got %d", cfg.AuthTokenEndpointRateLimitPerMinute)
+	}
+	if cfg.AuthTokenEndpointRateLimitBurst != 10 {
+		t.Fatalf("expected default token endpoint burst 10, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}

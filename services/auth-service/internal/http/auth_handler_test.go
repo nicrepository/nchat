@@ -105,6 +105,66 @@ func TestAuthRefresh_InvalidJSONReturns400(t *testing.T) {
 	}
 }
 
+func TestAuthRefresh_OversizedBodyReturns413(t *testing.T) {
+	auth := &fakeAuthService{pair: domain.TokenPair{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer", ExpiresIn: 900}}
+	handler := httpapi.AuthRefresh(auth)
+	rec := httptest.NewRecorder()
+	body := `{"refresh_token":"` + strings.Repeat("a", 5000) + `"}`
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(body))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if auth.refreshToken != "" {
+		t.Fatalf("oversized body must not reach service, got token %q", auth.refreshToken)
+	}
+	if strings.Contains(rec.Body.String(), strings.Repeat("a", 32)) {
+		t.Fatalf("response must not echo token material: %s", rec.Body.String())
+	}
+}
+
+func TestAuthRefresh_OversizedTrailingBodyReturns413(t *testing.T) {
+	auth := &fakeAuthService{pair: domain.TokenPair{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer", ExpiresIn: 900}}
+	handler := httpapi.AuthRefresh(auth)
+	rec := httptest.NewRecorder()
+	body := `{"refresh_token":"token"}` + strings.Repeat(" ", 5000)
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(body))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if auth.refreshToken != "" {
+		t.Fatalf("oversized trailing body must not reach service, got token %q", auth.refreshToken)
+	}
+	if strings.Contains(rec.Body.String(), strings.Repeat(" ", 32)) {
+		t.Fatalf("response must not echo token material: %s", rec.Body.String())
+	}
+}
+
+func TestAuthLogout_OversizedBodyReturns413(t *testing.T) {
+	auth := &fakeAuthService{}
+	handler := httpapi.AuthLogout(auth)
+	rec := httptest.NewRecorder()
+	body := `{"refresh_token":"` + strings.Repeat("b", 5000) + `"}`
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(body))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if auth.logoutToken != "" {
+		t.Fatalf("oversized body must not reach service, got token %q", auth.logoutToken)
+	}
+	if strings.Contains(rec.Body.String(), strings.Repeat("b", 32)) {
+		t.Fatalf("response must not echo token material: %s", rec.Body.String())
+	}
+}
+
 func TestAuthLogout_SuccessReturns204(t *testing.T) {
 	auth := &fakeAuthService{}
 	handler := httpapi.AuthLogout(auth)
@@ -136,15 +196,18 @@ func TestAuthLogout_MissingSecretOrStoreReturns503(t *testing.T) {
 	}
 }
 
-func TestAuthLogout_InvalidRefreshTokenReturns401(t *testing.T) {
+func TestAuthLogout_InvalidRefreshTokenReturns204(t *testing.T) {
 	handler := httpapi.AuthLogout(&fakeAuthService{logoutErr: domain.ErrInvalidRefreshToken})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"bad-token"}`))
 
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected empty body, got %s", rec.Body.String())
 	}
 }
 

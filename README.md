@@ -436,12 +436,15 @@ tokens, and policy settings.
 ## JWT access and refresh tokens
 
 `POST /auth/refresh` issues a short-lived HS256 JWT access token and rotates an opaque
-refresh token stored as an HMAC-SHA-256 hash in `auth.user_sessions`. `POST /auth/logout`
-revokes a refresh token by marking its session revoked.
+refresh token stored as an HMAC-SHA-256 hash in `auth.user_sessions` and
+`auth.refresh_token_history`. `POST /auth/logout` revokes the current refresh token session.
 
 - Endpoints: `POST /auth/refresh`, `POST /auth/logout` (auth-service, port 8081)
 - Access token TTL: `AUTH_ACCESS_TOKEN_TTL_SECONDS` (default `900`)
 - Refresh token TTL: `AUTH_REFRESH_TOKEN_TTL_SECONDS` (default `2592000`)
+- Request body cap: 4 KiB per token endpoint request
+- Rate limit: `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE` (default `60`) with burst `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST` (default `10`)
+- Reuse detection: rotated refresh token reuse revokes the session family with `refresh_token_reuse_detected`
 - Secret: `AUTH_JWT_HMAC_SECRET` is required, has no default, and must be at least 32 bytes
 - Runbook: [docs/runbooks/task-jwt-access-refresh.md](docs/runbooks/task-jwt-access-refresh.md)
 - Out of scope: login, OAuth/OIDC, RBAC, and frontend auth flows
