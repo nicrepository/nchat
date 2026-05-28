@@ -48,10 +48,10 @@ Implement three related auth-service flows in a single PR:
 
 ## Requirements Traceability
 
-| RF | Feature | Implementation |
-|----|---------|---------------|
-| RF-46 | Email invite with activation link, admin-only | `POST /admin/invites` + `POST /auth/invites/accept` |
-| RF-48 | Password recovery via expirable email token | `POST /auth/password/forgot` + `POST /auth/password/reset` |
+| RF    | Feature                                                   | Implementation                                                |
+| ----- | --------------------------------------------------------- | ------------------------------------------------------------- |
+| RF-46 | Email invite with activation link, admin-only             | `POST /admin/invites` + `POST /auth/invites/accept`           |
+| RF-48 | Password recovery via expirable email token               | `POST /auth/password/forgot` + `POST /auth/password/reset`    |
 | RF-51 | Session expires after inactivity, default 1h configurable | Fix `RotateRefreshToken` idle TTL; SQL checks already correct |
 
 ---
@@ -60,12 +60,12 @@ Implement three related auth-service flows in a single PR:
 
 The schema is already fully prepared. All tables required exist as of migration `000001`:
 
-| Table | Relevant columns |
-|-------|-----------------|
-| `auth.user_sessions` | `idle_expires_at`, `absolute_expires_at`, `revoked_at` |
-| `auth.password_reset_tokens` | `token_hash`, `expires_at`, `used_at` |
-| `auth.user_invites` | `token_hash`, `expires_at`, `status`, `accepted_at`, `accepted_by_user_id`, `invited_by_user_id` |
-| `auth.auth_policy_settings` | `session_idle_timeout_minutes` (default 60) |
+| Table                        | Relevant columns                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------------------------------ |
+| `auth.user_sessions`         | `idle_expires_at`, `absolute_expires_at`, `revoked_at`                                           |
+| `auth.password_reset_tokens` | `token_hash`, `expires_at`, `used_at`                                                            |
+| `auth.user_invites`          | `token_hash`, `expires_at`, `status`, `accepted_at`, `accepted_by_user_id`, `invited_by_user_id` |
+| `auth.auth_policy_settings`  | `session_idle_timeout_minutes` (default 60)                                                      |
 
 Migration `000004` adds two policy columns and the email outbox table.
 
@@ -180,6 +180,7 @@ This PR therefore implements the secure domain flow and handoff record, but deli
 ### Problem
 
 `auth_service.go`:
+
 ```go
 newRefreshToken, newRefreshHash, refreshExpiresAt, _ := s.tokens.GenerateRefreshToken()
 // refreshExpiresAt = now() + refreshTTL (30 days by default)
@@ -187,6 +188,7 @@ session, err := s.store.RotateRefreshToken(ctx, oldHash, newRefreshHash, refresh
 ```
 
 `session_store.go`:
+
 ```sql
 UPDATE auth.user_sessions
 SET refresh_token_hash = $1,
@@ -283,6 +285,7 @@ func (s *PasswordResetService) ResetPassword(ctx context.Context, input domain.R
 ```
 
 **`ForgotPassword` flow:**
+
 1. Normalize email.
 2. Validate email format. On validation failure → return nil (same generic response, not worth leaking format rejection).
 3. Fetch only active, manual, non-deleted user by email from store.
@@ -295,6 +298,7 @@ func (s *PasswordResetService) ResetPassword(ctx context.Context, input domain.R
 **Always return 202 from handler regardless of what the service does.**
 
 **`ResetPassword` flow:**
+
 1. Validate `Token` and `NewPassword` non-empty.
 2. Hash token via `HashPasswordResetToken`.
 3. Fetch policy via `store.GetPolicySettings`; validate `NewPassword` with `domain.ValidatePassword`.
@@ -322,11 +326,13 @@ type PasswordResetStore interface {
 **Password policy validation happens in the service layer** (consistent with `user_service.go`): `PasswordResetService.ResetPassword` calls `store.GetPolicySettings`, validates the password with `domain.ValidatePassword`, hashes it with `service.HashPassword`, then calls `store.ResetPasswordTx` with the pre-hashed value. The store never sees a plaintext password.
 
 `CreatePasswordResetToken`:
+
 - Within a transaction: mark all previous `password_reset_tokens` for `user_id` where `used_at IS NULL` as `used_at = now()` (supersede).
 - Insert new `password_reset_tokens` row.
 - Insert `email_outbox` row: `kind='password_reset'`, `reset_token_id=<new token id>`, `user_id=<user id>`, `to_email`, `template_key='auth.password_reset'`, `subject='Reset your NChat password'`.
 
 `ResetPasswordTx`:
+
 - Within a single transaction with `FOR UPDATE` lock on the token row.
 - Validate: `used_at IS NULL AND expires_at > now()`. Return `ErrInvalidToken` if not.
 - `UPDATE auth.user_password_credentials SET password_hash = $1, password_changed_at = now(), updated_at = now() WHERE user_id = (SELECT user_id FROM auth.password_reset_tokens WHERE id = <token_id>)`.
@@ -401,6 +407,7 @@ func (s *InviteService) AcceptInvite(ctx context.Context, input domain.AcceptInv
 ```
 
 **`CreateInvite` flow:**
+
 1. Normalize email. Validate format and `display_name` non-empty.
 2. Check user already exists → return `ErrDuplicateEmail` (caller → 409).
 3. Check active pending invite exists → return `ErrInviteAlreadyPending` (caller → 409).
@@ -410,6 +417,7 @@ func (s *InviteService) AcceptInvite(ctx context.Context, input domain.AcceptInv
 7. Return safe invite metadata (`id`, `email`, `created_at`). **Never return the raw token in the HTTP response.**
 
 **`AcceptInvite` flow:**
+
 1. Validate `Token`, `DisplayName`, `Password` non-empty.
 2. Hash token via `HashInviteToken`.
 3. Fetch policy via `store.GetPolicySettings`; validate `Password` with `domain.ValidatePassword`; hash with `service.HashPassword`. Return `ErrPasswordPolicy` on failure (caller → 400).
@@ -443,10 +451,12 @@ type InviteStore interface {
 **Password policy validation and hashing happen in the service layer** (consistent with `user_service.go`): `InviteService.AcceptInvite` calls `store.GetPolicySettings`, validates with `domain.ValidatePassword`, hashes with `service.HashPassword`, then calls `store.AcceptInviteTx` with the pre-hashed value.
 
 `CreateInvite`:
+
 - Within a transaction: insert `auth.user_invites` (`invited_by_user_id = NULL`, `status = 'pending'`).
 - Insert `email_outbox` row: `kind='invite'`, `invite_id=<invite id>`, `user_id=NULL`, `to_email`, `template_key='auth.invite'`, `subject='You have been invited to NChat'`.
 
 `AcceptInviteTx`:
+
 - `FOR UPDATE` on invite row.
 - Validate invite: `status = 'pending' AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()`. Return `ErrInvalidToken` if not.
 - Insert `auth.users` (`status='active'`, `auth_source='manual'`, `email_verified_at=now()`).
@@ -505,17 +515,17 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 ## Security Decisions
 
-| Decision | Detail |
-|----------|--------|
-| Token storage | Only HMAC-SHA-256 hash stored in DB (`token_hash`). Raw reset/invite tokens are never persisted and never returned by HTTP responses |
-| Token domain prefix | `HashPasswordResetToken` prefixes `nchat-password-reset-v1:`, `HashInviteToken` prefixes `nchat-invite-v1:` — prevents cross-type hash collisions |
-| Outbox payload | Metadata-only (`reset_token_id` or `invite_id`, optional non-sensitive JSON). No raw token, complete token link, token hash, password, password hash, access token, or refresh token in outbox |
-| Anti-enumeration | `ForgotPassword` always returns 202; unknown/locked/deleted users run dummy path |
-| Generic token oracle | Reset/accept return generic 401 for expired, used, invalid, or revoked token |
-| Session revocation after reset | All user sessions and active refresh history rows revoked in same transaction |
-| No auto-login | `AcceptInvite` creates user but no session |
-| Admin guard | `AdminBootstrapGuard` is temporary; documented as not final RBAC |
-| Token logging | No raw token, token hash, password hash, or email body in logs/metrics/traces |
+| Decision                       | Detail                                                                                                                                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Token storage                  | Only HMAC-SHA-256 hash stored in DB (`token_hash`). Raw reset/invite tokens are never persisted and never returned by HTTP responses                                                           |
+| Token domain prefix            | `HashPasswordResetToken` prefixes `nchat-password-reset-v1:`, `HashInviteToken` prefixes `nchat-invite-v1:` — prevents cross-type hash collisions                                              |
+| Outbox payload                 | Metadata-only (`reset_token_id` or `invite_id`, optional non-sensitive JSON). No raw token, complete token link, token hash, password, password hash, access token, or refresh token in outbox |
+| Anti-enumeration               | `ForgotPassword` always returns 202; unknown/locked/deleted users run dummy path                                                                                                               |
+| Generic token oracle           | Reset/accept return generic 401 for expired, used, invalid, or revoked token                                                                                                                   |
+| Session revocation after reset | All user sessions and active refresh history rows revoked in same transaction                                                                                                                  |
+| No auto-login                  | `AcceptInvite` creates user but no session                                                                                                                                                     |
+| Admin guard                    | `AdminBootstrapGuard` is temporary; documented as not final RBAC                                                                                                                               |
+| Token logging                  | No raw token, token hash, password hash, or email body in logs/metrics/traces                                                                                                                  |
 
 ---
 
@@ -523,50 +533,50 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 ### Part A — Session expiry
 
-| Test | Location | Type |
-|------|----------|------|
+| Test                                                                                  | Location                          | Type                 |
+| ------------------------------------------------------------------------------------- | --------------------------------- | -------------------- |
 | Active session refresh succeeds and extends `idle_expires_at` by policy TTL (not 30d) | `service/session_service_test.go` | Service (fake store) |
-| Idle-expired session rejects refresh with `ErrInvalidRefreshToken` | `service/session_service_test.go` | Service (fake store) |
-| Absolute-expired session rejects refresh | `service/session_service_test.go` | Service (fake store) |
-| Revoked session rejects refresh | `service/session_service_test.go` | Service (fake store) |
-| Logout on unknown/expired token returns no error (handler maps to 204) | `http/auth_handler_test.go` | Handler |
-| Store reads policy within rotation TX, updates `idle_expires_at` correctly | `storage/session_store_test.go` | Store (pgxmock) |
+| Idle-expired session rejects refresh with `ErrInvalidRefreshToken`                    | `service/session_service_test.go` | Service (fake store) |
+| Absolute-expired session rejects refresh                                              | `service/session_service_test.go` | Service (fake store) |
+| Revoked session rejects refresh                                                       | `service/session_service_test.go` | Service (fake store) |
+| Logout on unknown/expired token returns no error (handler maps to 204)                | `http/auth_handler_test.go`       | Handler              |
+| Store reads policy within rotation TX, updates `idle_expires_at` correctly            | `storage/session_store_test.go`   | Store (pgxmock)      |
 
 ### Part B — Password recovery
 
-| Test | Location | Type |
-|------|----------|------|
-| Known active user creates hashed token + outbox row, returns generic 202 | `service/password_reset_service_test.go` | Service |
-| Unknown email returns same generic response, no token created | `service/password_reset_service_test.go` | Service |
-| Deleted/suspended/locked user returns same generic response | `service/password_reset_service_test.go` | Service |
-| Valid token: updates Argon2id hash, marks `used_at`, revokes sessions + token history | `storage/password_reset_store_test.go` | Store (pgxmock) |
-| Expired token rejected with `ErrInvalidToken` | `storage/password_reset_store_test.go` | Store (pgxmock) |
-| Used token rejected | `storage/password_reset_store_test.go` | Store (pgxmock) |
-| Unknown token rejected | `storage/password_reset_store_test.go` | Store (pgxmock) |
-| Weak password rejected with `ErrPasswordPolicy` | `service/password_reset_service_test.go` | Service |
-| Token hash stored ≠ raw token (hash does not contain raw) | `service/token_service_test.go` | Unit |
-| Outbox row does not contain raw token, token hash, or link (metadata-only) | `storage/password_reset_store_test.go` | Store |
-| POST /auth/password/reset body > 4 KiB → 413 | `http/password_handler_test.go` | Handler |
-| POST /auth/password/forgot body > 4 KiB → 413 | `http/password_handler_test.go` | Handler |
-| Rate limit exceeded → 429 | `http/password_handler_test.go` | Handler |
-| HTTP response never contains token_hash or password_hash | `http/password_handler_test.go` | Handler |
+| Test                                                                                  | Location                                 | Type            |
+| ------------------------------------------------------------------------------------- | ---------------------------------------- | --------------- |
+| Known active user creates hashed token + outbox row, returns generic 202              | `service/password_reset_service_test.go` | Service         |
+| Unknown email returns same generic response, no token created                         | `service/password_reset_service_test.go` | Service         |
+| Deleted/suspended/locked user returns same generic response                           | `service/password_reset_service_test.go` | Service         |
+| Valid token: updates Argon2id hash, marks `used_at`, revokes sessions + token history | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Expired token rejected with `ErrInvalidToken`                                         | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Used token rejected                                                                   | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Unknown token rejected                                                                | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Weak password rejected with `ErrPasswordPolicy`                                       | `service/password_reset_service_test.go` | Service         |
+| Token hash stored ≠ raw token (hash does not contain raw)                             | `service/token_service_test.go`          | Unit            |
+| Outbox row does not contain raw token, token hash, or link (metadata-only)            | `storage/password_reset_store_test.go`   | Store           |
+| POST /auth/password/reset body > 4 KiB → 413                                          | `http/password_handler_test.go`          | Handler         |
+| POST /auth/password/forgot body > 4 KiB → 413                                         | `http/password_handler_test.go`          | Handler         |
+| Rate limit exceeded → 429                                                             | `http/password_handler_test.go`          | Handler         |
+| HTTP response never contains token_hash or password_hash                              | `http/password_handler_test.go`          | Handler         |
 
 ### Part C — Invites
 
-| Test | Location | Type |
-|------|----------|------|
-| Admin creates invite: hashed token + outbox row created | `service/invite_service_test.go` | Service |
-| Duplicate existing user returns 409 | `http/invite_handler_test.go` | Handler |
-| Active pending invite returns 409 | `http/invite_handler_test.go` | Handler |
-| Missing/wrong admin token returns 503/401 | `http/invite_handler_test.go` | Handler |
-| `POST /admin/invites` response never includes raw token | `http/invite_handler_test.go` | Handler |
-| Accept valid invite: creates user + credential, marks invite accepted | `storage/invite_store_test.go` | Store (pgxmock) |
-| Expired/used/unknown invite rejected with generic 401 | `storage/invite_store_test.go` | Store (pgxmock) |
-| Weak password during accept rejected | `service/invite_service_test.go` | Service |
-| Accept does NOT create session (no session in response) | `http/invite_handler_test.go` | Handler |
-| Outbox row does not contain raw token, token hash, or link | `storage/invite_store_test.go` | Store |
-| POST /auth/invites/accept body > 4 KiB → 413 | `http/invite_handler_test.go` | Handler |
-| Rate limit exceeded → 429 | `http/invite_handler_test.go` | Handler |
+| Test                                                                  | Location                         | Type            |
+| --------------------------------------------------------------------- | -------------------------------- | --------------- |
+| Admin creates invite: hashed token + outbox row created               | `service/invite_service_test.go` | Service         |
+| Duplicate existing user returns 409                                   | `http/invite_handler_test.go`    | Handler         |
+| Active pending invite returns 409                                     | `http/invite_handler_test.go`    | Handler         |
+| Missing/wrong admin token returns 503/401                             | `http/invite_handler_test.go`    | Handler         |
+| `POST /admin/invites` response never includes raw token               | `http/invite_handler_test.go`    | Handler         |
+| Accept valid invite: creates user + credential, marks invite accepted | `storage/invite_store_test.go`   | Store (pgxmock) |
+| Expired/used/unknown invite rejected with generic 401                 | `storage/invite_store_test.go`   | Store (pgxmock) |
+| Weak password during accept rejected                                  | `service/invite_service_test.go` | Service         |
+| Accept does NOT create session (no session in response)               | `http/invite_handler_test.go`    | Handler         |
+| Outbox row does not contain raw token, token hash, or link            | `storage/invite_store_test.go`   | Store           |
+| POST /auth/invites/accept body > 4 KiB → 413                          | `http/invite_handler_test.go`    | Handler         |
+| Rate limit exceeded → 429                                             | `http/invite_handler_test.go`    | Handler         |
 
 ---
 
@@ -574,42 +584,42 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 ### New
 
-| File | Purpose |
-|------|---------|
-| `migrations/auth/000004_auth_session_recovery_invites.up.sql` | Adds policy TTL columns + email_outbox |
-| `migrations/auth/000004_auth_session_recovery_invites.down.sql` | Removes above |
-| `services/auth-service/internal/service/password_reset_service.go` | ForgotPassword, ResetPassword |
-| `services/auth-service/internal/service/password_reset_service_test.go` | Service tests |
-| `services/auth-service/internal/service/invite_service.go` | CreateInvite, AcceptInvite |
-| `services/auth-service/internal/service/invite_service_test.go` | Service tests |
-| `services/auth-service/internal/storage/password_reset_store.go` | PGXPasswordResetStore |
-| `services/auth-service/internal/storage/password_reset_store_test.go` | Store tests |
-| `services/auth-service/internal/storage/invite_store.go` | PGXInviteStore |
-| `services/auth-service/internal/storage/invite_store_test.go` | Store tests |
-| `services/auth-service/internal/http/password_handler.go` | AuthForgotPassword, AuthResetPassword |
-| `services/auth-service/internal/http/password_handler_test.go` | Handler tests |
-| `services/auth-service/internal/http/invite_handler.go` | AdminCreateInvite, AuthAcceptInvite |
-| `services/auth-service/internal/http/invite_handler_test.go` | Handler tests |
-| `docs/runbooks/task-auth-session-recovery-invites.md` | Runbook |
+| File                                                                    | Purpose                                |
+| ----------------------------------------------------------------------- | -------------------------------------- |
+| `migrations/auth/000004_auth_session_recovery_invites.up.sql`           | Adds policy TTL columns + email_outbox |
+| `migrations/auth/000004_auth_session_recovery_invites.down.sql`         | Removes above                          |
+| `services/auth-service/internal/service/password_reset_service.go`      | ForgotPassword, ResetPassword          |
+| `services/auth-service/internal/service/password_reset_service_test.go` | Service tests                          |
+| `services/auth-service/internal/service/invite_service.go`              | CreateInvite, AcceptInvite             |
+| `services/auth-service/internal/service/invite_service_test.go`         | Service tests                          |
+| `services/auth-service/internal/storage/password_reset_store.go`        | PGXPasswordResetStore                  |
+| `services/auth-service/internal/storage/password_reset_store_test.go`   | Store tests                            |
+| `services/auth-service/internal/storage/invite_store.go`                | PGXInviteStore                         |
+| `services/auth-service/internal/storage/invite_store_test.go`           | Store tests                            |
+| `services/auth-service/internal/http/password_handler.go`               | AuthForgotPassword, AuthResetPassword  |
+| `services/auth-service/internal/http/password_handler_test.go`          | Handler tests                          |
+| `services/auth-service/internal/http/invite_handler.go`                 | AdminCreateInvite, AuthAcceptInvite    |
+| `services/auth-service/internal/http/invite_handler_test.go`            | Handler tests                          |
+| `docs/runbooks/task-auth-session-recovery-invites.md`                   | Runbook                                |
 
 ### Modified
 
-| File | Change |
-|------|--------|
-| `domain/auth.go` | Add `ForgotPasswordInput`, `ResetPasswordInput`, `AdminInviteInput`, `AcceptInviteInput`, `AcceptInviteResult` |
-| `domain/errors.go` | Add `ErrInvalidToken`, `ErrInviteAlreadyPending` |
-| `domain/user.go` | Add `PasswordResetTokenTTLMinutes`, `InviteTokenTTLHours` to `PolicySettings` |
-| `service/token_service.go` | Add `GenerateOpaqueToken`, `HashPasswordResetToken`, `HashInviteToken` |
-| `service/auth_service.go` | Remove `expiresAt` from `RotateRefreshToken` call |
-| `service/session_service_test.go` | Update for new interface; add expiry tests |
-| `storage/session_store.go` | `RotateRefreshToken` reads policy in TX, uses idle TTL; remove `expiresAt` param |
-| `storage/session_store_test.go` | Update mocks for policy query; update expiry assertions |
-| `storage/user_store.go` | `GetPolicySettings` scans two new columns |
-| `storage/login_store.go` | `selectLoginPolicy` scans two new columns |
-| `http/router.go` | Wire new handlers with rate limiters |
-| `http/routes.go` | Add 4 new route constants |
-| `app/app.go` | Instantiate and wire `PasswordResetService`, `InviteService` |
-| `README.md` | Auth section: document endpoints, RF traceability, out-of-scope |
+| File                              | Change                                                                                                         |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `domain/auth.go`                  | Add `ForgotPasswordInput`, `ResetPasswordInput`, `AdminInviteInput`, `AcceptInviteInput`, `AcceptInviteResult` |
+| `domain/errors.go`                | Add `ErrInvalidToken`, `ErrInviteAlreadyPending`                                                               |
+| `domain/user.go`                  | Add `PasswordResetTokenTTLMinutes`, `InviteTokenTTLHours` to `PolicySettings`                                  |
+| `service/token_service.go`        | Add `GenerateOpaqueToken`, `HashPasswordResetToken`, `HashInviteToken`                                         |
+| `service/auth_service.go`         | Remove `expiresAt` from `RotateRefreshToken` call                                                              |
+| `service/session_service_test.go` | Update for new interface; add expiry tests                                                                     |
+| `storage/session_store.go`        | `RotateRefreshToken` reads policy in TX, uses idle TTL; remove `expiresAt` param                               |
+| `storage/session_store_test.go`   | Update mocks for policy query; update expiry assertions                                                        |
+| `storage/user_store.go`           | `GetPolicySettings` scans two new columns                                                                      |
+| `storage/login_store.go`          | `selectLoginPolicy` scans two new columns                                                                      |
+| `http/router.go`                  | Wire new handlers with rate limiters                                                                           |
+| `http/routes.go`                  | Add 4 new route constants                                                                                      |
+| `app/app.go`                      | Instantiate and wire `PasswordResetService`, `InviteService`                                                   |
+| `README.md`                       | Auth section: document endpoints, RF traceability, out-of-scope                                                |
 
 ---
 

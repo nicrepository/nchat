@@ -26,7 +26,8 @@ func TestPGXUserStore_GetPolicySettings_Success(t *testing.T) {
 			"require_number", "require_symbol", "failed_login_limit",
 			"failed_login_window_minutes", "failed_login_lockout_minutes",
 			"session_idle_timeout_minutes", "max_devices_per_user",
-		}).AddRow(12, true, true, true, true, 5, 15, 15, 60, 5))
+			"password_reset_token_ttl_minutes", "invite_token_ttl_hours",
+		}).AddRow(12, true, true, true, true, 5, 15, 15, 60, 5, 60, 72))
 
 	store := storage.NewPGXUserStore(mock)
 	policy, err := store.GetPolicySettings(context.Background())
@@ -44,6 +45,9 @@ func TestPGXUserStore_GetPolicySettings_Success(t *testing.T) {
 	}
 	if policy.SessionIdleTimeoutMinutes != 60 || policy.MaxDevicesPerUser != 5 {
 		t.Fatalf("unexpected session/device policy: %+v", policy)
+	}
+	if policy.PasswordResetTokenTTLMinutes != 60 || policy.InviteTokenTTLHours != 72 {
+		t.Fatalf("unexpected recovery/invite policy: %+v", policy)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

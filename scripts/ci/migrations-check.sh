@@ -149,7 +149,7 @@ is_plaintext_credential_column() {
   local column="$1"
 
   case "$column" in
-    *_hash)
+    *_hash|token_id|*_token_id)
       return 1
       ;;
     token|*_token|token_*|*_token_*|raw_token|*_raw_token*)

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 	"github.com/nicrepository/nchat/services/auth-service/internal/service"
@@ -15,16 +14,14 @@ type fakeSessionStore struct {
 	session domain.Session
 	err     error
 
-	rotateOldHash   string
-	rotateNewHash   string
-	rotateExpiresAt time.Time
-	revokeHash      string
+	rotateOldHash string
+	rotateNewHash string
+	revokeHash    string
 }
 
-func (f *fakeSessionStore) RotateRefreshToken(_ context.Context, oldHash string, newHash string, expiresAt time.Time) (domain.Session, error) {
+func (f *fakeSessionStore) RotateRefreshToken(_ context.Context, oldHash string, newHash string) (domain.Session, error) {
 	f.rotateOldHash = oldHash
 	f.rotateNewHash = newHash
-	f.rotateExpiresAt = expiresAt
 	return f.session, f.err
 }
 
@@ -58,9 +55,6 @@ func TestAuthService_RefreshRotatesToken(t *testing.T) {
 	if store.rotateOldHash == store.rotateNewHash {
 		t.Fatal("refresh must rotate to a new token hash")
 	}
-	if !store.rotateExpiresAt.After(time.Now().Add(29 * 24 * time.Hour)) {
-		t.Fatalf("expected refresh expiry about 30 days out, got %s", store.rotateExpiresAt)
-	}
 	if pair.TokenType != "Bearer" {
 		t.Fatalf("expected Bearer token type, got %q", pair.TokenType)
 	}
@@ -79,12 +73,25 @@ func TestAuthService_RefreshRotatesToken(t *testing.T) {
 	}
 }
 
-func TestAuthService_RefreshRejectsRevokedOrExpiredSession(t *testing.T) {
+func TestAuthService_RefreshRejectsIdleExpiredSession(t *testing.T) {
+	assertRefreshRejectsInvalidSession(t, "idle-expired-token")
+}
+
+func TestAuthService_RefreshRejectsAbsoluteExpiredSession(t *testing.T) {
+	assertRefreshRejectsInvalidSession(t, "absolute-expired-token")
+}
+
+func TestAuthService_RefreshRejectsRevokedSession(t *testing.T) {
+	assertRefreshRejectsInvalidSession(t, "revoked-token")
+}
+
+func assertRefreshRejectsInvalidSession(t *testing.T, refreshToken string) {
+	t.Helper()
 	manager := newTestTokenManager(t, strings.Repeat("g", 32))
 	store := &fakeSessionStore{err: domain.ErrInvalidRefreshToken}
 	auth := service.NewAuthService(manager, store)
 
-	_, err := auth.Refresh(context.Background(), "revoked-or-expired-token")
+	_, err := auth.Refresh(context.Background(), refreshToken)
 	if !errors.Is(err, domain.ErrInvalidRefreshToken) {
 		t.Fatalf("expected ErrInvalidRefreshToken, got %v", err)
 	}

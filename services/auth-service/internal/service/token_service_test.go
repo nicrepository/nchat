@@ -253,6 +253,48 @@ func TestTokenManager_HashesDeviceFingerprintWithSecret(t *testing.T) {
 	}
 }
 
+func TestTokenManager_GenerateOpaqueToken(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("o", 32))
+
+	raw, err := manager.GenerateOpaqueToken()
+	if err != nil {
+		t.Fatalf("GenerateOpaqueToken: %v", err)
+	}
+	if len(raw) < 32 {
+		t.Fatalf("expected opaque token length >= 32, got %d", len(raw))
+	}
+	if strings.ContainsAny(raw, "+/") {
+		t.Fatalf("expected base64url token, got %q", raw)
+	}
+}
+
+func TestTokenManager_HashesPasswordResetAndInviteTokensWithDomainSeparation(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("p", 32))
+	raw := "raw-token-value"
+
+	resetHash := manager.HashPasswordResetToken(raw)
+	inviteHash := manager.HashInviteToken(raw)
+
+	if resetHash == "" || inviteHash == "" {
+		t.Fatal("expected token hashes")
+	}
+	if resetHash == raw || inviteHash == raw {
+		t.Fatal("token hash must not equal raw token")
+	}
+	if strings.Contains(resetHash, raw) || strings.Contains(inviteHash, raw) {
+		t.Fatal("token hashes must not contain raw token")
+	}
+	if len(resetHash) != 64 || len(inviteHash) != 64 {
+		t.Fatalf("expected hex SHA-256/HMAC hashes, got reset=%d invite=%d", len(resetHash), len(inviteHash))
+	}
+	if resetHash == inviteHash {
+		t.Fatal("password reset and invite hashes must be domain-separated")
+	}
+	if resetHash != manager.HashPasswordResetToken(raw) || inviteHash != manager.HashInviteToken(raw) {
+		t.Fatal("token hashes must be deterministic")
+	}
+}
+
 func claimStringsContain(values jwt.ClaimStrings, want string) bool {
 	for _, value := range values {
 		if value == want {

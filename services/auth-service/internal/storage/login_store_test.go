@@ -25,6 +25,7 @@ var policyColumns = []string{
 	"require_number", "require_symbol", "failed_login_limit",
 	"failed_login_window_minutes", "failed_login_lockout_minutes",
 	"session_idle_timeout_minutes", "max_devices_per_user",
+	"password_reset_token_ttl_minutes", "invite_token_ttl_hours",
 }
 
 // defaultPolicyRow returns a standard policy row: limit=5, window=15, lockout=15, idle=60, maxDevices=5.
@@ -34,7 +35,7 @@ func defaultPolicyRow() *pgxmock.Rows {
 
 func policyRow(limit, windowMinutes, lockoutMinutes, idleMinutes, maxDevices int) *pgxmock.Rows {
 	return pgxmock.NewRows(policyColumns).
-		AddRow(12, true, true, true, true, limit, windowMinutes, lockoutMinutes, idleMinutes, maxDevices)
+		AddRow(12, true, true, true, true, limit, windowMinutes, lockoutMinutes, idleMinutes, maxDevices, 60, 72)
 }
 
 func mustHashPassword(t *testing.T, password string) string {

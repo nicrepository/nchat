@@ -29,6 +29,8 @@ func New(cfg config.Config) *App {
 	var users service.UserCreator
 	var auth service.AuthSessionManager
 	var login service.LoginManager
+	var password service.PasswordRecoveryManager
+	var invites service.InviteManager
 	var pool storage.Pool
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -57,12 +59,14 @@ func New(cfg config.Config) *App {
 	default:
 		auth = service.NewAuthService(tokens, storage.NewPGXSessionStore(pool))
 		login = service.NewLoginService(tokens, storage.NewPGXLoginStore(pool, service.VerifyPassword, service.RunDummyPasswordVerification))
+		password = service.NewPasswordResetService(tokens, storage.NewPGXPasswordResetStore(pool))
+		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool))
 	}
 
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites),
 		TracingShutdown: shutdown,
 	}
 }
