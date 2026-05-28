@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Protótipo padronizado</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  html, body { margin: 0; height: 100%; font-family: "Inter", system-ui, sans-serif; background: #F5F2FA; }
+  iframe { border: 0; width: 100%; height: 100%; display: block; background: #F7F5FB; }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel">
+  const Frame = ({ src }) => <iframe src={src} title={src} />;
+
+  function App() {
+    return (
+      <DesignCanvas defaultZoom={0.42}>
+
+        <DCSection id="entrada" title="Entrada">
+          <DCArtboard id="login" label="Login" width={1280} height={860}>
+            <Frame src="login.html" />
+          </DCArtboard>
+        </DCSection>
+
+        <DCSection id="chamadas" title="Chamadas de áudio">
+          <DCArtboard id="chamada-1to1" label="Chamada 1:1 · Juliane Lino" width={1440} height={900}>
+            <Frame src="chamada-audio-1to1.html" />
+          </DCArtboard>
+          <DCArtboard id="chamada-grupo" label="Chamada em grupo · #infraestrutura" width={1440} height={900}>
+            <Frame src="chamada-audio-grupo.html" />
+          </DCArtboard>
+        </DCSection>
+
+        <DCSection id="chat" title="Chat & comunicação">
+          <DCArtboard id="canal" label="Canal #infraestrutura — com mensagens" width={1440} height={1000}>
+            <Frame src="canal.html" />
+          </DCArtboard>
+          <DCArtboard id="shell" label="Canal vazio (estado inicial)" width={1440} height={900}>
+            <Frame src="shell.html" />
+          </DCArtboard>
+          <DCArtboard id="chamada" label="Canal com chamada de voz ativa" width={1440} height={900}>
+            <Frame src="chamada.html" />
+          </DCArtboard>
+          <DCArtboard id="dm" label="Mensagem direta · Juliane Lino" width={1440} height={900}>
+            <Frame src="dm.html" />
+          </DCArtboard>
+        </DCSection>
+
+        <DCSection id="conteudo" title="Conteúdo & descoberta">
+          <DCArtboard id="arquivos" label="Arquivos — painel fechável" width={1440} height={900}>
+            <Frame src="arquivos.html" />
+          </DCArtboard>
+          <DCArtboard id="busca" label="Busca global — “backup”" width={1440} height={900}>
+            <Frame src="busca.html" />
+          </DCArtboard>
+        </DCSection>
+
+        <DCSection id="conta" title="Conta & preferências">
+          <DCArtboard id="perfil" label="Perfil + horário de trabalho (somente leitura)" width={1440} height={1300}>
+            <Frame src="perfil.html" />
+          </DCArtboard>
+          <DCArtboard id="notificacoes" label="Notificações" width={1440} height={1100}>
+            <Frame src="notificacoes.html" />
+          </DCArtboard>
+          <DCArtboard id="seguranca" label="Segurança · senha, 2FA, atividades" width={1440} height={1400}>
+            <Frame src="seguranca.html" />
+          </DCArtboard>
+          <DCArtboard id="sessoes" label="Sessões · dispositivos + revogar" width={1440} height={1000}>
+            <Frame src="sessoes.html" />
+          </DCArtboard>
+        </DCSection>
+
+        <DCSection id="admin" title="Administração">
+          <DCArtboard id="admin" label="Admin · Visão geral" width={1440} height={900}>
+            <Frame src="admin.html" />
+          </DCArtboard>
+          <DCArtboard id="admin-usuarios" label="Admin · Usuários (drawer com horário editável)" width={1440} height={1000}>
+            <Frame src="admin-usuarios.html" />
+          </DCArtboard>
+          <DCArtboard id="admin-canais" label="Admin · Canais" width={1440} height={1200}>
+            <Frame src="admin-canais.html" />
+          </DCArtboard>
+          <DCArtboard id="admin-auditoria" label="Admin · Auditoria" width={1440} height={1100}>
+            <Frame src="admin-auditoria.html" />
+          </DCArtboard>
+        </DCSection>
+
+        <DCSection id="sistema" title="Sistema visual">
+          <DCArtboard id="estados" label="Galeria de estados & feedbacks" width={1320} height={2200}>
+            <Frame src="estados.html" />
+          </DCArtboard>
+        </DCSection>
+
+      </DesignCanvas>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

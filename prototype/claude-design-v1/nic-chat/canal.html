@@ -1,0 +1,1630 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — #infraestrutura</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+
+/* ── Channel header ─────────────────────────────────── */
+.channel-header {
+  height: var(--topbar-h);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  display: flex; align-items: center;
+  padding: 0 var(--space-6);
+  gap: var(--space-4);
+  flex-shrink: 0;
+}
+.channel-title {
+  font-size: 18px; font-weight: 700;
+  color: var(--color-ink); margin: 0;
+  display: flex; align-items: center; gap: 4px;
+}
+.channel-title .hash { color: var(--color-muted-2); font-weight: 400; }
+.channel-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+
+/* ── Pinned banner ──────────────────────────────────── */
+.pinned {
+  background: #FFFBEB;
+  border-bottom: 1px solid #FDE68A;
+  padding: 9px var(--space-6);
+  display: flex; align-items: center; gap: 10px;
+  font-size: 13px; color: var(--color-warning-ink);
+  flex-shrink: 0;
+}
+.pinned .material-symbols-outlined { color: var(--color-warning); font-size: 18px; transform: rotate(40deg); }
+.pinned__cta {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid #FDE68A;
+  color: var(--color-warning-ink);
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+}
+
+/* ── Chat area ──────────────────────────────────────── */
+.chat {
+  flex: 1; overflow-y: auto;
+  background: var(--color-bg);
+  padding: var(--space-5) var(--space-6) var(--space-3);
+  display: flex; flex-direction: column; gap: 14px;
+}
+.day-divider {
+  align-self: center;
+  background: var(--color-surface);
+  color: var(--color-muted);
+  font-size: 12px; font-weight: 600;
+  padding: 4px 14px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border);
+  margin: 6px 0;
+}
+
+/* ── Messages ───────────────────────────────────────── */
+.msg { display: flex; gap: 12px; }
+.msg__avatar { flex-shrink: 0; margin-top: 2px; }
+.msg__body { min-width: 0; max-width: 680px; display: flex; flex-direction: column; }
+.msg__head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.msg__name { font-size: 13.5px; font-weight: 700; color: var(--color-ink); }
+.msg__time { font-size: 11px; color: var(--color-muted-2); }
+.msg__text {
+  font-size: 14px; line-height: 1.55;
+  color: var(--color-ink);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 12px; border-top-left-radius: 4px;
+  padding: 10px 14px;
+}
+
+/* Grouped — same sender, same minute */
+.msg--grouped { margin-top: -10px; }
+.msg--grouped .msg__head { display: none; }
+.msg--grouped .msg__avatar { opacity: 0; pointer-events: none; }
+
+/* Own messages — right side */
+.msg--mine { flex-direction: row-reverse; align-self: flex-end; }
+.msg--mine .msg__head { flex-direction: row-reverse; }
+.msg--mine .msg__body { align-items: flex-end; }
+.msg--mine .msg__text {
+  background: var(--color-primary-tint);
+  border-color: var(--color-primary-tint-strong);
+  border-top-left-radius: 12px;
+  border-top-right-radius: 4px;
+}
+
+/* Reactions */
+.reactions { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
+.reaction {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  padding: 2px 8px;
+  font-size: 12px; font-weight: 500;
+  color: var(--color-ink-2);
+  cursor: pointer;
+}
+.reaction:hover { border-color: var(--color-primary-soft); background: var(--color-primary-tint); }
+.reaction--mine { background: var(--color-primary-tint); border-color: var(--color-primary-tint-strong); color: var(--color-primary-strong); }
+.reaction--add { background: transparent; border: 1px dashed var(--color-border-strong); color: var(--color-muted-2); }
+
+/* Read receipts */
+.msg__read {
+  font-size: 11px; font-weight: 500;
+  color: var(--color-muted);
+  margin-top: 3px;
+  display: inline-flex; align-items: center; gap: 3px;
+}
+.msg__read .material-symbols-outlined { font-size: 14px; }
+.msg__read--read { color: var(--color-primary); }
+
+/* File attachment (non-image) */
+.msg__file {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 12px; border-top-left-radius: 4px;
+  padding: 10px 12px;
+  max-width: 320px;
+}
+.msg--mine .msg__file {
+  background: var(--color-primary-tint);
+  border-color: var(--color-primary-tint-strong);
+  border-top-left-radius: 12px; border-top-right-radius: 4px;
+}
+.msg__file-icon {
+  width: 36px; height: 36px;
+  border-radius: var(--radius-sm);
+  background: #FEE2E2; color: #DC2626;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.msg__file-icon .material-symbols-outlined { font-size: 22px; }
+.msg__file-body { flex: 1; min-width: 0; }
+.msg__file-name { font-size: 13px; font-weight: 600; color: var(--color-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.msg__file-meta { font-size: 11.5px; color: var(--color-muted); margin-top: 2px; display: flex; align-items: center; gap: 5px; }
+
+/* Image attachment */
+.msg__img-wrap {
+  width: 280px;
+  border: 1px solid var(--color-border);
+  border-radius: 12px; border-top-left-radius: 4px;
+  overflow: hidden;
+}
+.msg--mine .msg__img-wrap {
+  border-top-left-radius: 12px; border-top-right-radius: 4px;
+}
+.msg__img-wrap img {
+  width: 280px; height: 180px;
+  display: block; object-fit: cover;
+}
+.msg__img-footer {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--color-surface);
+  border-top: 1px solid var(--color-border);
+  padding: 9px 12px;
+  width: 280px; box-sizing: border-box;
+}
+.msg__img-name { font-size: 13px; font-weight: 600; color: var(--color-ink); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.msg__img-meta { font-size: 11.5px; color: var(--color-muted); margin-top: 2px; display: flex; align-items: center; gap: 5px; }
+
+.attach-action {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  color: var(--color-ink-2);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px; font-weight: 600;
+  cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+.attach-action:hover { background: var(--color-bg); }
+
+/* ── Composer ───────────────────────────────────────── */
+.composer {
+  padding: var(--space-3) var(--space-5) var(--space-4);
+  background: var(--color-bg);
+  flex-shrink: 0;
+}
+.composer__box {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 10px 0 4px;
+  transition: border-color .12s, box-shadow .12s;
+}
+.composer__box:focus-within {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(109,40,217,0.10);
+}
+.composer__input {
+  flex: 1;
+  padding: 12px 8px;
+  border: none; outline: none;
+  background: transparent;
+  font-size: 14px; color: var(--color-ink);
+  resize: none; font-family: inherit;
+  min-height: 42px; max-height: 160px;
+}
+.composer__send {
+  background: var(--color-primary); color: #fff; border: none;
+  width: 36px; height: 36px;
+  border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0;
+}
+.composer__send:hover { background: var(--color-primary-strong); }
+.composer__mic {
+  background: transparent; border: none;
+  color: var(--color-muted); cursor: pointer;
+  width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-md); flex-shrink: 0;
+}
+.composer__mic:hover { background: var(--color-surface-2); color: var(--color-primary); }
+
+/* ── Right panel ────────────────────────────────────── */
+.right-panel {
+  background: var(--color-surface);
+  border-left: 1px solid var(--color-border);
+  display: flex; flex-direction: column;
+  min-height: 0; overflow: hidden;
+}
+.right-panel__head {
+  height: var(--topbar-h);
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--color-border);
+  display: flex; align-items: center; justify-content: space-between;
+  flex-shrink: 0;
+}
+.right-panel__head h3 { font-size: 15px; font-weight: 700; margin: 0; }
+.right-panel__body {
+  flex: 1; overflow-y: auto;
+  padding: var(--space-5);
+  display: flex; flex-direction: column; gap: var(--space-5);
+}
+.panel-label {
+  font-size: 11px; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--color-muted); margin-bottom: 8px;
+}
+.panel-desc {
+  font-size: 13px; line-height: 1.55;
+  color: var(--color-ink-2);
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+.panel-meta { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--color-muted); padding: 6px 0; }
+.panel-meta .material-symbols-outlined { font-size: 16px; color: var(--color-muted-2); }
+
+.member-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-radius: var(--radius-md); position: relative; }
+.member-row:hover { background: var(--color-surface-2); }
+.member-row:hover .member-row__remove { opacity: 1; }
+.member-row__name { font-size: 13px; font-weight: 600; color: var(--color-ink); }
+.member-row__role { font-size: 11.5px; color: var(--color-muted); }
+.member-row__remove {
+  margin-left: auto; flex-shrink: 0;
+  opacity: 0; transition: opacity .12s;
+  background: transparent; border: none;
+  color: var(--color-muted-2); cursor: pointer;
+  width: 28px; height: 28px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+}
+.member-row__remove:hover { background: var(--color-danger-tint); color: var(--color-danger); }
+.member-row__remove .material-symbols-outlined { font-size: 17px; }
+
+/* ── Add members modal ─────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(22, 18, 31, 0.42);
+  backdrop-filter: blur(3px);
+  display: none; align-items: center; justify-content: center;
+}
+.modal-overlay.is-open { display: flex; }
+.modal {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  width: min(480px, 94vw);
+  max-height: 82vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.modal__head {
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--color-border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal__title { font-size: 16px; font-weight: 700; color: var(--color-ink); margin: 0; }
+.modal__sub { font-size: 12px; color: var(--color-muted); margin-top: 3px; }
+.modal__close {
+  background: transparent; border: none;
+  color: var(--color-muted-2); cursor: pointer;
+  width: 30px; height: 30px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal__close:hover { background: var(--color-bg); color: var(--color-ink); }
+.modal__search { padding: 14px 22px 10px; }
+.modal__search-wrap { position: relative; }
+.modal__search-wrap input {
+  width: 100%; box-sizing: border-box;
+  padding: 9px 14px 9px 38px;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  font-size: 14px; color: var(--color-ink); outline: none;
+  font-family: inherit;
+}
+.modal__search-wrap input:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(109,40,217,0.10);
+}
+.modal__search-icon {
+  position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+  color: var(--color-muted-2); font-size: 18px; pointer-events: none;
+}
+.modal__list { flex: 1; overflow-y: auto; padding: 4px 14px 10px; }
+.modal__section-label {
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--color-muted); padding: 8px 8px 4px;
+}
+.modal__user {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 10px; border-radius: var(--radius-md);
+  cursor: pointer; position: relative; user-select: none;
+}
+.modal__user:hover { background: var(--color-surface-2); }
+.modal__user-name { font-size: 13.5px; font-weight: 600; color: var(--color-ink); }
+.modal__user-role { font-size: 12px; color: var(--color-muted); margin-top: 1px; }
+.modal__check {
+  margin-left: auto; flex-shrink: 0;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: transparent;
+  border: 2px solid var(--color-border-strong);
+  display: flex; align-items: center; justify-content: center;
+  transition: background .12s, border-color .12s;
+}
+.modal__user.is-selected .modal__check {
+  background: var(--color-primary); border-color: var(--color-primary);
+}
+.modal__user.is-selected .modal__check::after {
+  content: ""; display: block;
+  width: 5px; height: 9px;
+  border: 2px solid #fff; border-top: none; border-left: none;
+  transform: rotate(42deg) translate(-1px, -1px);
+}
+.modal__user.is-member { opacity: 0.42; pointer-events: none; }
+.modal__user.is-member .modal__check {
+  background: var(--color-success-tint); border-color: var(--color-success);
+}
+.modal__user.is-member .modal__check::after {
+  border-color: var(--color-success);
+}
+.modal__foot {
+  padding: 12px 22px;
+  border-top: 1px solid var(--color-border);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: var(--color-surface-2);
+}
+.modal__selected-info { font-size: 13px; color: var(--color-muted); }
+.modal__selected-info strong { color: var(--color-ink); }
+
+/* ── Confirm remove toast ──────────────────────────── */
+.confirm-toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 14px 18px;
+  display: none; align-items: center; gap: 14px;
+  z-index: 200; min-width: 320px;
+  animation: slideup .18s ease;
+}
+.confirm-toast.is-open { display: flex; }
+@keyframes slideup { from { transform: translate(-50%, 16px); opacity: 0; } to { transform: translate(-50%, 0); opacity: 1; } }
+.confirm-toast__text { flex: 1; font-size: 13.5px; color: var(--color-ink); }
+.confirm-toast__name { font-weight: 700; }
+
+.panel-file {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.panel-file__icon { width: 30px; height: 30px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.panel-file__name { font-size: 13px; font-weight: 600; color: var(--color-ink); }
+.panel-file__meta { font-size: 11px; color: var(--color-muted); margin-top: 1px; }
+
+.pin-row {
+  display: flex; gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.pin-icon { color: var(--color-warning); font-size: 18px; transform: rotate(40deg); flex-shrink: 0; }
+.pin-text { font-size: 12.5px; color: var(--color-ink-2); line-height: 1.45; }
+.pin-by { font-size: 11px; color: var(--color-muted); margin-top: 3px; }
+</style>
+</head>
+<body>
+
+<div class="app app--three details-closed" id="appRoot">
+
+  <div data-sidebar></div>
+
+  <!-- Main column -->
+  <main class="flex col" style="min-width:0; overflow:hidden;">
+
+    <header class="channel-header">
+      <h2 class="channel-title"><span class="hash">#</span>infraestrutura</h2>
+      <div class="channel-actions">
+        <div class="search" onclick="window.location='busca.html'" style="cursor:pointer;">
+          <span class="material-symbols-outlined search__icon">search</span>
+          <input class="search__input" placeholder="Buscar no canal…" readonly style="cursor:pointer;" />
+        </div>
+        <button class="icon-btn" title="Chamada de voz" onclick="window.location='chamada-audio-grupo.html'">
+          <span class="material-symbols-outlined">call</span>
+        </button>
+        <button class="icon-btn" id="toggleDetailsBtn" title="Detalhes do canal">
+          <span class="material-symbols-outlined">info</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="pinned">
+      <span class="material-symbols-outlined">push_pin</span>
+      <span><strong>Mensagem fixada:</strong> Procedimento de deploy atualizado no ambiente de staging.</span>
+      <button class="pinned__cta">Ver</button>
+    </div>
+
+    <div class="chat">
+      <div class="day-divider">Hoje, 15 de maio</div>
+
+      <!-- Juliane — 09:15, 2 mensagens agrupadas -->
+      <div class="msg">
+        <span class="avatar avatar--lg avatar--rose avatar--on-light msg__avatar">JL</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__name">Juliane Lino</span>
+            <span class="msg__time">09:15</span>
+          </div>
+          <div class="msg__text">Bom dia, pessoal. O monitoramento do servidor de aplicações ficou estável durante a madrugada.</div>
+        </div>
+      </div>
+      <div class="msg msg--grouped">
+        <span class="avatar avatar--lg avatar--rose avatar--on-light msg__avatar">JL</span>
+        <div class="msg__body">
+          <div class="msg__text">Vou subir o relatório completo em instantes.</div>
+          <div class="reactions">
+            <button class="reaction">👀 2</button>
+            <button class="reaction reaction--add"><span class="material-symbols-outlined" style="font-size:14px;">add_reaction</span></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Caio — 09:18 -->
+      <div class="msg">
+        <span class="avatar avatar--lg avatar--blue avatar--on-light msg__avatar">CA</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__name">Caio Almeida</span>
+            <span class="msg__time">09:18</span>
+          </div>
+          <div class="msg__text">Vou validar os alertas do Prometheus e revisar os logs do Traefik antes do meio-dia.</div>
+          <div class="reactions">
+            <button class="reaction">✅ 2</button>
+            <button class="reaction reaction--add"><span class="material-symbols-outlined" style="font-size:14px;">add_reaction</span></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Você — 09:24, texto + arquivo agrupados -->
+      <div class="msg msg--mine">
+        <span class="avatar avatar--lg avatar--on-light msg__avatar">AN</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__time">09:24</span>
+          </div>
+          <div class="msg__text">Perfeito. Também vou testar o fluxo de upload e o scan de arquivos no ambiente de staging.</div>
+          <div class="reactions">
+            <button class="reaction reaction--mine">👍 3</button>
+            <button class="reaction reaction--add"><span class="material-symbols-outlined" style="font-size:14px;">add_reaction</span></button>
+          </div>
+          <div class="msg__read msg__read--read">
+            <span class="material-symbols-outlined">done_all</span>Lido por 3
+          </div>
+        </div>
+      </div>
+      <div class="msg msg--mine msg--grouped">
+        <span class="avatar avatar--lg avatar--on-light msg__avatar">AN</span>
+        <div class="msg__body">
+          <div class="msg__file">
+            <div class="msg__file-icon"><span class="material-symbols-outlined">picture_as_pdf</span></div>
+            <div class="msg__file-body">
+              <div class="msg__file-name">relatorio-backup.pdf</div>
+              <div class="msg__file-meta">
+                2,4 MB
+                <span style="opacity:.5;">·</span>
+                <span class="badge badge--warning" style="font-size:10px; padding:1px 6px;">
+                  <span class="material-symbols-outlined" style="font-size:11px;">hourglass_top</span>Em análise
+                </span>
+              </div>
+            </div>
+            <button class="attach-action" onclick="window.location='arquivos.html'">Detalhes</button>
+          </div>
+          <div class="msg__read msg__read--read">
+            <span class="material-symbols-outlined">done_all</span>Lido por 2
+          </div>
+        </div>
+      </div>
+
+      <!-- Fernanda — 09:31 -->
+      <div class="msg">
+        <span class="avatar avatar--lg avatar--teal avatar--on-light msg__avatar">FN</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__name">Fernanda Nicácio</span>
+            <span class="msg__time">09:31</span>
+          </div>
+          <div class="msg__text">Quando finalizarem, me avisem para validarmos com a gestão.</div>
+          <div class="reactions">
+            <button class="reaction reaction--add"><span class="material-symbols-outlined" style="font-size:14px;">add_reaction</span></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Caio — 09:34, imagem -->
+      <div class="msg">
+        <span class="avatar avatar--lg avatar--blue avatar--on-light msg__avatar">CA</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__name">Caio Almeida</span>
+            <span class="msg__time">09:34</span>
+          </div>
+          <div class="msg__img-wrap">
+            <img src="https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=600&h=400&fit=crop" alt="topologia-rede.png" />
+            <div class="msg__img-footer">
+              <div style="flex:1; min-width:0;">
+                <div class="msg__img-name">topologia-rede.png</div>
+                <div class="msg__img-meta">
+                  890 KB
+                  <span style="opacity:.5;">·</span>
+                  <span class="badge badge--success" style="font-size:10px; padding:1px 6px;">
+                    <span class="material-symbols-outlined" style="font-size:11px;">verified</span>Aprovado
+                  </span>
+                </div>
+              </div>
+              <button class="attach-action" onclick="window.location='arquivos.html'">Detalhes</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /chat -->
+
+    <!-- Composer -->
+    <div class="composer">
+      <div class="composer__box">
+        <button class="icon-btn" style="flex-shrink:0;" title="Anexar"><span class="material-symbols-outlined">attach_file</span></button>
+        <textarea class="composer__input" placeholder="Mensagem para #infraestrutura" rows="1"></textarea>
+        <button class="composer__mic" title="Gravar áudio"><span class="material-symbols-outlined">mic</span></button>
+        <button class="composer__send" title="Enviar"><span class="material-symbols-outlined" style="font-size:20px;">send</span></button>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Right panel — direct grid child, toggleable -->
+  <aside class="right-panel details-panel" id="rightPanel">
+    <div class="right-panel__head">
+      <h3>Detalhes do canal</h3>
+      <button class="icon-btn" id="closeDetailsBtn" title="Fechar">
+        <span class="material-symbols-outlined">close</span>
+      </button>
+    </div>
+    <div class="right-panel__body">
+
+      <section>
+        <div class="panel-label">Sobre</div>
+        <div class="panel-desc">Operações, infraestrutura, redes e segurança corporativa do laboratório.</div>
+        <div class="panel-meta"><span class="material-symbols-outlined">calendar_today</span>Criado em 12 de jan. de 2024</div>
+        <div class="panel-meta"><span class="material-symbols-outlined">public</span>Canal público · 12 membros</div>
+      </section>
+
+      <section>
+        <div class="flex items-center justify-between" style="margin-bottom:8px;">
+          <div class="panel-label" id="memberCount" style="margin:0;">Membros online (5)</div>
+          <a href="#" style="font-size:12px; font-weight:600; color: var(--color-primary); text-decoration:none;">Ver todos</a>
+        </div>
+        <div id="membersList">
+        <div class="member-row">
+          <span class="avatar avatar--lg avatar--on-light">AN<span class="avatar__status avatar__status--online"></span></span>
+          <div style="flex:1; min-width:0;">
+            <div class="member-row__name">Álvaro Neto <span class="badge badge--primary" style="font-size:10px; padding:1px 6px;">Você</span></div>
+            <div class="member-row__role">Infraestrutura &amp; Segurança</div>
+          </div>
+        </div>
+
+        <div class="member-row" data-member="JL" data-name="Juliane Lino">
+          <span class="avatar avatar--lg avatar--rose avatar--on-light">JL<span class="avatar__status avatar__status--online"></span></span>
+          <div style="flex:1; min-width:0;">
+            <div class="member-row__name">Juliane Lino</div>
+            <div class="member-row__role">Infraestrutura &amp; Suporte</div>
+          </div>
+          <button class="member-row__remove" title="Remover do canal" data-remove="JL" data-name="Juliane Lino">
+            <span class="material-symbols-outlined">person_remove</span>
+          </button>
+        </div>
+
+        <div class="member-row" data-member="CA" data-name="Caio Almeida">
+          <span class="avatar avatar--lg avatar--blue avatar--on-light">CA<span class="avatar__status avatar__status--online"></span></span>
+          <div style="flex:1; min-width:0;">
+            <div class="member-row__name">Caio Almeida</div>
+            <div class="member-row__role">DevOps</div>
+          </div>
+          <button class="member-row__remove" title="Remover do canal" data-remove="CA" data-name="Caio Almeida">
+            <span class="material-symbols-outlined">person_remove</span>
+          </button>
+        </div>
+
+        <div class="member-row" data-member="FN" data-name="Fernanda Nicácio">
+          <span class="avatar avatar--lg avatar--teal avatar--on-light">FN<span class="avatar__status avatar__status--online"></span></span>
+          <div style="flex:1; min-width:0;">
+            <div class="member-row__name">Fernanda Nicácio</div>
+            <div class="member-row__role">Gestão</div>
+          </div>
+          <button class="member-row__remove" title="Remover do canal" data-remove="FN" data-name="Fernanda Nicácio">
+            <span class="material-symbols-outlined">person_remove</span>
+          </button>
+        </div><!-- /member FN -->
+
+          <button id="btnAddMembers" class="btn btn--secondary" style="width:100%; justify-content:center; margin-top:8px; font-size:12px;">
+            <span class="material-symbols-outlined" style="font-size:16px;">person_add</span>
+            Adicionar membros
+          </button>
+        </div><!-- /membersList -->
+      </section>
+        <div class="pin-row">
+          <span class="material-symbols-outlined pin-icon">push_pin</span>
+          <div>
+            <div class="pin-text">Procedimento de deploy atualizado no ambiente de staging.</div>
+            <div class="pin-by">Fixado por Álvaro Neto · 08/05</div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex items-center justify-between" style="margin-bottom:8px;">
+          <div class="panel-label" style="margin:0;">Arquivos recentes</div>
+          <a href="arquivos.html" style="font-size:12px; font-weight:600; color: var(--color-primary); text-decoration:none;">Ver todos</a>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <div class="panel-file">
+            <div class="panel-file__icon" style="background:#FEE2E2; color:#DC2626;"><span class="material-symbols-outlined" style="font-size:18px;">picture_as_pdf</span></div>
+            <div>
+              <div class="panel-file__name">relatorio-backup.pdf</div>
+              <div class="panel-file__meta">Hoje, 09:24 · 2,4 MB</div>
+            </div>
+          </div>
+          <div class="panel-file">
+            <div class="panel-file__icon" style="background:#DBEAFE; color:#2563EB;"><span class="material-symbols-outlined" style="font-size:18px;">image</span></div>
+            <div>
+              <div class="panel-file__name">topologia-rede.png</div>
+              <div class="panel-file__meta">Hoje, 09:34 · 890 KB</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </aside>
+
+</div><!-- /app -->
+
+<!-- ── Create channel modal ─────────────────────── -->
+<div class="modal-overlay" id="newChannelModal">
+  <div class="modal" role="dialog" aria-labelledby="ncTitle" style="max-width:520px;">
+    <div class="modal__head">
+      <div>
+        <h2 class="modal__title" id="ncTitle">Criar novo canal</h2>
+        <div class="modal__sub">Workspace NIC-Labs</div>
+      </div>
+      <button class="modal__close" data-close="newChannelModal"><span class="material-symbols-outlined">close</span></button>
+    </div>
+
+    <div style="padding: 20px 22px; display:flex; flex-direction:column; gap: 18px; overflow-y:auto;">
+
+      <!-- Name -->
+      <div>
+        <label style="font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--color-muted); display:block; margin-bottom:7px;">Nome do canal</label>
+        <div style="position:relative;">
+          <span style="position:absolute; left:14px; top:50%; transform:translateY(-50%); font-size:17px; color:var(--color-muted-2); font-weight:400;">#</span>
+          <input id="ncName" type="text" maxlength="40" placeholder="ex: devops-alertas"
+            style="width:100%; box-sizing:border-box; padding:10px 14px 10px 30px;
+              background:var(--color-surface-2); border:1px solid var(--color-border);
+              border-radius:var(--radius-md); font-size:14px; color:var(--color-ink);
+              outline:none; font-family:inherit;"
+            oninput="this.value=this.value.toLowerCase().replace(/[^a-z0-9\-_]/g,'');document.getElementById('ncPreview').textContent='#'+(this.value||'nome-do-canal');"
+          />
+        </div>
+        <div style="font-size:12px; color:var(--color-muted); margin-top:5px;">
+          Pré-visualização: <strong id="ncPreview" style="color:var(--color-primary);">#nome-do-canal</strong>
+        </div>
+      </div>
+
+      <!-- Description -->
+      <div>
+        <label style="font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--color-muted); display:block; margin-bottom:7px;">Descrição <span style="font-weight:400; font-style:italic; text-transform:none; letter-spacing:0;">(opcional)</span></label>
+        <textarea id="ncDesc" placeholder="Para que serve este canal?" rows="2"
+          style="width:100%; box-sizing:border-box; padding:10px 14px;
+            background:var(--color-surface-2); border:1px solid var(--color-border);
+            border-radius:var(--radius-md); font-size:14px; color:var(--color-ink);
+            outline:none; font-family:inherit; resize:none;"></textarea>
+      </div>
+
+      <!-- Type -->
+      <div>
+        <label style="font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--color-muted); display:block; margin-bottom:10px;">Tipo</label>
+        <div style="display:flex; gap:10px;">
+          <label id="typePublic" class="type-card type-card--selected" style="flex:1;">
+            <input type="radio" name="ncType" value="public" checked style="display:none;" />
+            <span class="material-symbols-outlined" style="font-size:20px; color:var(--color-primary);">public</span>
+            <div>
+              <div style="font-size:13.5px; font-weight:700; color:var(--color-ink);">Público</div>
+              <div style="font-size:12px; color:var(--color-muted); margin-top:2px; line-height:1.4;">Qualquer membro do workspace pode entrar.</div>
+            </div>
+          </label>
+          <label id="typePrivate" class="type-card" style="flex:1;">
+            <input type="radio" name="ncType" value="private" style="display:none;" />
+            <span class="material-symbols-outlined" style="font-size:20px; color:var(--color-muted-2);">lock</span>
+            <div>
+              <div style="font-size:13.5px; font-weight:700; color:var(--color-ink);">Privado</div>
+              <div style="font-size:12px; color:var(--color-muted); margin-top:2px; line-height:1.4;">Apenas membros convidados podem acessar.</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Members -->
+      <div>
+        <label style="font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--color-muted); display:block; margin-bottom:7px;">Adicionar membros <span style="font-weight:400; font-style:italic; text-transform:none; letter-spacing:0;">(opcional)</span></label>
+        <div style="position:relative;">
+          <span class="material-symbols-outlined" style="position:absolute; left:12px; top:50%; transform:translateY(-50%); font-size:18px; color:var(--color-muted-2); pointer-events:none;">search</span>
+          <input id="ncMemberSearch" type="text" placeholder="Buscar membros…"
+            style="width:100%; box-sizing:border-box; padding:9px 14px 9px 38px;
+              background:var(--color-surface-2); border:1px solid var(--color-border);
+              border-radius:var(--radius-pill); font-size:14px; color:var(--color-ink);
+              outline:none; font-family:inherit;" />
+        </div>
+        <div id="ncMemberList" style="margin-top:8px; display:flex; flex-direction:column; gap:2px; max-height:180px; overflow-y:auto;"></div>
+        <div id="ncSelected" style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; min-height:0;"></div>
+      </div>
+
+    </div>
+
+    <div class="modal__foot">
+      <div style="font-size:13px; color:var(--color-muted);" id="ncMemberCount">Nenhum membro selecionado</div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn--secondary" data-close="newChannelModal">Cancelar</button>
+        <button class="btn btn--primary" id="ncCreate">
+          <span class="material-symbols-outlined" style="font-size:17px;">add</span>
+          Criar canal
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── New DM modal ──────────────────────────────── -->
+<div class="modal-overlay" id="newDmModal">
+  <div class="modal" role="dialog" aria-labelledby="dmTitle" style="max-width:480px;">
+    <div class="modal__head">
+      <div>
+        <h2 class="modal__title" id="dmTitle">Nova mensagem direta</h2>
+        <div class="modal__sub">Selecione uma ou mais pessoas</div>
+      </div>
+      <button class="modal__close" data-close="newDmModal"><span class="material-symbols-outlined">close</span></button>
+    </div>
+
+    <div style="padding:14px 22px 10px;">
+      <div style="position:relative;">
+        <span class="material-symbols-outlined" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:18px;color:var(--color-muted-2);pointer-events:none;">search</span>
+        <input id="dmSearch" type="text" placeholder="Buscar por nome ou cargo…"
+          style="width:100%;box-sizing:border-box;padding:9px 14px 9px 38px;
+            background:var(--color-surface-2);border:1px solid var(--color-border);
+            border-radius:var(--radius-pill);font-size:14px;color:var(--color-ink);
+            outline:none;font-family:inherit;" />
+      </div>
+      <div id="dmSelected" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;min-height:0;"></div>
+    </div>
+
+    <div class="modal__list" id="dmList" style="max-height:300px;"></div>
+
+    <div class="modal__foot">
+      <div id="dmPreview" style="font-size:13px;color:var(--color-muted);">Nenhuma pessoa selecionada</div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn--secondary" data-close="newDmModal">Cancelar</button>
+        <button class="btn btn--primary btn--disabled" id="dmStart" disabled>
+          <span class="material-symbols-outlined" style="font-size:17px;">forum</span>
+          Iniciar conversa
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .type-card {
+    display:flex; align-items:flex-start; gap:10px;
+    padding:12px 14px;
+    border:2px solid var(--color-border);
+    border-radius:var(--radius-md);
+    background:var(--color-surface);
+    cursor:pointer;
+    transition:border-color .12s, background .12s;
+  }
+  .type-card--selected {
+    border-color:var(--color-primary);
+    background:var(--color-primary-tint);
+  }
+  .chip-remove {
+    display:inline-flex; align-items:center; gap:5px;
+    padding:3px 8px 3px 10px;
+    background:var(--color-primary-tint);
+    border:1px solid var(--color-primary-tint-strong);
+    border-radius:var(--radius-pill);
+    font-size:12px; font-weight:600; color:var(--color-primary-strong);
+  }
+  .chip-remove button {
+    background:none;border:none;cursor:pointer;
+    color:var(--color-primary-strong);
+    display:flex;align-items:center;padding:0;line-height:1;
+  }
+  .chip-remove button .material-symbols-outlined { font-size:14px; }
+</style>
+<div class="modal-overlay" id="addModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal__head">
+      <div>
+        <h2 class="modal__title" id="modalTitle">Adicionar membros</h2>
+        <div class="modal__sub">Canal <strong>#infraestrutura</strong></div>
+      </div>
+      <button class="modal__close" id="closeModal"><span class="material-symbols-outlined">close</span></button>
+    </div>
+    <div class="modal__search">
+      <div class="modal__search-wrap">
+        <span class="material-symbols-outlined modal__search-icon">search</span>
+        <input id="modalSearch" type="text" placeholder="Buscar por nome ou cargo…" autocomplete="off" />
+      </div>
+    </div>
+    <div class="modal__list" id="modalList"></div>
+    <div class="modal__foot">
+      <div class="modal__selected-info" id="modalSelectedInfo">
+        <span>Selecione os membros a adicionar</span>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn--secondary" id="closeModal2" onclick="document.getElementById('addModal').classList.remove('is-open')">Cancelar</button>
+        <button class="btn btn--primary btn--disabled" id="modalConfirm" disabled>
+          <span class="material-symbols-outlined" style="font-size:17px;">person_add</span>
+          Adicionar
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Remove confirm toast ───────────────────────── -->
+<div class="confirm-toast" id="confirmToast">
+  <span class="material-symbols-outlined" style="color: var(--color-warning); font-size:20px;">person_remove</span>
+  <div class="confirm-toast__text">
+    Remover <span class="confirm-toast__name" id="confirmName"></span> do canal?
+  </div>
+  <button class="btn btn--secondary" id="confirmCancel" style="padding:6px 12px; font-size:12px;">Cancelar</button>
+  <button class="btn btn--danger-solid" id="confirmOk" style="padding:6px 12px; font-size:12px;">Remover</button>
+</div>
+
+<script src="partials.js"></script>
+<script>
+  /* ── 1. Render sidebar FIRST — elements must exist before wiring ── */
+  document.querySelector("[data-sidebar]").outerHTML = NIC.renderSidebar({ active: "infraestrutura", variant: "with-channels" });
+
+  /* ── 2. Panel toggle ──────────────────────────────────────────── */
+  const app       = document.getElementById("appRoot");
+  const toggleBtn = document.getElementById("toggleDetailsBtn");
+  const closeBtn  = document.getElementById("closeDetailsBtn");
+  function openPanel()  { app.classList.remove("details-closed"); toggleBtn.classList.add("icon-btn--active"); }
+  function closePanel() { app.classList.add("details-closed");    toggleBtn.classList.remove("icon-btn--active"); }
+  toggleBtn.addEventListener("click", () => app.classList.contains("details-closed") ? openPanel() : closePanel());
+  closeBtn.addEventListener("click", closePanel);
+
+  /* ── 3. Generic modal helpers ─────────────────────────────────── */
+  function openModal(id)  { document.getElementById(id).classList.add("is-open"); }
+  function closeModal(id) { document.getElementById(id).classList.remove("is-open"); }
+  document.querySelectorAll("[data-close]").forEach(btn =>
+    btn.addEventListener("click", () => closeModal(btn.dataset.close))
+  );
+  document.querySelectorAll(".modal-overlay").forEach(ov =>
+    ov.addEventListener("click", e => { if (e.target === ov) ov.classList.remove("is-open"); })
+  );
+
+  /* ── 4. Toast helper ──────────────────────────────────────────── */
+  function showToast(msg, type) {
+    const t = document.createElement("div");
+    const dot = type === "success" ? "#22C55E" : "#EF4444";
+    t.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+      background:var(--color-surface);border:1px solid var(--color-border);
+      border-radius:12px;box-shadow:0 8px 32px rgba(22,18,31,.12);
+      padding:12px 18px;display:flex;align-items:center;gap:10px;
+      font-size:13.5px;color:var(--color-ink);z-index:300;
+      animation:slideup .18s ease;min-width:260px;`;
+    t.innerHTML = `<span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0;"></span>${msg}`;
+    document.body.appendChild(t);
+    setTimeout(() => { t.style.transition="opacity .3s"; t.style.opacity="0"; setTimeout(()=>t.remove(),300); }, 2800);
+  }
+
+  /* ── 5. Sidebar action buttons ────────────────────────────────── */
+  document.querySelectorAll("[data-action='new-channel']").forEach(btn =>
+    btn.addEventListener("click", () => {
+      ncSelected.clear(); renderNcList(); renderNcChips();
+      document.getElementById("ncName").value = "";
+      document.getElementById("ncDesc").value = "";
+      document.getElementById("ncPreview").textContent = "#nome-do-canal";
+      document.getElementById("ncName").style.borderColor = "";
+      openModal("newChannelModal");
+    })
+  );
+  document.querySelectorAll("[data-action='new-dm']").forEach(btn =>
+    btn.addEventListener("click", () => {
+      dmSelected.clear(); dmSearch.value = "";
+      renderDmList(); renderDmChips(); updateDmFooter();
+      openModal("newDmModal");
+    })
+  );
+
+  /* ── 6. Channel type toggle ───────────────────────────────────── */
+  document.querySelectorAll("input[name='ncType']").forEach(radio => {
+    radio.addEventListener("change", () => {
+      const isPub = document.querySelector("[name=ncType][value=public]").checked;
+      document.getElementById("typePublic").classList.toggle("type-card--selected", isPub);
+      document.getElementById("typePrivate").classList.toggle("type-card--selected", !isPub);
+      document.querySelector("#typePublic .material-symbols-outlined").style.color  = isPub  ? "var(--color-primary)" : "var(--color-muted-2)";
+      document.querySelector("#typePrivate .material-symbols-outlined").style.color = !isPub ? "var(--color-primary)" : "var(--color-muted-2)";
+    });
+  });
+
+  /* ── 7. Create channel — member picker ────────────────────────── */
+  const ncSelected = new Set();
+  const ncMemberSearch = document.getElementById("ncMemberSearch");
+  const ncMemberList   = document.getElementById("ncMemberList");
+  const ncSelectedDiv  = document.getElementById("ncSelected");
+  const ncMemberCount  = document.getElementById("ncMemberCount");
+
+  function renderNcList(q = "") {
+    ncMemberList.innerHTML = "";
+    NIC.NIC_PEOPLE.filter(p =>
+      p.name.toLowerCase().includes(q.toLowerCase()) || p.role.toLowerCase().includes(q.toLowerCase())
+    ).forEach(p => {
+      const sel = ncSelected.has(p.initials);
+      const row = document.createElement("div");
+      row.className = "modal__user" + (sel ? " is-selected" : "");
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${p.color} avatar--on-light">${p.initials}
+          <span class="avatar__status avatar__status--${p.status}"></span>
+        </span>
+        <div style="flex:1;min-width:0;">
+          <div class="modal__user-name">${p.name}</div>
+          <div class="modal__user-role">${p.role}</div>
+        </div>
+        <div class="modal__check"></div>`;
+      row.addEventListener("click", () => {
+        ncSelected.has(p.initials) ? ncSelected.delete(p.initials) : ncSelected.add(p.initials);
+        renderNcList(ncMemberSearch.value); renderNcChips();
+      });
+      ncMemberList.appendChild(row);
+    });
+  }
+
+  function renderNcChips() {
+    ncSelectedDiv.innerHTML = "";
+    ncSelected.forEach(id => {
+      const p = NIC.NIC_PEOPLE.find(x => x.initials === id);
+      if (!p) return;
+      const chip = document.createElement("div");
+      chip.className = "chip-remove";
+      chip.innerHTML = `${p.name} <button title="Remover"><span class="material-symbols-outlined">close</span></button>`;
+      chip.querySelector("button").addEventListener("click", () => {
+        ncSelected.delete(id); renderNcList(ncMemberSearch.value); renderNcChips();
+      });
+      ncSelectedDiv.appendChild(chip);
+    });
+    const n = ncSelected.size;
+    ncMemberCount.textContent = n === 0 ? "Nenhum membro selecionado"
+      : `${n} membro${n>1?"s":""} selecionado${n>1?"s":""}`;
+  }
+
+  ncMemberSearch.addEventListener("input", () => renderNcList(ncMemberSearch.value));
+
+  document.getElementById("ncCreate").addEventListener("click", () => {
+    const name = document.getElementById("ncName").value.trim();
+    if (!name) {
+      document.getElementById("ncName").style.borderColor = "var(--color-danger)";
+      document.getElementById("ncName").focus();
+      return;
+    }
+    closeModal("newChannelModal");
+    showToast(`Canal #${name} criado com sucesso!`, "success");
+    const nav = document.querySelector(".sidebar__nav");
+    if (nav) {
+      const link = document.createElement("a");
+      link.className = "nav-item"; link.href = "shell.html";
+      link.innerHTML = `<span class="material-symbols-outlined icon" style="font-size:18px;">tag</span><span>#${name}</span>`;
+      const dmLabel = nav.querySelector(".sidebar__section-label[style*='margin-top']");
+      if (dmLabel) nav.insertBefore(link, dmLabel); else nav.appendChild(link);
+    }
+  });
+
+  /* ── 8. New DM — person picker ────────────────────────────────── */
+  const dmSelected   = new Set();
+  const dmSearch     = document.getElementById("dmSearch");
+  const dmList       = document.getElementById("dmList");
+  const dmSelectedDiv= document.getElementById("dmSelected");
+  const dmPreview    = document.getElementById("dmPreview");
+  const dmStart      = document.getElementById("dmStart");
+
+  function renderDmList(q = "") {
+    dmList.innerHTML = "";
+    const label = document.createElement("div");
+    label.className = "modal__section-label";
+    label.textContent = q ? "Resultados" : "Pessoas no workspace";
+    dmList.appendChild(label);
+    NIC.NIC_PEOPLE.filter(p =>
+      p.name.toLowerCase().includes(q.toLowerCase()) || p.role.toLowerCase().includes(q.toLowerCase())
+    ).forEach(p => {
+      const sel = dmSelected.has(p.initials);
+      const row = document.createElement("div");
+      row.className = "modal__user" + (sel ? " is-selected" : "");
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${p.color} avatar--on-light">${p.initials}
+          <span class="avatar__status avatar__status--${p.status}"></span>
+        </span>
+        <div style="flex:1;min-width:0;">
+          <div class="modal__user-name">${p.name}</div>
+          <div class="modal__user-role">${p.role}</div>
+        </div>
+        <div class="modal__check"></div>`;
+      row.addEventListener("click", () => {
+        dmSelected.has(p.initials) ? dmSelected.delete(p.initials) : dmSelected.add(p.initials);
+        renderDmList(dmSearch.value); renderDmChips(); updateDmFooter();
+      });
+      dmList.appendChild(row);
+    });
+  }
+
+  function renderDmChips() {
+    dmSelectedDiv.innerHTML = "";
+    dmSelected.forEach(id => {
+      const p = NIC.NIC_PEOPLE.find(x => x.initials === id);
+      if (!p) return;
+      const chip = document.createElement("div");
+      chip.className = "chip-remove";
+      chip.innerHTML = `${p.name.split(" ")[0]} <button title="Remover"><span class="material-symbols-outlined">close</span></button>`;
+      chip.querySelector("button").addEventListener("click", () => {
+        dmSelected.delete(id); renderDmList(dmSearch.value); renderDmChips(); updateDmFooter();
+      });
+      dmSelectedDiv.appendChild(chip);
+    });
+  }
+
+  function updateDmFooter() {
+    const n = dmSelected.size;
+    if (n === 0) { dmPreview.textContent = "Nenhuma pessoa selecionada"; }
+    else if (n === 1) {
+      const p = NIC.NIC_PEOPLE.find(x => x.initials === [...dmSelected][0]);
+      dmPreview.textContent = `DM 1:1 com ${p?.name || ""}`;
+    } else {
+      const names = [...dmSelected].map(id => NIC.NIC_PEOPLE.find(x => x.initials === id)?.name.split(" ")[0] || id);
+      dmPreview.textContent = `Grupo com ${names.join(", ")}`;
+    }
+    dmStart.disabled = n === 0;
+    dmStart.classList.toggle("btn--disabled", n === 0);
+  }
+
+  dmSearch.addEventListener("input", () => renderDmList(dmSearch.value));
+  dmStart.addEventListener("click", () => { closeModal("newDmModal"); window.location.href = "dm.html"; });
+
+  /* ── 9. Add members to channel ────────────────────────────────── */
+  const addModalSelected = new Set();
+  const overlay    = document.getElementById("addModal");
+  const modalList  = document.getElementById("modalList");
+  const modalSearch= document.getElementById("modalSearch");
+  const modalConfirm=document.getElementById("modalConfirm");
+  const modalSelectedInfo=document.getElementById("modalSelectedInfo");
+
+  function getCurrentMembers() {
+    return new Set([...document.querySelectorAll(".member-row[data-member]")].map(r => r.dataset.member).concat(["AN"]));
+  }
+
+  function renderModalList(filter = "") {
+    const current = getCurrentMembers();
+    const q = filter.toLowerCase();
+    modalList.innerHTML = "";
+    const section = document.createElement("div");
+    section.className = "modal__section-label";
+    section.textContent = filter ? "Resultados" : "Usuários do workspace";
+    modalList.appendChild(section);
+    const allUsers = [
+      { id:"JL", name:"Juliane Lino",     role:"Infraestrutura & Suporte", color:"rose",  status:"online"  },
+      { id:"CA", name:"Caio Almeida",     role:"DevOps",                   color:"blue",  status:"away"    },
+      { id:"BL", name:"Bruno Lima",       role:"Suporte",                  color:"amber", status:"offline" },
+      { id:"FN", name:"Fernanda Nicácio", role:"Gestão",                   color:"teal",  status:"online"  },
+      { id:"ML", name:"Marco Lopes",      role:"Desenvolvimento",          color:"blue",  status:"online"  },
+      { id:"SP", name:"Sara Pinto",       role:"QA & Testes",              color:"rose",  status:"away"    },
+    ];
+    const filtered = allUsers.filter(u => u.name.toLowerCase().includes(q) || u.role.toLowerCase().includes(q));
+    if (!filtered.length) {
+      const em = document.createElement("div");
+      em.style.cssText = "padding:24px 10px;text-align:center;font-size:13px;color:var(--color-muted);";
+      em.textContent = "Nenhum usuário encontrado.";
+      modalList.appendChild(em); return;
+    }
+    filtered.forEach(u => {
+      const isMember = current.has(u.id);
+      const isSel = addModalSelected.has(u.id);
+      const row = document.createElement("div");
+      row.className = "modal__user" + (isMember ? " is-member" : "") + (isSel ? " is-selected" : "");
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${u.color} avatar--on-light">${u.id}
+          <span class="avatar__status avatar__status--${u.status}"></span>
+        </span>
+        <div style="flex:1;min-width:0;">
+          <div class="modal__user-name">${u.name}${isMember ? ' <span class="badge badge--neutral" style="font-size:10px;padding:1px 6px;">Já membro</span>' : ""}</div>
+          <div class="modal__user-role">${u.role}</div>
+        </div>
+        <div class="modal__check"></div>`;
+      if (!isMember) {
+        row.addEventListener("click", () => {
+          addModalSelected.has(u.id) ? addModalSelected.delete(u.id) : addModalSelected.add(u.id);
+          renderModalList(modalSearch.value); updateAddModalFooter();
+        });
+      }
+      modalList.appendChild(row);
+    });
+  }
+
+  function updateAddModalFooter() {
+    const n = addModalSelected.size;
+    modalSelectedInfo.innerHTML = n === 0 ? "<span>Selecione os membros a adicionar</span>"
+      : `<span><strong>${n}</strong> selecionado${n>1?"s":""}</span>`;
+    modalConfirm.disabled = n === 0;
+    modalConfirm.classList.toggle("btn--disabled", n === 0);
+  }
+
+  document.getElementById("btnAddMembers").addEventListener("click", () => {
+    addModalSelected.clear(); modalSearch.value = "";
+    renderModalList(); updateAddModalFooter();
+    openModal("addModal");
+  });
+  document.getElementById("closeModal").addEventListener("click", () => closeModal("addModal"));
+  modalSearch.addEventListener("input", () => renderModalList(modalSearch.value));
+
+  modalConfirm.addEventListener("click", () => {
+    if (!addModalSelected.size) return;
+    const colorMap={JL:"rose",CA:"blue",BL:"amber",FN:"teal",ML:"blue",SP:"rose"};
+    const statusMap={JL:"online",CA:"away",BL:"offline",FN:"online",ML:"online",SP:"away"};
+    const roleMap={JL:"Infraestrutura & Suporte",CA:"DevOps",BL:"Suporte",FN:"Gestão",ML:"Desenvolvimento",SP:"QA & Testes"};
+    const nameMap={JL:"Juliane Lino",CA:"Caio Almeida",BL:"Bruno Lima",FN:"Fernanda Nicácio",ML:"Marco Lopes",SP:"Sara Pinto"};
+    const container = document.getElementById("membersList");
+    const addBtn = document.getElementById("btnAddMembers");
+    addModalSelected.forEach(id => {
+      if (document.querySelector(`.member-row[data-member="${id}"]`)) return;
+      const row = document.createElement("div");
+      row.className = "member-row"; row.dataset.member = id; row.dataset.name = nameMap[id];
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${colorMap[id]} avatar--on-light">${id}
+          <span class="avatar__status avatar__status--${statusMap[id]}"></span>
+        </span>
+        <div style="flex:1;min-width:0;">
+          <div class="member-row__name">${nameMap[id]}</div>
+          <div class="member-row__role">${roleMap[id]}</div>
+        </div>
+        <button class="member-row__remove" title="Remover do canal" data-remove="${id}" data-name="${nameMap[id]}">
+          <span class="material-symbols-outlined">person_remove</span>
+        </button>`;
+      row.style.opacity = "0"; row.style.transform = "translateX(-8px)";
+      container.insertBefore(row, addBtn);
+      requestAnimationFrame(() => {
+        row.style.transition = "opacity .2s, transform .2s";
+        row.style.opacity = "1"; row.style.transform = "none";
+      });
+    });
+    const n = addModalSelected.size;
+    closeModal("addModal");
+    updateMemberCount();
+    showToast(`${n} membro${n>1?"s":""} adicionado${n>1?"s":""} ao canal.`, "success");
+    addModalSelected.clear();
+  });
+
+  /* ── 10. Remove member ────────────────────────────────────────── */
+  const confirmToast  = document.getElementById("confirmToast");
+  const confirmName   = document.getElementById("confirmName");
+  const confirmOk     = document.getElementById("confirmOk");
+  const confirmCancel = document.getElementById("confirmCancel");
+  let pendingRemove = null;
+
+  document.getElementById("rightPanel").addEventListener("click", e => {
+    const btn = e.target.closest("[data-remove]");
+    if (!btn) return;
+    pendingRemove = btn.dataset.remove;
+    confirmName.textContent = btn.dataset.name;
+    confirmToast.classList.add("is-open");
+  });
+
+  confirmOk.addEventListener("click", () => {
+    if (!pendingRemove) return;
+    const row = document.querySelector(`.member-row[data-member="${pendingRemove}"]`);
+    if (row) {
+      row.style.transition = "opacity .2s, transform .2s";
+      row.style.opacity = "0"; row.style.transform = "translateX(12px)";
+      setTimeout(() => { row.remove(); updateMemberCount(); }, 200);
+    }
+    confirmToast.classList.remove("is-open");
+    pendingRemove = null;
+    showToast("Membro removido do canal.", "success");
+  });
+
+  confirmCancel.addEventListener("click", () => {
+    confirmToast.classList.remove("is-open"); pendingRemove = null;
+  });
+
+  function updateMemberCount() {
+    const el = document.getElementById("memberCount");
+    if (el) el.textContent = `Membros online (${document.querySelectorAll(".member-row[data-member]").length + 1})`;
+  }
+</script>
+
+  /* ── Generic modal open/close ────────────────────── */
+  function openModal(id) { document.getElementById(id).classList.add("is-open"); }
+  function closeModal(id) { document.getElementById(id).classList.remove("is-open"); }
+  document.querySelectorAll("[data-close]").forEach(btn =>
+    btn.addEventListener("click", () => closeModal(btn.dataset.close))
+  );
+  document.querySelectorAll(".modal-overlay").forEach(ov =>
+    ov.addEventListener("click", e => { if (e.target === ov) ov.classList.remove("is-open"); })
+  );
+
+  /* ── Channel type toggle ─────────────────────────── */
+  document.querySelectorAll("input[name='ncType']").forEach(radio => {
+    radio.addEventListener("change", () => {
+      document.getElementById("typePublic").classList.toggle("type-card--selected", document.querySelector("[name=ncType][value=public]").checked);
+      document.getElementById("typePrivate").classList.toggle("type-card--selected", document.querySelector("[name=ncType][value=private]").checked);
+      const ico = document.querySelector("#typePrivate .material-symbols-outlined");
+      ico.style.color = document.querySelector("[name=ncType][value=private]").checked ? "var(--color-primary)" : "var(--color-muted-2)";
+      const icoP = document.querySelector("#typePublic .material-symbols-outlined");
+      icoP.style.color = document.querySelector("[name=ncType][value=public]").checked ? "var(--color-primary)" : "var(--color-muted-2)";
+    });
+  });
+
+  /* ── New channel — member picker ─────────────────── */
+  const ncSelected = new Set();
+  const ncMemberSearch = document.getElementById("ncMemberSearch");
+  const ncMemberList = document.getElementById("ncMemberList");
+  const ncSelectedDiv = document.getElementById("ncSelected");
+  const ncMemberCount = document.getElementById("ncMemberCount");
+
+  function renderNcList(q = "") {
+    ncMemberList.innerHTML = "";
+    NIC.NIC_PEOPLE.filter(p =>
+      p.name.toLowerCase().includes(q.toLowerCase()) || p.role.toLowerCase().includes(q.toLowerCase())
+    ).forEach(p => {
+      const sel = ncSelected.has(p.initials);
+      const row = document.createElement("div");
+      row.className = "modal__user" + (sel ? " is-selected" : "");
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${p.color} avatar--on-light">${p.initials}<span class="avatar__status avatar__status--${p.status}"></span></span>
+        <div style="flex:1;min-width:0;"><div class="modal__user-name">${p.name}</div><div class="modal__user-role">${p.role}</div></div>
+        <div class="modal__check"></div>`;
+      row.addEventListener("click", () => {
+        sel ? ncSelected.delete(p.initials) : ncSelected.add(p.initials);
+        renderNcList(ncMemberSearch.value);
+        renderNcChips();
+      });
+      ncMemberList.appendChild(row);
+    });
+  }
+
+  function renderNcChips() {
+    ncSelectedDiv.innerHTML = "";
+    ncSelected.forEach(id => {
+      const p = NIC.NIC_PEOPLE.find(x => x.initials === id);
+      if (!p) return;
+      const chip = document.createElement("div");
+      chip.className = "chip-remove";
+      chip.innerHTML = `${p.name} <button title="Remover"><span class="material-symbols-outlined">close</span></button>`;
+      chip.querySelector("button").addEventListener("click", () => { ncSelected.delete(id); renderNcList(ncMemberSearch.value); renderNcChips(); });
+      ncSelectedDiv.appendChild(chip);
+    });
+    const n = ncSelected.size;
+    ncMemberCount.textContent = n === 0 ? "Nenhum membro selecionado" : `${n} membro${n>1?"s":""} selecionado${n>1?"s":""}`;
+  }
+
+  ncMemberSearch.addEventListener("input", () => renderNcList(ncMemberSearch.value));
+  document.getElementById("newChannelModal").addEventListener("click", e => {
+    if (e.target === document.getElementById("newChannelModal")) return;
+    // re-render list when modal opens via renderNcList call
+  });
+  // Init on first open
+  document.querySelector("[data-action='new-channel']").addEventListener("click", () => {
+    ncSelected.clear(); renderNcList(); renderNcChips();
+    document.getElementById("ncName").value = "";
+    document.getElementById("ncDesc").value = "";
+    document.getElementById("ncPreview").textContent = "#nome-do-canal";
+  });
+
+  // Create channel
+  document.getElementById("ncCreate").addEventListener("click", () => {
+    const name = document.getElementById("ncName").value.trim();
+    if (!name) {
+      document.getElementById("ncName").style.borderColor = "var(--color-danger)";
+      document.getElementById("ncName").focus();
+      return;
+    }
+    closeModal("newChannelModal");
+    showToast(`Canal #${name} criado com sucesso!`, "success");
+    // Add to sidebar channel list visually
+    const nav = document.querySelector(".sidebar__nav");
+    if (nav) {
+      const link = document.createElement("a");
+      link.className = "nav-item";
+      link.href = "shell.html";
+      link.innerHTML = `<span class="material-symbols-outlined icon" style="font-size:18px;">tag</span><span>#${name}</span>`;
+      const dmLabel = nav.querySelector(".sidebar__section-label[style*='margin-top']");
+      if (dmLabel) nav.insertBefore(link, dmLabel);
+      else nav.appendChild(link);
+    }
+  });
+
+  /* ── New DM — person picker ───────────────────────── */
+  const dmSelected = new Set();
+  const dmSearch = document.getElementById("dmSearch");
+  const dmList = document.getElementById("dmList");
+  const dmSelectedDiv = document.getElementById("dmSelected");
+  const dmPreview = document.getElementById("dmPreview");
+  const dmStart = document.getElementById("dmStart");
+
+  function renderDmList(q = "") {
+    dmList.innerHTML = "";
+    const label = document.createElement("div");
+    label.className = "modal__section-label";
+    label.textContent = q ? "Resultados" : "Pessoas no workspace";
+    dmList.appendChild(label);
+    NIC.NIC_PEOPLE.filter(p =>
+      p.name.toLowerCase().includes(q.toLowerCase()) || p.role.toLowerCase().includes(q.toLowerCase())
+    ).forEach(p => {
+      const sel = dmSelected.has(p.initials);
+      const row = document.createElement("div");
+      row.className = "modal__user" + (sel ? " is-selected" : "");
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${p.color} avatar--on-light">${p.initials}<span class="avatar__status avatar__status--${p.status}"></span></span>
+        <div style="flex:1;min-width:0;"><div class="modal__user-name">${p.name}</div><div class="modal__user-role">${p.role}</div></div>
+        <div class="modal__check"></div>`;
+      row.addEventListener("click", () => {
+        sel ? dmSelected.delete(p.initials) : dmSelected.add(p.initials);
+        renderDmList(dmSearch.value);
+        renderDmChips();
+        updateDmFooter();
+      });
+      dmList.appendChild(row);
+    });
+  }
+
+  function renderDmChips() {
+    dmSelectedDiv.innerHTML = "";
+    dmSelected.forEach(id => {
+      const p = NIC.NIC_PEOPLE.find(x => x.initials === id);
+      if (!p) return;
+      const chip = document.createElement("div");
+      chip.className = "chip-remove";
+      chip.innerHTML = `${p.name.split(" ")[0]} <button title="Remover"><span class="material-symbols-outlined">close</span></button>`;
+      chip.querySelector("button").addEventListener("click", () => { dmSelected.delete(id); renderDmList(dmSearch.value); renderDmChips(); updateDmFooter(); });
+      dmSelectedDiv.appendChild(chip);
+    });
+  }
+
+  function updateDmFooter() {
+    const n = dmSelected.size;
+    if (n === 0) {
+      dmPreview.textContent = "Nenhuma pessoa selecionada";
+    } else if (n === 1) {
+      const id = [...dmSelected][0];
+      const p = NIC.NIC_PEOPLE.find(x => x.initials === id);
+      dmPreview.textContent = `DM 1:1 com ${p?.name || id}`;
+    } else {
+      const names = [...dmSelected].map(id => NIC.NIC_PEOPLE.find(x => x.initials === id)?.name.split(" ")[0] || id);
+      dmPreview.textContent = `Grupo com ${names.join(", ")}`;
+    }
+    dmStart.disabled = n === 0;
+    dmStart.classList.toggle("btn--disabled", n === 0);
+  }
+
+  dmSearch.addEventListener("input", () => renderDmList(dmSearch.value));
+  document.querySelector("[data-action='new-dm']").addEventListener("click", () => {
+    dmSelected.clear(); renderDmList(); renderDmChips(); updateDmFooter();
+    dmSearch.value = "";
+  });
+
+  dmStart.addEventListener("click", () => {
+    closeModal("newDmModal");
+    window.location.href = "dm.html";
+  });
+
+  const app       = document.getElementById("appRoot");
+  const toggleBtn = document.getElementById("toggleDetailsBtn");
+  const closeBtn  = document.getElementById("closeDetailsBtn");
+
+  function openPanel()  { app.classList.remove("details-closed"); toggleBtn.classList.add("icon-btn--active"); }
+  function closePanel() { app.classList.add("details-closed");    toggleBtn.classList.remove("icon-btn--active"); }
+  toggleBtn.addEventListener("click", () => app.classList.contains("details-closed") ? openPanel() : closePanel());
+  closeBtn.addEventListener("click", closePanel);
+
+  /* ── Member counter ──────────────────────────────── */
+  function memberCount() { return document.querySelectorAll(".member-row[data-member]").length; }
+  function updateCounter() {
+    const el = document.getElementById("memberCount");
+    if (el) el.textContent = "Membros online (" + (memberCount() + 1) + ")"; // +1 for Álvaro
+  }
+
+  /* ── Remove member ───────────────────────────────── */
+  const confirmToast = document.getElementById("confirmToast");
+  const confirmName  = document.getElementById("confirmName");
+  const confirmOk    = document.getElementById("confirmOk");
+  const confirmCancel = document.getElementById("confirmCancel");
+  let pendingRemove = null;
+
+  document.getElementById("rightPanel").addEventListener("click", e => {
+    const btn = e.target.closest("[data-remove]");
+    if (!btn) return;
+    pendingRemove = btn.dataset.remove;
+    confirmName.textContent = btn.dataset.name;
+    confirmToast.classList.add("is-open");
+  });
+
+  confirmOk.addEventListener("click", () => {
+    if (!pendingRemove) return;
+    const row = document.querySelector(`.member-row[data-member="${pendingRemove}"]`);
+    if (row) {
+      row.style.transition = "opacity .2s, transform .2s";
+      row.style.opacity = "0"; row.style.transform = "translateX(12px)";
+      setTimeout(() => { row.remove(); updateCounter(); }, 200);
+    }
+    confirmToast.classList.remove("is-open");
+    pendingRemove = null;
+    showToast(`Membro removido do canal.`, "success");
+  });
+
+  confirmCancel.addEventListener("click", () => {
+    confirmToast.classList.remove("is-open");
+    pendingRemove = null;
+  });
+
+  /* ── Add members modal ───────────────────────────── */
+  const allUsers = [
+    { id: "JL", name: "Juliane Lino",     role: "Infraestrutura & Suporte", color: "rose",  status: "online"  },
+    { id: "CA", name: "Caio Almeida",     role: "DevOps",                   color: "blue",  status: "away"    },
+    { id: "BL", name: "Bruno Lima",       role: "Suporte",                  color: "amber", status: "offline" },
+    { id: "FN", name: "Fernanda Nicácio", role: "Gestão",                   color: "teal",  status: "online"  },
+    { id: "ML", name: "Marco Lopes",      role: "Desenvolvimento",          color: "blue",  status: "online"  },
+    { id: "SP", name: "Sara Pinto",       role: "QA & Testes",              color: "rose",  status: "away"    },
+  ];
+
+  const overlay   = document.getElementById("addModal");
+  const modalList = document.getElementById("modalList");
+  const modalSearch = document.getElementById("modalSearch");
+  const modalConfirm = document.getElementById("modalConfirm");
+  const modalSelectedInfo = document.getElementById("modalSelectedInfo");
+  let selected = new Set();
+
+  function getCurrentMembers() {
+    return new Set([...document.querySelectorAll(".member-row[data-member]")].map(r => r.dataset.member).concat(["AN"]));
+  }
+
+  function renderModalList(filter = "") {
+    const current = getCurrentMembers();
+    const q = filter.toLowerCase();
+    modalList.innerHTML = "";
+
+    const section = document.createElement("div");
+    section.className = "modal__section-label";
+    section.textContent = filter ? "Resultados" : "Usuários do workspace";
+    modalList.appendChild(section);
+
+    const filtered = allUsers.filter(u =>
+      u.name.toLowerCase().includes(q) || u.role.toLowerCase().includes(q)
+    );
+
+    if (!filtered.length) {
+      const empty = document.createElement("div");
+      empty.style.cssText = "padding: 24px 10px; text-align:center; font-size:13px; color: var(--color-muted);";
+      empty.textContent = "Nenhum usuário encontrado.";
+      modalList.appendChild(empty);
+      return;
+    }
+
+    filtered.forEach(u => {
+      const isMember = current.has(u.id);
+      const isSel = selected.has(u.id);
+      const row = document.createElement("div");
+      row.className = "modal__user" + (isMember ? " is-member" : "") + (isSel ? " is-selected" : "");
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${u.color} avatar--on-light">${u.id}<span class="avatar__status avatar__status--${u.status}"></span></span>
+        <div style="flex:1;min-width:0;">
+          <div class="modal__user-name">${u.name}${isMember ? ' <span class="badge badge--neutral" style="font-size:10px;padding:1px 6px;">Já membro</span>' : ""}</div>
+          <div class="modal__user-role">${u.role}</div>
+        </div>
+        <div class="modal__check"></div>
+      `;
+      if (!isMember) {
+        row.addEventListener("click", () => {
+          if (selected.has(u.id)) selected.delete(u.id);
+          else selected.add(u.id);
+          renderModalList(modalSearch.value);
+          updateModalFooter();
+        });
+      }
+      modalList.appendChild(row);
+    });
+  }
+
+  function updateModalFooter() {
+    const n = selected.size;
+    modalSelectedInfo.innerHTML = n === 0
+      ? "<span>Selecione os membros a adicionar</span>"
+      : `<span><strong>${n}</strong> selecionado${n > 1 ? "s" : ""}</span>`;
+    modalConfirm.disabled = n === 0;
+    modalConfirm.classList.toggle("btn--disabled", n === 0);
+  }
+
+  document.getElementById("btnAddMembers").addEventListener("click", () => {
+    selected.clear();
+    modalSearch.value = "";
+    renderModalList();
+    updateModalFooter();
+    overlay.classList.add("is-open");
+  });
+
+  document.getElementById("closeModal").addEventListener("click", () => overlay.classList.remove("is-open"));
+  overlay.addEventListener("click", e => { if (e.target === overlay) overlay.classList.remove("is-open"); });
+
+  modalSearch.addEventListener("input", () => renderModalList(modalSearch.value));
+
+  modalConfirm.addEventListener("click", () => {
+    if (!selected.size) return;
+    const container = document.getElementById("membersList");
+    const colorMap = { JL:"rose", CA:"blue", BL:"amber", FN:"teal", ML:"blue", SP:"rose" };
+    const statusMap = { JL:"online", CA:"away", BL:"offline", FN:"online", ML:"online", SP:"away" };
+    const roleMap   = { JL:"Infraestrutura & Suporte", CA:"DevOps", BL:"Suporte", FN:"Gestão", ML:"Desenvolvimento", SP:"QA & Testes" };
+    const nameMap   = { JL:"Juliane Lino", CA:"Caio Almeida", BL:"Bruno Lima", FN:"Fernanda Nicácio", ML:"Marco Lopes", SP:"Sara Pinto" };
+
+    selected.forEach(id => {
+      if (document.querySelector(`.member-row[data-member="${id}"]`)) return;
+      const row = document.createElement("div");
+      row.className = "member-row"; row.dataset.member = id; row.dataset.name = nameMap[id];
+      row.innerHTML = `
+        <span class="avatar avatar--lg avatar--${colorMap[id]} avatar--on-light">${id}<span class="avatar__status avatar__status--${statusMap[id]}"></span></span>
+        <div style="flex:1;min-width:0;">
+          <div class="member-row__name">${nameMap[id]}</div>
+          <div class="member-row__role">${roleMap[id]}</div>
+        </div>
+        <button class="member-row__remove" title="Remover do canal" data-remove="${id}" data-name="${nameMap[id]}">
+          <span class="material-symbols-outlined">person_remove</span>
+        </button>
+      `;
+      row.style.opacity = "0"; row.style.transform = "translateX(-8px)";
+      container.insertBefore(row, document.getElementById("btnAddMembers"));
+      requestAnimationFrame(() => {
+        row.style.transition = "opacity .2s, transform .2s";
+        row.style.opacity = "1"; row.style.transform = "translateX(0)";
+      });
+    });
+
+    const n = selected.size;
+    overlay.classList.remove("is-open");
+    updateCounter();
+    showToast(`${n} membro${n > 1 ? "s" : ""} adicionado${n > 1 ? "s" : ""} ao canal.`, "success");
+    selected.clear();
+  });
+
+  /* ── Toast helper ────────────────────────────────── */
+  function showToast(msg, type) {
+    const t = document.createElement("div");
+    t.style.cssText = `
+      position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+      background: var(--color-surface); border: 1px solid var(--color-border);
+      border-radius: 12px; box-shadow: 0 8px 32px rgba(22,18,31,0.12);
+      padding: 12px 18px; display:flex; align-items:center; gap:10px;
+      font-size: 13.5px; color: var(--color-ink);
+      z-index: 300; animation: slideup .18s ease;
+      min-width: 260px;
+    `;
+    const dot = type === "success" ? "#22C55E" : "#EF4444";
+    t.innerHTML = `<span style="width:8px;height:8px;border-radius:50%;background:${dot};flex-shrink:0;"></span>${msg}`;
+    document.body.appendChild(t);
+    setTimeout(() => { t.style.transition="opacity .3s"; t.style.opacity="0"; setTimeout(()=>t.remove(),300); }, 2800);
+  }
+</script>
+</body>
+</html>

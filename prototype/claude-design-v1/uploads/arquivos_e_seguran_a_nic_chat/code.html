@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+
+<html class="light" lang="pt-BR"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>NIC Chat - Arquivos</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "on-surface": "#121c2a",
+                        "background": "#f9f9ff",
+                        "tertiary-fixed": "#f0dbff",
+                        "inverse-primary": "#d3bbff",
+                        "surface": "#f9f9ff",
+                        "tertiary": "#6000a5",
+                        "surface-tint": "#7331df",
+                        "surface-dim": "#d0daef",
+                        "on-primary-fixed-variant": "#5b00c5",
+                        "surface-container-high": "#dee9fd",
+                        "on-background": "#121c2a",
+                        "on-secondary-container": "#6d5f78",
+                        "surface-variant": "#d9e3f7",
+                        "primary-container": "#6d28d9",
+                        "on-primary-container": "#dac5ff",
+                        "primary-fixed": "#ebddff",
+                        "surface-container-highest": "#d9e3f7",
+                        "surface-container-lowest": "#ffffff",
+                        "outline": "#7b7486",
+                        "on-surface-variant": "#4a4455",
+                        "on-error-container": "#93000a",
+                        "on-tertiary": "#ffffff",
+                        "on-error": "#ffffff",
+                        "secondary-fixed-dim": "#d2c0dc",
+                        "on-tertiary-fixed-variant": "#6900b3",
+                        "error": "#ba1a1a",
+                        "inverse-surface": "#273140",
+                        "surface-bright": "#f9f9ff",
+                        "secondary-fixed": "#efdcf9",
+                        "secondary": "#675971",
+                        "on-secondary": "#ffffff",
+                        "error-container": "#ffdad6",
+                        "on-tertiary-container": "#e3c2ff",
+                        "outline-variant": "#ccc3d7",
+                        "inverse-on-surface": "#ebf1ff",
+                        "surface-container-low": "#eff3ff",
+                        "tertiary-fixed-dim": "#ddb7ff",
+                        "on-primary": "#ffffff",
+                        "on-secondary-fixed": "#22172c",
+                        "on-tertiary-fixed": "#2c0051",
+                        "tertiary-container": "#7d21cb",
+                        "on-secondary-fixed-variant": "#4f4259",
+                        "on-primary-fixed": "#250059",
+                        "surface-container": "#e6eeff",
+                        "primary-fixed-dim": "#d3bbff",
+                        "primary": "#5300b7",
+                        "secondary-container": "#efdcf9"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "spacing": {
+                        "xs": "4px",
+                        "margin-desktop": "40px",
+                        "md": "16px",
+                        "sm": "8px",
+                        "xl": "32px",
+                        "gutter": "24px",
+                        "unit": "4px",
+                        "lg": "24px",
+                        "margin-mobile": "16px"
+                    },
+                    "fontFamily": {
+                        "label-md": ["Inter"],
+                        "headline-lg": ["Inter"],
+                        "body-md": ["Inter"],
+                        "body-sm": ["Inter"],
+                        "display-lg": ["Inter"],
+                        "headline-sm": ["Inter"],
+                        "body-lg": ["Inter"],
+                        "headline-lg-mobile": ["Inter"],
+                        "headline-md": ["Inter"]
+                    },
+                    "fontSize": {
+                        "label-md": ["12px", { "lineHeight": "16px", "letterSpacing": "0.02em", "fontWeight": "500" }],
+                        "headline-lg": ["32px", { "lineHeight": "40px", "letterSpacing": "-0.01em", "fontWeight": "600" }],
+                        "body-md": ["16px", { "lineHeight": "24px", "fontWeight": "400" }],
+                        "body-sm": ["14px", { "lineHeight": "20px", "fontWeight": "400" }],
+                        "display-lg": ["48px", { "lineHeight": "56px", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "headline-sm": ["20px", { "lineHeight": "28px", "fontWeight": "600" }],
+                        "body-lg": ["18px", { "lineHeight": "28px", "fontWeight": "400" }],
+                        "headline-lg-mobile": ["28px", { "lineHeight": "36px", "fontWeight": "600" }],
+                        "headline-md": ["24px", { "lineHeight": "32px", "fontWeight": "600" }]
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-background font-body-md text-body-md text-on-surface h-screen w-screen overflow-hidden flex flex-col antialiased">
+<!-- TopNavBar -->
+<header class="bg-surface-container-lowest dark:bg-inverse-surface border-b border-surface-variant dark:border-outline-variant flat no shadows flex justify-between items-center h-16 px-gutter ml-[280px] w-[calc(100%-280px)] fixed top-0 z-20">
+<div class="flex items-center space-x-4">
+<h1 class="font-headline-sm text-headline-sm font-bold text-on-surface dark:text-inverse-on-surface">NIC Chat</h1>
+</div>
+<div class="flex items-center space-x-6">
+<button class="text-on-surface-variant dark:text-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors" data-icon="call"><span class="material-symbols-outlined">call</span></button>
+<button class="text-on-surface-variant dark:text-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors" data-icon="videocam"><span class="material-symbols-outlined">videocam</span></button>
+<div class="relative">
+<span class="material-symbols-outlined absolute left-3 top-1/2 transform -translate-y-1/2 text-on-surface-variant">search</span>
+<input class="pl-10 pr-4 py-2 bg-surface-container border border-outline-variant rounded-full text-body-sm text-on-surface focus:outline-none focus:border-primary-container w-64" placeholder="Buscar..." type="text"/>
+</div>
+<button class="text-on-surface-variant dark:text-surface-variant hover:text-primary dark:hover:text-primary-fixed-dim transition-colors" data-icon="more_vert"><span class="material-symbols-outlined">more_vert</span></button>
+<img alt="Perfil do Colaborador" class="w-8 h-8 rounded-full border-2 border-surface-container-lowest object-cover" data-alt="A professional headshot of a corporate employee in a well-lit office environment. The image is clean and bright, reflecting a modern corporate style. The background is slightly blurred to focus on the person. The lighting is soft and even, highlighting a friendly yet professional expression." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCszBXO9OUTA3dOkcVZpJY9WKeS_rM7XDDg_g2rQSplJqGjH-4zGGWraorVD2096rGk3_Niq6FMWseiscgL9aGMS82F3Kutrq3eHYBFioGWjhbQHmS3dMIqh9gnWKcokOTId9zcsCi3XsTT29iInUXNsrSzQbrp4xOTGDMoN5k1MGSSIGTT70tggonzQtUk2FrcNz2DZoVNAXgc5tdllIZC0ZSmKLXRt626WBfpLNe8EVhZ_aDdPCz_-eVXiUZRaPXU0gCsbkjukmP5"/>
+</div>
+</header>
+<div class="flex h-full pt-16">
+<!-- SideNavBar -->
+<nav class="bg-inverse-surface dark:bg-inverse-surface w-[280px] h-full fixed left-0 top-0 border-r border-outline-variant dark:border-outline flat no shadows flex flex-col py-lg z-30">
+<div class="px-4 mb-6 flex items-center space-x-3">
+<div class="relative">
+<img alt="Avatar do Usuário" class="w-10 h-10 rounded-full object-cover" data-alt="A professional headshot of a corporate employee in a well-lit office environment. The image is clean and bright, reflecting a modern corporate style. The background is slightly blurred to focus on the person. The lighting is soft and even, highlighting a friendly yet professional expression." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBc5l2vKNyXI400Aj-tMM0XNoCStEfhloSHdI6cVLZ9HlxTsvpXQg4e9Sr3NYeUhzJfWR-GJxn38Z8VJrjNyTRDHiCV0c0LWZwq796GcAywSQkf5wpxM742TdzsBaLZbLX1Qx21b9Y1m79eePn_x61eK8RGattOOyjcfwcrOSrkPi7bqoGq3BaSGsnkTKc9jm68iQzM1tKa4DApibzQAF3axN9v7Lj6fCRXf6MUNF0ND_Y5Oq25oqTAfO2go1bFJDMWFdIwo473Le0U"/>
+<div class="absolute bottom-0 right-0 w-2.5 h-2.5 bg-green-500 border-2 border-inverse-surface rounded-full"></div>
+</div>
+<div>
+<h2 class="font-headline-md text-headline-md font-bold text-primary-fixed">NIC Chat</h2>
+<p class="font-label-md text-label-md text-surface-variant opacity-80">Plataforma Corporativa</p>
+</div>
+</div>
+<div class="px-4 mb-8">
+<button class="w-full bg-primary-container text-on-primary-container hover:bg-primary hover:text-white transition-all duration-200 rounded-xl py-3 px-4 flex items-center justify-center space-x-2 font-label-md text-label-md">
+<span class="material-symbols-outlined text-[18px]">add</span>
+<span>Novo Chat</span>
+</button>
+</div>
+<div class="flex-1 overflow-y-auto space-y-1">
+<a class="text-surface-variant hover:text-surface-bright flex items-center px-4 py-3 mx-2 transition-colors hover:bg-surface-container-highest/10 transition-all duration-200 rounded-xl" data-icon="chat" href="#">
+<span class="material-symbols-outlined mr-3">chat</span>
+<span class="font-label-md text-label-md">Mensagens</span>
+</a>
+<a class="text-surface-variant hover:text-surface-bright flex items-center px-4 py-3 mx-2 transition-colors hover:bg-surface-container-highest/10 transition-all duration-200 rounded-xl" data-icon="groups" href="#">
+<span class="material-symbols-outlined mr-3">groups</span>
+<span class="font-label-md text-label-md">Canais</span>
+</a>
+<a class="bg-primary-container text-on-primary-container rounded-xl flex items-center px-4 py-3 mx-2 opacity-90 transition-all" data-icon="description" href="#">
+<span class="material-symbols-outlined mr-3">description</span>
+<span class="font-label-md text-label-md">Arquivos</span>
+</a>
+<a class="text-surface-variant hover:text-surface-bright flex items-center px-4 py-3 mx-2 transition-colors hover:bg-surface-container-highest/10 transition-all duration-200 rounded-xl" data-icon="person" href="#">
+<span class="material-symbols-outlined mr-3">person</span>
+<span class="font-label-md text-label-md">Contatos</span>
+</a>
+</div>
+<div class="mt-auto pt-4 space-y-1 border-t border-outline-variant/20 px-2">
+<a class="text-surface-variant hover:text-surface-bright flex items-center px-4 py-3 hover:bg-surface-container-highest/10 transition-all duration-200 rounded-xl" data-icon="settings" href="#">
+<span class="material-symbols-outlined mr-3">settings</span>
+<span class="font-label-md text-label-md">Configurações</span>
+</a>
+<a class="text-surface-variant hover:text-surface-bright flex items-center px-4 py-3 hover:bg-surface-container-highest/10 transition-all duration-200 rounded-xl" data-icon="logout" href="#">
+<span class="material-symbols-outlined mr-3">logout</span>
+<span class="font-label-md text-label-md">Sair</span>
+</a>
+</div>
+</nav>
+<!-- Main Content Area -->
+<main class="ml-[280px] flex-1 flex bg-background overflow-hidden relative z-10">
+<!-- Files List -->
+<div class="flex-1 flex flex-col min-w-0 border-r border-outline-variant bg-surface">
+<div class="px-margin-desktop py-lg border-b border-surface-variant flex justify-between items-center bg-surface-container-lowest">
+<div>
+<h2 class="font-headline-lg text-headline-lg text-on-surface mb-1">Arquivos</h2>
+<p class="font-body-md text-body-md text-on-surface-variant">Arquivos compartilhados em canais e mensagens diretas</p>
+</div>
+<button class="bg-primary-container text-white px-6 py-2.5 rounded-lg font-label-md text-label-md hover:bg-primary transition-colors flex items-center space-x-2">
+<span class="material-symbols-outlined text-[18px]">upload</span>
+<span>Enviar arquivo</span>
+</button>
+</div>
+<div class="flex-1 overflow-auto p-margin-desktop">
+<div class="bg-surface-container-lowest rounded-xl border border-surface-variant overflow-hidden">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="bg-background text-on-surface-variant font-label-md text-label-md uppercase border-b border-surface-variant h-[52px]">
+<th class="px-6 py-3 font-semibold">Nome</th>
+<th class="px-6 py-3 font-semibold">Canal</th>
+<th class="px-6 py-3 font-semibold">Enviado por</th>
+<th class="px-6 py-3 font-semibold">Data</th>
+<th class="px-6 py-3 font-semibold">Tamanho</th>
+<th class="px-6 py-3 font-semibold">Status</th>
+</tr>
+</thead>
+<tbody class="font-body-sm text-body-sm text-on-surface">
+<!-- Row 1 (Selected) -->
+<tr class="border-b border-surface-variant bg-surface-container cursor-pointer hover:bg-surface-container-high transition-colors h-[52px]">
+<td class="px-6 py-3 flex items-center space-x-3">
+<span class="material-symbols-outlined text-primary">picture_as_pdf</span>
+<span class="font-medium">relatorio-backup.pdf</span>
+</td>
+<td class="px-6 py-3 text-on-surface-variant">#infraestrutura</td>
+<td class="px-6 py-3">Álvaro Neto</td>
+<td class="px-6 py-3 text-on-surface-variant">Hoje, 09:26</td>
+<td class="px-6 py-3 text-on-surface-variant">2.4 MB</td>
+<td class="px-6 py-3">
+<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[#FEF3C7] text-[#D97706] border border-[#FDE68A]">
+                                            Em análise
+                                        </span>
+</td>
+</tr>
+<!-- Row 2 -->
+<tr class="border-b border-surface-variant hover:bg-surface-container transition-colors h-[52px] cursor-pointer">
+<td class="px-6 py-3 flex items-center space-x-3">
+<span class="material-symbols-outlined text-secondary">image</span>
+<span class="font-medium">topologia-rede.png</span>
+</td>
+<td class="px-6 py-3 text-on-surface-variant">#infraestrutura</td>
+<td class="px-6 py-3">Caio Almeida</td>
+<td class="px-6 py-3 text-on-surface-variant">Ontem, 16:48</td>
+<td class="px-6 py-3 text-on-surface-variant">890 KB</td>
+<td class="px-6 py-3">
+<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[#DCFCE7] text-[#166534] border border-[#BBF7D0]">
+                                            Aprovado
+                                        </span>
+</td>
+</tr>
+<!-- Row 3 -->
+<tr class="border-b border-surface-variant hover:bg-surface-container transition-colors h-[52px] cursor-pointer">
+<td class="px-6 py-3 flex items-center space-x-3">
+<span class="material-symbols-outlined text-secondary">folder_zip</span>
+<span class="font-medium">script-antigo.zip</span>
+</td>
+<td class="px-6 py-3 text-on-surface-variant">#suporte</td>
+<td class="px-6 py-3">Bruno Lima</td>
+<td class="px-6 py-3 text-on-surface-variant">Ontem, 11:20</td>
+<td class="px-6 py-3 text-on-surface-variant">5.1 MB</td>
+<td class="px-6 py-3">
+<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[#FEE2E2] text-[#991B1B] border border-[#FECACA]">
+                                            Bloqueado
+                                        </span>
+</td>
+</tr>
+<!-- Row 4 -->
+<tr class="hover:bg-surface-container transition-colors h-[52px] cursor-pointer">
+<td class="px-6 py-3 flex items-center space-x-3">
+<span class="material-symbols-outlined text-secondary">grid_on</span>
+<span class="font-medium">inventario-servidores.xlsx</span>
+</td>
+<td class="px-6 py-3 text-on-surface-variant">#projetos</td>
+<td class="px-6 py-3">Juliane Lino</td>
+<td class="px-6 py-3 text-on-surface-variant">12/05/2026</td>
+<td class="px-6 py-3 text-on-surface-variant">1.8 MB</td>
+<td class="px-6 py-3">
+<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[#DCFCE7] text-[#166534] border border-[#BBF7D0]">
+                                            Aprovado
+                                        </span>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+<!-- Right Panel (Preview) -->
+<aside class="w-[360px] bg-surface-container-lowest border-l border-surface-variant flex flex-col h-full shrink-0">
+<div class="px-6 py-lg border-b border-surface-variant">
+<h3 class="font-headline-sm text-headline-sm text-on-surface">Detalhes do Arquivo</h3>
+</div>
+<div class="flex-1 overflow-y-auto p-6 flex flex-col">
+<div class="flex flex-col items-center justify-center py-8 bg-background rounded-xl border border-outline-variant mb-6">
+<span class="material-symbols-outlined text-6xl text-primary mb-4" style="font-variation-settings: 'FILL' 1;">description</span>
+<h4 class="font-headline-md text-headline-md text-on-surface text-center px-4 break-all">relatorio-backup.pdf</h4>
+</div>
+<div class="mb-6 flex justify-center">
+<span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-[#FEF3C7] text-[#D97706] border border-[#FDE68A]">
+<span class="material-symbols-outlined text-[16px] mr-1.5">hourglass_empty</span>
+                            Em análise
+                        </span>
+</div>
+<div class="space-y-4 mb-8">
+<div>
+<span class="block font-label-md text-label-md text-on-surface-variant mb-1">Tamanho</span>
+<span class="font-body-md text-body-md text-on-surface">2.4 MB</span>
+</div>
+<div>
+<span class="block font-label-md text-label-md text-on-surface-variant mb-1">Hash</span>
+<span class="font-body-sm text-body-sm text-on-surface font-mono bg-surface-container px-2 py-1 rounded">sha256: 8f3a...91c</span>
+</div>
+</div>
+<div class="bg-[#FFFBEB] border border-[#FDE68A] rounded-lg p-4 mb-auto">
+<div class="flex">
+<div class="flex-shrink-0">
+<span class="material-symbols-outlined text-[#D97706]">warning</span>
+</div>
+<div class="ml-3">
+<p class="font-body-sm text-body-sm text-[#92400E]">
+                                    Este arquivo está em análise de segurança. O download será liberado após aprovação.
+                                </p>
+</div>
+</div>
+</div>
+<div class="flex flex-col space-y-3 mt-6 pt-6 border-t border-surface-variant">
+<button class="w-full bg-primary-container text-white px-4 py-2.5 rounded-lg font-label-md text-label-md opacity-50 cursor-not-allowed flex items-center justify-center space-x-2">
+<span class="material-symbols-outlined text-[18px]">download</span>
+<span>Baixar</span>
+</button>
+<button class="w-full bg-transparent border border-error text-error px-4 py-2.5 rounded-lg font-label-md text-label-md hover:bg-error-container hover:text-on-error-container transition-colors flex items-center justify-center space-x-2">
+<span class="material-symbols-outlined text-[18px]">delete</span>
+<span>Deletar</span>
+</button>
+</div>
+</div>
+</aside>
+</main>
+</div>
+</body></html>

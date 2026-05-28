@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Chamada de voz</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  .channel-header {
+    padding: 14px var(--space-6);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface);
+    display: flex; align-items: center; gap: var(--space-4);
+  }
+  .channel-title { font-size: 20px; font-weight: 700; margin: 0; display: flex; align-items: center; gap: 6px; }
+  .channel-title .hash { color: var(--color-muted-2); font-weight: 400; }
+  .channel-members-pill {
+    padding: 3px 10px;
+    border-radius: var(--radius-pill);
+    background: var(--color-surface-2);
+    color: var(--color-ink-2);
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid var(--color-border);
+  }
+  .channel-actions { margin-left: auto; display: flex; align-items: center; gap: var(--space-2); }
+
+  /* Voice call banner — light style matching dm.html callbar */
+  .voicebanner {
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+    border-left: 3px solid var(--color-primary);
+    color: var(--color-ink);
+    padding: 10px var(--space-6);
+    display: flex; align-items: center; gap: var(--space-4);
+  }
+  .voicebanner__icon {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .voicebanner__title { font-size: 13px; font-weight: 700; color: var(--color-ink); }
+  .voicebanner__meta {
+    font-size: 12px;
+    color: var(--color-muted);
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 1px;
+  }
+  .voicebanner__dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--color-danger);
+    animation: pulse 1.4s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .voicebanner__avatars { display: flex; margin-left: auto; }
+  .voicebanner__avatars .avatar { border: 2px solid var(--color-surface); margin-left: -8px; }
+  .voicebanner__avatars .avatar:first-child { margin-left: 0; }
+  .voicebanner__avatars .avatar.speaking { box-shadow: 0 0 0 2px #4ADE80; }
+  .voicebanner__controls { display: flex; align-items: center; gap: 8px; margin-left: var(--space-4); }
+  .voicebanner__btn {
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    color: var(--color-ink-2);
+    padding: 6px 14px;
+    border-radius: var(--radius-pill);
+    font-size: 12px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 5px;
+    cursor: pointer;
+  }
+  .voicebanner__btn:hover { background: var(--color-bg); }
+  .voicebanner__btn .material-symbols-outlined { font-size: 16px; }
+  .voicebanner__btn--end {
+    background: var(--color-danger); color: #fff; border-color: var(--color-danger);
+  }
+  .voicebanner__btn--end:hover { background: #B91C1C; }
+
+  /* Chat */
+  .chat {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--color-bg);
+    padding: var(--space-5) var(--space-6) var(--space-3);
+    display: flex; flex-direction: column; gap: var(--space-3);
+  }
+  .day-divider {
+    align-self: center;
+    background: var(--color-surface);
+    color: var(--color-muted);
+    font-size: 12px; font-weight: 600;
+    padding: 4px 12px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--color-border);
+    margin: 8px 0;
+  }
+  .msg { display: flex; gap: 12px; }
+  .msg__avatar { flex-shrink: 0; }
+  .msg__body { min-width: 0; max-width: 720px; display: flex; flex-direction: column; }
+  .msg__head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+  .msg__name { font-size: 14px; font-weight: 700; color: var(--color-ink); }
+  .msg__time { font-size: 11px; color: var(--color-muted-2); }
+  .msg__text {
+    font-size: 14px; line-height: 1.55;
+    color: var(--color-ink);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    border-top-left-radius: 4px;
+    padding: 10px 14px;
+  }
+  /* Mine — align to the right side of the chat lane */
+  .msg--mine {
+    flex-direction: row-reverse;
+    align-self: flex-end;
+  }
+  .msg--mine .msg__body { align-items: flex-end; }
+  .msg--mine .msg__head { flex-direction: row-reverse; }
+  .msg--mine .msg__text {
+    background: var(--color-primary-tint);
+    border-color: var(--color-primary-tint-strong);
+    color: var(--color-ink);
+    border-top-left-radius: 12px;
+    border-top-right-radius: 4px;
+  }
+  .msg__read {
+    font-size: 11px;
+    color: var(--color-muted);
+    margin-top: 4px;
+    display: inline-flex; align-items: center; gap: 4px;
+    font-weight: 500;
+  }
+  .msg__read .material-symbols-outlined { font-size: 14px; }
+  .msg__read--read { color: var(--color-primary); }
+
+  .syscall {
+    align-self: center;
+    background: var(--color-primary-tint);
+    color: var(--color-primary-strong);
+    border: 1px solid var(--color-primary-tint-strong);
+    border-radius: var(--radius-pill);
+    padding: 6px 14px;
+    font-size: 12px; font-weight: 600;
+    display: flex; align-items: center; gap: 6px;
+    margin: 6px 0;
+  }
+  .syscall .material-symbols-outlined { font-size: 16px; }
+
+  /* Composer reused look */
+  .composer {
+    padding: var(--space-3) var(--space-6) var(--space-5);
+    background: var(--color-bg);
+  }
+  .composer__box {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+  .composer__box:focus-within {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px rgba(109, 40, 217, 0.10);
+  }
+  .composer__bar { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--color-border); }
+  .composer__input { width: 100%; padding: 12px 16px; border: none; outline: none; background: transparent; font-size: 14px; resize: none; font-family: inherit; }
+  .composer__bar2 { display: flex; align-items: center; padding: 6px 8px; border-top: 1px solid var(--color-border); }
+  .composer__send {
+    margin-left: auto;
+    background: var(--color-primary); color: #fff; border: none;
+    width: 36px; height: 32px;
+    border-radius: var(--radius-md);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .composer__send:hover { background: var(--color-primary-strong); }
+  .composer__mic {
+    background: var(--color-surface);
+    color: var(--color-primary);
+    border: 1px solid var(--color-border);
+    width: 36px; height: 32px;
+    border-radius: var(--radius-md);
+    display: flex; align-items: center; justify-content: center;
+    margin-left: 4px;
+  }
+  .composer__mic:hover { background: var(--color-primary-tint); border-color: var(--color-primary-tint-strong); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div data-sidebar></div>
+
+  <main class="flex col" style="min-width:0;">
+    <header class="channel-header">
+      <h2 class="channel-title"><span class="hash">#</span>infraestrutura</h2>
+      <div class="channel-actions">
+        <div class="search" onclick="window.location='busca.html'" style="cursor:pointer;">
+          <span class="material-symbols-outlined search__icon">search</span>
+          <input class="search__input" placeholder="Buscar em #infraestrutura" readonly style="cursor:pointer;" />
+        </div>
+        <button class="icon-btn icon-btn--active" title="Abrir chamada de voz" onclick="window.location='chamada-audio-grupo.html'">
+          <span class="material-symbols-outlined">call</span>
+        </button>
+        <button class="icon-btn" onclick="window.location='canal.html'" title="Voltar ao canal">
+          <span class="material-symbols-outlined">arrow_back</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="voicebanner" style="cursor:pointer;" onclick="window.location='chamada-audio-grupo.html'" title="Abrir chamada">
+      <div class="voicebanner__icon">
+        <span class="material-symbols-outlined">headphones</span>
+      </div>
+      <div>
+        <div class="voicebanner__title">Chamada de voz — #infraestrutura</div>
+        <div class="voicebanner__meta">
+          <span class="voicebanner__dot"></span>
+          <span id="bannerTimer">12:08</span>
+          <span style="opacity:0.5;">·</span>
+          3 participantes
+        </div>
+      </div>
+      <div class="voicebanner__avatars">
+        <span class="avatar avatar--lg speaking">AN<span class="avatar__status avatar__status--online"></span></span>
+        <span class="avatar avatar--lg avatar--rose">JL</span>
+        <span class="avatar avatar--lg avatar--blue">CA</span>
+      </div>
+      <div class="voicebanner__controls">
+        <button class="voicebanner__btn" title="Microfone" onclick="event.stopPropagation()">
+          <span class="material-symbols-outlined">mic</span>Mutar
+        </button>
+        <button class="voicebanner__btn voicebanner__btn--end" title="Encerrar" onclick="event.stopPropagation(); window.location='canal.html'">
+          <span class="material-symbols-outlined">call_end</span>Sair
+        </button>
+      </div>
+    </div>
+
+    <div class="chat">
+      <div class="day-divider">Hoje</div>
+
+      <div class="msg">
+        <span class="avatar avatar--lg avatar--rose avatar--on-light msg__avatar">JL</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__name">Juliane Lino</span>
+            <span class="msg__time">10:42</span>
+          </div>
+          <div class="msg__text">Pessoal, detectamos uma latência anormal no cluster B da AWS. O monitoramento aponta picos de 400&nbsp;ms nos últimos 15 minutos. Alguém mexeu nas regras de roteamento hoje cedo?</div>
+        </div>
+      </div>
+
+      <div class="msg">
+        <span class="avatar avatar--lg avatar--blue avatar--on-light msg__avatar">CA</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__name">Caio Almeida</span>
+            <span class="msg__time">10:45</span>
+          </div>
+          <div class="msg__text">Verifiquei aqui. Apliquei um patch de segurança no gateway às 08:00, mas os testes de carga não indicaram impacto na latência. Vou fazer um rollback parcial para isolar o problema.</div>
+        </div>
+      </div>
+
+      <div class="msg msg--mine">
+        <span class="avatar avatar--lg avatar--on-light msg__avatar">AN</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__time">10:50</span>
+          </div>
+          <div class="msg__text">Acho melhor abrir uma chamada rápida para coordenar antes que afete a produção em horário de pico. Iniciando agora.</div>
+          <div class="msg__read msg__read--read"><span class="material-symbols-outlined">done_all</span>Lido por 2</div>
+        </div>
+      </div>
+
+      <div class="syscall">
+        <span class="material-symbols-outlined">call</span>
+        Álvaro Neto iniciou uma chamada de voz
+        <a href="chamada-audio-grupo.html" style="margin-left:auto; font-size:12px; font-weight:700; color: var(--color-primary); text-decoration:none; background: var(--color-primary-tint); padding: 3px 12px; border-radius: 12px;">Entrar</a>
+      </div>
+
+      <div class="msg msg--mine">
+        <span class="avatar avatar--lg avatar--on-light msg__avatar">AN</span>
+        <div class="msg__body">
+          <div class="msg__head">
+            <span class="msg__time">12:05</span>
+          </div>
+          <div class="msg__text">Entrando na call para ajudar na análise dos logs do gateway.</div>
+          <div class="msg__read"><span class="material-symbols-outlined">done_all</span>Entregue</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="composer__box">
+        <div class="composer__bar">
+          <button class="icon-btn"><span class="material-symbols-outlined">format_bold</span></button>
+          <button class="icon-btn"><span class="material-symbols-outlined">format_italic</span></button>
+          <button class="icon-btn"><span class="material-symbols-outlined">strikethrough_s</span></button>
+          <button class="icon-btn"><span class="material-symbols-outlined">link</span></button>
+          <button class="icon-btn"><span class="material-symbols-outlined">code</span></button>
+        </div>
+        <textarea class="composer__input" placeholder="Mensagem para #infraestrutura…" rows="1"></textarea>
+        <div class="composer__bar2">
+          <button class="icon-btn"><span class="material-symbols-outlined">add</span></button>
+          <button class="icon-btn"><span class="material-symbols-outlined">mood</span></button>
+          <button class="icon-btn"><span class="material-symbols-outlined">attach_file</span></button>
+          <button class="composer__mic" title="Gravar áudio"><span class="material-symbols-outlined" style="font-size:20px;">mic</span></button>
+          <button class="composer__send" title="Enviar"><span class="material-symbols-outlined" style="font-size:20px;">send</span></button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="partials.js"></script>
+<script>
+  document.querySelector("[data-sidebar]").outerHTML = NIC.renderSidebar({ active: "infraestrutura-call", variant: "with-channels" });
+
+  // Live banner timer
+  let secs = 12 * 60 + 8;
+  setInterval(() => {
+    secs++;
+    const m = String(Math.floor(secs / 60)).padStart(2, '0');
+    const s = String(secs % 60).padStart(2, '0');
+    document.getElementById('bannerTimer').textContent = m + ':' + s;
+  }, 1000);
+</script>
+</body>
+</html>

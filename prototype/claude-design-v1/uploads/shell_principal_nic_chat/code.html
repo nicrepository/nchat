@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+
+<html lang="pt-BR"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>NIC Chat - #infraestrutura</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          "colors": {
+                  "on-secondary": "#ffffff",
+                  "on-error": "#ffffff",
+                  "surface-bright": "#f9f9ff",
+                  "on-primary-container": "#dac5ff",
+                  "on-secondary-fixed-variant": "#4f4259",
+                  "background": "#f9f9ff",
+                  "surface-container-high": "#dee9fd",
+                  "inverse-primary": "#d3bbff",
+                  "tertiary-container": "#7d21cb",
+                  "primary-fixed-dim": "#d3bbff",
+                  "on-primary-fixed-variant": "#5b00c5",
+                  "surface-dim": "#d0daef",
+                  "on-tertiary": "#ffffff",
+                  "inverse-surface": "#273140",
+                  "outline-variant": "#ccc3d7",
+                  "tertiary": "#6000a5",
+                  "on-tertiary-fixed-variant": "#6900b3",
+                  "surface-variant": "#d9e3f7",
+                  "on-tertiary-fixed": "#2c0051",
+                  "primary-container": "#6d28d9",
+                  "on-surface-variant": "#4a4455",
+                  "surface-container": "#e6eeff",
+                  "outline": "#7b7486",
+                  "on-error-container": "#93000a",
+                  "on-background": "#121c2a",
+                  "secondary-container": "#efdcf9",
+                  "secondary": "#675971",
+                  "on-secondary-container": "#6d5f78",
+                  "surface-container-low": "#eff3ff",
+                  "on-surface": "#121c2a",
+                  "surface-container-highest": "#d9e3f7",
+                  "on-secondary-fixed": "#22172c",
+                  "on-primary-fixed": "#250059",
+                  "error": "#ba1a1a",
+                  "inverse-on-surface": "#ebf1ff",
+                  "tertiary-fixed": "#f0dbff",
+                  "secondary-fixed-dim": "#d2c0dc",
+                  "on-primary": "#ffffff",
+                  "surface": "#f9f9ff",
+                  "tertiary-fixed-dim": "#ddb7ff",
+                  "secondary-fixed": "#efdcf9",
+                  "surface-tint": "#7331df",
+                  "surface-container-lowest": "#ffffff",
+                  "on-tertiary-container": "#e3c2ff",
+                  "primary": "#5300b7",
+                  "primary-fixed": "#ebddff",
+                  "error-container": "#ffdad6"
+          },
+          "borderRadius": {
+                  "DEFAULT": "0.125rem",
+                  "lg": "0.25rem",
+                  "xl": "0.5rem",
+                  "full": "0.75rem"
+          },
+          "spacing": {
+                  "xs": "4px",
+                  "xl": "32px",
+                  "margin-mobile": "16px",
+                  "lg": "24px",
+                  "margin-desktop": "40px",
+                  "unit": "4px",
+                  "md": "16px",
+                  "sm": "8px",
+                  "gutter": "24px"
+          },
+          "fontFamily": {
+                  "headline-sm": [
+                          "Inter"
+                  ],
+                  "display-lg": [
+                          "Inter"
+                  ],
+                  "headline-md": [
+                          "Inter"
+                  ],
+                  "body-sm": [
+                          "Inter"
+                  ],
+                  "headline-lg-mobile": [
+                          "Inter"
+                  ],
+                  "headline-lg": [
+                          "Inter"
+                  ],
+                  "body-md": [
+                          "Inter"
+                  ],
+                  "label-md": [
+                          "Inter"
+                  ],
+                  "body-lg": [
+                          "Inter"
+                  ]
+          },
+          "fontSize": {
+                  "headline-sm": [
+                          "20px",
+                          {
+                                  "lineHeight": "28px",
+                                  "fontWeight": "600"
+                          }
+                  ],
+                  "display-lg": [
+                          "48px",
+                          {
+                                  "lineHeight": "56px",
+                                  "letterSpacing": "-0.02em",
+                                  "fontWeight": "700"
+                          }
+                  ],
+                  "headline-md": [
+                          "24px",
+                          {
+                                  "lineHeight": "32px",
+                                  "fontWeight": "600"
+                          }
+                  ],
+                  "body-sm": [
+                          "14px",
+                          {
+                                  "lineHeight": "20px",
+                                  "fontWeight": "400"
+                          }
+                  ],
+                  "headline-lg-mobile": [
+                          "28px",
+                          {
+                                  "lineHeight": "36px",
+                                  "fontWeight": "600"
+                          }
+                  ],
+                  "headline-lg": [
+                          "32px",
+                          {
+                                  "lineHeight": "40px",
+                                  "letterSpacing": "-0.01em",
+                                  "fontWeight": "600"
+                          }
+                  ],
+                  "body-md": [
+                          "16px",
+                          {
+                                  "lineHeight": "24px",
+                                  "fontWeight": "400"
+                          }
+                  ],
+                  "label-md": [
+                          "12px",
+                          {
+                                  "lineHeight": "16px",
+                                  "letterSpacing": "0.02em",
+                                  "fontWeight": "500"
+                          }
+                  ],
+                  "body-lg": [
+                          "18px",
+                          {
+                                  "lineHeight": "28px",
+                                  "fontWeight": "400"
+                          }
+                  ]
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="bg-background text-on-background font-body-md text-body-md h-screen w-full overflow-hidden flex">
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-0 h-screen flex flex-col p-md z-40 bg-inverse-surface border-r border-outline-variant docked left-0 h-full w-[280px]">
+<!-- Header -->
+<div class="flex items-center gap-md mb-xl cursor-pointer">
+<div class="w-10 h-10 bg-[#7B2FE3] rounded-lg flex items-center justify-center shrink-0">
+<span class="material-symbols-outlined text-white">hexagon</span>
+</div>
+<div>
+<h1 class="font-headline-sm text-headline-sm font-bold text-white">NIC-Labs</h1>
+<p class="font-label-md text-label-md text-inverse-primary opacity-80">NIC Chat</p>
+</div>
+</div>
+<!-- Channels -->
+<div class="flex flex-col gap-xs flex-grow overflow-y-auto">
+<div class="flex items-center justify-between px-md py-sm mb-xs">
+<span class="font-label-md text-label-md text-inverse-primary uppercase tracking-wider">Canais</span>
+<button class="text-inverse-primary hover:text-white transition-colors w-6 h-6 flex items-center justify-center rounded-full hover:bg-surface-container-highest">
+<span class="material-symbols-outlined text-[18px]">add</span>
+</button>
+</div>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg" href="#">
+<span class="material-symbols-outlined text-[18px]">tag</span>
+<span class="font-body-sm text-body-sm">#geral</span>
+</a>
+<a class="flex items-center gap-sm bg-[#7B2FE3]/20 text-[#d3bbff] rounded-lg px-md py-sm border-l-4 border-[#7B2FE3] scale-[0.99] transition-transform" href="#">
+<span class="material-symbols-outlined text-[18px]">tag</span>
+<span class="font-body-sm text-body-sm font-semibold">#infraestrutura</span>
+</a>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg" href="#">
+<span class="material-symbols-outlined text-[18px]">tag</span>
+<span class="font-body-sm text-body-sm">#suporte</span>
+</a>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg" href="#">
+<span class="material-symbols-outlined text-[18px]">tag</span>
+<span class="font-body-sm text-body-sm">#projetos</span>
+</a>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg" href="#">
+<span class="material-symbols-outlined text-[18px]">tag</span>
+<span class="font-body-sm text-body-sm">#avisos</span>
+</a>
+<div class="mt-md">
+<button class="w-full py-2 px-4 rounded-lg border border-outline-variant text-inverse-primary hover:bg-surface-container-highest transition-colors font-label-md text-label-md flex items-center justify-center gap-sm">
+<span class="material-symbols-outlined text-[18px]">add_box</span>
+          Novo canal
+        </button>
+</div>
+<!-- Direct Messages -->
+<div class="mt-xl flex flex-col gap-xs">
+<div class="flex items-center justify-between px-md py-sm mb-xs">
+<span class="font-label-md text-label-md text-inverse-primary uppercase tracking-wider">Mensagens diretas</span>
+<button class="text-inverse-primary hover:text-white transition-colors w-6 h-6 flex items-center justify-center rounded-full hover:bg-surface-container-highest">
+<span class="material-symbols-outlined text-[18px]">add</span>
+</button>
+</div>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg group" href="#">
+<div class="relative">
+<img alt="Juliane Lino" class="w-6 h-6 rounded-full" data-alt="Corporate headshot of a professional woman with a soft purple background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuATNwZd2L3wOvvcZfAVeXcsr3CfxMeAwp-qHvi3sbsK3izf6gbMr6xozKYvaYjqoarXlAd8d8whcCr16ebrkJ8saW4cr-0PgbTv1zqAhOhnG4c1NDFftDYfqnh8gQ9yROzV42WuQ2UBAdBM1t5ME2kRc1HzAjr-CoI-zay7FuFfDOW3vUYcXDj0aDVcPClCfPuEgJb1Vpmb2az76SBS31mO5FjaNhyGxNCqXHDCVy5VFzSOa8HyImt95t9beIDaqcXtAim2In8T39lm"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-green-500 border-2 border-inverse-surface rounded-full"></span>
+</div>
+<span class="font-body-sm text-body-sm opacity-80 group-hover:opacity-100">Juliane Lino</span>
+</a>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg group" href="#">
+<div class="relative">
+<img alt="Caio Almeida" class="w-6 h-6 rounded-full" data-alt="Corporate headshot of a professional man with a light purple background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuB3tyAnVLhIcZKhuctFeug2gJ7itBQhrAyMOOG1fwlXDKSxv0pNbf7rqtaI9c34TCZFoNTlsNYsHvCZdr58qCbrANv7h9eu_88DMIyIGPIWqGPfs-e3ICvoqTGhEIj-2mAmDgwKIuV6JkyQqhpdeDi9bMDfdvp7P4sQFGfNN_-dLeyP7ZnDpwWfvKVZ7Y8tRRYjzD7U_Z5aqlCS7TJwaeaIoj3sComaiaCsgKv0snSZD1jX8WRDzLNaHMhyat9OzOFmzjehsVDlIpKF"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-yellow-500 border-2 border-inverse-surface rounded-full"></span>
+</div>
+<span class="font-body-sm text-body-sm opacity-80 group-hover:opacity-100">Caio Almeida</span>
+</a>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg group" href="#">
+<div class="relative">
+<img alt="Bruno Lima" class="w-6 h-6 rounded-full" data-alt="Corporate headshot of a professional woman with a subtle lilac background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBSLiDalFsJUeS2K6A7EyAKhJitA1pp38hnqpdwExx4_KQArCC1bh4JqCbBV2_wwsFYPZ5JpjJhxB6PDc1UOGg6azeH9j4rOooz1wbR-xOqpceGlzJNmzE3uKUZuoIerdF-NESUaSyLuED73JEGP5G9Edyg7IfIMdP8dIooeq_Q2iVUztyQWVmYR5eYy1IL-3uTjJyyIZRujzNaxRGYkKCXuP2sia1c8WElTme4DYI38dhITwQeMcHReKLvKxbT60DaulYqYAh8Uz_N"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-gray-400 border-2 border-inverse-surface rounded-full"></span>
+</div>
+<span class="font-body-sm text-body-sm opacity-80 group-hover:opacity-100">Bruno Lima</span>
+</a>
+<a class="flex items-center gap-sm text-surface-variant hover:text-white px-md py-sm transition-colors hover:bg-surface-container-highest transition-all duration-200 rounded-lg group" href="#">
+<div class="relative">
+<img alt="Fernanda Nicácio" class="w-6 h-6 rounded-full" data-alt="Corporate headshot of a professional man with a gentle pastel purple background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBzFIWF_wMOxlgykXVkT_CCztlRl01JYSzfuZEy92Od9iFNTNLoW4AP6gJar1BpNf3kINZePBjLKXKgw6jaPlRUVyv6AhQVcz79pSEBIVcHzwQDpj8g44WgenI1kwNDafoBzjJ3lmYRhvurj8kt0vH-uIMULHwZDuNeUEJoYuG22e0gxV7SNJveTeqVBjyj-qVrV30lXXMg1ROnsBBhNRuna4eSHdXnaVp-X64x_zXHorEMyd09Fd-Q07FNAdzIBIE5-T1cwv-G4AUY"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-green-500 border-2 border-inverse-surface rounded-full"></span>
+</div>
+<span class="font-body-sm text-body-sm opacity-80 group-hover:opacity-100">Fernanda Nicácio</span>
+</a>
+</div>
+</div>
+<!-- Footer Profile -->
+<div class="mt-auto pt-md border-t border-outline-variant flex items-center justify-between">
+<div class="flex items-center gap-sm cursor-pointer hover:bg-surface-container-highest p-sm rounded-lg transition-colors flex-grow">
+<div class="relative">
+<img alt="Álvaro Neto" class="w-8 h-8 rounded-full" data-alt="Corporate headshot of a professional man in a deep purple background, conveying a high-tech corporate environment." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCxPWwPsHkacNh0iRbI4dN8pcak5GnNR9wWCnZxtDTlHlXC-HlhVmd5mJOvFGM9dRCBbd1kLasy5dQ63robXaJdYw09_mPfmVdk_fK2BF30gMEErNv3mEILDN4kVEOIu8IY_8rjRoLqhJ_Qa6bmVDtCigGjmnVWFfXNLgyw8ZqpB2c0AqN8K1dWsMMQvUj8sOZ-AxKGVR06BaGsuVSHD6KEfT_x1VLqAe4fXDf5Ic0qwtfaTBWOk1a-73vPptHQrlyAKezRRP268uRu"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-3 h-3 bg-green-500 border-2 border-inverse-surface rounded-full"></span>
+</div>
+<div class="flex flex-col">
+<span class="font-label-md text-label-md font-semibold text-inverse-primary">Álvaro Neto</span>
+<span class="text-[10px] text-surface-variant opacity-70">Infraestrutura &amp; Segurança</span>
+</div>
+</div>
+<button class="p-sm text-surface-variant hover:text-white rounded-lg hover:bg-surface-container-highest transition-colors">
+<span class="material-symbols-outlined">settings</span>
+</button>
+</div>
+</aside>
+<!-- Main Content Area -->
+<main class="flex-1 flex flex-col ml-[280px] mr-[320px] bg-background">
+<!-- TopNavBar -->
+<header class="flex items-center justify-between px-lg w-full h-16 z-30 border-b border-outline-variant bg-surface dark:bg-surface-container sticky top-0">
+<div class="flex items-center gap-md">
+<div class="flex flex-col">
+<h2 class="font-headline-sm text-headline-sm font-bold text-[#7B2FE3] flex items-center gap-xs">
+<span class="material-symbols-outlined text-[20px]">tag</span>
+            #infraestrutura
+          </h2>
+<span class="font-body-sm text-body-sm text-on-surface-variant mt-0.5 opacity-80">Discussões sobre servidores, redes e estabilidade.</span>
+</div>
+</div>
+<div class="flex items-center gap-sm">
+<div class="relative mr-md">
+<span class="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-outline text-[20px]">search</span>
+<input class="bg-surface-container-low border border-outline-variant rounded-full pl-10 pr-4 py-1.5 font-body-sm text-body-sm focus:outline-none focus:border-[#7B2FE3] focus:ring-1 focus:ring-[#7B2FE3] w-64 transition-all" placeholder="Buscar no canal..." type="text"/>
+</div>
+<button class="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant hover:bg-surface-container-low transition-colors hover:text-on-surface">
+<span class="material-symbols-outlined">call</span>
+</button>
+<button class="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant hover:bg-surface-container-low transition-colors hover:text-on-surface">
+<span class="material-symbols-outlined">push_pin</span>
+</button>
+<button class="w-10 h-10 rounded-full flex items-center justify-center text-[#7B2FE3] bg-surface-container-low transition-colors hover:bg-surface-container">
+<span class="material-symbols-outlined">info</span>
+</button>
+</div>
+</header>
+<!-- Chat Area Canvas -->
+<div class="flex-1 overflow-y-auto p-lg flex flex-col justify-end bg-surface-bright relative">
+<!-- Empty State / Date Separator -->
+<div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+<div class="text-center flex flex-col items-center">
+<span class="material-symbols-outlined text-[64px] text-outline-variant mb-md opacity-50">forum</span>
+<h3 class="font-headline-sm text-headline-sm text-on-surface-variant mb-xs">Nenhuma mensagem ainda</h3>
+<p class="font-body-sm text-body-sm text-outline max-w-sm">Este é o início do canal #infraestrutura. Envie a primeira mensagem para começar a discussão.</p>
+</div>
+</div>
+</div>
+<!-- Message Input -->
+<div class="p-lg bg-surface border-t border-outline-variant relative z-10">
+<div class="bg-surface-container-lowest border border-outline-variant rounded-xl shadow-sm overflow-hidden focus-within:border-[#7B2FE3] focus-within:ring-1 focus-within:ring-[#7B2FE3] transition-all">
+<textarea class="w-full border-none bg-transparent resize-none focus:ring-0 font-body-md text-body-md p-md min-h-[56px] max-h-[200px] overflow-y-auto" placeholder="Mensagem para #infraestrutura..." rows="1"></textarea>
+<div class="flex items-center justify-between px-md py-sm bg-surface-container-low border-t border-outline-variant">
+<div class="flex items-center gap-xs">
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">add_circle</span>
+</button>
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">format_bold</span>
+</button>
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">format_italic</span>
+</button>
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">link</span>
+</button>
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">format_list_bulleted</span>
+</button>
+</div>
+<div class="flex items-center gap-sm">
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">alternate_email</span>
+</button>
+<button class="w-8 h-8 rounded flex items-center justify-center text-outline hover:text-on-surface hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[20px]">mood</span>
+</button>
+<button class="bg-[#7B2FE3]/10 text-[#7B2FE3] px-4 py-1.5 rounded-lg font-label-md text-label-md font-semibold flex items-center gap-xs hover:bg-[#7B2FE3] hover:text-white transition-colors ml-xs">
+<span class="material-symbols-outlined text-[16px]">send</span>
+              Enviar
+            </button>
+</div>
+</div>
+</div>
+</div>
+</main>
+<!-- Right Panel (Channel Details) -->
+<aside class="fixed right-0 top-0 h-screen w-[320px] bg-surface border-l border-outline-variant flex flex-col z-30">
+<div class="h-16 flex items-center justify-between px-md border-b border-outline-variant shrink-0">
+<h3 class="font-headline-sm text-headline-sm font-semibold text-on-surface">Detalhes do Canal</h3>
+<button class="w-8 h-8 rounded-full flex items-center justify-center text-on-surface-variant hover:bg-surface-container-low transition-colors">
+<span class="material-symbols-outlined">close</span>
+</button>
+</div>
+<div class="flex-1 overflow-y-auto p-md flex flex-col gap-lg">
+<!-- About Section -->
+<section class="bg-surface-container-lowest border border-outline-variant rounded-xl p-md shadow-sm">
+<h4 class="font-label-md text-label-md uppercase text-outline mb-sm tracking-wider">Sobre</h4>
+<div class="bg-surface-container-low p-sm rounded-lg mb-sm">
+<p class="font-body-sm text-body-sm text-on-surface-variant">Discussões técnicas fatiadas sobre infraestrutura, servidores on-premise, cloud e segurança de rede. Canal crítico para uptime.</p>
+</div>
+<div class="flex flex-col gap-xs mt-sm">
+<div class="flex items-center justify-between text-body-sm font-body-sm">
+<span class="text-outline">Criado em</span>
+<span class="text-on-surface font-medium">12 de Jan, 2024</span>
+</div>
+<div class="flex items-center justify-between text-body-sm font-body-sm">
+<span class="text-outline">Visibilidade</span>
+<span class="flex items-center gap-xs text-on-surface font-medium"><span class="material-symbols-outlined text-[16px] text-[#7B2FE3]">public</span> Público</span>
+</div>
+</div>
+</section>
+<!-- Members Section -->
+<section class="bg-surface-container-lowest border border-outline-variant rounded-xl p-md shadow-sm">
+<div class="flex items-center justify-between mb-sm">
+<h4 class="font-label-md text-label-md uppercase text-outline tracking-wider">Membros (14)</h4>
+<button class="text-[#7B2FE3] hover:text-[#5b00c5] transition-colors text-label-md font-label-md">Ver Todos</button>
+</div>
+<div class="flex flex-col gap-sm">
+<div class="flex items-center justify-between group cursor-pointer">
+<div class="flex items-center gap-sm">
+<div class="relative">
+<img alt="Álvaro Neto" class="w-8 h-8 rounded-full" data-alt="Corporate headshot of a professional man in a deep purple background, conveying a high-tech corporate environment." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBaND5QmCW6bFwFTzyUEgenP9lggwYEameHHLiasZ5jVamwO7pgZbTMF25TEwMpintXggxp2CuvYcEVXod4JH0C0dWiy9nvTuBdLMleeAFfT5yYRQzfZEqnQFu3sBmoI3iMpuO6hqigsjpoMoASOKHAjYnYAw0mwoSrf6gR2HXMTUIdCnlawe6cJBrMbeE5Yo5zCUPW7zWD97wqP_76SGn2sD7G3jq_FVxQuQzsbdfUzBcu3GSgiW338rc8NL297h5CR5bH5f6afILs"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-green-500 border-2 border-surface rounded-full"></span>
+</div>
+<div class="flex flex-col">
+<span class="font-body-sm text-body-sm font-medium text-on-surface">Álvaro Neto <span class="text-[10px] bg-[#7B2FE3]/10 text-[#7B2FE3] px-1.5 py-0.5 rounded ml-1">Admin</span></span>
+<span class="font-label-md text-label-md text-outline">Infraestrutura &amp; Segurança</span>
+</div>
+</div>
+</div>
+<div class="flex items-center justify-between group cursor-pointer">
+<div class="flex items-center gap-sm">
+<div class="relative">
+<img alt="Juliane Lino" class="w-8 h-8 rounded-full" data-alt="Corporate headshot of a professional man with a light purple background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBQfMZQJ2odFwLvsr65Kkbu6DS-_Xh2HQTfsjWSGMqNJYhUPtVvpxDnPWxXh-z9lJ-1MoZhOtSWJFyUU57_39UTzT8y_5HpQkh_6t3vl529PdHESV663R0rLB-SqQirSCNi6ZgDDFkCotFmpKKLfEPqgD7mPb_Llx4kcRG_6jckysGdCfVkdHZTHOJZJViSCeVM-3B5ybRqNbGrMbGFSc1q8A-ckLS0sOJs-vzJTjxn_uLCdNqfIHHHw8uQEVFsKZQ0IMfWcFiW9Duv"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-yellow-500 border-2 border-surface rounded-full"></span>
+</div>
+<div class="flex flex-col">
+<span class="font-body-sm text-body-sm font-medium text-on-surface">Juliane Lino</span>
+<span class="font-label-md text-label-md text-outline">Infraestrutura &amp; Suporte</span>
+</div>
+</div>
+</div>
+<div class="flex items-center justify-between group cursor-pointer">
+<div class="flex items-center gap-sm">
+<div class="relative">
+<img alt="Caio Almeida" class="w-8 h-8 rounded-full" data-alt="Corporate headshot of a professional woman with a subtle lilac background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCeLDJffKB8DRrhFa1ofoegwrgl7iKMVuQC7zDeQYmZ3fn2ZvOxCxpezrNUfNUXMFLD0fhBjvHaTYqDXMGUEdHAEPNaglT4BKs7fsz_EKT3e_nwQ-V7zxDrr0sV-N1Nxkeo7JpDBhfZTRT5YtZItzEJt03SztSSR9iOaAcmp11hX360q339ovuC3cK6U3nCU-XpM3Ns-1HHL7ZMLcirHDQopkdQ6UoE7AVjdqqA4-_UjOTw89H33YdiQeQSbkv88dXAuiRdZTneTtR5"/>
+<span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-gray-400 border-2 border-surface rounded-full"></span>
+</div>
+<div class="flex flex-col">
+<span class="font-body-sm text-body-sm font-medium text-on-surface">Caio Almeida</span>
+<span class="font-label-md text-label-md text-outline">DevOps</span>
+</div>
+</div>
+</div>
+<button class="mt-sm flex items-center justify-center gap-xs w-full py-2 border border-dashed border-outline-variant rounded-lg text-outline hover:text-[#7B2FE3] hover:border-[#7B2FE3] transition-colors font-label-md text-label-md">
+<span class="material-symbols-outlined text-[18px]">person_add</span>
+                Adicionar Membros
+            </button>
+</div>
+</section>
+<!-- Recent Files Section -->
+<section class="bg-surface-container-lowest border border-outline-variant rounded-xl p-md shadow-sm">
+<div class="flex items-center justify-between mb-sm">
+<h4 class="font-label-md text-label-md uppercase text-outline tracking-wider">Arquivos Recentes</h4>
+<button class="text-[#7B2FE3] hover:text-[#5b00c5] transition-colors text-label-md font-label-md">Ver Todos</button>
+</div>
+<div class="flex flex-col gap-sm">
+<a class="flex items-start gap-sm p-sm rounded-lg hover:bg-surface-container-low border border-transparent hover:border-outline-variant transition-all" href="#">
+<div class="w-10 h-10 rounded bg-red-100 flex items-center justify-center text-red-600 shrink-0">
+<span class="material-symbols-outlined">picture_as_pdf</span>
+</div>
+<div class="flex flex-col overflow-hidden">
+<span class="font-body-sm text-body-sm font-medium text-on-surface truncate">Topologia_Rede_v4.pdf</span>
+<span class="font-label-md text-label-md text-outline">Hoje, 14:32 • 2.4 MB</span>
+</div>
+</a>
+<a class="flex items-start gap-sm p-sm rounded-lg hover:bg-surface-container-low border border-transparent hover:border-outline-variant transition-all" href="#">
+<div class="w-10 h-10 rounded bg-green-100 flex items-center justify-center text-green-600 shrink-0">
+<span class="material-symbols-outlined">table_view</span>
+</div>
+<div class="flex flex-col overflow-hidden">
+<span class="font-body-sm text-body-sm font-medium text-on-surface truncate">Inventario_Servidores_Q3.xlsx</span>
+<span class="font-label-md text-label-md text-outline">Ontem, 09:15 • 845 KB</span>
+</div>
+</a>
+</div>
+</section>
+</div>
+</aside>
+</body></html>

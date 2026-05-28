@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Sessões</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  .device-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .device-row:last-child { border-bottom: none; }
+  .device-icon {
+    width: 40px; height: 40px;
+    border-radius: var(--radius-md);
+    background: var(--color-surface-2);
+    color: var(--color-ink-2);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    border: 1px solid var(--color-border);
+  }
+  .device-icon--current { background: var(--color-primary-tint); color: var(--color-primary); border-color: var(--color-primary-tint-strong); }
+  .device-row__name { font-size: 14px; font-weight: 600; color: var(--color-ink); display: flex; align-items: center; gap: 8px; }
+  .device-row__meta { font-size: 12px; color: var(--color-muted); margin-top: 3px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .device-row__action { margin-left: auto; }
+
+  /* Modal */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(22, 18, 31, 0.45);
+    backdrop-filter: blur(2px);
+    display: none; align-items: center; justify-content: center;
+    z-index: 50;
+  }
+  .modal-backdrop.is-open { display: flex; }
+  .modal {
+    width: min(440px, 92vw);
+    background: var(--color-surface);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-lg);
+    padding: 28px;
+    border: 1px solid var(--color-border);
+  }
+  .modal__icon {
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    background: var(--color-danger-tint);
+    color: var(--color-danger);
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 16px;
+  }
+  .modal__title { font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+  .modal__text { font-size: 13px; color: var(--color-muted); margin: 0 0 22px; line-height: 1.55; }
+  .modal__device {
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 10px 14px;
+    margin-bottom: 22px;
+    display: flex; align-items: center; gap: 10px;
+    font-size: 13px;
+  }
+  .modal__device .device-icon { width: 32px; height: 32px; }
+  .modal__actions { display: flex; gap: 10px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div data-sidebar></div>
+
+  <main class="flex col" style="min-width:0;">
+    <nav class="tabnav">
+      <div class="tabnav__items" data-settings-tabs></div>
+      <div class="tabnav__right">
+        <button class="icon-btn"><span class="material-symbols-outlined">help</span></button>
+        <span class="avatar avatar--lg avatar--on-light">AN<span class="avatar__status avatar__status--online"></span></span>
+      </div>
+    </nav>
+
+    <div class="scaffold-body">
+      <div class="scaffold-container scaffold-container--narrow">
+
+        <div>
+          <h1 class="page-h1">Sessões</h1>
+          <p class="page-sub">Dispositivos atualmente conectados à sua conta no NIC Chat.</p>
+        </div>
+
+        <section class="section">
+          <div class="section__head">
+            <div>
+              <h2 class="section__title">Dispositivos conectados</h2>
+              <div class="section__sub">Revogue qualquer sessão que você não reconhece.</div>
+            </div>
+            <button class="btn btn--danger" style="padding: 6px 12px; font-size: 12px;">Revogar todas as outras</button>
+          </div>
+          <div class="section__body">
+
+            <div class="device-row">
+              <div class="device-icon device-icon--current"><span class="material-symbols-outlined">public</span></div>
+              <div style="min-width:0;">
+                <div class="device-row__name">Firefox · Linux <span class="badge badge--success">Sessão atual</span></div>
+                <div class="device-row__meta">
+                  <span>Ativa agora</span>
+                  <span style="opacity:0.5;">·</span>
+                  <span>São Paulo, BR · 187.10.x.x</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="device-row">
+              <div class="device-icon"><span class="material-symbols-outlined">desktop_windows</span></div>
+              <div style="min-width:0;">
+                <div class="device-row__name">Chrome · Windows</div>
+                <div class="device-row__meta">
+                  <span>Último acesso há 2 dias</span>
+                  <span style="opacity:0.5;">·</span>
+                  <span>Campinas, BR · 200.143.x.x</span>
+                </div>
+              </div>
+              <button class="btn btn--danger device-row__action" data-open-revoke
+                      data-device-name="Chrome · Windows"
+                      data-device-meta="Campinas, BR · acesso há 2 dias">
+                Revogar sessão
+              </button>
+            </div>
+
+            <div class="device-row">
+              <div class="device-icon"><span class="material-symbols-outlined">terminal</span></div>
+              <div style="min-width:0;">
+                <div class="device-row__name">NIC Chat Desktop · Linux</div>
+                <div class="device-row__meta">
+                  <span>Último acesso há 1 dia</span>
+                  <span style="opacity:0.5;">·</span>
+                  <span>São Paulo, BR · 187.10.x.x</span>
+                </div>
+              </div>
+              <button class="btn btn--danger device-row__action" data-open-revoke
+                      data-device-name="NIC Chat Desktop · Linux"
+                      data-device-meta="São Paulo, BR · acesso há 1 dia">
+                Revogar sessão
+              </button>
+            </div>
+
+            <div class="device-row">
+              <div class="device-icon"><span class="material-symbols-outlined">phone_iphone</span></div>
+              <div style="min-width:0;">
+                <div class="device-row__name">iOS Safari · iPhone</div>
+                <div class="device-row__meta">
+                  <span>Último acesso há 8 dias</span>
+                  <span style="opacity:0.5;">·</span>
+                  <span>São Paulo, BR · 191.241.x.x</span>
+                </div>
+              </div>
+              <button class="btn btn--danger device-row__action" data-open-revoke
+                      data-device-name="iOS Safari · iPhone"
+                      data-device-meta="São Paulo, BR · acesso há 8 dias">
+                Revogar sessão
+              </button>
+            </div>
+
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section__head"><h2 class="section__title">Preferência</h2></div>
+          <div class="section__body">
+            <div class="setting-row">
+              <div>
+                <div class="setting-row__title">Encerrar sessão deste navegador ao fechar</div>
+                <div class="setting-row__sub">Ao fechar o navegador, será necessário fazer login novamente.</div>
+              </div>
+              <label class="toggle"><input type="checkbox" /><span class="toggle__track"></span><span class="toggle__thumb"></span></label>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Revoke session modal -->
+<div class="modal-backdrop" id="revoke-modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal__icon"><span class="material-symbols-outlined">logout</span></div>
+    <h3 class="modal__title" id="modal-title">Revogar sessão?</h3>
+    <p class="modal__text">Este dispositivo será desconectado imediatamente. Será necessário entrar novamente no NIC Chat para usá-lo.</p>
+    <div class="modal__device">
+      <div class="device-icon"><span class="material-symbols-outlined">desktop_windows</span></div>
+      <div>
+        <div style="font-weight:600;" id="modal-device-name">Chrome · Windows</div>
+        <div style="font-size:12px; color: var(--color-muted);" id="modal-device-meta">Campinas, BR · acesso há 2 dias</div>
+      </div>
+    </div>
+    <div class="modal__actions">
+      <button class="btn btn--secondary" data-close-revoke>Cancelar</button>
+      <button class="btn btn--danger-solid" data-close-revoke>Revogar sessão</button>
+    </div>
+  </div>
+</div>
+
+<script src="partials.js"></script>
+<script>
+  document.querySelector("[data-sidebar]").outerHTML = NIC.renderSidebar({ active: "configuracoes" });
+  document.querySelector("[data-settings-tabs]").innerHTML = NIC.renderSettingsTabs("sessoes");
+
+  const modal = document.getElementById("revoke-modal");
+  document.querySelectorAll("[data-open-revoke]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.getElementById("modal-device-name").textContent = btn.dataset.deviceName || "Dispositivo";
+      document.getElementById("modal-device-meta").textContent = btn.dataset.deviceMeta || "";
+      modal.classList.add("is-open");
+    });
+  });
+  document.querySelectorAll("[data-close-revoke]").forEach(btn => {
+    btn.addEventListener("click", () => modal.classList.remove("is-open"));
+  });
+  modal.addEventListener("click", e => { if (e.target === modal) modal.classList.remove("is-open"); });
+</script>
+</body>
+</html>

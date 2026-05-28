@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Busca global</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  .search-top {
+    height: var(--topbar-h);
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+    display: flex; align-items: center; gap: var(--space-4);
+    padding: 0 var(--space-6);
+  }
+  .search-top__input-wrap {
+    flex: 1; max-width: 720px;
+    position: relative;
+  }
+  .search-top__input {
+    width: 100%;
+    padding: 10px 38px 10px 42px;
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-pill);
+    font-size: 14px;
+    outline: none;
+    transition: border-color .12s, box-shadow .12s;
+  }
+  .search-top__input:focus {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px rgba(109,40,217,0.12);
+  }
+  .search-top__icon {
+    position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+    color: var(--color-muted-2); font-size: 20px;
+  }
+  .search-top__clear {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    width: 30px; height: 30px;
+    border: none; background: transparent;
+    color: var(--color-muted-2);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .search-top__clear:hover { background: var(--color-bg); color: var(--color-ink); }
+
+  .tabs {
+    background: var(--color-surface);
+    padding: 0 var(--space-6);
+    border-bottom: 1px solid var(--color-border);
+    display: flex; gap: var(--space-6);
+  }
+  .tab {
+    padding: 14px 2px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-muted);
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    cursor: pointer;
+    background: transparent; border-left: 0; border-right: 0; border-top: 0;
+  }
+  .tab:hover { color: var(--color-ink); }
+  .tab--active { color: var(--color-primary); border-bottom-color: var(--color-primary); }
+
+  .results {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-6) var(--space-8);
+    background: var(--color-bg);
+    max-width: 1080px;
+    margin: 0 auto;
+    width: 100%;
+  }
+  .results-section { margin-bottom: var(--space-8); }
+  .results-section__title {
+    font-size: 16px; font-weight: 700;
+    color: var(--color-ink);
+    margin: 0 0 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .results-section__count {
+    font-size: 12px; font-weight: 500;
+    color: var(--color-muted);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    padding: 1px 8px;
+    border-radius: var(--radius-pill);
+  }
+
+  .hl { background: rgba(168, 101, 247, 0.20); color: var(--color-primary-strong); padding: 0 3px; border-radius: 3px; font-weight: 600; }
+
+  .res-msg, .res-channel {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    display: flex; gap: 14px;
+  }
+  .res-msg__body { flex: 1; min-width: 0; }
+  .res-msg__head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; font-size: 13px; }
+  .res-msg__name { font-weight: 700; color: var(--color-ink); }
+  .res-msg__meta { color: var(--color-muted); }
+  .res-msg__ch { color: var(--color-primary); font-weight: 500; }
+  .res-msg__text { font-size: 14px; line-height: 1.55; color: var(--color-ink); margin: 0; }
+
+  .res-files { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .res-file {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    display: flex; align-items: center; gap: 12px;
+    transition: border-color .12s;
+  }
+  .res-file:hover { border-color: var(--color-primary-soft); }
+  .res-file__icon {
+    width: 40px; height: 40px;
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .res-file__icon--pdf { background: #FEE2E2; color: #DC2626; }
+  .res-file__icon--xls { background: #DCFCE7; color: #16A34A; }
+  .res-file__body { flex: 1; min-width: 0; }
+  .res-file__name { font-size: 13px; font-weight: 600; color: var(--color-ink); }
+  .res-file__meta { font-size: 12px; color: var(--color-muted); margin-top: 2px; }
+
+  .res-channel { align-items: flex-start; }
+  .res-channel__icon {
+    width: 40px; height: 40px;
+    border-radius: var(--radius-md);
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .res-channel__name { font-size: 16px; font-weight: 700; color: var(--color-primary); margin: 0 0 2px; }
+  .res-channel__desc { font-size: 13px; color: var(--color-ink-2); margin: 0; line-height: 1.5; }
+  .res-channel__count {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 4px;
+    color: var(--color-muted);
+    font-size: 12px;
+  }
+  .res-people { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .res-person {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .res-person__name { font-size: 14px; font-weight: 600; color: var(--color-ink); }
+  .res-person__role { font-size: 12px; color: var(--color-muted); margin-top: 2px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div data-sidebar></div>
+
+  <main class="flex col" style="min-width:0;">
+
+    <header class="search-top">
+      <div class="search-top__input-wrap">
+        <span class="material-symbols-outlined search-top__icon">search</span>
+        <input class="search-top__input" value="backup" placeholder="Buscar mensagens, pessoas, canais e arquivos" />
+        <button class="search-top__clear" onclick="window.location='canal.html'" title="Fechar busca"><span class="material-symbols-outlined">close</span></button>
+      </div>
+      <div style="margin-left:auto;"><span class="avatar avatar--lg avatar--on-light">AN<span class="avatar__status avatar__status--online"></span></span></div>
+    </header>
+
+    <div class="tabs">
+      <button class="tab tab--active">Tudo</button>
+      <button class="tab">Mensagens</button>
+      <button class="tab">Pessoas</button>
+      <button class="tab">Canais</button>
+      <button class="tab">Arquivos</button>
+    </div>
+
+    <div class="results">
+
+      <section class="results-section">
+        <h2 class="results-section__title">Mensagens <span class="results-section__count">2 resultados</span></h2>
+
+        <div class="res-msg" style="cursor:pointer;" onclick="window.location='canal.html'">
+          <span class="avatar avatar--lg avatar--rose avatar--on-light">JL</span>
+          <div class="res-msg__body">
+            <div class="res-msg__head">
+              <span class="res-msg__name">Juliane Lino</span>
+              <span class="res-msg__meta">em <span class="res-msg__ch">#infraestrutura</span> · Hoje, 09:41</span>
+            </div>
+            <p class="res-msg__text">“Checklist de <span class="hl">backup</span> semanal atualizado na wiki. Por favor, revisem os logs até o fim do dia.”</p>
+          </div>
+        </div>
+
+        <div class="res-msg" style="cursor:pointer;" onclick="window.location='canal.html'">
+          <span class="avatar avatar--lg avatar--blue avatar--on-light">CA</span>
+          <div class="res-msg__body">
+            <div class="res-msg__head">
+              <span class="res-msg__name">Caio Almeida</span>
+              <span class="res-msg__meta">em <span class="res-msg__ch">#projetos</span> · Ontem, 16:30</span>
+            </div>
+            <p class="res-msg__text">“Precisamos validar o <span class="hl">backup</span> antes do deploy da versão 2.4. Alguém confirma o status?”</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="results-section">
+        <h2 class="results-section__title">Pessoas <span class="results-section__count">1 resultado</span></h2>
+        <div class="res-people">
+          <div class="res-person">
+            <span class="avatar avatar--lg avatar--rose avatar--on-light">JL<span class="avatar__status avatar__status--online"></span></span>
+            <div>
+              <div class="res-person__name">Juliane Lino</div>
+              <div class="res-person__role">Infraestrutura &amp; Suporte · Responsável pelo <span class="hl">backup</span> semanal</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="results-section">
+        <h2 class="results-section__title">Arquivos <span class="results-section__count">2 resultados</span></h2>
+        <div class="res-files">
+          <div class="res-file" onclick="window.location='arquivos.html'">
+            <div class="res-file__icon res-file__icon--pdf"><span class="material-symbols-outlined">picture_as_pdf</span></div>
+            <div class="res-file__body">
+              <div class="res-file__name">relatorio-<span class="hl">backup</span>.pdf</div>
+              <div class="res-file__meta">em <span class="ch-ref" style="color: var(--color-primary);">#infraestrutura</span> · 2,4 MB</div>
+            </div>
+            <span class="badge badge--warning">Em análise</span>
+          </div>
+          <div class="res-file" onclick="window.location='arquivos.html'">
+            <div class="res-file__icon res-file__icon--xls"><span class="material-symbols-outlined">table_view</span></div>
+            <div class="res-file__body">
+              <div class="res-file__name"><span class="hl">backup</span>-servidores.xlsx</div>
+              <div class="res-file__meta">em <span class="ch-ref" style="color: var(--color-primary);">#projetos</span> · 1,1 MB</div>
+            </div>
+            <span class="badge badge--success">Aprovado</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="results-section">
+        <h2 class="results-section__title">Canais <span class="results-section__count">1 resultado</span></h2>
+
+        <div class="res-channel" style="cursor:pointer;" onclick="window.location='canal.html'">
+          <div class="res-channel__icon"><span class="material-symbols-outlined">tag</span></div>
+          <div style="flex:1; min-width:0;">
+            <h3 class="res-channel__name">#infraestrutura</h3>
+            <p class="res-channel__desc">Operações, infraestrutura, redes e segurança corporativa. (Relacionado a: <span class="hl">backup</span>)</p>
+          </div>
+          <div class="res-channel__count">
+            <span class="material-symbols-outlined" style="font-size:16px;">group</span>
+            42
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<script src="partials.js"></script>
+<script>
+  document.querySelector("[data-sidebar]").outerHTML = NIC.renderSidebar({ active: "canais", variant: "with-channels" });
+</script>
+</body>
+</html>
