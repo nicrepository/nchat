@@ -67,8 +67,11 @@ func (l *tokenEndpointRateLimiter) Middleware(next http.Handler) http.Handler {
 
 // clientIP returns the effective client IP for rate-limiting purposes.
 // When RemoteAddr belongs to a configured trusted-proxy CIDR, the leftmost
-// non-empty address from X-Forwarded-For is used; X-Real-IP is the fallback.
-// If no trusted-proxy CIDRs are configured, RemoteAddr is always used.
+// entry of X-Forwarded-For is used — but only after net.ParseIP validation
+// and canonicalization (parsed.String()). X-Real-IP is the fallback when XFF
+// is absent or its leftmost entry is not a valid IP. If no trusted-proxy CIDRs
+// are configured, or if forwarded headers contain no valid IP, RemoteAddr is
+// always used. Raw unvalidated header strings are never used as limiter keys.
 func (l *tokenEndpointRateLimiter) clientIP(r *http.Request) string {
 	remoteIP := remoteAddrKey(r.RemoteAddr)
 	if len(l.trustedProxyCIDRs) == 0 {
@@ -80,14 +83,18 @@ func (l *tokenEndpointRateLimiter) clientIP(r *http.Request) string {
 	}
 	for _, cidr := range l.trustedProxyCIDRs {
 		if cidr.Contains(ip) {
+			// X-Forwarded-For: validate and canonicalize the leftmost entry only.
 			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 				first := strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
-				if first != "" {
-					return first
+				if parsed := net.ParseIP(first); parsed != nil {
+					return parsed.String()
 				}
 			}
+			// X-Real-IP: validate and canonicalize.
 			if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
-				return xri
+				if parsed := net.ParseIP(xri); parsed != nil {
+					return parsed.String()
+				}
 			}
 			break
 		}

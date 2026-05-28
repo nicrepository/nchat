@@ -433,6 +433,60 @@ func TestRateLimiter_UntrustedRemoteAddr_IgnoresXForwardedFor(t *testing.T) {
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
 }
 
+// TestRateLimiter_InvalidXFF_FallsBackToRemoteAddr verifies that when a trusted proxy
+// is configured but X-Forwarded-For contains a non-IP string, the limiter falls back
+// to RemoteAddr and never uses the raw invalid header value as a limiter key.
+func TestRateLimiter_InvalidXFF_FallsBackToRemoteAddr(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+
+	// First request from trusted proxy — XFF is "not-an-ip", falls back to RemoteAddr "10.0.0.2".
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	firstReq.RemoteAddr = "10.0.0.2:1234"
+	firstReq.Header.Set("X-Forwarded-For", "not-an-ip")
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	// Second request from same RemoteAddr (different invalid XFF) — same key → blocked.
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	secondReq.RemoteAddr = "10.0.0.2:1234"
+	secondReq.Header.Set("X-Forwarded-For", "also-not-an-ip")
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+}
+
+// TestRateLimiter_MalformedXRealIP_FallsBackToRemoteAddr verifies that when a trusted
+// proxy is configured, no XFF is present, and X-Real-IP contains a non-IP string,
+// the limiter falls back to RemoteAddr.
+func TestRateLimiter_MalformedXRealIP_FallsBackToRemoteAddr(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+
+	// First request from trusted proxy — X-Real-IP is invalid, falls back to RemoteAddr "10.0.0.3".
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	firstReq.RemoteAddr = "10.0.0.3:2345"
+	firstReq.Header.Set("X-Real-IP", "not-an-ip-either")
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	// Second request from same RemoteAddr — same key (RemoteAddr) → blocked.
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	secondReq.RemoteAddr = "10.0.0.3:2345"
+	secondReq.Header.Set("X-Real-IP", "still-not-an-ip")
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+}
+
 // TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr verifies that when a trusted proxy
 // CIDR is configured but X-Forwarded-For contains an empty/malformed first element,
 // the limiter falls back to RemoteAddr as the rate-limit key.

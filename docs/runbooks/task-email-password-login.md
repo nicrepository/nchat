@@ -138,10 +138,12 @@ fingerprinting and a future device management UX.
 
 When `AUTH_TRUSTED_PROXY_CIDRS` is configured (e.g. `10.0.0.0/8`):
 
-- Rate-limiting uses the leftmost valid IP from `X-Forwarded-For` (or
-  `X-Real-IP` as fallback) only when the direct `RemoteAddr` is inside a
-  configured trusted CIDR.
-- Empty/malformed forwarded-IP headers fall back to `RemoteAddr`.
+- Rate-limiting uses the leftmost entry of `X-Forwarded-For` (or `X-Real-IP`
+  as fallback) **only when** the direct `RemoteAddr` is inside a configured
+  trusted CIDR **and** the forwarded value passes `net.ParseIP` validation.
+  Canonicalized (`parsed.String()`) IPs are used as limiter keys; raw header
+  strings are never used directly.
+- Empty, malformed, or non-IP forwarded-header values fall back to `RemoteAddr`.
 - **Traefik / reverse proxy must overwrite or sanitize inbound
   `X-Forwarded-For`** before forwarding to auth-service; auth-service must
   not be directly reachable from the internet when trusted proxy mode is
