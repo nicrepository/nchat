@@ -126,11 +126,12 @@ Behavior:
 - Reusing a rotated refresh token revokes the session family and does not reveal
   reuse detection to the client.
 - Token endpoint rate limiting uses `RemoteAddr` by default. When
-  `AUTH_TRUSTED_PROXY_CIDRS` is configured, `X-Forwarded-For` is honored only
-  when the request `RemoteAddr` is inside a configured trusted CIDR; the
-  leftmost valid IP from `X-Forwarded-For` (or `X-Real-IP` as fallback) is then
-  used as the rate-limit key. Empty/malformed forwarded headers fall back to
-  `RemoteAddr`.
+  `AUTH_TRUSTED_PROXY_CIDRS` is configured, forwarded headers are honored only
+  when the request `RemoteAddr` is inside a configured trusted CIDR. The
+  leftmost `X-Forwarded-For` entry is used if it passes `net.ParseIP`
+  validation; otherwise `X-Real-IP` is tried if valid; otherwise `RemoteAddr`
+  is used. Values are canonicalized with `parsed.String()`; raw header strings
+  are never used as limiter keys.
 - The Kubernetes base relies on the built-in defaults for optional token TTL and
   token endpoint rate-limit settings. Keep real `AUTH_JWT_HMAC_SECRET` and
   `DATABASE_URL` values out of versioned YAML; provision them through a strict
