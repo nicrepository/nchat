@@ -28,6 +28,7 @@ func New(cfg config.Config) *App {
 
 	var users service.UserCreator
 	var auth service.AuthSessionManager
+	var login service.LoginManager
 	var pool storage.Pool
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -55,12 +56,13 @@ func New(cfg config.Config) *App {
 		logger.Warn("auth token endpoints disabled", "reason", "database_not_configured")
 	default:
 		auth = service.NewAuthService(tokens, storage.NewPGXSessionStore(pool))
+		login = service.NewLoginService(tokens, storage.NewPGXLoginStore(pool, service.VerifyPassword, service.RunDummyPasswordVerification))
 	}
 
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login),
 		TracingShutdown: shutdown,
 	}
 }

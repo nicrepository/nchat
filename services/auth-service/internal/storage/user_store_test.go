@@ -23,8 +23,10 @@ func TestPGXUserStore_GetPolicySettings_Success(t *testing.T) {
 	mock.ExpectQuery(`SELECT min_password_length`).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"min_password_length", "require_uppercase", "require_lowercase",
-			"require_number", "require_symbol",
-		}).AddRow(12, true, true, true, true))
+			"require_number", "require_symbol", "failed_login_limit",
+			"failed_login_window_minutes", "failed_login_lockout_minutes",
+			"session_idle_timeout_minutes", "max_devices_per_user",
+		}).AddRow(12, true, true, true, true, 5, 15, 15, 60, 5))
 
 	store := storage.NewPGXUserStore(mock)
 	policy, err := store.GetPolicySettings(context.Background())
@@ -36,6 +38,12 @@ func TestPGXUserStore_GetPolicySettings_Success(t *testing.T) {
 	}
 	if !policy.RequireUppercase {
 		t.Fatal("expected RequireUppercase true")
+	}
+	if policy.FailedLoginLimit != 5 || policy.FailedLoginWindowMinutes != 15 || policy.FailedLoginLockoutMinutes != 15 {
+		t.Fatalf("unexpected failed login policy: %+v", policy)
+	}
+	if policy.SessionIdleTimeoutMinutes != 60 || policy.MaxDevicesPerUser != 5 {
+		t.Fatalf("unexpected session/device policy: %+v", policy)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

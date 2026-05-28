@@ -29,6 +29,11 @@ type Config struct {
 	AuthRefreshTokenTTLSeconds          int
 	AuthTokenEndpointRateLimitPerMinute int
 	AuthTokenEndpointRateLimitBurst     int
+	// AuthTrustedProxyCIDRs is a comma-separated list of CIDRs (e.g. "10.0.0.0/8,172.16.0.0/12")
+	// whose X-Forwarded-For header is trusted for client-IP extraction by the rate limiter.
+	// Leave empty (default) to always use RemoteAddr — safe for direct or single-instance deployments.
+	// In production behind Traefik, set this to the Traefik ingress CIDR.
+	AuthTrustedProxyCIDRs string
 }
 
 func Load() Config {
@@ -47,6 +52,7 @@ func Load() Config {
 		AuthRefreshTokenTTLSeconds:          positiveInt("AUTH_REFRESH_TOKEN_TTL_SECONDS", defaultRefreshTokenTTLSeconds),
 		AuthTokenEndpointRateLimitPerMinute: positiveInt("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE", defaultTokenEndpointRateLimitPerMinute),
 		AuthTokenEndpointRateLimitBurst:     positiveInt("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST", defaultTokenEndpointRateLimitBurst),
+		AuthTrustedProxyCIDRs:               platformconfig.GetString("AUTH_TRUSTED_PROXY_CIDRS", ""),
 	}
 }
 

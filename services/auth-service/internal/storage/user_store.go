@@ -31,11 +31,15 @@ func (s *PGXUserStore) GetPolicySettings(ctx context.Context) (domain.PolicySett
 	var p domain.PolicySettings
 	err := s.pool.QueryRow(ctx, `
 		SELECT min_password_length, require_uppercase, require_lowercase,
-		       require_number, require_symbol
+		       require_number, require_symbol, failed_login_limit,
+		       failed_login_window_minutes, failed_login_lockout_minutes,
+		       session_idle_timeout_minutes, max_devices_per_user
 		FROM auth.auth_policy_settings
 		WHERE id = 1`).Scan(
 		&p.MinPasswordLength, &p.RequireUppercase, &p.RequireLowercase,
-		&p.RequireNumber, &p.RequireSymbol,
+		&p.RequireNumber, &p.RequireSymbol, &p.FailedLoginLimit,
+		&p.FailedLoginWindowMinutes, &p.FailedLoginLockoutMinutes,
+		&p.SessionIdleTimeoutMinutes, &p.MaxDevicesPerUser,
 	)
 	if err != nil {
 		return domain.PolicySettings{}, fmt.Errorf("get policy settings: %w", err)

@@ -134,6 +134,16 @@ func (m *TokenManager) HashRefreshToken(raw string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+func (m *TokenManager) HashDeviceFingerprint(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, m.secret)
+	_, _ = mac.Write([]byte("nchat-device-fingerprint-v1:"))
+	_, _ = mac.Write([]byte(raw))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func randomOpaqueString(size int) (string, error) {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
