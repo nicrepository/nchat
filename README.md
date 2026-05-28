@@ -453,7 +453,7 @@ failed-login lockout, optionally tracks devices, and returns an access/refresh t
 
 - Lockout note: automatic brute-force lockout does **not** set `auth.users.status = 'locked'`. That status is reserved for a future admin lock flow.
 - Runbook: [docs/runbooks/task-email-password-login.md](docs/runbooks/task-email-password-login.md)
-- Out of scope: MFA, CAPTCHA, email verification gate, account unlock UI
+- Out of scope: OAuth/OIDC, password reset, frontend auth flows, final RBAC, MFA, CAPTCHA, email verification gate, account unlock UI
 
 ## JWT access and refresh tokens
 

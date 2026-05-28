@@ -2,9 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -57,7 +54,7 @@ func (s *LoginService) Login(ctx context.Context, input domain.LoginInput) (doma
 		Email:                 input.Email,
 		RefreshTokenHash:      refreshHash,
 		RefreshExpiresAt:      refreshExpiresAt,
-		DeviceFingerprintHash: hashOptionalDeviceFingerprint(input.DeviceFingerprint),
+		DeviceFingerprintHash: s.tokens.HashDeviceFingerprint(input.DeviceFingerprint),
 		DeviceName:            input.DeviceName,
 		Platform:              input.Platform,
 		IPAddress:             input.IPAddress,
@@ -81,15 +78,4 @@ func (s *LoginService) Login(ctx context.Context, input domain.LoginInput) (doma
 		ExpiresIn:    expiresIn,
 		User:         created.User,
 	}, nil
-}
-
-// hashOptionalDeviceFingerprint returns an HMAC-SHA256 hex digest of the raw fingerprint,
-// or empty string if the fingerprint is empty. The raw fingerprint is never stored.
-func hashOptionalDeviceFingerprint(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	mac := hmac.New(sha256.New, []byte("nchat-device-fingerprint-v1"))
-	_, _ = mac.Write([]byte(raw))
-	return hex.EncodeToString(mac.Sum(nil))
 }

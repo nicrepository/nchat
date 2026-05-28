@@ -234,6 +234,25 @@ func TestTokenManager_GeneratesOpaqueRefreshTokenHash(t *testing.T) {
 	}
 }
 
+func TestTokenManager_HashesDeviceFingerprintWithSecret(t *testing.T) {
+	first := newTestTokenManager(t, strings.Repeat("f", 32))
+	second := newTestTokenManager(t, strings.Repeat("g", 32))
+
+	firstHash := first.HashDeviceFingerprint("raw-device")
+	if firstHash == "" || firstHash == "raw-device" {
+		t.Fatalf("expected hashed fingerprint, got %q", firstHash)
+	}
+	if firstHash != first.HashDeviceFingerprint("raw-device") {
+		t.Fatal("expected deterministic fingerprint hash for the same secret and raw value")
+	}
+	if firstHash == second.HashDeviceFingerprint("raw-device") {
+		t.Fatal("different secrets must produce different fingerprint hashes")
+	}
+	if first.HashDeviceFingerprint("") != "" {
+		t.Fatal("empty fingerprint should remain empty")
+	}
+}
+
 func claimStringsContain(values jwt.ClaimStrings, want string) bool {
 	for _, value := range values {
 		if value == want {

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,11 +16,12 @@ const (
 )
 
 type tokenEndpointRateLimiter struct {
-	mu             sync.Mutex
-	limitPerMinute float64
-	burst          float64
-	now            func() time.Time
-	buckets        map[string]*tokenBucket
+	mu                sync.Mutex
+	limitPerMinute    float64
+	burst             float64
+	now               func() time.Time
+	buckets           map[string]*tokenBucket
+	trustedProxyCIDRs []*net.IPNet
 }
 
 type tokenBucket struct {
@@ -27,7 +29,17 @@ type tokenBucket struct {
 	updatedAt time.Time
 }
 
-func NewTokenEndpointRateLimiter(limitPerMinute int, burst int) *tokenEndpointRateLimiter {
+// NewTokenEndpointRateLimiter creates an in-memory token-bucket rate limiter.
+//
+// trustedProxyCIDRs is a comma-separated list of CIDR blocks (e.g.
+// "10.0.0.0/8,172.16.0.0/12") whose X-Forwarded-For header is trusted for
+// client-IP extraction. Leave empty (default) to always use RemoteAddr — the
+// safe default for direct or single-instance deployments.
+//
+// WARNING: This limiter is in-memory and per-process. It does not protect
+// multi-replica deployments; use a gateway or Valkey-based rate limit for
+// production clusters.
+func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDRs string) *tokenEndpointRateLimiter {
 	if limitPerMinute <= 0 {
 		limitPerMinute = fallbackTokenEndpointRateLimitPerMinute
 	}
@@ -35,21 +47,69 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int) *tokenEndpointRa
 		burst = fallbackTokenEndpointRateLimitBurst
 	}
 	return &tokenEndpointRateLimiter{
-		limitPerMinute: float64(limitPerMinute),
-		burst:          float64(burst),
-		now:            time.Now,
-		buckets:        make(map[string]*tokenBucket),
+		limitPerMinute:    float64(limitPerMinute),
+		burst:             float64(burst),
+		now:               time.Now,
+		buckets:           make(map[string]*tokenBucket),
+		trustedProxyCIDRs: parseCIDRs(trustedProxyCIDRs),
 	}
 }
 
 func (l *tokenEndpointRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !l.allow(r.RemoteAddr) {
+		if !l.allow(l.clientIP(r)) {
 			httputil.WriteError(w, http.StatusTooManyRequests, httputil.ErrCodeRateLimited, "rate limit exceeded")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// clientIP returns the effective client IP for rate-limiting purposes.
+// When RemoteAddr belongs to a configured trusted-proxy CIDR, the leftmost
+// non-empty address from X-Forwarded-For is used; X-Real-IP is the fallback.
+// If no trusted-proxy CIDRs are configured, RemoteAddr is always used.
+func (l *tokenEndpointRateLimiter) clientIP(r *http.Request) string {
+	remoteIP := remoteAddrKey(r.RemoteAddr)
+	if len(l.trustedProxyCIDRs) == 0 {
+		return remoteIP
+	}
+	ip := net.ParseIP(remoteIP)
+	if ip == nil {
+		return remoteIP
+	}
+	for _, cidr := range l.trustedProxyCIDRs {
+		if cidr.Contains(ip) {
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				first := strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+				if first != "" {
+					return first
+				}
+			}
+			if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+				return xri
+			}
+			break
+		}
+	}
+	return remoteIP
+}
+
+// parseCIDRs parses a comma-separated list of CIDR strings.
+// Invalid or empty entries are silently ignored.
+func parseCIDRs(cidrs string) []*net.IPNet {
+	var result []*net.IPNet
+	for _, raw := range strings.Split(cidrs, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		_, ipNet, err := net.ParseCIDR(raw)
+		if err == nil {
+			result = append(result, ipNet)
+		}
+	}
+	return result
 }
 
 func (l *tokenEndpointRateLimiter) allow(remoteAddr string) bool {

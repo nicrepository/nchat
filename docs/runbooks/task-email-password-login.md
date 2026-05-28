@@ -62,6 +62,7 @@ an access/refresh token pair.
 | 401    | `invalid_credentials` | Wrong password, unknown email, suspended user, or lockout |
 | 413    | `request_too_large`   | Body exceeds 4 KiB                                        |
 | 429    | `too_many_requests`   | Rate limit exceeded                                       |
+| 500    | `internal_error`      | Unexpected server error (token generation, DB write)      |
 | 503    | `service_unavailable` | Database or token manager not configured                  |
 
 ---
@@ -74,9 +75,9 @@ of failed attempts for a user (or email, if no user is found) within the
 attempts return `401 invalid_credentials` with failure reason
 `failed_login_limit_exceeded` recorded internally.
 
-The lockout expires automatically once enough time elapses (the window slides
-forward). There is **no unlock endpoint and no admin unlock UI** — lockout
-expires by policy time only.
+The lockout expires automatically after the threshold-crossing failure is older
+than `failed_login_lockout_minutes`. There is **no unlock endpoint and no
+admin unlock UI** — lockout expires by policy time only.
 
 > **Important:** Automatic brute-force lockout does **not** set
 > `auth.users.status = 'locked'`. That status is reserved for a future
@@ -99,9 +100,9 @@ expires by policy time only.
 
 If `device_fingerprint` is provided in the request:
 
-1. The raw fingerprint is **HMAC-SHA256** hashed client-side (in
-   `LoginService`) using the constant key `nchat-device-fingerprint-v1`. The
-   raw value is never stored.
+1. The raw fingerprint is **HMAC-SHA256** hashed in `LoginService` using
+   the token manager HMAC secret with device-fingerprint domain separation.
+   The raw value is never stored.
 2. The store looks up `auth.user_devices` by `(user_id, device_fingerprint_hash)`.
 3. If found → the device's `display_name`, `platform`, `last_ip`, and
    `last_seen_at` are updated; the `device_id` is linked to the new session.
@@ -115,16 +116,17 @@ If no `device_fingerprint` is provided, `device_id` on the session is `NULL`.
 
 ## Environment Variables
 
-| Variable                                    | Purpose                                           |
-| ------------------------------------------- | ------------------------------------------------- |
-| `DATABASE_URL`                              | PostgreSQL DSN; login endpoint disabled if absent |
-| `AUTH_JWT_HMAC_SECRET`                      | Min 32-byte HMAC secret for token signing         |
-| `AUTH_JWT_ISSUER`                           | JWT `iss` claim                                   |
-| `AUTH_JWT_AUDIENCE`                         | JWT `aud` claim                                   |
-| `AUTH_ACCESS_TOKEN_TTL_SECONDS`             | Access token TTL (default 900 s = 15 min)         |
-| `AUTH_REFRESH_TOKEN_TTL_SECONDS`            | Refresh token TTL (default 2592000 s = 30 days)   |
-| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE` | Requests/min per IP shared across token endpoints |
-| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST`      | Burst capacity for the rate limiter               |
+| Variable                                    | Purpose                                                                                                                                                                                                                                   |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                              | PostgreSQL DSN; login endpoint disabled if absent                                                                                                                                                                                         |
+| `AUTH_JWT_HMAC_SECRET`                      | Min 32-byte HMAC secret for token signing                                                                                                                                                                                                 |
+| `AUTH_JWT_ISSUER`                           | JWT `iss` claim                                                                                                                                                                                                                           |
+| `AUTH_JWT_AUDIENCE`                         | JWT `aud` claim                                                                                                                                                                                                                           |
+| `AUTH_ACCESS_TOKEN_TTL_SECONDS`             | Access token TTL (default 900 s = 15 min)                                                                                                                                                                                                 |
+| `AUTH_REFRESH_TOKEN_TTL_SECONDS`            | Refresh token TTL (default 2592000 s = 30 days)                                                                                                                                                                                           |
+| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE` | Requests/min per IP shared across token endpoints                                                                                                                                                                                         |
+| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST`      | Burst capacity for the rate limiter                                                                                                                                                                                                       |
+| `AUTH_TRUSTED_PROXY_CIDRS`                  | Comma-separated CIDRs of trusted reverse proxies (e.g. `10.0.0.0/8`); when the request RemoteAddr is in this list, `X-Forwarded-For` first IP is used for rate-limiting. Empty = use RemoteAddr only (default, safe for single-instance). |
 
 ---
 
@@ -136,9 +138,10 @@ If no `device_fingerprint` is provided, `device_id` on the session is `NULL`.
 - **Token hashing:** Refresh tokens are stored as HMAC-SHA256 digests in both
   `auth.user_sessions.refresh_token_hash` and `auth.refresh_token_history`.
   The raw token is returned only to the caller.
-- **User enumeration prevention:** When an email is not found the store runs a
-  constant-time dummy Argon2id operation (`RunDummyPasswordVerification`) to
-  equalise response time with the found-user path.
+- **User enumeration prevention:** Unknown email, ineligible user states, and
+  users without password credentials run a dummy Argon2id operation
+  (`RunDummyPasswordVerification`) to reduce timing differences from the
+  normal password-verification path.
 - **Generic error response:** All credential failures (wrong password, unknown
   email, suspended user, lockout) map to the same `401 invalid_credentials`
   response to prevent enumeration.
@@ -155,6 +158,7 @@ If no `device_fingerprint` is provided, `device_id` on the session is `NULL`.
 - No TOTP or second-factor challenge. MFA is out of scope.
 - No unlock endpoint for the temporary lockout window.
 - No CAPTCHA integration.
+- Rate limiting is in-memory and per auth-service instance until Valkey or gateway-level limiting is added.
 - Device revocation UI is out of scope.
 
 ---
@@ -168,7 +172,7 @@ If no `device_fingerprint` is provided, `device_id` on the session is `NULL`.
 2. Start the auth-service with a valid `DATABASE_URL` and JWT config.
 3. Send a test login:
    ```bash
-   curl -s -X POST http://localhost:8080/auth/login \
+   curl -s -X POST http://localhost:8081/auth/login \
      -H 'Content-Type: application/json' \
      -d '{"email":"admin@example.com","password":"ChangeMe@123"}' | jq .
    ```
@@ -191,6 +195,18 @@ make ci
 
 ## Related and Traceability
 
+### Requirements Framework (RF)
+
+| ID          | Title                            |
+| ----------- | -------------------------------- |
+| RF-47       | Password policy foundation       |
+| RF-49       | Brute-force lockout              |
+| RF-50       | Login attempts log foundation    |
+| RF-51       | Session idle expiration          |
+| RF-52/RF-53 | Multi-device / device foundation |
+
+### Files and Documents
+
 | Item            | Reference                                                           |
 | --------------- | ------------------------------------------------------------------- |
 | Plan            | `docs/superpowers/plans/2026-05-27-auth-email-password-login.md`    |
@@ -198,4 +214,4 @@ make ci
 | Login service   | `services/auth-service/internal/service/login_service.go`           |
 | Login store     | `services/auth-service/internal/storage/login_store.go`             |
 | HTTP handler    | `services/auth-service/internal/http/auth_handler.go` (`AuthLogin`) |
-| Refresh runbook | `docs/runbooks/task-jwt-access-refresh-tokens.md` (if exists)       |
+| Refresh runbook | `docs/runbooks/task-jwt-access-refresh.md`                          |

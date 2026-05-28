@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,6 +55,14 @@ func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.Cre
 		return domain.CreatedLoginSession{}, err
 	}
 
+	// Serialize the lockout-check + attempt-insert per email so concurrent failed
+	// logins cannot both pass the check before either records a failure.
+	// pg_advisory_xact_lock is transaction-scoped and auto-released on commit/rollback.
+	// The key is a deterministic FNV-1a hash of the normalized email — no raw value stored.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, emailAdvisoryKey(input.Email)); err != nil {
+		return domain.CreatedLoginSession{}, fmt.Errorf("acquire login lock: %w", err)
+	}
+
 	candidate, found, err := selectLoginUser(ctx, tx, input.Email)
 	if err != nil {
 		return domain.CreatedLoginSession{}, err
@@ -64,28 +73,23 @@ func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.Cre
 		return domain.CreatedLoginSession{}, err
 	}
 	if locked {
-		_ = recordLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input.Email, false, "failed_login_limit_exceeded", input.IPAddress, input.UserAgent)
-		return domain.CreatedLoginSession{}, domain.ErrInvalidCredentials
+		return commitFailedLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input, "failed_login_limit_exceeded")
 	}
 
 	if !found || candidate.Status != "active" || candidate.Deleted || candidate.PasswordHash == "" {
-		if !found {
-			s.dummyVerify(input.Password)
-		}
-		_ = recordLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input.Email, false, "invalid_credentials", input.IPAddress, input.UserAgent)
-		return domain.CreatedLoginSession{}, domain.ErrInvalidCredentials
+		s.dummyVerify(input.Password)
+		return commitFailedLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input, "invalid_credentials")
 	}
 
 	ok, verifyErr := s.verifyPassword(input.Password, candidate.PasswordHash)
 	if verifyErr != nil || !ok {
-		_ = recordLoginAttempt(ctx, tx, candidate.User.ID, input.Email, false, "invalid_credentials", input.IPAddress, input.UserAgent)
-		return domain.CreatedLoginSession{}, domain.ErrInvalidCredentials
+		return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "invalid_credentials")
 	}
 
 	deviceID, err := resolveLoginDevice(ctx, tx, candidate.User.ID, input, policy)
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidCredentials) {
-			_ = recordLoginAttempt(ctx, tx, candidate.User.ID, input.Email, false, "invalid_credentials", input.IPAddress, input.UserAgent)
+			return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "max_devices_exceeded")
 		}
 		return domain.CreatedLoginSession{}, err
 	}
@@ -148,7 +152,8 @@ func selectLoginUser(ctx context.Context, tx pgx.Tx, email string) (loginCandida
 		       COALESCE(pc.must_change_password, false)
 		FROM auth.users AS u
 		LEFT JOIN auth.user_password_credentials AS pc ON pc.user_id = u.id
-		WHERE u.email = $1`,
+		WHERE u.email = $1
+		  AND u.auth_source = 'manual'`,
 		email,
 	).Scan(
 		&c.User.ID, &c.User.Email, &c.User.DisplayName,
@@ -173,6 +178,13 @@ func loginTemporarilyLocked(ctx context.Context, tx pgx.Tx, found bool, userID, 
 		return false, nil
 	}
 
+	// Look back as far as the lockout can last so that failures which triggered
+	// a lockout remain visible even after the shorter detection window expires.
+	lookbackMinutes := policy.FailedLoginWindowMinutes
+	if policy.FailedLoginLockoutMinutes > lookbackMinutes {
+		lookbackMinutes = policy.FailedLoginLockoutMinutes
+	}
+
 	var rows pgx.Rows
 	var err error
 	if found {
@@ -180,16 +192,20 @@ func loginTemporarilyLocked(ctx context.Context, tx pgx.Tx, found bool, userID, 
 			SELECT created_at FROM auth.login_attempts
 			WHERE user_id = $1
 			  AND success = false
-			  AND created_at > now() - ($2 * interval '1 minute')`,
-			userID, policy.FailedLoginWindowMinutes,
+			  AND created_at >= now() - ($2 * interval '1 minute')
+			ORDER BY created_at DESC
+			LIMIT $3`,
+			userID, lookbackMinutes, policy.FailedLoginLimit,
 		)
 	} else {
 		rows, err = tx.Query(ctx, `
 			SELECT created_at FROM auth.login_attempts
 			WHERE email = $1
 			  AND success = false
-			  AND created_at > now() - ($2 * interval '1 minute')`,
-			email, policy.FailedLoginWindowMinutes,
+			  AND created_at >= now() - ($2 * interval '1 minute')
+			ORDER BY created_at DESC
+			LIMIT $3`,
+			email, lookbackMinutes, policy.FailedLoginLimit,
 		)
 	}
 	if err != nil {
@@ -197,14 +213,31 @@ func loginTemporarilyLocked(ctx context.Context, tx pgx.Tx, found bool, userID, 
 	}
 	defer rows.Close()
 
-	count := 0
+	failures := make([]time.Time, 0, policy.FailedLoginLimit)
 	for rows.Next() {
-		count++
+		var createdAt time.Time
+		if err := rows.Scan(&createdAt); err != nil {
+			return false, fmt.Errorf("scan login attempts: %w", err)
+		}
+		failures = append(failures, createdAt)
 	}
 	if err := rows.Err(); err != nil {
 		return false, fmt.Errorf("scan login attempts: %w", err)
 	}
-	return count >= policy.FailedLoginLimit, nil
+	if len(failures) < policy.FailedLoginLimit {
+		return false, nil
+	}
+	// failures is DESC: [0] is most recent, [limit-1] is oldest.
+	// The N most recent failures must span <= the detection window to represent a
+	// valid threshold crossing; without this, sparse failures beyond the window
+	// would falsely appear as a lockout.
+	window := time.Duration(policy.FailedLoginWindowMinutes) * time.Minute
+	if failures[0].Sub(failures[policy.FailedLoginLimit-1]) > window {
+		return false, nil
+	}
+	thresholdCrossing := failures[policy.FailedLoginLimit-1]
+	lockoutExpiresAt := thresholdCrossing.Add(time.Duration(policy.FailedLoginLockoutMinutes) * time.Minute)
+	return lockoutExpiresAt.After(time.Now()), nil
 }
 
 // recordLoginAttempt inserts a row into auth.login_attempts.
@@ -217,9 +250,19 @@ func recordLoginAttempt(ctx context.Context, tx pgx.Tx, userID any, email string
 	_, err := tx.Exec(ctx, `
 		INSERT INTO auth.login_attempts (user_id, email, success, failure_reason, ip_address, user_agent)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
-		userID, email, success, reason, ipAddress, userAgent,
+		userID, email, success, reason, nullableString(ipAddress), nullableString(userAgent),
 	)
 	return err
+}
+
+func commitFailedLoginAttempt(ctx context.Context, tx pgx.Tx, userID any, input domain.CreateSessionInput, failureReason string) (domain.CreatedLoginSession, error) {
+	if err := recordLoginAttempt(ctx, tx, userID, input.Email, false, failureReason, input.IPAddress, input.UserAgent); err != nil {
+		return domain.CreatedLoginSession{}, fmt.Errorf("record failed login attempt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.CreatedLoginSession{}, fmt.Errorf("commit failed login attempt: %w", err)
+	}
+	return domain.CreatedLoginSession{}, domain.ErrInvalidCredentials
 }
 
 // resolveLoginDevice returns the device_id to use for the session.
@@ -231,11 +274,12 @@ func resolveLoginDevice(ctx context.Context, tx pgx.Tx, userID string, input dom
 		return nil, nil
 	}
 
-	// Try to find existing device by fingerprint.
+	// Try to find existing non-revoked device by fingerprint.
+	// Revoked devices are excluded so they are not silently reactivated.
 	var deviceID string
 	err := tx.QueryRow(ctx, `
 		SELECT id FROM auth.user_devices
-		WHERE user_id = $1 AND device_fingerprint_hash = $2`,
+		WHERE user_id = $1 AND device_fingerprint_hash = $2 AND revoked_at IS NULL`,
 		userID, input.DeviceFingerprintHash,
 	).Scan(&deviceID)
 
@@ -257,7 +301,11 @@ func resolveLoginDevice(ctx context.Context, tx pgx.Tx, userID string, input dom
 		return nil, fmt.Errorf("select device: %w", err)
 	}
 
-	// New device — check against policy.
+	// New device — serialize count and insert so concurrent logins cannot bypass the max-device policy.
+	if err := lockUserForDeviceInsert(ctx, tx, userID); err != nil {
+		return nil, err
+	}
+
 	var deviceCount int
 	if countErr := tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM auth.user_devices
@@ -284,6 +332,19 @@ func resolveLoginDevice(ctx context.Context, tx pgx.Tx, userID string, input dom
 	return newDeviceID, nil
 }
 
+func lockUserForDeviceInsert(ctx context.Context, tx pgx.Tx, userID string) error {
+	var lockedID string
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM auth.users
+		WHERE id = $1
+		FOR UPDATE`,
+		userID,
+	).Scan(&lockedID); err != nil {
+		return fmt.Errorf("lock user for device insert: %w", err)
+	}
+	return nil
+}
+
 // insertLoginSession creates the auth.user_sessions row and returns the new session.
 func insertLoginSession(ctx context.Context, tx pgx.Tx, userID string, deviceID any, input domain.CreateSessionInput, policy domain.PolicySettings) (domain.Session, error) {
 	idleExpiresAt := time.Now().Add(time.Duration(policy.SessionIdleTimeoutMinutes) * time.Minute)
@@ -307,8 +368,8 @@ func insertLoginSession(ctx context.Context, tx pgx.Tx, userID string, deviceID 
 // insertInitialRefreshTokenHistory records the first refresh token in the rotation history.
 func insertInitialRefreshTokenHistory(ctx context.Context, tx pgx.Tx, sessionID, refreshTokenHash string) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO auth.refresh_token_history (session_id, refresh_token_hash)
-		VALUES ($1, $2)`,
+		INSERT INTO auth.refresh_token_history (session_id, refresh_token_hash, status)
+		VALUES ($1, $2, 'active')`,
 		sessionID, refreshTokenHash,
 	)
 	if err != nil {
@@ -323,4 +384,13 @@ func nullableUserID(found bool, userID string) any {
 		return nil
 	}
 	return userID
+}
+
+// emailAdvisoryKey returns a deterministic int64 advisory lock key for the given
+// (already-normalized) email. FNV-1a gives a stable, compact hash with no raw
+// email exposed in the advisory lock table.
+func emailAdvisoryKey(email string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(email))
+	return int64(h.Sum64()) //nolint:gosec // G115: intentional uint64→int64 reinterpret for advisory lock key; wrap is acceptable
 }

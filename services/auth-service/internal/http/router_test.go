@@ -341,3 +341,94 @@ func TestAuthLoginRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 	router.ServeHTTP(second, secondReq)
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
 }
+
+// TestRateLimiter_NoTrustedProxy_IgnoresXForwardedFor verifies that when no
+// trusted proxy CIDRs are configured, X-Forwarded-For is ignored and
+// RemoteAddr is used for rate-limiting.
+func TestRateLimiter_NoTrustedProxy_IgnoresXForwardedFor(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	cfg.AuthTrustedProxyCIDRs = "" // no trusted proxies
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+
+	// First request from 10.0.0.1 — allowed.
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	firstReq.RemoteAddr = "10.0.0.1:1111"
+	firstReq.Header.Set("X-Forwarded-For", "203.0.113.50") // should be ignored
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	// Second request from same RemoteAddr — blocked (XFF has a different IP but it's ignored).
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	secondReq.RemoteAddr = "10.0.0.1:1111"
+	secondReq.Header.Set("X-Forwarded-For", "203.0.113.99")
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+}
+
+// TestRateLimiter_TrustedProxy_UsesXForwardedFor verifies that when the
+// request RemoteAddr is inside a configured trusted-proxy CIDR, the leftmost
+// IP from X-Forwarded-For is used as the rate-limit key.
+func TestRateLimiter_TrustedProxy_UsesXForwardedFor(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+
+	proxyAddr := "10.0.0.1:9999"
+
+	// First request from client 203.0.113.1 — allowed.
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	firstReq.RemoteAddr = proxyAddr
+	firstReq.Header.Set("X-Forwarded-For", "203.0.113.1")
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	// Second request from a different client IP — allowed (fresh bucket).
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	secondReq.RemoteAddr = proxyAddr
+	secondReq.Header.Set("X-Forwarded-For", "203.0.113.2")
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusOK)
+
+	// Third request from client 203.0.113.1 again — blocked (bucket exhausted).
+	third := httptest.NewRecorder()
+	thirdReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	thirdReq.RemoteAddr = proxyAddr
+	thirdReq.Header.Set("X-Forwarded-For", "203.0.113.1")
+	router.ServeHTTP(third, thirdReq)
+	assertJSONResponse(t, third, http.StatusTooManyRequests)
+}
+
+// TestRateLimiter_UntrustedRemoteAddr_IgnoresXForwardedFor verifies that when
+// RemoteAddr is NOT inside any configured trusted-proxy CIDR, X-Forwarded-For
+// is ignored even when trusted CIDRs are present.
+func TestRateLimiter_UntrustedRemoteAddr_IgnoresXForwardedFor(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8" // 5.5.5.5 is NOT in this range
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+
+	// First request from 5.5.5.5 — allowed.
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	firstReq.RemoteAddr = "5.5.5.5:1234"
+	firstReq.Header.Set("X-Forwarded-For", "203.0.113.1")
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	// Second request from same 5.5.5.5 with a different XFF — blocked (RemoteAddr is the key).
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	secondReq.RemoteAddr = "5.5.5.5:1234"
+	secondReq.Header.Set("X-Forwarded-For", "203.0.113.2")
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+}
