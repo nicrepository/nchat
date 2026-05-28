@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Auditoria</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  .audit-filters {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    padding: 16px 18px;
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr auto;
+    gap: 12px;
+    align-items: end;
+  }
+  .filt { display: flex; flex-direction: column; gap: 4px; }
+  .filt label { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-muted); }
+  .filt select, .filt input {
+    padding: 9px 12px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    font-size: 13px; color: var(--color-ink); outline: none;
+  }
+  .filt select:focus, .filt input:focus { border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(109,40,217,0.12); }
+
+  .audit-table {
+    width: 100%;
+    border-collapse: separate; border-spacing: 0;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    font-size: 13px;
+  }
+  .audit-table thead th {
+    background: var(--color-surface-2);
+    color: var(--color-muted);
+    font-size: 11px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    text-align: left;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .audit-table tbody td { padding: 14px 18px; border-bottom: 1px solid var(--color-border); vertical-align: middle; }
+  .audit-table tbody tr:last-child td { border-bottom: none; }
+  .audit-table tbody tr:hover { background: var(--color-surface-2); }
+
+  .when { color: var(--color-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .when-date { color: var(--color-ink); font-weight: 500; }
+  .who { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--color-ink); }
+  .action-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px;
+    border-radius: var(--radius-pill);
+    font-size: 11.5px; font-weight: 600;
+    background: var(--color-surface-2);
+    color: var(--color-ink-2);
+    border: 1px solid var(--color-border);
+  }
+  .action-pill .material-symbols-outlined { font-size: 14px; }
+  .action-pill--login   { background: var(--color-info-tint); color: var(--color-info-ink); border-color: #BFDBFE; }
+  .action-pill--access  { background: var(--color-surface-2); color: var(--color-ink-2); }
+  .action-pill--user    { background: var(--color-primary-tint); color: var(--color-primary-strong); border-color: var(--color-primary-tint-strong); }
+  .action-pill--danger  { background: var(--color-danger-tint); color: var(--color-danger-ink); border-color: #FCA5A5; }
+  .action-pill--warning { background: var(--color-warning-tint); color: var(--color-warning-ink); border-color: #FDE68A; }
+  .target { font-family: var(--font-mono); font-size: 12.5px; color: var(--color-ink-2); }
+  .ip { font-family: var(--font-mono); font-size: 11.5px; color: var(--color-muted); }
+
+  .pagination {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px;
+    background: var(--color-surface-2);
+    border-top: 1px solid var(--color-border);
+  }
+  .pagination__info { font-size: 12px; color: var(--color-muted); }
+  .pagination__nav { display: flex; gap: 6px; align-items: center; }
+  .pagination__btn {
+    width: 32px; height: 32px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--color-ink-2);
+  }
+  .pagination__btn:hover { background: var(--color-bg); }
+  .pagination__btn--active { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div data-sidebar></div>
+
+  <main class="flex col" style="min-width:0;">
+    <nav class="tabnav">
+      <div class="tabnav__items" data-admin-tabs></div>
+      <div class="tabnav__right">
+        <button class="icon-btn"><span class="material-symbols-outlined">notifications</span></button>
+        <span class="avatar avatar--lg avatar--on-light">AN<span class="avatar__status avatar__status--online"></span></span>
+      </div>
+    </nav>
+
+    <div class="scaffold-body">
+      <div class="scaffold-container">
+
+        <div class="page-head">
+          <div>
+            <h1 class="page-h1">Auditoria</h1>
+            <p class="page-sub">Histórico completo de ações administrativas, acessos e eventos de segurança.</p>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn--secondary"><span class="material-symbols-outlined" style="font-size:18px;">download</span>Exportar CSV</button>
+            <button class="btn btn--secondary"><span class="material-symbols-outlined" style="font-size:18px;">code</span>Exportar JSON</button>
+          </div>
+        </div>
+
+        <div class="audit-filters">
+          <div class="filt">
+            <label>Buscar</label>
+            <input placeholder="Usuário, alvo ou IP…" />
+          </div>
+          <div class="filt">
+            <label>Tipo de ação</label>
+            <select>
+              <option>Todas</option>
+              <option>Login</option>
+              <option>Usuário</option>
+              <option>Canal</option>
+              <option>Arquivo</option>
+              <option>Configuração</option>
+            </select>
+          </div>
+          <div class="filt">
+            <label>Usuário</label>
+            <select>
+              <option>Todos</option>
+              <option>Álvaro Neto</option>
+              <option>Juliane Lino</option>
+              <option>Caio Almeida</option>
+              <option>Bruno Lima</option>
+              <option>Fernanda Nicácio</option>
+            </select>
+          </div>
+          <div class="filt">
+            <label>Período</label>
+            <select>
+              <option>Últimas 24h</option>
+              <option selected>Últimos 7 dias</option>
+              <option>Últimos 30 dias</option>
+              <option>Personalizado</option>
+            </select>
+          </div>
+          <button class="btn btn--ghost" style="height: 40px;">Limpar</button>
+        </div>
+
+        <div style="overflow-x: auto;">
+          <table class="audit-table">
+            <thead>
+              <tr>
+                <th style="width: 160px;">Data &amp; hora</th>
+                <th>Quem</th>
+                <th>Ação</th>
+                <th>Alvo</th>
+                <th>IP / dispositivo</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="when"><div class="when-date">Hoje, 09:41</div><div>13/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--on-light">AN</span>Álvaro Neto</div></td>
+                <td><span class="action-pill action-pill--login"><span class="material-symbols-outlined">login</span>Login realizado</span></td>
+                <td class="target">—</td>
+                <td class="ip">187.10.x.x · Firefox · Linux</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">Ontem, 16:20</div><div>12/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--on-light">AN</span>Álvaro Neto</div></td>
+                <td><span class="action-pill action-pill--danger"><span class="material-symbols-outlined">block</span>Usuário suspenso</span></td>
+                <td class="target">user:bruno.lima@nic-labs.com</td>
+                <td class="ip">187.10.x.x</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">Ontem, 14:15</div><div>12/05/2026</div></td>
+                <td><div class="who"><span style="width:24px; height:24px; border-radius:50%; background: var(--color-surface-2); display:flex; align-items:center; justify-content:center;"><span class="material-symbols-outlined" style="font-size:14px; color: var(--color-muted);">smart_toy</span></span>Sistema · ClamAV</div></td>
+                <td><span class="action-pill action-pill--warning"><span class="material-symbols-outlined">shield</span>Arquivo bloqueado</span></td>
+                <td class="target">file:script-antigo.zip · #suporte</td>
+                <td class="ip">—</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">Ontem, 13:02</div><div>12/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--rose avatar--on-light">JL</span>Juliane Lino</div></td>
+                <td><span class="action-pill action-pill--access"><span class="material-symbols-outlined">delete</span>Mensagem removida</span></td>
+                <td class="target">msg:#suporte/8b3a · autor: Bruno Lima</td>
+                <td class="ip">191.241.x.x · Chrome · macOS</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">Ontem, 11:30</div><div>12/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--on-light">AN</span>Álvaro Neto</div></td>
+                <td><span class="action-pill action-pill--user"><span class="material-symbols-outlined">manage_accounts</span>Função alterada</span></td>
+                <td class="target">user:caio.almeida@nic-labs.com · Usuário → Moderador</td>
+                <td class="ip">187.10.x.x</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">12/05, 09:08</div><div>12/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--on-light">AN</span>Álvaro Neto</div></td>
+                <td><span class="action-pill action-pill--user"><span class="material-symbols-outlined">person_add</span>Membro adicionado</span></td>
+                <td class="target">user:fernanda.nicacio@nic-labs.com → #avisos</td>
+                <td class="ip">187.10.x.x</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">11/05, 23:17</div><div>11/05/2026</div></td>
+                <td><div class="who" style="color: var(--color-muted);"><span style="width:24px; height:24px; border-radius:50%; background: var(--color-danger-tint); color: var(--color-danger); display:flex; align-items:center; justify-content:center;"><span class="material-symbols-outlined" style="font-size:14px;">shield_question</span></span>Desconhecido</div></td>
+                <td><span class="action-pill action-pill--danger"><span class="material-symbols-outlined">gpp_bad</span>Login bloqueado</span></td>
+                <td class="target">user:alvaro.neto@nic-labs.com · localização incomum</td>
+                <td class="ip">89.244.x.x · Berlim, DE</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">11/05, 15:48</div><div>11/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--blue avatar--on-light">CA</span>Caio Almeida</div></td>
+                <td><span class="action-pill action-pill--access"><span class="material-symbols-outlined">tag</span>Canal criado</span></td>
+                <td class="target">channel:#seguranca-interna · privado</td>
+                <td class="ip">200.143.x.x</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">10/05, 11:54</div><div>10/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--on-light">AN</span>Álvaro Neto</div></td>
+                <td><span class="action-pill action-pill--user"><span class="material-symbols-outlined">key</span>Chave 2FA registrada</span></td>
+                <td class="target">YubiKey 5C · NIC-Labs</td>
+                <td class="ip">187.10.x.x</td>
+              </tr>
+              <tr>
+                <td class="when"><div class="when-date">09/05, 18:02</div><div>09/05/2026</div></td>
+                <td><div class="who"><span class="avatar avatar--teal avatar--on-light">FN</span>Fernanda Nicácio</div></td>
+                <td><span class="action-pill action-pill--access"><span class="material-symbols-outlined">download</span>Exportação de logs</span></td>
+                <td class="target">audit-202604.csv · 14.2 MB</td>
+                <td class="ip">177.62.x.x</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="pagination">
+            <div class="pagination__info">Mostrando 1–10 de 342 eventos</div>
+            <div class="pagination__nav">
+              <button class="pagination__btn"><span class="material-symbols-outlined" style="font-size:18px;">chevron_left</span></button>
+              <button class="pagination__btn pagination__btn--active">1</button>
+              <button class="pagination__btn">2</button>
+              <button class="pagination__btn">3</button>
+              <button class="pagination__btn">…</button>
+              <button class="pagination__btn">35</button>
+              <button class="pagination__btn"><span class="material-symbols-outlined" style="font-size:18px;">chevron_right</span></button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="partials.js"></script>
+<script>
+  document.querySelector("[data-sidebar]").outerHTML = NIC.renderSidebar({ active: "configuracoes" });
+  document.querySelector("[data-admin-tabs]").innerHTML = NIC.renderAdminTabs("auditoria");
+</script>
+</body>
+</html>

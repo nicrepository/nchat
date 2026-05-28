@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Entrar</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  body {
+    background:
+      radial-gradient(1200px 600px at 12% -20%, rgba(168,101,247,0.18), transparent 60%),
+      radial-gradient(1100px 700px at 90% 110%, rgba(109,40,217,0.12), transparent 60%),
+      var(--color-bg);
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-6);
+  }
+  .login-card {
+    width: 100%;
+    max-width: 440px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-lg);
+    padding: 40px 40px 32px;
+  }
+  .login-header {
+    text-align: center;
+    margin-bottom: 28px;
+  }
+  .login-logo {
+    height: 72px;
+    width: auto;
+    margin: 0 auto 18px;
+    display: block;
+  }
+  .login-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--color-ink);
+    margin: 0 0 6px;
+    letter-spacing: -0.01em;
+  }
+  .login-sub {
+    font-size: 13px;
+    color: var(--color-muted);
+    margin: 0;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+  .field__label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-ink-2);
+    letter-spacing: 0.01em;
+  }
+  .field__input-wrap { position: relative; }
+  .field__icon {
+    position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+    color: var(--color-muted-2);
+    font-size: 20px;
+  }
+  .field__input {
+    width: 100%;
+    padding: 12px 14px 12px 42px;
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    font-size: 14px;
+    color: var(--color-ink);
+    outline: none;
+    transition: border-color .12s, box-shadow .12s, background .12s;
+  }
+  .field__input:focus {
+    border-color: var(--color-primary);
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(109,40,217,0.12);
+  }
+  .field__input::placeholder { color: var(--color-muted-2); }
+  .check {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 13px; color: var(--color-ink-2);
+    margin: 8px 0 20px;
+    cursor: pointer;
+  }
+  .check input { accent-color: var(--color-primary); width: 16px; height: 16px; }
+  .login-actions { display: flex; flex-direction: column; gap: 10px; }
+  .login-actions .btn { justify-content: center; padding: 11px 16px; }
+  .login-forgot {
+    display: block;
+    text-align: center;
+    margin-top: 20px;
+    color: var(--color-primary);
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .login-forgot:hover { color: var(--color-primary-strong); text-decoration: underline; }
+  footer {
+    padding: 24px 0 32px;
+    text-align: center;
+    color: var(--color-muted-2);
+    font-size: 12px;
+  }
+  footer strong { color: var(--color-ink-2); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <div class="login-card">
+    <div class="login-header">
+      <img class="login-logo" src="assets/nic-labs-logo.png" alt="NIC-Labs" />
+      <h1 class="login-title">Entrar no NIC Chat</h1>
+      <p class="login-sub">Comunicação interna segura para equipes NIC-Labs</p>
+    </div>
+
+    <form onsubmit="event.preventDefault(); window.location='canal.html'">
+      <div class="field">
+        <label class="field__label" for="email">E-mail corporativo</label>
+        <div class="field__input-wrap">
+          <span class="material-symbols-outlined field__icon">mail</span>
+          <input id="email" class="field__input" type="email" placeholder="nome@nic-labs.com" autocomplete="username" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="password">Senha</label>
+        <div class="field__input-wrap">
+          <span class="material-symbols-outlined field__icon">lock</span>
+          <input id="password" class="field__input" type="password" placeholder="••••••••" autocomplete="current-password" />
+        </div>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" />
+        Manter conectado neste dispositivo
+      </label>
+
+      <div class="login-actions">
+        <button type="submit" class="btn btn--primary">Entrar</button>
+        <button type="button" class="btn btn--secondary" style="border-color: var(--color-primary); color: var(--color-primary);" onclick="window.location='canal.html'">
+          Entrar com SSO
+        </button>
+      </div>
+
+      <a class="login-forgot" href="#">Esqueci minha senha</a>
+    </form>
+  </div>
+</main>
+<footer>
+  <strong>NIC-Labs</strong> · Plataforma interna
+</footer>
+</body>
+</html>

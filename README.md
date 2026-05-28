@@ -6,6 +6,11 @@ NChat e um chat corporativo interno para comunicacao segura, rastreavel e operav
 
 MVP em desenvolvimento.
 
+## Protótipo visual
+
+O protótipo de UI/UX do NChat está versionado em [`prototype/claude-design-v1/`](prototype/claude-design-v1/README.md).
+Trata-se de uma referência visual estática (HTML/CSS/JS) gerada no Claude Design — **não é código de produção** e não deve ser importado em `apps/web`.
+
 ## Architecture decisions
 
 As decisões arquiteturais do NChat são registradas como ADRs em `docs/adr/`.
