@@ -69,15 +69,24 @@ an access/refresh token pair.
 
 ## Temporary Lockout
 
-Failed login attempts are recorded in `auth.login_attempts`. When the number
-of failed attempts for a user (or email, if no user is found) within the
-`failed_login_window_minutes` period reaches `failed_login_limit`, subsequent
-attempts return `401 invalid_credentials` with failure reason
-`failed_login_limit_exceeded` recorded internally.
+Failed login attempts are recorded in `auth.login_attempts`. Only
+**credential failures** (`invalid_credentials`, `unknown_user`,
+`invalid_password`) count toward the brute-force threshold; lockout-denied
+attempts (`failed_login_limit_exceeded`), device errors (`device_revoked`,
+`max_devices_exceeded`), and other non-credential reasons are excluded.
 
-The lockout expires automatically after the threshold-crossing failure is older
-than `failed_login_lockout_minutes`. There is **no unlock endpoint and no
-admin unlock UI** — lockout expires by policy time only.
+When the number of credential failures within `failed_login_window_minutes`
+reaches `failed_login_limit`, subsequent attempts return `401
+invalid_credentials` with failure reason `failed_login_limit_exceeded` recorded
+internally. The lockout check uses a lookback of
+`failed_login_window_minutes + failed_login_lockout_minutes` so that a
+threshold-crossing group remains detectable even after the shorter detection
+window expires.
+
+The lockout expires automatically after `failed_login_lockout_minutes` from the
+threshold-crossing failure (the Nth credential failure that completed a group).
+There is **no unlock endpoint and no admin unlock UI** — lockout expires by
+policy time only.
 
 > **Important:** Automatic brute-force lockout does **not** set
 > `auth.users.status = 'locked'`. That status is reserved for a future
@@ -103,14 +112,40 @@ If `device_fingerprint` is provided in the request:
 1. The raw fingerprint is **HMAC-SHA256** hashed in `LoginService` using
    the token manager HMAC secret with device-fingerprint domain separation.
    The raw value is never stored.
-2. The store looks up `auth.user_devices` by `(user_id, device_fingerprint_hash)`.
-3. If found → the device's `display_name`, `platform`, `last_ip`, and
-   `last_seen_at` are updated; the `device_id` is linked to the new session.
-4. If not found → a new device row is inserted, subject to
-   `max_devices_per_user`. If the limit is already reached, the login fails
-   with `invalid_credentials`.
+2. The store looks up `auth.user_devices` by `(user_id, device_fingerprint_hash)`
+   **regardless of revocation state** to avoid unique-constraint violations on
+   the non-partial `(user_id, device_fingerprint_hash)` index.
+3. If found and **revoked** (`revoked_at IS NOT NULL`):
+   - The login fails with `401 invalid_credentials`.
+   - A `device_revoked` failure reason is recorded in `auth.login_attempts`.
+   - The revoked device is not reactivated. Reactivation is out of scope for this task.
+4. If found and **active** (`revoked_at IS NULL`):
+   - The device's `display_name`, `platform`, `last_ip`, and `last_seen_at`
+     are updated; the `device_id` is linked to the new session.
+5. If not found:
+   - Active (non-revoked) device count is checked against `max_devices_per_user`.
+   - If the limit is already reached, the login fails with `invalid_credentials`
+     and `max_devices_exceeded` is recorded.
+   - Otherwise a new device row is inserted.
 
-If no `device_fingerprint` is provided, `device_id` on the session is `NULL`.
+If `device_fingerprint` is **omitted**, `device_id` on the session is `NULL`.
+`max_devices_per_user` applies **only to device-bound (fingerprinted) logins**
+in this PR. Sessions created without a fingerprint are not counted against the
+limit. Full per-session device enforcement requires client-side device
+fingerprinting and a future device management UX.
+
+### Trusted proxy configuration
+
+When `AUTH_TRUSTED_PROXY_CIDRS` is configured (e.g. `10.0.0.0/8`):
+
+- Rate-limiting uses the leftmost valid IP from `X-Forwarded-For` (or
+  `X-Real-IP` as fallback) only when the direct `RemoteAddr` is inside a
+  configured trusted CIDR.
+- Empty/malformed forwarded-IP headers fall back to `RemoteAddr`.
+- **Traefik / reverse proxy must overwrite or sanitize inbound
+  `X-Forwarded-For`** before forwarding to auth-service; auth-service must
+  not be directly reachable from the internet when trusted proxy mode is
+  enabled.
 
 ---
 

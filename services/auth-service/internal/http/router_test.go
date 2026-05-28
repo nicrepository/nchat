@@ -432,3 +432,31 @@ func TestRateLimiter_UntrustedRemoteAddr_IgnoresXForwardedFor(t *testing.T) {
 	router.ServeHTTP(second, secondReq)
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
 }
+
+// TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr verifies that when a trusted proxy
+// CIDR is configured but X-Forwarded-For contains an empty/malformed first element,
+// the limiter falls back to RemoteAddr as the rate-limit key.
+func TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+
+	// Trusted proxy at 10.0.0.1 with a malformed XFF (empty first element after split).
+	// clientIP() falls back to RemoteAddr = "10.0.0.1".
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	firstReq.RemoteAddr = "10.0.0.1:5555"
+	firstReq.Header.Set("X-Forwarded-For", ",,,") // malformed: first element is empty
+	router.ServeHTTP(first, firstReq)
+	assertJSONResponse(t, first, http.StatusOK)
+
+	// Second request from same RemoteAddr with malformed XFF — same key (RemoteAddr) → blocked.
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"u@e.com","password":"P@ss1"}`))
+	secondReq.RemoteAddr = "10.0.0.1:5555"
+	secondReq.Header.Set("X-Forwarded-For", ",,,")
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+}

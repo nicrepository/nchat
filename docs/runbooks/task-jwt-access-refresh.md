@@ -109,8 +109,9 @@ Behavior:
 | `AUTH_JWT_AUDIENCE`                         | No       | `nchat-api`  | Expected `aud` claim.                                                    |
 | `AUTH_ACCESS_TOKEN_TTL_SECONDS`             | No       | `900`        | Access token TTL, default 15 minutes.                                    |
 | `AUTH_REFRESH_TOKEN_TTL_SECONDS`            | No       | `2592000`    | Refresh token idle TTL, default 30 days.                                 |
-| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE` | No       | `60`         | Per-instance in-memory token endpoint refill rate per `RemoteAddr`.      |
-| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST`      | No       | `10`         | Per-instance in-memory token endpoint burst per `RemoteAddr`.            |
+| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE` | No       | `60`         | Per-instance in-memory token endpoint refill rate per client IP.         |
+| `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST`      | No       | `10`         | Per-instance in-memory token endpoint burst per client IP.               |
+| `AUTH_TRUSTED_PROXY_CIDRS`                  | No       | empty        | Comma-separated trusted proxy CIDRs; empty = use `RemoteAddr` only.      |
 | `DATABASE_URL`                              | Yes      | none         | Required for session lookup, rotation, reuse detection, and logout.      |
 
 ## Security notes
@@ -124,8 +125,12 @@ Behavior:
   `rotated` and the session stores only the new active token hash.
 - Reusing a rotated refresh token revokes the session family and does not reveal
   reuse detection to the client.
-- Token endpoint rate limiting uses `RemoteAddr` directly. It intentionally does
-  not trust `X-Forwarded-For` because there is no trusted proxy helper yet.
+- Token endpoint rate limiting uses `RemoteAddr` by default. When
+  `AUTH_TRUSTED_PROXY_CIDRS` is configured, `X-Forwarded-For` is honored only
+  when the request `RemoteAddr` is inside a configured trusted CIDR; the
+  leftmost valid IP from `X-Forwarded-For` (or `X-Real-IP` as fallback) is then
+  used as the rate-limit key. Empty/malformed forwarded headers fall back to
+  `RemoteAddr`.
 - The Kubernetes base relies on the built-in defaults for optional token TTL and
   token endpoint rate-limit settings. Keep real `AUTH_JWT_HMAC_SECRET` and
   `DATABASE_URL` values out of versioned YAML; provision them through a strict

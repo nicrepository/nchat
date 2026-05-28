@@ -88,10 +88,14 @@ func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.Cre
 
 	deviceID, err := resolveLoginDevice(ctx, tx, candidate.User.ID, input, policy)
 	if err != nil {
-		if errors.Is(err, domain.ErrInvalidCredentials) {
+		switch {
+		case errors.Is(err, errDeviceRevoked):
+			return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "device_revoked")
+		case errors.Is(err, domain.ErrInvalidCredentials):
 			return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "max_devices_exceeded")
+		default:
+			return domain.CreatedLoginSession{}, err
 		}
-		return domain.CreatedLoginSession{}, err
 	}
 
 	if err := recordLoginAttempt(ctx, tx, candidate.User.ID, input.Email, true, "", input.IPAddress, input.UserAgent); err != nil {
@@ -170,20 +174,28 @@ func selectLoginUser(ctx context.Context, tx pgx.Tx, email string) (loginCandida
 	return c, true, nil
 }
 
-// loginTemporarilyLocked returns true when the number of recent failed login attempts
-// reaches or exceeds the policy limit within the failure window.
+// errDeviceRevoked is returned by resolveLoginDevice when the matching device exists
+// but has been revoked. The caller records a device_revoked failure and returns 401.
+var errDeviceRevoked = errors.New("device revoked")
+
+// loginTemporarilyLocked returns true when a credential threshold-crossing group is
+// still within the lockout period. Only credential failure reasons are counted; locked-out,
+// device-limit, and rate-limit denials must never extend or create a lockout.
 // When the user is not found, the check is keyed by email; otherwise by user_id.
 func loginTemporarilyLocked(ctx context.Context, tx pgx.Tx, found bool, userID, email string, policy domain.PolicySettings) (bool, error) {
 	if policy.FailedLoginLimit <= 0 {
 		return false, nil
 	}
 
-	// Look back as far as the lockout can last so that failures which triggered
-	// a lockout remain visible even after the shorter detection window expires.
-	lookbackMinutes := policy.FailedLoginWindowMinutes
-	if policy.FailedLoginLockoutMinutes > lookbackMinutes {
-		lookbackMinutes = policy.FailedLoginLockoutMinutes
-	}
+	// A threshold-crossing group can start as far back as (window + lockout) minutes
+	// ago and still keep the account locked now: the 5th failure might have happened
+	// up to lockout_minutes ago, and the 1st failure up to window_minutes before that.
+	lookbackMinutes := policy.FailedLoginWindowMinutes + policy.FailedLoginLockoutMinutes
+
+	// Only genuine credential failures count toward the brute-force threshold.
+	// Non-credential failures (lockout-denied, device errors, rate-limit) must not
+	// extend or create a lockout.
+	const credentialFilter = `failure_reason IN ('invalid_credentials', 'unknown_user', 'invalid_password')`
 
 	var rows pgx.Rows
 	var err error
@@ -192,20 +204,20 @@ func loginTemporarilyLocked(ctx context.Context, tx pgx.Tx, found bool, userID, 
 			SELECT created_at FROM auth.login_attempts
 			WHERE user_id = $1
 			  AND success = false
+			  AND `+credentialFilter+`
 			  AND created_at >= now() - ($2 * interval '1 minute')
-			ORDER BY created_at DESC
-			LIMIT $3`,
-			userID, lookbackMinutes, policy.FailedLoginLimit,
+			ORDER BY created_at ASC`,
+			userID, lookbackMinutes,
 		)
 	} else {
 		rows, err = tx.Query(ctx, `
 			SELECT created_at FROM auth.login_attempts
 			WHERE email = $1
 			  AND success = false
+			  AND `+credentialFilter+`
 			  AND created_at >= now() - ($2 * interval '1 minute')
-			ORDER BY created_at DESC
-			LIMIT $3`,
-			email, lookbackMinutes, policy.FailedLoginLimit,
+			ORDER BY created_at ASC`,
+			email, lookbackMinutes,
 		)
 	}
 	if err != nil {
@@ -213,31 +225,51 @@ func loginTemporarilyLocked(ctx context.Context, tx pgx.Tx, found bool, userID, 
 	}
 	defer rows.Close()
 
-	failures := make([]time.Time, 0, policy.FailedLoginLimit)
+	var failures []time.Time
 	for rows.Next() {
-		var createdAt time.Time
-		if err := rows.Scan(&createdAt); err != nil {
+		var t time.Time
+		if err := rows.Scan(&t); err != nil {
 			return false, fmt.Errorf("scan login attempts: %w", err)
 		}
-		failures = append(failures, createdAt)
+		failures = append(failures, t)
 	}
 	if err := rows.Err(); err != nil {
 		return false, fmt.Errorf("scan login attempts: %w", err)
 	}
-	if len(failures) < policy.FailedLoginLimit {
+
+	n := policy.FailedLoginLimit
+	if len(failures) < n {
 		return false, nil
 	}
-	// failures is DESC: [0] is most recent, [limit-1] is oldest.
-	// The N most recent failures must span <= the detection window to represent a
-	// valid threshold crossing; without this, sparse failures beyond the window
-	// would falsely appear as a lockout.
+
+	// failures is sorted ASC: failures[0] is the oldest, failures[len-1] is the newest.
+	// Find the most recent group of N consecutive failures whose span fits within the
+	// detection window. The threshold crossing time is failures[i+N-1] (the Nth failure
+	// in the group — the moment the limit was reached). Lockout is active while
+	// now < threshold_crossing + lockout_minutes.
+	//
+	// We iterate from the newest possible group (i = len-N) downward. Once we find a
+	// valid group whose lockout has expired, all earlier groups are also expired (their
+	// threshold crossings are older), so we stop.
 	window := time.Duration(policy.FailedLoginWindowMinutes) * time.Minute
-	if failures[0].Sub(failures[policy.FailedLoginLimit-1]) > window {
-		return false, nil
+	lockout := time.Duration(policy.FailedLoginLockoutMinutes) * time.Minute
+	now := time.Now()
+
+	for i := len(failures) - n; i >= 0; i-- {
+		oldest := failures[i]
+		newest := failures[i+n-1]
+		if newest.Sub(oldest) > window {
+			continue
+		}
+		// Valid threshold-crossing group: newest is the moment the limit was reached.
+		if newest.Add(lockout).After(now) {
+			return true, nil
+		}
+		// This group's lockout expired; no earlier group can have a later threshold
+		// crossing, so all remaining groups are also expired.
+		break
 	}
-	thresholdCrossing := failures[policy.FailedLoginLimit-1]
-	lockoutExpiresAt := thresholdCrossing.Add(time.Duration(policy.FailedLoginLockoutMinutes) * time.Minute)
-	return lockoutExpiresAt.After(time.Now()), nil
+	return false, nil
 }
 
 // recordLoginAttempt inserts a row into auth.login_attempts.
@@ -266,25 +298,35 @@ func commitFailedLoginAttempt(ctx context.Context, tx pgx.Tx, userID any, input 
 }
 
 // resolveLoginDevice returns the device_id to use for the session.
-// If no device fingerprint is provided, returns nil.
-// If a fingerprint is provided, upserts the device and returns its id.
-// Returns ErrInvalidCredentials if max devices are exceeded.
+// If no device fingerprint is provided, returns nil (session created without device binding).
+// If a fingerprint is provided, looks up the device by (user_id, device_fingerprint_hash)
+// regardless of revocation state to avoid duplicate-key errors on a non-partial unique constraint:
+//   - Revoked device → returns errDeviceRevoked; caller records a device_revoked failure.
+//   - Active device  → updates last_seen_at / last_ip / metadata; returns device id.
+//   - No device      → enforces max_devices_per_user against active (non-revoked) devices, then inserts.
 func resolveLoginDevice(ctx context.Context, tx pgx.Tx, userID string, input domain.CreateSessionInput, policy domain.PolicySettings) (any, error) {
 	if input.DeviceFingerprintHash == "" {
 		return nil, nil
 	}
 
-	// Try to find existing non-revoked device by fingerprint.
-	// Revoked devices are excluded so they are not silently reactivated.
+	// Look up the device regardless of revocation status.
+	// Excluding revoked rows here would allow a subsequent INSERT to hit the unique
+	// constraint on (user_id, device_fingerprint_hash), producing a 500.
 	var deviceID string
+	var revokedAt *time.Time
 	err := tx.QueryRow(ctx, `
-		SELECT id FROM auth.user_devices
-		WHERE user_id = $1 AND device_fingerprint_hash = $2 AND revoked_at IS NULL`,
+		SELECT id, revoked_at FROM auth.user_devices
+		WHERE user_id = $1 AND device_fingerprint_hash = $2`,
 		userID, input.DeviceFingerprintHash,
-	).Scan(&deviceID)
+	).Scan(&deviceID, &revokedAt)
 
 	if err == nil {
-		// Device exists — update last seen metadata.
+		if revokedAt != nil {
+			// Revoked device: do not reactivate silently. Let the caller record a
+			// device_revoked failure and return 401.
+			return nil, errDeviceRevoked
+		}
+		// Active device — update last seen metadata.
 		_, updateErr := tx.Exec(ctx, `
 			UPDATE auth.user_devices
 			SET display_name = $1, platform = $2, last_ip = $3, last_seen_at = now()

@@ -68,7 +68,7 @@ func TestPGXLoginStore_CreateLoginSession_Success(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, true))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", true, nil, "203.0.113.10", "agent").
@@ -130,7 +130,7 @@ func TestPGXLoginStore_CreateLoginSession_WrongPassword(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", false, "invalid_credentials", "1.2.3.4", "ua").
@@ -173,7 +173,7 @@ func TestPGXLoginStore_CreateLoginSession_UnknownEmail(t *testing.T) {
 		}))
 	// Lockout check is by email when user is not found.
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("nobody@example.com", 15, 5).
+		WithArgs("nobody@example.com", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs(nil, "nobody@example.com", false, "invalid_credentials", "1.2.3.4", "ua").
@@ -217,7 +217,7 @@ func TestPGXLoginStore_CreateLoginSession_SuspendedUser(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "suspended", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", false, "invalid_credentials", "1.2.3.4", "ua").
@@ -249,9 +249,11 @@ func TestPGXLoginStore_CreateLoginSession_TemporaryLockout(t *testing.T) {
 
 	passwordHash := mustHashPassword(t, "correct-password")
 
-	// Five recent failures (== limit) means locked.
+	// Five recent failures (== limit), added in ASC order (oldest first) as the
+	// query now returns ORDER BY created_at ASC. Default policy: window=15, lockout=15,
+	// so lookback = 30.
 	recentFailures := pgxmock.NewRows([]string{"created_at"})
-	for i := 0; i < 5; i++ {
+	for i := 4; i >= 0; i-- {
 		recentFailures.AddRow(time.Now().Add(-time.Duration(i) * time.Minute))
 	}
 
@@ -267,7 +269,7 @@ func TestPGXLoginStore_CreateLoginSession_TemporaryLockout(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(recentFailures)
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", false, "failed_login_limit_exceeded", "1.2.3.4", "ua").
@@ -300,8 +302,10 @@ func TestPGXLoginStore_CreateLoginSession_LockoutExpiresByLockoutPolicy(t *testi
 	passwordHash := mustHashPassword(t, "correct-password")
 	refreshExpiresAt := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Millisecond)
 
+	// Failures in ASC order (oldest first). Policy: window=60, lockout=1 → lookback=61.
+	// Threshold crossing = newest failure (-2 min). lockoutExpiry = -2+1 = -1 min ago → expired.
 	failuresWithinWindow := pgxmock.NewRows([]string{"created_at"})
-	for i := 2; i < 7; i++ {
+	for i := 6; i >= 2; i-- {
 		failuresWithinWindow.AddRow(time.Now().Add(-time.Duration(i) * time.Minute))
 	}
 
@@ -317,7 +321,7 @@ func TestPGXLoginStore_CreateLoginSession_LockoutExpiresByLockoutPolicy(t *testi
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 60, 5).
+		WithArgs("user-1", 61).
 		WillReturnRows(failuresWithinWindow)
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", true, nil, "1.2.3.4", "ua").
@@ -375,7 +379,7 @@ func TestPGXLoginStore_CreateLoginSession_NoDeviceFingerprint(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	// No user_devices queries expected — empty fingerprint.
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
@@ -430,12 +434,12 @@ func TestPGXLoginStore_CreateLoginSession_ExistingDeviceUpdated(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-	// Existing device lookup.
-	mock.ExpectQuery(`SELECT id FROM auth\.user_devices`).
+	// Existing active device lookup (returns id + revoked_at=nil).
+	mock.ExpectQuery(`SELECT id, revoked_at FROM auth\.user_devices`).
 		WithArgs("user-1", "fp-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("device-1"))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "revoked_at"}).AddRow("device-1", nil))
 	// Update existing device.
 	mock.ExpectExec(`UPDATE auth\.user_devices`).
 		WithArgs("Laptop", "linux", "1.2.3.4", "device-1").
@@ -499,12 +503,12 @@ func TestPGXLoginStore_CreateLoginSession_NewDeviceInserted(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-	// No existing device.
-	mock.ExpectQuery(`SELECT id FROM auth\.user_devices`).
+	// No existing device (no rows returned).
+	mock.ExpectQuery(`SELECT id, revoked_at FROM auth\.user_devices`).
 		WithArgs("user-1", "new-fp").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "revoked_at"}))
 	mock.ExpectQuery(`SELECT id FROM auth\.users`).
 		WithArgs("user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("user-1"))
@@ -615,7 +619,7 @@ func TestPGXLoginStore_CreateLoginSession_FailedAttemptInsertError(t *testing.T)
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", false, "invalid_credentials", "1.2.3.4", "ua").
@@ -657,7 +661,7 @@ func TestPGXLoginStore_CreateLoginSession_FailedAttemptCommitError(t *testing.T)
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", false, "invalid_credentials", "1.2.3.4", "ua").
@@ -700,11 +704,11 @@ func TestPGXLoginStore_CreateLoginSession_DeviceLockError(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-	mock.ExpectQuery(`SELECT id FROM auth\.user_devices`).
+	mock.ExpectQuery(`SELECT id, revoked_at FROM auth\.user_devices`).
 		WithArgs("user-1", "new-fp").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "revoked_at"}))
 	mock.ExpectQuery(`SELECT id FROM auth\.users`).
 		WithArgs("user-1").
 		WillReturnError(errors.New("lock failed"))
@@ -744,7 +748,7 @@ func TestPGXLoginStore_CreateLoginSession_SessionInsertError(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", true, nil, nil, nil).
@@ -788,7 +792,7 @@ func TestPGXLoginStore_CreateLoginSession_RefreshHistoryInsertError(t *testing.T
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", true, nil, nil, nil).
@@ -836,12 +840,12 @@ func TestPGXLoginStore_CreateLoginSession_MaxDevicesExceeded(t *testing.T) {
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-	// Device not found (new device).
-	mock.ExpectQuery(`SELECT id FROM auth\.user_devices`).
+	// Device not found (new device) — no existing row for this fingerprint.
+	mock.ExpectQuery(`SELECT id, revoked_at FROM auth\.user_devices`).
 		WithArgs("user-1", "new-fp-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "revoked_at"}))
 	mock.ExpectQuery(`SELECT id FROM auth\.users`).
 		WithArgs("user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("user-1"))
@@ -875,7 +879,7 @@ func TestPGXLoginStore_CreateLoginSession_MaxDevicesExceeded(t *testing.T) {
 // TestPGXLoginStore_CreateLoginSession_LockoutActiveAfterWindowExpires verifies that a
 // lockout remains active when failures are older than the detection window but still
 // within the lockout period (window=15 min, lockout=60 min). The lookback must be
-// widened to max(window, lockout) so threshold-crossing failures remain visible.
+// window + lockout = 75 min so threshold-crossing failures remain visible.
 // Lockout must not mutate auth.users.status — the mock expectations contain no
 // UPDATE auth.users SET status expectation.
 func TestPGXLoginStore_CreateLoginSession_LockoutActiveAfterWindowExpires(t *testing.T) {
@@ -888,9 +892,10 @@ func TestPGXLoginStore_CreateLoginSession_LockoutActiveAfterWindowExpires(t *tes
 	passwordHash := mustHashPassword(t, "correct-password")
 
 	// Five failures at 20-24 minutes ago: outside the 15-min detection window but
-	// inside the 60-min lockout period. The lookback must be max(15,60)=60.
+	// inside the 60-min lockout period. Rows in ASC order (oldest first), matching
+	// ORDER BY created_at ASC from the query. lookback = 15+60 = 75.
 	oldFailures := pgxmock.NewRows([]string{"created_at"})
-	for i := 20; i < 25; i++ {
+	for i := 24; i >= 20; i-- {
 		oldFailures.AddRow(time.Now().Add(-time.Duration(i) * time.Minute))
 	}
 
@@ -905,9 +910,9 @@ func TestPGXLoginStore_CreateLoginSession_LockoutActiveAfterWindowExpires(t *tes
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
-	// lookback = max(15, 60) = 60 minutes
+	// lookback = window + lockout = 15 + 60 = 75 minutes
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 60, 5).
+		WithArgs("user-1", 75).
 		WillReturnRows(oldFailures)
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", false, "failed_login_limit_exceeded", "1.2.3.4", "ua").
@@ -934,7 +939,7 @@ func TestPGXLoginStore_CreateLoginSession_LockoutActiveAfterWindowExpires(t *tes
 // when all failures are older than failed_login_lockout_minutes (i.e. outside the max
 // lookback window), the DB returns no rows and the account is no longer locked.
 // Policy: window=15, lockout=60. Failures > 60 min ago are excluded by the DB query
-// (lookback = max(15,60) = 60); mock returns 0 rows → account unlocked → login succeeds.
+// (lookback = 15+60 = 75); mock returns 0 rows → account unlocked → login succeeds.
 func TestPGXLoginStore_CreateLoginSession_LockoutExpiredAfterLockoutMinutes(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -956,9 +961,9 @@ func TestPGXLoginStore_CreateLoginSession_LockoutExpiredAfterLockoutMinutes(t *t
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
-	// All prior failures are > 60 min ago — the DB returns no rows.
+	// All prior failures are > 75 min ago — the DB returns no rows (lookback = 75).
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 60, 5).
+		WithArgs("user-1", 75).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", true, nil, "1.2.3.4", "ua").
@@ -1023,10 +1028,11 @@ func TestPGXLoginStore_CreateLoginSession_LoginLockAcquireError(t *testing.T) {
 	}
 }
 
-// TestPGXLoginStore_CreateLoginSession_RevokedDeviceNotReactivated verifies that a revoked
-// device (excluded by AND revoked_at IS NULL in the lookup query) is not silently
-// reactivated; instead the flow treats it as a new device subject to device-count policy.
-func TestPGXLoginStore_CreateLoginSession_RevokedDeviceNotReactivated(t *testing.T) {
+// TestPGXLoginStore_CreateLoginSession_RevokedDeviceReturnsFailure verifies that when
+// the device lookup finds a row with revoked_at IS NOT NULL, the login fails with
+// ErrInvalidCredentials and records a device_revoked failure reason. No duplicate INSERT
+// is attempted, which avoids a unique-constraint violation on (user_id, device_fingerprint_hash).
+func TestPGXLoginStore_CreateLoginSession_RevokedDeviceReturnsFailure(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -1034,7 +1040,7 @@ func TestPGXLoginStore_CreateLoginSession_RevokedDeviceNotReactivated(t *testing
 	defer mock.Close()
 
 	passwordHash := mustHashPassword(t, "pass")
-	refreshExpiresAt := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Millisecond)
+	revokedAt := time.Now().Add(-24 * time.Hour)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(defaultPolicyRow())
@@ -1047,30 +1053,129 @@ func TestPGXLoginStore_CreateLoginSession_RevokedDeviceNotReactivated(t *testing
 			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
 		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
 	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-		WithArgs("user-1", 15, 5).
+		WithArgs("user-1", 30).
 		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-	// Revoked device with matching fingerprint is excluded by AND revoked_at IS NULL — no rows returned.
-	mock.ExpectQuery(`SELECT id FROM auth\.user_devices`).
+	// Device lookup returns the revoked device (revoked_at is NOT NULL).
+	// No revoked_at IS NULL filter, so we find it and detect revocation in Go.
+	mock.ExpectQuery(`SELECT id, revoked_at FROM auth\.user_devices`).
 		WithArgs("user-1", "fp-was-revoked").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}))
-	// New device path: lock, count active devices (3 < max 5), then insert.
-	mock.ExpectQuery(`SELECT id FROM auth\.users`).
-		WithArgs("user-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("user-1"))
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM auth\.user_devices`).
-		WithArgs("user-1").
-		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(3))
-	mock.ExpectQuery(`INSERT INTO auth\.user_devices`).
-		WithArgs("user-1", "fp-was-revoked", nil, nil, "1.2.3.4").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("new-device-1"))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "revoked_at"}).AddRow("device-revoked-1", &revokedAt))
+	// No INSERT into user_devices — no duplicate row attempted.
+	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
+		WithArgs("user-1", "user@example.com", false, "device_revoked", "1.2.3.4", "ua").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := newLoginStore(mock)
+	_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
+		Password:              "pass",
+		Email:                 "user@example.com",
+		RefreshTokenHash:      "refresh-hash",
+		DeviceFingerprintHash: "fp-was-revoked",
+		IPAddress:             "1.2.3.4",
+		UserAgent:             "ua",
+	})
+	if !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials for revoked device, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXLoginStore_CreateLoginSession_SparseSingleGroupLockout verifies that 5 credential
+// failures spread non-uniformly within the detection window still trigger a lockout.
+// The threshold crossing is the 5th (newest) failure; lockout expires from that moment.
+func TestPGXLoginStore_CreateLoginSession_SparseSingleGroupLockout(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	passwordHash := mustHashPassword(t, "correct-password")
+
+	// Sparse failures at -14, -10, -5, -3, -1 min ago (span = 13 min ≤ window=15).
+	// ASC order (oldest first). lookback = window+lockout = 30.
+	sparseFailures := pgxmock.NewRows([]string{"created_at"})
+	for _, minutesAgo := range []int{14, 10, 5, 3, 1} {
+		sparseFailures.AddRow(time.Now().Add(-time.Duration(minutesAgo) * time.Minute))
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(defaultPolicyRow()) // window=15, lockout=15
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("", 0))
+	mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
+		WithArgs("user@example.com").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
+		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
+	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
+		WithArgs("user-1", 30).
+		WillReturnRows(sparseFailures)
+	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
+		WithArgs("user-1", "user@example.com", false, "failed_login_limit_exceeded", "1.2.3.4", "ua").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := newLoginStore(mock)
+	_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
+		Password:  "correct-password",
+		Email:     "user@example.com",
+		IPAddress: "1.2.3.4",
+		UserAgent: "ua",
+	})
+	if !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials (sparse failures within window = locked), got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXLoginStore_CreateLoginSession_NonCredentialFailuresDoNotTriggerLockout verifies
+// that failed_login_limit_exceeded, max_devices_exceeded, and similar non-credential failure
+// reasons do not count toward the brute-force threshold. The DB query filters by
+// failure_reason, so mock returning 0 rows represents a DB that contains only non-credential
+// failures — the account is not locked and login proceeds normally.
+func TestPGXLoginStore_CreateLoginSession_NonCredentialFailuresDoNotTriggerLockout(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	passwordHash := mustHashPassword(t, "pass")
+	refreshExpiresAt := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	// Policy with limit=1: even one credential failure would lock the account.
+	// DB returns 0 credential failures (all entries are non-credential type and filtered out).
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(policyRow(1, 15, 15, 60, 5))
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("", 0))
+	mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
+		WithArgs("user@example.com").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
+		}).AddRow("user-1", "user@example.com", "User", "active", nil, passwordHash, false))
+	// lookback = 15+15 = 30; credential filter returns 0 rows despite non-credential failures in DB.
+	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
+		WithArgs("user-1", 30).
+		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-1", "user@example.com", true, nil, "1.2.3.4", "ua").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectQuery(`INSERT INTO auth\.user_sessions`).
-		WithArgs("user-1", "new-device-1", "refresh-hash", "1.2.3.4", "ua", pgxmock.AnyArg(), refreshExpiresAt).
-		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-r", "user-1"))
+		WithArgs("user-1", nil, "refresh-hash", "1.2.3.4", "ua", pgxmock.AnyArg(), refreshExpiresAt).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-nc", "user-1"))
 	mock.ExpectExec(`INSERT INTO auth\.refresh_token_history`).
-		WithArgs("session-r", "refresh-hash").
+		WithArgs("session-nc", "refresh-hash").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`UPDATE auth\.users`).
 		WithArgs("user-1").
@@ -1080,19 +1185,18 @@ func TestPGXLoginStore_CreateLoginSession_RevokedDeviceNotReactivated(t *testing
 
 	store := newLoginStore(mock)
 	result, err := store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
-		Password:              "pass",
-		Email:                 "user@example.com",
-		RefreshTokenHash:      "refresh-hash",
-		RefreshExpiresAt:      refreshExpiresAt,
-		DeviceFingerprintHash: "fp-was-revoked",
-		IPAddress:             "1.2.3.4",
-		UserAgent:             "ua",
+		Password:         "pass",
+		Email:            "user@example.com",
+		RefreshTokenHash: "refresh-hash",
+		RefreshExpiresAt: refreshExpiresAt,
+		IPAddress:        "1.2.3.4",
+		UserAgent:        "ua",
 	})
 	if err != nil {
-		t.Fatalf("CreateLoginSession: %v", err)
+		t.Fatalf("expected success (non-credential failures filtered), got %v", err)
 	}
-	if result.Session.ID != "session-r" {
-		t.Fatalf("unexpected session id: %q", result.Session.ID)
+	if result.Session.ID != "session-nc" {
+		t.Fatalf("unexpected session: %+v", result.Session)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
