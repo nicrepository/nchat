@@ -2,10 +2,10 @@
 
 # NIC-Labs Chat — MVP Interno com Chat + Voz
 
-**Versão:** 1.0  
-**Data-base:** 15/05/2026  
-**Período do MVP:** 15/05/2026 a 21/08/2026  
-**Produto:** NIC-Labs Chat  
+**Versão:** 1.0
+**Data-base:** 15/05/2026
+**Período do MVP:** 15/05/2026 a 21/08/2026
+**Produto:** NIC-Labs Chat
 **Objetivo do documento:** fornecer contexto completo para desenvolvimento, prototipação, uso com IA, design, validação técnica e alinhamento de escopo.
 
 ---
@@ -47,22 +47,22 @@ A comunicação interna atual tende a ficar espalhada em ferramentas diferentes,
 
 Problemas principais:
 
-1. **Comunicação fragmentada**  
+1. **Comunicação fragmentada**
    Informações ficam distribuídas entre WhatsApp, Telegram, e-mails, Google Chat ou outras ferramentas.
 
-2. **Baixo controle corporativo**  
+2. **Baixo controle corporativo**
    Dificuldade para auditar, moderar, organizar canais e preservar histórico.
 
-3. **Dependência de fornecedores externos**  
+3. **Dependência de fornecedores externos**
    Dados, disponibilidade, roadmap e limites dependem de terceiros.
 
-4. **Ausência de comunicação estruturada por canais**  
+4. **Ausência de comunicação estruturada por canais**
    Times, projetos e áreas precisam de espaços próprios e organizados.
 
-5. **Necessidade de voz integrada**  
+5. **Necessidade de voz integrada**
    A comunicação por texto não cobre todos os cenários. Para suporte, infraestrutura e decisões rápidas, voz é necessária.
 
-6. **Potencial de produto futuro**  
+6. **Potencial de produto futuro**
    Caso o MVP funcione internamente, há possibilidade de evoluir para solução comercial soberana, on-premise e white-label.
 
 ---

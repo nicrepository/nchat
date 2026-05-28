@@ -3,6 +3,8 @@
 > **⚠️ Este diretório é referência visual, não código de produção.**
 > Não importe, reutilize nem integre nada daqui diretamente em `apps/web` ou qualquer outro pacote do repositório.
 
+Adicionado via **TASK-DESIGN-01** · branch `docs/prototype-visual-guide` · PR #217.
+
 ## O que é isso
 
 Protótipo de UI/UX do NChat gerado no [Claude Design](https://claude.ai/design), exportado como HTML/CSS/JS estático.
@@ -12,14 +14,18 @@ Serve como referência visual para futuras tasks de frontend.
 
 ```
 claude-design-v1/
-├── nic-chat/          # Telas do protótipo (HTML + CSS + JS + assets)
+├── nic-chat/          # Telas do protótipo (HTML + CSS estático + assets)
 │   ├── assets/        # Logos e ícones (nic-labs-icon.png, nic-labs-logo.png)
 │   ├── tokens.css     # Design tokens (cores, tipografia, espaçamento, sombras)
-│   ├── partials.js    # Componentes parciais compartilhados entre telas
+│   ├── partials.js    # Helpers DOM compartilhados entre telas (sem dependências remotas)
 │   └── *.html         # Telas individuais (ver lista abaixo)
 ├── screenshots/       # Capturas de tela de estados selecionados
-└── uploads/           # Uploads originais do Claude Design (screens + código bruto)
+└── uploads/           # Proveniência: screens exportados do Claude Design (somente leitura)
 ```
+
+> **`uploads/`** contém apenas capturas de tela (`screen.png`) e documentos Markdown de
+> design exportados do Claude Design. Os arquivos `code.html` brutos foram removidos
+> para manter apenas conteúdo estático e inerte.
 
 ## Telas cobertas
 
@@ -43,7 +49,7 @@ claude-design-v1/
 | `admin-canais.html`        | Admin — gestão de canais             |
 | `admin-auditoria.html`     | Admin — auditoria                    |
 | `estados.html`             | Estados de UI (vazio, erro, loading) |
-| `index.html`               | Índice navegável das telas           |
+| `index.html`               | Índice estático das telas            |
 
 ## Assets e logos
 
@@ -54,6 +60,20 @@ claude-design-v1/
 
 `nic-chat/tokens.css` define as variáveis CSS do sistema de design:
 cores primárias, neutros, tipografia, espaçamentos, bordas e sombras.
+
+## Referências externas
+
+As telas HTML carregam as seguintes fontes via Google Fonts CSS:
+
+- **Inter** — fonte de texto principal
+- **Material Symbols Outlined** — ícones via ligatura CSS
+- **JetBrains Mono** — fonte de código (apenas em algumas telas)
+
+Essas referências são **CSS `<link rel="stylesheet">`**, não JavaScript executável.
+A visualização off-line funcionará com fontes de fallback do sistema; para tipografia
+fiel ao protótipo é necessária conexão com `fonts.googleapis.com`.
+
+**Nenhum JavaScript remoto** (CDN, unpkg, Babel, React) é carregado por estas telas.
 
 ## Como usar como referência
 
