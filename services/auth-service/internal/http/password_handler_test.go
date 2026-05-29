@@ -51,6 +51,19 @@ func TestAuthForgotPasswordAlwaysReturns202ForServiceSuccess(t *testing.T) {
 	}
 }
 
+func TestAuthForgotPasswordKnownAndUnknownResponsesAreIdentical(t *testing.T) {
+	handler := httpapi.AuthForgotPassword(&fakePasswordRecoveryService{})
+
+	known := httptest.NewRecorder()
+	handler.ServeHTTP(known, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordForgot, strings.NewReader(`{"email":"known@example.com"}`)))
+	unknown := httptest.NewRecorder()
+	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordForgot, strings.NewReader(`{"email":"unknown@example.com"}`)))
+
+	if known.Code != unknown.Code || known.Body.String() != unknown.Body.String() {
+		t.Fatalf("forgot responses must be identical, known=%d %q unknown=%d %q", known.Code, known.Body.String(), unknown.Code, unknown.Body.String())
+	}
+}
+
 func TestAuthForgotPasswordResponseDoesNotLeakTokenOrHash(t *testing.T) {
 	handler := httpapi.AuthForgotPassword(&fakePasswordRecoveryService{})
 	rec := httptest.NewRecorder()
@@ -139,6 +152,18 @@ func TestAuthResetPasswordOversizedBodyReturns413(t *testing.T) {
 	}
 	if svc.resetGot.Token != "" {
 		t.Fatalf("oversized body must not reach service, got %+v", svc.resetGot)
+	}
+}
+
+func TestAuthForgotPasswordOutboxUnavailableReturns503(t *testing.T) {
+	handler := httpapi.AuthForgotPassword(&fakePasswordRecoveryService{forgotErr: domain.ErrEmailOutboxUnavailable})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordForgot, strings.NewReader(`{"email":"user@example.com"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

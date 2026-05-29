@@ -13,6 +13,8 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
+const encryptedInvitePayload = `{"alg":"AES-256-GCM","key_version":"v1","nonce":"bm9uY2U=","ciphertext":"Y2lwaGVydGV4dA=="}`
+
 func expectInviteCreateGuards(mock pgxmock.PgxPoolIface) {
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs("user@example.com").
@@ -69,7 +71,7 @@ func TestPGXInviteStore_ActiveInviteExistsByEmail(t *testing.T) {
 	}
 }
 
-func TestPGXInviteStore_CreateInviteInsertsInviteAndMetadataOnlyOutbox(t *testing.T) {
+func TestPGXInviteStore_CreateInviteInsertsInviteAndEncryptedOutbox(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -84,13 +86,13 @@ func TestPGXInviteStore_CreateInviteInsertsInviteAndMetadataOnlyOutbox(t *testin
 		WithArgs("user@example.com", "hashed-invite-token", expiresAt).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "created_at"}).AddRow("invite-1", "user@example.com", createdAt))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
-		WithArgs("user@example.com", "invite-1").
+		WithArgs("user@example.com", "invite-1", encryptedInvitePayload).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	result, err := store.CreateInvite(context.Background(), "user@example.com", "User", "User Full", "hashed-invite-token", expiresAt)
+	result, err := store.CreateInvite(context.Background(), "user@example.com", "User", "User Full", "hashed-invite-token", expiresAt, encryptedInvitePayload)
 	if err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}
@@ -325,14 +327,14 @@ func TestPGXInviteStore_CreateInviteErrors(t *testing.T) {
 			mock.ExpectBegin()
 			expectInviteCreateGuards(mock)
 			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs("user@example.com", "hashed-invite-token", expiresAt).WillReturnRows(pgxmock.NewRows([]string{"id", "email", "created_at"}).AddRow("invite-1", "user@example.com", time.Now()))
-			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs("user@example.com", "invite-1").WillReturnError(errors.New("outbox failed"))
+			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs("user@example.com", "invite-1", encryptedInvitePayload).WillReturnError(errors.New("outbox failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			expectInviteCreateGuards(mock)
 			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs("user@example.com", "hashed-invite-token", expiresAt).WillReturnRows(pgxmock.NewRows([]string{"id", "email", "created_at"}).AddRow("invite-1", "user@example.com", time.Now()))
-			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs("user@example.com", "invite-1").WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs("user@example.com", "invite-1", encryptedInvitePayload).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 			mock.ExpectRollback()
 		}},
@@ -347,7 +349,7 @@ func TestPGXInviteStore_CreateInviteErrors(t *testing.T) {
 			defer mock.Close()
 			tt.setup(mock)
 			store := storage.NewPGXInviteStore(mock)
-			_, err = store.CreateInvite(context.Background(), "user@example.com", "User", "User Full", "hashed-invite-token", expiresAt)
+			_, err = store.CreateInvite(context.Background(), "user@example.com", "User", "User Full", "hashed-invite-token", expiresAt, encryptedInvitePayload)
 			if err == nil {
 				t.Fatal("expected error")
 			}

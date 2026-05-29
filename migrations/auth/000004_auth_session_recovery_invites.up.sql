@@ -1,5 +1,5 @@
 -- 000004_auth_session_recovery_invites.up.sql
--- Adds configurable reset/invite token TTLs and metadata-only email outbox handoff.
+-- Adds configurable reset/invite token TTLs and encrypted email outbox token handoff.
 
 BEGIN;
 

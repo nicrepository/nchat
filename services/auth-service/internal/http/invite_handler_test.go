@@ -69,6 +69,18 @@ func TestAdminCreateInviteDuplicateOrPendingReturns409(t *testing.T) {
 	}
 }
 
+func TestAdminCreateInviteOutboxUnavailableReturns503(t *testing.T) {
+	handler := httpapi.AdminCreateInvite(&fakeInviteManager{createErr: domain.ErrEmailOutboxUnavailable})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAdminCreateInviteGuardRejectsMissingOrWrongToken(t *testing.T) {
 	cfg := config.Config{ServiceName: "auth-service", Env: "test"}
 	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{})

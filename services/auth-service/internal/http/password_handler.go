@@ -22,9 +22,18 @@ type resetPasswordRequest struct {
 	NewPassword string `json:"new_password"`
 }
 
-func AuthForgotPassword(recovery service.PasswordRecoveryManager) http.Handler {
+type emailHandoffAvailability interface {
+	EmailHandoffAvailable() bool
+}
+
+func AuthForgotPassword(recovery service.PasswordRecoveryManager, limiters ...*targetAwareRateLimiter) http.Handler {
+	targetLimiter := firstTargetLimiter(limiters)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if recovery == nil {
+			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "password recovery endpoint disabled")
+			return
+		}
+		if !emailHandoffAvailable(recovery) {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "password recovery endpoint disabled")
 			return
 		}
@@ -33,8 +42,16 @@ func AuthForgotPassword(recovery service.PasswordRecoveryManager) http.Handler {
 		if !decodePasswordRequest(w, r, &req) {
 			return
 		}
+		if !targetLimiter.allowEmail(req.Email) {
+			writeRateLimited(w)
+			return
+		}
 
 		if err := recovery.ForgotPassword(r.Context(), domain.ForgotPasswordInput{Email: req.Email}); err != nil {
+			if errors.Is(err, domain.ErrEmailOutboxUnavailable) {
+				httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "password recovery endpoint disabled")
+				return
+			}
 			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 			return
 		}
@@ -42,7 +59,8 @@ func AuthForgotPassword(recovery service.PasswordRecoveryManager) http.Handler {
 	})
 }
 
-func AuthResetPassword(recovery service.PasswordRecoveryManager) http.Handler {
+func AuthResetPassword(recovery service.PasswordRecoveryManager, limiters ...*targetAwareRateLimiter) http.Handler {
+	targetLimiter := firstTargetLimiter(limiters)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if recovery == nil {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "password recovery endpoint disabled")
@@ -51,6 +69,10 @@ func AuthResetPassword(recovery service.PasswordRecoveryManager) http.Handler {
 
 		var req resetPasswordRequest
 		if !decodePasswordRequest(w, r, &req) {
+			return
+		}
+		if !targetLimiter.allowToken(req.Token) {
+			writeRateLimited(w)
 			return
 		}
 
@@ -86,4 +108,19 @@ func writePasswordResetError(w http.ResponseWriter, err error) {
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
+}
+
+func firstTargetLimiter(limiters []*targetAwareRateLimiter) *targetAwareRateLimiter {
+	if len(limiters) == 0 {
+		return nil
+	}
+	return limiters[0]
+}
+
+func emailHandoffAvailable(manager any) bool {
+	if manager == nil {
+		return false
+	}
+	availability, ok := manager.(emailHandoffAvailability)
+	return !ok || availability.EmailHandoffAvailable()
 }

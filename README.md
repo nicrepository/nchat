@@ -466,11 +466,11 @@ Auth-service implements RF-46, RF-48, and RF-51:
 
 - RF-46: `POST /admin/invites` creates admin-only invites and `POST /auth/invites/accept` accepts expirable invite tokens.
 - RF-48: `POST /auth/password/forgot` and `POST /auth/password/reset` implement password recovery with expirable tokens.
-- RF-51: `POST /auth/refresh` rejects revoked, idle-expired, and absolute-expired sessions and extends only `idle_expires_at` by `session_idle_timeout_minutes`.
+- RF-51: `POST /auth/refresh` rejects revoked, idle-expired, and absolute-expired sessions and extends only `idle_expires_at` by `session_idle_timeout_minutes` (default 60 minutes, configurable).
 
 Reset and invite tokens are opaque random values. Only domain-separated HMAC-SHA-256 hashes are stored in `auth.password_reset_tokens` and `auth.user_invites`; HTTP responses never include raw tokens or token hashes.
 
-`auth.email_outbox` is metadata-only. It stores recipient/template/status metadata plus `reset_token_id` or `invite_id`, but it does not store raw tokens, full token links, token hashes in payload, passwords, password hashes, access tokens, or refresh tokens. Real e-mail delivery is intentionally out of scope for this PR and requires a later notification/e-mail worker strategy.
+`auth.email_outbox.payload` stores only an AES-256-GCM encrypted envelope for a future worker. Token tables keep only `token_hash`; raw reset/invite tokens and full token-bearing links are not stored in plaintext. `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` has no default and must be base64 for exactly 32 bytes. Real e-mail delivery is intentionally out of scope for this PR and requires a later notification/e-mail worker to decrypt the handoff and send the message.
 
 - Runbook: [docs/runbooks/task-auth-session-recovery-invites.md](docs/runbooks/task-auth-session-recovery-invites.md)
 - Migration: `migrations/auth/000004_auth_session_recovery_invites.{up,down}.sql`

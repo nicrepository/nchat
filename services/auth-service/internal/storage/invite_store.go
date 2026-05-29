@@ -90,7 +90,7 @@ func activeInviteExistsByEmailTx(ctx context.Context, q queryer, email string) (
 	return true, nil
 }
 
-func (s *PGXInviteStore) CreateInvite(ctx context.Context, email, displayName, fullName, tokenHash string, expiresAt time.Time) (domain.InviteResult, error) {
+func (s *PGXInviteStore) CreateInvite(ctx context.Context, email, displayName, fullName, tokenHash string, expiresAt time.Time, encryptedPayload string) (domain.InviteResult, error) {
 	_ = displayName
 	_ = fullName
 	tx, err := s.pool.Begin(ctx)
@@ -133,8 +133,8 @@ func (s *PGXInviteStore) CreateInvite(ctx context.Context, email, displayName, f
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO auth.email_outbox
 		  (kind, to_email, subject, template_key, invite_id, payload)
-		VALUES ('invite', $1, 'You have been invited to NChat', 'auth.invite', $2, '{}'::jsonb)`,
-		email, result.ID,
+		VALUES ('invite', $1, 'You have been invited to NChat', 'auth.invite', $2, $3::jsonb)`,
+		email, result.ID, encryptedPayload,
 	); err != nil {
 		return domain.InviteResult{}, fmt.Errorf("insert invite outbox: %w", err)
 	}

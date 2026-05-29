@@ -23,14 +23,24 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator
 	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
+	rateLimitKeyer := newRateLimitKeyer(cfg.AuthJWTHMACSecret)
 	tokenEndpointLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, cfg.AuthTrustedProxyCIDRs)
-	recoveryEndpointLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, cfg.AuthTrustedProxyCIDRs)
+	forgotIPLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, cfg.AuthTrustedProxyCIDRs)
+	resetIPLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, cfg.AuthTrustedProxyCIDRs)
+	inviteAcceptIPLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, cfg.AuthTrustedProxyCIDRs)
+	forgotTargetLimiter := newTargetAwareRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, rateLimitKeyer, "forgot-email")
+	resetTargetLimiter := newTargetAwareRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, rateLimitKeyer, "password-reset-token")
+	inviteAcceptTargetLimiter := newTargetAwareRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, rateLimitKeyer, "invite-accept-token")
 	mux.Handle(RouteAuthRefresh, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthRefresh(auth))))
 	mux.Handle(RouteAuthLogout, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthLogout(auth))))
 	mux.Handle(RouteAuthLogin, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthLogin(login))))
-	mux.Handle(RouteAuthPasswordForgot, httputil.MethodNotAllowed(http.MethodPost, recoveryEndpointLimiter.Middleware(AuthForgotPassword(password))))
-	mux.Handle(RouteAuthPasswordReset, httputil.MethodNotAllowed(http.MethodPost, recoveryEndpointLimiter.Middleware(AuthResetPassword(password))))
-	mux.Handle(RouteAuthInvitesAccept, httputil.MethodNotAllowed(http.MethodPost, recoveryEndpointLimiter.Middleware(AuthAcceptInvite(invites))))
+	forgotHandler := AuthForgotPassword(password, forgotTargetLimiter)
+	if password != nil && emailHandoffAvailable(password) {
+		forgotHandler = forgotIPLimiter.Middleware(forgotHandler)
+	}
+	mux.Handle(RouteAuthPasswordForgot, httputil.MethodNotAllowed(http.MethodPost, forgotHandler))
+	mux.Handle(RouteAuthPasswordReset, httputil.MethodNotAllowed(http.MethodPost, resetIPLimiter.Middleware(AuthResetPassword(password, resetTargetLimiter))))
+	mux.Handle(RouteAuthInvitesAccept, httputil.MethodNotAllowed(http.MethodPost, inviteAcceptIPLimiter.Middleware(AuthAcceptInvite(invites, inviteAcceptTargetLimiter))))
 	mux.Handle(RouteAdminUsers, httputil.MethodNotAllowed(http.MethodPost,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateUser(users)),
 	))

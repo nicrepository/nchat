@@ -2,7 +2,9 @@
 package service_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -20,18 +22,21 @@ type fakePasswordResetStore struct {
 	createErr    error
 	resetErr     error
 
-	lookupEmail  string
-	createCalls  int
-	createUserID string
-	createEmail  string
-	createHash   string
-	createExpiry time.Time
+	lookupCalls   int
+	lookupEmail   string
+	createCalls   int
+	createUserID  string
+	createEmail   string
+	createHash    string
+	createPayload string
+	createExpiry  time.Time
 
 	resetTokenHash    string
 	resetPasswordHash string
 }
 
 func (f *fakePasswordResetStore) GetActiveUserForPasswordReset(_ context.Context, email string) (string, bool, error) {
+	f.lookupCalls++
 	f.lookupEmail = email
 	return f.activeUserID, f.activeFound, nil
 }
@@ -40,11 +45,12 @@ func (f *fakePasswordResetStore) GetPolicySettings(_ context.Context) (domain.Po
 	return f.policy, f.policyErr
 }
 
-func (f *fakePasswordResetStore) CreatePasswordResetToken(_ context.Context, userID, email, tokenHash string, expiresAt time.Time) error {
+func (f *fakePasswordResetStore) CreatePasswordResetToken(_ context.Context, userID, email, tokenHash string, expiresAt time.Time, encryptedPayload string) error {
 	f.createCalls++
 	f.createUserID = userID
 	f.createEmail = email
 	f.createHash = tokenHash
+	f.createPayload = encryptedPayload
 	f.createExpiry = expiresAt
 	return f.createErr
 }
@@ -55,10 +61,26 @@ func (f *fakePasswordResetStore) ResetPasswordTx(_ context.Context, tokenHash, n
 	return f.resetErr
 }
 
+func TestPasswordResetService_EmailHandoffAvailableReflectsEncryptor(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("h", 32))
+	store := &fakePasswordResetStore{policy: defaultPolicy()}
+	if service.NewPasswordResetService(manager, store).EmailHandoffAvailable() {
+		t.Fatal("expected handoff unavailable without encryptor")
+	}
+	if !service.NewPasswordResetService(manager, store, service.WithPasswordResetOutboxEncryptor(newTestEmailOutboxEncryptor(t))).EmailHandoffAvailable() {
+		t.Fatal("expected handoff available with encryptor")
+	}
+}
+
 func TestPasswordResetService_ForgotPasswordKnownActiveUserCreatesHashedToken(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("q", 32))
+	encryptor := newTestEmailOutboxEncryptor(t)
 	store := &fakePasswordResetStore{activeUserID: "user-1", activeFound: true, policy: defaultPolicy()}
-	svc := service.NewPasswordResetService(manager, store)
+	dummyCalls := 0
+	svc := service.NewPasswordResetService(manager, store,
+		service.WithPasswordResetOutboxEncryptor(encryptor),
+		service.WithPasswordResetDummyWork(func() { dummyCalls++ }),
+	)
 
 	if err := svc.ForgotPassword(context.Background(), domain.ForgotPasswordInput{Email: "  USER@Example.COM  "}); err != nil {
 		t.Fatalf("ForgotPassword: %v", err)
@@ -72,8 +94,27 @@ func TestPasswordResetService_ForgotPasswordKnownActiveUserCreatesHashedToken(t 
 	if store.createHash == "" || len(store.createHash) != 64 {
 		t.Fatalf("expected HMAC-SHA-256 token hash, got %q", store.createHash)
 	}
+	if dummyCalls != 1 {
+		t.Fatalf("expected dummy work for found user, got %d calls", dummyCalls)
+	}
 	if strings.Contains(store.createHash, "USER") || strings.Contains(store.createHash, "user@example.com") {
 		t.Fatalf("token hash must not contain email or raw token material: %q", store.createHash)
+	}
+	plaintext, err := encryptor.Decrypt(store.createPayload)
+	if err != nil {
+		t.Fatalf("decrypt outbox payload: %v", err)
+	}
+	if plaintext.Kind != "password_reset" || plaintext.ToEmail != "user@example.com" || plaintext.ActionPath != "/auth/password/reset" {
+		t.Fatalf("unexpected encrypted payload: %+v", plaintext)
+	}
+	if plaintext.Token == "" {
+		t.Fatal("expected encrypted payload to contain reset token")
+	}
+	if strings.Contains(store.createPayload, plaintext.Token) {
+		t.Fatalf("outbox envelope must not contain raw token: %s", store.createPayload)
+	}
+	if strings.Contains(store.createPayload, "/auth/password/reset?token="+plaintext.Token) {
+		t.Fatalf("outbox envelope must not contain full raw link token: %s", store.createPayload)
 	}
 	if !store.createExpiry.After(time.Now().Add(59 * time.Minute)) {
 		t.Fatalf("expected reset token expiry about 60 minutes out, got %s", store.createExpiry)
@@ -82,11 +123,22 @@ func TestPasswordResetService_ForgotPasswordKnownActiveUserCreatesHashedToken(t 
 
 func TestPasswordResetService_ForgotPasswordUnknownUserGenericSuccessNoToken(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("r", 32))
+	encryptor := newTestEmailOutboxEncryptor(t)
 	store := &fakePasswordResetStore{activeFound: false, policy: defaultPolicy()}
-	svc := service.NewPasswordResetService(manager, store)
+	dummyCalls := 0
+	svc := service.NewPasswordResetService(manager, store,
+		service.WithPasswordResetOutboxEncryptor(encryptor),
+		service.WithPasswordResetDummyWork(func() { dummyCalls++ }),
+	)
 
 	if err := svc.ForgotPassword(context.Background(), domain.ForgotPasswordInput{Email: "missing@example.com"}); err != nil {
 		t.Fatalf("ForgotPassword should be generic success: %v", err)
+	}
+	if store.lookupCalls != 1 || store.lookupEmail != "missing@example.com" {
+		t.Fatalf("expected lookup for normalized syntactically valid email, calls=%d email=%q", store.lookupCalls, store.lookupEmail)
+	}
+	if dummyCalls != 1 {
+		t.Fatalf("expected dummy work for missing user, got %d calls", dummyCalls)
 	}
 	if store.createCalls != 0 || store.createHash != "" {
 		t.Fatalf("unknown user must not create token, calls=%d hash=%q", store.createCalls, store.createHash)
@@ -95,14 +147,35 @@ func TestPasswordResetService_ForgotPasswordUnknownUserGenericSuccessNoToken(t *
 
 func TestPasswordResetService_ForgotPasswordInvalidEmailGenericSuccessNoToken(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("s", 32))
+	encryptor := newTestEmailOutboxEncryptor(t)
 	store := &fakePasswordResetStore{activeFound: true, activeUserID: "user-1", policy: defaultPolicy()}
-	svc := service.NewPasswordResetService(manager, store)
+	dummyCalls := 0
+	svc := service.NewPasswordResetService(manager, store,
+		service.WithPasswordResetOutboxEncryptor(encryptor),
+		service.WithPasswordResetDummyWork(func() { dummyCalls++ }),
+	)
 
 	if err := svc.ForgotPassword(context.Background(), domain.ForgotPasswordInput{Email: "not-an-email"}); err != nil {
 		t.Fatalf("ForgotPassword should hide invalid email: %v", err)
 	}
-	if store.lookupEmail != "" || store.createCalls != 0 {
-		t.Fatalf("invalid email must not lookup/create token, lookup=%q calls=%d", store.lookupEmail, store.createCalls)
+	if store.lookupCalls != 0 || store.lookupEmail != "" || store.createCalls != 0 || dummyCalls != 0 {
+		t.Fatalf("invalid email must not lookup/create token/run dummy work, lookupCalls=%d lookup=%q create=%d dummy=%d", store.lookupCalls, store.lookupEmail, store.createCalls, dummyCalls)
+	}
+}
+
+func TestPasswordResetService_ForgotPasswordMissingOutboxKeyDisablesBeforeLookup(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("s", 32))
+	store := &fakePasswordResetStore{activeFound: true, activeUserID: "user-1", policy: defaultPolicy()}
+	svc := service.NewPasswordResetService(manager, store, service.WithPasswordResetDummyWork(func() {
+		t.Fatal("dummy work must not run when email outbox encryption is unavailable")
+	}))
+
+	err := svc.ForgotPassword(context.Background(), domain.ForgotPasswordInput{Email: "user@example.com"})
+	if !errors.Is(err, domain.ErrEmailOutboxUnavailable) {
+		t.Fatalf("expected ErrEmailOutboxUnavailable, got %v", err)
+	}
+	if store.lookupCalls != 0 || store.createCalls != 0 {
+		t.Fatalf("missing outbox key must fail before lookup/create, lookup=%d create=%d", store.lookupCalls, store.createCalls)
 	}
 }
 
@@ -149,4 +222,15 @@ func TestPasswordResetService_ResetPasswordInvalidTokenPropagatesGenericError(t 
 	if !errors.Is(err, domain.ErrInvalidToken) {
 		t.Fatalf("expected ErrInvalidToken, got %v", err)
 	}
+}
+
+func newTestEmailOutboxEncryptor(t *testing.T) *service.EmailOutboxEncryptor {
+	t.Helper()
+
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+	encryptor, err := service.NewEmailOutboxEncryptor(key)
+	if err != nil {
+		t.Fatalf("NewEmailOutboxEncryptor: %v", err)
+	}
+	return encryptor
 }

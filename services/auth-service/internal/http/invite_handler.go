@@ -46,6 +46,10 @@ func AdminCreateInvite(invites service.InviteManager) http.Handler {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "admin invite endpoint unavailable: database not configured")
 			return
 		}
+		if !emailHandoffAvailable(invites) {
+			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "admin invite endpoint unavailable: email handoff disabled")
+			return
+		}
 
 		var req createInviteRequest
 		if !decodePasswordRequest(w, r, &req) {
@@ -61,7 +65,8 @@ func AdminCreateInvite(invites service.InviteManager) http.Handler {
 	})
 }
 
-func AuthAcceptInvite(invites service.InviteManager) http.Handler {
+func AuthAcceptInvite(invites service.InviteManager, limiters ...*targetAwareRateLimiter) http.Handler {
+	targetLimiter := firstTargetLimiter(limiters)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if invites == nil {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "invite endpoint disabled")
@@ -70,6 +75,10 @@ func AuthAcceptInvite(invites service.InviteManager) http.Handler {
 
 		var req acceptInviteRequest
 		if !decodePasswordRequest(w, r, &req) {
+			return
+		}
+		if !targetLimiter.allowToken(req.Token) {
+			writeRateLimited(w)
 			return
 		}
 
@@ -88,6 +97,8 @@ func AuthAcceptInvite(invites service.InviteManager) http.Handler {
 
 func writeCreateInviteError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrEmailOutboxUnavailable):
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "admin invite endpoint unavailable: email handoff disabled")
 	case errors.Is(err, domain.ErrDuplicateEmail), errors.Is(err, domain.ErrInviteAlreadyPending):
 		httputil.WriteError(w, http.StatusConflict, errCodeConflict, "invite conflict")
 	case errors.Is(err, domain.ErrInvalidInput):

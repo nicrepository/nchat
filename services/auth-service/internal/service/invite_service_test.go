@@ -20,6 +20,8 @@ type fakeInviteStore struct {
 	acceptErr          error
 	createResult       domain.InviteResult
 	acceptResult       domain.AcceptInviteResult
+	checkedUserCalls   int
+	checkedInviteCalls int
 	checkedUserEmail   string
 	checkedInviteEmail string
 
@@ -27,6 +29,7 @@ type fakeInviteStore struct {
 	createDisplayName string
 	createFullName    string
 	createTokenHash   string
+	createPayload     string
 	createExpiresAt   time.Time
 
 	acceptTokenHash    string
@@ -36,11 +39,13 @@ type fakeInviteStore struct {
 }
 
 func (f *fakeInviteStore) UserExistsByEmail(_ context.Context, email string) (bool, error) {
+	f.checkedUserCalls++
 	f.checkedUserEmail = email
 	return f.userExists, nil
 }
 
 func (f *fakeInviteStore) ActiveInviteExistsByEmail(_ context.Context, email string) (bool, error) {
+	f.checkedInviteCalls++
 	f.checkedInviteEmail = email
 	return f.activeInvite, nil
 }
@@ -49,11 +54,12 @@ func (f *fakeInviteStore) GetPolicySettings(_ context.Context) (domain.PolicySet
 	return f.policy, nil
 }
 
-func (f *fakeInviteStore) CreateInvite(_ context.Context, email, displayName, fullName, tokenHash string, expiresAt time.Time) (domain.InviteResult, error) {
+func (f *fakeInviteStore) CreateInvite(_ context.Context, email, displayName, fullName, tokenHash string, expiresAt time.Time, encryptedPayload string) (domain.InviteResult, error) {
 	f.createEmail = email
 	f.createDisplayName = displayName
 	f.createFullName = fullName
 	f.createTokenHash = tokenHash
+	f.createPayload = encryptedPayload
 	f.createExpiresAt = expiresAt
 	return f.createResult, f.createErr
 }
@@ -66,10 +72,22 @@ func (f *fakeInviteStore) AcceptInviteTx(_ context.Context, tokenHash, displayNa
 	return f.acceptResult, f.acceptErr
 }
 
+func TestInviteService_EmailHandoffAvailableReflectsEncryptor(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("i", 32))
+	store := &fakeInviteStore{policy: defaultPolicy()}
+	if service.NewInviteService(manager, store).EmailHandoffAvailable() {
+		t.Fatal("expected handoff unavailable without encryptor")
+	}
+	if !service.NewInviteService(manager, store, service.WithInviteOutboxEncryptor(newTestEmailOutboxEncryptor(t))).EmailHandoffAvailable() {
+		t.Fatal("expected handoff available with encryptor")
+	}
+}
+
 func TestInviteService_CreateInviteCreatesHashedToken(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("w", 32))
+	encryptor := newTestEmailOutboxEncryptor(t)
 	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1", Email: "user@example.com", CreatedAt: time.Now()}}
-	svc := service.NewInviteService(manager, store)
+	svc := service.NewInviteService(manager, store, service.WithInviteOutboxEncryptor(encryptor))
 
 	result, err := svc.CreateInvite(context.Background(), domain.AdminInviteInput{Email: " USER@Example.COM ", DisplayName: " User ", FullName: " User Full "})
 	if err != nil {
@@ -87,6 +105,22 @@ func TestInviteService_CreateInviteCreatesHashedToken(t *testing.T) {
 	if store.createTokenHash == "" || len(store.createTokenHash) != 64 || strings.Contains(store.createTokenHash, "user@example.com") {
 		t.Fatalf("expected hashed invite token, got %q", store.createTokenHash)
 	}
+	plaintext, err := encryptor.Decrypt(store.createPayload)
+	if err != nil {
+		t.Fatalf("decrypt invite outbox payload: %v", err)
+	}
+	if plaintext.Kind != "invite" || plaintext.ToEmail != "user@example.com" || plaintext.ActionPath != "/auth/invites/accept" {
+		t.Fatalf("unexpected encrypted payload: %+v", plaintext)
+	}
+	if plaintext.Token == "" {
+		t.Fatal("expected encrypted payload to contain invite token")
+	}
+	if strings.Contains(store.createPayload, plaintext.Token) {
+		t.Fatalf("outbox envelope must not contain raw invite token: %s", store.createPayload)
+	}
+	if strings.Contains(store.createPayload, "/auth/invites/accept?token="+plaintext.Token) {
+		t.Fatalf("outbox envelope must not contain full invite link token: %s", store.createPayload)
+	}
 	if !store.createExpiresAt.After(time.Now().Add(71 * time.Hour)) {
 		t.Fatalf("expected invite expiry about 72 hours out, got %s", store.createExpiresAt)
 	}
@@ -95,7 +129,7 @@ func TestInviteService_CreateInviteCreatesHashedToken(t *testing.T) {
 func TestInviteService_CreateInviteRejectsDuplicateUser(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("x", 32))
 	store := &fakeInviteStore{userExists: true, policy: defaultPolicy()}
-	svc := service.NewInviteService(manager, store)
+	svc := service.NewInviteService(manager, store, service.WithInviteOutboxEncryptor(newTestEmailOutboxEncryptor(t)))
 
 	_, err := svc.CreateInvite(context.Background(), domain.AdminInviteInput{Email: "user@example.com", DisplayName: "User"})
 	if !errors.Is(err, domain.ErrDuplicateEmail) {
@@ -109,7 +143,7 @@ func TestInviteService_CreateInviteRejectsDuplicateUser(t *testing.T) {
 func TestInviteService_CreateInviteRejectsActivePendingInvite(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("y", 32))
 	store := &fakeInviteStore{activeInvite: true, policy: defaultPolicy()}
-	svc := service.NewInviteService(manager, store)
+	svc := service.NewInviteService(manager, store, service.WithInviteOutboxEncryptor(newTestEmailOutboxEncryptor(t)))
 
 	_, err := svc.CreateInvite(context.Background(), domain.AdminInviteInput{Email: "user@example.com", DisplayName: "User"})
 	if !errors.Is(err, domain.ErrInviteAlreadyPending) {
@@ -117,6 +151,20 @@ func TestInviteService_CreateInviteRejectsActivePendingInvite(t *testing.T) {
 	}
 	if store.createTokenHash != "" {
 		t.Fatal("pending invite must not rotate token in this PR")
+	}
+}
+
+func TestInviteService_CreateInviteMissingOutboxKeyDisablesBeforeLookup(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("y", 32))
+	store := &fakeInviteStore{policy: defaultPolicy()}
+	svc := service.NewInviteService(manager, store)
+
+	_, err := svc.CreateInvite(context.Background(), domain.AdminInviteInput{Email: "user@example.com", DisplayName: "User"})
+	if !errors.Is(err, domain.ErrEmailOutboxUnavailable) {
+		t.Fatalf("expected ErrEmailOutboxUnavailable, got %v", err)
+	}
+	if store.checkedUserCalls != 0 || store.checkedInviteCalls != 0 || store.createTokenHash != "" {
+		t.Fatalf("missing outbox key must fail before lookup/token creation, userChecks=%d inviteChecks=%d tokenHash=%q", store.checkedUserCalls, store.checkedInviteCalls, store.createTokenHash)
 	}
 }
 

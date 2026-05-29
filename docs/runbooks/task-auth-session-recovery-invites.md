@@ -4,15 +4,15 @@
 
 This runbook covers RF-46, RF-48, and RF-51 for auth-service.
 
-| RF    | Requirement                                   | Implementation                                                                  |
-| ----- | --------------------------------------------- | ------------------------------------------------------------------------------- |
-| RF-46 | Convite por e-mail com link de ativação       | `POST /admin/invites` and `POST /auth/invites/accept` with expirable tokens     |
-| RF-48 | Recuperação de senha via e-mail com token TTL | `POST /auth/password/forgot` and `POST /auth/password/reset`                    |
-| RF-51 | Sessão expira após inatividade, padrão 1h     | Refresh rejects revoked/idle-expired/absolute-expired sessions and extends idle |
+| RF    | Requirement                                   | Implementation                                                                                                                 |
+| ----- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| RF-46 | Convite por e-mail com link de ativacao       | `POST /admin/invites` and `POST /auth/invites/accept` with expirable tokens and encrypted outbox handoff                       |
+| RF-48 | Recuperacao de senha via e-mail com token TTL | `POST /auth/password/forgot` and `POST /auth/password/reset` with expirable tokens and encrypted outbox handoff                |
+| RF-51 | Sessao expira apos inatividade, padrao 1h     | Refresh rejects revoked/idle-expired/absolute-expired sessions and extends `session_idle_timeout_minutes` (default 60 minutes) |
 
-The PR prepares secure domain flows and a metadata-only e-mail handoff. It does
-not implement frontend screens, SMTP, a notification worker, OAuth/OIDC, final
-RBAC, or automatic login after invite/password reset.
+The PR prepares secure domain flows and an encrypted e-mail token handoff. It
+does not implement frontend screens, SMTP, a notification worker, OAuth/OIDC,
+final RBAC, or automatic login after invite/password reset.
 
 ---
 
@@ -38,7 +38,8 @@ refresh tokens still return `204 No Content` through the HTTP contract.
 
 ### `POST /auth/password/forgot`
 
-Public endpoint, 4 KiB body cap, in-memory rate limit.
+Public endpoint, 4 KiB body cap, endpoint-specific IP rate limit, and secondary
+normalized-email HMAC rate limit.
 
 Request:
 
@@ -51,25 +52,30 @@ Request:
 Response:
 
 - `202 Accepted` with an empty body for known, unknown, invalid, deleted,
-  suspended, or locked users.
+  suspended, locked, or non-manual users.
+- `503 unavailable` for every request when `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` is
+  missing or invalid. This check happens before user lookup.
 - The response never reveals whether the e-mail exists.
 
 Behavior:
 
-1. Normalize e-mail.
-2. If an active manual non-deleted user exists, generate an opaque token of at
-   least 32 random bytes.
-3. Store only a domain-separated HMAC-SHA-256 hash in
-   `auth.password_reset_tokens.token_hash`.
-4. Supersede previous unused reset tokens for the user by setting `used_at`.
-5. Insert a metadata-only `auth.email_outbox` row with `kind='password_reset'`,
-   `reset_token_id`, `user_id`, recipient metadata, status, attempts, and
-   timestamps.
-6. Do not return the token over HTTP.
+1. Verify encrypted outbox handoff is configured.
+2. Normalize e-mail.
+3. For syntactically valid e-mails, generate an opaque token candidate, compute
+   its domain-separated HMAC-SHA-256 hash, and run the dummy Argon2id work path
+   regardless of user existence/status.
+4. Only active, non-deleted, manual-auth users receive a reset token row.
+5. Store only `auth.password_reset_tokens.token_hash` in the token table.
+6. Supersede previous unused reset tokens for the user by setting `used_at`.
+7. Insert an `auth.email_outbox` row with an encrypted `payload` envelope for a
+   future worker. The raw token is present only inside AES-256-GCM ciphertext.
+8. Do not return the token over HTTP.
 
 ### `POST /auth/password/reset`
 
-Public endpoint, 4 KiB body cap, in-memory rate limit.
+Public endpoint, 4 KiB body cap, endpoint-specific IP rate limit, and secondary
+submitted-token HMAC rate limit after cheap token-shape validation. Malformed
+tokens use a generic target limiter key.
 
 Request:
 
@@ -83,7 +89,8 @@ Request:
 Response:
 
 - `204 No Content` on success.
-- `401 invalid_token` for unknown, expired, used, or otherwise invalid tokens.
+- `401 invalid_token` for unknown, expired, used, owner-ineligible, or otherwise
+  invalid tokens.
 - `400 bad_request` for weak passwords or malformed input.
 
 Behavior:
@@ -91,10 +98,12 @@ Behavior:
 1. Hash the submitted token with the password-reset HMAC domain prefix.
 2. Validate the new password using `auth.auth_policy_settings`.
 3. Hash the new password with the existing Argon2id PHC implementation.
-4. In one transaction, lock the reset token row, reject expired/used tokens,
-   update the password credential, mark the token used, revoke all sessions for
-   the user, and revoke active refresh-token history rows.
-5. Do not auto-login.
+4. In one transaction, lock the reset token row and require that its owner is
+   active, not deleted, and manual-auth eligible.
+5. Reject expired/used tokens generically.
+6. Update the password credential, mark the token used, revoke all sessions for
+   the user, and revoke active refresh-token history rows for those sessions.
+7. Do not auto-login.
 
 ---
 
@@ -106,7 +115,9 @@ Admin endpoint guarded by `AdminBootstrapGuard` and `X-NChat-Admin-Token` until
 final RBAC exists.
 
 - Empty `ADMIN_BOOTSTRAP_TOKEN` disables the endpoint with `503`.
-- Wrong or missing `X-NChat-Admin-Token` returns `401`.
+- Missing or wrong `X-NChat-Admin-Token` returns `401`.
+- Missing or invalid `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` returns `503` before
+  user or invite lookup.
 - The admin token is never logged.
 
 Request:
@@ -131,20 +142,23 @@ Response:
 
 Behavior:
 
-1. Normalize and validate e-mail and `display_name`.
-2. If any user already exists with that e-mail, return `409`.
-3. If an active pending invite exists, return `409`. This PR does not rotate
+1. Verify encrypted outbox handoff is configured.
+2. Normalize and validate e-mail and `display_name`.
+3. If any user already exists with that e-mail, return `409`.
+4. If an active pending invite exists, return `409`. This PR does not rotate
    pending invite tokens.
-4. Generate an opaque token of at least 32 random bytes.
-5. Store only a domain-separated HMAC-SHA-256 hash in
+5. Generate an opaque token of at least 32 random bytes.
+6. Store only a domain-separated HMAC-SHA-256 hash in
    `auth.user_invites.token_hash`.
-6. Insert a metadata-only `auth.email_outbox` row with `kind='invite'`,
-   `invite_id`, recipient metadata, status, attempts, and timestamps.
-7. Do not return the token over HTTP.
+7. Insert an `auth.email_outbox` row with an encrypted `payload` envelope for a
+   future worker. The raw token is present only inside AES-256-GCM ciphertext.
+8. Do not return the token over HTTP.
 
 ### `POST /auth/invites/accept`
 
-Public endpoint, 4 KiB body cap, in-memory rate limit.
+Public endpoint, 4 KiB body cap, endpoint-specific IP rate limit, and secondary
+submitted-token HMAC rate limit after cheap token-shape validation. Malformed
+tokens use a generic target limiter key.
 
 Request:
 
@@ -180,37 +194,80 @@ Behavior:
 
 ---
 
-## Metadata-Only Email Outbox
+## Encrypted Email Outbox Handoff
 
-`auth.email_outbox` is a handoff table only. It stores:
+`auth.email_outbox` is a handoff table only. The token tables keep only
+`token_hash`. The outbox `payload` stores only this encrypted envelope:
 
-- `id`
+```json
+{
+  "alg": "AES-256-GCM",
+  "key_version": "v1",
+  "nonce": "base64",
+  "ciphertext": "base64"
+}
+```
+
+Plaintext before encryption may include:
+
 - `kind` (`password_reset` or `invite`)
+- `token`
+- `action_path` or `link_path`
 - `to_email`
-- `subject`
-- `template_key`
-- `reset_token_id` or `invite_id`
-- `user_id` when applicable
-- non-sensitive `payload` JSONB, currently `{}`
-- `status`, `attempts`, `created_at`, `sent_at`, and `last_error`
+- `expires_at`
 
-It must not store:
+It must not include:
 
-- raw reset or invite tokens
-- full links containing tokens
-- token hashes in payload
 - passwords or password hashes
 - access tokens or refresh tokens
-- e-mail bodies containing token-bearing links
+- device fingerprints
+- raw token links outside the encrypted ciphertext
+- token hashes in payload
+- e-mail bodies
 
-### Known delivery limitation
+`AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` is required to create password reset and
+invite e-mail handoff rows. It has no default and must be standard base64 that
+decodes to exactly 32 bytes, for example from `openssl rand -base64 32`. Reset
+and invite-accept endpoints do not require this key because they consume tokens
+already delivered to the user.
 
-This PR does not deliver reset or invite e-mails end-to-end because the raw token
-is intentionally not persisted in `auth.email_outbox`. A future e-mail or
-notification-service task must choose a safe strategy, such as generating the
-link inside the same trusted delivery boundary, encrypting a payload with
-explicit key management, or handing the token directly to a notification worker
-without plaintext database persistence.
+A future SMTP or notification worker can decrypt `payload` with the same
+`AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY`, build the user-facing e-mail link, and send
+the message. That worker and real SMTP provider integration are out of scope for
+this PR. This PR must not be described as completing e-mail delivery.
+
+A database-only compromise exposes recipients and workflow metadata, but does
+not expose plaintext reset or invite tokens without the outbox encryption key.
+Key rotation is future work; the current envelope records `key_version: v1` so a
+future worker can support multiple active/decryption-only keys.
+
+---
+
+## Rate Limit and Trusted Proxy Notes
+
+Public recovery endpoints use in-memory per-process token buckets:
+
+- `/auth/password/forgot`: endpoint-specific IP bucket plus normalized-email
+  HMAC bucket.
+- `/auth/password/reset`: endpoint-specific IP bucket plus submitted-token HMAC
+  bucket after cheap token-shape validation.
+- `/auth/invites/accept`: endpoint-specific IP bucket plus submitted-token HMAC
+  bucket after cheap token-shape validation.
+
+Limiter keys are never raw e-mail addresses or raw tokens. The IP limiter uses
+`RemoteAddr` by default. When auth-service is deployed behind Traefik, set
+`AUTH_TRUSTED_PROXY_CIDRS` to the Traefik pod/source CIDR; otherwise all client
+traffic may share the Traefik pod IP for rate-limiting. Forwarded headers are
+trusted only when `RemoteAddr` is inside the configured CIDR. The leftmost
+`X-Forwarded-For` entry is used only if it parses as an IP; `X-Real-IP` is the
+fallback if valid; otherwise `RemoteAddr` remains the key.
+
+Limitations:
+
+- The limiter is in-memory and per auth-service instance.
+- Multi-replica deployments still need gateway or shared-store rate limiting.
+- Target-aware buckets reduce abuse of public recovery endpoints but are not a
+  replacement for distributed edge controls.
 
 ---
 
@@ -219,12 +276,14 @@ without plaintext database persistence.
 - Reset/invite tokens are opaque random values with at least 32 bytes of entropy.
 - Only HMAC-SHA-256 token hashes are persisted in token tables.
 - Password reset and invite hashes use separate HMAC domain prefixes.
-- Public endpoints have 4 KiB request body caps and in-memory rate limiting.
+- Outbox handoff payloads are encrypted with AES-256-GCM and random 96-bit
+  nonces.
 - Token validation errors are generic to avoid token oracle behavior.
 - Forgot-password responses are generic to avoid account enumeration.
 - Responses do not include raw tokens, token hashes, password hashes, access
   tokens, or refresh tokens.
-- Sensitive request fields and e-mail bodies are not logged by these handlers.
+- Sensitive request fields, plaintext outbox payloads, ciphertext payloads, and
+  e-mail bodies are not logged by these handlers.
 
 ---
 
@@ -237,6 +296,7 @@ without plaintext database persistence.
 - Final RBAC
 - Auto-login after password reset or invite acceptance
 - Distributed rate limiting
+- Email outbox key rotation implementation
 
 ---
 

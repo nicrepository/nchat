@@ -23,6 +23,7 @@ type Config struct {
 	DBConnectTimeoutSeconds             int
 	AdminBootstrapToken                 string
 	AuthJWTHMACSecret                   string
+	AuthEmailOutboxEncryptionKey        string
 	AuthJWTIssuer                       string
 	AuthJWTAudience                     string
 	AuthAccessTokenTTLSeconds           int
@@ -46,6 +47,7 @@ func Load() Config {
 		DBConnectTimeoutSeconds:             platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
 		AdminBootstrapToken:                 platformconfig.GetString("ADMIN_BOOTSTRAP_TOKEN", ""),
 		AuthJWTHMACSecret:                   platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthEmailOutboxEncryptionKey:        platformconfig.GetString("AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY", ""),
 		AuthJWTIssuer:                       platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
 		AuthJWTAudience:                     platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
 		AuthAccessTokenTTLSeconds:           positiveInt("AUTH_ACCESS_TOKEN_TTL_SECONDS", defaultAccessTokenTTLSeconds),

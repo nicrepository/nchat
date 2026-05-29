@@ -1,5 +1,5 @@
 -- 000004_auth_session_recovery_invites.down.sql
--- Reverts configurable reset/invite token TTLs and metadata-only email outbox handoff.
+-- Reverts configurable reset/invite token TTLs and encrypted email outbox token handoff.
 
 BEGIN;
 

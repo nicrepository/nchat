@@ -1,6 +1,10 @@
 package httpapi
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"strings"
@@ -8,11 +12,14 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
 const (
 	fallbackTokenEndpointRateLimitPerMinute = 60
 	fallbackTokenEndpointRateLimitBurst     = 10
+	minRateLimitSecretBytes                 = 32
+	malformedTokenLimiterKey                = "malformed"
 )
 
 type tokenEndpointRateLimiter struct {
@@ -58,7 +65,7 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDR
 func (l *tokenEndpointRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !l.allow(l.clientIP(r)) {
-			httputil.WriteError(w, http.StatusTooManyRequests, httputil.ErrCodeRateLimited, "rate limit exceeded")
+			writeRateLimited(w)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -153,4 +160,82 @@ func remoteAddrKey(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+type rateLimitKeyer struct {
+	key []byte
+}
+
+func newRateLimitKeyer(secret string) *rateLimitKeyer {
+	if len([]byte(secret)) >= minRateLimitSecretBytes {
+		return &rateLimitKeyer{key: []byte(secret)}
+	}
+	key := make([]byte, minRateLimitSecretBytes)
+	if _, err := rand.Read(key); err != nil {
+		panic("rate limiter random key unavailable")
+	}
+	return &rateLimitKeyer{key: key}
+}
+
+func (k *rateLimitKeyer) hmacKey(domainName, value string) string {
+	mac := hmac.New(sha256.New, k.key)
+	_, _ = mac.Write([]byte("nchat-rate-limit-v1:"))
+	_, _ = mac.Write([]byte(domainName))
+	_, _ = mac.Write([]byte(":"))
+	_, _ = mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+type targetAwareRateLimiter struct {
+	limiter *tokenEndpointRateLimiter
+	keyer   *rateLimitKeyer
+	domain  string
+}
+
+func newTargetAwareRateLimiter(limitPerMinute int, burst int, keyer *rateLimitKeyer, domainName string) *targetAwareRateLimiter {
+	return &targetAwareRateLimiter{
+		limiter: NewTokenEndpointRateLimiter(limitPerMinute, burst, ""),
+		keyer:   keyer,
+		domain:  domainName,
+	}
+}
+
+func (l *targetAwareRateLimiter) allowEmail(email string) bool {
+	if l == nil {
+		return true
+	}
+	normalized := domain.NormalizeEmail(email)
+	return l.limiter.allow(l.keyer.hmacKey(l.domain, normalized))
+}
+
+func (l *targetAwareRateLimiter) allowToken(token string) bool {
+	if l == nil {
+		return true
+	}
+	trimmed := strings.TrimSpace(token)
+	if !looksLikeOpaqueToken(trimmed) {
+		return l.limiter.allow(l.keyer.hmacKey(l.domain, malformedTokenLimiterKey))
+	}
+	return l.limiter.allow(l.keyer.hmacKey(l.domain, trimmed))
+}
+
+func looksLikeOpaqueToken(token string) bool {
+	if len(token) < 32 || len(token) > 128 {
+		return false
+	}
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func writeRateLimited(w http.ResponseWriter) {
+	httputil.WriteError(w, http.StatusTooManyRequests, httputil.ErrCodeRateLimited, "rate limit exceeded")
 }

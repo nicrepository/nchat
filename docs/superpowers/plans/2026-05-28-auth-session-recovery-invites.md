@@ -4,7 +4,7 @@
 
 **Goal:** Implement RF-46, RF-48, and RF-51 in auth-service: session idle expiry enforcement, password recovery with expirable hashed tokens, and admin email invites with expirable hashed tokens.
 
-**Architecture:** Keep all raw reset/invite tokens in memory only, persist only HMAC-SHA-256 hashes, and record email handoff in a metadata-only `auth.email_outbox`. Services own normalization, policy validation, token hashing, and password hashing; stores own transactional persistence and row locks. HTTP handlers provide body caps, rate limits, generic enumeration-safe responses, and no frontend or SMTP behavior.
+**Architecture:** Keep all raw reset/invite tokens in memory only, persist only HMAC-SHA-256 hashes, and record email handoff through an encrypted `auth.email_outbox` token handoff. Services own normalization, policy validation, token hashing, and password hashing; stores own transactional persistence and row locks. HTTP handlers provide body caps, rate limits, generic enumeration-safe responses, and no frontend or SMTP behavior.
 
 **Tech Stack:** Go 1.25, pgx/pgxmock, PostgreSQL migrations, existing auth-service domain/service/storage/http layers, pnpm/make validation, Semgrep security scan.
 
@@ -23,7 +23,7 @@
 
 - [ ] **Step 1: Write migration files**
 
-Create `000004` with `BEGIN`, `SET LOCAL search_path = auth, public`, add `password_reset_token_ttl_minutes`, `invite_token_ttl_hours`, and metadata-only `auth.email_outbox` with `reset_token_id`, `invite_id`, nullable `user_id`, non-sensitive `payload`, status fields, and reference check.
+Create `000004` with `BEGIN`, `SET LOCAL search_path = auth, public`, add `password_reset_token_ttl_minutes`, `invite_token_ttl_hours`, and encrypted `auth.email_outbox` token handoff with `reset_token_id`, `invite_id`, nullable `user_id`, non-sensitive `payload`, status fields, and reference check.
 
 - [ ] **Step 2: Extend policy struct and scans**
 
@@ -218,7 +218,7 @@ Normalize and validate email/display name; detect duplicate user/pending invite;
 
 - [ ] **Step 4: Write failing invite store tests**
 
-Use pgxmock to cover duplicate user lookup, active pending invite query, invite insert returning id/created_at, metadata-only outbox insert with `invite_id`, valid accept creates user and credential then marks invite accepted, expired/used/revoked/unknown token returns `ErrInvalidToken`.
+Use pgxmock to cover duplicate user lookup, active pending invite query, invite insert returning id/created_at, encrypted outbox insert with `invite_id`, valid accept creates user and credential then marks invite accepted, expired/used/revoked/unknown token returns `ErrInvalidToken`.
 
 - [ ] **Step 5: Run red store tests**
 
@@ -227,7 +227,7 @@ Expected: compile failure for missing invite store.
 
 - [ ] **Step 6: Implement invite store**
 
-Create `PGXInviteStore` with transactional create/accept, `FOR UPDATE` locks on token rows, unique-email handling mapped to `ErrDuplicateEmail`, and metadata-only outbox inserts.
+Create `PGXInviteStore` with transactional create/accept, `FOR UPDATE` locks on token rows, unique-email handling mapped to `ErrDuplicateEmail`, and encrypted outbox inserts.
 
 - [ ] **Step 7: Verify invite layer tests**
 
@@ -270,7 +270,7 @@ Expected: pass.
 
 - [ ] **Step 1: Update docs**
 
-Document RF-46/RF-48/RF-51 traceability, endpoints, metadata-only outbox, security decisions, known limitations, and out-of-scope frontend/SMTP/OAuth/RBAC/notification worker/auto-login.
+Document RF-46/RF-48/RF-51 traceability, endpoints, encrypted outbox token handoff, key requirements, security decisions, known limitations, and out-of-scope frontend/SMTP/OAuth/RBAC/notification worker/auto-login.
 
 - [ ] **Step 2: Link issues in planned PR body**
 

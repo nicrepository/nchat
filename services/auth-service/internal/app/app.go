@@ -44,6 +44,11 @@ func New(cfg config.Config) *App {
 		}
 	}
 
+	emailOutboxEncryptor, emailOutboxErr := service.NewEmailOutboxEncryptor(cfg.AuthEmailOutboxEncryptionKey)
+	if emailOutboxErr != nil {
+		logger.Warn("email outbox handoff disabled", "reason", "invalid_email_outbox_encryption_key")
+	}
+
 	tokens, err := service.NewTokenManager(service.TokenConfig{
 		HMACSecret: cfg.AuthJWTHMACSecret,
 		Issuer:     cfg.AuthJWTIssuer,
@@ -59,8 +64,8 @@ func New(cfg config.Config) *App {
 	default:
 		auth = service.NewAuthService(tokens, storage.NewPGXSessionStore(pool))
 		login = service.NewLoginService(tokens, storage.NewPGXLoginStore(pool, service.VerifyPassword, service.RunDummyPasswordVerification))
-		password = service.NewPasswordResetService(tokens, storage.NewPGXPasswordResetStore(pool))
-		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool))
+		password = service.NewPasswordResetService(tokens, storage.NewPGXPasswordResetStore(pool), service.WithPasswordResetOutboxEncryptor(emailOutboxEncryptor))
+		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool), service.WithInviteOutboxEncryptor(emailOutboxEncryptor))
 	}
 
 	return &App{

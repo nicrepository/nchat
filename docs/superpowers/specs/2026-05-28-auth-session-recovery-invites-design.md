@@ -27,7 +27,7 @@ Implement three related auth-service flows in a single PR:
 - `POST /admin/invites` — guarded by `AdminBootstrapGuard`
 - `POST /auth/invites/accept` — 201 with user summary
 - Migration `000004_auth_session_recovery_invites`
-- Email outbox table (metadata-only — see Email Outbox Decision)
+- Email outbox table with encrypted token handoff payloads (see Email Outbox Decision)
 - Service, store, HTTP handler tests; coverage ≥ 90%
 - Runbook `docs/runbooks/task-auth-session-recovery-invites.md`
 - README auth section update
@@ -103,7 +103,7 @@ ALTER TABLE auth.auth_policy_settings
     ADD CONSTRAINT auth_policy_settings_invite_ttl_check
         CHECK (invite_token_ttl_hours > 0);
 
--- Email outbox: metadata-only handoff table for the future email worker.
+-- Email outbox: encrypted token handoff table for the future email worker.
 -- Raw reset/invite tokens, complete token links, token hashes, passwords,
 -- password hashes, access tokens, and refresh tokens are NEVER stored here.
 CREATE TABLE auth.email_outbox (
@@ -163,15 +163,15 @@ COMMIT;
 
 ## Email Outbox Decision
 
-**Choice: Option B — metadata-only outbox.**
+**Choice: encrypted outbox token handoff.**
 
-**Rationale:** Adding AES-GCM encryption (key management, `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY`, nonce, key versioning) is out of scope for this PR and would double the complexity of the store layer. The safer boundary is: **the outbox stores only metadata and typed foreign keys (`reset_token_id` or `invite_id`) pointing to `auth.password_reset_tokens.id` or `auth.user_invites.id`.** The optional `payload` column may contain only non-sensitive template metadata such as display name. It must never contain a raw token, complete token link, token hash, password, password hash, access token, refresh token, or email body containing any of those values.
+**Rationale:** Review found that metadata-only handoff cannot support real reset/invite e-mail links because the raw token is generated, hashed, and discarded. The outbox now stores only an AES-256-GCM envelope in `payload`; token tables still store only `token_hash`. `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` has no default and must be base64 for exactly 32 bytes. Missing or invalid key disables forgot-password and admin-invite handoff with `503` before user/invite lookup.
 
-This PR therefore implements the secure domain flow and handoff record, but deliberately does not deliver a usable email link end-to-end. The actual email delivery worker — not implemented here — must choose a safe strategy later, such as generating a link in the same delivery boundary, using an encrypted payload with explicit key management, or integrating directly with `notification-service` so raw token material is never persisted in plaintext.
+The encrypted plaintext can contain `kind`, `token`, `action_path` or `link_path`, `to_email`, and `expires_at`. It must not contain passwords, password hashes, access tokens, refresh tokens, device fingerprints, token hashes, plaintext token links outside ciphertext, or e-mail bodies.
 
-**Security consequence:** No token (raw or hashed) is ever persisted in the outbox. If `auth.email_outbox` leaks, it exposes recipients and workflow metadata, not temporary account-takeover credentials. The email worker has no raw token to send in this PR. Real email delivery is deferred and documented in the runbook.
+This PR still does not implement SMTP or a notification worker. A future worker can decrypt the outbox envelope, build the user-facing e-mail link, and send it. Key rotation is future work; the envelope records `key_version: v1`.
 
-**Encrypted outbox (Option A) is recorded as a known future improvement** in the runbook under "Known limitations."
+**Security consequence:** A database-only compromise exposes outbox metadata and ciphertext, not plaintext reset or invite tokens without the encryption key.
 
 ---
 
@@ -515,17 +515,17 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 ## Security Decisions
 
-| Decision                       | Detail                                                                                                                                                                                         |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Token storage                  | Only HMAC-SHA-256 hash stored in DB (`token_hash`). Raw reset/invite tokens are never persisted and never returned by HTTP responses                                                           |
-| Token domain prefix            | `HashPasswordResetToken` prefixes `nchat-password-reset-v1:`, `HashInviteToken` prefixes `nchat-invite-v1:` — prevents cross-type hash collisions                                              |
-| Outbox payload                 | Metadata-only (`reset_token_id` or `invite_id`, optional non-sensitive JSON). No raw token, complete token link, token hash, password, password hash, access token, or refresh token in outbox |
-| Anti-enumeration               | `ForgotPassword` always returns 202; unknown/locked/deleted users run dummy path                                                                                                               |
-| Generic token oracle           | Reset/accept return generic 401 for expired, used, invalid, or revoked token                                                                                                                   |
-| Session revocation after reset | All user sessions and active refresh history rows revoked in same transaction                                                                                                                  |
-| No auto-login                  | `AcceptInvite` creates user but no session                                                                                                                                                     |
-| Admin guard                    | `AdminBootstrapGuard` is temporary; documented as not final RBAC                                                                                                                               |
-| Token logging                  | No raw token, token hash, password hash, or email body in logs/metrics/traces                                                                                                                  |
+| Decision                       | Detail                                                                                                                                                                                |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Token storage                  | Only HMAC-SHA-256 hash stored in DB (`token_hash`). Raw reset/invite tokens are never persisted and never returned by HTTP responses                                                  |
+| Token domain prefix            | `HashPasswordResetToken` prefixes `nchat-password-reset-v1:`, `HashInviteToken` prefixes `nchat-invite-v1:` — prevents cross-type hash collisions                                     |
+| Outbox payload                 | AES-256-GCM envelope only; token tables keep only `token_hash`; no plaintext token links, passwords, password hashes, access tokens, refresh tokens, or device fingerprints in outbox |
+| Anti-enumeration               | `ForgotPassword` always returns 202; unknown/locked/deleted users run dummy path                                                                                                      |
+| Generic token oracle           | Reset/accept return generic 401 for expired, used, invalid, or revoked token                                                                                                          |
+| Session revocation after reset | All user sessions and active refresh history rows revoked in same transaction                                                                                                         |
+| No auto-login                  | `AcceptInvite` creates user but no session                                                                                                                                            |
+| Admin guard                    | `AdminBootstrapGuard` is temporary; documented as not final RBAC                                                                                                                      |
+| Token logging                  | No raw token, token hash, password hash, or email body in logs/metrics/traces                                                                                                         |
 
 ---
 
@@ -544,22 +544,22 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 ### Part B — Password recovery
 
-| Test                                                                                  | Location                                 | Type            |
-| ------------------------------------------------------------------------------------- | ---------------------------------------- | --------------- |
-| Known active user creates hashed token + outbox row, returns generic 202              | `service/password_reset_service_test.go` | Service         |
-| Unknown email returns same generic response, no token created                         | `service/password_reset_service_test.go` | Service         |
-| Deleted/suspended/locked user returns same generic response                           | `service/password_reset_service_test.go` | Service         |
-| Valid token: updates Argon2id hash, marks `used_at`, revokes sessions + token history | `storage/password_reset_store_test.go`   | Store (pgxmock) |
-| Expired token rejected with `ErrInvalidToken`                                         | `storage/password_reset_store_test.go`   | Store (pgxmock) |
-| Used token rejected                                                                   | `storage/password_reset_store_test.go`   | Store (pgxmock) |
-| Unknown token rejected                                                                | `storage/password_reset_store_test.go`   | Store (pgxmock) |
-| Weak password rejected with `ErrPasswordPolicy`                                       | `service/password_reset_service_test.go` | Service         |
-| Token hash stored ≠ raw token (hash does not contain raw)                             | `service/token_service_test.go`          | Unit            |
-| Outbox row does not contain raw token, token hash, or link (metadata-only)            | `storage/password_reset_store_test.go`   | Store           |
-| POST /auth/password/reset body > 4 KiB → 413                                          | `http/password_handler_test.go`          | Handler         |
-| POST /auth/password/forgot body > 4 KiB → 413                                         | `http/password_handler_test.go`          | Handler         |
-| Rate limit exceeded → 429                                                             | `http/password_handler_test.go`          | Handler         |
-| HTTP response never contains token_hash or password_hash                              | `http/password_handler_test.go`          | Handler         |
+| Test                                                                                                         | Location                                 | Type            |
+| ------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | --------------- |
+| Known active user creates hashed token + outbox row, returns generic 202                                     | `service/password_reset_service_test.go` | Service         |
+| Unknown email returns same generic response, no token created                                                | `service/password_reset_service_test.go` | Service         |
+| Deleted/suspended/locked user returns same generic response                                                  | `service/password_reset_service_test.go` | Service         |
+| Valid token: updates Argon2id hash, marks `used_at`, revokes sessions + token history                        | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Expired token rejected with `ErrInvalidToken`                                                                | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Used token rejected                                                                                          | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Unknown token rejected                                                                                       | `storage/password_reset_store_test.go`   | Store (pgxmock) |
+| Weak password rejected with `ErrPasswordPolicy`                                                              | `service/password_reset_service_test.go` | Service         |
+| Token hash stored ≠ raw token (hash does not contain raw)                                                    | `service/token_service_test.go`          | Unit            |
+| Outbox envelope does not contain raw token or full token link, and decrypts to expected token under test key | `storage/password_reset_store_test.go`   | Store           |
+| POST /auth/password/reset body > 4 KiB → 413                                                                 | `http/password_handler_test.go`          | Handler         |
+| POST /auth/password/forgot body > 4 KiB → 413                                                                | `http/password_handler_test.go`          | Handler         |
+| Rate limit exceeded → 429                                                                                    | `http/password_handler_test.go`          | Handler         |
+| HTTP response never contains token_hash or password_hash                                                     | `http/password_handler_test.go`          | Handler         |
 
 ### Part C — Invites
 
@@ -625,9 +625,9 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 ## Known Limitations
 
-1. **Email delivery not implemented.** The `email_outbox` table is a metadata-only handoff boundary. No worker reads it in this PR. Actual email delivery requires a separate worker or notification-service integration that can safely obtain or generate a delivery link without plaintext token persistence in the database.
+1. **Email delivery not implemented.** The `email_outbox` table stores encrypted token handoff payloads, but no SMTP provider or notification worker reads it in this PR. A future worker can decrypt the envelope, build the user-facing link, and send the message.
 
-2. **Email links not generated or stored.** Because we deliberately chose Option B (metadata-only outbox), the email worker cannot build the reset/invite link from the outbox row alone. A follow-up email/notification task must choose a safe delivery strategy, such as generating the link in the same trusted boundary, using encrypted payloads with explicit key management, or direct notification-service handoff that avoids plaintext token persistence.
+2. **Email outbox key rotation not implemented.** The envelope records `key_version: v1`, but multiple-key rotation/decryption policy is future work.
 
 3. **Rate limiting is per-process, in-memory.** Does not protect multi-replica deployments. Production deployments behind a gateway should apply cluster-scoped rate limiting.
 

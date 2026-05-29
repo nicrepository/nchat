@@ -63,7 +63,7 @@ func (s *PGXPasswordResetStore) GetActiveUserForPasswordReset(ctx context.Contex
 	return userID, true, nil
 }
 
-func (s *PGXPasswordResetStore) CreatePasswordResetToken(ctx context.Context, userID, email, tokenHash string, expiresAt time.Time) error {
+func (s *PGXPasswordResetStore) CreatePasswordResetToken(ctx context.Context, userID, email, tokenHash string, expiresAt time.Time, encryptedPayload string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -115,8 +115,8 @@ func (s *PGXPasswordResetStore) CreatePasswordResetToken(ctx context.Context, us
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO auth.email_outbox
 		  (kind, to_email, subject, template_key, reset_token_id, user_id, payload)
-		VALUES ('password_reset', $1, 'Reset your NChat password', 'auth.password_reset', $2, $3, '{}'::jsonb)`,
-		email, resetTokenID, userID,
+		VALUES ('password_reset', $1, 'Reset your NChat password', 'auth.password_reset', $2, $3, $4::jsonb)`,
+		email, resetTokenID, userID, encryptedPayload,
 	); err != nil {
 		return fmt.Errorf("insert password reset outbox: %w", err)
 	}
@@ -139,10 +139,14 @@ func (s *PGXPasswordResetStore) ResetPasswordTx(ctx context.Context, tokenHash, 
 	var used bool
 	var expiresAt time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT id, user_id, used_at IS NOT NULL, expires_at
-		FROM auth.password_reset_tokens
-		WHERE token_hash = $1
-		FOR UPDATE`,
+		SELECT t.id, t.user_id, t.used_at IS NOT NULL, t.expires_at
+		FROM auth.password_reset_tokens AS t
+		JOIN auth.users AS u ON u.id = t.user_id
+		WHERE t.token_hash = $1
+		  AND u.status = 'active'
+		  AND u.deleted_at IS NULL
+		  AND u.auth_source = 'manual'
+		FOR UPDATE OF t`,
 		tokenHash,
 	).Scan(&tokenID, &userID, &used, &expiresAt)
 	if err != nil {

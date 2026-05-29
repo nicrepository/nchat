@@ -9,14 +9,17 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
-const defaultInviteTokenTTLHours = 72
+const (
+	defaultInviteTokenTTLHours = 72
+	inviteAcceptActionPath     = "/auth/invites/accept"
+)
 
 // InviteStore persists invite state without receiving plaintext invite tokens or passwords.
 type InviteStore interface {
 	UserExistsByEmail(ctx context.Context, email string) (bool, error)
 	ActiveInviteExistsByEmail(ctx context.Context, email string) (bool, error)
 	GetPolicySettings(ctx context.Context) (domain.PolicySettings, error)
-	CreateInvite(ctx context.Context, email, displayName, fullName, tokenHash string, expiresAt time.Time) (domain.InviteResult, error)
+	CreateInvite(ctx context.Context, email, displayName, fullName, tokenHash string, expiresAt time.Time, encryptedPayload string) (domain.InviteResult, error)
 	AcceptInviteTx(ctx context.Context, tokenHash, displayName, fullName, passwordHash string) (domain.AcceptInviteResult, error)
 }
 
@@ -26,17 +29,38 @@ type InviteManager interface {
 	AcceptInvite(ctx context.Context, input domain.AcceptInviteInput) (domain.AcceptInviteResult, error)
 }
 
-// InviteService implements admin invite creation and public invite acceptance.
-type InviteService struct {
-	tokens *TokenManager
-	store  InviteStore
+type InviteOption func(*InviteService)
+
+func WithInviteOutboxEncryptor(encryptor *EmailOutboxEncryptor) InviteOption {
+	return func(s *InviteService) {
+		s.emailOutbox = encryptor
+	}
 }
 
-func NewInviteService(tokens *TokenManager, store InviteStore) *InviteService {
-	return &InviteService{tokens: tokens, store: store}
+// InviteService implements admin invite creation and public invite acceptance.
+type InviteService struct {
+	tokens      *TokenManager
+	store       InviteStore
+	emailOutbox *EmailOutboxEncryptor
+}
+
+func NewInviteService(tokens *TokenManager, store InviteStore, opts ...InviteOption) *InviteService {
+	svc := &InviteService{tokens: tokens, store: store}
+	for _, opt := range opts {
+		opt(svc)
+	}
+	return svc
+}
+
+func (s *InviteService) EmailHandoffAvailable() bool {
+	return s != nil && s.emailOutbox != nil
 }
 
 func (s *InviteService) CreateInvite(ctx context.Context, input domain.AdminInviteInput) (domain.InviteResult, error) {
+	if s.emailOutbox == nil {
+		return domain.InviteResult{}, domain.ErrEmailOutboxUnavailable
+	}
+
 	email := domain.NormalizeEmail(input.Email)
 	displayName := strings.TrimSpace(input.DisplayName)
 	fullName := strings.TrimSpace(input.FullName)
@@ -79,8 +103,18 @@ func (s *InviteService) CreateInvite(ctx context.Context, input domain.AdminInvi
 	}
 	tokenHash := s.tokens.HashInviteToken(rawToken)
 	expiresAt := time.Now().UTC().Add(time.Duration(inviteTTLHours) * time.Hour)
+	encryptedPayload, err := s.emailOutbox.Encrypt(EmailOutboxPlaintext{
+		Kind:       "invite",
+		Token:      rawToken,
+		ActionPath: inviteAcceptActionPath,
+		ToEmail:    email,
+		ExpiresAt:  expiresAt,
+	})
+	if err != nil {
+		return domain.InviteResult{}, fmt.Errorf("encrypt invite outbox payload: %w", err)
+	}
 
-	return s.store.CreateInvite(ctx, email, displayName, fullName, tokenHash, expiresAt)
+	return s.store.CreateInvite(ctx, email, displayName, fullName, tokenHash, expiresAt, encryptedPayload)
 }
 
 func (s *InviteService) AcceptInvite(ctx context.Context, input domain.AcceptInviteInput) (domain.AcceptInviteResult, error) {

@@ -109,6 +109,20 @@ As imagens sao placeholders versionados. Dockerfiles reais, build e push de imag
 
 `base/secrets.example.yaml` e apenas modelo com chaves vazias e nao entra no `base/kustomization.yaml`. Nao aplique esse arquivo em producao. Secrets reais devem ficar fora do repositorio. Para o MVP, secrets versionados devem ser gerados como SealedSecrets com escopo `strict`; External Secrets fica fora desta tarefa.
 
+### Auth trusted proxy and email handoff secrets
+
+For auth-service behind Traefik, set `AUTH_TRUSTED_PROXY_CIDRS` to the Traefik
+pod/source CIDR so public auth rate limiters can safely use validated
+`X-Forwarded-For` or `X-Real-IP`. Empty keeps the safe default: ignore forwarded
+headers and use `RemoteAddr`. The k3s-dev overlay uses the common local k3s pod
+CIDR `10.42.0.0/16`; replace it if your cluster differs.
+
+`AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` is a secret, not ConfigMap data. Provide it
+through `nchat-secrets` or SealedSecrets as standard base64 that decodes to
+exactly 32 bytes, for example `openssl rand -base64 32`. It enables encrypted
+password reset and invite token handoff rows; SMTP/notification workers remain
+out of scope for these manifests.
+
 ## Seguranca inicial
 
 - `runAsNonRoot: true` nos Pods.

@@ -552,3 +552,216 @@ func TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr(t *testing.T) {
 	router.ServeHTTP(second, secondReq)
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
 }
+
+type routerPasswordRecoveryStub struct {
+	forgotCalls int
+	resetCalls  int
+}
+
+func (s *routerPasswordRecoveryStub) ForgotPassword(_ context.Context, _ domain.ForgotPasswordInput) error {
+	s.forgotCalls++
+	return nil
+}
+
+func (s *routerPasswordRecoveryStub) ResetPassword(_ context.Context, _ domain.ResetPasswordInput) error {
+	s.resetCalls++
+	return nil
+}
+
+type routerInviteStub struct {
+	acceptCalls int
+}
+
+func (s *routerInviteStub) CreateInvite(_ context.Context, _ domain.AdminInviteInput) (domain.InviteResult, error) {
+	return domain.InviteResult{}, nil
+}
+
+func (s *routerInviteStub) AcceptInvite(_ context.Context, _ domain.AcceptInviteInput) (domain.AcceptInviteResult, error) {
+	s.acceptCalls++
+	return domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", CreatedAt: time.Now()}, nil
+}
+
+type unavailableRouterPasswordRecoveryStub struct{}
+
+func (unavailableRouterPasswordRecoveryStub) EmailHandoffAvailable() bool {
+	return false
+}
+
+func (unavailableRouterPasswordRecoveryStub) ForgotPassword(context.Context, domain.ForgotPasswordInput) error {
+	return domain.ErrEmailOutboxUnavailable
+}
+
+func (unavailableRouterPasswordRecoveryStub) ResetPassword(context.Context, domain.ResetPasswordInput) error {
+	return nil
+}
+
+func TestForgotPasswordMissingOutboxKeyReturns503BeforeRateLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, unavailableRouterPasswordRecoveryStub{}, nil)
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"user@example.com"}`))
+		req.RemoteAddr = "203.0.113.151:1000"
+		router.ServeHTTP(rec, req)
+		assertJSONResponse(t, rec, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRecoveryRateLimiterForgotPerEmailLimitTriggers429(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"USER@example.com"}`))
+	firstReq.RemoteAddr = "203.0.113.101:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("expected first forgot request 202, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":" user@example.com "}`))
+	secondReq.RemoteAddr = "203.0.113.102:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), "user@example.com") {
+		t.Fatalf("rate limit response must not include target email: %s", second.Body.String())
+	}
+	if passwords.forgotCalls != 1 {
+		t.Fatalf("expected target limiter to block before second service call, got %d calls", passwords.forgotCalls)
+	}
+}
+
+func TestRecoveryRateLimiterResetPerTokenLimitTriggers429(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+	token := strings.Repeat("a", 43)
+	body := `{"token":"` + token + `","new_password":"StrongPassword@123"}`
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(body))
+	firstReq.RemoteAddr = "203.0.113.111:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("expected first reset request 204, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(body))
+	secondReq.RemoteAddr = "203.0.113.112:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), token) {
+		t.Fatalf("rate limit response must not include token: %s", second.Body.String())
+	}
+	if passwords.resetCalls != 1 {
+		t.Fatalf("expected target limiter to block before second service call, got %d calls", passwords.resetCalls)
+	}
+}
+
+func TestRecoveryRateLimiterInviteAcceptPerTokenLimitTriggers429(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	invites := &routerInviteStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, invites)
+	token := strings.Repeat("b", 43)
+	body := `{"token":"` + token + `","display_name":"User","password":"StrongPassword@123"}`
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthInvitesAccept, strings.NewReader(body))
+	firstReq.RemoteAddr = "203.0.113.121:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected first invite accept request 201, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthInvitesAccept, strings.NewReader(body))
+	secondReq.RemoteAddr = "203.0.113.122:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), token) {
+		t.Fatalf("rate limit response must not include token: %s", second.Body.String())
+	}
+	if invites.acceptCalls != 1 {
+		t.Fatalf("expected target limiter to block before second service call, got %d calls", invites.acceptCalls)
+	}
+}
+
+func TestRecoveryRateLimiterEndpointBucketsDoNotBlockEachOther(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	invites := &routerInviteStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, invites)
+	remoteAddr := "203.0.113.131:1000"
+
+	forgot := httptest.NewRecorder()
+	forgotReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"one@example.com"}`))
+	forgotReq.RemoteAddr = remoteAddr
+	router.ServeHTTP(forgot, forgotReq)
+	if forgot.Code != http.StatusAccepted {
+		t.Fatalf("expected forgot request 202, got %d body=%s", forgot.Code, forgot.Body.String())
+	}
+
+	reset := httptest.NewRecorder()
+	resetReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"`+strings.Repeat("c", 43)+`","new_password":"StrongPassword@123"}`))
+	resetReq.RemoteAddr = remoteAddr
+	router.ServeHTTP(reset, resetReq)
+	if reset.Code != http.StatusNoContent {
+		t.Fatalf("expected reset request 204, got %d body=%s", reset.Code, reset.Body.String())
+	}
+
+	accept := httptest.NewRecorder()
+	acceptReq := httptest.NewRequest(http.MethodPost, RouteAuthInvitesAccept, strings.NewReader(`{"token":"`+strings.Repeat("d", 43)+`","display_name":"User","password":"StrongPassword@123"}`))
+	acceptReq.RemoteAddr = remoteAddr
+	router.ServeHTTP(accept, acceptReq)
+	if accept.Code != http.StatusCreated {
+		t.Fatalf("expected invite accept request 201, got %d body=%s", accept.Code, accept.Body.String())
+	}
+}
+
+func TestRecoveryRateLimiterMalformedResetTokenUsesGenericLimiter(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"bad token","new_password":"StrongPassword@123"}`))
+	firstReq.RemoteAddr = "203.0.113.141:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("expected first malformed token to reach service without panic, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"other bad token","new_password":"StrongPassword@123"}`))
+	secondReq.RemoteAddr = "203.0.113.142:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), "bad token") {
+		t.Fatalf("rate limit response must not include malformed token: %s", second.Body.String())
+	}
+	if passwords.resetCalls != 1 {
+		t.Fatalf("expected generic malformed-token target limiter to block second service call, got %d calls", passwords.resetCalls)
+	}
+}
