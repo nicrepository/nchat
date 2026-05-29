@@ -68,6 +68,23 @@ func TestReadyzContract(t *testing.T) {
 	assertRFC3339(t, body.Data.CheckedAt)
 	assertReadinessCheck(t, body.Data.Checks, "service-bootstrap")
 	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
+	assertReadinessCheck(t, body.Data.Checks, "smtp-worker-config")
+}
+
+func TestReadyzFailsWhenSMTPWorkerIsMisconfigured(t *testing.T) {
+	cfg := testConfig()
+	cfg.SMTPWorkerEnabled = true
+	router := NewRouter(cfg, platformlog.New("notification-service", "test"))
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Status != health.StatusUnready {
+		t.Fatalf("expected unready status, got %q", body.Data.Status)
+	}
+	assertReadinessFailure(t, body.Data.Checks, "smtp-worker-config", "SMTP_HOST is required")
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
@@ -168,6 +185,23 @@ func assertReadinessCheck(t *testing.T, checks []health.CheckResult, name string
 		}
 	}
 	t.Fatalf("expected readiness check %s in %+v", name, checks)
+}
+
+func assertReadinessFailure(t *testing.T, checks []health.CheckResult, name, message string) {
+	t.Helper()
+
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != health.CheckFail {
+				t.Fatalf("expected %s to fail, got %q", name, check.Status)
+			}
+			if check.Message != message {
+				t.Fatalf("expected %s message %q, got %q", name, message, check.Message)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected readiness failure %s in %+v", name, checks)
 }
 
 func assertRFC3339(t *testing.T, value string) {

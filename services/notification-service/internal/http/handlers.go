@@ -19,7 +19,7 @@ func Healthz(cfg config.Config) http.Handler {
 
 func Readyz(cfg config.Config) http.Handler {
 	info := buildinfo.Current()
-	return health.ReadinessHandler(cfg.ServiceName, info.Version, info.Commit, readinessChecks(), readinessTimeout)
+	return health.ReadinessHandler(cfg.ServiceName, info.Version, info.Commit, readinessChecks(cfg), readinessTimeout)
 }
 
 func Version(cfg config.Config) http.Handler {
@@ -33,9 +33,22 @@ func Version(cfg config.Config) http.Handler {
 	})
 }
 
-func readinessChecks() []health.Checker {
+func readinessChecks(cfg config.Config) []health.Checker {
 	return []health.Checker{
 		health.NewStaticChecker("service-bootstrap", true, health.CheckPass, ""),
 		health.NewStaticChecker("config-loaded", true, health.CheckPass, ""),
+		smtpWorkerCheck(cfg),
 	}
+}
+
+func smtpWorkerCheck(cfg config.Config) health.Checker {
+	if !cfg.SMTPWorkerEnabled {
+		return health.NewStaticChecker("smtp-worker-config", true, health.CheckPass, "")
+	}
+
+	ready, reason := cfg.SMTPWorkerReady()
+	if !ready {
+		return health.NewStaticChecker("smtp-worker-config", true, health.CheckFail, reason)
+	}
+	return health.NewStaticChecker("smtp-worker-config", true, health.CheckPass, "")
 }

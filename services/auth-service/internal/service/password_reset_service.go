@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/emailcrypto"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
@@ -30,7 +31,7 @@ type PasswordRecoveryManager interface {
 
 type PasswordResetOption func(*PasswordResetService)
 
-func WithPasswordResetOutboxEncryptor(encryptor *EmailOutboxEncryptor) PasswordResetOption {
+func WithPasswordResetOutboxEncryptor(encryptor *emailcrypto.Encryptor) PasswordResetOption {
 	return func(s *PasswordResetService) {
 		s.emailOutbox = encryptor
 	}
@@ -48,7 +49,7 @@ func WithPasswordResetDummyWork(dummyWork func()) PasswordResetOption {
 type PasswordResetService struct {
 	tokens      *TokenManager
 	store       PasswordResetStore
-	emailOutbox *EmailOutboxEncryptor
+	emailOutbox *emailcrypto.Encryptor
 	dummyWork   func()
 }
 
@@ -102,7 +103,7 @@ func (s *PasswordResetService) ForgotPassword(ctx context.Context, input domain.
 		resetTTLMinutes = defaultPasswordResetTokenTTLMinutes
 	}
 	expiresAt := time.Now().UTC().Add(time.Duration(resetTTLMinutes) * time.Minute)
-	encryptedPayload, err := s.emailOutbox.Encrypt(EmailOutboxPlaintext{
+	encryptedPayload, err := s.emailOutbox.Encrypt(emailcrypto.Plaintext{
 		Kind:       "password_reset",
 		Token:      rawToken,
 		ActionPath: passwordResetActionPath,

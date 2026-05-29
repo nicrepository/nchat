@@ -409,15 +409,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service              | Default port | Current endpoints                                                                                                                                        |
-| -------------------- | -----------: | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept |
-| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                              |
-| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                              |
-| notification-service |         8084 | /healthz, /readyz, /version                                                                                                                              |
-| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                              |
-| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                              |
-| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                              |
+| Service              | Default port | Current endpoints                                                                                                                                                                 |
+| -------------------- | -----------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept, /auth/me/login-attempts |
+| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                                                       |
+| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                                                       |
+| notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                  |
+| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                       |
+| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                       |
+| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                                                       |
 
 ## Auth data model
 
@@ -470,11 +470,11 @@ Auth-service implements RF-46, RF-48, and RF-51:
 
 Reset and invite tokens are opaque random values. Only domain-separated HMAC-SHA-256 hashes are stored in `auth.password_reset_tokens` and `auth.user_invites`; HTTP responses never include raw tokens or token hashes.
 
-`auth.email_outbox.payload` stores only an AES-256-GCM encrypted envelope for a future worker. Token tables keep only `token_hash`; raw reset/invite tokens and full token-bearing links are not stored in plaintext. `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` has no default and must be base64 for exactly 32 bytes. Real e-mail delivery is intentionally out of scope for this PR and requires a later notification/e-mail worker to decrypt the handoff and send the message.
+`auth.email_outbox.payload` stores only an AES-256-GCM encrypted envelope. The `notification-service` SMTP worker decrypts the handoff in-memory to construct and send emails. Token tables keep only `token_hash`; raw reset/invite tokens and full token-bearing links are not stored in plaintext. `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` has no default and must be base64 for exactly 32 bytes. SMTP delivery is opt-in via `SMTP_WORKER_ENABLED=true` in notification-service.
 
 - Runbook: [docs/runbooks/task-auth-session-recovery-invites.md](docs/runbooks/task-auth-session-recovery-invites.md)
 - Migration: `migrations/auth/000004_auth_session_recovery_invites.{up,down}.sql`
-- Out of scope: frontend screens, SMTP provider, notification-service worker, OAuth/OIDC, final RBAC, auto-login after reset/invite acceptance
+- Out of scope: frontend screens, OAuth/OIDC, final RBAC, auto-login after reset/invite acceptance
 
 ## JWT access and refresh tokens
 
@@ -491,6 +491,27 @@ refresh token stored as an HMAC-SHA-256 hash in `auth.user_sessions` and
 - Secret: `AUTH_JWT_HMAC_SECRET` is required, has no default, and must be at least 32 bytes
 - Runbook: [docs/runbooks/task-jwt-access-refresh.md](docs/runbooks/task-jwt-access-refresh.md)
 - Out of scope: OAuth/OIDC, RBAC, and frontend auth flows
+
+## SMTP delivery, brute-force hardening, and login audit
+
+Auth-service implements RF-49 (complete), RF-50 (complete), and begins RF-35/RNF-25 (foundation):
+
+- **RF-35/RNF-25**: `notification-service` SMTP worker decrypts `auth.email_outbox` rows and
+  delivers password reset and invite emails via SMTP. Opt-in: `SMTP_WORKER_ENABLED=true` +
+  `SMTP_HOST`, `SMTP_FROM`, `SMTP_PASSWORD`, `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY`.
+  Local dev smoke test with [Mailpit](https://github.com/axllent/mailpit):
+  ```bash
+  docker run -d --name mailpit -p 1025:1025 -p 8025:8025 axllent/mailpit
+  ```
+- **RF-49**: Brute-force lockout is DB-resident (`auth.auth_policy_settings`). Lockout does
+  not mutate `auth.users.status`. Only `invalid_credentials` failures count — other reasons
+  (`device_revoked`, `max_devices_exceeded`) are excluded from the window count.
+- **RF-50**: `GET /auth/me/login-attempts` returns the authenticated user's own failed login
+  attempts (Bearer JWT required). IPv4 last two octets and IPv6 all-but-first group are masked.
+
+- Runbook: [docs/runbooks/task-smtp-bruteforce-login-audit.md](docs/runbooks/task-smtp-bruteforce-login-audit.md)
+- Migration: `migrations/auth/000005_smtp_worker_login_audit.{up,down}.sql`
+- Out of scope: notification preference centre, digest batching, DND/URGENT, final RBAC, frontend UI for login audit, Valkey scheduler
 
 ## Database migrations
 

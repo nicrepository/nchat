@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/auth-service/internal/http"
 )
@@ -277,7 +278,7 @@ func TestAuthLogin_SuccessReturnsTokenAndSafeUser(t *testing.T) {
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "u1", Email: "user@example.com", DisplayName: "User", MustChangePassword: true},
 	}}
-	handler := httpapi.AuthLogin(svc)
+	handler := httpapi.AuthLogin(svc, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -311,7 +312,7 @@ func TestAuthLogin_SuccessReturnsTokenAndSafeUser(t *testing.T) {
 }
 
 func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{err: domain.ErrInvalidCredentials})
+	handler := httpapi.AuthLogin(&fakeLoginService{err: domain.ErrInvalidCredentials}, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"wrong"}`))
@@ -327,7 +328,7 @@ func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {
 }
 
 func TestAuthLogin_InvalidJSONReturns400(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{})
+	handler := httpapi.AuthLogin(&fakeLoginService{}, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin, strings.NewReader(`not-json`))
 
@@ -339,7 +340,7 @@ func TestAuthLogin_InvalidJSONReturns400(t *testing.T) {
 }
 
 func TestAuthLogin_TrailingJSONReturns400(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}})
+	handler := httpapi.AuthLogin(&fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"e","password":"p"}{"extra":"junk"}`))
@@ -352,7 +353,7 @@ func TestAuthLogin_TrailingJSONReturns400(t *testing.T) {
 }
 
 func TestAuthLogin_OversizedBodyReturns413(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{})
+	handler := httpapi.AuthLogin(&fakeLoginService{}, nil)
 	rec := httptest.NewRecorder()
 	body := `{"email":"user@example.com","password":"` + strings.Repeat("a", 5000) + `"}`
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin, strings.NewReader(body))
@@ -365,7 +366,7 @@ func TestAuthLogin_OversizedBodyReturns413(t *testing.T) {
 }
 
 func TestAuthLogin_ServiceNilReturns503(t *testing.T) {
-	handler := httpapi.AuthLogin(nil)
+	handler := httpapi.AuthLogin(nil, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -385,7 +386,7 @@ func TestAuthLogin_ResponseDoesNotLeakSensitiveFields(t *testing.T) {
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "u1", Email: "user@example.com"},
 	}}
-	handler := httpapi.AuthLogin(svc)
+	handler := httpapi.AuthLogin(svc, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -400,5 +401,67 @@ func TestAuthLogin_ResponseDoesNotLeakSensitiveFields(t *testing.T) {
 		if strings.Contains(body, sensitive) {
 			t.Fatalf("response must not include %q: %s", sensitive, body)
 		}
+	}
+}
+
+func TestAuthLogin_TrustedProxy_RecordsXFFAsClientIP(t *testing.T) {
+	svc := &fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}
+	cidrs := httputil.ParseCIDRs("10.0.0.0/8")
+	handler := httpapi.AuthLogin(svc, cidrs)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
+	req.RemoteAddr = "10.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.50")
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if svc.got.IPAddress != "203.0.113.50" {
+		t.Fatalf("expected IPAddress=203.0.113.50 from X-Forwarded-For, got %q", svc.got.IPAddress)
+	}
+}
+
+func TestAuthLogin_TrustedProxy_MalformedXFF_UsesRemoteAddr(t *testing.T) {
+	svc := &fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}
+	cidrs := httputil.ParseCIDRs("10.0.0.0/8")
+	handler := httpapi.AuthLogin(svc, cidrs)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
+	req.RemoteAddr = "10.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "not-an-ip")
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if svc.got.IPAddress != "10.0.0.1" {
+		t.Fatalf("expected IPAddress=10.0.0.1 fallback to RemoteAddr, got %q", svc.got.IPAddress)
+	}
+}
+
+func TestAuthLogin_NoTrustedProxy_UsesRemoteAddr(t *testing.T) {
+	svc := &fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}
+	handler := httpapi.AuthLogin(svc, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
+	req.RemoteAddr = "203.0.113.99:5000"
+	req.Header.Set("X-Forwarded-For", "198.51.100.1")
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if svc.got.IPAddress != "203.0.113.99" {
+		t.Fatalf("expected IPAddress=203.0.113.99 (no trusted proxies), got %q", svc.got.IPAddress)
 	}
 }

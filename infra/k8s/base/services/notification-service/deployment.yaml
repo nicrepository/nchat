@@ -58,6 +58,18 @@ spec:
               value: "8084"
             - name: SERVICE_NAME
               value: notification-service
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: SMTP_PASSWORD
+                  optional: true
+            - name: AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY
+                  optional: true
           ports:
             - name: http
               containerPort: 8084

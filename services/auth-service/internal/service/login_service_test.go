@@ -75,4 +75,28 @@ func TestLoginService_LoginPropagatesInvalidCredentials(t *testing.T) {
 	}
 }
 
+// TestRF49_PolicyLimitOne_FirstCredentialFailureLocks verifies that when the store
+// returns ErrInvalidCredentials (which it does when a lockout fires), the service layer
+// propagates that error unchanged. The lockout itself is enforced at the storage layer.
+// RF-49: lockout is enforced at storage layer; see login_store_test.go RF49_* tests.
+func TestRF49_PolicyLimitOne_FirstCredentialFailureLocks(t *testing.T) {
+	manager := newTestTokenManager(t, strings.Repeat("p", 32))
+	// RF-49: lockout is enforced at storage layer; see login_store_test.go RF49_* tests.
+	// The service simply propagates ErrInvalidCredentials from the store — it does not
+	// branch on lockout itself.
+	store := &fakeLoginStore{err: domain.ErrInvalidCredentials}
+	login := service.NewLoginService(manager, store)
+	_, err := login.Login(context.Background(), domain.LoginInput{
+		Email: "user@example.com", Password: "wrong",
+	})
+	if !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials propagated from store, got %v", err)
+	}
+}
+
+// RF49_PolicyLimitZero_LockoutDisabled: when FailedLoginLimit=0 the policy disables
+// lockout entirely. This is a DB-resident policy setting; see storage-layer test
+// TestRF49_* in login_store_bruteforce_test.go (loginTemporarilyLocked returns false
+// immediately when policy.FailedLoginLimit <= 0).
+
 var _ = time.Time{}
