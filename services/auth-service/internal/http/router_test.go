@@ -17,7 +17,7 @@ import (
 )
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -46,7 +46,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -74,7 +74,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -92,7 +92,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -186,7 +186,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -201,7 +201,7 @@ func TestMetricsRouteReturns200(t *testing.T) {
 }
 
 func TestAdminUsersDisabledWithNoToken(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, RouteAdminUsers, nil))
 	// testConfig has no ADMIN_BOOTSTRAP_TOKEN => 503
@@ -211,7 +211,7 @@ func TestAdminUsersDisabledWithNoToken(t *testing.T) {
 }
 
 func TestAdminUsersMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAdminUsers, nil))
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -222,7 +222,7 @@ func TestAdminUsersMethodNotAllowed(t *testing.T) {
 type routerAuthStub struct{}
 
 func (routerAuthStub) Refresh(_ context.Context, _ string) (domain.TokenPair, error) {
-	return domain.TokenPair{AccessToken: "access-token", RefreshToken: "refresh-token", TokenType: "Bearer", ExpiresIn: 900}, nil
+	return domain.TokenPair{AccessToken: makeInternalTestOpaqueValue("router-auth-access"), RefreshToken: makeInternalTestOpaqueValue("router-auth-refresh"), TokenType: "Bearer", ExpiresIn: 900}, nil
 }
 
 func (routerAuthStub) Logout(_ context.Context, _ string) error {
@@ -233,11 +233,12 @@ func TestAuthTokenEndpointRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 2
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil)
 
+	submitted := makeInternalTestOpaqueValue("router-rate-limit-refresh")
 	for i := 0; i < 2; i++ {
 		response := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"refresh-token"}`))
+		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 		req.RemoteAddr = "203.0.113.10:12345"
 
 		router.ServeHTTP(response, req)
@@ -250,27 +251,28 @@ func TestAuthTokenEndpointRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil)
 
+	submitted := makeInternalTestOpaqueValue("router-rate-limit-secret")
 	first := httptest.NewRecorder()
-	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"secret-refresh-token"}`))
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 	firstReq.RemoteAddr = "203.0.113.20:12345"
 	router.ServeHTTP(first, firstReq)
 	assertJSONResponse(t, first, http.StatusOK)
 
 	second := httptest.NewRecorder()
-	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, strings.NewReader(`{"refresh_token":"secret-refresh-token"}`))
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 	secondReq.RemoteAddr = "203.0.113.20:12345"
 	router.ServeHTTP(second, secondReq)
 
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
-	if strings.Contains(second.Body.String(), "secret-refresh-token") {
+	if strings.Contains(second.Body.String(), submitted) {
 		t.Fatalf("rate limit response must not include refresh token: %s", second.Body.String())
 	}
 }
 
 func TestAuthRoutesMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
 
 	tests := []struct {
 		name string
@@ -293,8 +295,8 @@ type routerLoginStub struct{}
 
 func (routerLoginStub) Login(_ context.Context, _ domain.LoginInput) (domain.LoginResult, error) {
 	return domain.LoginResult{
-		AccessToken:  "access-token",
-		RefreshToken: "refresh-token",
+		AccessToken:  makeInternalTestOpaqueValue("router-login-access"),
+		RefreshToken: makeInternalTestOpaqueValue("router-login-refresh"),
 		TokenType:    "Bearer",
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "user-1", Email: "user@example.com", DisplayName: "User"},
@@ -302,7 +304,7 @@ func (routerLoginStub) Login(_ context.Context, _ domain.LoginInput) (domain.Log
 }
 
 func TestAuthLoginMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAuthLogin, nil))
 	assertJSONResponse(t, rec, http.StatusMethodNotAllowed)
@@ -312,7 +314,7 @@ func TestAuthLoginRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 2
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
@@ -327,7 +329,7 @@ func TestAuthLoginRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	first := httptest.NewRecorder()
 	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -350,7 +352,7 @@ func TestRateLimiter_NoTrustedProxy_IgnoresXForwardedFor(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "" // no trusted proxies
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	// First request from 10.0.0.1 — allowed.
 	first := httptest.NewRecorder()
@@ -377,7 +379,7 @@ func TestRateLimiter_TrustedProxy_UsesXForwardedFor(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	proxyAddr := "10.0.0.1:9999"
 
@@ -414,7 +416,7 @@ func TestRateLimiter_UntrustedRemoteAddr_IgnoresXForwardedFor(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8" // 5.5.5.5 is NOT in this range
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	// First request from 5.5.5.5 — allowed.
 	first := httptest.NewRecorder()
@@ -441,7 +443,7 @@ func TestRateLimiter_TrustedProxy_UsesXRealIPWhenXFFAbsent(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	proxyAddr := "10.0.0.5:9999"
 	clientXRI := "203.0.113.77"
@@ -479,7 +481,7 @@ func TestRateLimiter_InvalidXFF_FallsBackToRemoteAddr(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	// First request from trusted proxy — XFF is "not-an-ip", falls back to RemoteAddr "10.0.0.2".
 	first := httptest.NewRecorder()
@@ -506,7 +508,7 @@ func TestRateLimiter_MalformedXRealIP_FallsBackToRemoteAddr(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	// First request from trusted proxy — X-Real-IP is invalid, falls back to RemoteAddr "10.0.0.3".
 	first := httptest.NewRecorder()
@@ -533,7 +535,7 @@ func TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{})
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
 
 	// Trusted proxy at 10.0.0.1 with a malformed XFF (empty first element after split).
 	// clientIP() falls back to RemoteAddr = "10.0.0.1".
@@ -551,4 +553,217 @@ func TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr(t *testing.T) {
 	secondReq.Header.Set("X-Forwarded-For", ",,,")
 	router.ServeHTTP(second, secondReq)
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
+}
+
+type routerPasswordRecoveryStub struct {
+	forgotCalls int
+	resetCalls  int
+}
+
+func (s *routerPasswordRecoveryStub) ForgotPassword(_ context.Context, _ domain.ForgotPasswordInput) error {
+	s.forgotCalls++
+	return nil
+}
+
+func (s *routerPasswordRecoveryStub) ResetPassword(_ context.Context, _ domain.ResetPasswordInput) error {
+	s.resetCalls++
+	return nil
+}
+
+type routerInviteStub struct {
+	acceptCalls int
+}
+
+func (s *routerInviteStub) CreateInvite(_ context.Context, _ domain.AdminInviteInput) (domain.InviteResult, error) {
+	return domain.InviteResult{}, nil
+}
+
+func (s *routerInviteStub) AcceptInvite(_ context.Context, _ domain.AcceptInviteInput) (domain.AcceptInviteResult, error) {
+	s.acceptCalls++
+	return domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", CreatedAt: time.Now()}, nil
+}
+
+type unavailableRouterPasswordRecoveryStub struct{}
+
+func (unavailableRouterPasswordRecoveryStub) EmailHandoffAvailable() bool {
+	return false
+}
+
+func (unavailableRouterPasswordRecoveryStub) ForgotPassword(context.Context, domain.ForgotPasswordInput) error {
+	return domain.ErrEmailOutboxUnavailable
+}
+
+func (unavailableRouterPasswordRecoveryStub) ResetPassword(context.Context, domain.ResetPasswordInput) error {
+	return nil
+}
+
+func TestForgotPasswordMissingOutboxKeyReturns503BeforeRateLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, unavailableRouterPasswordRecoveryStub{}, nil)
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"user@example.com"}`))
+		req.RemoteAddr = "203.0.113.151:1000"
+		router.ServeHTTP(rec, req)
+		assertJSONResponse(t, rec, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRecoveryRateLimiterForgotPerEmailLimitTriggers429(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"USER@example.com"}`))
+	firstReq.RemoteAddr = "203.0.113.101:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("expected first forgot request 202, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":" user@example.com "}`))
+	secondReq.RemoteAddr = "203.0.113.102:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), "user@example.com") {
+		t.Fatalf("rate limit response must not include target email: %s", second.Body.String())
+	}
+	if passwords.forgotCalls != 1 {
+		t.Fatalf("expected target limiter to block before second service call, got %d calls", passwords.forgotCalls)
+	}
+}
+
+func TestRecoveryRateLimiterResetPerTokenLimitTriggers429(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+	token := strings.Repeat("a", 43)
+	body := `{"token":"` + token + `","new_password":"StrongPassword@123"}`
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(body))
+	firstReq.RemoteAddr = "203.0.113.111:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("expected first reset request 204, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(body))
+	secondReq.RemoteAddr = "203.0.113.112:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), token) {
+		t.Fatalf("rate limit response must not include token: %s", second.Body.String())
+	}
+	if passwords.resetCalls != 1 {
+		t.Fatalf("expected target limiter to block before second service call, got %d calls", passwords.resetCalls)
+	}
+}
+
+func TestRecoveryRateLimiterInviteAcceptPerTokenLimitTriggers429(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	invites := &routerInviteStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, invites)
+	token := strings.Repeat("b", 43)
+	body := `{"token":"` + token + `","display_name":"User","password":"StrongPassword@123"}`
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthInvitesAccept, strings.NewReader(body))
+	firstReq.RemoteAddr = "203.0.113.121:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected first invite accept request 201, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthInvitesAccept, strings.NewReader(body))
+	secondReq.RemoteAddr = "203.0.113.122:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), token) {
+		t.Fatalf("rate limit response must not include token: %s", second.Body.String())
+	}
+	if invites.acceptCalls != 1 {
+		t.Fatalf("expected target limiter to block before second service call, got %d calls", invites.acceptCalls)
+	}
+}
+
+func TestRecoveryRateLimiterEndpointBucketsDoNotBlockEachOther(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	invites := &routerInviteStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, invites)
+	remoteAddr := "203.0.113.131:1000"
+
+	forgot := httptest.NewRecorder()
+	forgotReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"one@example.com"}`))
+	forgotReq.RemoteAddr = remoteAddr
+	router.ServeHTTP(forgot, forgotReq)
+	if forgot.Code != http.StatusAccepted {
+		t.Fatalf("expected forgot request 202, got %d body=%s", forgot.Code, forgot.Body.String())
+	}
+
+	reset := httptest.NewRecorder()
+	resetReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"`+strings.Repeat("c", 43)+`","new_password":"StrongPassword@123"}`))
+	resetReq.RemoteAddr = remoteAddr
+	router.ServeHTTP(reset, resetReq)
+	if reset.Code != http.StatusNoContent {
+		t.Fatalf("expected reset request 204, got %d body=%s", reset.Code, reset.Body.String())
+	}
+
+	accept := httptest.NewRecorder()
+	acceptReq := httptest.NewRequest(http.MethodPost, RouteAuthInvitesAccept, strings.NewReader(`{"token":"`+strings.Repeat("d", 43)+`","display_name":"User","password":"StrongPassword@123"}`))
+	acceptReq.RemoteAddr = remoteAddr
+	router.ServeHTTP(accept, acceptReq)
+	if accept.Code != http.StatusCreated {
+		t.Fatalf("expected invite accept request 201, got %d body=%s", accept.Code, accept.Body.String())
+	}
+}
+
+func TestRecoveryRateLimiterMalformedResetTokenUsesGenericLimiter(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthTokenEndpointRateLimitPerMinute = 60
+	cfg.AuthTokenEndpointRateLimitBurst = 1
+	passwords := &routerPasswordRecoveryStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"bad token","new_password":"StrongPassword@123"}`))
+	firstReq.RemoteAddr = "203.0.113.141:1000"
+	router.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("expected first malformed token to reach service without panic, got %d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"other bad token","new_password":"StrongPassword@123"}`))
+	secondReq.RemoteAddr = "203.0.113.142:1000"
+	router.ServeHTTP(second, secondReq)
+	assertJSONResponse(t, second, http.StatusTooManyRequests)
+	if strings.Contains(second.Body.String(), "bad token") {
+		t.Fatalf("rate limit response must not include malformed token: %s", second.Body.String())
+	}
+	if passwords.resetCalls != 1 {
+		t.Fatalf("expected generic malformed value target limiter to block second service call, got %d calls", passwords.resetCalls)
+	}
 }

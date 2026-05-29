@@ -13,9 +13,12 @@ import (
 )
 
 const (
-	minJWTSecretBytes = 32
-	refreshTokenBytes = 32
-	bearerTokenType   = "Bearer"
+	minJWTSecretBytes        = 32
+	refreshTokenBytes        = 32
+	opaqueTokenBytes         = 32
+	bearerTokenType          = "Bearer"
+	passwordResetTokenPrefix = "nchat-password-reset-v1:"
+	inviteTokenPrefix        = "nchat-invite-v1:" //nolint:gosec // G101: HMAC domain-separation label, not a credential
 )
 
 // TokenConfig contains the cryptographic token settings used by auth-service.
@@ -126,6 +129,29 @@ func (m *TokenManager) GenerateRefreshToken() (string, string, time.Time, error)
 		return "", "", time.Time{}, fmt.Errorf("generate refresh token: %w", err)
 	}
 	return raw, m.HashRefreshToken(raw), time.Now().UTC().Add(m.refreshTTL), nil
+}
+
+func (m *TokenManager) GenerateOpaqueToken() (string, error) {
+	raw, err := randomOpaqueString(opaqueTokenBytes)
+	if err != nil {
+		return "", fmt.Errorf("generate opaque token: %w", err)
+	}
+	return raw, nil
+}
+
+func (m *TokenManager) HashPasswordResetToken(raw string) string {
+	return m.hashDomainToken(passwordResetTokenPrefix, raw)
+}
+
+func (m *TokenManager) HashInviteToken(raw string) string {
+	return m.hashDomainToken(inviteTokenPrefix, raw)
+}
+
+func (m *TokenManager) hashDomainToken(prefix string, raw string) string {
+	mac := hmac.New(sha256.New, m.secret)
+	_, _ = mac.Write([]byte(prefix))
+	_, _ = mac.Write([]byte(raw))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (m *TokenManager) HashRefreshToken(raw string) string {

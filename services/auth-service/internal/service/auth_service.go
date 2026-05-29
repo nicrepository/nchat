@@ -4,14 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
 // SessionStore persists refresh token state for auth.user_sessions.
 type SessionStore interface {
-	RotateRefreshToken(ctx context.Context, oldHash string, newHash string, expiresAt time.Time) (domain.Session, error)
+	RotateRefreshToken(ctx context.Context, oldHash string, newHash string) (domain.Session, error)
 	RevokeRefreshToken(ctx context.Context, hash string) error
 }
 
@@ -37,13 +36,13 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (domain.
 		return domain.TokenPair{}, fmt.Errorf("%w: refresh_token is required", domain.ErrInvalidInput)
 	}
 
-	newRefreshToken, newRefreshHash, refreshExpiresAt, err := s.tokens.GenerateRefreshToken()
+	newRefreshToken, newRefreshHash, _, err := s.tokens.GenerateRefreshToken()
 	if err != nil {
 		return domain.TokenPair{}, err
 	}
 
 	oldHash := s.tokens.HashRefreshToken(refreshToken)
-	session, err := s.store.RotateRefreshToken(ctx, oldHash, newRefreshHash, refreshExpiresAt)
+	session, err := s.store.RotateRefreshToken(ctx, oldHash, newRefreshHash)
 	if err != nil {
 		return domain.TokenPair{}, err
 	}

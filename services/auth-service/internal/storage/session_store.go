@@ -20,7 +20,7 @@ func NewPGXSessionStore(pool Pool) *PGXSessionStore {
 	return &PGXSessionStore{pool: pool}
 }
 
-func (s *PGXSessionStore) RotateRefreshToken(ctx context.Context, oldHash string, newHash string, expiresAt time.Time) (domain.Session, error) {
+func (s *PGXSessionStore) RotateRefreshToken(ctx context.Context, oldHash string, newHash string) (domain.Session, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("begin tx: %w", err)
@@ -62,6 +62,16 @@ func (s *PGXSessionStore) RotateRefreshToken(ctx context.Context, oldHash string
 		return domain.Session{}, domain.ErrInvalidRefreshToken
 	}
 
+	var idleTimeoutMinutes int
+	if err := tx.QueryRow(ctx, `
+		SELECT session_idle_timeout_minutes
+		FROM auth.auth_policy_settings
+		WHERE id = 1`,
+	).Scan(&idleTimeoutMinutes); err != nil {
+		return domain.Session{}, fmt.Errorf("get session idle timeout policy: %w", err)
+	}
+	idleExpiresAt := time.Now().UTC().Add(time.Duration(idleTimeoutMinutes) * time.Minute)
+
 	result, err := tx.Exec(ctx, `
 		UPDATE auth.refresh_token_history
 		SET status = 'rotated',
@@ -86,7 +96,7 @@ func (s *PGXSessionStore) RotateRefreshToken(ctx context.Context, oldHash string
 		WHERE id = $3
 		  AND refresh_token_hash = $4
 		  AND revoked_at IS NULL`,
-		newHash, expiresAt, session.ID, oldHash,
+		newHash, idleExpiresAt, session.ID, oldHash,
 	)
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("rotate refresh token: %w", err)

@@ -1,6 +1,10 @@
 package httpapi
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"strings"
@@ -8,11 +12,17 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
 const (
 	fallbackTokenEndpointRateLimitPerMinute = 60
 	fallbackTokenEndpointRateLimitBurst     = 10
+	defaultRateLimiterBucketTTL             = time.Hour
+	defaultRateLimiterMaxBuckets            = 10_000
+	defaultRateLimiterPruneInterval         = time.Minute
+	minRateLimitSecretBytes                 = 32
+	malformedTokenLimiterKey                = "malformed"
 )
 
 type tokenEndpointRateLimiter struct {
@@ -20,6 +30,10 @@ type tokenEndpointRateLimiter struct {
 	limitPerMinute    float64
 	burst             float64
 	now               func() time.Time
+	bucketTTL         time.Duration
+	maxBuckets        int
+	pruneInterval     time.Duration
+	lastPrunedAt      time.Time
 	buckets           map[string]*tokenBucket
 	trustedProxyCIDRs []*net.IPNet
 }
@@ -50,6 +64,9 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDR
 		limitPerMinute:    float64(limitPerMinute),
 		burst:             float64(burst),
 		now:               time.Now,
+		bucketTTL:         defaultRateLimiterBucketTTL,
+		maxBuckets:        defaultRateLimiterMaxBuckets,
+		pruneInterval:     defaultRateLimiterPruneInterval,
 		buckets:           make(map[string]*tokenBucket),
 		trustedProxyCIDRs: parseCIDRs(trustedProxyCIDRs),
 	}
@@ -58,7 +75,7 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDR
 func (l *tokenEndpointRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !l.allow(l.clientIP(r)) {
-			httputil.WriteError(w, http.StatusTooManyRequests, httputil.ErrCodeRateLimited, "rate limit exceeded")
+			writeRateLimited(w)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -126,8 +143,10 @@ func (l *tokenEndpointRateLimiter) allow(remoteAddr string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	l.pruneExpiredBucketsLocked(now, false)
 	bucket, ok := l.buckets[key]
 	if !ok {
+		l.evictBucketForCapacityLocked(now)
 		l.buckets[key] = &tokenBucket{tokens: l.burst - 1, updatedAt: now}
 		return true
 	}
@@ -147,10 +166,127 @@ func (l *tokenEndpointRateLimiter) allow(remoteAddr string) bool {
 	return true
 }
 
+func (l *tokenEndpointRateLimiter) pruneExpiredBucketsLocked(now time.Time, force bool) {
+	if l.bucketTTL <= 0 {
+		return
+	}
+	if !force && !l.lastPrunedAt.IsZero() && l.pruneInterval > 0 && now.Sub(l.lastPrunedAt) < l.pruneInterval {
+		return
+	}
+	cutoff := now.Add(-l.bucketTTL)
+	for key, bucket := range l.buckets {
+		if bucket.updatedAt.Before(cutoff) {
+			delete(l.buckets, key)
+		}
+	}
+	l.lastPrunedAt = now
+}
+
+func (l *tokenEndpointRateLimiter) evictBucketForCapacityLocked(now time.Time) {
+	if l.maxBuckets <= 0 || len(l.buckets) < l.maxBuckets {
+		return
+	}
+	l.pruneExpiredBucketsLocked(now, true)
+	for len(l.buckets) >= l.maxBuckets {
+		oldestKey := ""
+		oldestFound := false
+		var oldestAt time.Time
+		for key, bucket := range l.buckets {
+			if !oldestFound || bucket.updatedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = bucket.updatedAt
+				oldestFound = true
+			}
+		}
+		if !oldestFound {
+			return
+		}
+		delete(l.buckets, oldestKey)
+	}
+}
+
 func remoteAddrKey(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil || host == "" {
 		return remoteAddr
 	}
 	return host
+}
+
+type rateLimitKeyer struct {
+	key []byte
+}
+
+func newRateLimitKeyer(secret string) *rateLimitKeyer {
+	if len([]byte(secret)) >= minRateLimitSecretBytes {
+		return &rateLimitKeyer{key: []byte(secret)}
+	}
+	key := make([]byte, minRateLimitSecretBytes)
+	if _, err := rand.Read(key); err != nil {
+		panic("rate limiter random key unavailable")
+	}
+	return &rateLimitKeyer{key: key}
+}
+
+func (k *rateLimitKeyer) hmacKey(domainName, value string) string {
+	mac := hmac.New(sha256.New, k.key)
+	_, _ = mac.Write([]byte("nchat-rate-limit-v1:"))
+	_, _ = mac.Write([]byte(domainName))
+	_, _ = mac.Write([]byte(":"))
+	_, _ = mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+type targetAwareRateLimiter struct {
+	limiter *tokenEndpointRateLimiter
+	keyer   *rateLimitKeyer
+	domain  string
+}
+
+func newTargetAwareRateLimiter(limitPerMinute int, burst int, keyer *rateLimitKeyer, domainName string) *targetAwareRateLimiter {
+	return &targetAwareRateLimiter{
+		limiter: NewTokenEndpointRateLimiter(limitPerMinute, burst, ""),
+		keyer:   keyer,
+		domain:  domainName,
+	}
+}
+
+func (l *targetAwareRateLimiter) allowEmail(email string) bool {
+	if l == nil {
+		return true
+	}
+	normalized := domain.NormalizeEmail(email)
+	return l.limiter.allow(l.keyer.hmacKey(l.domain, normalized))
+}
+
+func (l *targetAwareRateLimiter) allowToken(token string) bool {
+	if l == nil {
+		return true
+	}
+	trimmed := strings.TrimSpace(token)
+	if !looksLikeOpaqueToken(trimmed) {
+		return l.limiter.allow(l.keyer.hmacKey(l.domain, malformedTokenLimiterKey))
+	}
+	return l.limiter.allow(l.keyer.hmacKey(l.domain, trimmed))
+}
+
+func looksLikeOpaqueToken(token string) bool {
+	if len(token) < 32 || len(token) > 128 {
+		return false
+	}
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func writeRateLimited(w http.ResponseWriter) {
+	httputil.WriteError(w, http.StatusTooManyRequests, httputil.ErrCodeRateLimited, "rate limit exceeded")
 }

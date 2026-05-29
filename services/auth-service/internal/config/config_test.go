@@ -130,6 +130,19 @@ func TestLoadAuthJWTInvalidTTLUsesDefault(t *testing.T) {
 	}
 }
 
+func TestLoadEmailOutboxEncryptionKey(t *testing.T) {
+	cfg := Load()
+	if cfg.AuthEmailOutboxEncryptionKey != "" {
+		t.Fatalf("expected empty AuthEmailOutboxEncryptionKey, got %q", cfg.AuthEmailOutboxEncryptionKey)
+	}
+
+	t.Setenv("AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY", "base64-key")
+	cfg = Load()
+	if cfg.AuthEmailOutboxEncryptionKey != "base64-key" {
+		t.Fatalf("expected email outbox key from environment, got %q", cfg.AuthEmailOutboxEncryptionKey)
+	}
+}
+
 func TestLoadAuthTokenEndpointRateLimitDefaults(t *testing.T) {
 	cfg := Load()
 

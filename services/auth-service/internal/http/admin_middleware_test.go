@@ -25,7 +25,8 @@ func TestAdminBootstrapGuard_TokenNotConfigured_Returns503(t *testing.T) {
 }
 
 func TestAdminBootstrapGuard_MissingHeader_Returns401(t *testing.T) {
-	handler := httpapi.AdminBootstrapGuard("secret-token")(okHandler)
+	credential := makeTestOpaqueValue("admin-bootstrap")
+	handler := httpapi.AdminBootstrapGuard(credential)(okHandler)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/users", nil))
 
@@ -36,10 +37,11 @@ func TestAdminBootstrapGuard_MissingHeader_Returns401(t *testing.T) {
 }
 
 func TestAdminBootstrapGuard_WrongToken_Returns401(t *testing.T) {
-	handler := httpapi.AdminBootstrapGuard("secret-token")(okHandler)
+	credential := makeTestOpaqueValue("admin-bootstrap")
+	handler := httpapi.AdminBootstrapGuard(credential)(okHandler)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/admin/users", nil)
-	req.Header.Set("X-NChat-Admin-Token", "wrong-token")
+	req.Header.Set("X-NChat-Admin-Token", makeTestOpaqueValue("admin-bootstrap-wrong"))
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
@@ -48,10 +50,11 @@ func TestAdminBootstrapGuard_WrongToken_Returns401(t *testing.T) {
 }
 
 func TestAdminBootstrapGuard_CorrectToken_Passes(t *testing.T) {
-	handler := httpapi.AdminBootstrapGuard("secret-token")(okHandler)
+	credential := makeTestOpaqueValue("admin-bootstrap")
+	handler := httpapi.AdminBootstrapGuard(credential)(okHandler)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/admin/users", nil)
-	req.Header.Set("X-NChat-Admin-Token", "secret-token")
+	req.Header.Set("X-NChat-Admin-Token", credential)
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {

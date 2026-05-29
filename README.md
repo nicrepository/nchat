@@ -409,15 +409,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service              | Default port | Current endpoints                                                     |
-| -------------------- | -----------: | --------------------------------------------------------------------- |
-| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout |
-| chat-service         |         8082 | /healthz, /readyz, /version                                           |
-| file-service         |         8083 | /healthz, /readyz, /version                                           |
-| notification-service |         8084 | /healthz, /readyz, /version                                           |
-| admin-service        |         8085 | /healthz, /readyz, /version                                           |
-| search-service       |         8086 | /healthz, /readyz, /version                                           |
-| media-service        |         8087 | /healthz, /readyz, /version                                           |
+| Service              | Default port | Current endpoints                                                                                                                                        |
+| -------------------- | -----------: | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept |
+| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                              |
+| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                              |
+| notification-service |         8084 | /healthz, /readyz, /version                                                                                                                              |
+| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                              |
+| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                              |
+| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                              |
 
 ## Auth data model
 
@@ -459,6 +459,22 @@ failed-login lockout, optionally tracks devices, and returns an access/refresh t
 - Lockout note: automatic brute-force lockout does **not** set `auth.users.status = 'locked'`. That status is reserved for a future admin lock flow.
 - Runbook: [docs/runbooks/task-email-password-login.md](docs/runbooks/task-email-password-login.md)
 - Out of scope: OAuth/OIDC, password reset, frontend auth flows, final RBAC, MFA, CAPTCHA, email verification gate, account unlock UI
+
+## Session expiry, password recovery, and invites
+
+Auth-service implements RF-46, RF-48, and RF-51:
+
+- RF-46: `POST /admin/invites` creates admin-only invites and `POST /auth/invites/accept` accepts expirable invite tokens.
+- RF-48: `POST /auth/password/forgot` and `POST /auth/password/reset` implement password recovery with expirable tokens.
+- RF-51: `POST /auth/refresh` rejects revoked, idle-expired, and absolute-expired sessions and extends only `idle_expires_at` by `session_idle_timeout_minutes` (default 60 minutes, configurable).
+
+Reset and invite tokens are opaque random values. Only domain-separated HMAC-SHA-256 hashes are stored in `auth.password_reset_tokens` and `auth.user_invites`; HTTP responses never include raw tokens or token hashes.
+
+`auth.email_outbox.payload` stores only an AES-256-GCM encrypted envelope for a future worker. Token tables keep only `token_hash`; raw reset/invite tokens and full token-bearing links are not stored in plaintext. `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` has no default and must be base64 for exactly 32 bytes. Real e-mail delivery is intentionally out of scope for this PR and requires a later notification/e-mail worker to decrypt the handoff and send the message.
+
+- Runbook: [docs/runbooks/task-auth-session-recovery-invites.md](docs/runbooks/task-auth-session-recovery-invites.md)
+- Migration: `migrations/auth/000004_auth_session_recovery_invites.{up,down}.sql`
+- Out of scope: frontend screens, SMTP provider, notification-service worker, OAuth/OIDC, final RBAC, auto-login after reset/invite acceptance
 
 ## JWT access and refresh tokens
 

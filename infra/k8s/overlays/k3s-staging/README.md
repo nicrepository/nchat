@@ -9,6 +9,11 @@ It includes:
 - TLS placeholder secret reference: `nchat-staging-tls`.
 - Traefik `TLSOption` requiring `VersionTLS13` with strict SNI.
 
+Auth-service deployment notes:
+
+- Set `AUTH_TRUSTED_PROXY_CIDRS` for the Traefik pod/source CIDR before exposing public auth recovery endpoints; forwarded headers are ignored unless `RemoteAddr` is inside that CIDR.
+- Provide `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` via Secret/SealedSecret as base64 for exactly 32 bytes. Do not store it in ConfigMap data.
+
 Limitations:
 
 - This is not production configuration.

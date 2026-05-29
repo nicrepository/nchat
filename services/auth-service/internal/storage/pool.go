@@ -11,3 +11,7 @@ type Pool interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
+
+type queryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}

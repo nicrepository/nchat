@@ -15,16 +15,18 @@ type User struct {
 }
 
 type PolicySettings struct {
-	MinPasswordLength         int
-	RequireUppercase          bool
-	RequireLowercase          bool
-	RequireNumber             bool
-	RequireSymbol             bool
-	FailedLoginLimit          int
-	FailedLoginWindowMinutes  int
-	FailedLoginLockoutMinutes int
-	SessionIdleTimeoutMinutes int
-	MaxDevicesPerUser         int
+	MinPasswordLength            int
+	RequireUppercase             bool
+	RequireLowercase             bool
+	RequireNumber                bool
+	RequireSymbol                bool
+	FailedLoginLimit             int
+	FailedLoginWindowMinutes     int
+	FailedLoginLockoutMinutes    int
+	SessionIdleTimeoutMinutes    int
+	MaxDevicesPerUser            int
+	PasswordResetTokenTTLMinutes int
+	InviteTokenTTLHours          int
 }
 
 type CreateUserInput struct {

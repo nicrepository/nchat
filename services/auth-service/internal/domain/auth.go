@@ -64,3 +64,45 @@ type CreatedLoginSession struct {
 	Session Session
 	User    LoginUser
 }
+
+// ForgotPasswordInput carries the email submitted to the enumeration-safe forgot-password endpoint.
+type ForgotPasswordInput struct {
+	Email string
+}
+
+// ResetPasswordInput carries the opaque reset token and replacement password.
+type ResetPasswordInput struct {
+	Token       string
+	NewPassword string
+}
+
+// AdminInviteInput carries admin-created email invite data.
+type AdminInviteInput struct {
+	Email       string
+	DisplayName string
+	FullName    string
+}
+
+// InviteResult is the safe invite metadata returned after admin invite creation.
+type InviteResult struct {
+	ID        string
+	Email     string
+	CreatedAt time.Time
+}
+
+// AcceptInviteInput carries the public invite acceptance payload.
+type AcceptInviteInput struct {
+	Token       string
+	DisplayName string
+	FullName    string
+	Password    string
+}
+
+// AcceptInviteResult is the safe user metadata returned after invite acceptance.
+type AcceptInviteResult struct {
+	UserID      string
+	Email       string
+	DisplayName string
+	FullName    string
+	CreatedAt   time.Time
+}

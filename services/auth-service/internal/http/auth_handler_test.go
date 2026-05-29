@@ -33,22 +33,25 @@ func (f *fakeAuthService) Logout(_ context.Context, refreshToken string) error {
 }
 
 func TestAuthRefresh_SuccessReturnsTokenResponse(t *testing.T) {
+	submitted := makeTestOpaqueValue("auth-refresh-submitted")
+	access := makeTestOpaqueValue("auth-refresh-access")
+	nextRefresh := makeTestOpaqueValue("auth-refresh-next")
 	auth := &fakeAuthService{pair: domain.TokenPair{
-		AccessToken:  "access-token",
-		RefreshToken: "new-refresh-token",
+		AccessToken:  access,
+		RefreshToken: nextRefresh,
 		TokenType:    "Bearer",
 		ExpiresIn:    900,
 	}}
 	handler := httpapi.AuthRefresh(auth)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"old-refresh-token"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if auth.refreshToken != "old-refresh-token" {
+	if auth.refreshToken != submitted {
 		t.Fatalf("expected raw refresh token passed to service, got %q", auth.refreshToken)
 	}
 	var body struct {
@@ -61,7 +64,7 @@ func TestAuthRefresh_SuccessReturnsTokenResponse(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.AccessToken != "access-token" || body.RefreshToken != "new-refresh-token" || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
+	if body.AccessToken != access || body.RefreshToken != nextRefresh || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
 		t.Fatalf("unexpected response: %+v", body)
 	}
 	if body.TokenHash != "" || strings.Contains(rec.Body.String(), "hash") {
@@ -72,7 +75,8 @@ func TestAuthRefresh_SuccessReturnsTokenResponse(t *testing.T) {
 func TestAuthRefresh_MissingSecretOrStoreReturns503(t *testing.T) {
 	handler := httpapi.AuthRefresh(nil)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"token"}`))
+	submitted := makeTestOpaqueValue("auth-refresh-unavailable")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -84,7 +88,8 @@ func TestAuthRefresh_MissingSecretOrStoreReturns503(t *testing.T) {
 func TestAuthRefresh_RevokedOrExpiredRefreshRejected(t *testing.T) {
 	handler := httpapi.AuthRefresh(&fakeAuthService{refreshErr: domain.ErrInvalidRefreshToken})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"bad-token"}`))
+	submitted := makeTestOpaqueValue("auth-refresh-invalid")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -129,7 +134,7 @@ func TestAuthRefresh_OversizedTrailingBodyReturns413(t *testing.T) {
 	auth := &fakeAuthService{pair: domain.TokenPair{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer", ExpiresIn: 900}}
 	handler := httpapi.AuthRefresh(auth)
 	rec := httptest.NewRecorder()
-	body := `{"refresh_token":"token"}` + strings.Repeat(" ", 5000)
+	body := `{"refresh_token":"` + makeTestOpaqueValue("auth-refresh-trailing") + `"}` + strings.Repeat(" ", 5000)
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(body))
 
 	handler.ServeHTTP(rec, req)
@@ -169,7 +174,8 @@ func TestAuthLogout_SuccessReturns204(t *testing.T) {
 	auth := &fakeAuthService{}
 	handler := httpapi.AuthLogout(auth)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"refresh-token"}`))
+	submitted := makeTestOpaqueValue("auth-logout-submitted")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -179,7 +185,7 @@ func TestAuthLogout_SuccessReturns204(t *testing.T) {
 	if rec.Body.Len() != 0 {
 		t.Fatalf("expected empty body, got %s", rec.Body.String())
 	}
-	if auth.logoutToken != "refresh-token" {
+	if auth.logoutToken != submitted {
 		t.Fatalf("expected raw refresh token passed to service, got %q", auth.logoutToken)
 	}
 }
@@ -187,7 +193,8 @@ func TestAuthLogout_SuccessReturns204(t *testing.T) {
 func TestAuthLogout_MissingSecretOrStoreReturns503(t *testing.T) {
 	handler := httpapi.AuthLogout(nil)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"token"}`))
+	submitted := makeTestOpaqueValue("auth-logout-unavailable")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -199,7 +206,8 @@ func TestAuthLogout_MissingSecretOrStoreReturns503(t *testing.T) {
 func TestAuthLogout_InvalidRefreshTokenReturns204(t *testing.T) {
 	handler := httpapi.AuthLogout(&fakeAuthService{logoutErr: domain.ErrInvalidRefreshToken})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"bad-token"}`))
+	submitted := makeTestOpaqueValue("auth-logout-invalid")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -214,7 +222,8 @@ func TestAuthLogout_InvalidRefreshTokenReturns204(t *testing.T) {
 func TestAuthLogout_InternalErrorReturns500(t *testing.T) {
 	handler := httpapi.AuthLogout(&fakeAuthService{logoutErr: errors.New("db down")})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"token"}`))
+	submitted := makeTestOpaqueValue("auth-logout-internal")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 
 	handler.ServeHTTP(rec, req)
 
