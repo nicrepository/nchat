@@ -270,7 +270,7 @@ func TestTokenManager_GenerateOpaqueToken(t *testing.T) {
 
 func TestTokenManager_HashesPasswordResetAndInviteTokensWithDomainSeparation(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("p", 32))
-	raw := "raw-token-value"
+	raw := makeTestOpaqueValue("domain-separated-hash-input")
 
 	resetHash := manager.HashPasswordResetToken(raw)
 	inviteHash := manager.HashInviteToken(raw)

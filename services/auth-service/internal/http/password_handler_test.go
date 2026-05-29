@@ -1,4 +1,4 @@
-//nolint:gosec // Test fixtures intentionally use example token/password strings.
+//nolint:gosec // Test fixtures intentionally use example opaque/password strings.
 package httpapi_test
 
 import (
@@ -98,14 +98,15 @@ func TestAuthResetPasswordSuccessReturns204(t *testing.T) {
 	svc := &fakePasswordRecoveryService{}
 	handler := httpapi.AuthResetPassword(svc)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"raw-reset-token","new_password":"NewStrongPassword@123"}`))
+	submitted := makeTestOpaqueValue("reset-success")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"`+submitted+`","new_password":"NewStrongPassword@123"}`))
 
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if svc.resetGot.Token != "raw-reset-token" || svc.resetGot.NewPassword != "NewStrongPassword@123" {
+	if svc.resetGot.Token != submitted || svc.resetGot.NewPassword != "NewStrongPassword@123" {
 		t.Fatalf("unexpected service input: %+v", svc.resetGot)
 	}
 }
@@ -113,7 +114,8 @@ func TestAuthResetPasswordSuccessReturns204(t *testing.T) {
 func TestAuthResetPasswordInvalidTokenReturnsGeneric401(t *testing.T) {
 	handler := httpapi.AuthResetPassword(&fakePasswordRecoveryService{resetErr: domain.ErrInvalidToken})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"bad-token","new_password":"NewStrongPassword@123"}`))
+	submitted := makeTestOpaqueValue("reset-invalid")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"`+submitted+`","new_password":"NewStrongPassword@123"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -121,7 +123,7 @@ func TestAuthResetPasswordInvalidTokenReturnsGeneric401(t *testing.T) {
 		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "invalid_token") || strings.Contains(body, "bad-token") {
+	if !strings.Contains(body, "invalid_token") || strings.Contains(body, submitted) {
 		t.Fatalf("expected generic invalid token response without raw token, got %s", body)
 	}
 }
@@ -129,7 +131,8 @@ func TestAuthResetPasswordInvalidTokenReturnsGeneric401(t *testing.T) {
 func TestAuthResetPasswordWeakPasswordReturns400(t *testing.T) {
 	handler := httpapi.AuthResetPassword(&fakePasswordRecoveryService{resetErr: domain.ErrPasswordPolicy})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"raw-reset-token","new_password":"weak"}`))
+	submitted := makeTestOpaqueValue("reset-weak-password")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"`+submitted+`","new_password":"weak"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -181,7 +184,8 @@ func TestAuthPasswordRecoveryUnavailableReturns503(t *testing.T) {
 func TestAuthPasswordRecoveryInternalErrorReturns500(t *testing.T) {
 	handler := httpapi.AuthResetPassword(&fakePasswordRecoveryService{resetErr: errors.New("db down")})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"raw-reset-token","new_password":"NewStrongPassword@123"}`))
+	submitted := makeTestOpaqueValue("reset-internal")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordReset, strings.NewReader(`{"token":"`+submitted+`","new_password":"NewStrongPassword@123"}`))
 
 	handler.ServeHTTP(rec, req)
 

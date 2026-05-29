@@ -1,4 +1,4 @@
-//nolint:gosec // Test fixtures intentionally use example token/password strings.
+//nolint:gosec // Test fixtures intentionally use example opaque/password strings.
 package service_test
 
 import (
@@ -172,15 +172,16 @@ func TestInviteService_AcceptInviteHashesTokenAndPassword(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("z", 32))
 	store := &fakeInviteStore{policy: defaultPolicy(), acceptResult: domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", CreatedAt: time.Now()}}
 	svc := service.NewInviteService(manager, store)
+	submitted := makeTestOpaqueValue("invite-service-valid")
 
-	result, err := svc.AcceptInvite(context.Background(), domain.AcceptInviteInput{Token: "raw-invite-token", DisplayName: " User ", FullName: " User Full ", Password: "StrongPassword@123"})
+	result, err := svc.AcceptInvite(context.Background(), domain.AcceptInviteInput{Token: submitted, DisplayName: " User ", FullName: " User Full ", Password: "StrongPassword@123"})
 	if err != nil {
 		t.Fatalf("AcceptInvite: %v", err)
 	}
 	if result.UserID != "user-1" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
-	if store.acceptTokenHash == "" || store.acceptTokenHash == "raw-invite-token" || strings.Contains(store.acceptTokenHash, "raw-invite-token") {
+	if store.acceptTokenHash == "" || store.acceptTokenHash == submitted || strings.Contains(store.acceptTokenHash, submitted) {
 		t.Fatalf("expected hashed invite token, got %q", store.acceptTokenHash)
 	}
 	if !strings.HasPrefix(store.acceptPasswordHash, "$argon2id$") || strings.Contains(store.acceptPasswordHash, "StrongPassword") {
@@ -195,8 +196,9 @@ func TestInviteService_AcceptInviteWeakPasswordRejected(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("a1", 16))
 	store := &fakeInviteStore{policy: defaultPolicy()}
 	svc := service.NewInviteService(manager, store)
+	submitted := makeTestOpaqueValue("invite-service-weak-password")
 
-	_, err := svc.AcceptInvite(context.Background(), domain.AcceptInviteInput{Token: "raw-invite-token", DisplayName: "User", Password: "weak"})
+	_, err := svc.AcceptInvite(context.Background(), domain.AcceptInviteInput{Token: submitted, DisplayName: "User", Password: "weak"})
 	if !errors.Is(err, domain.ErrPasswordPolicy) {
 		t.Fatalf("expected ErrPasswordPolicy, got %v", err)
 	}

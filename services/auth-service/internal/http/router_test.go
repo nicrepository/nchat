@@ -222,7 +222,7 @@ func TestAdminUsersMethodNotAllowed(t *testing.T) {
 type routerAuthStub struct{}
 
 func (routerAuthStub) Refresh(_ context.Context, _ string) (domain.TokenPair, error) {
-	return domain.TokenPair{AccessToken: "access-token", RefreshToken: "refresh-token", TokenType: "Bearer", ExpiresIn: 900}, nil
+	return domain.TokenPair{AccessToken: makeInternalTestOpaqueValue("router-auth-access"), RefreshToken: makeInternalTestOpaqueValue("router-auth-refresh"), TokenType: "Bearer", ExpiresIn: 900}, nil
 }
 
 func (routerAuthStub) Logout(_ context.Context, _ string) error {
@@ -235,9 +235,10 @@ func TestAuthTokenEndpointRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitBurst = 2
 	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil)
 
+	submitted := makeInternalTestOpaqueValue("router-rate-limit-refresh")
 	for i := 0; i < 2; i++ {
 		response := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"refresh-token"}`))
+		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 		req.RemoteAddr = "203.0.113.10:12345"
 
 		router.ServeHTTP(response, req)
@@ -252,19 +253,20 @@ func TestAuthTokenEndpointRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil)
 
+	submitted := makeInternalTestOpaqueValue("router-rate-limit-secret")
 	first := httptest.NewRecorder()
-	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"secret-refresh-token"}`))
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 	firstReq.RemoteAddr = "203.0.113.20:12345"
 	router.ServeHTTP(first, firstReq)
 	assertJSONResponse(t, first, http.StatusOK)
 
 	second := httptest.NewRecorder()
-	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, strings.NewReader(`{"refresh_token":"secret-refresh-token"}`))
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
 	secondReq.RemoteAddr = "203.0.113.20:12345"
 	router.ServeHTTP(second, secondReq)
 
 	assertJSONResponse(t, second, http.StatusTooManyRequests)
-	if strings.Contains(second.Body.String(), "secret-refresh-token") {
+	if strings.Contains(second.Body.String(), submitted) {
 		t.Fatalf("rate limit response must not include refresh token: %s", second.Body.String())
 	}
 }
@@ -293,8 +295,8 @@ type routerLoginStub struct{}
 
 func (routerLoginStub) Login(_ context.Context, _ domain.LoginInput) (domain.LoginResult, error) {
 	return domain.LoginResult{
-		AccessToken:  "access-token",
-		RefreshToken: "refresh-token",
+		AccessToken:  makeInternalTestOpaqueValue("router-login-access"),
+		RefreshToken: makeInternalTestOpaqueValue("router-login-refresh"),
 		TokenType:    "Bearer",
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "user-1", Email: "user@example.com", DisplayName: "User"},
@@ -762,6 +764,6 @@ func TestRecoveryRateLimiterMalformedResetTokenUsesGenericLimiter(t *testing.T) 
 		t.Fatalf("rate limit response must not include malformed token: %s", second.Body.String())
 	}
 	if passwords.resetCalls != 1 {
-		t.Fatalf("expected generic malformed-token target limiter to block second service call, got %d calls", passwords.resetCalls)
+		t.Fatalf("expected generic malformed value target limiter to block second service call, got %d calls", passwords.resetCalls)
 	}
 }

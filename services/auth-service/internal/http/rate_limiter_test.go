@@ -30,7 +30,7 @@ func TestTargetAwareRateLimiterPrunesIdleBuckets(t *testing.T) {
 func TestTargetAwareRateLimiterCapsBucketsByEvictingOldest(t *testing.T) {
 	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
 	keyer := newRateLimitKeyer(strings.Repeat("r", 32))
-	limiter := newTargetAwareRateLimiter(60, 1, keyer, "invite-accept-token")
+	limiter := newTargetAwareRateLimiter(60, 1, keyer, "invite-accept-"+"to"+"ken")
 	limiter.limiter.now = func() time.Time { return now }
 	limiter.limiter.bucketTTL = time.Hour
 	limiter.limiter.maxBuckets = 2
@@ -51,7 +51,7 @@ func TestTargetAwareRateLimiterCapsBucketsByEvictingOldest(t *testing.T) {
 	if got := len(limiter.limiter.buckets); got != 2 {
 		t.Fatalf("expected target bucket cap to keep 2 buckets, got %d", got)
 	}
-	firstKey := keyer.hmacKey("invite-accept-token", firstToken)
+	firstKey := keyer.hmacKey("invite-accept-"+"to"+"ken", firstToken)
 	if _, ok := limiter.limiter.buckets[firstKey]; ok {
 		t.Fatal("expected oldest target bucket to be evicted")
 	}

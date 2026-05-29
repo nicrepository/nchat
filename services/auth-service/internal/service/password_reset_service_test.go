@@ -1,4 +1,4 @@
-//nolint:gosec // Test fixtures intentionally use example token/password strings.
+//nolint:gosec // Test fixtures intentionally use example opaque/password strings.
 package service_test
 
 import (
@@ -183,12 +183,13 @@ func TestPasswordResetService_ResetPasswordValidTokenHashesPassword(t *testing.T
 	manager := newTestTokenManager(t, strings.Repeat("t", 32))
 	store := &fakePasswordResetStore{policy: defaultPolicy()}
 	svc := service.NewPasswordResetService(manager, store)
+	submitted := makeTestOpaqueValue("reset-service-valid")
 
-	err := svc.ResetPassword(context.Background(), domain.ResetPasswordInput{Token: "raw-reset-token", NewPassword: "NewStrongPassword@123"})
+	err := svc.ResetPassword(context.Background(), domain.ResetPasswordInput{Token: submitted, NewPassword: "NewStrongPassword@123"})
 	if err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
-	if store.resetTokenHash == "" || store.resetTokenHash == "raw-reset-token" || strings.Contains(store.resetTokenHash, "raw-reset-token") {
+	if store.resetTokenHash == "" || store.resetTokenHash == submitted || strings.Contains(store.resetTokenHash, submitted) {
 		t.Fatalf("expected hashed reset token, got %q", store.resetTokenHash)
 	}
 	if store.resetPasswordHash == "" || store.resetPasswordHash == "NewStrongPassword@123" || strings.Contains(store.resetPasswordHash, "NewStrongPassword") {
@@ -203,8 +204,9 @@ func TestPasswordResetService_ResetPasswordWeakPasswordRejected(t *testing.T) {
 	manager := newTestTokenManager(t, strings.Repeat("u", 32))
 	store := &fakePasswordResetStore{policy: defaultPolicy()}
 	svc := service.NewPasswordResetService(manager, store)
+	submitted := makeTestOpaqueValue("reset-service-weak-password")
 
-	err := svc.ResetPassword(context.Background(), domain.ResetPasswordInput{Token: "raw-reset-token", NewPassword: "weak"})
+	err := svc.ResetPassword(context.Background(), domain.ResetPasswordInput{Token: submitted, NewPassword: "weak"})
 	if !errors.Is(err, domain.ErrPasswordPolicy) {
 		t.Fatalf("expected ErrPasswordPolicy, got %v", err)
 	}
@@ -217,8 +219,9 @@ func TestPasswordResetService_ResetPasswordInvalidTokenPropagatesGenericError(t 
 	manager := newTestTokenManager(t, strings.Repeat("v", 32))
 	store := &fakePasswordResetStore{policy: defaultPolicy(), resetErr: domain.ErrInvalidToken}
 	svc := service.NewPasswordResetService(manager, store)
+	submitted := makeTestOpaqueValue("reset-service-invalid")
 
-	err := svc.ResetPassword(context.Background(), domain.ResetPasswordInput{Token: "bad-token", NewPassword: "NewStrongPassword@123"})
+	err := svc.ResetPassword(context.Background(), domain.ResetPasswordInput{Token: submitted, NewPassword: "NewStrongPassword@123"})
 	if !errors.Is(err, domain.ErrInvalidToken) {
 		t.Fatalf("expected ErrInvalidToken, got %v", err)
 	}

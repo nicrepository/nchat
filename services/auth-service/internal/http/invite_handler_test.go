@@ -1,4 +1,4 @@
-//nolint:gosec // Test fixtures intentionally use example token/password strings.
+//nolint:gosec // Test fixtures intentionally use example opaque/password strings.
 package httpapi_test
 
 import (
@@ -90,11 +90,11 @@ func TestAdminCreateInviteGuardRejectsMissingOrWrongToken(t *testing.T) {
 		t.Fatalf("expected 503 with empty ADMIN_BOOTSTRAP_TOKEN, got %d", rec.Code)
 	}
 
-	cfg.AdminBootstrapToken = "expected-token"
+	cfg.AdminBootstrapToken = "expected-credential"
 	router = httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{})
 	rec = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
-	req.Header.Set("X-NChat-Admin-Token", "wrong-token")
+	req.Header.Set("X-NChat-Admin-Token", "wrong-credential")
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with wrong admin token, got %d", rec.Code)
@@ -105,18 +105,19 @@ func TestAuthAcceptInviteSuccessReturnsSafeUserSummary(t *testing.T) {
 	svc := &fakeInviteManager{acceptResult: domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", FullName: "User Full", CreatedAt: time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)}}
 	handler := httpapi.AuthAcceptInvite(svc)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"raw-invite-token","display_name":"User","full_name":"User Full","password":"StrongPassword@123"}`))
+	submitted := makeTestOpaqueValue("invite-success")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"`+submitted+`","display_name":"User","full_name":"User Full","password":"StrongPassword@123"}`))
 
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if svc.acceptGot.Token != "raw-invite-token" || svc.acceptGot.Password != "StrongPassword@123" {
+	if svc.acceptGot.Token != submitted || svc.acceptGot.Password != "StrongPassword@123" {
 		t.Fatalf("unexpected service input: %+v", svc.acceptGot)
 	}
 	body := rec.Body.String()
-	if strings.Contains(body, "raw-invite-token") || strings.Contains(body, "password") || strings.Contains(body, "hash") || strings.Contains(body, "access_token") || strings.Contains(body, "refresh_token") {
+	if strings.Contains(body, submitted) || strings.Contains(body, "password") || strings.Contains(body, "hash") || strings.Contains(body, "access_token") || strings.Contains(body, "refresh_token") {
 		t.Fatalf("accept response must not expose secrets or session tokens: %s", body)
 	}
 }
@@ -124,14 +125,15 @@ func TestAuthAcceptInviteSuccessReturnsSafeUserSummary(t *testing.T) {
 func TestAuthAcceptInviteInvalidTokenReturnsGeneric401(t *testing.T) {
 	handler := httpapi.AuthAcceptInvite(&fakeInviteManager{acceptErr: domain.ErrInvalidToken})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"bad-token","display_name":"User","password":"StrongPassword@123"}`))
+	submitted := makeTestOpaqueValue("invite-invalid")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"`+submitted+`","display_name":"User","password":"StrongPassword@123"}`))
 
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "bad-token") {
+	if strings.Contains(rec.Body.String(), submitted) {
 		t.Fatalf("invalid invite response must not echo token: %s", rec.Body.String())
 	}
 }
@@ -139,7 +141,8 @@ func TestAuthAcceptInviteInvalidTokenReturnsGeneric401(t *testing.T) {
 func TestAuthAcceptInviteWeakPasswordReturns400(t *testing.T) {
 	handler := httpapi.AuthAcceptInvite(&fakeInviteManager{acceptErr: domain.ErrPasswordPolicy})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"raw-invite-token","display_name":"User","password":"weak"}`))
+	submitted := makeTestOpaqueValue("invite-weak-password")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"`+submitted+`","display_name":"User","password":"weak"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -169,8 +172,10 @@ func TestAuthAcceptInviteRouterRateLimitsPublicEndpoint(t *testing.T) {
 	cfg := config.Config{ServiceName: "auth-service", Env: "test", AuthTokenEndpointRateLimitPerMinute: 60, AuthTokenEndpointRateLimitBurst: 1}
 	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{acceptResult: domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", CreatedAt: time.Now()}})
 
+	submitted := makeTestOpaqueValue("invite-rate-limit")
+	body := `{"token":"` + submitted + `","display_name":"User","password":"StrongPassword@123"}`
 	first := httptest.NewRecorder()
-	firstReq := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"raw-invite-token","display_name":"User","password":"StrongPassword@123"}`))
+	firstReq := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(body))
 	firstReq.RemoteAddr = "203.0.113.50:12345"
 	router.ServeHTTP(first, firstReq)
 	if first.Code != http.StatusCreated {
@@ -178,7 +183,7 @@ func TestAuthAcceptInviteRouterRateLimitsPublicEndpoint(t *testing.T) {
 	}
 
 	second := httptest.NewRecorder()
-	secondReq := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"raw-invite-token","display_name":"User","password":"StrongPassword@123"}`))
+	secondReq := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(body))
 	secondReq.RemoteAddr = "203.0.113.50:12345"
 	router.ServeHTTP(second, secondReq)
 	if second.Code != http.StatusTooManyRequests {
@@ -200,7 +205,8 @@ func TestAuthInviteHandlersUnavailableReturn503(t *testing.T) {
 func TestAuthAcceptInviteInternalErrorReturns500(t *testing.T) {
 	handler := httpapi.AuthAcceptInvite(&fakeInviteManager{acceptErr: errors.New("db down")})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"raw-invite-token","display_name":"User","password":"StrongPassword@123"}`))
+	submitted := makeTestOpaqueValue("invite-internal")
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{"token":"`+submitted+`","display_name":"User","password":"StrongPassword@123"}`))
 
 	handler.ServeHTTP(rec, req)
 

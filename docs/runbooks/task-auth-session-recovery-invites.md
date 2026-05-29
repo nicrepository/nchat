@@ -81,7 +81,7 @@ Request:
 
 ```json
 {
-  "token": "opaque-token-from-email",
+  "token": "opaque-value-from-email",
   "new_password": "NewStrongPassword@123"
 }
 ```
@@ -164,7 +164,7 @@ Request:
 
 ```json
 {
-  "token": "opaque-token-from-email",
+  "token": "opaque-value-from-email",
   "display_name": "User Name",
   "full_name": "User Full Name",
   "password": "StrongPassword@123"

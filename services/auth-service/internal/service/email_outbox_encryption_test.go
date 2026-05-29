@@ -1,4 +1,4 @@
-//nolint:gosec // Test fixtures intentionally use example token strings.
+//nolint:gosec // Test fixtures intentionally use example opaque strings.
 package service_test
 
 import (
@@ -20,9 +20,10 @@ func TestEmailOutboxEncryptorEncryptsEnvelopeAndDecryptsPayload(t *testing.T) {
 		t.Fatalf("NewEmailOutboxEncryptor: %v", err)
 	}
 
+	plaintextValue := makeTestOpaqueValue("outbox-reset")
 	plaintext := service.EmailOutboxPlaintext{
 		Kind:       "password_reset",
-		Token:      "raw-reset-token",
+		Token:      plaintextValue,
 		ActionPath: "/auth/password/reset",
 		ToEmail:    "user@example.com",
 		ExpiresAt:  time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC),
@@ -32,7 +33,7 @@ func TestEmailOutboxEncryptorEncryptsEnvelopeAndDecryptsPayload(t *testing.T) {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	for _, forbidden := range []string{"raw-reset-token", "/auth/password/reset?to" + "ken=raw-reset-token", "user@example.com"} {
+	for _, forbidden := range []string{plaintextValue, "/auth/password/reset?to" + "ken=" + plaintextValue, "user@example.com"} {
 		if strings.Contains(envelope, forbidden) {
 			t.Fatalf("encrypted envelope contains forbidden plaintext %q: %s", forbidden, envelope)
 		}
@@ -65,7 +66,7 @@ func TestEmailOutboxEncryptorRejectsMissingAndInvalidKeys(t *testing.T) {
 
 func TestEmailOutboxEncryptorRejectsInvalidPayloadsAndTampering(t *testing.T) {
 	var nilEncryptor *service.EmailOutboxEncryptor
-	if _, err := nilEncryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "password_reset", Token: "token", ActionPath: "/auth/password/reset", ToEmail: "user@example.com", ExpiresAt: time.Now()}); !errors.Is(err, domain.ErrEmailOutboxUnavailable) {
+	if _, err := nilEncryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "password_reset", Token: makeTestOpaqueValue("nil-encryptor"), ActionPath: "/auth/password/reset", ToEmail: "user@example.com", ExpiresAt: time.Now()}); !errors.Is(err, domain.ErrEmailOutboxUnavailable) {
 		t.Fatalf("expected nil encryptor unavailable error, got %v", err)
 	}
 
@@ -73,11 +74,11 @@ func TestEmailOutboxEncryptorRejectsInvalidPayloadsAndTampering(t *testing.T) {
 	if _, err := encryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "password_reset"}); err == nil {
 		t.Fatal("expected missing required field error")
 	}
-	if _, err := encryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "password_reset", Token: "token", ToEmail: "user@example.com", ExpiresAt: time.Now()}); err == nil {
+	if _, err := encryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "password_reset", Token: makeTestOpaqueValue("missing-path"), ToEmail: "user@example.com", ExpiresAt: time.Now()}); err == nil {
 		t.Fatal("expected missing action path error")
 	}
 
-	validEnvelope, err := encryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "invite", Token: "raw-invite-token", ActionPath: "/auth/invites/accept", ToEmail: "user@example.com", ExpiresAt: time.Now().UTC().Add(time.Hour)})
+	validEnvelope, err := encryptor.Encrypt(service.EmailOutboxPlaintext{Kind: "invite", Token: makeTestOpaqueValue("outbox-invite"), ActionPath: "/auth/invites/accept", ToEmail: "user@example.com", ExpiresAt: time.Now().UTC().Add(time.Hour)})
 	if err != nil {
 		t.Fatalf("Encrypt valid envelope: %v", err)
 	}

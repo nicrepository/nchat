@@ -35,7 +35,8 @@ func TestAuthService_RefreshRotatesToken(t *testing.T) {
 	store := &fakeSessionStore{session: domain.Session{ID: "session-456", UserID: "user-123"}}
 	auth := service.NewAuthService(manager, store)
 
-	pair, err := auth.Refresh(context.Background(), "old-refresh-token")
+	submitted := makeTestOpaqueValue("refresh-rotate-old")
+	pair, err := auth.Refresh(context.Background(), submitted)
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
@@ -43,7 +44,7 @@ func TestAuthService_RefreshRotatesToken(t *testing.T) {
 	if store.rotateOldHash == "" {
 		t.Fatal("expected old refresh token hash")
 	}
-	if store.rotateOldHash == "old-refresh-token" {
+	if store.rotateOldHash == submitted {
 		t.Fatal("old refresh token must be hashed before storage lookup")
 	}
 	if store.rotateNewHash == "" {
@@ -74,15 +75,15 @@ func TestAuthService_RefreshRotatesToken(t *testing.T) {
 }
 
 func TestAuthService_RefreshRejectsIdleExpiredSession(t *testing.T) {
-	assertRefreshRejectsInvalidSession(t, "idle-expired-token")
+	assertRefreshRejectsInvalidSession(t, makeTestOpaqueValue("refresh-idle-expired"))
 }
 
 func TestAuthService_RefreshRejectsAbsoluteExpiredSession(t *testing.T) {
-	assertRefreshRejectsInvalidSession(t, "absolute-expired-token")
+	assertRefreshRejectsInvalidSession(t, makeTestOpaqueValue("refresh-absolute-expired"))
 }
 
 func TestAuthService_RefreshRejectsRevokedSession(t *testing.T) {
-	assertRefreshRejectsInvalidSession(t, "revoked-token")
+	assertRefreshRejectsInvalidSession(t, makeTestOpaqueValue("refresh-revoked"))
 }
 
 func assertRefreshRejectsInvalidSession(t *testing.T, refreshToken string) {
@@ -102,13 +103,14 @@ func TestAuthService_LogoutRevokesRefreshToken(t *testing.T) {
 	store := &fakeSessionStore{}
 	auth := service.NewAuthService(manager, store)
 
-	if err := auth.Logout(context.Background(), "raw-refresh-token"); err != nil {
+	submitted := makeTestOpaqueValue("logout-refresh")
+	if err := auth.Logout(context.Background(), submitted); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
 	if store.revokeHash == "" {
 		t.Fatal("expected revoke hash")
 	}
-	if store.revokeHash == "raw-refresh-token" {
+	if store.revokeHash == submitted {
 		t.Fatal("logout must hash refresh token before revoking")
 	}
 }

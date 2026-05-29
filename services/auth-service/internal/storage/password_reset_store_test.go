@@ -83,7 +83,7 @@ func TestPGXPasswordResetStore_CreatePasswordResetTokenSupersedesAndEnqueuesEncr
 		WithArgs("user-1").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).
-		WithArgs("user-1", "hashed-reset-token", expiresAt).
+		WithArgs("user-1", "hashed-reset-value", expiresAt).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("reset-id-1"))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
 		WithArgs("user@example.com", "reset-id-1", "user-1", encryptedResetPayload).
@@ -92,7 +92,7 @@ func TestPGXPasswordResetStore_CreatePasswordResetTokenSupersedesAndEnqueuesEncr
 	mock.ExpectRollback()
 
 	store := storage.NewPGXPasswordResetStore(mock)
-	if err := store.CreatePasswordResetToken(context.Background(), "user-1", "user@example.com", "hashed-reset-token", expiresAt, encryptedResetPayload); err != nil {
+	if err := store.CreatePasswordResetToken(context.Background(), "user-1", "user@example.com", "hashed-reset-value", expiresAt, encryptedResetPayload); err != nil {
 		t.Fatalf("CreatePasswordResetToken: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -109,7 +109,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxValidTokenUpdatesCredentialAndRevo
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).
-		WithArgs("hashed-token").
+		WithArgs("hashed-value").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id", "used", "expires_at"}).AddRow("reset-1", "user-1", false, time.Now().Add(time.Hour)))
 	mock.ExpectExec(`UPDATE auth\.user_password_credentials`).
 		WithArgs("argon2id-hash", "user-1").
@@ -127,7 +127,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxValidTokenUpdatesCredentialAndRevo
 	mock.ExpectRollback()
 
 	store := storage.NewPGXPasswordResetStore(mock)
-	if err := store.ResetPasswordTx(context.Background(), "hashed-token", "argon2id-hash"); err != nil {
+	if err := store.ResetPasswordTx(context.Background(), "hashed-value", "argon2id-hash"); err != nil {
 		t.Fatalf("ResetPasswordTx: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -146,12 +146,12 @@ func TestPGXPasswordResetStore_ResetPasswordTxRejectsIneligibleTokenOwners(t *te
 
 			mock.ExpectBegin()
 			mock.ExpectQuery(`(?s)JOIN auth\.users AS u.*u\.status = 'active'.*u\.deleted_at IS NULL.*u\.auth_source = 'manual'`).
-				WithArgs("hashed-token").
+				WithArgs("hashed-value").
 				WillReturnError(pgx.ErrNoRows)
 			mock.ExpectRollback()
 
 			store := storage.NewPGXPasswordResetStore(mock)
-			err = store.ResetPasswordTx(context.Background(), "hashed-token", "argon2id-hash")
+			err = store.ResetPasswordTx(context.Background(), "hashed-value", "argon2id-hash")
 			if !errors.Is(err, domain.ErrInvalidToken) {
 				t.Fatalf("expected ErrInvalidToken, got %v", err)
 			}
@@ -182,7 +182,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxRejectsUnknownExpiredAndUsedTokens
 			defer mock.Close()
 
 			mock.ExpectBegin()
-			expect := mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token")
+			expect := mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value")
 			if tt.err != nil {
 				expect.WillReturnError(tt.err)
 			} else {
@@ -191,7 +191,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxRejectsUnknownExpiredAndUsedTokens
 			mock.ExpectRollback()
 
 			store := storage.NewPGXPasswordResetStore(mock)
-			err = store.ResetPasswordTx(context.Background(), "hashed-token", "argon2id-hash")
+			err = store.ResetPasswordTx(context.Background(), "hashed-value", "argon2id-hash")
 			if !errors.Is(err, domain.ErrInvalidToken) {
 				t.Fatalf("expected ErrInvalidToken, got %v", err)
 			}
@@ -254,7 +254,7 @@ func TestPGXPasswordResetStore_CreatePasswordResetTokenIneligibleUserDoesNotCrea
 	mock.ExpectRollback()
 
 	store := storage.NewPGXPasswordResetStore(mock)
-	if err := store.CreatePasswordResetToken(context.Background(), "user-1", "user@example.com", "hashed-reset-token", time.Now().Add(time.Hour), encryptedResetPayload); err != nil {
+	if err := store.CreatePasswordResetToken(context.Background(), "user-1", "user@example.com", "hashed-reset-value", time.Now().Add(time.Hour), encryptedResetPayload); err != nil {
 		t.Fatalf("CreatePasswordResetToken: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -284,14 +284,14 @@ func TestPGXPasswordResetStore_CreatePasswordResetTokenErrors(t *testing.T) {
 			mock.ExpectBegin()
 			expectPasswordResetUserLock(mock)
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-			mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).WithArgs("user-1", "hashed-reset-token", expiresAt).WillReturnError(errors.New("insert failed"))
+			mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).WithArgs("user-1", "hashed-reset-value", expiresAt).WillReturnError(errors.New("insert failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "outbox", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			expectPasswordResetUserLock(mock)
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-			mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).WithArgs("user-1", "hashed-reset-token", expiresAt).WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("reset-id-1"))
+			mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).WithArgs("user-1", "hashed-reset-value", expiresAt).WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("reset-id-1"))
 			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs("user@example.com", "reset-id-1", "user-1", encryptedResetPayload).WillReturnError(errors.New("outbox failed"))
 			mock.ExpectRollback()
 		}},
@@ -299,7 +299,7 @@ func TestPGXPasswordResetStore_CreatePasswordResetTokenErrors(t *testing.T) {
 			mock.ExpectBegin()
 			expectPasswordResetUserLock(mock)
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-			mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).WithArgs("user-1", "hashed-reset-token", expiresAt).WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("reset-id-1"))
+			mock.ExpectQuery(`INSERT INTO auth\.password_reset_tokens`).WithArgs("user-1", "hashed-reset-value", expiresAt).WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("reset-id-1"))
 			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs("user@example.com", "reset-id-1", "user-1", encryptedResetPayload).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 			mock.ExpectRollback()
@@ -315,7 +315,7 @@ func TestPGXPasswordResetStore_CreatePasswordResetTokenErrors(t *testing.T) {
 			defer mock.Close()
 			tt.setup(mock)
 			store := storage.NewPGXPasswordResetStore(mock)
-			err = store.CreatePasswordResetToken(context.Background(), "user-1", "user@example.com", "hashed-reset-token", expiresAt, encryptedResetPayload)
+			err = store.CreatePasswordResetToken(context.Background(), "user-1", "user@example.com", "hashed-reset-value", expiresAt, encryptedResetPayload)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -337,31 +337,31 @@ func TestPGXPasswordResetStore_ResetPasswordTxErrors(t *testing.T) {
 		{name: "begin", setup: func(mock pgxmock.PgxPoolIface) { mock.ExpectBegin().WillReturnError(errors.New("begin failed")) }},
 		{name: "query", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnError(errors.New("query failed"))
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnError(errors.New("query failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "credential update", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnRows(validTokenRows())
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnRows(validTokenRows())
 			mock.ExpectExec(`UPDATE auth\.user_password_credentials`).WithArgs("argon2id-hash", "user-1").WillReturnError(errors.New("credential failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "credential missing", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnRows(validTokenRows())
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnRows(validTokenRows())
 			mock.ExpectExec(`UPDATE auth\.user_password_credentials`).WithArgs("argon2id-hash", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 			mock.ExpectRollback()
 		}},
 		{name: "mark used", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnRows(validTokenRows())
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnRows(validTokenRows())
 			mock.ExpectExec(`UPDATE auth\.user_password_credentials`).WithArgs("argon2id-hash", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("reset-1").WillReturnError(errors.New("mark failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "sessions", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnRows(validTokenRows())
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnRows(validTokenRows())
 			mock.ExpectExec(`UPDATE auth\.user_password_credentials`).WithArgs("argon2id-hash", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("reset-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.user_sessions`).WithArgs("user-1").WillReturnError(errors.New("sessions failed"))
@@ -369,7 +369,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxErrors(t *testing.T) {
 		}},
 		{name: "history", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnRows(validTokenRows())
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnRows(validTokenRows())
 			mock.ExpectExec(`UPDATE auth\.user_password_credentials`).WithArgs("argon2id-hash", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("reset-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.user_sessions`).WithArgs("user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -378,7 +378,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxErrors(t *testing.T) {
 		}},
 		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-token").WillReturnRows(validTokenRows())
+			mock.ExpectQuery(`SELECT t\.id, t\.user_id, t\.used_at IS NOT NULL, t\.expires_at`).WithArgs("hashed-value").WillReturnRows(validTokenRows())
 			mock.ExpectExec(`UPDATE auth\.user_password_credentials`).WithArgs("argon2id-hash", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.password_reset_tokens`).WithArgs("reset-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 			mock.ExpectExec(`UPDATE auth\.user_sessions`).WithArgs("user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -397,7 +397,7 @@ func TestPGXPasswordResetStore_ResetPasswordTxErrors(t *testing.T) {
 			defer mock.Close()
 			tt.setup(mock)
 			store := storage.NewPGXPasswordResetStore(mock)
-			err = store.ResetPasswordTx(context.Background(), "hashed-token", "argon2id-hash")
+			err = store.ResetPasswordTx(context.Background(), "hashed-value", "argon2id-hash")
 			if err == nil {
 				t.Fatal("expected error")
 			}
