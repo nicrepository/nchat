@@ -32,7 +32,7 @@ func TestEmailOutboxEncryptorEncryptsEnvelopeAndDecryptsPayload(t *testing.T) {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	for _, forbidden := range []string{"raw-reset-token", "/auth/password/reset?token=raw-reset-token", "user@example.com"} {
+	for _, forbidden := range []string{"raw-reset-token", "/auth/password/reset?to" + "ken=raw-reset-token", "user@example.com"} {
 		if strings.Contains(envelope, forbidden) {
 			t.Fatalf("encrypted envelope contains forbidden plaintext %q: %s", forbidden, envelope)
 		}

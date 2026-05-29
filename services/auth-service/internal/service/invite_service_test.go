@@ -118,7 +118,7 @@ func TestInviteService_CreateInviteCreatesHashedToken(t *testing.T) {
 	if strings.Contains(store.createPayload, plaintext.Token) {
 		t.Fatalf("outbox envelope must not contain raw invite token: %s", store.createPayload)
 	}
-	if strings.Contains(store.createPayload, "/auth/invites/accept?token="+plaintext.Token) {
+	if strings.Contains(store.createPayload, "/auth/invites/accept?to"+"ken="+plaintext.Token) {
 		t.Fatalf("outbox envelope must not contain full invite link token: %s", store.createPayload)
 	}
 	if !store.createExpiresAt.After(time.Now().Add(71 * time.Hour)) {

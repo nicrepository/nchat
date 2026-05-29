@@ -18,6 +18,9 @@ import (
 const (
 	fallbackTokenEndpointRateLimitPerMinute = 60
 	fallbackTokenEndpointRateLimitBurst     = 10
+	defaultRateLimiterBucketTTL             = time.Hour
+	defaultRateLimiterMaxBuckets            = 10_000
+	defaultRateLimiterPruneInterval         = time.Minute
 	minRateLimitSecretBytes                 = 32
 	malformedTokenLimiterKey                = "malformed"
 )
@@ -27,6 +30,10 @@ type tokenEndpointRateLimiter struct {
 	limitPerMinute    float64
 	burst             float64
 	now               func() time.Time
+	bucketTTL         time.Duration
+	maxBuckets        int
+	pruneInterval     time.Duration
+	lastPrunedAt      time.Time
 	buckets           map[string]*tokenBucket
 	trustedProxyCIDRs []*net.IPNet
 }
@@ -57,6 +64,9 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDR
 		limitPerMinute:    float64(limitPerMinute),
 		burst:             float64(burst),
 		now:               time.Now,
+		bucketTTL:         defaultRateLimiterBucketTTL,
+		maxBuckets:        defaultRateLimiterMaxBuckets,
+		pruneInterval:     defaultRateLimiterPruneInterval,
 		buckets:           make(map[string]*tokenBucket),
 		trustedProxyCIDRs: parseCIDRs(trustedProxyCIDRs),
 	}
@@ -133,8 +143,10 @@ func (l *tokenEndpointRateLimiter) allow(remoteAddr string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	l.pruneExpiredBucketsLocked(now, false)
 	bucket, ok := l.buckets[key]
 	if !ok {
+		l.evictBucketForCapacityLocked(now)
 		l.buckets[key] = &tokenBucket{tokens: l.burst - 1, updatedAt: now}
 		return true
 	}
@@ -152,6 +164,45 @@ func (l *tokenEndpointRateLimiter) allow(remoteAddr string) bool {
 	}
 	bucket.tokens--
 	return true
+}
+
+func (l *tokenEndpointRateLimiter) pruneExpiredBucketsLocked(now time.Time, force bool) {
+	if l.bucketTTL <= 0 {
+		return
+	}
+	if !force && !l.lastPrunedAt.IsZero() && l.pruneInterval > 0 && now.Sub(l.lastPrunedAt) < l.pruneInterval {
+		return
+	}
+	cutoff := now.Add(-l.bucketTTL)
+	for key, bucket := range l.buckets {
+		if bucket.updatedAt.Before(cutoff) {
+			delete(l.buckets, key)
+		}
+	}
+	l.lastPrunedAt = now
+}
+
+func (l *tokenEndpointRateLimiter) evictBucketForCapacityLocked(now time.Time) {
+	if l.maxBuckets <= 0 || len(l.buckets) < l.maxBuckets {
+		return
+	}
+	l.pruneExpiredBucketsLocked(now, true)
+	for len(l.buckets) >= l.maxBuckets {
+		oldestKey := ""
+		oldestFound := false
+		var oldestAt time.Time
+		for key, bucket := range l.buckets {
+			if !oldestFound || bucket.updatedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = bucket.updatedAt
+				oldestFound = true
+			}
+		}
+		if !oldestFound {
+			return
+		}
+		delete(l.buckets, oldestKey)
+	}
 }
 
 func remoteAddrKey(remoteAddr string) string {

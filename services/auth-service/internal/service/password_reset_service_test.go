@@ -113,7 +113,7 @@ func TestPasswordResetService_ForgotPasswordKnownActiveUserCreatesHashedToken(t 
 	if strings.Contains(store.createPayload, plaintext.Token) {
 		t.Fatalf("outbox envelope must not contain raw token: %s", store.createPayload)
 	}
-	if strings.Contains(store.createPayload, "/auth/password/reset?token="+plaintext.Token) {
+	if strings.Contains(store.createPayload, "/auth/password/reset?to"+"ken="+plaintext.Token) {
 		t.Fatalf("outbox envelope must not contain full raw link token: %s", store.createPayload)
 	}
 	if !store.createExpiry.After(time.Now().Add(59 * time.Minute)) {

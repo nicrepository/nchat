@@ -42,7 +42,7 @@ Implement three related auth-service flows in a single PR:
 - Auto-login after invite accept or password reset
 - Rate-limit persistence across replicas (in-memory only)
 - Email outbox worker (the table is the handoff boundary)
-- AES-GCM payload encryption for outbox (deferred — see Email Outbox Decision)
+- AES-GCM payload encryption for outbox via `AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY` (implemented in this PR; see Email Outbox Decision)
 
 ---
 
@@ -629,8 +629,10 @@ Admin endpoints (`/admin/invites`) are not rate-limited at the handler level (pr
 
 2. **Email outbox key rotation not implemented.** The envelope records `key_version: v1`, but multiple-key rotation/decryption policy is future work.
 
-3. **Rate limiting is per-process, in-memory.** Does not protect multi-replica deployments. Production deployments behind a gateway should apply cluster-scoped rate limiting.
+3. **Outbox AAD can be hardened further.** AES-GCM AAD currently binds envelope algorithm/version. A future worker/schema revision can additionally bind immutable row metadata such as outbox id and kind.
 
-4. **`AdminBootstrapGuard` is not final RBAC.** `POST /admin/invites` is protected by a pre-shared bootstrap token. Real role-based access control is out of scope for this PR.
+4. **Rate limiting is per-process, in-memory.** Does not protect multi-replica deployments. Production deployments behind a gateway should apply cluster-scoped rate limiting.
 
-5. **`invited_by_user_id` is NULL.** The admin bootstrap guard has no user identity. This column will be populated once final RBAC is implemented.
+5. **`AdminBootstrapGuard` is not final RBAC.** `POST /admin/invites` is protected by a pre-shared bootstrap token. Real role-based access control is out of scope for this PR.
+
+6. **`invited_by_user_id` is NULL.** The admin bootstrap guard has no user identity. This column will be populated once final RBAC is implemented.
