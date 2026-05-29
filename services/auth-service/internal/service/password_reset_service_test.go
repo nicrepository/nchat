@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/emailcrypto"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 	"github.com/nicrepository/nchat/services/auth-service/internal/service"
 )
@@ -227,11 +228,11 @@ func TestPasswordResetService_ResetPasswordInvalidTokenPropagatesGenericError(t 
 	}
 }
 
-func newTestEmailOutboxEncryptor(t *testing.T) *service.EmailOutboxEncryptor {
+func newTestEmailOutboxEncryptor(t *testing.T) *emailcrypto.Encryptor {
 	t.Helper()
 
 	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
-	encryptor, err := service.NewEmailOutboxEncryptor(key)
+	encryptor, err := emailcrypto.New(key)
 	if err != nil {
 		t.Fatalf("NewEmailOutboxEncryptor: %v", err)
 	}

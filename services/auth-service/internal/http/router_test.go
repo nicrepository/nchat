@@ -17,7 +17,7 @@ import (
 )
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -46,7 +46,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -74,7 +74,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -92,7 +92,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -186,7 +186,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -201,7 +201,7 @@ func TestMetricsRouteReturns200(t *testing.T) {
 }
 
 func TestAdminUsersDisabledWithNoToken(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, RouteAdminUsers, nil))
 	// testConfig has no ADMIN_BOOTSTRAP_TOKEN => 503
@@ -211,11 +211,28 @@ func TestAdminUsersDisabledWithNoToken(t *testing.T) {
 }
 
 func TestAdminUsersMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAdminUsers, nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+func TestAuthMeLoginAttemptsDisabledReturns503BeforeAuth(t *testing.T) {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
+	cfg.AuthJWTIssuer = "test-issuer"
+	cfg.AuthJWTAudience = "test-audience"
+	cfg.AuthAccessTokenTTLSeconds = 900
+	cfg.AuthRefreshTokenTTLSeconds = 3600
+
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -233,7 +250,7 @@ func TestAuthTokenEndpointRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 2
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil, nil)
 
 	submitted := makeInternalTestOpaqueValue("router-rate-limit-refresh")
 	for i := 0; i < 2; i++ {
@@ -251,7 +268,7 @@ func TestAuthTokenEndpointRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, routerAuthStub{}, nil, nil, nil, nil)
 
 	submitted := makeInternalTestOpaqueValue("router-rate-limit-secret")
 	first := httptest.NewRecorder()
@@ -272,7 +289,7 @@ func TestAuthTokenEndpointRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 }
 
 func TestAuthRoutesMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil)
 
 	tests := []struct {
 		name string
@@ -304,7 +321,7 @@ func (routerLoginStub) Login(_ context.Context, _ domain.LoginInput) (domain.Log
 }
 
 func TestAuthLoginMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAuthLogin, nil))
 	assertJSONResponse(t, rec, http.StatusMethodNotAllowed)
@@ -314,7 +331,7 @@ func TestAuthLoginRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 2
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
@@ -329,7 +346,7 @@ func TestAuthLoginRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	first := httptest.NewRecorder()
 	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -352,7 +369,7 @@ func TestRateLimiter_NoTrustedProxy_IgnoresXForwardedFor(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "" // no trusted proxies
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	// First request from 10.0.0.1 — allowed.
 	first := httptest.NewRecorder()
@@ -379,7 +396,7 @@ func TestRateLimiter_TrustedProxy_UsesXForwardedFor(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	proxyAddr := "10.0.0.1:9999"
 
@@ -416,7 +433,7 @@ func TestRateLimiter_UntrustedRemoteAddr_IgnoresXForwardedFor(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8" // 5.5.5.5 is NOT in this range
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	// First request from 5.5.5.5 — allowed.
 	first := httptest.NewRecorder()
@@ -443,7 +460,7 @@ func TestRateLimiter_TrustedProxy_UsesXRealIPWhenXFFAbsent(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	proxyAddr := "10.0.0.5:9999"
 	clientXRI := "203.0.113.77"
@@ -481,7 +498,7 @@ func TestRateLimiter_InvalidXFF_FallsBackToRemoteAddr(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	// First request from trusted proxy — XFF is "not-an-ip", falls back to RemoteAddr "10.0.0.2".
 	first := httptest.NewRecorder()
@@ -508,7 +525,7 @@ func TestRateLimiter_MalformedXRealIP_FallsBackToRemoteAddr(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	// First request from trusted proxy — X-Real-IP is invalid, falls back to RemoteAddr "10.0.0.3".
 	first := httptest.NewRecorder()
@@ -535,7 +552,7 @@ func TestRateLimiter_MalformedXFF_FallsBackToRemoteAddr(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	cfg.AuthTrustedProxyCIDRs = "10.0.0.0/8"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, routerLoginStub{}, nil, nil, nil)
 
 	// Trusted proxy at 10.0.0.1 with a malformed XFF (empty first element after split).
 	// clientIP() falls back to RemoteAddr = "10.0.0.1".
@@ -602,7 +619,7 @@ func TestForgotPasswordMissingOutboxKeyReturns503BeforeRateLimit(t *testing.T) {
 	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, unavailableRouterPasswordRecoveryStub{}, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, unavailableRouterPasswordRecoveryStub{}, nil, nil)
 
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
@@ -619,7 +636,7 @@ func TestRecoveryRateLimiterForgotPerEmailLimitTriggers429(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	passwords := &routerPasswordRecoveryStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil, nil)
 
 	first := httptest.NewRecorder()
 	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordForgot, strings.NewReader(`{"email":"USER@example.com"}`))
@@ -648,7 +665,7 @@ func TestRecoveryRateLimiterResetPerTokenLimitTriggers429(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	passwords := &routerPasswordRecoveryStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil, nil)
 	token := strings.Repeat("a", 43)
 	body := `{"token":"` + token + `","new_password":"StrongPassword@123"}`
 
@@ -679,7 +696,7 @@ func TestRecoveryRateLimiterInviteAcceptPerTokenLimitTriggers429(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	invites := &routerInviteStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, invites)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, invites, nil)
 	token := strings.Repeat("b", 43)
 	body := `{"token":"` + token + `","display_name":"User","password":"StrongPassword@123"}`
 
@@ -711,7 +728,7 @@ func TestRecoveryRateLimiterEndpointBucketsDoNotBlockEachOther(t *testing.T) {
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	passwords := &routerPasswordRecoveryStub{}
 	invites := &routerInviteStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, invites)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, invites, nil)
 	remoteAddr := "203.0.113.131:1000"
 
 	forgot := httptest.NewRecorder()
@@ -745,7 +762,7 @@ func TestRecoveryRateLimiterMalformedResetTokenUsesGenericLimiter(t *testing.T) 
 	cfg.AuthTokenEndpointRateLimitPerMinute = 60
 	cfg.AuthTokenEndpointRateLimitBurst = 1
 	passwords := &routerPasswordRecoveryStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, passwords, nil, nil)
 
 	first := httptest.NewRecorder()
 	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthPasswordReset, strings.NewReader(`{"token":"bad token","new_password":"StrongPassword@123"}`))

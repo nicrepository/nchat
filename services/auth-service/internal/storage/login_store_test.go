@@ -1138,6 +1138,61 @@ func TestPGXLoginStore_CreateLoginSession_SparseSingleGroupLockout(t *testing.T)
 	}
 }
 
+// TestRF49_UnknownEmailPathGeneric verifies that when the email is not found, the store
+// calls dummyVerify (to prevent user-enumeration timing attacks) and returns
+// ErrInvalidCredentials — indistinguishable from a wrong-password failure.
+// RF-49: unknown-email path must exercise the dummy verifier exactly once.
+func TestRF49_UnknownEmailPathGeneric(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	var dummyCalls int
+	trackingDummy := func(_ string) { dummyCalls++ }
+
+	// Policy limit=2, window=5, lockout=10 → lookback=15.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT min_password_length`).
+		WillReturnRows(policyRow(2, 5, 10, 60, 5))
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("", 0))
+	// User lookup: email not found → empty rows.
+	mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
+		WithArgs("ghost@example.com").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
+		}))
+	// Lockout check is keyed by email when user is not found; lookback = 5+10 = 15.
+	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
+		WithArgs("ghost@example.com", 15).
+		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
+	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
+		WithArgs(nil, "ghost@example.com", false, "invalid_credentials", "1.2.3.4", "ua").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXLoginStore(mock, service.VerifyPassword, trackingDummy)
+	_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
+		Password:  "any-password",
+		Email:     "ghost@example.com",
+		IPAddress: "1.2.3.4",
+		UserAgent: "ua",
+	})
+	if !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials for unknown email, got %v", err)
+	}
+	if dummyCalls != 1 {
+		t.Fatalf("expected dummyVerify called once, got %d", dummyCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 // TestPGXLoginStore_CreateLoginSession_NonCredentialFailuresDoNotTriggerLockout verifies
 // that failed_login_limit_exceeded, max_devices_exceeded, and similar non-credential failure
 // reasons do not count toward the brute-force threshold. The DB query filters by

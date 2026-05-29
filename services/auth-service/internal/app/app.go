@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/emailcrypto"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/auth-service/internal/config"
@@ -44,7 +45,7 @@ func New(cfg config.Config) *App {
 		}
 	}
 
-	emailOutboxEncryptor, emailOutboxErr := service.NewEmailOutboxEncryptor(cfg.AuthEmailOutboxEncryptionKey)
+	emailOutboxEncryptor, emailOutboxErr := emailcrypto.New(cfg.AuthEmailOutboxEncryptionKey)
 	if emailOutboxErr != nil {
 		logger.Warn("email outbox handoff disabled", "reason", "invalid_email_outbox_encryption_key")
 	}
@@ -56,6 +57,8 @@ func New(cfg config.Config) *App {
 		AccessTTL:  time.Duration(cfg.AuthAccessTokenTTLSeconds) * time.Second,
 		RefreshTTL: time.Duration(cfg.AuthRefreshTokenTTLSeconds) * time.Second,
 	})
+
+	var loginAttempts httpapi.LoginAttemptsManager
 	switch {
 	case err != nil:
 		logger.Warn("auth token endpoints disabled", "reason", "invalid_jwt_config")
@@ -66,12 +69,13 @@ func New(cfg config.Config) *App {
 		login = service.NewLoginService(tokens, storage.NewPGXLoginStore(pool, service.VerifyPassword, service.RunDummyPasswordVerification))
 		password = service.NewPasswordResetService(tokens, storage.NewPGXPasswordResetStore(pool), service.WithPasswordResetOutboxEncryptor(emailOutboxEncryptor))
 		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool), service.WithInviteOutboxEncryptor(emailOutboxEncryptor))
+		loginAttempts = service.NewLoginAttemptsService(storage.NewPGXLoginAttemptsStore(pool))
 	}
 
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts),
 		TracingShutdown: shutdown,
 	}
 }

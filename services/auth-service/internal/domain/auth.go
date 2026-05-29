@@ -106,3 +106,19 @@ type AcceptInviteResult struct {
 	FullName    string
 	CreatedAt   time.Time
 }
+
+// LoginAttempt is a single failed login attempt record for a user.
+type LoginAttempt struct {
+	ID            int64
+	Email         string
+	IPAddress     string // raw; masking happens in HTTP layer
+	UserAgent     string
+	FailureReason string
+	CreatedAt     time.Time
+}
+
+// LoginAttemptsCursor is used for keyset pagination over login attempts.
+type LoginAttemptsCursor struct {
+	CreatedAt time.Time
+	ID        int64
+}

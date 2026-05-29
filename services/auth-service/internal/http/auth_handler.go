@@ -156,7 +156,7 @@ type loginResponse struct {
 // AuthLogin returns an http.Handler for POST /auth/login.
 // It returns 503 when login service is nil (database not configured),
 // 401 for invalid credentials (including lockout), and 200 with tokens on success.
-func AuthLogin(login service.LoginManager) http.Handler {
+func AuthLogin(login service.LoginManager, trustedProxyCIDRs []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if login == nil {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "auth login endpoint disabled")
@@ -168,11 +168,8 @@ func AuthLogin(login service.LoginManager) http.Handler {
 			return
 		}
 
-		// Extract client IP from RemoteAddr — strip port if present.
-		ipAddress := r.RemoteAddr
-		if host, _, err := splitHostPort(r.RemoteAddr); err == nil {
-			ipAddress = host
-		}
+		// Extract real client IP using trusted-proxy-aware logic.
+		ipAddress := httputil.ClientIP(r, trustedProxyCIDRs)
 
 		result, err := login.Login(r.Context(), domain.LoginInput{
 			Email:             req.Email,
@@ -238,10 +235,4 @@ func writeLoginError(w http.ResponseWriter, err error) {
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
-}
-
-// splitHostPort splits a "host:port" address string, returning (host, port, error).
-// It handles IPv6 addresses in bracket notation.
-func splitHostPort(addr string) (host, port string, err error) {
-	return net.SplitHostPort(addr)
 }

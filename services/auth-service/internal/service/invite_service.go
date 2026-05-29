@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/emailcrypto"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
@@ -31,7 +32,7 @@ type InviteManager interface {
 
 type InviteOption func(*InviteService)
 
-func WithInviteOutboxEncryptor(encryptor *EmailOutboxEncryptor) InviteOption {
+func WithInviteOutboxEncryptor(encryptor *emailcrypto.Encryptor) InviteOption {
 	return func(s *InviteService) {
 		s.emailOutbox = encryptor
 	}
@@ -41,7 +42,7 @@ func WithInviteOutboxEncryptor(encryptor *EmailOutboxEncryptor) InviteOption {
 type InviteService struct {
 	tokens      *TokenManager
 	store       InviteStore
-	emailOutbox *EmailOutboxEncryptor
+	emailOutbox *emailcrypto.Encryptor
 }
 
 func NewInviteService(tokens *TokenManager, store InviteStore, opts ...InviteOption) *InviteService {
@@ -103,7 +104,7 @@ func (s *InviteService) CreateInvite(ctx context.Context, input domain.AdminInvi
 	}
 	tokenHash := s.tokens.HashInviteToken(rawToken)
 	expiresAt := time.Now().UTC().Add(time.Duration(inviteTTLHours) * time.Hour)
-	encryptedPayload, err := s.emailOutbox.Encrypt(EmailOutboxPlaintext{
+	encryptedPayload, err := s.emailOutbox.Encrypt(emailcrypto.Plaintext{
 		Kind:       "invite",
 		Token:      rawToken,
 		ActionPath: inviteAcceptActionPath,

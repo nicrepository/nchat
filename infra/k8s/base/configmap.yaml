@@ -22,3 +22,4 @@ data:
   VALKEY_PORT: "6379"
   SEAWEEDFS_FILER_URL: http://seaweedfs-filer:8888
   SEAWEEDFS_S3_ENDPOINT: http://seaweedfs-s3:8333
+  SMTP_WORKER_ENABLED: "false"
