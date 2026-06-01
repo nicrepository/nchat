@@ -101,6 +101,33 @@ func TestBearerAuth_NilTokens_Returns503(t *testing.T) {
 	assertErrorCode(t, rec.Body.Bytes(), "service_unavailable")
 }
 
+func TestBearerAuth_ValidJWT_InjectsSessionID(t *testing.T) {
+	tokens := makeTestTokenManager(t)
+	accessToken, _, err := tokens.GenerateAccessToken("user-abc", "session-xyz")
+	if err != nil {
+		t.Fatalf("generate access token: %v", err)
+	}
+
+	var capturedSessionID string
+	captureHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedSessionID = httpapi.GetContextSessionID(r)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := httpapi.BearerAuth(tokens)(captureHandler)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if capturedSessionID != "session-xyz" {
+		t.Fatalf("expected session ID 'session-xyz', got %q", capturedSessionID)
+	}
+}
+
 func makeTestTokenManager(t *testing.T) *service.TokenManager {
 	t.Helper()
 	tokens, err := service.NewTokenManager(service.TokenConfig{

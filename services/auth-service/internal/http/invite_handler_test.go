@@ -83,7 +83,7 @@ func TestAdminCreateInviteOutboxUnavailableReturns503(t *testing.T) {
 
 func TestAdminCreateInviteGuardRejectsMissingOrWrongToken(t *testing.T) {
 	cfg := config.Config{ServiceName: "auth-service", Env: "test"}
-	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{}, nil)
+	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{}, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`)))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -91,7 +91,7 @@ func TestAdminCreateInviteGuardRejectsMissingOrWrongToken(t *testing.T) {
 	}
 
 	cfg.AdminBootstrapToken = "expected-credential"
-	router = httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{}, nil)
+	router = httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{}, nil, nil, nil)
 	rec = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
 	req.Header.Set("X-NChat-Admin-Token", "wrong-credential")
@@ -170,7 +170,7 @@ func TestAuthAcceptInviteOversizedBodyReturns413(t *testing.T) {
 
 func TestAuthAcceptInviteRouterRateLimitsPublicEndpoint(t *testing.T) {
 	cfg := config.Config{ServiceName: "auth-service", Env: "test", AuthTokenEndpointRateLimitPerMinute: 60, AuthTokenEndpointRateLimitBurst: 1}
-	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{acceptResult: domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", CreatedAt: time.Now()}}, nil)
+	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{acceptResult: domain.AcceptInviteResult{UserID: "user-1", Email: "user@example.com", DisplayName: "User", CreatedAt: time.Now()}}, nil, nil, nil)
 
 	submitted := makeTestOpaqueValue("invite-rate-limit")
 	body := `{"token":"` + submitted + `","display_name":"User","password":"StrongPassword@123"}`

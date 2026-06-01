@@ -13,7 +13,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager) http.Handler {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
@@ -63,6 +63,41 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator
 		loginAttemptsHandler = BearerAuth(tokens)(loginAttemptsHandler)
 	}
 	mux.Handle(RouteAuthMeLoginAttempts, httputil.MethodNotAllowed(http.MethodGet, loginAttemptsHandler))
+
+	sessionsHandler := GetMySessions(sessions)
+	deleteSessionHandler := DeleteMySession(sessions)
+	deleteAllSessionsHandler := DeleteAllMySessions(sessions)
+	if tokens != nil && sessions != nil {
+		requireActive := RequireActiveSession(sessions)
+		sessionsHandler = BearerAuth(tokens)(requireActive(sessionsHandler))
+		deleteSessionHandler = BearerAuth(tokens)(requireActive(deleteSessionHandler))
+		deleteAllSessionsHandler = BearerAuth(tokens)(requireActive(deleteAllSessionsHandler))
+	}
+	mux.Handle(RouteAuthMeSessions, methodRouter(map[string]http.Handler{
+		http.MethodDelete: deleteAllSessionsHandler,
+		http.MethodGet:    sessionsHandler,
+	}))
+	mux.Handle(RouteAuthMeSessionByID, methodRouter(map[string]http.Handler{
+		http.MethodDelete: deleteSessionHandler,
+	}))
+
+	devicesHandler := GetMyDevices(devices)
+	deleteDeviceHandler := DeleteMyDevice(devices)
+	patchDeviceHandler := PatchMyDevice(devices)
+	if tokens != nil && devices != nil {
+		requireActive := RequireActiveSession(devices)
+		devicesHandler = BearerAuth(tokens)(requireActive(devicesHandler))
+		deleteDeviceHandler = BearerAuth(tokens)(requireActive(deleteDeviceHandler))
+		patchDeviceHandler = BearerAuth(tokens)(requireActive(patchDeviceHandler))
+	}
+	mux.Handle(RouteAuthMeDevices, methodRouter(map[string]http.Handler{
+		http.MethodGet: devicesHandler,
+	}))
+	mux.Handle(RouteAuthMeDeviceByID, methodRouter(map[string]http.Handler{
+		http.MethodDelete: deleteDeviceHandler,
+		http.MethodPatch:  patchDeviceHandler,
+	}))
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	})

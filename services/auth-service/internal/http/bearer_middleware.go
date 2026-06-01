@@ -12,7 +12,16 @@ import (
 // ctxKeyUserID is the context key for the authenticated userID.
 type ctxKey int
 
-const ctxKeyUserID ctxKey = iota
+const (
+	ctxKeyUserID    ctxKey = iota
+	ctxKeySessionID        // carries AccessClaims.SessionID ("sid"); "" if absent
+)
+
+// GetContextSessionID returns the session ID injected by BearerAuth, or "" if absent.
+func GetContextSessionID(r *http.Request) string {
+	sid, _ := r.Context().Value(ctxKeySessionID).(string)
+	return sid
+}
 
 // BearerAuth extracts and validates a Bearer JWT access token.
 // On success it injects the userID into the request context and calls next.
@@ -44,6 +53,7 @@ func BearerAuth(tokens *service.TokenManager) func(http.Handler) http.Handler {
 			}
 
 			ctx := context.WithValue(r.Context(), ctxKeyUserID, claims.Subject)
+			ctx = context.WithValue(ctx, ctxKeySessionID, claims.SessionID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

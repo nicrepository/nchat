@@ -122,3 +122,37 @@ type LoginAttemptsCursor struct {
 	CreatedAt time.Time
 	ID        int64
 }
+
+// SessionInfo is the safe, displayable representation of a user session row.
+// IPAddress and UserAgent are raw — masking/sanitizing is done in the HTTP layer.
+type SessionInfo struct {
+	ID                string
+	DeviceID          *string
+	CreatedAt         time.Time
+	LastSeenAt        time.Time
+	IdleExpiresAt     time.Time
+	AbsoluteExpiresAt *time.Time
+	RevokedAt         *time.Time
+	IPAddress         string
+	UserAgent         string
+}
+
+// DeviceInfo is the safe, displayable representation of a user device row.
+// LastIP is raw — masking is done in the HTTP layer.
+// Current is true when the current access token's session belongs to this device.
+type DeviceInfo struct {
+	ID           string
+	DisplayName  *string
+	Platform     *string
+	LastIP       string
+	FirstSeenAt  time.Time
+	LastSeenAt   time.Time
+	RevokedAt    *time.Time
+	SessionCount int
+	Current      bool
+}
+
+// DeviceSessionPolicy carries policy fields surfaced by the device/session endpoints.
+type DeviceSessionPolicy struct {
+	MaxDevicesPerUser int
+}
