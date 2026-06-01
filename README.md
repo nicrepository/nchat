@@ -409,15 +409,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service              | Default port | Current endpoints                                                                                                                                                                 |
-| -------------------- | -----------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept, /auth/me/login-attempts |
-| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                                                       |
-| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                                                       |
-| notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                  |
-| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                       |
-| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                       |
-| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                                                       |
+| Service              | Default port | Current endpoints                                                                                                                                                                                                      |
+| -------------------- | -----------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept, /auth/me/login-attempts, /auth/me/sessions, /auth/me/devices |
+| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                                                                                            |
+| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                                                                                            |
+| notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                                                       |
+| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                                                            |
+| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                                                            |
+| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                                                                                            |
 
 ## Auth data model
 
@@ -512,6 +512,26 @@ Auth-service implements RF-49 (complete), RF-50 (complete), and begins RF-35/RNF
 - Runbook: [docs/runbooks/task-smtp-bruteforce-login-audit.md](docs/runbooks/task-smtp-bruteforce-login-audit.md)
 - Migration: `migrations/auth/000005_smtp_worker_login_audit.{up,down}.sql`
 - Out of scope: notification preference centre, digest batching, DND/URGENT, final RBAC, frontend UI for login audit, Valkey scheduler
+
+## Device and session management
+
+Auth-service implements RF-51, RF-52, and RF-53 for user self-management of sessions and devices:
+
+- **RF-51/RF-52/RF-53**: Device and session management endpoints allow users to view and revoke
+  their own sessions and linked devices. Bearer JWT with `sid` and an active DB-backed current
+  session required. IP masking and UA sanitization applied consistently.
+  - `GET /auth/me/sessions` — list own sessions (`?include_revoked=true`, `?limit=N`)
+  - `DELETE /auth/me/sessions/{session_id}` — revoke one session; 404 cross-user
+  - `DELETE /auth/me/sessions` — revoke all except current; 401 if token lacks `sid` or current session is invalid
+  - `GET /auth/me/devices` — list own devices with session count and `max_devices_per_user`
+  - `DELETE /auth/me/devices/{device_id}` — revoke device and all its sessions
+  - `PATCH /auth/me/devices/{device_id}` — update device `display_name` (1–80 chars, active only)
+- **RF-54** (new-device notifications): out of scope in this PR. `user_devices.trusted_at`
+  preserved for future use.
+
+- Runbook: [docs/runbooks/task-device-session-management.md](docs/runbooks/task-device-session-management.md)
+- Migration: `migrations/auth/000006_device_session_indexes.{up,down}.sql`
+- Out of scope: RF-54 notifications, frontend UI, admin RBAC device management, MFA
 
 ## Database migrations
 

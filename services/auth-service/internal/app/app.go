@@ -59,6 +59,7 @@ func New(cfg config.Config) *App {
 	})
 
 	var loginAttempts httpapi.LoginAttemptsManager
+	var deviceSessions *service.DeviceSessionService
 	switch {
 	case err != nil:
 		logger.Warn("auth token endpoints disabled", "reason", "invalid_jwt_config")
@@ -70,12 +71,13 @@ func New(cfg config.Config) *App {
 		password = service.NewPasswordResetService(tokens, storage.NewPGXPasswordResetStore(pool), service.WithPasswordResetOutboxEncryptor(emailOutboxEncryptor))
 		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool), service.WithInviteOutboxEncryptor(emailOutboxEncryptor))
 		loginAttempts = service.NewLoginAttemptsService(storage.NewPGXLoginAttemptsStore(pool))
+		deviceSessions = service.NewDeviceSessionService(storage.NewPGXDeviceSessionStore(pool))
 	}
 
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, deviceSessions, deviceSessions),
 		TracingShutdown: shutdown,
 	}
 }

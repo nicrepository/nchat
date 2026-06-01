@@ -15,3 +15,5 @@ var ErrInvalidRefreshToken = errors.New("invalid refresh token")
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
 var ErrInviteAlreadyPending = errors.New("active invite already exists for this email")
+
+var ErrNotFound = errors.New("not found")
