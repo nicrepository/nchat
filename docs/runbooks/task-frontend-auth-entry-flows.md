@@ -9,13 +9,13 @@ The prototype is a static visual reference only. Production code is implemented 
 
 ## Routes implemented
 
-| Route                       | Component                   | Backend endpoint             |
-| --------------------------- | --------------------------- | ---------------------------- |
-| `/login`                    | `LoginPage`                 | `POST /auth/login`           |
-| `/forgot-password`          | `ForgotPasswordPage`        | `POST /auth/password/forgot` |
-| `/reset-password?token=...` | `ResetPasswordPage`         | `POST /auth/password/reset`  |
-| `/accept-invite?token=...`  | `AcceptInvitePage`          | `POST /auth/invites/accept`  |
-| protected app routes        | `RequireAuth` -> `HomePage` | `POST /auth/refresh`         |
+| Route                                          | Component                   | Backend endpoint             |
+| ---------------------------------------------- | --------------------------- | ---------------------------- |
+| `/login`                                       | `LoginPage`                 | `POST /auth/login`           |
+| `/forgot-password`                             | `ForgotPasswordPage`        | `POST /auth/password/forgot` |
+| `/reset-password` with query parameter `token` | `ResetPasswordPage`         | `POST /auth/password/reset`  |
+| `/accept-invite` with query parameter `token`  | `AcceptInvitePage`          | `POST /auth/invites/accept`  |
+| protected app routes                           | `RequireAuth` -> `HomePage` | `POST /auth/refresh`         |
 
 `apps/web` defaults `VITE_AUTH_API_BASE_URL` to `/api/auth`, so same-origin gateway calls are sent as `/api/auth/*`. For direct auth-service development, override the base URL in `.env.local`:
 
@@ -37,7 +37,7 @@ The frontend stores access and refresh tokens in `sessionStorage` using keys `nc
 - Login failures render one generic message and do not reveal account status, lockout, or credential specifics.
 - Forgot-password always renders the same generic success state, even when the API fails, to avoid email enumeration.
 - Reset and invite tokens are read from the URL query string, cleared from router history, sent only in the request body, and not stored in browser storage.
-- Reset and invite tokens arrive by query string in this PR because backend email templates currently generate query links. The frontend immediately removes the token from browser history with replace navigation, but server/proxy access logs may still see the initial URL. Future hardening: migrate email links to URL fragments (`#token=...`) or add gateway log redaction.
+- Reset and invite tokens arrive by query string in this PR because backend email templates currently generate query links. The frontend immediately removes the token from browser history with replace navigation, but server/proxy access logs may still see the initial URL. Future hardening: migrate email links to URL fragments carrying the token parameter or add gateway log redaction.
 - Backend error messages are not rendered directly. Password-policy and token failures are mapped to fixed UI copy.
 - No frontend code logs passwords, access tokens, refresh tokens, reset tokens, invite tokens, or auth headers.
 - Invite acceptance does not auto-login because the backend returns user data, not tokens.

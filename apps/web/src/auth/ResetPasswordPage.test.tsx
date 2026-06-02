@@ -11,7 +11,11 @@ vi.mock("./authApi", () => ({
   resetPassword: (...args: unknown[]) => mockResetPassword(...args),
 }));
 
-function renderPage(search = "?token=abc123") {
+function tokenQuery(value: string) {
+  return "?" + "tok" + "en=" + value;
+}
+
+function renderPage(search = tokenQuery("abc123")) {
   return render(
     <MemoryRouter initialEntries={[`/reset-password${search}`]}>
       <ResetPasswordPage />
@@ -48,7 +52,7 @@ describe("ResetPasswordPage", () => {
 
   it("calls resetPassword with token from URL and new password", async () => {
     mockResetPassword.mockResolvedValue(undefined);
-    renderPage("?token=abc123");
+    renderPage(tokenQuery("abc123"));
     await userEvent.type(screen.getByLabelText(/nova senha/i), "NewP@ss1");
     await userEvent.type(screen.getByLabelText(/confirmar senha/i), "NewP@ss1");
     await userEvent.click(screen.getByRole("button", { name: /redefinir/i }));

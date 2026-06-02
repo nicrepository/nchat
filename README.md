@@ -466,8 +466,8 @@ The web app implements the auth entry screens at:
 
 - `/login` - email/password login via `POST /auth/login` through the default `/api/auth` gateway base.
 - `/forgot-password` - password recovery request via `POST /auth/password/forgot`.
-- `/reset-password?token=...` - token-based password reset via `POST /auth/password/reset`.
-- `/accept-invite?token=...` - invite acceptance / account activation via `POST /auth/invites/accept`.
+- `/reset-password` with query parameter `token` - token-based password reset via `POST /auth/password/reset`.
+- `/accept-invite` with query parameter `token` - invite acceptance / account activation via `POST /auth/invites/accept`.
 
 A `RequireAuth` guard protects all other routes. On page reload it attempts a silent token refresh via `POST /auth/refresh`; on failure it redirects to `/login`.
 

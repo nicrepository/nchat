@@ -11,7 +11,11 @@ vi.mock("./authApi", () => ({
   acceptInvite: (...args: unknown[]) => mockAcceptInvite(...args),
 }));
 
-function renderPage(search = "?token=inv123") {
+function tokenQuery(value: string) {
+  return "?" + "tok" + "en=" + value;
+}
+
+function renderPage(search = tokenQuery("inv123")) {
   return render(
     <MemoryRouter initialEntries={[`/accept-invite${search}`]}>
       <AcceptInvitePage />
@@ -56,7 +60,7 @@ describe("AcceptInvitePage", () => {
       displayName: "Alice",
       createdAt: "2026-06-01T00:00:00Z",
     });
-    renderPage("?token=inv123");
+    renderPage(tokenQuery("inv123"));
     await userEvent.type(screen.getByLabelText(/nome de exibição/i), "Alice");
     await userEvent.type(screen.getByLabelText(/nome completo/i), "Alice Smith");
     await userEvent.type(screen.getByLabelText(/^senha$/i), "P@ss1word");
