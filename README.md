@@ -460,6 +460,24 @@ failed-login lockout, optionally tracks devices, and returns an access/refresh t
 - Runbook: [docs/runbooks/task-email-password-login.md](docs/runbooks/task-email-password-login.md)
 - Out of scope: OAuth/OIDC, password reset, frontend auth flows, final RBAC, MFA, CAPTCHA, email verification gate, account unlock UI
 
+## Frontend auth entry flows
+
+The web app implements the auth entry screens at:
+
+- `/login` - email/password login via `POST /auth/login` through the default `/api/auth` gateway base.
+- `/forgot-password` - password recovery request via `POST /auth/password/forgot`.
+- `/reset-password` with query parameter `token` - token-based password reset via `POST /auth/password/reset`.
+- `/accept-invite` with query parameter `token` - invite acceptance / account activation via `POST /auth/invites/accept`.
+
+A `RequireAuth` guard protects all other routes. On page reload it attempts a silent token refresh via `POST /auth/refresh`; on failure it redirects to `/login`.
+
+Token storage: access and refresh tokens are kept in `sessionStorage` (keys `nchat_at` / `nchat_rt`). No `localStorage` is used.
+
+Visual reference: `prototype/claude-design-v1/nic-chat/login.html`, `tokens.css`, and `assets/` are reference-only static prototype artifacts and are not production code.
+
+- Runbook: [docs/runbooks/task-frontend-auth-entry-flows.md](docs/runbooks/task-frontend-auth-entry-flows.md)
+- Out of scope: backend auth changes, full SSO/OIDC flow, admin UI, RBAC, device/session UI, and migrations
+
 ## Session expiry, password recovery, and invites
 
 Auth-service implements RF-46, RF-48, and RF-51:
