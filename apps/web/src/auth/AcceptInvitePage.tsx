@@ -14,10 +14,7 @@ function readToken(search: string): string {
 }
 
 function inviteErrorMessage(error: unknown): string {
-  if (
-    error instanceof ApiRequestError &&
-    (error.code === "invalid_token" || error.code === "invalid_invite_token")
-  ) {
+  if (error instanceof ApiRequestError && error.code === "invalid_invite_token") {
     return "Convite inválido ou expirado. Solicite um novo convite.";
   }
 

@@ -28,7 +28,7 @@ export default function LoginPage() {
       const result = await login({ email, password, deviceName: "NIC Chat Web" });
       if (result.user.mustChangePassword) {
         // TODO(auth): route this state into the real change-password flow when available.
-        clearTokens();
+        clearTokens(); // evict any prior stale session; new tokens are intentionally not stored
         setPasswordChangeRequired(true);
         return;
       }

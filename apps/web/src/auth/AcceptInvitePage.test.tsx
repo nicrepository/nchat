@@ -105,8 +105,8 @@ describe("AcceptInvitePage", () => {
     expect(screen.getByRole("alert").textContent).not.toMatch(/expired/i);
   });
 
-  it("shows expired-invite error when invalid_token is returned with 400", async () => {
-    mockAcceptInvite.mockRejectedValue(new ApiRequestError(400, "invalid_token", "expired"));
+  it("shows expired-invite error when invalid_invite_token is returned with 401", async () => {
+    mockAcceptInvite.mockRejectedValue(new ApiRequestError(401, "invalid_invite_token", "expired"));
     renderPage();
     await userEvent.type(screen.getByLabelText(/nome de exibição/i), "Alice");
     await userEvent.type(screen.getByLabelText(/^senha$/i), "P@ss1word");
