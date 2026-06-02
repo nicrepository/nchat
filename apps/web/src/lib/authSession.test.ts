@@ -34,14 +34,14 @@ describe("authSession", () => {
     expect(getRefreshToken()).toBeNull();
   });
 
-  it("isAuthenticated returns true when both tokens are set", () => {
-    setTokens("acc_abc", "ref_xyz");
+  it("isAuthenticated returns true when access token is set", () => {
+    sessionStorage.setItem("nchat_at", "acc_abc");
     expect(isAuthenticated()).toBe(true);
   });
 
-  it("isAuthenticated returns true when only refresh token present (page reload scenario)", () => {
+  it("isAuthenticated returns false when only refresh token is set", () => {
     sessionStorage.setItem("nchat_rt", "ref_xyz");
-    expect(isAuthenticated()).toBe(true);
+    expect(isAuthenticated()).toBe(false);
   });
 
   it("isAuthenticated returns false when no tokens are stored", () => {

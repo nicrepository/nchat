@@ -81,6 +81,18 @@ describe("ResetPasswordPage", () => {
     expect(screen.getByRole("alert").textContent).not.toMatch(/expired/i);
   });
 
+  it("shows expired-link error when invalid_token is returned with 400", async () => {
+    mockResetPassword.mockRejectedValue(new ApiRequestError(400, "invalid_token", "expired"));
+    renderPage();
+    await userEvent.type(screen.getByLabelText(/nova senha/i), "NewP@ss1");
+    await userEvent.type(screen.getByLabelText(/confirmar senha/i), "NewP@ss1");
+    await userEvent.click(screen.getByRole("button", { name: /redefinir/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/link inválido ou expirado/i);
+    });
+    expect(screen.getByRole("alert").textContent).not.toMatch(/requisitos de segurança|expired/i);
+  });
+
   it("shows generic password policy message on 400 without raw backend text", async () => {
     mockResetPassword.mockRejectedValue(
       new ApiRequestError(400, "bad_request", "minimum length is 8 characters"),

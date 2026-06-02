@@ -18,8 +18,10 @@ vi.mock("react-router-dom", async () => {
 const mockLogin = vi.fn();
 vi.mock("./authApi", () => ({ login: (...args: unknown[]) => mockLogin(...args) }));
 
+const mockClearTokens = vi.fn();
 const mockSetTokens = vi.fn();
 vi.mock("../lib/authSession", () => ({
+  clearTokens: (...args: unknown[]) => mockClearTokens(...args),
   setTokens: (...args: unknown[]) => mockSetTokens(...args),
 }));
 
@@ -92,6 +94,26 @@ describe("LoginPage", () => {
       expect(mockSetTokens).toHaveBeenCalledWith("at", "rt");
       expect(mockNavigate).toHaveBeenCalledWith("/", { replace: true });
     });
+  });
+
+  it("blocks app navigation when password change is required", async () => {
+    mockLogin.mockResolvedValue({
+      accessToken: "at",
+      refreshToken: "rt",
+      tokenType: "Bearer",
+      expiresIn: 900,
+      user: { id: "u1", email: "a@b.com", displayName: "Alice", mustChangePassword: true },
+    });
+    renderLogin();
+    await userEvent.type(screen.getByLabelText(/e-mail corporativo/i), "a@b.com");
+    await userEvent.type(screen.getByLabelText(/senha/i), "temporary-pass");
+    await userEvent.click(screen.getByRole("button", { name: /entrar$/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/troca de senha obrigatória/i);
+    });
+    expect(mockClearTokens).toHaveBeenCalled();
+    expect(mockSetTokens).not.toHaveBeenCalled();
+    expect(mockNavigate).not.toHaveBeenCalledWith("/", expect.anything());
   });
 
   it("shows generic error message on 401 without revealing account status", async () => {

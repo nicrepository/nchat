@@ -37,6 +37,7 @@ The frontend stores access and refresh tokens in `sessionStorage` using keys `nc
 - Login failures render one generic message and do not reveal account status, lockout, or credential specifics.
 - Forgot-password always renders the same generic success state, even when the API fails, to avoid email enumeration.
 - Reset and invite tokens are read from the URL query string, cleared from router history, sent only in the request body, and not stored in browser storage.
+- Reset and invite tokens arrive by query string in this PR because backend email templates currently generate query links. The frontend immediately removes the token from browser history with replace navigation, but server/proxy access logs may still see the initial URL. Future hardening: migrate email links to URL fragments (`#token=...`) or add gateway log redaction.
 - Backend error messages are not rendered directly. Password-policy and token failures are mapped to fixed UI copy.
 - No frontend code logs passwords, access tokens, refresh tokens, reset tokens, invite tokens, or auth headers.
 - Invite acceptance does not auto-login because the backend returns user data, not tokens.

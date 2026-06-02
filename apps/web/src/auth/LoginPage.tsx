@@ -1,12 +1,14 @@
 import { type FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
-import { setTokens } from "../lib/authSession";
+import { clearTokens, setTokens } from "../lib/authSession";
 import "../tokens.css";
 import "./auth.css";
 import { login } from "./authApi";
 
 const LOGIN_ERROR = "E-mail ou senha inválidos. Tente novamente.";
+const CHANGE_PASSWORD_REQUIRED_MESSAGE =
+  "Troca de senha obrigatória ainda não implementada. Encerre a sessão e solicite suporte interno.";
 
 export default function LoginPage() {
   const navigate = useNavigate();
@@ -14,14 +16,22 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [passwordChangeRequired, setPasswordChangeRequired] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setLoading(true);
     setError(null);
+    setPasswordChangeRequired(false);
 
     try {
       const result = await login({ email, password, deviceName: "NIC Chat Web" });
+      if (result.user.mustChangePassword) {
+        // TODO(auth): route this state into the real change-password flow when available.
+        clearTokens();
+        setPasswordChangeRequired(true);
+        return;
+      }
       setTokens(result.accessToken, result.refreshToken);
       navigate("/", { replace: true });
     } catch {
@@ -29,6 +39,12 @@ export default function LoginPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function handleEndRequiredPasswordSession() {
+    clearTokens();
+    setPasswordChangeRequired(false);
+    setPassword("");
   }
 
   return (
@@ -49,77 +65,92 @@ export default function LoginPage() {
             </div>
           )}
 
-          <form className="auth-form" onSubmit={handleSubmit} noValidate>
-            <div className="auth-field">
-              <label className="auth-label" htmlFor="login-email">
-                E-mail corporativo
-              </label>
-              <div className="auth-input-wrap">
-                <span className="material-symbols-outlined auth-input-icon" aria-hidden="true">
-                  mail
-                </span>
-                <input
-                  id="login-email"
-                  className="auth-input"
-                  type="email"
-                  placeholder="nome@nic-labs.com"
-                  autoComplete="username"
-                  required
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  aria-invalid={error !== null ? "true" : undefined}
-                  aria-describedby={error !== null ? "login-error" : undefined}
-                />
+          {passwordChangeRequired ? (
+            <div className="auth-form">
+              <div className="auth-alert auth-alert--error" role="alert">
+                {CHANGE_PASSWORD_REQUIRED_MESSAGE}
               </div>
-            </div>
-
-            <div className="auth-field">
-              <label className="auth-label" htmlFor="login-password">
-                Senha
-              </label>
-              <div className="auth-input-wrap">
-                <span className="material-symbols-outlined auth-input-icon" aria-hidden="true">
-                  lock
-                </span>
-                <input
-                  id="login-password"
-                  className="auth-input"
-                  type="password"
-                  placeholder="********"
-                  autoComplete="current-password"
-                  required
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  aria-invalid={error !== null ? "true" : undefined}
-                  aria-describedby={error !== null ? "login-error" : undefined}
-                />
-              </div>
-            </div>
-
-            <div className="auth-actions">
-              <button type="submit" className="auth-btn auth-btn--primary" disabled={loading}>
-                <span className="material-symbols-outlined auth-btn-icon" aria-hidden="true">
-                  login
-                </span>
-                {loading ? "Entrando..." : "Entrar"}
-              </button>
               <button
                 type="button"
                 className="auth-btn auth-btn--secondary"
-                disabled
-                title="SSO não disponível nesta versão"
+                onClick={handleEndRequiredPasswordSession}
               >
-                <span className="material-symbols-outlined auth-btn-icon" aria-hidden="true">
-                  shield_locked
-                </span>
-                Entrar com SSO (em breve)
+                Encerrar sessão
               </button>
             </div>
+          ) : (
+            <form className="auth-form" onSubmit={handleSubmit} noValidate>
+              <div className="auth-field">
+                <label className="auth-label" htmlFor="login-email">
+                  E-mail corporativo
+                </label>
+                <div className="auth-input-wrap">
+                  <span className="material-symbols-outlined auth-input-icon" aria-hidden="true">
+                    mail
+                  </span>
+                  <input
+                    id="login-email"
+                    className="auth-input"
+                    type="email"
+                    placeholder="nome@nic-labs.com"
+                    autoComplete="username"
+                    required
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    aria-invalid={error !== null ? "true" : undefined}
+                    aria-describedby={error !== null ? "login-error" : undefined}
+                  />
+                </div>
+              </div>
 
-            <Link to="/forgot-password" className="auth-link">
-              Esqueci minha senha
-            </Link>
-          </form>
+              <div className="auth-field">
+                <label className="auth-label" htmlFor="login-password">
+                  Senha
+                </label>
+                <div className="auth-input-wrap">
+                  <span className="material-symbols-outlined auth-input-icon" aria-hidden="true">
+                    lock
+                  </span>
+                  <input
+                    id="login-password"
+                    className="auth-input"
+                    type="password"
+                    placeholder="********"
+                    autoComplete="current-password"
+                    required
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    aria-invalid={error !== null ? "true" : undefined}
+                    aria-describedby={error !== null ? "login-error" : undefined}
+                  />
+                </div>
+              </div>
+
+              <div className="auth-actions">
+                <button type="submit" className="auth-btn auth-btn--primary" disabled={loading}>
+                  <span className="material-symbols-outlined auth-btn-icon" aria-hidden="true">
+                    login
+                  </span>
+                  {loading ? "Entrando..." : "Entrar"}
+                </button>
+                <button
+                  type="button"
+                  className="auth-btn auth-btn--secondary"
+                  disabled
+                  title="SSO não disponível nesta versão"
+                >
+                  <span className="material-symbols-outlined auth-btn-icon" aria-hidden="true">
+                    shield_locked
+                  </span>
+                  Entrar com SSO (em breve)
+                </button>
+              </div>
+
+              <Link to="/forgot-password" className="auth-link">
+                Esqueci minha senha
+              </Link>
+            </form>
+          )}
         </section>
       </main>
       <footer className="auth-footer">

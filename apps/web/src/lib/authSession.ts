@@ -20,8 +20,5 @@ export function clearTokens(): void {
 }
 
 export function isAuthenticated(): boolean {
-  return (
-    sessionStorage.getItem(ACCESS_TOKEN_KEY) !== null ||
-    sessionStorage.getItem(REFRESH_TOKEN_KEY) !== null
-  );
+  return sessionStorage.getItem(ACCESS_TOKEN_KEY) !== null;
 }

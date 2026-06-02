@@ -13,12 +13,12 @@ function readToken(search: string): string {
 }
 
 function resetErrorMessage(error: unknown): string {
-  if (error instanceof ApiRequestError && error.status === 400) {
-    return "A senha não atende aos requisitos de segurança.";
-  }
-
   if (error instanceof ApiRequestError && error.code === "invalid_token") {
     return "Link inválido ou expirado. Solicite uma nova redefinição.";
+  }
+
+  if (error instanceof ApiRequestError && error.status === 400) {
+    return "A senha não atende aos requisitos de segurança.";
   }
 
   return "Não foi possível redefinir a senha. Tente novamente.";

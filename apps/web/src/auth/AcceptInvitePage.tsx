@@ -14,12 +14,15 @@ function readToken(search: string): string {
 }
 
 function inviteErrorMessage(error: unknown): string {
-  if (error instanceof ApiRequestError && error.status === 400) {
-    return "A senha não atende aos requisitos de segurança.";
+  if (
+    error instanceof ApiRequestError &&
+    (error.code === "invalid_token" || error.code === "invalid_invite_token")
+  ) {
+    return "Convite inválido ou expirado. Solicite um novo convite.";
   }
 
-  if (error instanceof ApiRequestError && error.code === "invalid_invite_token") {
-    return "Convite inválido ou expirado. Solicite um novo convite.";
+  if (error instanceof ApiRequestError && error.status === 400) {
+    return "A senha não atende aos requisitos de segurança.";
   }
 
   return "Não foi possível ativar a conta. Tente novamente.";

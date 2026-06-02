@@ -105,6 +105,19 @@ describe("AcceptInvitePage", () => {
     expect(screen.getByRole("alert").textContent).not.toMatch(/expired/i);
   });
 
+  it("shows expired-invite error when invalid_token is returned with 400", async () => {
+    mockAcceptInvite.mockRejectedValue(new ApiRequestError(400, "invalid_token", "expired"));
+    renderPage();
+    await userEvent.type(screen.getByLabelText(/nome de exibição/i), "Alice");
+    await userEvent.type(screen.getByLabelText(/^senha$/i), "P@ss1word");
+    await userEvent.type(screen.getByLabelText(/confirmar senha/i), "P@ss1word");
+    await userEvent.click(screen.getByRole("button", { name: /ativar/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/convite inválido ou expirado/i);
+    });
+    expect(screen.getByRole("alert").textContent).not.toMatch(/requisitos de segurança|expired/i);
+  });
+
   it("shows generic password policy error from backend on 400", async () => {
     mockAcceptInvite.mockRejectedValue(
       new ApiRequestError(400, "bad_request", "minimum length is 8 characters"),
