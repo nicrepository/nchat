@@ -1,0 +1,43 @@
+/* Design tokens — ported from prototype/claude-design-v1/nic-chat/tokens.css */
+:root {
+  /* Brand */
+  --color-primary: #6d28d9;
+  --color-primary-strong: #5b21b6;
+  --color-primary-soft: #a865f7;
+  --color-primary-tint: #f3ebfb;
+
+  /* Surfaces */
+  --color-bg: #f7f5fb;
+  --color-surface: #ffffff;
+  --color-surface-2: #faf8fd;
+  --color-border: #e8e3f0;
+  --color-border-strong: #d4cde3;
+
+  /* Text */
+  --color-ink: #16121f;
+  --color-ink-2: #3d3550;
+  --color-muted: #7c7390;
+  --color-muted-2: #a39cb3;
+
+  /* Semantic */
+  --color-danger: #dc2626;
+  --color-danger-tint: #fee2e2;
+  --color-danger-ink: #991b1b;
+  --color-success: #16a34a;
+  --color-success-tint: #dcfce7;
+  --color-success-ink: #166534;
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(22, 18, 31, 0.05);
+  --shadow-md: 0 4px 16px rgba(22, 18, 31, 0.06);
+  --shadow-lg: 0 12px 40px rgba(22, 18, 31, 0.1);
+
+  /* Typography */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
