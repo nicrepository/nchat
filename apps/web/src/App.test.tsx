@@ -1,18 +1,17 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import App from "./App";
+import { clearTokens } from "./lib/authSession";
+
+beforeEach(() => {
+  clearTokens();
+  window.history.pushState({}, "", "/");
+});
 
 describe("App", () => {
-  it("renders the NChat title", () => {
+  it("renders the login page when user is not authenticated", async () => {
     render(<App />);
-
-    expect(screen.getByRole("heading", { name: "NChat" })).toBeInTheDocument();
-  });
-
-  it("renders the bootstrap status", () => {
-    render(<App />);
-
-    expect(screen.getByText("MVP bootstrap ready")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /entrar no nic chat/i })).toBeInTheDocument();
   });
 });
