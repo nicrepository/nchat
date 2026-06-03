@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { acceptInvite, forgotPassword, login, logout, refresh, resetPassword } from "./authApi";
+import {
+  acceptInvite,
+  forgotPassword,
+  login,
+  logout,
+  oidcExchange,
+  oidcLoginUrl,
+  refresh,
+  resetPassword,
+} from "./authApi";
 
 const mockFetch = vi.fn<typeof fetch>();
 vi.stubGlobal("fetch", mockFetch);
@@ -198,5 +207,56 @@ describe("acceptInvite", () => {
     await expect(
       acceptInvite({ token: "bad", displayName: "X", password: "P@ss1" }),
     ).rejects.toMatchObject({ code: "invalid_invite_token" });
+  });
+});
+
+describe("oidcLoginUrl", () => {
+  it("points to backend Keycloak login endpoint", () => {
+    expect(oidcLoginUrl()).toBe("/api/auth/oidc/keycloak/login");
+  });
+});
+
+describe("oidcExchange", () => {
+  it("calls POST /api/auth/oidc/keycloak/exchange with opaque code", async () => {
+    mockFetch.mockResolvedValue(
+      jsonOk({
+        access_token: "at",
+        refresh_token: "rt",
+        token_type: "Bearer",
+        expires_in: 900,
+        user: {
+          id: "u1",
+          email: "sso@example.com",
+          display_name: "SSO User",
+          must_change_password: false,
+        },
+      }),
+    );
+
+    const result = await oidcExchange("opaque-code");
+
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/auth/oidc/keycloak/exchange");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ code: "opaque-code" });
+    expect(result.accessToken).toBe("at");
+    expect(result.refreshToken).toBe("rt");
+    expect(result.user.displayName).toBe("SSO User");
+  });
+
+  it("propagates generic OIDC ApiRequestError", async () => {
+    mockFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { code: "invalid_oidc_callback", message: "failed" } }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await expect(oidcExchange("bad-code")).rejects.toMatchObject({
+      code: "invalid_oidc_callback",
+    });
   });
 });

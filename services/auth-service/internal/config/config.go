@@ -1,6 +1,12 @@
 package config
 
-import platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+import (
+	"net/url"
+	"strings"
+
+	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
+)
 
 const (
 	serviceName = "auth-service"
@@ -12,6 +18,12 @@ const (
 	defaultRefreshTokenTTLSeconds          = 2592000
 	defaultTokenEndpointRateLimitPerMinute = 60
 	defaultTokenEndpointRateLimitBurst     = 10
+
+	defaultOIDCProviderName        = "keycloak"
+	defaultOIDCScopes              = "openid email profile"
+	defaultOIDCHTTPTimeoutSeconds  = 10
+	defaultOIDCStateTTLMinutes     = 10
+	defaultOIDCAutoProvisionEnable = false
 )
 
 type Config struct {
@@ -30,6 +42,18 @@ type Config struct {
 	AuthRefreshTokenTTLSeconds          int
 	AuthTokenEndpointRateLimitPerMinute int
 	AuthTokenEndpointRateLimitBurst     int
+	OIDCEnabled                         bool
+	OIDCProviderName                    string
+	OIDCIssuerURL                       string
+	OIDCClientID                        string
+	OIDCClientSecret                    string
+	OIDCRedirectURL                     string
+	OIDCFrontendCallbackURL             string
+	OIDCScopes                          string
+	OIDCHTTPTimeoutSeconds              int
+	OIDCStateTTLMinutes                 int
+	OIDCAutoProvisionEnabled            bool
+	OIDCAllowedEmailDomains             string
 	// AuthTrustedProxyCIDRs is a comma-separated list of CIDRs (e.g. "10.0.0.0/8,172.16.0.0/12")
 	// whose X-Forwarded-For header is trusted for client-IP extraction by the rate limiter.
 	// Leave empty (default) to always use RemoteAddr — safe for direct or single-instance deployments.
@@ -54,8 +78,50 @@ func Load() Config {
 		AuthRefreshTokenTTLSeconds:          positiveInt("AUTH_REFRESH_TOKEN_TTL_SECONDS", defaultRefreshTokenTTLSeconds),
 		AuthTokenEndpointRateLimitPerMinute: positiveInt("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE", defaultTokenEndpointRateLimitPerMinute),
 		AuthTokenEndpointRateLimitBurst:     positiveInt("AUTH_TOKEN_ENDPOINT_RATE_LIMIT_BURST", defaultTokenEndpointRateLimitBurst),
+		OIDCEnabled:                         platformconfig.GetBool("OIDC_ENABLED", false),
+		OIDCProviderName:                    strings.TrimSpace(platformconfig.GetString("OIDC_PROVIDER_NAME", defaultOIDCProviderName)),
+		OIDCIssuerURL:                       strings.TrimRight(strings.TrimSpace(platformconfig.GetString("OIDC_ISSUER_URL", "")), "/"),
+		OIDCClientID:                        strings.TrimSpace(platformconfig.GetString("OIDC_CLIENT_ID", "")),
+		OIDCClientSecret:                    platformconfig.GetString("OIDC_CLIENT_SECRET", ""),
+		OIDCRedirectURL:                     strings.TrimSpace(platformconfig.GetString("OIDC_REDIRECT_URL", "")),
+		OIDCFrontendCallbackURL:             strings.TrimSpace(platformconfig.GetString("OIDC_FRONTEND_CALLBACK_URL", "")),
+		OIDCScopes:                          strings.TrimSpace(platformconfig.GetString("OIDC_SCOPES", defaultOIDCScopes)),
+		OIDCHTTPTimeoutSeconds:              positiveInt("OIDC_HTTP_TIMEOUT_SECONDS", defaultOIDCHTTPTimeoutSeconds),
+		OIDCStateTTLMinutes:                 positiveInt("OIDC_STATE_TTL_MINUTES", defaultOIDCStateTTLMinutes),
+		OIDCAutoProvisionEnabled:            platformconfig.GetBool("OIDC_AUTO_PROVISION_ENABLED", defaultOIDCAutoProvisionEnable),
+		OIDCAllowedEmailDomains:             strings.TrimSpace(platformconfig.GetString("OIDC_ALLOWED_EMAIL_DOMAINS", "")),
 		AuthTrustedProxyCIDRs:               platformconfig.GetString("AUTH_TRUSTED_PROXY_CIDRS", ""),
 	}
+}
+
+func (c Config) ValidateOIDC() error {
+	if !c.OIDCEnabled {
+		return nil
+	}
+	if strings.ToLower(strings.TrimSpace(c.OIDCProviderName)) != defaultOIDCProviderName {
+		return domain.ErrOIDCMisconfigured
+	}
+	if strings.TrimSpace(c.OIDCIssuerURL) == "" || strings.TrimSpace(c.OIDCClientID) == "" || strings.TrimSpace(c.OIDCClientSecret) == "" || strings.TrimSpace(c.OIDCRedirectURL) == "" || strings.TrimSpace(c.OIDCFrontendCallbackURL) == "" {
+		return domain.ErrOIDCMisconfigured
+	}
+	if !validOIDCFrontendCallbackPath(c.OIDCFrontendCallbackURL) {
+		return domain.ErrOIDCMisconfigured
+	}
+	return nil
+}
+
+func validOIDCFrontendCallbackPath(callbackPath string) bool {
+	if strings.ContainsAny(callbackPath, "\r\n") {
+		return false
+	}
+	if !strings.HasPrefix(callbackPath, "/") || strings.HasPrefix(callbackPath, "//") {
+		return false
+	}
+	parsed, err := url.Parse(callbackPath)
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "" && parsed.Host == "" && parsed.User == nil && parsed.Fragment == "" && parsed.RawQuery == "" && parsed.Path == domain.OIDCFrontendCallbackPath
 }
 
 func positiveInt(key string, fallback int) int {

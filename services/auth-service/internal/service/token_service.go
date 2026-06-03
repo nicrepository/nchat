@@ -19,6 +19,9 @@ const (
 	bearerTokenType          = "Bearer"
 	passwordResetTokenPrefix = "nchat-password-reset-v1:"
 	inviteTokenPrefix        = "nchat-invite-v1:" //nolint:gosec // G101: HMAC domain-separation label, not a credential
+	oidcStatePrefix          = "nchat-oidc-state-v1:"
+	oidcNoncePrefix          = "nchat-oidc-nonce-v1:"
+	oidcExchangeCodePrefix   = "nchat-oidc-exchange-code-v1:"
 )
 
 // TokenConfig contains the cryptographic token settings used by auth-service.
@@ -145,6 +148,18 @@ func (m *TokenManager) HashPasswordResetToken(raw string) string {
 
 func (m *TokenManager) HashInviteToken(raw string) string {
 	return m.hashDomainToken(inviteTokenPrefix, raw)
+}
+
+func (m *TokenManager) HashOIDCState(raw string) string {
+	return m.hashDomainToken(oidcStatePrefix, raw)
+}
+
+func (m *TokenManager) HashOIDCNonce(raw string) string {
+	return m.hashDomainToken(oidcNoncePrefix, raw)
+}
+
+func (m *TokenManager) HashOIDCExchangeCode(raw string) string {
+	return m.hashDomainToken(oidcExchangeCodePrefix, raw)
 }
 
 func (m *TokenManager) hashDomainToken(prefix string, raw string) string {

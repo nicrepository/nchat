@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/emailcrypto"
@@ -32,6 +33,7 @@ func New(cfg config.Config) *App {
 	var login service.LoginManager
 	var password service.PasswordRecoveryManager
 	var invites service.InviteManager
+	var oidc service.OIDCManager
 	var pool storage.Pool
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -74,10 +76,71 @@ func New(cfg config.Config) *App {
 		deviceSessions = service.NewDeviceSessionService(storage.NewPGXDeviceSessionStore(pool))
 	}
 
+	if cfg.OIDCEnabled {
+		allowedDomains := splitOIDCDomains(cfg.OIDCAllowedEmailDomains)
+		warnOIDCAllowedEmailDomainsUnset(logger, cfg, allowedDomains)
+		oidcConfigured := true
+		if oidcErr := cfg.ValidateOIDC(); oidcErr != nil {
+			logger.Warn("oidc endpoints unavailable", "reason", "invalid_oidc_config")
+			oidcConfigured = false
+		}
+		if err != nil || pool == nil {
+			logger.Warn("oidc endpoints unavailable", "reason", "auth_dependencies_unavailable")
+			oidcConfigured = false
+		}
+
+		var oidcStore service.OIDCStore
+		var provider service.OIDCProvider
+		if oidcConfigured {
+			oidcStore = storage.NewPGXOIDCStore(pool)
+			provider = service.NewKeycloakProvider(service.KeycloakProviderConfig{
+				IssuerURL:    cfg.OIDCIssuerURL,
+				ClientID:     cfg.OIDCClientID,
+				ClientSecret: cfg.OIDCClientSecret,
+				RedirectURL:  cfg.OIDCRedirectURL,
+				Scopes:       cfg.OIDCScopes,
+				HTTPTimeout:  time.Duration(cfg.OIDCHTTPTimeoutSeconds) * time.Second,
+			})
+		}
+		oidcService, oidcErr := service.NewOIDCService(service.OIDCServiceConfig{
+			Enabled:             cfg.OIDCEnabled,
+			Configured:          oidcConfigured,
+			ProviderName:        cfg.OIDCProviderName,
+			FrontendCallbackURL: cfg.OIDCFrontendCallbackURL,
+			StateTTL:            time.Duration(cfg.OIDCStateTTLMinutes) * time.Minute,
+			AutoProvision:       cfg.OIDCAutoProvisionEnabled,
+			AllowedDomains:      allowedDomains,
+		}, tokens, oidcStore, provider)
+		if oidcErr != nil {
+			logger.Warn("oidc endpoints unavailable", "reason", "oidc_service_init_failed")
+		} else {
+			oidc = oidcService
+		}
+	}
+
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, deviceSessions, deviceSessions),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, deviceSessions, deviceSessions, oidc),
 		TracingShutdown: shutdown,
 	}
+}
+
+func splitOIDCDomains(raw string) []string {
+	parts := strings.Split(raw, ",")
+	domains := make([]string, 0, len(parts))
+	for _, part := range parts {
+		domain := strings.ToLower(strings.TrimSpace(part))
+		if domain != "" {
+			domains = append(domains, domain)
+		}
+	}
+	return domains
+}
+
+func warnOIDCAllowedEmailDomainsUnset(logger *slog.Logger, cfg config.Config, domains []string) {
+	if logger == nil || !cfg.OIDCEnabled || len(domains) > 0 {
+		return
+	}
+	logger.Warn("OIDC_ALLOWED_EMAIL_DOMAINS is not set; all email domains are permitted")
 }

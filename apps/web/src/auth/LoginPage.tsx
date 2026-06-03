@@ -4,7 +4,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { clearTokens, setTokens } from "../lib/authSession";
 import "../tokens.css";
 import "./auth.css";
-import { login } from "./authApi";
+import { login, oidcLoginUrl } from "./authApi";
 
 const LOGIN_ERROR = "E-mail ou senha inválidos. Tente novamente.";
 const CHANGE_PASSWORD_REQUIRED_MESSAGE =
@@ -133,17 +133,12 @@ export default function LoginPage() {
                   </span>
                   {loading ? "Entrando..." : "Entrar"}
                 </button>
-                <button
-                  type="button"
-                  className="auth-btn auth-btn--secondary"
-                  disabled
-                  title="SSO não disponível nesta versão"
-                >
+                <a className="auth-btn auth-btn--secondary" href={oidcLoginUrl()}>
                   <span className="material-symbols-outlined auth-btn-icon" aria-hidden="true">
                     shield_locked
                   </span>
-                  Entrar com SSO (em breve)
-                </button>
+                  Entrar com Keycloak
+                </a>
               </div>
 
               <Link to="/forgot-password" className="auth-link">
