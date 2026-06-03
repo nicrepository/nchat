@@ -82,6 +82,11 @@ build/
 storybook-static/
 *.tsbuildinfo
 
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
 # Docker and containers
 .docker/
 docker-compose.override.yml
