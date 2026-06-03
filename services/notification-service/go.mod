@@ -3,8 +3,9 @@ module github.com/nicrepository/nchat/services/notification-service
 go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/nicrepository/nchat/libs/go/platform v0.0.0
+	github.com/pashagolub/pgxmock/v2 v2.12.0
 )
 
 require (
