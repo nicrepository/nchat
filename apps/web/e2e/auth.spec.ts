@@ -51,9 +51,7 @@ async function mockRefreshApi(page: Page) {
 }
 
 async function mockForgotPasswordApi(page: Page) {
-  await page.route("**/api/auth/password/forgot", (route) =>
-    route.fulfill({ status: 204 }),
-  );
+  await page.route("**/api/auth/password/forgot", (route) => route.fulfill({ status: 204 }));
 }
 
 async function performLogin(page: Page) {
