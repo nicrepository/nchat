@@ -2,6 +2,8 @@ package domain
 
 import "time"
 
+const OIDCFrontendCallbackPath = "/oidc-callback"
+
 // Session identifies an active auth.user_sessions row that can receive tokens.
 type Session struct {
 	ID     string
@@ -105,6 +107,91 @@ type AcceptInviteResult struct {
 	DisplayName string
 	FullName    string
 	CreatedAt   time.Time
+}
+
+// OIDCLoginRequest stores generated one-time login request material.
+type OIDCLoginRequest struct {
+	ID                    string
+	Provider              string
+	StateHash             string
+	NonceHash             string
+	PKCEVerifierEncrypted string
+	RedirectAfter         string
+	ExpiresAt             time.Time
+}
+
+// OIDCConsumedAuthRequest is returned after a state value is atomically consumed.
+type OIDCConsumedAuthRequest struct {
+	ID                    string
+	Provider              string
+	NonceHash             string
+	PKCEVerifierEncrypted string
+	RedirectAfter         string
+}
+
+// OIDCClaims carries the validated identity claims used by nchat.
+type OIDCClaims struct {
+	Subject           string
+	Email             string
+	EmailVerified     bool
+	PreferredUsername string
+	Name              string
+	Nonce             string
+}
+
+// OIDCSessionInput carries provider identity and internal session material for atomic persistence.
+type OIDCSessionInput struct {
+	Provider              string
+	Subject               string
+	Email                 string
+	DisplayName           string
+	RefreshTokenHash      string
+	RefreshExpiresAt      time.Time
+	DeviceFingerprintHash string
+	DeviceName            string
+	Platform              string
+	IPAddress             string
+	UserAgent             string
+	AutoProvision         bool
+}
+
+// OIDCExchangeInput carries a one-time frontend exchange row.
+type OIDCExchangeInput struct {
+	ID                    string
+	Provider              string
+	CodeHash              string
+	AccessValueEncrypted  string
+	RefreshValueEncrypted string
+	BearerScheme          string
+	ExpiresIn             int
+	User                  LoginUser
+	ExpiresAt             time.Time
+}
+
+// OIDCConsumedExchange is returned after a frontend exchange code is atomically consumed.
+type OIDCConsumedExchange struct {
+	ID                    string
+	Provider              string
+	AccessValueEncrypted  string
+	RefreshValueEncrypted string
+	BearerScheme          string
+	ExpiresIn             int
+	User                  LoginUser
+}
+
+// OIDCCreatedSession is returned after OIDC user resolution, session creation, and exchange insertion.
+type OIDCCreatedSession struct {
+	Session Session
+	User    LoginUser
+}
+
+// OIDCExchangeResult is returned to the frontend after consuming a one-time exchange code.
+type OIDCExchangeResult struct {
+	AccessToken  string
+	RefreshToken string
+	TokenType    string
+	ExpiresIn    int
+	User         LoginUser
 }
 
 // LoginAttempt is a single failed login attempt record for a user.

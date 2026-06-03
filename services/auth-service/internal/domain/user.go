@@ -3,15 +3,17 @@ package domain
 import "time"
 
 type User struct {
-	ID              string
-	Email           string
-	DisplayName     string
-	FullName        string
-	Status          string
-	AuthSource      string
-	EmailVerifiedAt time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID               string
+	Email            string
+	DisplayName      string
+	FullName         string
+	Status           string
+	AuthSource       string
+	ExternalProvider string
+	ExternalSubject  string
+	EmailVerifiedAt  time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type PolicySettings struct {

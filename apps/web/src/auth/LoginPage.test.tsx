@@ -16,7 +16,10 @@ vi.mock("react-router-dom", async () => {
 });
 
 const mockLogin = vi.fn();
-vi.mock("./authApi", () => ({ login: (...args: unknown[]) => mockLogin(...args) }));
+vi.mock("./authApi", () => ({
+  login: (...args: unknown[]) => mockLogin(...args),
+  oidcLoginUrl: () => "/api/auth/oidc/keycloak/login",
+}));
 
 const mockClearTokens = vi.fn();
 const mockSetTokens = vi.fn();
@@ -45,10 +48,10 @@ describe("LoginPage", () => {
     expect(screen.getByRole("button", { name: /entrar$/i })).toBeInTheDocument();
   });
 
-  it("renders disabled SSO button", () => {
+  it("renders active Keycloak SSO entry", () => {
     renderLogin();
-    const ssoBtn = screen.getByRole("button", { name: /sso/i });
-    expect(ssoBtn).toBeDisabled();
+    const ssoLink = screen.getByRole("link", { name: /entrar com keycloak/i });
+    expect(ssoLink).toHaveAttribute("href", "/api/auth/oidc/keycloak/login");
   });
 
   it("renders link to forgot-password page", () => {

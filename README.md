@@ -409,15 +409,15 @@ Os servicos Go seguem uma estrutura interna padronizada:
 - `internal/storage`: persistencia futura.
 - `libs/go/platform`: utilitarios compartilhados para config, HTTP, logging e health.
 
-| Service              | Default port | Current endpoints                                                                                                                                                                                                      |
-| -------------------- | -----------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept, /auth/me/login-attempts, /auth/me/sessions, /auth/me/devices |
-| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                                                                                            |
-| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                                                                                            |
-| notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                                                       |
-| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                                                            |
-| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                                                            |
-| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                                                                                            |
+| Service              | Default port | Current endpoints                                                                                                                                                                                                                                                                                             |
+| -------------------- | -----------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept, /auth/me/login-attempts, /auth/me/sessions, /auth/me/devices, /auth/oidc/keycloak/login, /auth/oidc/keycloak/callback, /auth/oidc/keycloak/exchange |
+| chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
+| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
+| notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                                                                                                                                              |
+| admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
+| search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
+| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
 
 ## Auth data model
 
@@ -493,6 +493,20 @@ Reset and invite tokens are opaque random values. Only domain-separated HMAC-SHA
 - Runbook: [docs/runbooks/task-auth-session-recovery-invites.md](docs/runbooks/task-auth-session-recovery-invites.md)
 - Migration: `migrations/auth/000004_auth_session_recovery_invites.{up,down}.sql`
 - Out of scope: frontend screens, OAuth/OIDC, final RBAC, auto-login after reset/invite acceptance
+
+## Keycloak OIDC login
+
+Auth-service implements RF-44 with Keycloak as the first OIDC provider. The flow adds SSO beside email/password login and keeps existing JWT access/refresh issuance, session expiry, device tracking, and manual account behavior unchanged.
+
+- Start: `GET /auth/oidc/keycloak/login`
+- Provider callback: `GET /auth/oidc/keycloak/callback`
+- Frontend exchange: `POST /auth/oidc/keycloak/exchange`
+- Web route: `/oidc-callback`
+- User linking: existing `(external_provider, external_subject)` users log in; new verified emails are auto-provisioned when enabled; manual same-email accounts are not silently linked.
+- Required provider values use secret refs in Kubernetes. `OIDC_ENABLED=false` by default.
+- Runbook: [docs/runbooks/task-auth-oidc-keycloak.md](docs/runbooks/task-auth-oidc-keycloak.md)
+- Migration: `migrations/auth/000007_oidc_keycloak_provider.{up,down}.sql`
+- Out of scope: Azure AD, Google Workspace, MFA, SCIM, admin provider UI, and advanced account linking.
 
 ## JWT access and refresh tokens
 

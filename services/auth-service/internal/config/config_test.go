@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
+)
 
 func TestLoadDefaults(t *testing.T) {
 	cfg := Load()
@@ -179,5 +184,165 @@ func TestLoadAuthTokenEndpointRateLimitInvalidUsesDefault(t *testing.T) {
 	}
 	if cfg.AuthTokenEndpointRateLimitBurst != 10 {
 		t.Fatalf("expected default token endpoint burst 10, got %d", cfg.AuthTokenEndpointRateLimitBurst)
+	}
+}
+
+func TestLoadOIDCDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.OIDCEnabled {
+		t.Fatal("expected OIDC disabled by default")
+	}
+	if cfg.OIDCProviderName != "keycloak" {
+		t.Fatalf("expected keycloak provider, got %q", cfg.OIDCProviderName)
+	}
+	if cfg.OIDCScopes != "openid email profile" {
+		t.Fatalf("expected default scopes, got %q", cfg.OIDCScopes)
+	}
+	if cfg.OIDCHTTPTimeoutSeconds != 10 {
+		t.Fatalf("expected HTTP timeout 10, got %d", cfg.OIDCHTTPTimeoutSeconds)
+	}
+	if cfg.OIDCStateTTLMinutes != 10 {
+		t.Fatalf("expected state ttl 10, got %d", cfg.OIDCStateTTLMinutes)
+	}
+	if cfg.OIDCAutoProvisionEnabled {
+		t.Fatal("expected auto-provision disabled by default")
+	}
+	if cfg.OIDCAllowedEmailDomains != "" {
+		t.Fatalf("expected empty domain allowlist, got %q", cfg.OIDCAllowedEmailDomains)
+	}
+	if err := cfg.ValidateOIDC(); err != nil {
+		t.Fatalf("disabled OIDC config should validate, got %v", err)
+	}
+}
+
+func TestLoadOIDCOverrides(t *testing.T) {
+	t.Setenv("OIDC_ENABLED", "true")
+	t.Setenv("OIDC_PROVIDER_NAME", "keycloak")
+	t.Setenv("OIDC_ISSUER_URL", "https://keycloak.example.com/realms/nchat")
+	t.Setenv("OIDC_CLIENT_ID", "nchat-web")
+	t.Setenv("OIDC_CLIENT_SECRET", "client-secret")
+	t.Setenv("OIDC_REDIRECT_URL", "https://auth.example.com/auth/oidc/keycloak/callback")
+	t.Setenv("OIDC_FRONTEND_CALLBACK_URL", "/oidc-callback")
+	t.Setenv("OIDC_SCOPES", "openid email")
+	t.Setenv("OIDC_HTTP_TIMEOUT_SECONDS", "3")
+	t.Setenv("OIDC_STATE_TTL_MINUTES", "7")
+	t.Setenv("OIDC_AUTO_PROVISION_ENABLED", "false")
+	t.Setenv("OIDC_ALLOWED_EMAIL_DOMAINS", "nic.br,example.com")
+
+	cfg := Load()
+
+	if !cfg.OIDCEnabled {
+		t.Fatal("expected OIDC enabled")
+	}
+	if cfg.OIDCIssuerURL != "https://keycloak.example.com/realms/nchat" {
+		t.Fatalf("unexpected issuer %q", cfg.OIDCIssuerURL)
+	}
+	if cfg.OIDCClientID != "nchat-web" {
+		t.Fatalf("unexpected client id %q", cfg.OIDCClientID)
+	}
+	if cfg.OIDCClientSecret != "client-secret" {
+		t.Fatalf("unexpected client secret %q", cfg.OIDCClientSecret)
+	}
+	if cfg.OIDCRedirectURL != "https://auth.example.com/auth/oidc/keycloak/callback" {
+		t.Fatalf("unexpected redirect url %q", cfg.OIDCRedirectURL)
+	}
+	if cfg.OIDCFrontendCallbackURL != "/oidc-callback" {
+		t.Fatalf("unexpected frontend callback url %q", cfg.OIDCFrontendCallbackURL)
+	}
+	if cfg.OIDCScopes != "openid email" {
+		t.Fatalf("unexpected scopes %q", cfg.OIDCScopes)
+	}
+	if cfg.OIDCHTTPTimeoutSeconds != 3 {
+		t.Fatalf("unexpected HTTP timeout %d", cfg.OIDCHTTPTimeoutSeconds)
+	}
+	if cfg.OIDCStateTTLMinutes != 7 {
+		t.Fatalf("unexpected state ttl %d", cfg.OIDCStateTTLMinutes)
+	}
+	if cfg.OIDCAutoProvisionEnabled {
+		t.Fatal("expected auto-provision disabled")
+	}
+	if cfg.OIDCAllowedEmailDomains != "nic.br,example.com" {
+		t.Fatalf("unexpected domain allowlist %q", cfg.OIDCAllowedEmailDomains)
+	}
+	if err := cfg.ValidateOIDC(); err != nil {
+		t.Fatalf("enabled OIDC config should validate, got %v", err)
+	}
+}
+
+func TestLoadOIDCInvalidPositiveIntsUseDefaults(t *testing.T) {
+	t.Setenv("OIDC_HTTP_TIMEOUT_SECONDS", "0")
+	t.Setenv("OIDC_STATE_TTL_MINUTES", "-5")
+
+	cfg := Load()
+
+	if cfg.OIDCHTTPTimeoutSeconds != 10 {
+		t.Fatalf("expected default HTTP timeout 10, got %d", cfg.OIDCHTTPTimeoutSeconds)
+	}
+	if cfg.OIDCStateTTLMinutes != 10 {
+		t.Fatalf("expected default state ttl 10, got %d", cfg.OIDCStateTTLMinutes)
+	}
+}
+
+func TestValidateOIDCEnabledMissingRequiredConfigFailsClosed(t *testing.T) {
+	cfg := Load()
+	cfg.OIDCEnabled = true
+
+	err := cfg.ValidateOIDC()
+
+	if !errors.Is(err, domain.ErrOIDCMisconfigured) {
+		t.Fatalf("expected ErrOIDCMisconfigured, got %v", err)
+	}
+}
+
+func TestValidateOIDCRequiresKeycloakProviderForMVP(t *testing.T) {
+	cfg := Load()
+	cfg.OIDCEnabled = true
+	cfg.OIDCProviderName = "google"
+	cfg.OIDCIssuerURL = "https://issuer.example.com"
+	cfg.OIDCClientID = "client"
+	cfg.OIDCClientSecret = "secret"
+	cfg.OIDCRedirectURL = "https://auth.example.com/callback"
+	cfg.OIDCFrontendCallbackURL = "/oidc-callback"
+
+	err := cfg.ValidateOIDC()
+
+	if !errors.Is(err, domain.ErrOIDCMisconfigured) {
+		t.Fatalf("expected ErrOIDCMisconfigured, got %v", err)
+	}
+}
+
+func TestValidateOIDCRequiresRelativeFrontendCallbackPath(t *testing.T) {
+	base := Load()
+	base.OIDCEnabled = true
+	base.OIDCProviderName = "keycloak"
+	base.OIDCIssuerURL = "https://issuer.example.com"
+	base.OIDCClientID = "client"
+	base.OIDCClientSecret = "secret"
+	base.OIDCRedirectURL = "https://auth.example.com/callback"
+	base.OIDCFrontendCallbackURL = "/oidc-callback"
+	if err := base.ValidateOIDC(); err != nil {
+		t.Fatalf("expected relative callback path to validate, got %v", err)
+	}
+
+	for _, callbackURL := range []string{
+		"https://nchat.example.com/oidc-callback",
+		"//evil.example.com/oidc-callback",
+		"oidc-callback",
+		"/oidc-callback\n",
+		"/oidc-callback%",
+		"/oidc-callback?next=/dashboard",
+		"/oidc-callback#fragment",
+		"/unexpected-callback",
+	} {
+		t.Run(callbackURL, func(t *testing.T) {
+			cfg := base
+			cfg.OIDCFrontendCallbackURL = callbackURL
+
+			err := cfg.ValidateOIDC()
+			if !errors.Is(err, domain.ErrOIDCMisconfigured) {
+				t.Fatalf("expected ErrOIDCMisconfigured, got %v", err)
+			}
+		})
 	}
 }

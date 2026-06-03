@@ -58,6 +58,36 @@ spec:
               value: "8081"
             - name: SERVICE_NAME
               value: auth-service
+            - name: OIDC_ISSUER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_ISSUER_URL
+                  optional: true
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_CLIENT_ID
+                  optional: true
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_CLIENT_SECRET
+                  optional: true
+            - name: OIDC_REDIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_REDIRECT_URL
+                  optional: true
+            - name: OIDC_FRONTEND_CALLBACK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_FRONTEND_CALLBACK_URL
+                  optional: true
           ports:
             - name: http
               containerPort: 8081

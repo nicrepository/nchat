@@ -76,6 +76,22 @@ function mapTokenPair(raw: RawTokenResponse): TokenPair {
   };
 }
 
+function mapLoginResponse(raw: RawLoginResponse): LoginResponse {
+  return {
+    ...mapTokenPair(raw),
+    user: {
+      id: raw.user.id,
+      email: raw.user.email,
+      displayName: raw.user.display_name,
+      mustChangePassword: raw.user.must_change_password,
+    },
+  };
+}
+
+export function oidcLoginUrl(): string {
+  return `${AUTH_BASE}/oidc/keycloak/login`;
+}
+
 export async function login(input: LoginInput): Promise<LoginResponse> {
   const raw = await apiFetch<RawLoginResponse>(`${AUTH_BASE}/login`, {
     method: "POST",
@@ -86,15 +102,16 @@ export async function login(input: LoginInput): Promise<LoginResponse> {
     }),
   });
 
-  return {
-    ...mapTokenPair(raw),
-    user: {
-      id: raw.user.id,
-      email: raw.user.email,
-      displayName: raw.user.display_name,
-      mustChangePassword: raw.user.must_change_password,
-    },
-  };
+  return mapLoginResponse(raw);
+}
+
+export async function oidcExchange(code: string): Promise<LoginResponse> {
+  const raw = await apiFetch<RawLoginResponse>(`${AUTH_BASE}/oidc/keycloak/exchange`, {
+    method: "POST",
+    body: JSON.stringify({ code }),
+  });
+
+  return mapLoginResponse(raw);
 }
 
 export async function refresh(refreshToken: string): Promise<TokenPair> {
