@@ -1,0 +1,12 @@
+go 1.25.0
+
+use (
+	./libs/go/platform
+	./services/admin-service
+	./services/auth-service
+	./services/chat-service
+	./services/file-service
+	./services/media-service
+	./services/notification-service
+	./services/search-service
+)

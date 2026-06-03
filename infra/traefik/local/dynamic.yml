@@ -1,0 +1,287 @@
+tls:
+  certificates:
+    - certFile: /certs/nchat.local.pem
+      keyFile: /certs/nchat.local-key.pem
+  options:
+    default:
+      minVersion: VersionTLS13
+      sniStrict: true
+
+http:
+  routers:
+    traefik-dashboard:
+      entryPoints:
+        - dashboard
+      rule: PathPrefix(`/api`) || PathPrefix(`/dashboard`)
+      service: api@internal
+
+    nchat-auth:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 100
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-auth-prefix
+
+    nchat-auth-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 100
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-auth-prefix
+      tls: {}
+
+    nchat-chat:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/chat`)
+      priority: 100
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
+
+    nchat-chat-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/chat`)
+      priority: 100
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
+      tls: {}
+
+    nchat-files:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/files`)
+      priority: 100
+      service: file-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-files-prefix
+
+    nchat-files-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/files`)
+      priority: 100
+      service: file-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-files-prefix
+      tls: {}
+
+    nchat-notifications:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/notifications`)
+      priority: 100
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-notifications-prefix
+
+    nchat-notifications-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/notifications`)
+      priority: 100
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-notifications-prefix
+      tls: {}
+
+    nchat-admin:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/admin`)
+      priority: 100
+      service: admin-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-admin-prefix
+
+    nchat-admin-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/admin`)
+      priority: 100
+      service: admin-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-admin-prefix
+      tls: {}
+
+    nchat-search:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/search`)
+      priority: 100
+      service: search-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-search-prefix
+
+    nchat-search-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/search`)
+      priority: 100
+      service: search-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-search-prefix
+      tls: {}
+
+    nchat-media:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/media`)
+      priority: 100
+      service: media-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-media-prefix
+
+    nchat-media-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/media`)
+      priority: 100
+      service: media-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-media-prefix
+      tls: {}
+
+    nchat-web:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: web
+      middlewares:
+        - security-headers
+        - compress
+
+    nchat-web-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: web
+      middlewares:
+        - security-headers
+        - compress
+      tls: {}
+
+  services:
+    web:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:5173
+
+    auth-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8081
+
+    chat-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8082
+
+    file-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8083
+
+    notification-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8084
+
+    admin-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8085
+
+    search-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8086
+
+    media-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8087
+
+  middlewares:
+    security-headers:
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: no-referrer
+        customResponseHeaders:
+          X-Gateway: traefik-local
+
+    compress:
+      compress: {}
+
+    strip-auth-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/auth
+
+    strip-chat-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/chat
+
+    strip-files-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/files
+
+    strip-notifications-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/notifications
+
+    strip-admin-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/admin
+
+    strip-search-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/search
+
+    strip-media-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/media

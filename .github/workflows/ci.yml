@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25.11"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "11.1.2"
+
+jobs:
+  metadata:
+    name: Metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Print run metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "branch=${GITHUB_REF_NAME}"
+          echo "sha=${GITHUB_SHA}"
+          echo "actor=${GITHUB_ACTOR}"
+          echo "event=${GITHUB_EVENT_NAME}"
+
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Activate pnpm
+        run: corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run aggregate CI
+        run: pnpm run ci
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+      - name: Check Go formatting
+        run: bash scripts/ci/go-fmt-check.sh
+
+      - name: Vet Go
+        run: bash scripts/ci/go-vet.sh
+
+      - name: Test Go
+        run: bash scripts/ci/go-test.sh
+
+      - name: Check Go coverage
+        run: bash scripts/ci/go-coverage-check.sh
+
+      - name: Lint Go
+        run: bash scripts/ci/go-lint.sh
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Activate pnpm
+        run: corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check web formatting
+        run: pnpm format:check:web
+
+      - name: Lint web
+        run: pnpm lint:web
+
+      - name: Typecheck web
+        run: pnpm typecheck:web
+
+      - name: Test web coverage
+        run: pnpm test:coverage:web
+
+      - name: Build web
+        run: pnpm build:web
+
+  manifests:
+    name: Manifests
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Activate pnpm
+        run: corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check dev environment config
+        run: pnpm dev:env:config-check
+
+      - name: Check local gateway config
+        run: pnpm gateway:config-check
+
+      - name: Check TLS config
+        run: pnpm tls:config-check
+
+      - name: Check Sealed Secrets policy
+        run: pnpm sealed-secrets:policy-check
+
+      - name: Check Kubernetes manifests
+        run: pnpm k8s:ci

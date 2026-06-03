@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>NIC Chat — Notificações</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  .info-card {
+    background: var(--color-primary-tint);
+    border: 1px solid var(--color-primary-tint-strong);
+    border-radius: var(--radius-lg);
+    padding: 14px 18px;
+    display: flex; align-items: flex-start; gap: 12px;
+    color: var(--color-primary-strong);
+  }
+  .info-card .material-symbols-outlined { color: var(--color-primary); }
+  .info-card p { margin: 0; font-size: 13px; line-height: 1.5; }
+
+  .select { position: relative; display: inline-flex; }
+  .select select {
+    appearance: none;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 8px 32px 8px 14px;
+    font-size: 13px;
+    color: var(--color-ink);
+    cursor: pointer;
+    min-width: 180px;
+  }
+  .select select:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(109,40,217,0.12); }
+  .select .material-symbols-outlined {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    color: var(--color-muted-2);
+    pointer-events: none;
+    font-size: 18px;
+  }
+  .channel-row { display: grid; grid-template-columns: 1fr auto; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--color-border); }
+  .channel-row:last-child { border-bottom: none; }
+  .channel-row__name { font-size: 14px; font-weight: 600; color: var(--color-primary); }
+
+  .segment {
+    display: inline-flex;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 4px;
+    gap: 2px;
+  }
+  .segment button {
+    padding: 7px 18px;
+    font-size: 13px; font-weight: 600;
+    border-radius: 6px;
+    background: transparent;
+    border: none;
+    color: var(--color-muted);
+    cursor: pointer;
+  }
+  .segment button.is-on {
+    background: var(--color-surface);
+    color: var(--color-ink);
+    box-shadow: var(--shadow-sm);
+  }
+  .field-inline { display: flex; flex-direction: column; gap: 8px; }
+  .field-inline label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--color-muted); }
+  .time-input { padding: 10px 14px; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); font-size: 14px; width: 160px; color: var(--color-ink); outline: none; }
+  .time-input:focus { border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(109,40,217,0.12); }
+  .save-bar { display: flex; justify-content: flex-end; padding-top: var(--space-2); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div data-sidebar></div>
+
+  <main class="flex col" style="min-width:0;">
+    <nav class="tabnav">
+      <div class="tabnav__items" data-settings-tabs></div>
+      <div class="tabnav__right">
+        <button class="icon-btn"><span class="material-symbols-outlined">help</span></button>
+        <span class="avatar avatar--lg avatar--on-light">AN<span class="avatar__status avatar__status--online"></span></span>
+      </div>
+    </nav>
+
+    <div class="scaffold-body">
+      <div class="scaffold-container scaffold-container--narrow">
+
+        <div>
+          <h1 class="page-h1">Notificações</h1>
+          <p class="page-sub">Gerencie como você é avisado de mensagens, menções e atividades.</p>
+        </div>
+
+        <div class="info-card">
+          <span class="material-symbols-outlined">info</span>
+          <p>No MVP, as notificações incluem web push, badge no navegador e e-mail digest. Regras avançadas de expediente entram em fase futura.</p>
+        </div>
+
+        <section class="section">
+          <div class="section__head"><h2 class="section__title">Notificações gerais</h2></div>
+          <div class="section__body">
+            <div class="setting-row">
+              <div>
+                <div class="setting-row__title">Ativar notificações</div>
+                <div class="setting-row__sub">Permitir notificações push no navegador.</div>
+              </div>
+              <label class="toggle"><input type="checkbox" checked /><span class="toggle__track"></span><span class="toggle__thumb"></span></label>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-row__title">Som de notificação</div>
+                <div class="setting-row__sub">Tocar um som curto ao receber mensagens.</div>
+              </div>
+              <label class="toggle"><input type="checkbox" checked /><span class="toggle__track"></span><span class="toggle__thumb"></span></label>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-row__title">Mostrar badges</div>
+                <div class="setting-row__sub">Exibir contagem de não lidas no ícone do app.</div>
+              </div>
+              <label class="toggle"><input type="checkbox" /><span class="toggle__track"></span><span class="toggle__thumb"></span></label>
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-row__title">Receber e-mail digest</div>
+                <div class="setting-row__sub">Resumo de atividades enquanto você esteve fora.</div>
+              </div>
+              <label class="toggle"><input type="checkbox" checked /><span class="toggle__track"></span><span class="toggle__thumb"></span></label>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section__head"><h2 class="section__title">Notificações por canal</h2></div>
+          <div class="section__body">
+            <div class="channel-row">
+              <span class="channel-row__name">#geral</span>
+              <div class="select"><select><option>Todas as mensagens</option><option>Menções e respostas</option><option>Silenciado</option></select><span class="material-symbols-outlined">expand_more</span></div>
+            </div>
+            <div class="channel-row">
+              <span class="channel-row__name">#infraestrutura</span>
+              <div class="select"><select><option>Todas as mensagens</option><option selected>Menções e respostas</option><option>Silenciado</option></select><span class="material-symbols-outlined">expand_more</span></div>
+            </div>
+            <div class="channel-row">
+              <span class="channel-row__name">#suporte</span>
+              <div class="select"><select><option selected>Todas as mensagens</option><option>Menções e respostas</option><option>Silenciado</option></select><span class="material-symbols-outlined">expand_more</span></div>
+            </div>
+            <div class="channel-row">
+              <span class="channel-row__name">#projetos</span>
+              <div class="select"><select><option>Todas as mensagens</option><option>Menções e respostas</option><option selected>Silenciado</option></select><span class="material-symbols-outlined">expand_more</span></div>
+            </div>
+            <div class="channel-row">
+              <span class="channel-row__name">#avisos</span>
+              <div class="select"><select><option selected>Todas as mensagens</option><option>Menções e respostas</option><option>Silenciado</option></select><span class="material-symbols-outlined">expand_more</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section__head"><h2 class="section__title">E-mail digest</h2></div>
+          <div class="section__body" style="padding: 22px;">
+            <div class="field-inline" style="margin-bottom: 22px;">
+              <label>Frequência</label>
+              <div class="segment">
+                <button>Imediato</button>
+                <button class="is-on">Diário</button>
+                <button>Semanal</button>
+              </div>
+            </div>
+            <div class="field-inline" style="margin-bottom: 22px;">
+              <label>Horário preferido</label>
+              <input class="time-input" type="time" value="18:00" />
+            </div>
+            <div class="save-bar">
+              <button class="btn btn--primary">
+                <span class="material-symbols-outlined" style="font-size:18px;">save</span>
+                Salvar preferências
+              </button>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="partials.js"></script>
+<script>
+  document.querySelector("[data-sidebar]").outerHTML = NIC.renderSidebar({ active: "configuracoes" });
+  document.querySelector("[data-settings-tabs]").innerHTML = NIC.renderSettingsTabs("notificacoes");
+</script>
+</body>
+</html>

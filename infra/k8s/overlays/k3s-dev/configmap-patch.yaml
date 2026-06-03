@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+  annotations:
+    nchat.nicrepository.io/data-services: placeholders-only
+data:
+  APP_ENV: development
+  LOG_LEVEL: info
+  # k3s local default pod CIDR. Replace if Traefik runs from a different CIDR.
+  AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16

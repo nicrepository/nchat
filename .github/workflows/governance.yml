@@ -1,0 +1,79 @@
+name: Governance
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    name: Repository governance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check mandatory files
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_files=(
+            "README.md"
+            "CONTRIBUTING.md"
+            "SECURITY.md"
+            ".github/pull_request_template.md"
+            ".github/CODEOWNERS"
+          )
+
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "Missing required file: $file"
+              exit 1
+            fi
+          done
+
+      - name: Check no committed env files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)\.env$'; then
+            echo "Committed .env files are not allowed."
+            exit 1
+          fi
+
+      - name: Check obvious secret markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          patterns=(
+            "pass""word="
+            "sec""ret="
+            "tok""en="
+            "private""_key"
+            "BEGIN PRIVATE"" KEY"
+          )
+
+          found=0
+          for pattern in "${patterns[@]}"; do
+            if git ls-files -z | xargs -0 grep -nI -F "$pattern" --; then
+              found=1
+            fi
+          done
+
+          if [ "$found" -ne 0 ]; then
+            echo "Obvious secret marker found in versioned files."
+            exit 1
+          fi
