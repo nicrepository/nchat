@@ -381,3 +381,68 @@ func jwkToRSAPublicKey(key oidcJWK) (*rsa.PublicKey, error) {
 	}
 	return &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: e}, nil
 }
+
+// AzureADProviderConfig configures an Azure Active Directory OIDC provider.
+// TenantID is the Azure tenant GUID or domain (e.g. "contoso.onmicrosoft.com").
+type AzureADProviderConfig struct {
+	TenantID     string
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+	Scopes       string
+	HTTPTimeout  time.Duration
+	HTTPClient   *http.Client
+}
+
+// NewAzureADProvider returns an OIDCProvider configured for Azure AD using the
+// standard v2.0 endpoint for the given tenant.
+// Returns ErrOIDCMisconfigured if TenantID or ClientID is empty.
+func NewAzureADProvider(cfg AzureADProviderConfig) (OIDCProvider, error) {
+	if strings.TrimSpace(cfg.TenantID) == "" || strings.TrimSpace(cfg.ClientID) == "" {
+		return nil, domain.ErrOIDCMisconfigured
+	}
+	scopes := cfg.Scopes
+	if scopes == "" {
+		scopes = "openid email profile"
+	}
+	return NewKeycloakProvider(KeycloakProviderConfig{
+		IssuerURL:    "https://login.microsoftonline.com/" + strings.TrimSpace(cfg.TenantID) + "/v2.0",
+		ClientID:     cfg.ClientID,
+		ClientSecret: cfg.ClientSecret,
+		RedirectURL:  cfg.RedirectURL,
+		Scopes:       scopes,
+		HTTPTimeout:  cfg.HTTPTimeout,
+		HTTPClient:   cfg.HTTPClient,
+	}), nil
+}
+
+// GoogleWorkspaceProviderConfig configures a Google Workspace (Google Identity) OIDC provider.
+type GoogleWorkspaceProviderConfig struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+	Scopes       string
+	HTTPTimeout  time.Duration
+	HTTPClient   *http.Client
+}
+
+// NewGoogleWorkspaceProvider returns an OIDCProvider configured for Google Identity.
+// Returns ErrOIDCMisconfigured if ClientID is empty.
+func NewGoogleWorkspaceProvider(cfg GoogleWorkspaceProviderConfig) (OIDCProvider, error) {
+	if strings.TrimSpace(cfg.ClientID) == "" {
+		return nil, domain.ErrOIDCMisconfigured
+	}
+	scopes := cfg.Scopes
+	if scopes == "" {
+		scopes = "openid email profile"
+	}
+	return NewKeycloakProvider(KeycloakProviderConfig{
+		IssuerURL:    "https://accounts.google.com",
+		ClientID:     cfg.ClientID,
+		ClientSecret: cfg.ClientSecret,
+		RedirectURL:  cfg.RedirectURL,
+		Scopes:       scopes,
+		HTTPTimeout:  cfg.HTTPTimeout,
+		HTTPClient:   cfg.HTTPClient,
+	}), nil
+}

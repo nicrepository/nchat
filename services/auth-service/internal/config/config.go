@@ -98,7 +98,8 @@ func (c Config) ValidateOIDC() error {
 	if !c.OIDCEnabled {
 		return nil
 	}
-	if strings.ToLower(strings.TrimSpace(c.OIDCProviderName)) != defaultOIDCProviderName {
+	slug := domain.IdentityProviderSlug(c.NormalizedOIDCProviderName())
+	if !domain.IsOIDCSlug(slug) {
 		return domain.ErrOIDCMisconfigured
 	}
 	if strings.TrimSpace(c.OIDCIssuerURL) == "" || strings.TrimSpace(c.OIDCClientID) == "" || strings.TrimSpace(c.OIDCClientSecret) == "" || strings.TrimSpace(c.OIDCRedirectURL) == "" || strings.TrimSpace(c.OIDCFrontendCallbackURL) == "" {
@@ -108,6 +109,10 @@ func (c Config) ValidateOIDC() error {
 		return domain.ErrOIDCMisconfigured
 	}
 	return nil
+}
+
+func (c Config) NormalizedOIDCProviderName() string {
+	return strings.ToLower(strings.TrimSpace(c.OIDCProviderName))
 }
 
 func validOIDCFrontendCallbackPath(callbackPath string) bool {
