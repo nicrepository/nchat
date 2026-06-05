@@ -301,6 +301,12 @@
   border-bottom-color: var(--color-primary);
 }
 
+.admin-tabnav__item--unavailable {
+  opacity: 0.45;
+  cursor: default;
+  pointer-events: none;
+}
+
 .admin-tabnav__right {
   margin-left: auto;
   display: flex;
@@ -373,6 +379,45 @@
 
   .admin-sidebar {
     display: none;
+  }
+
+  /* Allow tabnav to grow beyond the fixed desktop height so it never clips */
+  .admin-tabnav {
+    height: auto;
+    min-height: var(--topbar-h);
+    flex-wrap: nowrap;
+    gap: 8px;
+    padding: 0 12px;
+    /* Right controls must never be clipped */
+    overflow: visible;
+  }
+
+  /* Scroll the tab list horizontally; right controls stay pinned */
+  .admin-tabnav__items {
+    overflow-x: auto;
+    /* Hide scrollbar visually but keep scroll functional */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    flex-shrink: 1;
+    min-width: 0;
+    gap: 12px;
+  }
+
+  .admin-tabnav__items::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Prevent individual tab labels from breaking mid-word */
+  .admin-tabnav__item {
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-size: 12px;
+  }
+
+  /* Right controls: never shrink, never clip */
+  .admin-tabnav__right {
+    flex-shrink: 0;
+    margin-left: 4px;
   }
 
   .admin-scaffold-body {

@@ -123,9 +123,9 @@ function EmptyState() {
               <path d="M16 3.13a4 4 0 0 1 0 7.75" />
             </svg>
           </div>
-          <p className="admin-users__empty-title">Nenhum usuário encontrado</p>
+          <p className="admin-users__empty-title">Nenhum usuário disponível</p>
           <p className="admin-users__empty-sub">
-            Usuários aparecerão aqui assim que o serviço estiver disponível.
+            As contas registradas aparecerão aqui quando o serviço retornar resultados.
           </p>
         </div>
       </td>

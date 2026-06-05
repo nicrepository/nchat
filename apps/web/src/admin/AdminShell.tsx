@@ -174,18 +174,24 @@ export default function AdminShell({ activeTab, children }: AdminShellProps) {
       <div className="admin-main">
         <nav className="admin-tabnav" aria-label="Administração" data-testid="admin-topnav">
           <div className="admin-tabnav__items" role="tablist">
-            {ADMIN_TABS.map((tab) => (
-              <a
-                key={tab.id}
-                href={tab.id === "users" ? "/admin/users" : "#"}
-                className={`admin-tabnav__item${activeTab === tab.id ? " admin-tabnav__item--active" : ""}`}
-                role="tab"
-                aria-selected={activeTab === tab.id}
-                aria-current={activeTab === tab.id ? "page" : undefined}
-              >
-                {tab.label}
-              </a>
-            ))}
+            {ADMIN_TABS.map((tab) => {
+              const isActive = activeTab === tab.id;
+              const isAvailable = tab.id === "users";
+              return (
+                <a
+                  key={tab.id}
+                  href={isAvailable ? "/admin/users" : undefined}
+                  className={`admin-tabnav__item${isActive ? " admin-tabnav__item--active" : ""}${!isAvailable && !isActive ? " admin-tabnav__item--unavailable" : ""}`}
+                  role="tab"
+                  aria-selected={isActive}
+                  aria-current={isActive ? "page" : undefined}
+                  aria-disabled={!isAvailable && !isActive ? true : undefined}
+                  onClick={!isAvailable && !isActive ? (e) => e.preventDefault() : undefined}
+                >
+                  {tab.label}
+                </a>
+              );
+            })}
           </div>
           <div className="admin-tabnav__right">
             <button className="admin-icon-btn" aria-label="Notificações" type="button">

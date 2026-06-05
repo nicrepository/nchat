@@ -248,10 +248,10 @@ describe("AdminUsersPage — empty state", () => {
     renderAdminUsersRoute();
 
     await waitFor(() => {
-      expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+      expect(screen.getByText(/nenhum usuário disponível/i)).toBeInTheDocument();
     });
 
-    expect(screen.getByText(/usuários aparecerão aqui/i)).toBeInTheDocument();
+    expect(screen.getByText(/as contas registradas aparecerão aqui/i)).toBeInTheDocument();
   });
 
   it("empty state is rendered inside the admin shell layout", async () => {
@@ -259,7 +259,7 @@ describe("AdminUsersPage — empty state", () => {
     renderAdminUsersRoute();
 
     await waitFor(() => {
-      expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+      expect(screen.getByText(/nenhum usuário disponível/i)).toBeInTheDocument();
     });
 
     // Admin shell must still be present when showing empty state
@@ -440,7 +440,7 @@ describe("AdminUsersPage — filter chips", () => {
 
     await user.click(screen.getByRole("button", { name: "Admins" }));
 
-    expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+    expect(screen.getByText(/nenhum usuário disponível/i)).toBeInTheDocument();
   });
 
   it("clicking Convites pendentes chip shows empty state", async () => {
@@ -454,7 +454,7 @@ describe("AdminUsersPage — filter chips", () => {
 
     await user.click(screen.getByRole("button", { name: "Convites pendentes" }));
 
-    expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+    expect(screen.getByText(/nenhum usuário disponível/i)).toBeInTheDocument();
   });
 });
 
