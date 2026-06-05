@@ -68,7 +68,10 @@ by `authenticatedFetch`.
 
 URL detection uses `new URL(url, window.location.origin).pathname` to compare pathnames only,
 preventing false positives from query-string values that contain auth path segments
-(e.g. `/api/search?next=/api/auth/login`). The following pathname prefixes are excluded:
+(e.g. `/api/search?next=/api/auth/login`). Detection uses exact-match or prefix+`/`-boundary
+check (`pathname === prefix || pathname.startsWith(prefix + "/")`) so paths like
+`/api/auth/loginExtra` do **not** match `/api/auth/login`. The following pathname prefixes are
+excluded:
 
 - `/api/auth/login`
 - `/api/auth/refresh`
@@ -79,9 +82,12 @@ preventing false positives from query-string values that contain auth path segme
 
 ## Concurrency guard
 
-A module-level `let inflightRefresh: Promise<TokenPair> | null` variable ensures that if multiple
-concurrent requests all receive a 401, only one refresh call is made. All concurrent callers await
-the same promise. The variable is reset to `null` in `.finally()` after the promise settles.
+A module-level `inflightRefresh: { refreshToken: string; promise: Promise<TokenPair> } | null`
+ensures that concurrent 401s from the **same session generation** share one refresh call. The
+refresh token is stored alongside the promise. Only requests whose current refresh token matches
+the in-flight record share it; cross-session requests (different refresh token) each create their
+own independent refresh call and cannot observe or modify each other's in-flight state. The
+variable is reset to `null` after the promise settles and any token commit is complete.
 
 ## Late-arrival guard
 
@@ -92,9 +98,15 @@ second refresh is triggered.
 
 ## Session-binding guard
 
-`setTokens` and `clearTokens` are conditional on the stored refresh token still equalling the one
-that initiated the refresh. If the session changed while the refresh was in flight (e.g. logout or
-new login), the in-flight refresh result is discarded and the current session is preserved.
+`setTokens` and `clearTokens` are conditional on the stored refresh token after the promise
+settles:
+
+- **First settler** (RT unchanged): calls `setTokens`, then retries.
+- **Concurrent waiter** (RT equals `newTokens.refreshToken` committed by first settler): skips
+  `setTokens`, falls through to retry with current access token.
+- **External session change** (logout or newer login while in flight): neither `setTokens` nor
+  `clearTokens` is called; the original `401` is re-thrown without retrying under the new or
+  absent session.
 
 ## Token storage
 
@@ -134,14 +146,18 @@ Unit tests (`authClient.test.ts`):
 10. Refresh failure: `clearTokens()`, re-throw, no retry
 11. No retry after failed refresh (request called exactly once)
 12. No refresh token present: `clearTokens()`, no `refresh` call
-13. Concurrent 401s trigger exactly one refresh call
-14. Late-arrival guard: retries with newer token, no second refresh
-15. Late-arrival guard: retry uses newer access token in header
-16. Stale refresh success after `clearTokens` does not restore tokens
-17. Stale refresh success after newer `setTokens` does not overwrite newer tokens
-18. Stale refresh failure after newer `setTokens` does not clear newer tokens
-19. Auth endpoint 401 does not trigger refresh (parameterized over all excluded paths)
-20. Query-string auth path does not skip refresh
+13. Concurrent 401s (same session) trigger exactly one refresh call
+14. Concurrent waiters on the same refresh both retry once with the new access token
+15. Late-arrival guard: retries with newer token, no second refresh
+16. Late-arrival guard: retry uses newer access token in header
+17. Late second 401 after first refresh settles: retries with newer token, no extra refresh
+18. Stale refresh success after `clearTokens` does not restore tokens
+19. Stale refresh success after newer `setTokens` does not overwrite newer tokens and rethrows original 401
+20. Stale refresh failure after newer `setTokens` does not clear newer tokens
+21. Cross-session 401 with different refresh token starts its own refresh call
+22. Auth endpoint 401 does not trigger refresh (parameterized over all excluded paths)
+23. Query-string auth path does not skip refresh
+24. Path that merely starts with auth prefix (no `/` boundary) does not skip refresh
 
 E2E: Deferred — no authenticated endpoints exist in the app yet. Once the first
 authenticated page feature is added, a Playwright smoke test should be added to

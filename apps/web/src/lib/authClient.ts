@@ -17,7 +17,9 @@ export const AUTH_SKIP_PREFIXES = [
 ] as const;
 
 /**
- * Returns true if the URL's pathname starts with an auth endpoint prefix.
+ * Returns true if the URL's pathname matches an auth endpoint prefix.
+ * Uses exact-match or prefix+"/" boundary so /api/auth/loginExtra does NOT match
+ * /api/auth/login, but /api/auth/login/sub does.
  * Parses the URL to avoid false positives from query-string values that contain
  * auth path segments (e.g. /api/search?next=/api/auth/login).
  */
@@ -26,10 +28,11 @@ function isAuthUrl(url: string): boolean {
   try {
     pathname = new URL(url, window.location.origin).pathname;
   } catch {
-    // Non-parseable URL: fall back to startsWith on the raw string.
-    return AUTH_SKIP_PREFIXES.some((prefix) => url.startsWith(prefix));
+    pathname = url;
   }
-  return AUTH_SKIP_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+  return AUTH_SKIP_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(prefix + "/"),
+  );
 }
 
 /**
@@ -52,8 +55,18 @@ function buildHeaders(
   return Object.fromEntries(headers.entries());
 }
 
-// Shared in-flight refresh promise. Prevents concurrent refresh calls.
-let inflightRefresh: Promise<TokenPair> | null = null;
+/**
+ * Generation-bound in-flight refresh state. Each session generation (identified by
+ * its refresh token) has at most one pending refresh call. Cross-session requests
+ * (different refresh token) each get their own independent refresh call and cannot
+ * observe or mutate each other's in-flight state.
+ */
+type InflightRefresh = {
+  refreshToken: string;
+  promise: Promise<TokenPair>;
+};
+
+let inflightRefresh: InflightRefresh | null = null;
 
 /**
  * Authenticated wrapper around apiFetch.
@@ -63,10 +76,16 @@ let inflightRefresh: Promise<TokenPair> | null = null;
  * - Late-arrival guard: if the stored access token changed while the request was in
  *   flight (a concurrent request already refreshed), retries immediately with the
  *   newer token instead of triggering another refresh.
- * - Concurrency guard: concurrent 401s share one refresh promise; only one
- *   POST /api/auth/refresh is ever sent at a time.
- * - Session-binding guard: setTokens/clearTokens are no-ops if the stored refresh
- *   token changed while the refresh was in flight (e.g. logout or new login).
+ * - Generation-bound concurrency guard: concurrent 401s sharing the same refresh
+ *   token share one refresh promise. Requests with a different refresh token (cross-
+ *   session) each create their own refresh call and cannot affect each other.
+ * - Session-binding guard: after the refresh settles, actions are conditional on
+ *   the stored refresh token:
+ *     - First settler (RT unchanged): calls setTokens, then retries.
+ *     - Concurrent waiter on same refresh (RT === newTokens.refreshToken): falls
+ *       through to retry without re-calling setTokens.
+ *     - External session change (logout / newer login): throws original 401 without
+ *       retrying and without touching the new session's tokens.
  *
  * Refresh is request-driven only — no background timer, no keepalive.
  * Backend remains authoritative for idle/absolute session expiry.
@@ -104,30 +123,39 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
       throw err;
     }
 
-    // Acquire or share the in-flight refresh promise to avoid concurrent refresh calls.
-    if (inflightRefresh === null) {
-      inflightRefresh = refresh(refreshToken).finally(() => {
-        inflightRefresh = null;
-      });
+    // Acquire or share a generation-bound in-flight refresh. Only share if the
+    // stored refresh token matches; cross-session requests each get their own call.
+    if (!inflightRefresh || inflightRefresh.refreshToken !== refreshToken) {
+      inflightRefresh = { refreshToken, promise: refresh(refreshToken) };
     }
+    const captured = inflightRefresh;
 
     let newTokens: TokenPair;
     try {
-      newTokens = await inflightRefresh;
+      newTokens = await captured.promise;
     } catch {
-      // Session-binding guard: only clear tokens if the session hasn't changed
-      // (e.g. a newer login) while the refresh was in flight.
-      if (getRefreshToken() === refreshToken) {
-        clearTokens();
-      }
+      if (inflightRefresh === captured) inflightRefresh = null;
+      // Session-binding guard: only clear tokens if this session is still active.
+      if (getRefreshToken() === refreshToken) clearTokens();
       throw err;
     }
 
-    // Session-binding guard: only store tokens if the session hasn't changed while
-    // the refresh was in flight. Concurrent waiters on the same promise will see the
-    // RT already updated by the first settler and correctly skip this.
-    if (getRefreshToken() === refreshToken) {
+    // Clear in-flight state for this generation after the promise settled and before
+    // committing tokens, so no new 401 for this session starts an extra refresh.
+    if (inflightRefresh === captured) inflightRefresh = null;
+
+    // Three-way session-binding guard:
+    const currentRT = getRefreshToken();
+    if (currentRT === refreshToken) {
+      // First settler: commit the new tokens for this session generation.
       setTokens(newTokens.accessToken, newTokens.refreshToken);
+    } else if (currentRT === newTokens.refreshToken) {
+      // Concurrent waiter on the same session: first settler already committed the
+      // tokens. Fall through to retry with the now-current access token.
+    } else {
+      // External session change (logout or newer login) while refresh was in flight.
+      // Do not retry under the new/empty session; return the original 401.
+      throw err;
     }
 
     // Retry the original request exactly once with the current access token.

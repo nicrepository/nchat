@@ -44,9 +44,14 @@ refreshed only when an authenticated API call receives a `401 Unauthorized` resp
 
 ### Concurrency guard
 
-A module-level `inflightRefresh` promise is shared across concurrent requests. If multiple API
-calls receive `401` simultaneously, only one `POST /api/auth/refresh` call is made. All concurrent
-callers await the same promise. The guard is reset to `null` in `.finally()` after settling.
+A module-level `inflightRefresh` record (`{ refreshToken, promise }`) is shared across concurrent
+requests **of the same session generation**. If multiple API calls receive `401` simultaneously,
+only one `POST /api/auth/refresh` call is made for a given refresh token. All concurrent callers
+for the same session await the same promise. The variable is reset to `null` after the promise
+settles and tokens are committed.
+
+Requests whose refresh token differs from the in-flight record (cross-session 401s) each create
+their own independent refresh call and cannot observe or modify each other's in-flight state.
 
 ### Late-arrival guard
 
@@ -57,10 +62,19 @@ refresh call.
 
 ### Session-binding guard
 
-`setTokens` and `clearTokens` are conditional on the stored refresh token still matching the one
-that initiated the refresh. If the session changed while the refresh was in flight (e.g. the user
-logged out or a newer login occurred), the in-flight refresh result is discarded and the current
-session is preserved.
+After a refresh promise settles, the stored refresh token is compared against the one that
+initiated the refresh:
+
+- **First settler** (RT unchanged): calls `setTokens`, then retries the original request.
+- **Concurrent waiter on same session** (RT equals the new token from the refresh result):
+  tokens were already committed; falls through to retry with the current access token.
+- **External session change** (logout or newer login while refresh was in flight):
+  `setTokens` and `clearTokens` are not called; the original `401` is re-thrown without
+  retrying the request under the new or absent session.
+
+On refresh failure: `clearTokens()` is called only if the stored refresh token still matches
+the one that started the refresh. If the session changed while the failure was in flight, tokens
+are preserved unchanged.
 
 ### Auth endpoint exclusion
 
@@ -78,7 +92,9 @@ positives from query-string values that contain auth path segments:
 | `/api/auth/logout`   | `logout()`                            |
 
 URL detection uses `new URL(url, window.location.origin).pathname` to compare pathnames only,
-preventing false positives from query-string values like `?next=/api/auth/login`.
+preventing false positives from query-string values like `?next=/api/auth/login`. Detection uses
+exact-match or prefix+`/`-boundary check, so `/api/auth/loginExtra` does **not** match
+`/api/auth/login`.
 
 ### Body reuse
 

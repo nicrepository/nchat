@@ -238,6 +238,34 @@ describe("authenticatedFetch", () => {
       expect(mockRefresh).toHaveBeenCalledTimes(1);
     });
 
+    it("concurrent waiters on the same refresh both retry once with the new access token", async () => {
+      // Both requests share one refresh call; both retry after it resolves.
+      setTokens("expired_at", "rt");
+      mockApiFetch
+        .mockRejectedValueOnce(make401()) // p1 initial
+        .mockRejectedValueOnce(make401()) // p2 initial
+        .mockResolvedValueOnce({ data: "p1_ok" }) // p1 retry
+        .mockResolvedValueOnce({ data: "p2_ok" }); // p2 retry (concurrent waiter case)
+
+      let resolveRefresh!: (value: ReturnType<typeof makeTokenPair>) => void;
+      mockRefresh.mockReturnValue(
+        new Promise<ReturnType<typeof makeTokenPair>>((res) => (resolveRefresh = res)),
+      );
+
+      const p1 = authenticatedFetch<{ data: string }>("/api/r1", { method: "GET" });
+      const p2 = authenticatedFetch<{ data: string }>("/api/r2", { method: "GET" });
+
+      // Let both requests process their 401s and reach await captured.promise.
+      await Promise.resolve();
+
+      resolveRefresh(makeTokenPair());
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1).toEqual({ data: "p1_ok" });
+      expect(r2).toEqual({ data: "p2_ok" });
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+    });
+
     describe("late-arrival guard (access token changed while request was in flight)", () => {
       it("retries with newer token without triggering a second refresh", async () => {
         setTokens("at1", "rt1");
@@ -340,9 +368,10 @@ describe("authenticatedFetch", () => {
         expect(getRefreshToken()).toBeNull();
       });
 
-      it("stale refresh success after newer setTokens does not overwrite newer tokens", async () => {
+      it("stale refresh success after newer setTokens does not overwrite newer tokens and rethrows original 401", async () => {
         setTokens("expired_at", "rt");
-        mockApiFetch.mockRejectedValueOnce(make401()).mockResolvedValueOnce({ data: "ok" });
+        // No retry expected: external session change → original 401 is rethrown.
+        mockApiFetch.mockRejectedValue(make401());
 
         let resolveRefresh!: (value: ReturnType<typeof makeTokenPair>) => void;
         mockRefresh.mockReturnValue(
@@ -351,15 +380,15 @@ describe("authenticatedFetch", () => {
 
         const p = authenticatedFetch("/api/resource", { method: "GET" });
 
-        // Yield so authenticatedFetch processes the 401 and suspends on await inflightRefresh.
+        // Yield so authenticatedFetch processes the 401 and suspends on await captured.promise.
         await Promise.resolve();
 
         // Newer login replaces the session while refresh was in flight.
         setTokens("newer_at", "newer_rt");
         resolveRefresh(makeTokenPair()); // stale refresh "succeeds" (would give new_at/new_rt)
 
-        await p; // retry uses getAccessToken() = "newer_at", second mock returns { data: "ok" }
-
+        // External session change detected: original 401 is rethrown without retrying.
+        await expect(p).rejects.toMatchObject({ status: 401 });
         expect(getAccessToken()).toBe("newer_at");
         expect(getRefreshToken()).toBe("newer_rt");
       });
@@ -375,10 +404,7 @@ describe("authenticatedFetch", () => {
 
         const p = authenticatedFetch("/api/resource", { method: "GET" });
 
-        // Yield so authenticatedFetch processes the 401, attaches .finally() to the
-        // refresh promise, and suspends on `await inflightRefresh`.
-        // Without this yield, rejectRefresh() would fire before .finally() is attached,
-        // causing an unhandled rejection.
+        // Yield so authenticatedFetch processes the 401 and suspends on `await captured.promise`.
         await Promise.resolve();
 
         // Newer login while refresh is in flight.
@@ -388,6 +414,68 @@ describe("authenticatedFetch", () => {
         await expect(p).rejects.toBeTruthy();
         expect(getAccessToken()).toBe("newer_at");
         expect(getRefreshToken()).toBe("newer_rt");
+      });
+    });
+
+    describe("cross-session guard (different refresh token does not share in-flight refresh)", () => {
+      it("newer session 401 with a different refresh token starts its own refresh call", async () => {
+        // Old session pending refresh.
+        setTokens("old_at", "old_rt");
+
+        let resolveOldRefresh!: (value: ReturnType<typeof makeTokenPair>) => void;
+        let resolveNewRefresh!: (value: ReturnType<typeof makeTokenPair>) => void;
+        mockRefresh
+          .mockReturnValueOnce(
+            new Promise<ReturnType<typeof makeTokenPair>>((res) => (resolveOldRefresh = res)),
+          )
+          .mockReturnValueOnce(
+            new Promise<ReturnType<typeof makeTokenPair>>((res) => (resolveNewRefresh = res)),
+          );
+
+        mockApiFetch
+          .mockRejectedValueOnce(make401()) // old session initial
+          .mockRejectedValueOnce(make401()) // new session initial
+          .mockResolvedValueOnce({ data: "new_ok" }); // new session retry
+
+        const oldRequest = authenticatedFetch("/api/r1", { method: "GET" });
+
+        // Let old request reach await captured.promise.
+        await Promise.resolve();
+
+        // New login: new session with its own refresh token.
+        setTokens("new_at", "new_rt");
+
+        const newRequest = authenticatedFetch<{ data: string }>("/api/r2", { method: "GET" });
+
+        // Let new request reach its await captured.promise.
+        await Promise.resolve();
+
+        // Two separate refresh calls must have been made (one per session generation).
+        expect(mockRefresh).toHaveBeenCalledTimes(2);
+
+        // Resolve old refresh (session changed → old request throws original 401).
+        resolveOldRefresh({
+          accessToken: "old_refreshed_at",
+          refreshToken: "old_refreshed_rt",
+          tokenType: "Bearer",
+          expiresIn: 900,
+        });
+
+        // Resolve new refresh (succeeds for new session).
+        resolveNewRefresh({
+          accessToken: "newest_at",
+          refreshToken: "newest_rt",
+          tokenType: "Bearer",
+          expiresIn: 900,
+        });
+
+        await expect(oldRequest).rejects.toMatchObject({ status: 401 });
+        const newResult = await newRequest;
+        expect(newResult).toEqual({ data: "new_ok" });
+
+        // New session tokens are those committed by the new refresh.
+        expect(getAccessToken()).toBe("newest_at");
+        expect(getRefreshToken()).toBe("newest_rt");
       });
     });
   });
@@ -413,6 +501,17 @@ describe("authenticatedFetch", () => {
 
       // Pathname is /api/search — only query string contains /auth/login.
       await authenticatedFetch("/api/search?next=/api/auth/login", { method: "GET" });
+
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not skip refresh for path that merely starts with auth prefix without '/' boundary", async () => {
+      setTokens("expired_at", "rt");
+      mockApiFetch.mockRejectedValueOnce(make401()).mockResolvedValueOnce({ data: "ok" });
+      mockRefresh.mockResolvedValue(makeTokenPair());
+
+      // /api/auth/loginExtra starts with /api/auth/login but is NOT an auth endpoint.
+      await authenticatedFetch("/api/auth/loginExtra", { method: "GET" });
 
       expect(mockRefresh).toHaveBeenCalledTimes(1);
     });
