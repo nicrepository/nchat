@@ -1,7 +1,14 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 
-import { clearTokens, getAccessToken, getRefreshToken, setTokens } from "../lib/authSession";
+import {
+  clearTokens,
+  getAccessToken,
+  getRefreshToken,
+  isAuthenticated,
+  onAuthChange,
+  setTokens,
+} from "../lib/authSession";
 import { refresh } from "./authApi";
 
 type AuthState = "authenticated" | "checking" | "unauthenticated";
@@ -19,6 +26,14 @@ interface RequireAuthProps {
 export default function RequireAuth({ children }: RequireAuthProps) {
   const [authState, setAuthState] = useState<AuthState>(initialAuthState);
   const refreshStarted = useRef(false);
+  const location = useLocation();
+
+  // React to setTokens / clearTokens called anywhere after mount.
+  useEffect(() => {
+    return onAuthChange(() => {
+      setAuthState(isAuthenticated() ? "authenticated" : "unauthenticated");
+    });
+  }, []);
 
   useEffect(() => {
     if (authState !== "checking" || refreshStarted.current) return;
@@ -55,7 +70,8 @@ export default function RequireAuth({ children }: RequireAuthProps) {
   }, [authState]);
 
   if (authState === "checking") return null;
-  if (authState === "unauthenticated") return <Navigate to="/login" replace />;
+  if (authState === "unauthenticated")
+    return <Navigate to="/login" state={{ from: location.pathname }} replace />;
 
   return <>{children}</>;
 }
