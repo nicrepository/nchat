@@ -34,6 +34,7 @@
     "format:docs": "prettier \"**/*.{md,yml,yaml,json}\" --write",
     "format:check:docs": "prettier \"**/*.{md,yml,yaml,json}\" --check",
     "test:web": "pnpm --filter @nchat/web test",
+    "test:e2e:web": "pnpm --filter @nchat/web test:e2e",
     "test:coverage:web": "pnpm --filter @nchat/web test:coverage",
     "typecheck:web": "pnpm --filter @nchat/web typecheck",
     "test:go": "bash scripts/ci/go-test.sh",
