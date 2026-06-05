@@ -168,15 +168,18 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
     try {
       newTokens = await captured.promise;
     } catch {
-      if (inflightRefresh === captured) inflightRefresh = null;
-      // Session-binding guard: only clear tokens if this session is still active.
-      if (getRefreshToken() === refreshToken) {
-        clearTokens();
-        if (lastAppliedRefreshRotation?.fromRefreshToken === refreshToken) {
-          lastAppliedRefreshRotation = null;
+      try {
+        // Session-binding guard: only clear tokens if this session is still active.
+        if (getRefreshToken() === refreshToken) {
+          clearTokens();
+          if (lastAppliedRefreshRotation?.fromRefreshToken === refreshToken) {
+            lastAppliedRefreshRotation = null;
+          }
         }
+        throw err;
+      } finally {
+        if (inflightRefresh === captured) inflightRefresh = null;
       }
-      throw err;
     }
 
     // Three-way session-binding guard. Keep inflightRefresh active until after the
