@@ -66,21 +66,35 @@ by `authenticatedFetch`.
 
 ## Auth URL exclusion
 
-The following path segments are excluded from auto-refresh (safety net; these functions already
-use `apiFetch` directly in normal usage):
+URL detection uses `new URL(url, window.location.origin).pathname` to compare pathnames only,
+preventing false positives from query-string values that contain auth path segments
+(e.g. `/api/search?next=/api/auth/login`). The following pathname prefixes are excluded:
 
-- `/auth/login`
-- `/auth/refresh`
-- `/auth/password`
-- `/auth/oidc`
-- `/auth/invites`
-- `/auth/logout`
+- `/api/auth/login`
+- `/api/auth/refresh`
+- `/api/auth/password`
+- `/api/auth/oidc`
+- `/api/auth/invites`
+- `/api/auth/logout`
 
 ## Concurrency guard
 
 A module-level `let inflightRefresh: Promise<TokenPair> | null` variable ensures that if multiple
 concurrent requests all receive a 401, only one refresh call is made. All concurrent callers await
 the same promise. The variable is reset to `null` in `.finally()` after the promise settles.
+
+## Late-arrival guard
+
+The access token used for the original request is captured before the first `apiFetch` call. If
+the stored access token has already changed by the time a `401` is caught (because a concurrent
+request completed a refresh first), the request retries immediately with the newer token — no
+second refresh is triggered.
+
+## Session-binding guard
+
+`setTokens` and `clearTokens` are conditional on the stored refresh token still equalling the one
+that initiated the refresh. If the session changed while the refresh was in flight (e.g. logout or
+new login), the in-flight refresh result is discarded and the current session is preserved.
 
 ## Token storage
 
@@ -108,18 +122,26 @@ the same promise. The variable is reset to `null` in `.finally()` after the prom
 
 Unit tests (`authClient.test.ts`):
 
-1. Attaches `Authorization: Bearer` header when access token is present
-2. Omits `Authorization` header when no access token
-3. Returns result directly on non-401 success
-4. Re-throws non-401 errors without attempting refresh
-5. 401 triggers refresh and retries original request once on success
-6. Refresh success stores new tokens via `setTokens`
-7. Retry uses new `Authorization` header
-8. Refresh failure: `clearTokens()`, re-throw, no retry
-9. No retry after failed refresh (request called exactly once)
-10. No refresh token present: `clearTokens()`, no `refresh` call
-11. Concurrent 401s trigger exactly one refresh call
-12. Auth endpoint 401 does not trigger refresh (parameterized over all excluded paths)
+1. Attaches `authorization` header when access token is present
+2. Omits `authorization` header when no access token
+3. Handles plain object, Headers instance, and tuple-array HeadersInit forms
+4. Does not mutate a caller-provided Headers object
+5. Returns result directly on non-401 success
+6. Re-throws non-401 errors without attempting refresh
+7. 401 triggers refresh and retries original request once on success
+8. Refresh success stores new tokens via `setTokens`
+9. Retry uses updated `authorization` header
+10. Refresh failure: `clearTokens()`, re-throw, no retry
+11. No retry after failed refresh (request called exactly once)
+12. No refresh token present: `clearTokens()`, no `refresh` call
+13. Concurrent 401s trigger exactly one refresh call
+14. Late-arrival guard: retries with newer token, no second refresh
+15. Late-arrival guard: retry uses newer access token in header
+16. Stale refresh success after `clearTokens` does not restore tokens
+17. Stale refresh success after newer `setTokens` does not overwrite newer tokens
+18. Stale refresh failure after newer `setTokens` does not clear newer tokens
+19. Auth endpoint 401 does not trigger refresh (parameterized over all excluded paths)
+20. Query-string auth path does not skip refresh
 
 E2E: Deferred — no authenticated endpoints exist in the app yet. Once the first
 authenticated page feature is added, a Playwright smoke test should be added to
@@ -128,7 +150,9 @@ authenticated page feature is added, a Playwright smoke test should be added to
 ## Out of scope
 
 - Backend refresh endpoint changes
+- Refresh via cookies
 - Persistent refresh across browser restarts
 - Background keepalive timer
 - OAuth/OIDC provider changes
 - Mobile app behavior
+- Admin session policy UI

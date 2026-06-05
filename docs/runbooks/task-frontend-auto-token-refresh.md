@@ -18,9 +18,11 @@ refreshed only when an authenticated API call receives a `401 Unauthorized` resp
   attempt to keep a session alive by proactively refreshing tokens. If the backend decides the
   session has expired (idle timeout, absolute max age, revocation), the next API call will receive
   `401`, the refresh attempt will fail, and the user will be redirected to `/login`.
-- **Refresh failure clears the session and returns the user to login.** On refresh failure,
-  `clearTokens()` is called, the original `401` error is re-thrown, and `RequireAuth` or the
-  calling page is expected to redirect the user to `/login`.
+- **Refresh failure clears stored tokens and returns an unauthenticated error to the caller.**
+  On refresh failure, `clearTokens()` is called (subject to the session-binding guard described
+  below) and the original `401` error is re-thrown. Protected routes and callers are responsible
+  for handling the unauthenticated state using the existing unauthenticated flow (e.g. `RequireAuth`
+  redirecting to `/login` on the next render cycle after detecting no tokens).
 - **No tokens in URL, localStorage, or cookies.** Access and refresh tokens are kept exclusively in
   `sessionStorage` using the existing keys `nchat_at` (access token) and `nchat_rt` (refresh
   token). This means tokens are scoped to the current browser tab and cleared when the tab closes.
@@ -46,19 +48,37 @@ A module-level `inflightRefresh` promise is shared across concurrent requests. I
 calls receive `401` simultaneously, only one `POST /api/auth/refresh` call is made. All concurrent
 callers await the same promise. The guard is reset to `null` in `.finally()` after settling.
 
+### Late-arrival guard
+
+The access token used for the original request is captured before the call. If the stored access
+token has already changed by the time a `401` is caught (because a concurrent request completed a
+refresh first), the request retries immediately with the newer token instead of triggering another
+refresh call.
+
+### Session-binding guard
+
+`setTokens` and `clearTokens` are conditional on the stored refresh token still matching the one
+that initiated the refresh. If the session changed while the refresh was in flight (e.g. the user
+logged out or a newer login occurred), the in-flight refresh result is discarded and the current
+session is preserved.
+
 ### Auth endpoint exclusion
 
-The following URL path segments never trigger auto-refresh. These functions call `apiFetch`
-directly in normal usage; the exclusion is a safety net:
+The following URL pathnames never trigger auto-refresh. These functions call `apiFetch`
+directly in normal usage; the exclusion is a safety net against accidental use and prevents false
+positives from query-string values that contain auth path segments:
 
-| Path             | Auth function                         |
-| ---------------- | ------------------------------------- |
-| `/auth/login`    | `login()`                             |
-| `/auth/refresh`  | `refresh()`                           |
-| `/auth/password` | `forgotPassword()`, `resetPassword()` |
-| `/auth/oidc`     | `oidcExchange()`                      |
-| `/auth/invites`  | `acceptInvite()`                      |
-| `/auth/logout`   | `logout()`                            |
+| Pathname prefix      | Auth function                         |
+| -------------------- | ------------------------------------- |
+| `/api/auth/login`    | `login()`                             |
+| `/api/auth/refresh`  | `refresh()`                           |
+| `/api/auth/password` | `forgotPassword()`, `resetPassword()` |
+| `/api/auth/oidc`     | `oidcExchange()`                      |
+| `/api/auth/invites`  | `acceptInvite()`                      |
+| `/api/auth/logout`   | `logout()`                            |
+
+URL detection uses `new URL(url, window.location.origin).pathname` to compare pathnames only,
+preventing false positives from query-string values like `?next=/api/auth/login`.
 
 ### Body reuse
 
@@ -118,6 +138,7 @@ pnpm format:check:docs
 ## Out of scope
 
 - Backend refresh endpoint changes
+- Refresh via cookies
 - Persistent refresh across browser restarts (would require `localStorage` or `httpOnly` cookie)
 - Background keepalive timer
 - OAuth/OIDC provider changes
