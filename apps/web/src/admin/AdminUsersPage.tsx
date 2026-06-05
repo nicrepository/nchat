@@ -7,7 +7,9 @@ import { type AdminUser, listAdminUsers } from "./adminUsersApi";
 
 /** Derives up to two uppercase initials from a display name. */
 function initials(name: string): string {
-  const parts = name.trim().split(/\s+/);
+  const trimmed = name.trim();
+  if (!trimmed) return "?";
+  const parts = trimmed.split(/\s+/);
   if (parts.length === 1) return (parts[0][0] ?? "?").toUpperCase();
   return ((parts[0][0] ?? "") + (parts[1][0] ?? "")).toUpperCase();
 }
@@ -57,15 +59,8 @@ function StatusBadge({ status }: StatusBadgeProps) {
   );
 }
 
-interface RoleBadgeProps {
-  authSource: string;
-}
-
-function RoleBadge({ authSource }: RoleBadgeProps) {
-  const src = authSource.toLowerCase();
-  if (src === "admin") {
-    return <span className="admin-users__badge admin-users__badge--primary">Admin</span>;
-  }
+/** Renders the authentication origin (auth_source field) as a neutral label. */
+function OriginBadge({ authSource }: { authSource: string }) {
   return <span className="admin-users__badge admin-users__badge--neutral">{authSource}</span>;
 }
 
@@ -174,7 +169,7 @@ function UserRows({ users }: UserRowsProps) {
             <StatusBadge status={user.status} />
           </td>
           <td>
-            <RoleBadge authSource={user.authSource} />
+            <OriginBadge authSource={user.authSource} />
           </td>
           <td className="admin-users__col-created admin-users__muted">
             {formatDate(user.createdAt)}
@@ -239,7 +234,7 @@ export default function AdminUsersPage() {
                 E-mail
               </th>
               <th scope="col">Status</th>
-              <th scope="col">Função</th>
+              <th scope="col">Origem</th>
               <th scope="col" className="admin-users__col-created">
                 Criado em
               </th>

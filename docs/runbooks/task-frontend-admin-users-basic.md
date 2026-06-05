@@ -1,7 +1,7 @@
 # Admin Users Basic Screen — Runbook
 
-**Feature:** Basic read-only admin users list in the web frontend  
-**Branch:** `feat/web-admin-users-basic`  
+**Feature:** Basic read-only admin users list in the web frontend |
+**Branch:** `feat/web-admin-users-basic` |
 **Status:** In progress
 
 ---

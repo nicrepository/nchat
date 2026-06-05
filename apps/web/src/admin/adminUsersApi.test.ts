@@ -31,6 +31,10 @@ describe("listAdminUsers", () => {
 
     const users = await listAdminUsers();
 
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/admin/users"),
+      expect.objectContaining({ method: "GET" }),
+    );
     expect(users).toHaveLength(1);
     expect(users[0]).toEqual({
       id: "u1",

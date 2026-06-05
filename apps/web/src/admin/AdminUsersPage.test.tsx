@@ -181,7 +181,7 @@ describe("AdminUsersPage — user rows", () => {
     });
   });
 
-  it("renders neutral role badge for non-admin auth source", async () => {
+  it("renders origin badge showing auth source value", async () => {
     mockListAdminUsers.mockResolvedValue([SAMPLE_USERS[0]]);
     renderAdminUsersRoute();
 
