@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -67,7 +68,6 @@ const SAMPLE_USERS: AdminUser[] = [
 beforeEach(() => {
   clearTokens();
   vi.clearAllMocks();
-  // default: resolves after explicit control
 });
 
 afterEach(() => {
@@ -93,17 +93,138 @@ describe("AdminUsersPage — route protection", () => {
   });
 });
 
+describe("AdminUsersPage — admin shell structure", () => {
+  it("renders the admin shell wrapper", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("admin-shell")).toBeInTheDocument();
+    });
+  });
+
+  it("renders the dark sidebar", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("admin-sidebar")).toBeInTheDocument();
+    });
+  });
+
+  it("renders the admin top navigation", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("admin-topnav")).toBeInTheDocument();
+    });
+  });
+
+  it("admin top nav contains expected tabs", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("admin-topnav")).toBeInTheDocument();
+    });
+
+    const topnav = screen.getByTestId("admin-topnav");
+    expect(topnav).toHaveTextContent("Visão geral");
+    expect(topnav).toHaveTextContent("Usuários");
+    expect(topnav).toHaveTextContent("Canais");
+    expect(topnav).toHaveTextContent("Auditoria");
+  });
+
+  it("marks Usuários tab as active", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("admin-topnav")).toBeInTheDocument();
+    });
+
+    const activeTab = screen.getByTestId("admin-topnav").querySelector('[aria-current="page"]');
+    expect(activeTab).toHaveTextContent("Usuários");
+  });
+
+  it("sidebar shows NIC Chat branding", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("admin-sidebar")).toBeInTheDocument();
+    });
+
+    const sidebar = screen.getByTestId("admin-sidebar");
+    expect(sidebar).toHaveTextContent("NIC Chat");
+    expect(sidebar).toHaveTextContent("Workspace NIC-Labs");
+  });
+});
+
+describe("AdminUsersPage — invite button", () => {
+  it("renders the invite button in a disabled state", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /convidar usuário/i })).toBeInTheDocument();
+    });
+
+    const inviteBtn = screen.getByRole("button", { name: /convidar usuário/i });
+    expect(inviteBtn).toBeDisabled();
+    expect(inviteBtn).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("invite button does not submit a form or trigger navigation", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /convidar usuário/i })).toBeInTheDocument();
+    });
+
+    const inviteBtn = screen.getByRole("button", { name: /convidar usuário/i });
+    expect(inviteBtn).toHaveAttribute("type", "button");
+    expect(inviteBtn).toBeDisabled();
+  });
+});
+
 describe("AdminUsersPage — authenticated rendering", () => {
   it("renders the page heading when authenticated", async () => {
     mockListAdminUsers.mockResolvedValue([]);
     renderAdminUsersRoute();
 
-    // Wait past loading state
     await waitFor(() => {
       expect(screen.queryByRole("table", { name: /lista de usuários/i })).toBeInTheDocument();
     });
 
     expect(screen.getByRole("heading", { name: /usuários/i })).toBeInTheDocument();
+  });
+
+  it("renders filter chips", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: /filtrar usuários/i })).toBeInTheDocument();
+    });
+
+    const filterGroup = screen.getByRole("group", { name: /filtrar usuários/i });
+    expect(filterGroup).toHaveTextContent("Todos");
+    expect(filterGroup).toHaveTextContent("Ativos");
+    expect(filterGroup).toHaveTextContent("Suspensos");
+    expect(filterGroup).toHaveTextContent("Admins");
+    expect(filterGroup).toHaveTextContent("Convites pendentes");
+  });
+
+  it("renders search input", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByRole("searchbox", { name: /buscar usuários/i })).toBeInTheDocument();
+    });
   });
 });
 
@@ -114,11 +235,9 @@ describe("AdminUsersPage — loading state", () => {
 
     renderAdminUsersRoute();
 
-    // Skeleton rows are aria-hidden; table has aria-busy
     const table = screen.getByRole("table", { name: /lista de usuários/i });
     expect(table).toHaveAttribute("aria-busy", "true");
 
-    // Clean up pending promise
     resolve!([]);
   });
 });
@@ -133,6 +252,19 @@ describe("AdminUsersPage — empty state", () => {
     });
 
     expect(screen.getByText(/usuários aparecerão aqui/i)).toBeInTheDocument();
+  });
+
+  it("empty state is rendered inside the admin shell layout", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+    });
+
+    // Admin shell must still be present when showing empty state
+    expect(screen.getByTestId("admin-shell")).toBeInTheDocument();
+    expect(screen.getByTestId("admin-topnav")).toBeInTheDocument();
   });
 });
 
@@ -190,6 +322,24 @@ describe("AdminUsersPage — user rows", () => {
     });
   });
 
+  it("renders authSource as origin/provider badge, not as role or function", async () => {
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("local")).toBeInTheDocument();
+    });
+
+    // authSource values should appear as-is (origin, not inferred roles)
+    expect(screen.getByText("admin")).toBeInTheDocument();
+
+    // No "Função" column header — the table does not have a role column
+    const headers = screen.getAllByRole("columnheader");
+    const headerTexts = headers.map((h) => h.textContent?.toLowerCase() ?? "");
+    expect(headerTexts.some((t) => t.includes("função"))).toBe(false);
+    expect(headerTexts.some((t) => t.includes("cargo"))).toBe(false);
+  });
+
   it("renders fullName as subtitle when it differs from displayName", async () => {
     mockListAdminUsers.mockResolvedValue([
       {
@@ -205,6 +355,23 @@ describe("AdminUsersPage — user rows", () => {
       expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
     });
   });
+
+  it("renders table column headers: Nome, E-mail, Status, Origem, Criado em", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.queryByRole("table", { name: /lista de usuários/i })).toBeInTheDocument();
+    });
+
+    const headers = screen.getAllByRole("columnheader");
+    const texts = headers.map((h) => h.textContent?.toLowerCase() ?? "");
+    expect(texts.some((t) => t.includes("nome"))).toBe(true);
+    expect(texts.some((t) => t.includes("e-mail"))).toBe(true);
+    expect(texts.some((t) => t.includes("status"))).toBe(true);
+    expect(texts.some((t) => t.includes("origem"))).toBe(true);
+    expect(texts.some((t) => t.includes("criado em"))).toBe(true);
+  });
 });
 
 describe("AdminUsersPage — error state", () => {
@@ -217,5 +384,110 @@ describe("AdminUsersPage — error state", () => {
     });
 
     expect(screen.getByText(/verifique sua conexão/i)).toBeInTheDocument();
+  });
+
+  it("error state is rendered inside the admin shell layout", async () => {
+    mockListAdminUsers.mockRejectedValue(new Error("fail"));
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText(/não foi possível carregar os usuários/i)).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("admin-shell")).toBeInTheDocument();
+  });
+});
+
+describe("AdminUsersPage — filter chips", () => {
+  it("clicking Ativos chip filters to active users only", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Ativos" }));
+
+    expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    expect(screen.queryByText("Bob Bastos")).not.toBeInTheDocument();
+  });
+
+  it("clicking Suspensos chip filters to suspended users only", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("Bob Bastos")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Suspensos" }));
+
+    expect(screen.queryByText("Alice Andrade")).not.toBeInTheDocument();
+    expect(screen.getByText("Bob Bastos")).toBeInTheDocument();
+  });
+
+  it("clicking Admins chip shows empty state (no role data)", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Admins" }));
+
+    expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+  });
+
+  it("clicking Convites pendentes chip shows empty state", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Convites pendentes" }));
+
+    expect(screen.getByText(/nenhum usuário encontrado/i)).toBeInTheDocument();
+  });
+});
+
+describe("AdminUsersPage — search", () => {
+  it("search filters users by name", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    });
+
+    const searchInput = screen.getByRole("searchbox", { name: /buscar usuários/i });
+    await user.type(searchInput, "bob");
+
+    expect(screen.queryByText("Alice Andrade")).not.toBeInTheDocument();
+    expect(screen.getByText("Bob Bastos")).toBeInTheDocument();
+  });
+
+  it("search filters users by email", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers.mockResolvedValue(SAMPLE_USERS);
+    renderAdminUsersRoute();
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    });
+
+    const searchInput = screen.getByRole("searchbox", { name: /buscar usuários/i });
+    await user.type(searchInput, "alice@");
+
+    expect(screen.getByText("Alice Andrade")).toBeInTheDocument();
+    expect(screen.queryByText("Bob Bastos")).not.toBeInTheDocument();
   });
 });
