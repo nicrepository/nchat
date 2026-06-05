@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -81,8 +82,10 @@ func New(cfg config.Config) *App {
 		allowedDomains := splitOIDCDomains(cfg.OIDCAllowedEmailDomains)
 		warnOIDCAllowedEmailDomainsUnset(logger, cfg, allowedDomains)
 		oidcConfigured := true
-		if oidcErr := cfg.ValidateOIDC(); oidcErr != nil {
-			logger.Warn("oidc endpoints unavailable", "reason", "invalid_oidc_config")
+		oidcProviderName, resolvedProvider, providerErr := resolveOIDCProvider(cfg)
+		cfg.OIDCProviderName = oidcProviderName
+		if providerErr != nil {
+			logger.Warn("oidc endpoints unavailable", "reason", oidcProviderBootstrapReason(providerErr))
 			oidcConfigured = false
 		}
 		if err != nil || pool == nil {
@@ -94,33 +97,12 @@ func New(cfg config.Config) *App {
 		var provider service.OIDCProvider
 		if oidcConfigured {
 			oidcStore = storage.NewPGXOIDCStore(pool)
-			registry := service.NewProviderRegistry()
-			keycloakProvider := service.NewKeycloakProvider(service.KeycloakProviderConfig{
-				IssuerURL:    cfg.OIDCIssuerURL,
-				ClientID:     cfg.OIDCClientID,
-				ClientSecret: cfg.OIDCClientSecret,
-				RedirectURL:  cfg.OIDCRedirectURL,
-				Scopes:       cfg.OIDCScopes,
-				HTTPTimeout:  time.Duration(cfg.OIDCHTTPTimeoutSeconds) * time.Second,
-			})
-			if regErr := registry.Register(domain.IdentityProviderSlugKeycloak, keycloakProvider); regErr != nil {
-				logger.Warn("oidc endpoints unavailable", "reason", "provider_registration_failed")
-				oidcConfigured = false
-			} else {
-				slug := domain.IdentityProviderSlug(cfg.OIDCProviderName)
-				resolved, resolveErr := registry.Resolve(slug)
-				if resolveErr != nil {
-					logger.Warn("oidc endpoints unavailable", "reason", "provider_not_resolved")
-					oidcConfigured = false
-				} else {
-					provider = resolved
-				}
-			}
+			provider = resolvedProvider
 		}
 		oidcService, oidcErr := service.NewOIDCService(service.OIDCServiceConfig{
 			Enabled:             cfg.OIDCEnabled,
 			Configured:          oidcConfigured,
-			ProviderName:        cfg.OIDCProviderName,
+			ProviderName:        oidcProviderName,
 			FrontendCallbackURL: cfg.OIDCFrontendCallbackURL,
 			StateTTL:            time.Duration(cfg.OIDCStateTTLMinutes) * time.Minute,
 			AutoProvision:       cfg.OIDCAutoProvisionEnabled,
@@ -151,6 +133,43 @@ func splitOIDCDomains(raw string) []string {
 		}
 	}
 	return domains
+}
+
+func resolveOIDCProvider(cfg config.Config) (string, service.OIDCProvider, error) {
+	providerName := cfg.NormalizedOIDCProviderName()
+	if err := cfg.ValidateOIDC(); err != nil {
+		return providerName, nil, err
+	}
+
+	registry := service.NewProviderRegistry()
+	keycloakProvider := service.NewKeycloakProvider(service.KeycloakProviderConfig{
+		IssuerURL:    cfg.OIDCIssuerURL,
+		ClientID:     cfg.OIDCClientID,
+		ClientSecret: cfg.OIDCClientSecret,
+		RedirectURL:  cfg.OIDCRedirectURL,
+		Scopes:       cfg.OIDCScopes,
+		HTTPTimeout:  time.Duration(cfg.OIDCHTTPTimeoutSeconds) * time.Second,
+	})
+	if err := registry.Register(domain.IdentityProviderSlugKeycloak, keycloakProvider); err != nil {
+		return providerName, nil, err
+	}
+
+	provider, err := registry.Resolve(domain.IdentityProviderSlug(providerName))
+	if err != nil {
+		return providerName, nil, err
+	}
+	return providerName, provider, nil
+}
+
+func oidcProviderBootstrapReason(err error) string {
+	switch {
+	case errors.Is(err, domain.ErrOIDCMisconfigured):
+		return "invalid_oidc_config"
+	case errors.Is(err, domain.ErrOIDCDisabled):
+		return "provider_not_resolved"
+	default:
+		return "provider_registration_failed"
+	}
 }
 
 func warnOIDCAllowedEmailDomainsUnset(logger *slog.Logger, cfg config.Config, domains []string) {

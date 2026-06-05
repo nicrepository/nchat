@@ -295,6 +295,14 @@ func TestValidateOIDCEnabledMissingRequiredConfigFailsClosed(t *testing.T) {
 	}
 }
 
+func TestNormalizedOIDCProviderNameTrimsAndLowercases(t *testing.T) {
+	cfg := Config{OIDCProviderName: " Keycloak "}
+
+	if got := cfg.NormalizedOIDCProviderName(); got != "keycloak" {
+		t.Fatalf("expected keycloak, got %q", got)
+	}
+}
+
 func TestValidateOIDCAcceptsKnownOIDCSlugsAndRejectsUnknown(t *testing.T) {
 	base := Load()
 	base.OIDCEnabled = true

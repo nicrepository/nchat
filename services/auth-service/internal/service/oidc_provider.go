@@ -397,7 +397,7 @@ type AzureADProviderConfig struct {
 // NewAzureADProvider returns an OIDCProvider configured for Azure AD using the
 // standard v2.0 endpoint for the given tenant.
 // Returns ErrOIDCMisconfigured if TenantID or ClientID is empty.
-func NewAzureADProvider(cfg AzureADProviderConfig) (*KeycloakProvider, error) {
+func NewAzureADProvider(cfg AzureADProviderConfig) (OIDCProvider, error) {
 	if strings.TrimSpace(cfg.TenantID) == "" || strings.TrimSpace(cfg.ClientID) == "" {
 		return nil, domain.ErrOIDCMisconfigured
 	}
@@ -428,7 +428,7 @@ type GoogleWorkspaceProviderConfig struct {
 
 // NewGoogleWorkspaceProvider returns an OIDCProvider configured for Google Identity.
 // Returns ErrOIDCMisconfigured if ClientID is empty.
-func NewGoogleWorkspaceProvider(cfg GoogleWorkspaceProviderConfig) (*KeycloakProvider, error) {
+func NewGoogleWorkspaceProvider(cfg GoogleWorkspaceProviderConfig) (OIDCProvider, error) {
 	if strings.TrimSpace(cfg.ClientID) == "" {
 		return nil, domain.ErrOIDCMisconfigured
 	}

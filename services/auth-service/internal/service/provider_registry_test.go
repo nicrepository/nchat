@@ -58,10 +58,37 @@ func TestProviderRegistry_AzureADDefinitionExistsButRequiresConfig(t *testing.T)
 	}
 }
 
+func TestProviderRegistry_AzureADDefinitionReturnsOIDCProviderForConfig(t *testing.T) {
+	provider, err := NewAzureADProvider(AzureADProviderConfig{
+		TenantID:    "contoso.onmicrosoft.com",
+		ClientID:    "client",
+		RedirectURL: "https://auth.example.com/auth/oidc/keycloak/callback",
+	})
+	if err != nil {
+		t.Fatalf("AzureADProviderConfig: expected no error, got %v", err)
+	}
+	if provider == nil {
+		t.Fatal("expected Azure AD OIDC provider")
+	}
+}
+
 func TestProviderRegistry_GoogleWorkspaceDefinitionExistsButRequiresConfig(t *testing.T) {
 	_, err := NewGoogleWorkspaceProvider(GoogleWorkspaceProviderConfig{})
 	if !errors.Is(err, domain.ErrOIDCMisconfigured) {
 		t.Fatalf("empty GoogleWorkspaceProviderConfig: expected ErrOIDCMisconfigured, got %v", err)
+	}
+}
+
+func TestProviderRegistry_GoogleWorkspaceDefinitionReturnsOIDCProviderForConfig(t *testing.T) {
+	provider, err := NewGoogleWorkspaceProvider(GoogleWorkspaceProviderConfig{
+		ClientID:    "client",
+		RedirectURL: "https://auth.example.com/auth/oidc/keycloak/callback",
+	})
+	if err != nil {
+		t.Fatalf("GoogleWorkspaceProviderConfig: expected no error, got %v", err)
+	}
+	if provider == nil {
+		t.Fatal("expected Google Workspace OIDC provider")
 	}
 }
 

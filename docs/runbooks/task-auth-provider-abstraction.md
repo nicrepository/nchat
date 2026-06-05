@@ -8,11 +8,11 @@ Keycloak behaviour.
 
 ## Provider status
 
-| Slug               | Kind    | Status |
-|--------------------|---------|--------|
-| `keycloak`         | OIDC    | Fully implemented and enabled |
-| `azure_ad`         | OIDC    | Config adapters only — constructor exists, not wired to env vars yet |
-| `google_workspace` | OIDC    | Config adapters only — constructor exists, not wired to env vars yet |
+| Slug               | Kind    | Status                                                                  |
+| ------------------ | ------- | ----------------------------------------------------------------------- |
+| `keycloak`         | OIDC    | Fully implemented and enabled                                           |
+| `azure_ad`         | OIDC    | Config adapters only — constructor exists, not wired to env vars yet    |
+| `google_workspace` | OIDC    | Config adapters only — constructor exists, not wired to env vars yet    |
 | `samba_ad`         | LDAP/AD | `DirectoryProvider` interface placeholder only — cannot be used as OIDC |
 
 Azure AD and Google Workspace providers are **abstraction-ready but not fully enabled**
@@ -63,3 +63,8 @@ error. Full LDAP bind/login is out of scope for this abstraction PR.
 Existing deployments using `OIDC_PROVIDER_NAME=keycloak` (or omitting the variable entirely)
 are unaffected. The only breaking change is that `OIDC_PROVIDER_NAME=samba_ad` now fails
 config validation — it was previously invalid ("not keycloak") and would also have failed.
+
+Future enablement of Azure AD and Google Workspace requires a schema migration because
+the current OIDC tables/check constraints from migration `000007` only allow
+`provider='keycloak'`. This PR only prepares the abstraction and does not enable
+persisted non-keycloak OIDC flows.
