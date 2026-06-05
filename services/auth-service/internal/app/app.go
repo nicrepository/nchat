@@ -11,6 +11,7 @@ import (
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/auth-service/internal/config"
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/auth-service/internal/http"
 	"github.com/nicrepository/nchat/services/auth-service/internal/service"
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
@@ -93,7 +94,8 @@ func New(cfg config.Config) *App {
 		var provider service.OIDCProvider
 		if oidcConfigured {
 			oidcStore = storage.NewPGXOIDCStore(pool)
-			provider = service.NewKeycloakProvider(service.KeycloakProviderConfig{
+			registry := service.NewProviderRegistry()
+			keycloakProvider := service.NewKeycloakProvider(service.KeycloakProviderConfig{
 				IssuerURL:    cfg.OIDCIssuerURL,
 				ClientID:     cfg.OIDCClientID,
 				ClientSecret: cfg.OIDCClientSecret,
@@ -101,6 +103,19 @@ func New(cfg config.Config) *App {
 				Scopes:       cfg.OIDCScopes,
 				HTTPTimeout:  time.Duration(cfg.OIDCHTTPTimeoutSeconds) * time.Second,
 			})
+			if regErr := registry.Register(domain.IdentityProviderSlugKeycloak, keycloakProvider); regErr != nil {
+				logger.Warn("oidc endpoints unavailable", "reason", "provider_registration_failed")
+				oidcConfigured = false
+			} else {
+				slug := domain.IdentityProviderSlug(cfg.OIDCProviderName)
+				resolved, resolveErr := registry.Resolve(slug)
+				if resolveErr != nil {
+					logger.Warn("oidc endpoints unavailable", "reason", "provider_not_resolved")
+					oidcConfigured = false
+				} else {
+					provider = resolved
+				}
+			}
 		}
 		oidcService, oidcErr := service.NewOIDCService(service.OIDCServiceConfig{
 			Enabled:             cfg.OIDCEnabled,
