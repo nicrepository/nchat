@@ -113,3 +113,7 @@ ruvector.db
 # Local PoC outputs
 poc-results/*
 !poc-results/.gitkeep
+
+# Playwright local artifacts
+apps/web/playwright-report/
+apps/web/test-results/
