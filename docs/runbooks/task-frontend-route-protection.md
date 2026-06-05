@@ -32,7 +32,14 @@ Do not rely on frontend guards for data confidentiality or access control.
 Wraps any route that requires an authenticated session:
 
 ```tsx
-<Route path="/" element={<RequireAuth><HomePage /></RequireAuth>} />
+<Route
+  path="/"
+  element={
+    <RequireAuth>
+      <HomePage />
+    </RequireAuth>
+  }
+/>
 ```
 
 Behavior:
@@ -82,13 +89,13 @@ the check silently falls back to `/`.
 
 Tokens are stored exclusively in `sessionStorage` via the `authSession` helper:
 
-| Constraint | Status |
-|---|---|
-| `sessionStorage` only | ✅ enforced in `authSession.ts` |
-| No `localStorage` | ✅ no `localStorage.*` calls |
-| No cookies | ✅ no `document.cookie` usage |
-| No tokens in URL | ✅ `state.from` stores only pathname, never tokens |
-| No token in listener payload | ✅ callbacks receive no arguments |
+| Constraint                   | Status                                             |
+| ---------------------------- | -------------------------------------------------- |
+| `sessionStorage` only        | ✅ enforced in `authSession.ts`                    |
+| No `localStorage`            | ✅ no `localStorage.*` calls                       |
+| No cookies                   | ✅ no `document.cookie` usage                      |
+| No tokens in URL             | ✅ `state.from` stores only pathname, never tokens |
+| No token in listener payload | ✅ callbacks receive no arguments                  |
 
 ---
 
@@ -96,20 +103,20 @@ Tokens are stored exclusively in `sessionStorage` via the `authSession` helper:
 
 ### Protected routes (require authenticated session)
 
-| Path | Guard |
-|---|---|
-| `/` | `RequireAuth` |
+| Path                  | Guard                        |
+| --------------------- | ---------------------------- |
+| `/`                   | `RequireAuth`                |
 | `*` (catch-all → `/`) | `RequireAuth` (via redirect) |
 
 ### Public routes (no auth required)
 
-| Path | Notes |
-|---|---|
-| `/login` | Guest guard redirects authenticated users away |
-| `/forgot-password` | Always accessible |
-| `/reset-password` | Always accessible |
-| `/accept-invite` | Always accessible |
-| `/oidc-callback` | Always accessible; hardened in a prior PR |
+| Path               | Notes                                          |
+| ------------------ | ---------------------------------------------- |
+| `/login`           | Guest guard redirects authenticated users away |
+| `/forgot-password` | Always accessible                              |
+| `/reset-password`  | Always accessible                              |
+| `/accept-invite`   | Always accessible                              |
+| `/oidc-callback`   | Always accessible; hardened in a prior PR      |
 
 ---
 
