@@ -218,4 +218,30 @@ test.describe("auth", () => {
     // Code must never appear in the final URL
     expect(page.url()).not.toContain("code=");
   });
+
+  test("login page redirects already-authenticated user to /", async ({ page }) => {
+    await performLogin(page);
+    await page.goto("/login");
+    await expect(page).toHaveURL("/");
+    await expect(page.getByRole("heading", { name: "NChat" })).toBeVisible();
+  });
+
+  test("public route /forgot-password is accessible when unauthenticated", async ({ page }) => {
+    await mockForgotPasswordApi(page);
+    await page.goto("/forgot-password");
+    await expect(page).toHaveURL("/forgot-password");
+    await expect(page.getByLabel(/e-mail corporativo/i)).toBeVisible();
+  });
+
+  test("public route /reset-password is accessible when unauthenticated", async ({ page }) => {
+    await page.goto("/reset-password");
+    await expect(page).toHaveURL("/reset-password");
+    await expect(page).not.toHaveURL("/login");
+  });
+
+  test("public route /accept-invite is accessible when unauthenticated", async ({ page }) => {
+    await page.goto("/accept-invite");
+    await expect(page).toHaveURL("/accept-invite");
+    await expect(page).not.toHaveURL("/login");
+  });
 });

@@ -1,15 +1,22 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  _resetListeners,
   clearTokens,
   getAccessToken,
   getRefreshToken,
   isAuthenticated,
+  onAuthChange,
   setTokens,
 } from "./authSession";
 
 beforeEach(() => {
   sessionStorage.clear();
+  _resetListeners();
+});
+
+afterEach(() => {
+  _resetListeners();
 });
 
 describe("authSession", () => {
@@ -53,5 +60,52 @@ describe("authSession", () => {
     setTokens("acc_2", "ref_2");
     expect(getAccessToken()).toBe("acc_2");
     expect(getRefreshToken()).toBe("ref_2");
+  });
+});
+
+describe("onAuthChange", () => {
+  it("calls listener after setTokens", () => {
+    const listener = vi.fn();
+    const unsub = onAuthChange(listener);
+    setTokens("at", "rt");
+    expect(listener).toHaveBeenCalledTimes(1);
+    unsub();
+  });
+
+  it("calls listener after clearTokens", () => {
+    setTokens("at", "rt");
+    const listener = vi.fn();
+    const unsub = onAuthChange(listener);
+    clearTokens();
+    expect(listener).toHaveBeenCalledTimes(1);
+    unsub();
+  });
+
+  it("unsubscribe stops future notifications", () => {
+    const listener = vi.fn();
+    const unsub = onAuthChange(listener);
+    unsub();
+    setTokens("at", "rt");
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("multiple listeners all receive the notification", () => {
+    const a = vi.fn();
+    const b = vi.fn();
+    const unsubA = onAuthChange(a);
+    const unsubB = onAuthChange(b);
+    setTokens("at", "rt");
+    expect(a).toHaveBeenCalledTimes(1);
+    expect(b).toHaveBeenCalledTimes(1);
+    unsubA();
+    unsubB();
+  });
+
+  it("listener is called with no arguments (no token payload)", () => {
+    const listener = vi.fn();
+    const unsub = onAuthChange(listener);
+    setTokens("at", "rt");
+    expect(listener).toHaveBeenCalledWith();
+    unsub();
   });
 });

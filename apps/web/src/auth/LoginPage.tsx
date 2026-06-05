@@ -1,7 +1,8 @@
 import { type FormEvent, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, Navigate, useLocation, useNavigate } from "react-router-dom";
 
-import { clearTokens, setTokens } from "../lib/authSession";
+import { clearTokens, isAuthenticated, setTokens } from "../lib/authSession";
+import { safeFrom } from "../lib/safeRedirect";
 import "../tokens.css";
 import "./auth.css";
 import { login, oidcLoginUrl } from "./authApi";
@@ -12,11 +13,19 @@ const CHANGE_PASSWORD_REQUIRED_MESSAGE =
 
 export default function LoginPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [passwordChangeRequired, setPasswordChangeRequired] = useState(false);
+
+  const dest = safeFrom((location.state as { from?: unknown } | null)?.from);
+
+  // Guest guard: redirect already-authenticated users away from the login form.
+  if (isAuthenticated()) {
+    return <Navigate to={dest} replace />;
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -33,7 +42,7 @@ export default function LoginPage() {
         return;
       }
       setTokens(result.accessToken, result.refreshToken);
-      navigate("/", { replace: true });
+      navigate(dest, { replace: true });
     } catch {
       setError(LOGIN_ERROR);
     } finally {

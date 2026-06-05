@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
@@ -23,14 +23,18 @@ vi.mock("./authApi", () => ({
 
 const mockClearTokens = vi.fn();
 const mockSetTokens = vi.fn();
+const mockIsAuthenticated = vi.fn(() => false);
 vi.mock("../lib/authSession", () => ({
   clearTokens: (...args: unknown[]) => mockClearTokens(...args),
   setTokens: (...args: unknown[]) => mockSetTokens(...args),
+  isAuthenticated: () => mockIsAuthenticated(),
 }));
 
-function renderLogin() {
+function renderLogin(
+  initialEntries: Array<string | { pathname: string; state: unknown }> = ["/login"],
+) {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={initialEntries}>
       <LoginPage />
     </MemoryRouter>,
   );
@@ -157,5 +161,63 @@ describe("LoginPage", () => {
     await userEvent.click(screen.getByRole("button", { name: /entrar$/i }));
     expect(screen.getByRole("button", { name: /entrando/i })).toBeDisabled();
     rejectLogin!();
+  });
+});
+
+describe("guest guard", () => {
+  // Navigate uses real MemoryRouter navigation (not the useNavigate mock),
+  // so we verify the destination by checking which route renders.
+  function renderLoginWithRoutes(
+    initialEntries: Array<string | { pathname: string; state: unknown }> = ["/login"],
+  ) {
+    return render(
+      <MemoryRouter initialEntries={initialEntries}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/" element={<div>Home page</div>} />
+          <Route path="/chat" element={<div>Chat page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("redirects already-authenticated user to / when no state.from is set", async () => {
+    mockIsAuthenticated.mockReturnValue(true);
+    renderLoginWithRoutes();
+    await waitFor(() => {
+      expect(screen.getByText("Home page")).toBeInTheDocument();
+    });
+    expect(screen.queryByLabelText(/e-mail corporativo/i)).not.toBeInTheDocument();
+  });
+
+  it("redirects already-authenticated user to internal state.from path", async () => {
+    mockIsAuthenticated.mockReturnValue(true);
+    renderLoginWithRoutes([{ pathname: "/login", state: { from: "/chat" } }]);
+    await waitFor(() => {
+      expect(screen.getByText("Chat page")).toBeInTheDocument();
+    });
+  });
+
+  it("rejects external state.from and redirects to /", async () => {
+    mockIsAuthenticated.mockReturnValue(true);
+    renderLoginWithRoutes([{ pathname: "/login", state: { from: "https://evil.com" } }]);
+    await waitFor(() => {
+      expect(screen.getByText("Home page")).toBeInTheDocument();
+    });
+  });
+
+  it("rejects protocol-relative state.from //evil.com and redirects to /", async () => {
+    mockIsAuthenticated.mockReturnValue(true);
+    renderLoginWithRoutes([{ pathname: "/login", state: { from: "//evil.com" } }]);
+    await waitFor(() => {
+      expect(screen.getByText("Home page")).toBeInTheDocument();
+    });
+  });
+
+  it("does not redirect unauthenticated user", () => {
+    mockIsAuthenticated.mockReturnValue(false);
+    renderLogin();
+    expect(screen.getByLabelText(/e-mail corporativo/i)).toBeInTheDocument();
+    expect(mockNavigate).not.toHaveBeenCalled();
   });
 });
