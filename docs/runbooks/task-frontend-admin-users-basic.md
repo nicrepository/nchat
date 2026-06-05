@@ -58,6 +58,41 @@ No demo data or hardcoded user records are included.
 
 ---
 
+## UI Alignment Follow-Up
+
+A follow-up change (`fix/web-admin-users-match-prototype`) aligns the `/admin/users`
+screen with the Claude Design prototype (`prototype/claude-design-v1/nic-chat/`).
+
+### What changed
+
+| File                                         | Change                                              |
+| -------------------------------------------- | --------------------------------------------------- |
+| `apps/web/src/admin/AdminShell.tsx`          | New: dark sidebar + admin top tabnav shell          |
+| `apps/web/src/admin/AdminShell.css`          | New: shell styles (scoped prototype purple tokens)  |
+| `apps/web/src/admin/AdminUsersPage.tsx`      | Wrapped in AdminShell; filter chips; search; button |
+| `apps/web/src/admin/AdminUsersPage.css`      | Updated styles (page head, chips, toolbar, icons)   |
+| `apps/web/src/admin/AdminUsersPage.test.tsx` | Added shell, nav, invite, filter, and search tests  |
+
+### What the alignment covers
+
+- Dark left sidebar with NIC Chat / Workspace NIC-Labs branding
+- Admin top navigation: Visão geral, **Usuários** (active), Canais, Auditoria
+- Page head with title, subtitle, and disabled "Convidar usuário" button
+- Search input and filter chips (Todos, Ativos, Suspensos, Admins, Convites pendentes)
+  - Client-side filtering for Todos / Ativos / Suspensos
+  - Admins and Convites pendentes show empty state (no role/invite data in API)
+- Empty and error states render inside the admin shell layout
+- Emoji icons replaced with inline SVG
+- Prototype purple (`#6D28D9`) scoped to `.admin-app` wrapper
+
+### Authorization boundary note (unchanged)
+
+This change is **frontend-only**. No RBAC, no backend admin support, no role inference
+from `authSource`. The `RequireAuth` session guard and the read-only `adminUsersApi`
+behavior are preserved. Real admin authorization must be enforced by the backend.
+
+---
+
 ## Files Changed
 
 | File                                                            | Change                                         |
