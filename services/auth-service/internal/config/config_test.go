@@ -295,20 +295,29 @@ func TestValidateOIDCEnabledMissingRequiredConfigFailsClosed(t *testing.T) {
 	}
 }
 
-func TestValidateOIDCRequiresKeycloakProviderForMVP(t *testing.T) {
-	cfg := Load()
-	cfg.OIDCEnabled = true
-	cfg.OIDCProviderName = "google"
-	cfg.OIDCIssuerURL = "https://issuer.example.com"
-	cfg.OIDCClientID = "client"
-	cfg.OIDCClientSecret = "secret"
-	cfg.OIDCRedirectURL = "https://auth.example.com/callback"
-	cfg.OIDCFrontendCallbackURL = "/oidc-callback"
+func TestValidateOIDCAcceptsKnownOIDCSlugsAndRejectsUnknown(t *testing.T) {
+	base := Load()
+	base.OIDCEnabled = true
+	base.OIDCIssuerURL = "https://issuer.example.com"
+	base.OIDCClientID = "client"
+	base.OIDCClientSecret = "secret"
+	base.OIDCRedirectURL = "https://auth.example.com/callback"
+	base.OIDCFrontendCallbackURL = "/oidc-callback"
 
-	err := cfg.ValidateOIDC()
+	for _, slug := range []string{"keycloak", "azure_ad", "google_workspace"} {
+		cfg := base
+		cfg.OIDCProviderName = slug
+		if err := cfg.ValidateOIDC(); err != nil {
+			t.Errorf("slug %q: expected no error, got %v", slug, err)
+		}
+	}
 
-	if !errors.Is(err, domain.ErrOIDCMisconfigured) {
-		t.Fatalf("expected ErrOIDCMisconfigured, got %v", err)
+	for _, slug := range []string{"google", "okta", "samba_ad", ""} {
+		cfg := base
+		cfg.OIDCProviderName = slug
+		if err := cfg.ValidateOIDC(); !errors.Is(err, domain.ErrOIDCMisconfigured) {
+			t.Errorf("slug %q: expected ErrOIDCMisconfigured, got %v", slug, err)
+		}
 	}
 }
 
