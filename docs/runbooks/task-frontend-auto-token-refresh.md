@@ -19,11 +19,12 @@ refreshed only when an authenticated API call receives a `401 Unauthorized` resp
   session has expired (idle timeout, absolute max age, revocation), the next API call will receive
   `401`, the refresh attempt will fail, tokens will be cleared, and the original `401` error will
   be returned to the caller.
-- **Refresh failure clears stored tokens and returns an unauthenticated error to the caller.**
+- **Refresh failure clears stored tokens and rethrows an unauthenticated error to the caller.**
   On refresh failure, `clearTokens()` is called (subject to the session-binding guard described
-  below) and the original `401` error is re-thrown. Protected routes and callers are responsible
-  for handling the unauthenticated state using the existing unauthenticated flow (e.g. `RequireAuth`
-  redirecting to `/login` on the next render cycle after detecting no tokens).
+  below) and the original `401` error is re-thrown. Callers and protected routes are responsible
+  for handling the unauthenticated result using the existing auth flow.
+  `RequireAuth` will redirect to `/login` only on its next render cycle if it checks token state
+  at that point; it does not subscribe to token changes while already mounted.
 - **No tokens in URL, localStorage, or cookies.** Access and refresh tokens are kept exclusively in
   `sessionStorage` using the existing keys `nchat_at` (access token) and `nchat_rt` (refresh
   token). This means tokens are scoped to the current browser tab and cleared when the tab closes.

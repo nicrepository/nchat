@@ -179,26 +179,29 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
       throw err;
     }
 
-    // Clear in-flight state after the promise settled and before committing tokens.
-    if (inflightRefresh === captured) inflightRefresh = null;
-
-    // Three-way session-binding guard:
-    const currentRT = getRefreshToken();
-    if (currentRT === refreshToken) {
-      // First settler: commit the new tokens and record the rotation.
-      setTokens(newTokens.accessToken, newTokens.refreshToken);
-      lastAppliedRefreshRotation = {
-        fromRefreshToken: refreshToken,
-        toAccessToken: newTokens.accessToken,
-        toRefreshToken: newTokens.refreshToken,
-      };
-    } else if (currentRT === newTokens.refreshToken) {
-      // Concurrent waiter on the same session: first settler already committed the
-      // tokens. Fall through to retry with the now-current access token.
-    } else {
-      // External session change (logout or newer login) while refresh was in flight.
-      // Do not retry under the new/empty session; return the original 401.
-      throw err;
+    // Three-way session-binding guard. Keep inflightRefresh active until after the
+    // guarded commit/discard decision so no concurrent 401 for this generation can
+    // start a second refresh before the commit is complete.
+    try {
+      const currentRT = getRefreshToken();
+      if (currentRT === refreshToken) {
+        // First settler: commit the new tokens and record the rotation.
+        setTokens(newTokens.accessToken, newTokens.refreshToken);
+        lastAppliedRefreshRotation = {
+          fromRefreshToken: refreshToken,
+          toAccessToken: newTokens.accessToken,
+          toRefreshToken: newTokens.refreshToken,
+        };
+      } else if (currentRT === newTokens.refreshToken) {
+        // Concurrent waiter on the same session: first settler already committed the
+        // tokens. Fall through to retry with the now-current access token.
+      } else {
+        // External session change (logout or newer login) while refresh was in flight.
+        // Do not retry under the new/empty session; return the original 401.
+        throw err;
+      }
+    } finally {
+      if (inflightRefresh === captured) inflightRefresh = null;
     }
 
     // Retry the original request exactly once with the current access token.

@@ -352,8 +352,8 @@ describe("authenticatedFetch", () => {
         expect(getRefreshToken()).toBeNull();
       });
 
-      it("late second 401 after first refresh settles: retries with newer token, no extra refresh", async () => {
-        // First request: full refresh cycle completes.
+      it("sequential server-side 401 on already-refreshed token triggers its own refresh, no cross-request interference", async () => {
+        // First request: full refresh cycle completes; rotation record is set.
         setTokens("expired_at", "rt");
         mockApiFetch.mockRejectedValueOnce(make401()).mockResolvedValueOnce({ data: "first_ok" });
         mockRefresh.mockResolvedValueOnce(makeTokenPair());
@@ -363,16 +363,12 @@ describe("authenticatedFetch", () => {
         mockApiFetch.mockReset();
         mockRefresh.mockReset();
 
-        // Second request arrives after the refresh settled (inflightRefresh is null).
-        // It captured originalAccessToken = "expired_at" but now sessionStorage has "new_at".
-        // Simulate by seeding the "old" token into the call then letting the mock change it:
-        // actually, since AT is already "new_at" we just simulate the original request failing
-        // with a stale-token scenario via mockImplementation.
+        // Second request is made fresh with the current token ("new_at").
+        // The server returns 401 anyway (e.g. clock skew) — originalAccessToken ===
+        // currentAccessToken so the late-arrival guard does NOT fire; a new full
+        // refresh cycle runs for this request.
         mockApiFetch
           .mockImplementationOnce(async () => {
-            // AT is already "new_at" at call time, but suppose the server still returns 401
-            // (e.g. clock skew). originalAccessToken === currentAccessToken here, so the
-            // late-arrival guard won't fire — this verifies normal refresh still works.
             throw make401();
           })
           .mockResolvedValueOnce({ data: "second_ok" });
