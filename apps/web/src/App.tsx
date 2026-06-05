@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import "./App.css";
+import AdminUsersPage from "./admin/AdminUsersPage";
 import AcceptInvitePage from "./auth/AcceptInvitePage";
 import ForgotPasswordPage from "./auth/ForgotPasswordPage";
 import LoginPage from "./auth/LoginPage";
@@ -23,6 +24,14 @@ export default function App() {
           element={
             <RequireAuth>
               <HomePage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/admin/users"
+          element={
+            <RequireAuth>
+              <AdminUsersPage />
             </RequireAuth>
           }
         />

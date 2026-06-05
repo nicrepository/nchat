@@ -1,0 +1,331 @@
+/* Admin Users page — follows NIC Chat design tokens */
+
+.admin-users {
+  padding: 28px 32px 40px;
+  max-width: 1080px;
+}
+
+/* ── Page head ── */
+.admin-users__head {
+  margin-bottom: 24px;
+}
+
+.admin-users__title {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--color-ink);
+  margin: 0 0 4px;
+  letter-spacing: -0.01em;
+}
+
+.admin-users__subtitle {
+  font-size: 13.5px;
+  color: var(--color-muted);
+  margin: 0;
+}
+
+/* ── Table wrapper ── */
+.admin-users__table-wrap {
+  overflow-x: auto;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── Table ── */
+.admin-users__table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+
+.admin-users__table thead th {
+  background: var(--color-surface-2);
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  text-align: left;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.admin-users__table tbody td {
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: middle;
+  color: var(--color-ink-2);
+}
+
+.admin-users__table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.admin-users__table tbody tr:hover td {
+  background: var(--color-surface-2);
+}
+
+/* ── User cell (avatar + name) ── */
+.admin-users__user-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.admin-users__user-name {
+  font-weight: 600;
+  color: var(--color-ink);
+  line-height: 1.3;
+}
+
+.admin-users__user-sub {
+  font-size: 11.5px;
+  color: var(--color-muted);
+  margin-top: 1px;
+}
+
+/* ── Avatar ── */
+.admin-users__avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--color-primary-tint);
+  border: 1.5px solid var(--color-border);
+  color: var(--color-primary-strong);
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+/* ── Badges ── */
+.admin-users__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill, 999px);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.admin-users__badge--success {
+  background: var(--color-success-tint);
+  color: var(--color-success-ink);
+}
+
+.admin-users__badge--danger {
+  background: var(--color-danger-tint);
+  color: var(--color-danger-ink);
+}
+
+.admin-users__badge--neutral {
+  background: var(--color-surface-2);
+  color: var(--color-muted);
+  border: 1px solid var(--color-border);
+}
+
+.admin-users__badge--primary {
+  background: var(--color-primary-tint);
+  color: var(--color-primary-strong);
+}
+
+/* ── Status dot ── */
+.admin-users__status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.admin-users__status-dot--success {
+  background: var(--color-success);
+}
+.admin-users__status-dot--danger {
+  background: var(--color-danger);
+}
+.admin-users__status-dot--neutral {
+  background: var(--color-muted-2);
+}
+
+/* ── Muted text ── */
+.admin-users__muted {
+  color: var(--color-muted);
+}
+
+/* ── Loading skeleton ── */
+.admin-users__skeleton-row td {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.admin-users__skeleton-row:last-child td {
+  border-bottom: none;
+}
+
+.admin-users__skel {
+  height: 14px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--color-border) 0%,
+    var(--color-surface-2) 50%,
+    var(--color-border) 100%
+  );
+  background-size: 200% 100%;
+  animation: admin-users-shimmer 1.4s ease-in-out infinite;
+}
+
+.admin-users__skel--avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.admin-users__skel-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+@keyframes admin-users-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* ── Empty state ── */
+.admin-users__empty {
+  padding: 56px 24px;
+  text-align: center;
+  color: var(--color-muted);
+}
+
+.admin-users__empty-icon {
+  font-size: 40px;
+  margin-bottom: 12px;
+  opacity: 0.45;
+}
+
+.admin-users__empty-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-ink-2);
+  margin: 0 0 6px;
+}
+
+.admin-users__empty-sub {
+  font-size: 13px;
+  color: var(--color-muted);
+  margin: 0;
+}
+
+/* ── Error state ── */
+.admin-users__error {
+  padding: 48px 24px;
+  text-align: center;
+}
+
+.admin-users__error-icon {
+  font-size: 36px;
+  margin-bottom: 10px;
+  color: var(--color-danger);
+  opacity: 0.7;
+}
+
+.admin-users__error-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-ink);
+  margin: 0 0 6px;
+}
+
+.admin-users__error-sub {
+  font-size: 13px;
+  color: var(--color-muted);
+  margin: 0;
+}
+
+/* ── Responsive cards (≤ 639px) ── */
+@media (max-width: 639px) {
+  .admin-users {
+    padding: 20px 16px 32px;
+  }
+
+  .admin-users__table-wrap {
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    overflow: visible;
+  }
+
+  .admin-users__table,
+  .admin-users__table thead,
+  .admin-users__table tbody,
+  .admin-users__table tr,
+  .admin-users__table td {
+    display: block;
+  }
+
+  .admin-users__table thead {
+    display: none;
+  }
+
+  .admin-users__table tbody tr {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    margin-bottom: 10px;
+    padding: 14px;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .admin-users__table tbody tr:hover {
+    background: var(--color-surface);
+  }
+
+  .admin-users__table tbody td {
+    padding: 4px 0;
+    border-bottom: none;
+    color: var(--color-ink-2);
+  }
+
+  /* hide less important columns on mobile */
+  .admin-users__col-email {
+    display: none;
+  }
+  .admin-users__col-created {
+    display: none;
+  }
+
+  .admin-users__skeleton-row {
+    display: block;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    margin-bottom: 10px;
+    padding: 14px;
+  }
+
+  .admin-users__skeleton-row td {
+    display: block;
+    padding: 5px 0;
+    border-bottom: none;
+  }
+}
