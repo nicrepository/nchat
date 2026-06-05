@@ -56,6 +56,18 @@ function buildHeaders(
 }
 
 /**
+ * Records the most recent successful refresh rotation committed by this module.
+ * Used by the late-arrival guard to distinguish a same-generation rotation (safe
+ * to retry) from an external session change such as logout or a new login (must
+ * not retry under the new session).
+ */
+type AppliedRefreshRotation = {
+  fromRefreshToken: string;
+  toAccessToken: string;
+  toRefreshToken: string;
+};
+
+/**
  * Generation-bound in-flight refresh state. Each session generation (identified by
  * its refresh token) has at most one pending refresh call. Cross-session requests
  * (different refresh token) each get their own independent refresh call and cannot
@@ -66,7 +78,14 @@ type InflightRefresh = {
   promise: Promise<TokenPair>;
 };
 
+let lastAppliedRefreshRotation: AppliedRefreshRotation | null = null;
 let inflightRefresh: InflightRefresh | null = null;
+
+/** Reset module-level concurrency state. For test isolation only. */
+export function _resetState(): void {
+  inflightRefresh = null;
+  lastAppliedRefreshRotation = null;
+}
 
 /**
  * Authenticated wrapper around apiFetch.
@@ -94,9 +113,10 @@ let inflightRefresh: InflightRefresh | null = null;
  * ReadableStream bodies cannot be safely reused across a retry.
  */
 export async function authenticatedFetch<T>(url: string, init: RequestInit): Promise<T> {
-  // Capture the access token BEFORE the first call so the late-arrival guard can
-  // detect whether a concurrent request already refreshed between the call and 401.
+  // Capture both tokens BEFORE the first call so the late-arrival guard can
+  // verify that any token change was caused by a same-generation rotation.
   const originalAccessToken = getAccessToken();
+  const originalRefreshToken = getRefreshToken();
 
   try {
     return await apiFetch<T>(url, {
@@ -108,12 +128,26 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
       throw err;
     }
 
-    // Late-arrival guard: if the stored access token already changed, a concurrent
-    // request refreshed while this one was in flight. Retry once with the newer
-    // token rather than triggering a second refresh.
+    // Late-arrival guard: if the stored access token changed, only retry when the
+    // change is known to be a same-generation rotation committed by this module.
+    // Retrying under a different session (logout or a newer login) is forbidden.
     const currentAccessToken = getAccessToken();
     if (currentAccessToken !== originalAccessToken) {
-      return apiFetch<T>(url, { ...init, headers: buildHeaders(init.headers, currentAccessToken) });
+      const rotation = lastAppliedRefreshRotation;
+      if (
+        originalRefreshToken !== null &&
+        rotation !== null &&
+        rotation.fromRefreshToken === originalRefreshToken &&
+        currentAccessToken === rotation.toAccessToken &&
+        getRefreshToken() === rotation.toRefreshToken
+      ) {
+        return apiFetch<T>(url, {
+          ...init,
+          headers: buildHeaders(init.headers, currentAccessToken),
+        });
+      }
+      // Token changed due to logout or a different-session login: throw original 401.
+      throw err;
     }
 
     // 401 on a non-auth endpoint: attempt a single refresh.
@@ -136,19 +170,28 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
     } catch {
       if (inflightRefresh === captured) inflightRefresh = null;
       // Session-binding guard: only clear tokens if this session is still active.
-      if (getRefreshToken() === refreshToken) clearTokens();
+      if (getRefreshToken() === refreshToken) {
+        clearTokens();
+        if (lastAppliedRefreshRotation?.fromRefreshToken === refreshToken) {
+          lastAppliedRefreshRotation = null;
+        }
+      }
       throw err;
     }
 
-    // Clear in-flight state for this generation after the promise settled and before
-    // committing tokens, so no new 401 for this session starts an extra refresh.
+    // Clear in-flight state after the promise settled and before committing tokens.
     if (inflightRefresh === captured) inflightRefresh = null;
 
     // Three-way session-binding guard:
     const currentRT = getRefreshToken();
     if (currentRT === refreshToken) {
-      // First settler: commit the new tokens for this session generation.
+      // First settler: commit the new tokens and record the rotation.
       setTokens(newTokens.accessToken, newTokens.refreshToken);
+      lastAppliedRefreshRotation = {
+        fromRefreshToken: refreshToken,
+        toAccessToken: newTokens.accessToken,
+        toRefreshToken: newTokens.refreshToken,
+      };
     } else if (currentRT === newTokens.refreshToken) {
       // Concurrent waiter on the same session: first settler already committed the
       // tokens. Fall through to retry with the now-current access token.

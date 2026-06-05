@@ -17,7 +17,8 @@ refreshed only when an authenticated API call receives a `401 Unauthorized` resp
 - **Backend remains authoritative for idle and absolute session expiry.** The frontend does not
   attempt to keep a session alive by proactively refreshing tokens. If the backend decides the
   session has expired (idle timeout, absolute max age, revocation), the next API call will receive
-  `401`, the refresh attempt will fail, and the user will be redirected to `/login`.
+  `401`, the refresh attempt will fail, tokens will be cleared, and the original `401` error will
+  be returned to the caller.
 - **Refresh failure clears stored tokens and returns an unauthenticated error to the caller.**
   On refresh failure, `clearTokens()` is called (subject to the session-binding guard described
   below) and the original `401` error is re-thrown. Protected routes and callers are responsible
@@ -55,10 +56,12 @@ their own independent refresh call and cannot observe or modify each other's in-
 
 ### Late-arrival guard
 
-The access token used for the original request is captured before the call. If the stored access
-token has already changed by the time a `401` is caught (because a concurrent request completed a
-refresh first), the request retries immediately with the newer token instead of triggering another
-refresh call.
+Both the access token and the refresh token used for the original request are captured before the
+call. If the stored access token has already changed by the time a `401` is caught, the request
+retries immediately — but **only** if the token change is known to be a same-generation rotation
+committed by this module (i.e., the stored tokens exactly match the most recent rotation record).
+If the tokens changed due to a logout or a different-session login, the original `401` is
+re-thrown without retrying.
 
 ### Session-binding guard
 

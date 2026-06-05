@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "./api";
-import { AUTH_SKIP_PREFIXES, authenticatedFetch } from "./authClient";
+import { AUTH_SKIP_PREFIXES, _resetState, authenticatedFetch } from "./authClient";
 import { clearTokens, getAccessToken, getRefreshToken, setTokens } from "./authSession";
 
 const mockApiFetch = vi.fn();
@@ -21,6 +21,7 @@ vi.mock("../auth/authApi", () => ({
 beforeEach(() => {
   sessionStorage.clear();
   vi.clearAllMocks();
+  _resetState();
 });
 
 afterEach(() => {
@@ -203,6 +204,21 @@ describe("authenticatedFetch", () => {
       expect(mockApiFetch).toHaveBeenCalledTimes(1);
     });
 
+    it("retry returning 401 after successful refresh does not trigger a second refresh", async () => {
+      setTokens("expired_at", "rt");
+      mockApiFetch
+        .mockRejectedValueOnce(make401()) // initial
+        .mockRejectedValueOnce(make401()); // retry also returns 401
+      mockRefresh.mockResolvedValue(makeTokenPair());
+
+      await expect(authenticatedFetch("/api/resource", { method: "GET" })).rejects.toMatchObject({
+        status: 401,
+      });
+
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    });
+
     it("clears tokens and does not call refresh when no refresh token is stored", async () => {
       sessionStorage.setItem("nchat_at", "expired_at");
       // no refresh token
@@ -267,13 +283,24 @@ describe("authenticatedFetch", () => {
     });
 
     describe("late-arrival guard (access token changed while request was in flight)", () => {
-      it("retries with newer token without triggering a second refresh", async () => {
-        setTokens("at1", "rt1");
-        // Simulate a concurrent refresh completing while this request was in flight:
-        // the mock changes the stored tokens before throwing 401.
+      it("same-generation late 401 retries once with the rotated token, no second refresh", async () => {
+        // Step 1: run a complete refresh cycle to establish the rotation record.
+        setTokens("expired_at", "rt");
+        mockApiFetch.mockRejectedValueOnce(make401()).mockResolvedValueOnce({});
+        mockRefresh.mockResolvedValueOnce(makeTokenPair()); // → { new_at, new_rt }
+        await authenticatedFetch("/api/setup", { method: "GET" });
+        // lastAppliedRefreshRotation = { fromRT:"rt", toAT:"new_at", toRT:"new_rt" }
+
+        // Step 2: simulate a request that was started before the rotation committed.
+        // Restore old tokens so originalAccessToken/originalRefreshToken capture them.
+        setTokens("expired_at", "rt");
+        mockApiFetch.mockReset();
+        mockRefresh.mockReset();
+
+        // The apiFetch mock simulates the rotation completing concurrently mid-call.
         mockApiFetch
           .mockImplementationOnce(async () => {
-            setTokens("at2", "rt2");
+            setTokens("new_at", "new_rt"); // same rotation already recorded
             throw make401();
           })
           .mockResolvedValueOnce({ data: "retried" });
@@ -284,22 +311,45 @@ describe("authenticatedFetch", () => {
 
         expect(result).toEqual({ data: "retried" });
         expect(mockRefresh).not.toHaveBeenCalled();
-        expect(mockApiFetch).toHaveBeenCalledTimes(2);
+        const [, retryInit] = mockApiFetch.mock.calls[1] as [string, RequestInit];
+        expect((retryInit.headers as Record<string, string>)["authorization"]).toBe(
+          "Bearer new_at",
+        );
       });
 
-      it("uses the newer access token for the retry", async () => {
-        setTokens("at1", "rt1");
-        mockApiFetch
-          .mockImplementationOnce(async () => {
-            setTokens("at2", "rt2");
-            throw make401();
-          })
-          .mockResolvedValueOnce({});
+      it("access token changed due to a newer login does not retry under the new session", async () => {
+        setTokens("expired_at", "old_rt");
+        // Mock simulates a new login replacing the session while the request was in flight.
+        // lastAppliedRefreshRotation is null (reset in beforeEach), so the rotation check fails.
+        mockApiFetch.mockImplementationOnce(async () => {
+          setTokens("new_login_at", "new_login_rt");
+          throw make401();
+        });
 
-        await authenticatedFetch("/api/resource", { method: "GET" });
+        await expect(authenticatedFetch("/api/resource", { method: "GET" })).rejects.toMatchObject({
+          status: 401,
+        });
 
-        const [, retryInit] = mockApiFetch.mock.calls[1] as [string, RequestInit];
-        expect((retryInit.headers as Record<string, string>)["authorization"]).toBe("Bearer at2");
+        expect(mockRefresh).not.toHaveBeenCalled();
+        // New session tokens are preserved, not disturbed.
+        expect(getAccessToken()).toBe("new_login_at");
+        expect(getRefreshToken()).toBe("new_login_rt");
+      });
+
+      it("access token cleared due to logout does not retry", async () => {
+        setTokens("expired_at", "rt");
+        mockApiFetch.mockImplementationOnce(async () => {
+          clearTokens(); // logout while request was in flight
+          throw make401();
+        });
+
+        await expect(authenticatedFetch("/api/resource", { method: "GET" })).rejects.toMatchObject({
+          status: 401,
+        });
+
+        expect(mockRefresh).not.toHaveBeenCalled();
+        expect(getAccessToken()).toBeNull();
+        expect(getRefreshToken()).toBeNull();
       });
 
       it("late second 401 after first refresh settles: retries with newer token, no extra refresh", async () => {
@@ -362,7 +412,7 @@ describe("authenticatedFetch", () => {
         clearTokens(); // simulate logout while refresh is in flight
         resolveRefresh(makeTokenPair()); // stale refresh "succeeds"
 
-        // Retry fires but also 401s; p rejects.
+        // External session change detected: original 401 is rethrown, no retry.
         await expect(p).rejects.toMatchObject({ status: 401 });
         expect(getAccessToken()).toBeNull();
         expect(getRefreshToken()).toBeNull();
