@@ -1,8 +1,8 @@
 # Design: Frontend Route Protection
 
-**Date:** 2026-06-05  
-**Branch:** feat/web-route-protection  
-**Base:** develop  
+**Date:** 2026-06-05
+**Branch:** feat/web-route-protection
+**Base:** develop
 **PR target:** develop
 
 ---
