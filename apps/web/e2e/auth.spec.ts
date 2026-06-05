@@ -54,6 +54,36 @@ async function mockForgotPasswordApi(page: Page) {
   await page.route("**/api/auth/password/forgot", (route) => route.fulfill({ status: 204 }));
 }
 
+async function mockOIDCExchangeSuccess(page: Page) {
+  await page.route("**/api/auth/oidc/keycloak/exchange", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...MOCK_TOKENS,
+        user: {
+          id: "sso-user",
+          email: "sso@example.test",
+          display_name: "SSO User",
+          must_change_password: false,
+        },
+      }),
+    }),
+  );
+}
+
+async function mockOIDCExchangeFailure(page: Page) {
+  await page.route("**/api/auth/oidc/keycloak/exchange", (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: { code: "invalid_oidc_callback", message: "expired or reused code" },
+      }),
+    }),
+  );
+}
+
 async function performLogin(page: Page) {
   await mockLoginSuccess(page);
   await mockRefreshApi(page);
@@ -114,10 +144,54 @@ test.describe("auth", () => {
     await expect(page.getByRole("link", { name: /voltar para entrar/i })).toBeVisible();
   });
 
-  test("SSO button is visible but disabled (smoke test)", async ({ page }) => {
+  test("SSO link is visible and points to backend Keycloak login endpoint", async ({ page }) => {
     await page.goto("/login");
-    const ssoButton = page.getByRole("button", { name: /sso/i });
-    await expect(ssoButton).toBeVisible();
-    await expect(ssoButton).toBeDisabled();
+    const ssoLink = page.getByRole("link", { name: /entrar com keycloak/i });
+    await expect(ssoLink).toBeVisible();
+    await expect(ssoLink).toHaveAttribute("href", /\/auth\/oidc\/keycloak\/login/);
+  });
+
+  test("OIDC callback with missing code shows generic SSO error and link to /login", async ({
+    page,
+  }) => {
+    await page.goto("/oidc-callback");
+    await expect(page.getByRole("alert")).toBeVisible();
+    await expect(page.getByRole("alert")).toContainText(
+      /não foi possível concluir o login com sso/i,
+    );
+    await expect(page.getByRole("link", { name: /voltar ao login/i })).toBeVisible();
+  });
+
+  test("OIDC callback successfully exchanges code, stores session, and navigates home", async ({
+    page,
+  }) => {
+    await mockOIDCExchangeSuccess(page);
+    await mockRefreshApi(page);
+    await page.goto("/oidc-callback?code=opaque-test-code");
+    await expect(page).toHaveURL("/");
+    await expect(page.getByRole("heading", { name: "NChat" })).toBeVisible();
+  });
+
+  test("OIDC callback handles exchange failure with generic SSO error", async ({ page }) => {
+    await mockOIDCExchangeFailure(page);
+    await page.goto("/oidc-callback?code=expired-code");
+    await expect(page.getByRole("alert")).toBeVisible();
+    await expect(page.getByRole("alert")).toContainText(
+      /não foi possível concluir o login com sso/i,
+    );
+    await expect(page.getByRole("alert").textContent()).resolves.not.toMatch(
+      /expired-code|expired or reused/i,
+    );
+  });
+
+  test("OIDC callback removes code from URL on success before navigating home", async ({
+    page,
+  }) => {
+    await mockOIDCExchangeSuccess(page);
+    await mockRefreshApi(page);
+    await page.goto("/oidc-callback?code=opaque-test-code");
+    await expect(page).toHaveURL("/");
+    // Code must never appear in the final URL
+    expect(page.url()).not.toContain("code=");
   });
 });

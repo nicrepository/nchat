@@ -60,7 +60,9 @@ describe("OIDCCallbackPage", () => {
   it("shows generic error when code is absent", async () => {
     renderCallback("/oidc-callback");
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(/sso indisponível/i);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /não foi possível concluir o login com sso/i,
+    );
     expect(mockOIDCExchange).not.toHaveBeenCalled();
   });
 
@@ -69,7 +71,9 @@ describe("OIDCCallbackPage", () => {
 
     renderCallback("/oidc-callback?code=bad-code");
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(/sso indisponível/i);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /não foi possível concluir o login com sso/i,
+    );
     expect(screen.getByRole("alert").textContent).not.toMatch(/raw backend detail|bad-code/i);
   });
 });

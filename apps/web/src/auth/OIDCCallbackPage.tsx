@@ -6,7 +6,7 @@ import "../tokens.css";
 import "./auth.css";
 import { oidcExchange } from "./authApi";
 
-const SSO_ERROR = "SSO indisponível. Tente novamente ou use e-mail e senha.";
+const SSO_ERROR = "Não foi possível concluir o login com SSO.";
 
 export default function OIDCCallbackPage() {
   const navigate = useNavigate();
