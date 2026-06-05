@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 
 import { setTokens } from "../lib/authSession";
@@ -12,37 +12,41 @@ export default function OIDCCallbackPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const code = searchParams.get("code")?.trim() ?? "";
+  const hasCodeParam = searchParams.has("code");
   const [error, setError] = useState<string | null>(() => (code ? null : SSO_ERROR));
+  const hasExchangedRef = useRef(false);
 
   useEffect(() => {
-    let cancelled = false;
     if (!code) {
+      // Remove a blank ?code= from the URL (e.g. /oidc-callback?code=) if present.
+      if (hasCodeParam) {
+        window.history.replaceState({}, "", "/oidc-callback");
+      }
       return;
     }
+
+    // One-shot guard: prevents duplicate POST under React StrictMode double-invoke.
+    if (hasExchangedRef.current) {
+      return;
+    }
+    hasExchangedRef.current = true;
+
+    // Remove code from URL immediately before the network call to avoid
+    // leaking it through the Referer header on the POST.
+    window.history.replaceState({}, "", "/oidc-callback");
 
     async function exchangeCode() {
       try {
         const result = await oidcExchange(code);
-        if (cancelled) {
-          return;
-        }
         setTokens(result.accessToken, result.refreshToken);
-        window.history.replaceState({}, "", "/oidc-callback");
         navigate("/", { replace: true });
       } catch {
-        if (!cancelled) {
-          window.history.replaceState({}, "", "/oidc-callback");
-          setError(SSO_ERROR);
-        }
+        setError(SSO_ERROR);
       }
     }
 
     void exchangeCode();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [code, navigate]);
+  }, [code, hasCodeParam, navigate]);
 
   return (
     <div className="auth-root">

@@ -148,7 +148,7 @@ test.describe("auth", () => {
     await page.goto("/login");
     const ssoLink = page.getByRole("link", { name: /entrar com keycloak/i });
     await expect(ssoLink).toBeVisible();
-    await expect(ssoLink).toHaveAttribute("href", /\/auth\/oidc\/keycloak\/login/);
+    await expect(ssoLink).toHaveAttribute("href", "/api/auth/oidc/keycloak/login");
   });
 
   test("OIDC callback with missing code shows generic SSO error and link to /login", async ({
@@ -182,6 +182,30 @@ test.describe("auth", () => {
     await expect(page.getByRole("alert").textContent()).resolves.not.toMatch(
       /expired-code|expired or reused/i,
     );
+  });
+
+  test("OIDC callback posts exchange request exactly once", async ({ page }) => {
+    let exchangeCount = 0;
+    await page.route("**/api/auth/oidc/keycloak/exchange", (route) => {
+      exchangeCount++;
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...MOCK_TOKENS,
+          user: {
+            id: "sso-user",
+            email: "sso@example.test",
+            display_name: "SSO User",
+            must_change_password: false,
+          },
+        }),
+      });
+    });
+    await mockRefreshApi(page);
+    await page.goto("/oidc-callback?code=opaque-test-code");
+    await expect(page).toHaveURL("/");
+    expect(exchangeCount).toBe(1);
   });
 
   test("OIDC callback removes code from URL on success before navigating home", async ({

@@ -1,6 +1,6 @@
 # Runbook: Frontend SSO Button and Callback Flow
 
-**RF traceability:** Keycloak OIDC provider (feat/auth-keycloak-oidc-provider)
+**RF traceability:** RF-44 — Frontend SSO entry flow; Keycloak OIDC provider (feat/auth-keycloak-oidc-provider)
 **Branch:** `feat/web-sso-button-callback-flow`
 **Depends on runbook:** `task-auth-oidc-keycloak.md`, `task-frontend-auth-entry-flows.md`
 
@@ -31,11 +31,12 @@ OIDCCallbackPage  →  POST /auth/oidc/keycloak/exchange  →  NChat access + re
 - The backend validates the provider session and issues a **one-time opaque exchange code**.
 - The frontend exchanges that code via `POST /auth/oidc/keycloak/exchange`; **no real auth
   tokens ever appear in the URL**.
-- The exchange code is consumed immediately and removed from the browser URL via
-  `window.history.replaceState` before navigation, so it does not appear in the browser
-  history or referrer headers.
-- Tokens are stored in `sessionStorage` (keys `nchat_at`, `nchat_rt`), consistent with the
-  email/password login flow. See `task-frontend-auth-entry-flows.md` for storage rationale.
+- The exchange code is removed from the browser URL **before the network call** via
+  `window.history.replaceState`, so it cannot leak through the `Referer` header on the `POST`
+  and does not appear in browser history.
+- Tokens are stored via the existing `setTokens` helper from `authSession.ts` in `sessionStorage`
+  (keys `nchat_at`, `nchat_rt`), consistent with the email/password login flow. See
+  `task-frontend-auth-entry-flows.md` for storage rationale.
 
 ## Frontend components
 
@@ -79,7 +80,8 @@ written to `console`, or included in tests.
 
 - Access tokens and refresh tokens are **never placed in URLs**.
 - `localStorage` is not used.
-- The exchange code is removed from the browser URL before navigation.
+- The exchange code is removed from the browser URL **before the network call** to avoid
+  leaking it via the `Referer` header on the `POST`.
 - No arbitrary `redirect_after` query parameter is accepted.
 - No open redirect: the callback page always navigates to the hard-coded `/` path on success.
 
@@ -95,12 +97,12 @@ VITE_AUTH_API_BASE_URL=http://localhost:8081/auth
 
 ## Out of scope
 
-- Azure AD UI option
-- Google Workspace UI option
+- Azure AD button
+- Google Workspace button
 - SambaAD login UI
-- Provider selector UI
-- Admin provider configuration UI
-- Backend OIDC changes
+- provider selector
+- admin provider configuration UI
+- backend OIDC changes
 
 ## Local commands
 
