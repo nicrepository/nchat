@@ -43,6 +43,9 @@ func (f *fakeDeviceSessionStore) RevokeAllSessionsExcept(_ context.Context, _, e
 	f.lastExceptSessionID = exceptSessionID
 	return f.revokeAllErr
 }
+func (f *fakeDeviceSessionStore) RevokeAllUserSessions(_ context.Context, _ string) error {
+	return nil
+}
 func (f *fakeDeviceSessionStore) ListDevices(_ context.Context, _ string, _ string, includeRevoked bool, limit int) ([]domain.DeviceInfo, domain.DeviceSessionPolicy, error) {
 	f.lastIncludeRevoked = includeRevoked
 	f.lastLimit = limit
