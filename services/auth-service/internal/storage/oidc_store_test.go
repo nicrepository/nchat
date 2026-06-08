@@ -849,26 +849,26 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeReturnsPolicyError(t *testing.
 // after the user is suspended. The JOIN on auth.users with status='active' causes
 // the UPDATE to match zero rows, returning ErrInvalidToken.
 func TestPGXOIDCStore_ConsumeExchangeRejectsSuspendedUser(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-// User was suspended after the exchange code was minted.
-// The JOIN on auth.users WHERE status='active' matches nothing → ErrNoRows.
-mock.ExpectQuery(`UPDATE auth\.oidc_exchange_codes ec`).
-WithArgs("keycloak", "code-hash").
-WillReturnRows(pgxmock.NewRows([]string{
-"id", "provider", "access_value_encrypted", "refresh_value_encrypted", "bearer_scheme", "expires_in", "user_json",
-})) // empty: suspended user's join fails
+	// User was suspended after the exchange code was minted.
+	// The JOIN on auth.users WHERE status='active' matches nothing → ErrNoRows.
+	mock.ExpectQuery(`UPDATE auth\.oidc_exchange_codes ec`).
+		WithArgs("keycloak", "code-hash").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "provider", "access_value_encrypted", "refresh_value_encrypted", "bearer_scheme", "expires_in", "user_json",
+		})) // empty: suspended user's join fails
 
-store := storage.NewPGXOIDCStore(mock)
-_, err = store.ConsumeExchange(context.Background(), "keycloak", "code-hash")
-if !errors.Is(err, domain.ErrInvalidToken) {
-t.Fatalf("expected ErrInvalidToken for suspended user, got %v", err)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXOIDCStore(mock)
+	_, err = store.ConsumeExchange(context.Background(), "keycloak", "code-hash")
+	if !errors.Is(err, domain.ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken for suspended user, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }

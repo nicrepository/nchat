@@ -65,11 +65,11 @@ On activation, no sessions are restored. The user must authenticate again.
 
 The current `PATCH /admin/users/{id}/status` endpoint is guarded by `AdminBootstrapGuard` (static shared `X-NChat-Admin-Token`). This is a **bootstrap-only** guard, not the final RF-74/RBAC implementation.
 
-| Limitation                  | Status                                                   |
-| --------------------------- | -------------------------------------------------------- |
-| Token is not browser-safe   | Endpoint is only for server-to-server / tooling use      |
+| Limitation                  | Status                                                     |
+| --------------------------- | ---------------------------------------------------------- |
+| Token is not browser-safe   | Endpoint is only for server-to-server / tooling use        |
 | No user identity in request | `callerID` passed as `""` — self-deactivation not enforced |
-| No RBAC role check          | Any holder of `ADMIN_BOOTSTRAP_TOKEN` can call this      |
+| No RBAC role check          | Any holder of `ADMIN_BOOTSTRAP_TOKEN` can call this        |
 
 **Self-deactivation prevention** requires the requesting admin's user ID from a verified JWT. This will be enforced when RF-74 provides a `BearerAuth` + admin role check, at which point `callerID` in `UserService.UpdateUserStatus` will be populated from the JWT `sub` claim.
 
