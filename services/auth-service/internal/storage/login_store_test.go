@@ -1321,51 +1321,51 @@ func TestPGXLoginStore_CreateLoginSession_NonCredentialFailuresDoNotTriggerLocko
 // No session row, no refresh-token-history row, and no login_attempts success
 // record are inserted.
 func TestPGXLoginStore_CreateLoginSession_SuspendedDuringLogin_AbortsBeforeSessionInsert(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-passwordHash := mustHashPassword(t, "correct-password")
+	passwordHash := mustHashPassword(t, "correct-password")
 
-mock.ExpectBegin()
-mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(defaultPolicyRow())
-mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
-WithArgs(pgxmock.AnyArg()).
-WillReturnResult(pgxmock.NewResult("", 0))
-// User is active when first read (password verification proceeds).
-mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
-WithArgs("suspended@example.com").
-WillReturnRows(pgxmock.NewRows([]string{
-"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
-}).AddRow("user-s", "suspended@example.com", "User", "active", nil, passwordHash, false))
-mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-WithArgs("user-s", 30).
-WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-// Revalidation finds no active user (suspension committed between password check and here).
-mock.ExpectQuery(`SELECT id FROM auth\.users`).
-WithArgs("user-s").
-WillReturnRows(pgxmock.NewRows([]string{"id"})) // no rows = not active
-// No INSERT login_attempts, no INSERT user_sessions, no INSERT refresh_token_history.
-mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(defaultPolicyRow())
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("", 0))
+	// User is active when first read (password verification proceeds).
+	mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
+		WithArgs("suspended@example.com").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
+		}).AddRow("user-s", "suspended@example.com", "User", "active", nil, passwordHash, false))
+	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
+		WithArgs("user-s", 30).
+		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
+	// Revalidation finds no active user (suspension committed between password check and here).
+	mock.ExpectQuery(`SELECT id FROM auth\.users`).
+		WithArgs("user-s").
+		WillReturnRows(pgxmock.NewRows([]string{"id"})) // no rows = not active
+	// No INSERT login_attempts, no INSERT user_sessions, no INSERT refresh_token_history.
+	mock.ExpectRollback()
 
-store := newLoginStore(mock)
-_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
-Password:         "correct-password",
-Email:            "suspended@example.com",
-RefreshTokenHash: "refresh-hash",
-RefreshExpiresAt: time.Now().Add(time.Hour),
-})
-if err == nil {
-t.Fatal("expected error when user is suspended during login, got nil")
-}
-if !errors.Is(err, domain.ErrInvalidCredentials) {
-t.Fatalf("expected ErrInvalidCredentials (opaque error), got %v", err)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations (no session must have been inserted): %v", err)
-}
+	store := newLoginStore(mock)
+	_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
+		Password:         "correct-password",
+		Email:            "suspended@example.com",
+		RefreshTokenHash: "refresh-hash",
+		RefreshExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err == nil {
+		t.Fatal("expected error when user is suspended during login, got nil")
+	}
+	if !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("expected ErrInvalidCredentials (opaque error), got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations (no session must have been inserted): %v", err)
+	}
 }
 
 // TestPGXLoginStore_CreateLoginSession_SuspendedUser_RevalidationSQL verifies that
@@ -1373,44 +1373,44 @@ t.Fatalf("unmet expectations (no session must have been inserted): %v", err)
 // password verification but before any session or artifact inserts — by checking that
 // a failure at the revalidation step leaves the DB in a consistent state.
 func TestPGXLoginStore_CreateLoginSession_SuspendedUser_RevalidationSQL(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-passwordHash := mustHashPassword(t, "correct-password")
+	passwordHash := mustHashPassword(t, "correct-password")
 
-mock.ExpectBegin()
-mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(defaultPolicyRow())
-mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
-WithArgs(pgxmock.AnyArg()).
-WillReturnResult(pgxmock.NewResult("", 0))
-mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
-WithArgs("user@example.com").
-WillReturnRows(pgxmock.NewRows([]string{
-"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
-}).AddRow("user-r", "user@example.com", "Revalidated", "active", nil, passwordHash, false))
-mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
-WithArgs("user-r", 30).
-WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
-// Revalidation fails (DB error).
-mock.ExpectQuery(`SELECT id FROM auth\.users`).
-WithArgs("user-r").
-WillReturnError(errors.New("db error during revalidation"))
-mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT min_password_length`).WillReturnRows(defaultPolicyRow())
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("", 0))
+	mock.ExpectQuery(`SELECT u\.id, u\.email::text, u\.display_name`).
+		WithArgs("user@example.com").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "status", "deleted_at", "password_hash", "must_change_password",
+		}).AddRow("user-r", "user@example.com", "Revalidated", "active", nil, passwordHash, false))
+	mock.ExpectQuery(`SELECT created_at FROM auth\.login_attempts`).
+		WithArgs("user-r", 30).
+		WillReturnRows(pgxmock.NewRows([]string{"created_at"}))
+	// Revalidation fails (DB error).
+	mock.ExpectQuery(`SELECT id FROM auth\.users`).
+		WithArgs("user-r").
+		WillReturnError(errors.New("db error during revalidation"))
+	mock.ExpectRollback()
 
-store := newLoginStore(mock)
-_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
-Password:         "correct-password",
-Email:            "user@example.com",
-RefreshTokenHash: "refresh-hash",
-RefreshExpiresAt: time.Now().Add(time.Hour),
-})
-if err == nil {
-t.Fatal("expected error from revalidation DB failure, got nil")
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("expectations not met: %v", err)
-}
+	store := newLoginStore(mock)
+	_, err = store.CreateLoginSession(context.Background(), domain.CreateSessionInput{
+		Password:         "correct-password",
+		Email:            "user@example.com",
+		RefreshTokenHash: "refresh-hash",
+		RefreshExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err == nil {
+		t.Fatal("expected error from revalidation DB failure, got nil")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations not met: %v", err)
+	}
 }

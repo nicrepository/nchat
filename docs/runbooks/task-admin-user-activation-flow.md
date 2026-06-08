@@ -34,30 +34,39 @@ The frontend displays disabled action buttons as a UI contract placeholder only.
   **Not triggered from the UI in this PR.**
 - Action buttons ("Suspender" / "Ativar") are rendered but permanently disabled
   with `title="Requer permissão de administrador"`.
-- No `X-NChat-Admin-Token` appears anywhere in frontend code.
+- `X-NChat-Admin-Token` is **not sent by runtime frontend code**.
+  It may appear in tests or comments as a boundary assertion (e.g., asserting it is absent), which is expected.
 
 ---
 
-## Session revocation behavior
+## Session and token revocation behavior
 
-Status change and session revocation happen atomically (single transaction):
+RF-75 partial foundation (status transition + revocation atomics). End-to-end browser admin flow depends on future RF-74/RBAC admin guard.
+
+Status change, session revocation, and OIDC exchange invalidation happen **atomically in a single DB transaction**:
 
 1. User row locked (`SELECT ... FOR UPDATE`).
 2. Transition validated under the lock (`active → suspended` or `suspended → active`).
 3. User status updated.
-4. If `suspended`: `UPDATE auth.user_sessions SET revoked_at = now(), revoked_reason = 'admin_suspension'` for all non-revoked sessions + `UPDATE auth.refresh_token_history SET status = 'revoked'` for active token history.
+4. If `suspended`:
+   - `UPDATE auth.user_sessions SET revoked_at = now(), revoked_reason = 'admin_suspension'` for all non-revoked sessions + cascade to `auth.refresh_token_history`.
+   - `UPDATE auth.oidc_exchange_codes SET used_at = now() WHERE used_at IS NULL AND expires_at > now() AND user_json->>'id' = $1` — invalidates pending OIDC exchange codes so a pre-suspension code cannot be consumed after reactivation.
 5. Commit. If any step fails, the entire transaction rolls back — no partial state.
 
-Additional guards that block suspended users without requiring explicit revocation:
+**Activation** updates status only. No sessions, refresh tokens, or OIDC exchange codes are restored. The user must log in again.
 
-- Login: `login_store.go` rejects `status != 'active'`.
+### Password login / suspension race
+
+Password login re-validates user status immediately after password verification but **before inserting any session artifact**, using `SELECT ... FOR UPDATE` on the user row. This serializes with the suspension transaction's own row lock:
+
+- If suspension commits first: login revalidation sees `status != 'active'`, returns generic `ErrInvalidCredentials`, no session created.
+- If login proceeds first: login holds the row lock through session insert; suspension then waits, locks the row, and revokes the newly-created session in its own transaction.
+
+### Other guards for suspended users
+
 - Refresh: `session_store.go` JOIN requires `u.status = 'active'`.
 - Session validation: `device_session_store.go` requires `u.status = 'active'`.
 - OIDC exchange consumption: `ConsumeExchange` joins `auth.users` and rejects inactive users.
-
-On activation, no sessions are restored. The user must authenticate again.
-
-**Known limitation:** A concurrent login or OIDC session creation may race with a suspension if it reads the user's status as `active` before the suspension transaction commits. This is a pre-existing design consideration in the login/OIDC store paths and is out of scope for this PR.
 
 ---
 

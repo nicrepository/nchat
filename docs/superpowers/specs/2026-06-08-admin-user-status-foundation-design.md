@@ -224,17 +224,24 @@ The existing invite button pattern (`disabled`, `aria-disabled="true"`, `title="
 
 ## 6. Effect on login / session / refresh
 
-The following behaviors already hold because of existing DB checks; no changes required:
+The following behaviors hold because of existing DB checks plus new explicit revocation:
 
-| Operation               | Suspended user outcome                                |
-| ----------------------- | ----------------------------------------------------- |
-| `POST /auth/login`      | ❌ `status != 'active'` check in `login_store.go:79`  |
-| `POST /auth/refresh`    | ❌ `u.status = 'active'` JOIN in `session_store.go`   |
-| `ValidateActiveSession` | ❌ `u.status = 'active'` in `device_session_store.go` |
+| Operation                | Suspended user outcome                                                                          |
+| ------------------------ | ----------------------------------------------------------------------------------------------- |
+| `POST /auth/login`       | ❌ `status != 'active'` check in `login_store.go` (initial check + revalidation under row lock) |
+| `POST /auth/refresh`     | ❌ `u.status = 'active'` JOIN in `session_store.go`                                             |
+| `ValidateActiveSession`  | ❌ `u.status = 'active'` in `device_session_store.go`                                           |
+| `OIDCExchange` (consume) | ❌ `u.status = 'active'` JOIN in `ConsumeExchange` SQL                                          |
 
-Additionally, on suspension this PR revokes all existing sessions/refresh tokens via `RevokeAllUserSessions`, making the revocation explicit and audit-friendly.
+On suspension, `PGXUserStore.UpdateUserStatus` atomically:
 
-On activation, no sessions are restored. The user must log in again.
+1. Updates user status to `suspended`.
+2. Revokes all active sessions and refresh token history (`admin_suspension`).
+3. Marks pending OIDC exchange codes as used (`user_json->>'id' = $1`).
+
+**Password login / suspension race** is addressed by `revalidateUserActive`: after password verification but before inserting any session artifact, the login transaction re-reads the user row with `SELECT ... FOR UPDATE`, serializing with the suspension transaction's own row lock.
+
+On activation, no sessions, refresh tokens, or OIDC exchange codes are restored. The user must log in again.
 
 ---
 
@@ -244,14 +251,27 @@ On activation, no sessions are restored. The user must log in again.
 
 **Service tests** (`service/user_service_test.go`):
 
-- active → suspended succeeds
-- suspended → active succeeds
-- active → active rejected (`ErrStatusTransitionNotAllowed`)
-- suspended → suspended rejected
-- unknown user returns `ErrNotFound`
-- suspension calls `RevokeAllUserSessions`
-- activation does NOT call `RevokeAllUserSessions`
-- callerID == targetID returns `ErrForbidden`
+- active → suspended delegates to store, store propagates result
+- suspended → active delegates to store, store propagates result
+- store error → `ErrStatusTransitionNotAllowed` propagated
+- store error → `ErrNotFound` propagated
+- callerID == targetID returns `ErrForbidden` (store not called)
+
+**Storage tests** (`storage/user_store_test.go`):
+
+- suspension TX: lock + transition validate + UPDATE users + revoke sessions CTE + invalidate OIDC exchange codes (all in one TX)
+- activation TX: lock + transition validate + UPDATE users (no revocation step)
+- not-found: user row absent → `ErrNotFound`
+- invalid transition: `active→active` → `ErrStatusTransitionNotAllowed`
+- revocation failure rolls back status change
+- OIDC invalidation failure rolls back all changes
+- lifecycle: suspension sets `used_at` on OIDC codes; activation does not reset `used_at`
+
+**Login store tests** (`storage/login_store_test.go`):
+
+- `revalidateUserActive` is called after password verification and before session insert (verified by mock expectations order)
+- if revalidation sees no active user (user suspended between password check and session insert): returns `ErrInvalidCredentials`, no session inserted
+- revalidation DB error propagates
 
 **Handler tests** (`http/admin_handler_test.go`):
 
@@ -262,9 +282,17 @@ On activation, no sessions are restored. The user must log in again.
 - 422 on unknown status value in body
 - 400 on invalid JSON
 - 500 on unexpected error
-- 401 when `X-NChat-Admin-Token` is absent or wrong (via `AdminBootstrapGuard` — existing middleware tests cover this; add integration test for the wired route)
+- 403 on `ErrForbidden`
 
-**Domain tests** (`domain/validation_test.go` or new file):
+**Router tests** (`http/router_test.go`):
+
+- no bootstrap token → 503
+- wrong token → 401
+- Bearer-only → 401
+- wrong method → 405
+- service nil + correct token → 503
+
+**Domain tests** (`domain/validation_test.go`):
 
 - `ValidateStatusTransition("active", "suspended")` → nil
 - `ValidateStatusTransition("suspended", "active")` → nil
