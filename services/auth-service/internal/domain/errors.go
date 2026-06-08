@@ -24,3 +24,6 @@ var ErrInvalidCredentials = errors.New("invalid credentials")
 var ErrInviteAlreadyPending = errors.New("active invite already exists for this email")
 
 var ErrNotFound = errors.New("not found")
+
+var ErrStatusTransitionNotAllowed = errors.New("status transition not allowed")
+var ErrForbidden                  = errors.New("forbidden")

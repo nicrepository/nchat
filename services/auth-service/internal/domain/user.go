@@ -38,3 +38,17 @@ type CreateUserInput struct {
 	InitialPassword    string
 	MustChangePassword bool
 }
+
+// ValidateStatusTransition returns ErrStatusTransitionNotAllowed for any
+// transition not in the supported set. Only active↔suspended is allowed.
+// Transitions involving locked, invited, or deleted are not part of this flow.
+func ValidateStatusTransition(from, to string) error {
+	switch {
+	case from == "active" && to == "suspended":
+		return nil
+	case from == "suspended" && to == "active":
+		return nil
+	default:
+		return ErrStatusTransitionNotAllowed
+	}
+}
