@@ -19,6 +19,7 @@ type DeviceSessionStore interface {
 	ListSessions(ctx context.Context, userID string, includeRevoked bool, limit int) ([]domain.SessionInfo, error)
 	RevokeSession(ctx context.Context, sessionID, userID string) error
 	RevokeAllSessionsExcept(ctx context.Context, userID, exceptSessionID string) error
+	RevokeAllUserSessions(ctx context.Context, userID string) error
 	ListDevices(ctx context.Context, userID, currentSessionID string, includeRevoked bool, limit int) ([]domain.DeviceInfo, domain.DeviceSessionPolicy, error)
 	RevokeDevice(ctx context.Context, deviceID, userID string) error
 	UpdateDeviceDisplayName(ctx context.Context, deviceID, userID, name string) error
@@ -57,6 +58,10 @@ func (s *DeviceSessionService) RevokeSession(ctx context.Context, sessionID, use
 
 func (s *DeviceSessionService) RevokeAllSessionsExcept(ctx context.Context, userID, exceptSessionID string) error {
 	return s.store.RevokeAllSessionsExcept(ctx, userID, exceptSessionID)
+}
+
+func (s *DeviceSessionService) RevokeAllUserSessions(ctx context.Context, userID string) error {
+	return s.store.RevokeAllUserSessions(ctx, userID)
 }
 
 func (s *DeviceSessionService) ValidateActiveSession(ctx context.Context, userID, sessionID string) error {
