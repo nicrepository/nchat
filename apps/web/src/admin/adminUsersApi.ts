@@ -55,3 +55,26 @@ export async function listAdminUsers(): Promise<AdminUser[]> {
     throw err;
   }
 }
+
+/**
+ * Updates the status of a user via the admin endpoint.
+ *
+ * NOTE: The corresponding backend endpoint (PATCH /admin/users/{id}/status) is
+ * currently guarded by AdminBootstrapGuard (X-NChat-Admin-Token), which is NOT
+ * browser-safe. This function is prepared for when a browser-callable admin
+ * JWT/RBAC guard exists (RF-74). Do not trigger this from the UI until that
+ * guard is in place.
+ *
+ * Permitted transitions: active → suspended, suspended → active.
+ */
+export async function updateUserStatus(
+  id: string,
+  status: "active" | "suspended",
+): Promise<AdminUser> {
+  const raw = await authenticatedFetch<RawAdminUser>(`${ADMIN_BASE}/users/${id}/status`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  return mapUser(raw);
+}
