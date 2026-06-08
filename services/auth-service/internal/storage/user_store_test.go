@@ -237,147 +237,147 @@ func TestPGXUserStore_CreateUser_DuplicateEmail(t *testing.T) {
 }
 
 func userRow() *pgxmock.Rows {
-return pgxmock.NewRows([]string{
-"id", "email", "display_name", "full_name", "status", "auth_source",
-"email_verified_at", "created_at", "updated_at",
-}).AddRow("uid-1", "u@example.com", "User", "", "active", "manual",
-time.Now(), time.Now(), time.Now())
+	return pgxmock.NewRows([]string{
+		"id", "email", "display_name", "full_name", "status", "auth_source",
+		"email_verified_at", "created_at", "updated_at",
+	}).AddRow("uid-1", "u@example.com", "User", "", "active", "manual",
+		time.Now(), time.Now(), time.Now())
 }
 
 func TestPGXUserStore_GetUserByID_Success(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-mock.ExpectQuery(`SELECT id, email`).
-WithArgs("uid-1").
-WillReturnRows(userRow())
+	mock.ExpectQuery(`SELECT id, email`).
+		WithArgs("uid-1").
+		WillReturnRows(userRow())
 
-store := storage.NewPGXUserStore(mock)
-user, err := store.GetUserByID(context.Background(), "uid-1")
-if err != nil {
-t.Fatalf("unexpected error: %v", err)
-}
-if user.ID != "uid-1" {
-t.Fatalf("expected uid-1, got %q", user.ID)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXUserStore(mock)
+	user, err := store.GetUserByID(context.Background(), "uid-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if user.ID != "uid-1" {
+		t.Fatalf("expected uid-1, got %q", user.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestPGXUserStore_GetUserByID_NotFound(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-mock.ExpectQuery(`SELECT id, email`).
-WithArgs("no-such").
-WillReturnRows(pgxmock.NewRows([]string{"id","email","display_name","full_name","status","auth_source","email_verified_at","created_at","updated_at"})) // empty result set
+	mock.ExpectQuery(`SELECT id, email`).
+		WithArgs("no-such").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "full_name", "status", "auth_source", "email_verified_at", "created_at", "updated_at"})) // empty result set
 
-store := storage.NewPGXUserStore(mock)
-_, err = store.GetUserByID(context.Background(), "no-such")
-if !errors.Is(err, domain.ErrNotFound) {
-t.Fatalf("expected ErrNotFound, got %v", err)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetUserByID(context.Background(), "no-such")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestPGXUserStore_UpdateUserStatus_Success(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-mock.ExpectQuery(`UPDATE auth\.users`).
-WithArgs("uid-1", "suspended").
-WillReturnRows(userRow())
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("uid-1", "suspended").
+		WillReturnRows(userRow())
 
-store := storage.NewPGXUserStore(mock)
-user, err := store.UpdateUserStatus(context.Background(), "uid-1", "suspended")
-if err != nil {
-t.Fatalf("unexpected error: %v", err)
-}
-if user.ID != "uid-1" {
-t.Fatalf("expected uid-1, got %q", user.ID)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXUserStore(mock)
+	user, err := store.UpdateUserStatus(context.Background(), "uid-1", "suspended")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if user.ID != "uid-1" {
+		t.Fatalf("expected uid-1, got %q", user.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestPGXUserStore_UpdateUserStatus_NotFound(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-mock.ExpectQuery(`UPDATE auth\.users`).
-WithArgs("no-id", "suspended").
-WillReturnRows(pgxmock.NewRows([]string{"id","email","display_name","full_name","status","auth_source","email_verified_at","created_at","updated_at"})) // no rows matched
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("no-id", "suspended").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "full_name", "status", "auth_source", "email_verified_at", "created_at", "updated_at"})) // no rows matched
 
-store := storage.NewPGXUserStore(mock)
-_, err = store.UpdateUserStatus(context.Background(), "no-id", "suspended")
-if !errors.Is(err, domain.ErrNotFound) {
-t.Fatalf("expected ErrNotFound, got %v", err)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.UpdateUserStatus(context.Background(), "no-id", "suspended")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestPGXUserStore_GetUserByID_QueryError(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-mock.ExpectQuery(`SELECT id, email`).
-WithArgs("uid-1").
-WillReturnError(errors.New("db down"))
+	mock.ExpectQuery(`SELECT id, email`).
+		WithArgs("uid-1").
+		WillReturnError(errors.New("db down"))
 
-store := storage.NewPGXUserStore(mock)
-_, err = store.GetUserByID(context.Background(), "uid-1")
-if err == nil {
-t.Fatal("expected error, got nil")
-}
-if errors.Is(err, domain.ErrNotFound) {
-t.Fatalf("expected wrapped db error, got ErrNotFound")
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetUserByID(context.Background(), "uid-1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected wrapped db error, got ErrNotFound")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestPGXUserStore_UpdateUserStatus_QueryError(t *testing.T) {
-mock, err := pgxmock.NewPool()
-if err != nil {
-t.Fatalf("pgxmock: %v", err)
-}
-defer mock.Close()
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
 
-mock.ExpectQuery(`UPDATE auth\.users`).
-WithArgs("uid-1", "suspended").
-WillReturnError(errors.New("db down"))
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("uid-1", "suspended").
+		WillReturnError(errors.New("db down"))
 
-store := storage.NewPGXUserStore(mock)
-_, err = store.UpdateUserStatus(context.Background(), "uid-1", "suspended")
-if err == nil {
-t.Fatal("expected error, got nil")
-}
-if errors.Is(err, domain.ErrNotFound) {
-t.Fatalf("expected wrapped db error, got ErrNotFound")
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.UpdateUserStatus(context.Background(), "uid-1", "suspended")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected wrapped db error, got ErrNotFound")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }

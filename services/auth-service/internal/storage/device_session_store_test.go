@@ -417,21 +417,21 @@ func TestPGXDeviceSessionStore_UpdateDeviceDisplayName_DBErrorPropagates(t *test
 // ---- RevokeAllUserSessions --------------------------------------------------
 
 func TestPGXDeviceSessionStore_RevokeAllUserSessions_RunsCTE(t *testing.T) {
-mock := newMockPool(t)
-defer mock.Close()
+	mock := newMockPool(t)
+	defer mock.Close()
 
-mock.ExpectBegin()
-mock.ExpectExec(`WITH revoked AS`).
-WithArgs("user-1").
-WillReturnResult(pgxmock.NewResult("UPDATE", 3))
-mock.ExpectCommit()
-mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectExec(`WITH revoked AS`).
+		WithArgs("user-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 3))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
 
-store := storage.NewPGXDeviceSessionStore(mock)
-if err := store.RevokeAllUserSessions(context.Background(), "user-1"); err != nil {
-t.Fatalf("RevokeAllUserSessions: %v", err)
-}
-if err := mock.ExpectationsWereMet(); err != nil {
-t.Fatalf("unmet expectations: %v", err)
-}
+	store := storage.NewPGXDeviceSessionStore(mock)
+	if err := store.RevokeAllUserSessions(context.Background(), "user-1"); err != nil {
+		t.Fatalf("RevokeAllUserSessions: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
