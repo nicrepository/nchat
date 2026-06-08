@@ -20,4 +20,5 @@ const (
 	RouteAuthOIDCKeycloakLogin    = "/auth/oidc/keycloak/login"
 	RouteAuthOIDCKeycloakCallback = "/auth/oidc/keycloak/callback"
 	RouteAuthOIDCKeycloakExchange = "/auth/oidc/keycloak/exchange"
+	RouteAdminUserStatus          = "/admin/users/{id}/status"
 )
