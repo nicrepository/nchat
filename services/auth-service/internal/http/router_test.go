@@ -219,6 +219,73 @@ func TestAdminUsersMethodNotAllowed(t *testing.T) {
 	}
 }
 
+// ── PATCH /admin/users/{id}/status router-level tests ─────────────────────
+
+func TestAdminUserStatus_NoToken_Returns503(t *testing.T) {
+	// testConfig has no ADMIN_BOOTSTRAP_TOKEN → token is empty → guard returns 503
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no bootstrap token configured, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUserStatus_WrongToken_Returns401(t *testing.T) {
+	cfg := testConfig()
+	cfg.AdminBootstrapToken = "correct-token"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NChat-Admin-Token", "wrong-token")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong bootstrap token, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUserStatus_BearerOnly_Returns401(t *testing.T) {
+	// Only a Bearer JWT (no admin token) must be rejected
+	cfg := testConfig()
+	cfg.AdminBootstrapToken = "correct-token"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for bearer-only request, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUserStatus_MethodNotAllowed_Returns405(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/users/user-1/status", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET on status route, got %d", rec.Code)
+	}
+}
+
+func TestAdminUserStatus_NoService_Returns503(t *testing.T) {
+	// Service nil + correct token → 503 (service unavailable from handler)
+	cfg := testConfig()
+	cfg.AdminBootstrapToken = "correct-token"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NChat-Admin-Token", "correct-token")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when service nil, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAuthMeLoginAttemptsDisabledReturns503BeforeAuth(t *testing.T) {
 	cfg := testConfig()
 	cfg.AuthJWTHMACSecret = strings.Repeat("r", 32)
