@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
@@ -16,6 +17,8 @@ const pgCodeUniqueViolation = "23505"
 type UserStore interface {
 	CreateUser(ctx context.Context, input domain.CreateUserInput, passwordHash string) (domain.User, error)
 	GetPolicySettings(ctx context.Context) (domain.PolicySettings, error)
+	GetUserByID(ctx context.Context, id string) (domain.User, error)
+	UpdateUserStatus(ctx context.Context, id, status string) (domain.User, error)
 }
 
 // PGXUserStore implements UserStore using a pgx connection pool.
@@ -86,6 +89,47 @@ func (s *PGXUserStore) CreateUser(ctx context.Context, input domain.CreateUserIn
 
 	if err := tx.Commit(ctx); err != nil {
 		return domain.User{}, fmt.Errorf("commit tx: %w", err)
+	}
+	return u, nil
+}
+
+func (s *PGXUserStore) GetUserByID(ctx context.Context, id string) (domain.User, error) {
+	var u domain.User
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, email::text, display_name, COALESCE(full_name, ''), status, auth_source,
+		       email_verified_at, created_at, updated_at
+		FROM auth.users
+		WHERE id = $1
+		  AND deleted_at IS NULL`,
+		id,
+	).Scan(&u.ID, &u.Email, &u.DisplayName, &u.FullName, &u.Status, &u.AuthSource,
+		&u.EmailVerifiedAt, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrNotFound
+		}
+		return domain.User{}, fmt.Errorf("get user by id: %w", err)
+	}
+	return u, nil
+}
+
+func (s *PGXUserStore) UpdateUserStatus(ctx context.Context, id, status string) (domain.User, error) {
+	var u domain.User
+	err := s.pool.QueryRow(ctx, `
+		UPDATE auth.users
+		SET status = $2, updated_at = now()
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		RETURNING id, email::text, display_name, COALESCE(full_name, ''), status, auth_source,
+		          email_verified_at, created_at, updated_at`,
+		id, status,
+	).Scan(&u.ID, &u.Email, &u.DisplayName, &u.FullName, &u.Status, &u.AuthSource,
+		&u.EmailVerifiedAt, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user status: %w", err)
 	}
 	return u, nil
 }
