@@ -86,6 +86,18 @@ func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.Cre
 		return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "invalid_credentials")
 	}
 
+	// Re-validate that the user is still active, taking a row-level lock.
+	// This serializes with the suspension transaction (which also locks the user row via
+	// SELECT ... FOR UPDATE). Two outcomes:
+	//   - If suspension committed first (status != 'active'): abort login; no session created.
+	//   - If login reaches this point first: hold the lock through session insert; suspension
+	//     then waits, locks the row, and revokes the newly-created session in its own TX.
+	// The error is the same generic ErrInvalidCredentials used for wrong passwords so that
+	// callers cannot distinguish "suspended" from "bad credentials".
+	if err := revalidateUserActive(ctx, tx, candidate.User.ID); err != nil {
+		return domain.CreatedLoginSession{}, err
+	}
+
 	deviceID, err := resolveLoginDevice(ctx, tx, candidate.User.ID, input, policy)
 	if err != nil {
 		switch {
@@ -385,6 +397,29 @@ func lockUserForDeviceInsert(ctx context.Context, tx pgx.Tx, userID string) erro
 		userID,
 	).Scan(&lockedID); err != nil {
 		return fmt.Errorf("lock user for device insert: %w", err)
+	}
+	return nil
+}
+
+// revalidateUserActive re-checks that the user is still active immediately before inserting
+// session artifacts. It acquires a row-level lock (FOR UPDATE) so that this check
+// serializes correctly with the suspension transaction.
+//
+// Returns domain.ErrInvalidCredentials (same code used for wrong passwords) if the user
+// is no longer active, ensuring callers cannot distinguish "suspended" from "bad credentials".
+func revalidateUserActive(ctx context.Context, tx pgx.Tx, userID string) error {
+	var id string
+	err := tx.QueryRow(ctx, `
+		SELECT id FROM auth.users
+		WHERE id = $1 AND status = 'active' AND deleted_at IS NULL
+		FOR UPDATE`,
+		userID,
+	).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidCredentials
+		}
+		return fmt.Errorf("revalidate user active: %w", err)
 	}
 	return nil
 }
