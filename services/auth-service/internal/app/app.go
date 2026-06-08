@@ -30,7 +30,7 @@ func New(cfg config.Config) *App {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
 
-	var users service.UserCreator
+	var users service.UserAdmin
 	var auth service.AuthSessionManager
 	var login service.LoginManager
 	var password service.PasswordRecoveryManager
@@ -45,7 +45,8 @@ func New(cfg config.Config) *App {
 			logger.Warn("database unavailable; auth database endpoints disabled", "reason", "open_db_failed")
 		} else {
 			pool = openedPool
-			users = service.NewUserService(storage.NewPGXUserStore(pool))
+			deviceStore := storage.NewPGXDeviceSessionStore(pool)
+			users = service.NewUserService(storage.NewPGXUserStore(pool), deviceStore)
 		}
 	}
 
