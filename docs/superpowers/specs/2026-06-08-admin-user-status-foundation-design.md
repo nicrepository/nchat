@@ -13,18 +13,19 @@ This document describes the **foundation** for admin-controlled user status chan
 
 ### What this PR delivers
 
-| Component                                                           | Status                                     |
-| ------------------------------------------------------------------- | ------------------------------------------ |
-| Domain: status transition validation (`active ↔ suspended`)         | ✅ Implemented                             |
-| Storage: `GetUserByID`, `UpdateUserStatus`, `RevokeAllUserSessions` | ✅ Implemented                             |
-| Service: `UpdateUserStatus` with session revocation on suspension   | ✅ Implemented                             |
-| HTTP: `PATCH /admin/users/{id}/status` behind `AdminBootstrapGuard` | ✅ Implemented (not browser-callable)      |
-| Frontend: `updateUserStatus()` typed contract in `adminUsersApi.ts` | ✅ Prepared                                |
-| Frontend: action buttons rendered but **disabled**                  | ✅ Disabled with dependency label          |
-| End-to-end mutation via browser                                     | ❌ Blocked — requires admin JWT/RBAC guard |
-| Self-deactivation prevention (reliable)                             | ❌ Requires callerID from JWT (RBAC)       |
-| RF-74 RBAC / role assignment                                        | ❌ Out of scope                            |
-| Hard delete / LGPD erasure                                          | ❌ Out of scope                            |
+| Component                                                                                                         | Status                                     |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| Domain: status transition validation (`active ↔ suspended`)                                                       | ✅ Implemented                             |
+| Storage: atomic `UpdateUserStatus` (lock + transition + status + session revocation + OIDC exchange invalidation) | ✅ Implemented                             |
+| Storage: `GetUserByID`                                                                                            | ✅ Implemented                             |
+| Service: `UpdateUserStatus` (self-deactivation guard; delegates to atomic storage)                                | ✅ Implemented                             |
+| HTTP: `PATCH /admin/users/{id}/status` behind `AdminBootstrapGuard`                                               | ✅ Implemented (not browser-callable)      |
+| Frontend: `updateUserStatus()` typed contract in `adminUsersApi.ts`                                               | ✅ Prepared                                |
+| Frontend: action buttons rendered but **disabled**                                                                | ✅ Disabled with dependency label          |
+| End-to-end mutation via browser                                                                                   | ❌ Blocked — requires admin JWT/RBAC guard |
+| Self-deactivation prevention (reliable)                                                                           | ❌ Requires callerID from JWT (RBAC)       |
+| RF-74 RBAC / role assignment                                                                                      | ❌ Out of scope                            |
+| Hard delete / LGPD erasure                                                                                        | ❌ Out of scope                            |
 
 ---
 
@@ -97,52 +98,57 @@ func ValidateStatusTransition(from, to string) error
 
 ### 4.2 Storage layer (`services/auth-service/internal/storage/`)
 
-**`user_store.go`** — extend `UserStore` interface:
+**`user_store.go`** — `UserStore` interface:
 
 ```go
 type UserStore interface {
     CreateUser(...)          // existing
     GetPolicySettings(...)   // existing
     GetUserByID(ctx context.Context, id string) (domain.User, error)
-    UpdateUserStatus(ctx context.Context, id, status string) (domain.User, error)
+    UpdateUserStatus(ctx context.Context, id, newStatus string) (domain.User, error)
 }
 ```
 
-`PGXUserStore` implements both:
+`PGXUserStore.UpdateUserStatus` runs a **single atomic transaction**:
 
-- `GetUserByID`: `SELECT ... FROM auth.users WHERE id = $1 AND deleted_at IS NULL`
-- `UpdateUserStatus`: `UPDATE auth.users SET status = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING ...`; returns `domain.ErrNotFound` if no row matched.
+1. `SELECT status FROM auth.users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE` — locks the row, reads current status.
+2. `domain.ValidateStatusTransition(currentStatus, newStatus)` — rejects invalid transitions under the lock.
+3. `UPDATE auth.users SET status = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING ...`
+4. **If `newStatus == "suspended"` only:**
+   - CTE: `UPDATE auth.user_sessions SET revoked_at = now(), revoked_reason = 'admin_suspension' WHERE user_id = $1 AND revoked_at IS NULL`, then cascade to `auth.refresh_token_history`.
+   - `UPDATE auth.oidc_exchange_codes SET used_at = now() WHERE used_at IS NULL AND expires_at > now() AND user_json->>'id' = $1` — invalidates pending OIDC exchange codes for the user. Uses the existing `user_json JSONB` field; no migration required.
+5. `COMMIT` — if any step fails, the entire transaction rolls back (no partial state).
 
-**`device_session_store.go`** — extend interface and add method:
-
-```go
-// In DeviceManager interface (or a new SessionRevoker interface):
-RevokeAllUserSessions(ctx context.Context, userID string) error
-```
-
-`PGXDeviceSessionStore.RevokeAllUserSessions`: CTE-based revocation of all active sessions for `userID` (no exception), setting `revoked_at = now()`, `revoked_reason = 'admin_suspension'`, and marking active refresh token history as `'revoked'`.
+**On activation:** only step 3 runs. No session restoration. No OIDC exchange code reset — a code invalidated by suspension remains invalid even after reactivation.
 
 ### 4.3 Service layer (`services/auth-service/internal/service/`)
 
-**`user_service.go`** — new interface and method:
+**`user_service.go`** — interfaces and service:
 
 ```go
 // UserStatusManager is the HTTP-facing interface for status change operations.
 type UserStatusManager interface {
     UpdateUserStatus(ctx context.Context, callerID, targetID, newStatus string) (domain.User, error)
 }
+
+// UserAdmin is the combined interface used by admin HTTP handlers.
+type UserAdmin interface {
+    UserCreator
+    UserStatusManager
+}
 ```
+
+`UserService` has a single field: `store storage.UserStore`. No `SessionRevoker` dependency — session revocation and OIDC exchange invalidation are handled atomically by `UpdateUserStatus` in the storage layer.
+
+`NewUserService(store storage.UserStore) *UserService` — single constructor argument.
 
 `UserService.UpdateUserStatus` logic:
 
-1. `GetUserByID(ctx, targetID)` → wrap as `ErrNotFound` if absent
-2. `ValidateStatusTransition(user.Status, newStatus)` → propagate `ErrStatusTransitionNotAllowed`
-3. If `callerID != "" && callerID == targetID` → return `ErrForbidden`
-4. `store.UpdateUserStatus(ctx, targetID, newStatus)`
-5. If `newStatus == "suspended"` → `sessionRevoker.RevokeAllUserSessions(ctx, targetID)`
-6. Return updated user
+1. If `callerID != "" && callerID == targetID` → return `ErrForbidden` (self-deactivation guard; effective when callerID is populated from a future JWT/RBAC guard).
+2. `store.UpdateUserStatus(ctx, targetID, newStatus)` — atomic: transition validation + status change + (if suspended) session revocation + OIDC exchange invalidation.
+3. Return updated user; propagate `ErrNotFound`, `ErrStatusTransitionNotAllowed`, `ErrForbidden` from storage.
 
-`UserService` requires a `SessionRevoker` dependency (injected via constructor). This is a new field.
+**Note:** `SessionRevoker`, `RevokeAllUserSessions`, and related interfaces were removed. Session revocation is an implementation detail of `PGXUserStore.UpdateUserStatus`, not a separate service concern.
 
 ### 4.4 HTTP layer (`services/auth-service/internal/http/`)
 

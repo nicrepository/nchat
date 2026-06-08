@@ -156,6 +156,8 @@ func (s *PGXUserStore) UpdateUserStatus(ctx context.Context, id, newStatus strin
 
 	// Revoke all active sessions and refresh tokens in the same transaction so that
 	// a suspension always produces a consistent state (status suspended + no active sessions).
+	// Also invalidate pending OIDC exchange codes for the user, because a code created before
+	// suspension could otherwise be consumed after reactivation to return pre-suspension tokens.
 	if newStatus == "suspended" {
 		if _, err := tx.Exec(ctx, `
 			WITH revoked AS (
@@ -171,6 +173,21 @@ func (s *PGXUserStore) UpdateUserStatus(ctx context.Context, id, newStatus strin
 			id,
 		); err != nil {
 			return domain.User{}, fmt.Errorf("revoke sessions on suspension: %w", err)
+		}
+
+		// Invalidate any pending OIDC exchange codes for this user.
+		// user_json->>'id' stores the user UUID as text; no migration required.
+		// Activation intentionally does NOT reset used_at — a code invalidated by
+		// suspension cannot be replayed even if the user is later reactivated.
+		if _, err := tx.Exec(ctx, `
+			UPDATE auth.oidc_exchange_codes
+			SET used_at = now()
+			WHERE used_at IS NULL
+			  AND expires_at > now()
+			  AND user_json->>'id' = $1`,
+			id,
+		); err != nil {
+			return domain.User{}, fmt.Errorf("invalidate oidc exchange codes on suspension: %w", err)
 		}
 	}
 
