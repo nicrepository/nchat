@@ -13,18 +13,18 @@ This document describes the **foundation** for admin-controlled user status chan
 
 ### What this PR delivers
 
-| Component | Status |
-|-----------|--------|
-| Domain: status transition validation (`active ↔ suspended`) | ✅ Implemented |
-| Storage: `GetUserByID`, `UpdateUserStatus`, `RevokeAllUserSessions` | ✅ Implemented |
-| Service: `UpdateUserStatus` with session revocation on suspension | ✅ Implemented |
-| HTTP: `PATCH /admin/users/{id}/status` behind `AdminBootstrapGuard` | ✅ Implemented (not browser-callable) |
-| Frontend: `updateUserStatus()` typed contract in `adminUsersApi.ts` | ✅ Prepared |
-| Frontend: action buttons rendered but **disabled** | ✅ Disabled with dependency label |
-| End-to-end mutation via browser | ❌ Blocked — requires admin JWT/RBAC guard |
-| Self-deactivation prevention (reliable) | ❌ Requires callerID from JWT (RBAC) |
-| RF-74 RBAC / role assignment | ❌ Out of scope |
-| Hard delete / LGPD erasure | ❌ Out of scope |
+| Component                                                           | Status                                     |
+| ------------------------------------------------------------------- | ------------------------------------------ |
+| Domain: status transition validation (`active ↔ suspended`)         | ✅ Implemented                             |
+| Storage: `GetUserByID`, `UpdateUserStatus`, `RevokeAllUserSessions` | ✅ Implemented                             |
+| Service: `UpdateUserStatus` with session revocation on suspension   | ✅ Implemented                             |
+| HTTP: `PATCH /admin/users/{id}/status` behind `AdminBootstrapGuard` | ✅ Implemented (not browser-callable)      |
+| Frontend: `updateUserStatus()` typed contract in `adminUsersApi.ts` | ✅ Prepared                                |
+| Frontend: action buttons rendered but **disabled**                  | ✅ Disabled with dependency label          |
+| End-to-end mutation via browser                                     | ❌ Blocked — requires admin JWT/RBAC guard |
+| Self-deactivation prevention (reliable)                             | ❌ Requires callerID from JWT (RBAC)       |
+| RF-74 RBAC / role assignment                                        | ❌ Out of scope                            |
+| Hard delete / LGPD erasure                                          | ❌ Out of scope                            |
 
 ---
 
@@ -33,6 +33,7 @@ This document describes the **foundation** for admin-controlled user status chan
 ### Current state
 
 The only admin guard in the codebase is `AdminBootstrapGuard`, which validates a static `X-NChat-Admin-Token` header. This token:
+
 - Is a server-side secret
 - Cannot and must not be exposed to the browser
 - Does not carry user identity (no callerID)
@@ -61,11 +62,11 @@ CHECK (status IN ('active', 'invited', 'suspended', 'locked', 'deleted'))
 
 ### Permitted transitions in this flow
 
-| From | To | Allowed |
-|------|----|---------|
-| `active` | `suspended` | ✅ |
-| `suspended` | `active` | ✅ |
-| Any | Any other | ❌ `ErrStatusTransitionNotAllowed` |
+| From        | To          | Allowed                            |
+| ----------- | ----------- | ---------------------------------- |
+| `active`    | `suspended` | ✅                                 |
+| `suspended` | `active`    | ✅                                 |
+| Any         | Any other   | ❌ `ErrStatusTransitionNotAllowed` |
 
 `locked` remains the brute-force lockout status and is not touched by this flow. `deleted`, `invited` are out of scope.
 
@@ -80,12 +81,14 @@ The `status` column and its constraint already exist in `migrations/auth/000001_
 ### 4.1 Domain layer (`services/auth-service/internal/domain/`)
 
 **`errors.go`** — new sentinel errors:
+
 ```go
 var ErrStatusTransitionNotAllowed = errors.New("status transition not allowed")
 var ErrForbidden                  = errors.New("forbidden")
 ```
 
 **`user.go`** — new transition validator:
+
 ```go
 // ValidateStatusTransition returns ErrStatusTransitionNotAllowed for any
 // transition not in the permitted set. Only active↔suspended is allowed.
@@ -95,6 +98,7 @@ func ValidateStatusTransition(from, to string) error
 ### 4.2 Storage layer (`services/auth-service/internal/storage/`)
 
 **`user_store.go`** — extend `UserStore` interface:
+
 ```go
 type UserStore interface {
     CreateUser(...)          // existing
@@ -105,10 +109,12 @@ type UserStore interface {
 ```
 
 `PGXUserStore` implements both:
+
 - `GetUserByID`: `SELECT ... FROM auth.users WHERE id = $1 AND deleted_at IS NULL`
 - `UpdateUserStatus`: `UPDATE auth.users SET status = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING ...`; returns `domain.ErrNotFound` if no row matched.
 
 **`device_session_store.go`** — extend interface and add method:
+
 ```go
 // In DeviceManager interface (or a new SessionRevoker interface):
 RevokeAllUserSessions(ctx context.Context, userID string) error
@@ -128,6 +134,7 @@ type UserStatusManager interface {
 ```
 
 `UserService.UpdateUserStatus` logic:
+
 1. `GetUserByID(ctx, targetID)` → wrap as `ErrNotFound` if absent
 2. `ValidateStatusTransition(user.Status, newStatus)` → propagate `ErrStatusTransitionNotAllowed`
 3. If `callerID != "" && callerID == targetID` → return `ErrForbidden`
@@ -140,11 +147,13 @@ type UserStatusManager interface {
 ### 4.4 HTTP layer (`services/auth-service/internal/http/`)
 
 **`routes.go`**:
+
 ```go
 RouteAdminUserStatus = "/admin/users/{id}/status"
 ```
 
 **`admin_handler.go`** — `AdminUpdateUserStatus(users service.UserStatusManager) http.Handler`:
+
 - `nil` service → 503
 - Extract `{id}` from path; validate non-empty
 - Decode `{"status": "active"|"suspended"}` — unknown values → 422 with `"invalid_status"`
@@ -157,6 +166,7 @@ RouteAdminUserStatus = "/admin/users/{id}/status"
 - Success → 200 + `userResponse` (same shape as `AdminCreateUser`)
 
 **`router.go`**:
+
 ```go
 mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
     AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
@@ -185,7 +195,7 @@ Add a typed `updateUserStatus` function:
 export async function updateUserStatus(
   id: string,
   status: "active" | "suspended",
-): Promise<AdminUser>
+): Promise<AdminUser>;
 ```
 
 Uses `authenticatedFetch`. Returns `AdminUser` on success; propagates `ApiRequestError` on failure. Does **not** swallow errors as empty results.
@@ -194,11 +204,11 @@ Uses `authenticatedFetch`. Returns `AdminUser` on success; propagates `ApiReques
 
 Add an "Ações" column to the users table. Action buttons are rendered but always disabled:
 
-| User status | Button label | State |
-|-------------|-------------|-------|
-| `active` | "Suspender" | `disabled`, `aria-disabled="true"`, `title="Requer permissão de administrador"` |
-| `suspended` | "Ativar" | `disabled`, `aria-disabled="true"`, `title="Requer permissão de administrador"` |
-| other | (none) | — |
+| User status | Button label | State                                                                           |
+| ----------- | ------------ | ------------------------------------------------------------------------------- |
+| `active`    | "Suspender"  | `disabled`, `aria-disabled="true"`, `title="Requer permissão de administrador"` |
+| `suspended` | "Ativar"     | `disabled`, `aria-disabled="true"`, `title="Requer permissão de administrador"` |
+| other       | (none)       | —                                                                               |
 
 No confirmation dialog, no mutation state, no loading/error handling in this PR — the buttons cannot be activated.
 
@@ -210,10 +220,10 @@ The existing invite button pattern (`disabled`, `aria-disabled="true"`, `title="
 
 The following behaviors already hold because of existing DB checks; no changes required:
 
-| Operation | Suspended user outcome |
-|-----------|----------------------|
-| `POST /auth/login` | ❌ `status != 'active'` check in `login_store.go:79` |
-| `POST /auth/refresh` | ❌ `u.status = 'active'` JOIN in `session_store.go` |
+| Operation               | Suspended user outcome                                |
+| ----------------------- | ----------------------------------------------------- |
+| `POST /auth/login`      | ❌ `status != 'active'` check in `login_store.go:79`  |
+| `POST /auth/refresh`    | ❌ `u.status = 'active'` JOIN in `session_store.go`   |
 | `ValidateActiveSession` | ❌ `u.status = 'active'` in `device_session_store.go` |
 
 Additionally, on suspension this PR revokes all existing sessions/refresh tokens via `RevokeAllUserSessions`, making the revocation explicit and audit-friendly.
@@ -227,6 +237,7 @@ On activation, no sessions are restored. The user must log in again.
 ### Backend (no real DB — fakes/stubs only)
 
 **Service tests** (`service/user_service_test.go`):
+
 - active → suspended succeeds
 - suspended → active succeeds
 - active → active rejected (`ErrStatusTransitionNotAllowed`)
@@ -237,6 +248,7 @@ On activation, no sessions are restored. The user must log in again.
 - callerID == targetID returns `ErrForbidden`
 
 **Handler tests** (`http/admin_handler_test.go`):
+
 - 200 + correct shape on success
 - 503 when service is nil
 - 404 on `ErrNotFound`
@@ -247,6 +259,7 @@ On activation, no sessions are restored. The user must log in again.
 - 401 when `X-NChat-Admin-Token` is absent or wrong (via `AdminBootstrapGuard` — existing middleware tests cover this; add integration test for the wired route)
 
 **Domain tests** (`domain/validation_test.go` or new file):
+
 - `ValidateStatusTransition("active", "suspended")` → nil
 - `ValidateStatusTransition("suspended", "active")` → nil
 - `ValidateStatusTransition("active", "active")` → `ErrStatusTransitionNotAllowed`
@@ -256,11 +269,13 @@ On activation, no sessions are restored. The user must log in again.
 ### Frontend
 
 **`adminUsersApi.test.ts`**:
+
 - `updateUserStatus` calls `PATCH /api/admin/users/{id}/status` with correct body
 - Maps snake_case response to `AdminUser`
 - Propagates non-2xx errors (does not swallow as empty)
 
 **`AdminUsersPage.test.tsx`** (additions to existing tests):
+
 - Active user row has a "Suspender" button that is `disabled`
 - Suspended user row has an "Ativar" button that is `disabled`
 - Buttons have `title` containing "Requer permissão de administrador"
@@ -272,6 +287,7 @@ On activation, no sessions are restored. The user must log in again.
 ## 8. Docs
 
 **`docs/runbooks/task-admin-user-activation-flow.md`** documents:
+
 - RF-75 partial foundation: backend logic complete, end-to-end pending RBAC
 - `PATCH /admin/users/{id}/status` behind `AdminBootstrapGuard` (not browser-callable)
 - Frontend displays disabled actions until admin JWT/RBAC guard (RF-74)

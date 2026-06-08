@@ -197,3 +197,12 @@ func TestDeviceSessionService_RevokeAllSessionsExcept_Delegates(t *testing.T) {
 		t.Fatalf("expected session-current delegated, got %q", store.lastExceptSessionID)
 	}
 }
+
+func TestDeviceSessionService_RevokeAllUserSessions_Delegates(t *testing.T) {
+store := &fakeDeviceSessionStore{}
+svc := service.NewDeviceSessionService(store)
+
+if err := svc.RevokeAllUserSessions(context.Background(), "user-1"); err != nil {
+t.Fatalf("RevokeAllUserSessions: %v", err)
+}
+}

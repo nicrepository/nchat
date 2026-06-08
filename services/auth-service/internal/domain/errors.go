@@ -26,4 +26,4 @@ var ErrInviteAlreadyPending = errors.New("active invite already exists for this 
 var ErrNotFound = errors.New("not found")
 
 var ErrStatusTransitionNotAllowed = errors.New("status transition not allowed")
-var ErrForbidden                  = errors.New("forbidden")
+var ErrForbidden = errors.New("forbidden")

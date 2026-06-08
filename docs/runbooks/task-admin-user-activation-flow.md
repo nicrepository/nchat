@@ -39,12 +39,14 @@ a JWT-based admin authorization guard (RF-74) that does not yet exist.
 ## Session revocation behavior
 
 When an admin suspends a user:
+
 1. `UPDATE auth.user_sessions SET revoked_at = now(), revoked_reason = 'admin_suspension'`
    for all non-revoked sessions of that user.
 2. `UPDATE auth.refresh_token_history SET status = 'revoked'` for all active refresh
    token history rows in those sessions.
 
 Even without explicit revocation, suspended users are blocked by:
+
 - Login: `login_store.go` rejects `status != 'active'`.
 - Refresh: `session_store.go` JOIN requires `u.status = 'active'`.
 - Session validation: `device_session_store.go` `ValidateActiveSession` requires `u.status = 'active'`.
@@ -58,11 +60,11 @@ On activation, no sessions are restored. The user must authenticate again.
 The current `PATCH /admin/users/{id}/status` endpoint is guarded by `AdminBootstrapGuard`,
 a static shared token. Limitations:
 
-| Limitation | Mitigation |
-|-----------|------------|
-| Token is not browser-safe | Endpoint is only for server-to-server / tooling use |
+| Limitation                  | Mitigation                                               |
+| --------------------------- | -------------------------------------------------------- |
+| Token is not browser-safe   | Endpoint is only for server-to-server / tooling use      |
 | No user identity in request | callerID passed as `""` — self-deactivation not enforced |
-| No RBAC role check | Any holder of ADMIN_BOOTSTRAP_TOKEN can call this |
+| No RBAC role check          | Any holder of ADMIN_BOOTSTRAP_TOKEN can call this        |
 
 **Self-deactivation prevention** requires the requesting admin's user ID from a verified JWT.
 This will be enforced when RF-74 provides a `BearerAuth` + admin role check, at which point

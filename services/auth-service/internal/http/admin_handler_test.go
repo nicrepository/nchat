@@ -252,3 +252,12 @@ func TestAdminUpdateUserStatus_ResponseHasNoSensitiveFields(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminUpdateUserStatus_Forbidden_Returns403(t *testing.T) {
+handler := httpapi.AdminUpdateUserStatus(&fakeUserStatusManager{err: domain.ErrForbidden})
+rec := patchAdminUserStatus(t, handler, "user-1", `{"status":"suspended"}`)
+if rec.Code != http.StatusForbidden {
+t.Fatalf("expected 403, got %d", rec.Code)
+}
+assertErrorCode(t, rec.Body.Bytes(), "forbidden")
+}
