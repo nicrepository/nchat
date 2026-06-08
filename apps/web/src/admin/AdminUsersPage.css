@@ -450,3 +450,24 @@
     border-bottom: none;
   }
 }
+
+/* ── Status action buttons (disabled — requires admin JWT/RBAC guard) ── */
+.admin-users__action-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--color-border, #e2e8f0);
+  background: transparent;
+  color: var(--color-muted, #64748b);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: not-allowed;
+  opacity: 0.55;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+.admin-users__action-btn:disabled,
+.admin-users__action-btn[aria-disabled="true"] {
+  pointer-events: none;
+}

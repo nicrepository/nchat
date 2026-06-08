@@ -65,6 +65,43 @@ function OriginBadge({ authSource }: { authSource: string }) {
   return <span className="admin-users__badge admin-users__badge--neutral">{authSource}</span>;
 }
 
+// ── Status action button (disabled until admin JWT/RBAC guard exists) ──────
+
+interface StatusActionButtonProps {
+  status: string;
+}
+
+function StatusActionButton({ status }: StatusActionButtonProps) {
+  const s = status.toLowerCase();
+  if (s === "active") {
+    return (
+      <button
+        type="button"
+        className="admin-users__action-btn"
+        disabled
+        aria-disabled="true"
+        title="Requer permissão de administrador"
+      >
+        Suspender
+      </button>
+    );
+  }
+  if (s === "suspended") {
+    return (
+      <button
+        type="button"
+        className="admin-users__action-btn"
+        disabled
+        aria-disabled="true"
+        title="Requer permissão de administrador"
+      >
+        Ativar
+      </button>
+    );
+  }
+  return null;
+}
+
 // ── Skeleton rows ──────────────────────────────────────────────────────────
 
 const SKELETON_COUNT = 5;
@@ -106,7 +143,7 @@ function SkeletonRows() {
 function EmptyState() {
   return (
     <tr>
-      <td colSpan={5}>
+      <td colSpan={6}>
         <div className="admin-users__empty">
           <div className="admin-users__empty-icon" aria-hidden="true">
             <svg
@@ -138,7 +175,7 @@ function EmptyState() {
 function ErrorState() {
   return (
     <tr>
-      <td colSpan={5}>
+      <td colSpan={6}>
         <div className="admin-users__error">
           <div className="admin-users__error-icon" aria-hidden="true">
             <svg
@@ -197,6 +234,9 @@ function UserRows({ users }: UserRowsProps) {
           </td>
           <td className="admin-users__col-created admin-users__muted">
             {formatDate(user.createdAt)}
+          </td>
+          <td>
+            <StatusActionButton status={user.status} />
           </td>
         </tr>
       ))}
@@ -379,6 +419,7 @@ export default function AdminUsersPage() {
               <th scope="col" className="admin-users__col-created">
                 Criado em
               </th>
+              <th scope="col">Ações</th>
             </tr>
           </thead>
           <tbody>{tableBody}</tbody>

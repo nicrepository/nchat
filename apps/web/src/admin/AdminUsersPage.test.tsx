@@ -491,3 +491,73 @@ describe("AdminUsersPage — search", () => {
     expect(screen.queryByText("Bob Bastos")).not.toBeInTheDocument();
   });
 });
+
+describe("AdminUsersPage — status action buttons", () => {
+  it("shows disabled 'Suspender' button for active users", async () => {
+    mockListAdminUsers.mockResolvedValue([
+      {
+        id: "u1",
+        email: "alice@example.com",
+        displayName: "Alice",
+        status: "active",
+        authSource: "manual",
+        createdAt: "2024-01-01T00:00:00Z",
+      },
+    ]);
+
+    renderAdminUsersRoute();
+    const btn = await screen.findByRole("button", { name: "Suspender" });
+
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("aria-disabled", "true");
+    expect(btn).toHaveAttribute("title", "Requer permissão de administrador");
+  });
+
+  it("shows disabled 'Ativar' button for suspended users", async () => {
+    mockListAdminUsers.mockResolvedValue([
+      {
+        id: "u2",
+        email: "bob@example.com",
+        displayName: "Bob",
+        status: "suspended",
+        authSource: "manual",
+        createdAt: "2024-01-01T00:00:00Z",
+      },
+    ]);
+
+    renderAdminUsersRoute();
+    const btn = await screen.findByRole("button", { name: "Ativar" });
+
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("aria-disabled", "true");
+    expect(btn).toHaveAttribute("title", "Requer permissão de administrador");
+  });
+
+  it("shows no action button for non-active/suspended status", async () => {
+    mockListAdminUsers.mockResolvedValue([
+      {
+        id: "u3",
+        email: "carol@example.com",
+        displayName: "Carol",
+        status: "invited",
+        authSource: "manual",
+        createdAt: "2024-01-01T00:00:00Z",
+      },
+    ]);
+
+    renderAdminUsersRoute();
+    await screen.findByText("Carol");
+
+    expect(screen.queryByRole("button", { name: "Suspender" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Ativar" })).toBeNull();
+  });
+
+  it("renders 'Ações' column header", async () => {
+    mockListAdminUsers.mockResolvedValue([]);
+
+    renderAdminUsersRoute();
+    await screen.findByText("Nenhum usuário disponível");
+
+    expect(screen.getByRole("columnheader", { name: "Ações" })).toBeInTheDocument();
+  });
+});
