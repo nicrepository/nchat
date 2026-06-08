@@ -132,6 +132,9 @@ function SkeletonRows() {
           <td className="admin-users__col-created">
             <div className="admin-users__skel" style={{ width: 90 }} />
           </td>
+          <td>
+            <div className="admin-users__skel" style={{ width: 68 }} />
+          </td>
         </tr>
       ))}
     </>
