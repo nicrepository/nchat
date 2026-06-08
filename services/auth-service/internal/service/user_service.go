@@ -9,11 +9,6 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
-// SessionRevoker revokes all active sessions for a user. Implemented by DeviceSessionService.
-type SessionRevoker interface {
-	RevokeAllUserSessions(ctx context.Context, userID string) error
-}
-
 // UserCreator is the interface for creating new users.
 type UserCreator interface {
 	CreateUser(ctx context.Context, input domain.CreateUserInput) (domain.User, error)
@@ -25,6 +20,7 @@ type UserStatusManager interface {
 	// callerID is the requesting admin's user ID (from JWT); pass "" when identity
 	// is unavailable (e.g. AdminBootstrapGuard). Self-deactivation is rejected only
 	// when callerID is non-empty and matches targetID.
+	// Status update and session revocation (on suspension) are atomic.
 	UpdateUserStatus(ctx context.Context, callerID, targetID, newStatus string) (domain.User, error)
 }
 
@@ -36,14 +32,12 @@ type UserAdmin interface {
 
 // UserService implements UserCreator and UserStatusManager.
 type UserService struct {
-	store   storage.UserStore
-	revoker SessionRevoker // may be nil; if nil, sessions are not explicitly revoked on suspension
+	store storage.UserStore
 }
 
-// NewUserService creates a UserService. revoker may be nil (sessions will not be explicitly
-// revoked when nil, though ValidateActiveSession will still reject suspended users).
-func NewUserService(store storage.UserStore, revoker SessionRevoker) *UserService {
-	return &UserService{store: store, revoker: revoker}
+// NewUserService creates a UserService backed by the given store.
+func NewUserService(store storage.UserStore) *UserService {
+	return &UserService{store: store}
 }
 
 func (s *UserService) CreateUser(ctx context.Context, input domain.CreateUserInput) (domain.User, error) {
@@ -78,30 +72,14 @@ func (s *UserService) CreateUser(ctx context.Context, input domain.CreateUserInp
 	return s.store.CreateUser(ctx, input, hash)
 }
 
+// UpdateUserStatus transitions targetID to newStatus. Status change and session
+// revocation (on suspension) are performed atomically by the storage layer.
+// Returns ErrForbidden if callerID is non-empty and equals targetID.
+// Returns ErrNotFound if the user does not exist.
+// Returns ErrStatusTransitionNotAllowed for unsupported transitions.
 func (s *UserService) UpdateUserStatus(ctx context.Context, callerID, targetID, newStatus string) (domain.User, error) {
-	existing, err := s.store.GetUserByID(ctx, targetID)
-	if err != nil {
-		return domain.User{}, err // ErrNotFound propagates as-is
-	}
-
-	if err := domain.ValidateStatusTransition(existing.Status, newStatus); err != nil {
-		return domain.User{}, err
-	}
-
 	if callerID != "" && callerID == targetID {
 		return domain.User{}, domain.ErrForbidden
 	}
-
-	updated, err := s.store.UpdateUserStatus(ctx, targetID, newStatus)
-	if err != nil {
-		return domain.User{}, fmt.Errorf("update user status: %w", err)
-	}
-
-	if newStatus == "suspended" && s.revoker != nil {
-		if revokeErr := s.revoker.RevokeAllUserSessions(ctx, targetID); revokeErr != nil {
-			return domain.User{}, fmt.Errorf("revoke sessions: %w", revokeErr)
-		}
-	}
-
-	return updated, nil
+	return s.store.UpdateUserStatus(ctx, targetID, newStatus)
 }

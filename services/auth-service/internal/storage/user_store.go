@@ -113,23 +113,69 @@ func (s *PGXUserStore) GetUserByID(ctx context.Context, id string) (domain.User,
 	return u, nil
 }
 
-func (s *PGXUserStore) UpdateUserStatus(ctx context.Context, id, status string) (domain.User, error) {
+func (s *PGXUserStore) UpdateUserStatus(ctx context.Context, id, newStatus string) (domain.User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Lock the user row and read current status to validate the transition atomically.
+	var currentStatus string
+	err = tx.QueryRow(ctx, `
+		SELECT status FROM auth.users
+		WHERE id = $1 AND deleted_at IS NULL
+		FOR UPDATE`,
+		id,
+	).Scan(&currentStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrNotFound
+		}
+		return domain.User{}, fmt.Errorf("lock user for status update: %w", err)
+	}
+
+	if err := domain.ValidateStatusTransition(currentStatus, newStatus); err != nil {
+		return domain.User{}, err
+	}
+
 	var u domain.User
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE auth.users
 		SET status = $2, updated_at = now()
 		WHERE id = $1
 		  AND deleted_at IS NULL
 		RETURNING id, email::text, display_name, COALESCE(full_name, ''), status, auth_source,
 		          email_verified_at, created_at, updated_at`,
-		id, status,
+		id, newStatus,
 	).Scan(&u.ID, &u.Email, &u.DisplayName, &u.FullName, &u.Status, &u.AuthSource,
 		&u.EmailVerifiedAt, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.User{}, domain.ErrNotFound
-		}
 		return domain.User{}, fmt.Errorf("update user status: %w", err)
+	}
+
+	// Revoke all active sessions and refresh tokens in the same transaction so that
+	// a suspension always produces a consistent state (status suspended + no active sessions).
+	if newStatus == "suspended" {
+		if _, err := tx.Exec(ctx, `
+			WITH revoked AS (
+			    UPDATE auth.user_sessions
+			    SET revoked_at = now(), revoked_reason = 'admin_suspension'
+			    WHERE user_id = $1 AND revoked_at IS NULL
+			    RETURNING id
+			)
+			UPDATE auth.refresh_token_history
+			SET status = 'revoked', revoked_at = now()
+			WHERE session_id IN (SELECT id FROM revoked)
+			  AND status = 'active'`,
+			id,
+		); err != nil {
+			return domain.User{}, fmt.Errorf("revoke sessions on suspension: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.User{}, fmt.Errorf("commit tx: %w", err)
 	}
 	return u, nil
 }

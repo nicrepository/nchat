@@ -145,38 +145,6 @@ func (s *PGXDeviceSessionStore) RevokeAllSessionsExcept(ctx context.Context, use
 	return nil
 }
 
-// RevokeAllUserSessions revokes all active sessions for userID and their active
-// refresh token history. Used when an admin suspends an account.
-func (s *PGXDeviceSessionStore) RevokeAllUserSessions(ctx context.Context, userID string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	if _, err := tx.Exec(ctx, `
-		WITH revoked AS (
-		    UPDATE auth.user_sessions
-		    SET revoked_at = now(), revoked_reason = 'admin_suspension'
-		    WHERE user_id = $1
-		      AND revoked_at IS NULL
-		    RETURNING id
-		)
-		UPDATE auth.refresh_token_history
-		SET status = 'revoked', revoked_at = now()
-		WHERE session_id IN (SELECT id FROM revoked)
-		  AND status = 'active'`,
-		userID,
-	); err != nil {
-		return fmt.Errorf("revoke all user sessions: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
-}
-
 // ValidateActiveSession verifies that sessionID is the current active database session
 // for userID and that the owning user can still authenticate.
 func (s *PGXDeviceSessionStore) ValidateActiveSession(ctx context.Context, userID, sessionID string) error {

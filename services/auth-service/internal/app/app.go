@@ -45,8 +45,7 @@ func New(cfg config.Config) *App {
 			logger.Warn("database unavailable; auth database endpoints disabled", "reason", "open_db_failed")
 		} else {
 			pool = openedPool
-			deviceStore := storage.NewPGXDeviceSessionStore(pool)
-			users = service.NewUserService(storage.NewPGXUserStore(pool), deviceStore)
+			users = service.NewUserService(storage.NewPGXUserStore(pool))
 		}
 	}
 

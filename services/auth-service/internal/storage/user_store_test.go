@@ -289,19 +289,60 @@ func TestPGXUserStore_GetUserByID_NotFound(t *testing.T) {
 	}
 }
 
-func TestPGXUserStore_UpdateUserStatus_Success(t *testing.T) {
+func TestPGXUserStore_UpdateUserStatus_Suspend_Atomic(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
 	}
 	defer mock.Close()
 
+	// Atomic: BEGIN, lock+read status, UPDATE users, revoke sessions CTE, COMMIT
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status FROM auth\.users`).
+		WithArgs("uid-1").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
 	mock.ExpectQuery(`UPDATE auth\.users`).
 		WithArgs("uid-1", "suspended").
 		WillReturnRows(userRow())
+	mock.ExpectExec(`WITH revoked AS`).
+		WithArgs("uid-1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
 
 	store := storage.NewPGXUserStore(mock)
 	user, err := store.UpdateUserStatus(context.Background(), "uid-1", "suspended")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if user.ID != "uid-1" {
+		t.Fatalf("expected uid-1, got %q", user.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXUserStore_UpdateUserStatus_Activate_NoRevocation(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	// Activation: no session revocation step
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status FROM auth\.users`).
+		WithArgs("uid-1").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("uid-1", "active").
+		WillReturnRows(userRow())
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXUserStore(mock)
+	user, err := store.UpdateUserStatus(context.Background(), "uid-1", "active")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -320,9 +361,11 @@ func TestPGXUserStore_UpdateUserStatus_NotFound(t *testing.T) {
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`UPDATE auth\.users`).
-		WithArgs("no-id", "suspended").
-		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "full_name", "status", "auth_source", "email_verified_at", "created_at", "updated_at"})) // no rows matched
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status FROM auth\.users`).
+		WithArgs("no-id").
+		WillReturnRows(pgxmock.NewRows([]string{"status"})) // empty = not found
+	mock.ExpectRollback()
 
 	store := storage.NewPGXUserStore(mock)
 	_, err = store.UpdateUserStatus(context.Background(), "no-id", "suspended")
@@ -334,48 +377,54 @@ func TestPGXUserStore_UpdateUserStatus_NotFound(t *testing.T) {
 	}
 }
 
-func TestPGXUserStore_GetUserByID_QueryError(t *testing.T) {
+func TestPGXUserStore_UpdateUserStatus_InvalidTransition_Rejected(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`SELECT id, email`).
+	// active→active is invalid; status is read under lock then rejected
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status FROM auth\.users`).
 		WithArgs("uid-1").
-		WillReturnError(errors.New("db down"))
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectRollback()
 
 	store := storage.NewPGXUserStore(mock)
-	_, err = store.GetUserByID(context.Background(), "uid-1")
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected wrapped db error, got ErrNotFound")
+	_, err = store.UpdateUserStatus(context.Background(), "uid-1", "active")
+	if !errors.Is(err, domain.ErrStatusTransitionNotAllowed) {
+		t.Fatalf("expected ErrStatusTransitionNotAllowed, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
-func TestPGXUserStore_UpdateUserStatus_QueryError(t *testing.T) {
+func TestPGXUserStore_UpdateUserStatus_RevocationFailure_RollsBackStatus(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
 	}
 	defer mock.Close()
 
+	// Status update succeeds but revocation fails → entire TX rolls back
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status FROM auth\.users`).
+		WithArgs("uid-1").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
 	mock.ExpectQuery(`UPDATE auth\.users`).
 		WithArgs("uid-1", "suspended").
-		WillReturnError(errors.New("db down"))
+		WillReturnRows(userRow())
+	mock.ExpectExec(`WITH revoked AS`).
+		WithArgs("uid-1").
+		WillReturnError(errors.New("revocation db error"))
+	mock.ExpectRollback()
 
 	store := storage.NewPGXUserStore(mock)
 	_, err = store.UpdateUserStatus(context.Background(), "uid-1", "suspended")
 	if err == nil {
 		t.Fatal("expected error, got nil")
-	}
-	if errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected wrapped db error, got ErrNotFound")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

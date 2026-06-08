@@ -43,9 +43,6 @@ func (f *fakeDeviceSessionStore) RevokeAllSessionsExcept(_ context.Context, _, e
 	f.lastExceptSessionID = exceptSessionID
 	return f.revokeAllErr
 }
-func (f *fakeDeviceSessionStore) RevokeAllUserSessions(_ context.Context, _ string) error {
-	return nil
-}
 func (f *fakeDeviceSessionStore) ListDevices(_ context.Context, _ string, _ string, includeRevoked bool, limit int) ([]domain.DeviceInfo, domain.DeviceSessionPolicy, error) {
 	f.lastIncludeRevoked = includeRevoked
 	f.lastLimit = limit
@@ -195,14 +192,5 @@ func TestDeviceSessionService_RevokeAllSessionsExcept_Delegates(t *testing.T) {
 	}
 	if store.lastExceptSessionID != "session-current" {
 		t.Fatalf("expected session-current delegated, got %q", store.lastExceptSessionID)
-	}
-}
-
-func TestDeviceSessionService_RevokeAllUserSessions_Delegates(t *testing.T) {
-	store := &fakeDeviceSessionStore{}
-	svc := service.NewDeviceSessionService(store)
-
-	if err := svc.RevokeAllUserSessions(context.Background(), "user-1"); err != nil {
-		t.Fatalf("RevokeAllUserSessions: %v", err)
 	}
 }
