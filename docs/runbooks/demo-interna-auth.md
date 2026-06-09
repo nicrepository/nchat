@@ -110,7 +110,7 @@ Substituir `<ADMIN_BOOTSTRAP_TOKEN>` pelo valor do secret de staging (nunca hard
 
 **O que mostrar no DevTools (opcional):**
 
-- Network → `POST /api/auth/login` → 200 com `access_token`, `refresh_token`, `user`.
+- Network → `POST /api/auth/login` → status 200 (tokens existem mas não serão exibidos).
 - Nenhum token aparece na URL.
 
 **Erro esperado se credenciais erradas:**
@@ -240,7 +240,7 @@ Anotar o `id` retornado para referência. Não exibir o token (ele vai por email
 
 **O que mostrar no DevTools (opcional):**
 
-- Network → exchange → 200 com `access_token` e `refresh_token`.
+- Network → exchange → status 200 (tokens existem mas não serão exibidos).
 - URL do browser mostra `/oidc-callback` limpo (sem `code=`) após o exchange.
 
 **Nota:** `OIDC_AUTO_PROVISION_ENABLED=true` cria automaticamente a conta NChat se o email
@@ -253,29 +253,30 @@ localmente com o mesmo email e `auth_source = oidc`.
 
 **Objetivo:** demonstrar RF-51 — tokens se renovam automaticamente; sessão persiste sem re-login.
 
+> O refresh automático do frontend é reativo: `authenticatedFetch` tenta renovar o par de tokens quando uma chamada autenticada recebe 401. Não existe timer em background nem refresh proativo antes da expiração.
+
+> ⚠️ **Nunca exibir, copiar, gravar, compartilhar, colar em tickets/chat ou salvar em terminal persistente valores reais de `nchat_at`/`nchat_rt`/`access_token`/`refresh_token` durante a demo.**
+
 **Fluxo (opção A — aguardar expiração, requer TTL curto):**
 
 > Requer ambiente de staging com `AUTH_ACCESS_TOKEN_TTL_SECONDS` reduzido (ex: 60s).
 
 1. Fazer login.
 2. Aguardar o access token expirar (observar Network no DevTools).
-3. Qualquer ação autenticada dispara refresh automático silencioso.
+3. Qualquer ação autenticada dispara refresh automático silencioso via `authenticatedFetch`.
 4. Verificar: `POST /api/auth/refresh` → 200 com novos tokens, sem re-login.
 
 **Fluxo (opção B — inspecionar via DevTools):**
 
 1. Fazer login.
-2. DevTools → Application → Session Storage → copiar o valor da chave `nchat_rt` (refresh token opaco).
-   > ⚠️ **Staging/demo apenas.** Não commitar, não logar em histórico persistente de shell,
-   > não colar em tickets, chat ou screen recording. Não compartilhar o valor do token.
-3. Aguardar qualquer ação autenticada ou forçar via `authClient.ts` hook.
-4. Verificar Network: `POST /api/auth/refresh` → 200.
-5. O access token anterior (`nchat_at`) não funciona mais após rotação.
+2. DevTools → Application → Session Storage → verificar que as chaves `nchat_at` e `nchat_rt` existem (valores redacted — não exibir).
+3. Acionar qualquer chamada autenticada; caso receba 401, `authenticatedFetch` inicia o refresh automaticamente.
+4. Verificar Network: `POST /api/auth/refresh` → status 200.
 
 **Resultado esperado:**
 
 - `POST /api/auth/refresh` → 200 com novos `access_token` e `refresh_token`.
-- Token anterior é revogado automaticamente (rotação).
+- Após refresh bem-sucedido, o `nchat_rt` anterior não deve mais ser reutilizável. O `nchat_at` anterior pode continuar válido até expirar, salvo se a sessão for revogada.
 - Usuário continua logado sem interrupção.
 
 **Nota:** O smoke test de staging
@@ -297,7 +298,7 @@ valida esse comportamento automaticamente.
 ACCESS_TOKEN="<access_token_do_login>"
 ```
 
-> ⚠️ Copiar do DevTools → Network → login → response body. Staging/demo apenas.
+> ⚠️ Obter o `ACCESS_TOKEN` de um login em staging via script de smoke test ou CLI, nunca copiando de DevTools durante screen sharing. Staging/demo apenas.
 > Não commitar, não logar em histórico persistente, não colar em tickets ou chat.
 
 **Passo 2 — Listar sessões:**
@@ -508,4 +509,4 @@ export STAGING_AUTH_EMAIL="nchat-test-demo@<dominio-staging>"
 node scripts/staging/auth-smoke.mjs
 ```
 
-> Nunca executar contra produção. O script tem guard que rejeita hosts `prod`/`production`/`api.nic-labs.com`.
+> Nunca executar contra produção. O script tem guard que rejeita hosts `prod`/`production` e o hostname interno de produção.
