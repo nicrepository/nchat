@@ -153,7 +153,7 @@ Substituir `<ADMIN_BOOTSTRAP_TOKEN>` pelo valor do secret de staging (nunca hard
 3. Clicar em **Enviar**.
 4. Resultado esperado: mensagem de confirmação na tela (202 Accepted).
 5. Verificar caixa de entrada do endereço de teste.
-6. Clicar no link de reset no email → abre `/reset-password?token=<token>`.
+6. Clicar no link de reset no email → abre `/reset-password?<reset-token-param>=<opaque-reset-token>`.
 7. Preencher nova senha (mínimo 12 caracteres, letras maiúsculas, minúsculas, número e símbolo).
 8. Confirmar reset → 204 → tela de sucesso → redirecionar para `/login`.
 9. Fazer login com a nova senha para confirmar.
@@ -194,7 +194,7 @@ Anotar o `id` retornado para referência. Não exibir o token (ele vai por email
 **Passo 2 — Ativar conta (browser):**
 
 1. Verificar caixa de entrada de `nchat-test-invite@<dominio-staging>`.
-2. Clicar no link de convite no email → abre `/accept-invite?token=<token>`.
+2. Clicar no link de convite no email → abre `/accept-invite?<invite-token-param>=<opaque-invite-token>`.
 3. Preencher:
    - Nome de exibição (obrigatório)
    - Nome completo (opcional)
@@ -295,7 +295,7 @@ valida esse comportamento automaticamente.
 **Passo 1 — Fazer login e capturar access token:**
 
 ```bash
-ACCESS_TOKEN="<access_token_do_login>"
+ACCESS_JWT_VALUE="<access_token_do_login>"
 ```
 
 > ⚠️ Obter o `ACCESS_TOKEN` de um login em staging via script de smoke test ou CLI, nunca copiando de DevTools durante screen sharing. Staging/demo apenas.
@@ -305,7 +305,7 @@ ACCESS_TOKEN="<access_token_do_login>"
 
 ```bash
 curl -s \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Authorization: Bearer $ACCESS_JWT_VALUE" \
   https://auth.staging.example.com/auth/me/sessions | jq .
 ```
 
@@ -315,7 +315,7 @@ Resposta esperada: array com pelo menos a sessão atual (`"current": true`).
 
 ```bash
 curl -s -X DELETE \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Authorization: Bearer $ACCESS_JWT_VALUE" \
   https://auth.staging.example.com/auth/me/sessions/<session_id>
 ```
 
@@ -325,7 +325,7 @@ Resposta esperada: 204.
 
 ```bash
 curl -s -X DELETE \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Authorization: Bearer $ACCESS_JWT_VALUE" \
   https://auth.staging.example.com/auth/me/sessions
 ```
 
@@ -335,7 +335,7 @@ Resposta esperada: 204.
 
 ```bash
 curl -s \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Authorization: Bearer $ACCESS_JWT_VALUE" \
   https://auth.staging.example.com/auth/me/devices | jq .
 ```
 
@@ -345,7 +345,7 @@ Resposta esperada: array de dispositivos com `meta.max_devices_per_user`.
 
 ```bash
 curl -s -X DELETE \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Authorization: Bearer $ACCESS_JWT_VALUE" \
   https://auth.staging.example.com/auth/me/devices/<device_id>
 ```
 
@@ -469,18 +469,18 @@ RESP=$(curl -s -X POST \
   -d '{"email":"nchat-test-demo@<dominio-staging>","password":"<senha_teste>"}' \
   https://auth.staging.example.com/auth/login)
 
-ACCESS_TOKEN=$(echo "$RESP" | jq -r .access_token)
-REFRESH_TOKEN=$(echo "$RESP" | jq -r .refresh_token)
+ACCESS_JWT_VALUE=$(echo "$RESP" | jq -r .access_token)
+REFRESH_VALUE=$(echo "$RESP" | jq -r .refresh_token)
 
 # Revogar todas as sessões exceto a atual
 curl -s -X DELETE \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Authorization: Bearer $ACCESS_JWT_VALUE" \
   https://auth.staging.example.com/auth/me/sessions
 
 # Logout (invalida a sessão atual)
 curl -s -X POST \
   -H "Content-Type: application/json" \
-  -d "{\"refresh_token\":\"$REFRESH_TOKEN\"}" \
+  -d "{\"refresh_token\":\"$REFRESH_VALUE\"}" \
   https://auth.staging.example.com/auth/logout
 ```
 

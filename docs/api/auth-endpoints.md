@@ -288,12 +288,12 @@ currently sends `device_name: "NIC Chat Web"` and omits `device_fingerprint`.
 - Token is single-use: `used_at` is set atomically on consumption.
 - Password must pass the policy configured in `auth_policy_settings`
   (default: ≥12 chars, uppercase, lowercase, number, symbol).
-- Token arrives in the browser URL from the email link (`/reset-password?token=<token>`).
+- Token arrives in the browser URL from the email link (`/reset-password?<reset-token-param>=<opaque-reset-token>`).
   `ResetPasswordPage.tsx` removes the token query parameter on mount via `replace` navigation,
   so the token does not persist in browser URL or history.
   The API receives the token only in the POST request body, not as a URL query parameter.
 
-**Frontend screen:** `ResetPasswordPage.tsx` — `/reset-password?token=<token>`
+**Frontend screen:** `ResetPasswordPage.tsx` — `/reset-password?<reset-token-param>=<opaque-reset-token>`
 
 **RF mapping:** RF-48 (password recovery)
 
@@ -346,14 +346,14 @@ currently sends `device_name: "NIC Chat Web"` and omits `device_fingerprint`.
 **Security notes:**
 
 - Invite token is single-use (consumed atomically).
-- Token arrives in the browser URL from the email link (`/accept-invite?token=<token>`).
+- Token arrives in the browser URL from the email link (`/accept-invite?<invite-token-param>=<opaque-invite-token>`).
   `AcceptInvitePage.tsx` removes the token query parameter on mount via `replace` navigation,
   so the token does not persist in browser URL or history.
   The API receives the token only in the POST request body, not as a URL query parameter.
 - Password policy enforced on first activation.
 - Accepting an invite creates the user account and activates it in one step.
 
-**Frontend screen:** `AcceptInvitePage.tsx` — `/accept-invite?token=<token>`
+**Frontend screen:** `AcceptInvitePage.tsx` — `/accept-invite?<invite-token-param>=<opaque-invite-token>`
 
 **RF mapping:** RF-46 (invite-based registration)
 
