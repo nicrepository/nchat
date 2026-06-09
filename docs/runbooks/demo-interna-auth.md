@@ -265,10 +265,12 @@ localmente com o mesmo email e `auth_source = oidc`.
 **Fluxo (opção B — inspecionar via DevTools):**
 
 1. Fazer login.
-2. DevTools → Application → Session Storage → copiar `refresh_token` (valor opaco).
+2. DevTools → Application → Session Storage → copiar o valor da chave `nchat_rt` (refresh token opaco).
+   > ⚠️ **Staging/demo apenas.** Não commitar, não logar em histórico persistente de shell,
+   > não colar em tickets, chat ou screen recording. Não compartilhar o valor do token.
 3. Aguardar qualquer ação autenticada ou forçar via `authClient.ts` hook.
 4. Verificar Network: `POST /api/auth/refresh` → 200.
-5. O access token anterior não funciona mais após rotação.
+5. O access token anterior (`nchat_at`) não funciona mais após rotação.
 
 **Resultado esperado:**
 
@@ -295,7 +297,8 @@ valida esse comportamento automaticamente.
 ACCESS_TOKEN="<access_token_do_login>"
 ```
 
-(Copiar do DevTools → Network → login → response body. Não commitar.)
+> ⚠️ Copiar do DevTools → Network → login → response body. Staging/demo apenas.
+> Não commitar, não logar em histórico persistente, não colar em tickets ou chat.
 
 **Passo 2 — Listar sessões:**
 
@@ -365,14 +368,19 @@ Resposta esperada: 204.
 
 1. Fazer login com conta que tenha acesso à rota `/admin` (qualquer usuário autenticado no MVP).
 2. Navegar para `/admin/users`.
-3. A tela carrega a lista de usuários via `GET /api/admin/users` (Bearer JWT — **endpoint diferente** do bootstrap).
+3. A tela chama `GET /api/admin/users` (Bearer JWT), mas esse endpoint **não está implementado
+   no backend atual**. Dependendo da resposta (404 ou 405), a página mostrará o estado vazio
+   ("Nenhum usuário disponível") ou o estado de erro. Ambos os estados fazem parte da demo.
 4. Mostrar filtros (Todos / Ativos / Suspensos) e busca por nome/email.
-5. Mostrar badges de status (Ativo / Suspenso) e origem (manual / oidc).
+5. Mostrar badges de status (Ativo / Suspenso) e origem (manual / oidc) no layout da tabela.
 6. Mostrar que os botões **Suspender / Ativar** estão desabilitados (`disabled`, `aria-disabled="true"`).
 
 **O que explicar:**
 
-- A leitura da lista de usuários funciona (GET /admin/users com Bearer JWT).
+- `GET /admin/users` não está implementado no backend. A tela demonstra o shell de
+  administração, o layout da tabela, os filtros e a busca — não dados reais do servidor.
+- Não usar `curl` com `X-NChat-Admin-Token` para "preencher" a lista na demo; isso contornaria
+  a limitação correta e exigiria expor o token bootstrap no browser.
 - A mutação de status (`PATCH /admin/users/{id}/status`) existe no backend,
   mas está protegida pelo `X-NChat-Admin-Token` (bootstrap guard), que **não é seguro para uso
   no browser**. Os botões ficam desabilitados até que um guard JWT/RBAC de admin (RF-74)
@@ -384,33 +392,33 @@ Resposta esperada: 204.
 
 **Resultado esperado:**
 
-- Tela renderiza lista de usuários com skeleton de carregamento.
-- Status e origem exibidos corretamente.
-- Busca filtra por nome e email na lista carregada (client-side).
+- Tela renderiza o shell de admin com tabela, filtros e busca.
+- Como `GET /admin/users` não está implementado no backend, a página exibe estado vazio
+  ("Nenhum usuário disponível") ou estado de erro — ambos são comportamentos corretos para a demo.
 - Botões de ação permanecem desabilitados — não há click handler.
 
 ---
 
 ## Resultados esperados por fluxo
 
-| Fluxo                 | Endpoint principal                  | Resposta esperada      |
-| --------------------- | ----------------------------------- | ---------------------- |
-| Login manual          | `POST /auth/login`                  | 200 com tokens + user  |
-| Logout                | `POST /auth/logout`                 | 204                    |
-| Forgot password       | `POST /auth/password/forgot`        | 202                    |
-| Reset password        | `POST /auth/password/reset`         | 204                    |
-| Criar convite (CLI)   | `POST /admin/invites`               | 201 com invite id      |
-| Aceitar convite       | `POST /auth/invites/accept`         | 201 com user id        |
-| SSO login             | `GET /auth/oidc/keycloak/login`     | 302 → Keycloak         |
-| SSO callback          | `GET /auth/oidc/keycloak/callback`  | 302 → `/oidc-callback` |
-| SSO exchange          | `POST /auth/oidc/keycloak/exchange` | 200 com tokens + user  |
-| Refresh               | `POST /auth/refresh`                | 200 com novos tokens   |
-| Listar sessões        | `GET /auth/me/sessions`             | 200 com array          |
-| Revogar sessão        | `DELETE /auth/me/sessions/{id}`     | 204                    |
-| Revogar todas         | `DELETE /auth/me/sessions`          | 204                    |
-| Listar dispositivos   | `GET /auth/me/devices`              | 200 com array          |
-| Revogar dispositivo   | `DELETE /auth/me/devices/{id}`      | 204                    |
-| Admin users (leitura) | `GET /admin/users`                  | 200 com array          |
+| Fluxo               | Endpoint principal                    | Resposta esperada               |
+| ------------------- | ------------------------------------- | ------------------------------- |
+| Login manual        | `POST /auth/login`                    | 200 com tokens + user           |
+| Logout              | `POST /auth/logout`                   | 204                             |
+| Forgot password     | `POST /auth/password/forgot`          | 202                             |
+| Reset password      | `POST /auth/password/reset`           | 204                             |
+| Criar convite (CLI) | `POST /admin/invites`                 | 201 com invite id               |
+| Aceitar convite     | `POST /auth/invites/accept`           | 201 com user id                 |
+| SSO login           | `GET /auth/oidc/keycloak/login`       | 302 → Keycloak                  |
+| SSO callback        | `GET /auth/oidc/keycloak/callback`    | 302 → `/oidc-callback`          |
+| SSO exchange        | `POST /auth/oidc/keycloak/exchange`   | 200 com tokens + user           |
+| Refresh             | `POST /auth/refresh`                  | 200 com novos tokens            |
+| Listar sessões      | `GET /auth/me/sessions`               | 200 com array                   |
+| Revogar sessão      | `DELETE /auth/me/sessions/{id}`       | 204                             |
+| Revogar todas       | `DELETE /auth/me/sessions`            | 204                             |
+| Listar dispositivos | `GET /auth/me/devices`                | 200 com array                   |
+| Revogar dispositivo | `DELETE /auth/me/devices/{id}`        | 204                             |
+| Admin users (tela)  | `GET /admin/users` (não implementado) | estado vazio ou erro (esperado) |
 
 ---
 
@@ -420,6 +428,7 @@ Resposta esperada: 204.
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `must_change_password` flow não implementado              | Login com `must_change_password: true` mostra aviso e impede sessão; não redireciona para troca de senha real |
 | Tela de sessões/dispositivos não implementada no frontend | Revogação só via `curl` / API direta                                                                          |
+| `GET /admin/users` não implementado no backend            | Tela admin mostra estado vazio ou erro; não exibe lista real de usuários                                      |
 | Mutação de status de usuário não disponível no browser    | Botões desabilitados; requer `X-NChat-Admin-Token` via CLI                                                    |
 | Convite pelo browser não disponível                       | Botão "Convidar usuário" desabilitado; requer CLI                                                             |
 | Filtros "Admins" e "Convites pendentes" sem dados         | API não retorna dados de role/invite na listagem                                                              |
@@ -448,6 +457,9 @@ Resposta esperada: 204.
 ## Rollback e limpeza pós-demo
 
 **Revogar todas as sessões de contas de teste:**
+
+> ⚠️ O script abaixo captura tokens em variáveis de shell. Use apenas em staging.
+> Não commitar, não logar em histórico persistente, não colar em tickets, chat ou screen recording.
 
 ```bash
 # Login para obter token

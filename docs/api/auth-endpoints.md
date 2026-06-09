@@ -205,10 +205,12 @@ currently sends `device_name: "NIC Chat Web"` and omits `device_fingerprint`.
 **Security notes:**
 
 - The old refresh token is invalidated on exchange (token rotation).
-- Frontend performs automatic silent refresh before the access token expires.
-  See `authClient.ts` and `useAutoRefresh`.
+- Frontend performs silent refresh reactively: `authenticatedFetch` in `authClient.ts`
+  retries once with a new token pair when an authenticated endpoint returns 401.
+  There is no background timer and no proactive refresh before expiry.
+  Backend remains authoritative for idle and absolute session expiry.
 
-**Frontend usage:** `authApi.ts → refresh()` / auto-refresh hook
+**Frontend usage:** `authApi.ts → refresh()` called by `authClient.ts → authenticatedFetch`
 
 **RF mapping:** RF-51 (session expiry / refresh)
 
@@ -286,7 +288,10 @@ currently sends `device_name: "NIC Chat Web"` and omits `device_fingerprint`.
 - Token is single-use: `used_at` is set atomically on consumption.
 - Password must pass the policy configured in `auth_policy_settings`
   (default: ≥12 chars, uppercase, lowercase, number, symbol).
-- Reset token is included only in the request body; never in the URL.
+- Token arrives in the browser URL from the email link (`/reset-password?token=<token>`).
+  `ResetPasswordPage.tsx` removes the token query parameter on mount via `replace` navigation,
+  so the token does not persist in browser URL or history.
+  The API receives the token only in the POST request body, not as a URL query parameter.
 
 **Frontend screen:** `ResetPasswordPage.tsx` — `/reset-password?token=<token>`
 
@@ -341,6 +346,10 @@ currently sends `device_name: "NIC Chat Web"` and omits `device_fingerprint`.
 **Security notes:**
 
 - Invite token is single-use (consumed atomically).
+- Token arrives in the browser URL from the email link (`/accept-invite?token=<token>`).
+  `AcceptInvitePage.tsx` removes the token query parameter on mount via `replace` navigation,
+  so the token does not persist in browser URL or history.
+  The API receives the token only in the POST request body, not as a URL query parameter.
 - Password policy enforced on first activation.
 - Accepting an invite creates the user account and activates it in one step.
 
