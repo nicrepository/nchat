@@ -79,7 +79,8 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	))
 	loginAttemptsHandler := GetMyLoginAttempts(loginAttempts)
 	if tokens != nil && loginAttempts != nil {
-		loginAttemptsHandler = BearerAuth(tokens)(loginAttemptsHandler)
+		requireActive := RequireActiveSession(sessions)
+		loginAttemptsHandler = BearerAuth(tokens)(requireActive(loginAttemptsHandler))
 	}
 	mux.Handle(RouteAuthMeLoginAttempts, httputil.MethodNotAllowed(http.MethodGet, loginAttemptsHandler))
 
