@@ -143,19 +143,19 @@ function validateEnvironment() {
   // Only the sanitized origin (protocol + host) is ever logged or used in fetch.
   API_ORIGIN = apiUrl.origin;
 
-  // --- Production origin guard (independent of allowlist) ---
+  // --- Production origin guard (independent of allowlist, no override) ---
   const host = apiUrl.hostname.toLowerCase();
-  const allowProdLike =
-    process.env.STAGING_ALLOW_PRODUCTION_LIKE_ORIGIN === "I_UNDERSTAND_THIS_IS_DANGEROUS";
+  // Split on both "." and "-" so that api-prod.example and prod-api.example are caught.
+  // Token "product" is not equal to "prod", so product.example is not rejected.
+  // Rejected examples: prod.example, api.prod.example, api-prod.example,
+  //   prod-api.example, api.production.example, production-api.example.
+  const hostTokens = host.split(/[.\-]+/);
   const isProdLike =
-    /(?:^|\.)prod(?:\.|$)/.test(host) ||
-    /(?:^|\.)production(?:\.|$)/.test(host) ||
-    host === "api.nic-labs.com";
-  if (isProdLike && !allowProdLike) {
+    hostTokens.some((t) => t === "prod" || t === "production") || host === "api.nic-labs.com";
+  if (isProdLike) {
     abort(
       "STAGING_API_BASE_URL appears to be a production host. " +
-        "Refusing to run against production. " +
-        "If this is intentional, set STAGING_ALLOW_PRODUCTION_LIKE_ORIGIN=I_UNDERSTAND_THIS_IS_DANGEROUS.",
+        "Refusing to run against production.",
     );
   }
 
@@ -662,9 +662,10 @@ async function suiteD() {
 
     await test("valid refresh token after AT expiry returns new token pair", async () => {
       const r = await refresh(rt);
+      // Register rotated token immediately so cleanup runs even if assertions below fail.
+      if (typeof r.refresh_token === "string") rt = r.refresh_token;
       assert(r.access_token, "new access_token missing");
       assert(r.refresh_token, "new refresh_token missing");
-      rt = r.refresh_token; // update for cleanup
       await logout(rt);
       rt = ""; // already cleaned up
     });
