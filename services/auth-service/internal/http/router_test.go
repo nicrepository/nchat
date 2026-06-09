@@ -14,6 +14,7 @@ import (
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/auth-service/internal/config"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
+	"github.com/nicrepository/nchat/services/auth-service/internal/service"
 )
 
 func TestHealthzContract(t *testing.T) {
@@ -216,6 +217,73 @@ func TestAdminUsersMethodNotAllowed(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAdminUsers, nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+// ── PATCH /admin/users/{id}/status router-level tests ─────────────────────
+
+func TestAdminUserStatus_NoToken_Returns503(t *testing.T) {
+	// testConfig has no ADMIN_BOOTSTRAP_TOKEN → token is empty → guard returns 503
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no bootstrap token configured, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUserStatus_WrongToken_Returns401(t *testing.T) {
+	cfg := testConfig()
+	cfg.AdminBootstrapToken = "correct-token"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NChat-Admin-Token", "wrong-token")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong bootstrap token, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUserStatus_BearerOnly_Returns401(t *testing.T) {
+	// Only a Bearer JWT (no admin token) must be rejected
+	cfg := testConfig()
+	cfg.AdminBootstrapToken = "correct-token"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer some.jwt.token")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for bearer-only request, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUserStatus_MethodNotAllowed_Returns405(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/users/user-1/status", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET on status route, got %d", rec.Code)
+	}
+}
+
+func TestAdminUserStatus_NoService_Returns503(t *testing.T) {
+	// Service nil + correct token → 503 (service unavailable from handler)
+	cfg := testConfig()
+	cfg.AdminBootstrapToken = "correct-token"
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NChat-Admin-Token", "correct-token")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when service nil, got %d — %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -782,5 +850,154 @@ func TestRecoveryRateLimiterMalformedResetTokenUsesGenericLimiter(t *testing.T) 
 	}
 	if passwords.resetCalls != 1 {
 		t.Fatalf("expected generic malformed value target limiter to block second service call, got %d calls", passwords.resetCalls)
+	}
+}
+
+// ── /auth/me/login-attempts active-session guard tests ────────────────────
+
+// routerLoginAttemptsStub satisfies LoginAttemptsManager for router-level tests.
+type routerLoginAttemptsStub struct{}
+
+func (routerLoginAttemptsStub) GetMyAttempts(_ context.Context, _ string, _ int, _ string) ([]domain.LoginAttempt, string, error) {
+	return nil, "", nil
+}
+
+// routerSessionStub satisfies SessionManager for router-level tests.
+// ValidateErr controls what ValidateActiveSession returns.
+type routerSessionStub struct {
+	validateErr error
+}
+
+func (s routerSessionStub) ValidateActiveSession(_ context.Context, _, _ string) error {
+	return s.validateErr
+}
+func (routerSessionStub) ListSessions(_ context.Context, _ string, _ bool, _ int) ([]domain.SessionInfo, error) {
+	return nil, nil
+}
+func (routerSessionStub) RevokeSession(_ context.Context, _, _ string) error { return nil }
+func (routerSessionStub) RevokeAllSessionsExcept(_ context.Context, _, _ string) error {
+	return nil
+}
+
+// jwtTestConfig returns a router config with a valid JWT setup for active-session tests.
+// Must use the same HMAC secret as makeRouterTokens so tokens validate correctly.
+func jwtTestConfig() config.Config {
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("a", 32)
+	cfg.AuthJWTIssuer = "test-issuer"
+	cfg.AuthJWTAudience = "test-audience"
+	cfg.AuthAccessTokenTTLSeconds = 900
+	cfg.AuthRefreshTokenTTLSeconds = 3600
+	return cfg
+}
+
+// makeRouterTokens creates a TokenManager matching jwtTestConfig.
+func makeRouterTokens(t *testing.T) *service.TokenManager {
+	t.Helper()
+	tokens, err := service.NewTokenManager(service.TokenConfig{
+		HMACSecret: strings.Repeat("a", 32),
+		Issuer:     "test-issuer",
+		Audience:   "test-audience",
+		AccessTTL:  15 * time.Minute,
+		RefreshTTL: 7 * 24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("create router token manager: %v", err)
+	}
+	return tokens
+}
+
+// mustAccessTokenForRouter generates a signed access token for router-level tests.
+func mustAccessTokenForRouter(t *testing.T, userID, sessionID string) string {
+	t.Helper()
+	tok, _, err := makeRouterTokens(t).GenerateAccessToken(userID, sessionID)
+	if err != nil {
+		t.Fatalf("generate access token: %v", err)
+	}
+	return tok
+}
+
+func TestLoginAttempts_RequiresActiveSession_RevokedSessionReturns401(t *testing.T) {
+	// Valid JWT, but session is revoked/suspended → active-session guard must reject.
+	accessToken := mustAccessTokenForRouter(t, "user-1", "session-revoked")
+	sessions := routerSessionStub{validateErr: domain.ErrInvalidToken}
+
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for revoked session, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLoginAttempts_RequiresActiveSession_MissingBearerReturns401(t *testing.T) {
+	// No Authorization header — BearerAuth should reject before session check.
+	sessions := routerSessionStub{validateErr: nil}
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing bearer, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLoginAttempts_RequiresActiveSession_ActiveSessionSucceeds(t *testing.T) {
+	// Valid JWT + active session → handler must be reached (returns 200).
+	// Session ID must be a valid UUID because RequireActiveSession validates UUID format.
+	accessToken := mustAccessTokenForRouter(t, "user-2", "00000000-0000-0000-0000-000000000002")
+	sessions := routerSessionStub{validateErr: nil}
+
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid bearer + active session, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLoginAttempts_RequiresActiveSession_NilSessionValidatorFailsClosed(t *testing.T) {
+	// sessions is nil → RequireActiveSession must return 503 (fail-closed).
+	accessToken := mustAccessTokenForRouter(t, "user-3", "session-any")
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, nil, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when session validator nil (fail-closed), got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLoginAttempts_RequiresActiveSession_NotFoundSessionReturns401(t *testing.T) {
+	// Valid JWT but session not found in DB → should be 401, not 200.
+	accessToken := mustAccessTokenForRouter(t, "user-4", "session-gone")
+	sessions := routerSessionStub{validateErr: domain.ErrNotFound}
+
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for not-found session, got %d — %s", rec.Code, rec.Body.String())
 	}
 }

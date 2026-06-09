@@ -108,3 +108,37 @@ func TestValidatePassword_NoRequirements(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
+
+func TestValidateStatusTransition(t *testing.T) {
+	tests := []struct {
+		from    string
+		to      string
+		wantErr bool
+	}{
+		{"active", "suspended", false},
+		{"suspended", "active", false},
+		{"active", "active", true},
+		{"suspended", "suspended", true},
+		{"active", "locked", true},
+		{"locked", "active", true},
+		{"active", "deleted", true},
+		{"invited", "active", true},
+		{"", "active", true},
+		{"active", "", true},
+	}
+	for _, tt := range tests {
+		name := tt.from + "->" + tt.to
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateStatusTransition(tt.from, tt.to)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected error for %s->%s", tt.from, tt.to)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error for %s->%s: %v", tt.from, tt.to, err)
+			}
+			if tt.wantErr && err != nil && !errors.Is(err, domain.ErrStatusTransitionNotAllowed) {
+				t.Fatalf("expected ErrStatusTransitionNotAllowed, got %v", err)
+			}
+		})
+	}
+}

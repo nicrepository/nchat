@@ -88,3 +88,67 @@ func AdminCreateUser(users service.UserCreator) http.Handler {
 		httputil.WriteJSON(w, http.StatusCreated, resp)
 	})
 }
+
+type updateUserStatusRequest struct {
+	Status string `json:"status"`
+}
+
+// AdminUpdateUserStatus handles PATCH /admin/users/{id}/status.
+// This endpoint is guarded by AdminBootstrapGuard and is NOT browser-callable.
+// callerID is passed as "" because AdminBootstrapGuard provides no user identity;
+// self-deactivation prevention requires a future JWT/RBAC admin guard.
+func AdminUpdateUserStatus(users service.UserStatusManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if users == nil {
+			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "admin endpoint unavailable: database not configured")
+			return
+		}
+
+		id := r.PathValue("id")
+		if id == "" {
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "missing user id")
+			return
+		}
+
+		var req updateUserStatusRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid JSON body")
+			return
+		}
+
+		if req.Status != "active" && req.Status != "suspended" {
+			httputil.WriteError(w, http.StatusUnprocessableEntity, "invalid_status", "status must be active or suspended")
+			return
+		}
+
+		user, err := users.UpdateUserStatus(r.Context(), "", id, req.Status)
+		if err != nil {
+			switch {
+			case errors.Is(err, domain.ErrNotFound):
+				httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "user not found")
+			case errors.Is(err, domain.ErrStatusTransitionNotAllowed):
+				httputil.WriteError(w, http.StatusUnprocessableEntity, "invalid_transition", "status transition not allowed")
+			case errors.Is(err, domain.ErrForbidden):
+				httputil.WriteError(w, http.StatusForbidden, "forbidden", "forbidden")
+			default:
+				httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+			}
+			return
+		}
+
+		resp := userResponse{
+			ID:              user.ID,
+			Email:           user.Email,
+			DisplayName:     user.DisplayName,
+			Status:          user.Status,
+			AuthSource:      user.AuthSource,
+			EmailVerifiedAt: user.EmailVerifiedAt.Format(time.RFC3339),
+			CreatedAt:       user.CreatedAt.Format(time.RFC3339),
+		}
+		if user.FullName != "" {
+			resp.FullName = &user.FullName
+		}
+
+		httputil.WriteJSON(w, http.StatusOK, resp)
+	})
+}

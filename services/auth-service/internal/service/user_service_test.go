@@ -27,6 +27,14 @@ func (f *fakeStore) CreateUser(_ context.Context, _ domain.CreateUserInput, hash
 	return f.user, f.createErr
 }
 
+func (f *fakeStore) GetUserByID(_ context.Context, _ string) (domain.User, error) {
+	return domain.User{}, domain.ErrNotFound
+}
+
+func (f *fakeStore) UpdateUserStatus(_ context.Context, _, _ string) (domain.User, error) {
+	return domain.User{}, nil
+}
+
 func defaultPolicy() domain.PolicySettings {
 	return domain.PolicySettings{
 		MinPasswordLength: 8,
@@ -139,5 +147,100 @@ func TestUserService_CreateUser_DuplicateEmail(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrDuplicateEmail) {
 		t.Fatalf("expected ErrDuplicateEmail, got %v", err)
+	}
+}
+
+// ── UpdateUserStatus tests ─────────────────────────────────────────────────
+// The service delegates all status-change logic (transition validation,
+// atomic status update + session revocation) to the storage layer.
+// These tests verify the thin service logic: self-deactivation guard and
+// error propagation.
+
+type fakeUserStatusStore struct {
+	fakeStore
+	updatedUser     domain.User
+	updateErr       error
+	gotUpdateID     string
+	gotUpdateStatus string
+}
+
+func (f *fakeUserStatusStore) GetUserByID(_ context.Context, _ string) (domain.User, error) {
+	return domain.User{}, domain.ErrNotFound
+}
+
+func (f *fakeUserStatusStore) UpdateUserStatus(_ context.Context, id, status string) (domain.User, error) {
+	f.gotUpdateID = id
+	f.gotUpdateStatus = status
+	return f.updatedUser, f.updateErr
+}
+
+func activeUser() domain.User {
+	return domain.User{ID: "user-1", Email: "u@example.com", Status: "active"}
+}
+
+func suspendedUser() domain.User {
+	return domain.User{ID: "user-1", Email: "u@example.com", Status: "suspended"}
+}
+
+func TestUpdateUserStatus_ActiveToSuspended_DelegatesToStore(t *testing.T) {
+	store := &fakeUserStatusStore{updatedUser: suspendedUser()}
+	svc := service.NewUserService(store)
+
+	got, err := svc.UpdateUserStatus(context.Background(), "", "user-1", "suspended")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Status != "suspended" {
+		t.Fatalf("expected suspended, got %q", got.Status)
+	}
+	if store.gotUpdateID != "user-1" || store.gotUpdateStatus != "suspended" {
+		t.Fatalf("unexpected store call: id=%q status=%q", store.gotUpdateID, store.gotUpdateStatus)
+	}
+}
+
+func TestUpdateUserStatus_SuspendedToActive_DelegatesToStore(t *testing.T) {
+	store := &fakeUserStatusStore{updatedUser: activeUser()}
+	svc := service.NewUserService(store)
+
+	got, err := svc.UpdateUserStatus(context.Background(), "", "user-1", "active")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Status != "active" {
+		t.Fatalf("expected active, got %q", got.Status)
+	}
+}
+
+func TestUpdateUserStatus_StoreError_Propagates(t *testing.T) {
+	store := &fakeUserStatusStore{updateErr: domain.ErrStatusTransitionNotAllowed}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateUserStatus(context.Background(), "", "user-1", "active")
+	if !errors.Is(err, domain.ErrStatusTransitionNotAllowed) {
+		t.Fatalf("expected ErrStatusTransitionNotAllowed, got %v", err)
+	}
+}
+
+func TestUpdateUserStatus_NotFound_Propagates(t *testing.T) {
+	store := &fakeUserStatusStore{updateErr: domain.ErrNotFound}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateUserStatus(context.Background(), "", "no-such-id", "suspended")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestUpdateUserStatus_SelfDeactivation_Rejected(t *testing.T) {
+	store := &fakeUserStatusStore{}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateUserStatus(context.Background(), "user-1", "user-1", "suspended")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	// self-check fires before storage call
+	if store.gotUpdateID != "" {
+		t.Fatal("store must not be called on self-deactivation")
 	}
 }

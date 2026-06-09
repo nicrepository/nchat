@@ -232,13 +232,17 @@ func (s *PGXOIDCStore) ConsumeExchange(ctx context.Context, provider, codeHash s
 	var exchange domain.OIDCConsumedExchange
 	var userJSON []byte
 	err := s.pool.QueryRow(ctx, `
-		UPDATE auth.oidc_exchange_codes
+		UPDATE auth.oidc_exchange_codes ec
 		SET used_at = now()
-		WHERE provider = $1
-		  AND code_hash = $2
-		  AND used_at IS NULL
-		  AND expires_at > now()
-		RETURNING id, provider, access_value_encrypted, refresh_value_encrypted, bearer_scheme, expires_in, user_json`,
+		FROM auth.users u
+		WHERE ec.provider = $1
+		  AND ec.code_hash = $2
+		  AND ec.used_at IS NULL
+		  AND ec.expires_at > now()
+		  AND u.id::text = ec.user_json->>'id'
+		  AND u.status = 'active'
+		  AND u.deleted_at IS NULL
+		RETURNING ec.id, ec.provider, ec.access_value_encrypted, ec.refresh_value_encrypted, ec.bearer_scheme, ec.expires_in, ec.user_json`,
 		provider, codeHash,
 	).Scan(&exchange.ID, &exchange.Provider, &exchange.AccessValueEncrypted, &exchange.RefreshValueEncrypted, &exchange.BearerScheme, &exchange.ExpiresIn, &userJSON)
 	if errors.Is(err, pgx.ErrNoRows) {

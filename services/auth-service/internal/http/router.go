@@ -13,7 +13,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, oidcManagers ...service.OIDCManager) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, oidcManagers ...service.OIDCManager) http.Handler {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
@@ -74,9 +74,13 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserCreator
 	mux.Handle(RouteAdminInvites, httputil.MethodNotAllowed(http.MethodPost,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateInvite(invites)),
 	))
+	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
+		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
+	))
 	loginAttemptsHandler := GetMyLoginAttempts(loginAttempts)
 	if tokens != nil && loginAttempts != nil {
-		loginAttemptsHandler = BearerAuth(tokens)(loginAttemptsHandler)
+		requireActive := RequireActiveSession(sessions)
+		loginAttemptsHandler = BearerAuth(tokens)(requireActive(loginAttemptsHandler))
 	}
 	mux.Handle(RouteAuthMeLoginAttempts, httputil.MethodNotAllowed(http.MethodGet, loginAttemptsHandler))
 

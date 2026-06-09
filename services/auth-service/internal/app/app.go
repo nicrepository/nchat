@@ -30,7 +30,7 @@ func New(cfg config.Config) *App {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
 
-	var users service.UserCreator
+	var users service.UserAdmin
 	var auth service.AuthSessionManager
 	var login service.LoginManager
 	var password service.PasswordRecoveryManager

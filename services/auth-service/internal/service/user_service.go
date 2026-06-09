@@ -9,16 +9,33 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
-// UserCreator is the interface the HTTP handler depends on.
+// UserCreator is the interface for creating new users.
 type UserCreator interface {
 	CreateUser(ctx context.Context, input domain.CreateUserInput) (domain.User, error)
 }
 
-// UserService implements UserCreator.
+// UserStatusManager is the interface for admin status change operations.
+type UserStatusManager interface {
+	// UpdateUserStatus transitions targetID to newStatus.
+	// callerID is the requesting admin's user ID (from JWT); pass "" when identity
+	// is unavailable (e.g. AdminBootstrapGuard). Self-deactivation is rejected only
+	// when callerID is non-empty and matches targetID.
+	// Status update and session revocation (on suspension) are atomic.
+	UpdateUserStatus(ctx context.Context, callerID, targetID, newStatus string) (domain.User, error)
+}
+
+// UserAdmin is the combined interface used by admin HTTP handlers.
+type UserAdmin interface {
+	UserCreator
+	UserStatusManager
+}
+
+// UserService implements UserCreator and UserStatusManager.
 type UserService struct {
 	store storage.UserStore
 }
 
+// NewUserService creates a UserService backed by the given store.
 func NewUserService(store storage.UserStore) *UserService {
 	return &UserService{store: store}
 }
@@ -53,4 +70,16 @@ func (s *UserService) CreateUser(ctx context.Context, input domain.CreateUserInp
 	}
 
 	return s.store.CreateUser(ctx, input, hash)
+}
+
+// UpdateUserStatus transitions targetID to newStatus. Status change and session
+// revocation (on suspension) are performed atomically by the storage layer.
+// Returns ErrForbidden if callerID is non-empty and equals targetID.
+// Returns ErrNotFound if the user does not exist.
+// Returns ErrStatusTransitionNotAllowed for unsupported transitions.
+func (s *UserService) UpdateUserStatus(ctx context.Context, callerID, targetID, newStatus string) (domain.User, error) {
+	if callerID != "" && callerID == targetID {
+		return domain.User{}, domain.ErrForbidden
+	}
+	return s.store.UpdateUserStatus(ctx, targetID, newStatus)
 }
