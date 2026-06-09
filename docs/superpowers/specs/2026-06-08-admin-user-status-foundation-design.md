@@ -226,12 +226,17 @@ The existing invite button pattern (`disabled`, `aria-disabled="true"`, `title="
 
 The following behaviors hold because of existing DB checks plus new explicit revocation:
 
-| Operation                | Suspended user outcome                                                                          |
-| ------------------------ | ----------------------------------------------------------------------------------------------- |
-| `POST /auth/login`       | ❌ `status != 'active'` check in `login_store.go` (initial check + revalidation under row lock) |
-| `POST /auth/refresh`     | ❌ `u.status = 'active'` JOIN in `session_store.go`                                             |
-| `ValidateActiveSession`  | ❌ `u.status = 'active'` in `device_session_store.go`                                           |
-| `OIDCExchange` (consume) | ❌ `u.status = 'active'` JOIN in `ConsumeExchange` SQL                                          |
+| Operation                            | Suspended user outcome                                                                          |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `POST /auth/login`                   | ❌ `status != 'active'` check in `login_store.go` (initial check + revalidation under row lock) |
+| `POST /auth/refresh`                 | ❌ `u.status = 'active'` JOIN in `session_store.go`                                             |
+| `ValidateActiveSession`              | ❌ `u.status = 'active'` in `device_session_store.go`                                           |
+| `OIDCExchange` (consume)             | ❌ `u.status = 'active'` JOIN in `ConsumeExchange` SQL                                          |
+| `GET /auth/me/login-attempts`        | ❌ `RequireActiveSession` → `ValidateActiveSession` rejects revoked/suspended session           |
+| `GET/DELETE /auth/me/sessions*`      | ❌ `RequireActiveSession` (already present before this PR)                                      |
+| `GET/DELETE/PATCH /auth/me/devices*` | ❌ `RequireActiveSession` (already present before this PR)                                      |
+
+**Route audit:** `/auth/me/login-attempts` was the only `BearerAuth`-only user-sensitive route. It now requires `RequireActiveSession`. All other authenticated user routes already used both middlewares or are intentionally public/token-based.
 
 On suspension, `PGXUserStore.UpdateUserStatus` atomically:
 
@@ -314,7 +319,7 @@ On activation, no sessions, refresh tokens, or OIDC exchange codes are restored.
 - Suspended user row has an "Ativar" button that is `disabled`
 - Buttons have `title` containing "Requer permissão de administrador"
 - Row with status other than active/suspended has no action button
-- No `X-NChat-Admin-Token` appears anywhere in the source
+- `X-NChat-Admin-Token` is not sent by runtime frontend code. References in backend guard/tests/comments are expected boundary assertions.
 
 ---
 

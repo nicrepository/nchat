@@ -859,145 +859,145 @@ func TestRecoveryRateLimiterMalformedResetTokenUsesGenericLimiter(t *testing.T) 
 type routerLoginAttemptsStub struct{}
 
 func (routerLoginAttemptsStub) GetMyAttempts(_ context.Context, _ string, _ int, _ string) ([]domain.LoginAttempt, string, error) {
-return nil, "", nil
+	return nil, "", nil
 }
 
 // routerSessionStub satisfies SessionManager for router-level tests.
 // ValidateErr controls what ValidateActiveSession returns.
 type routerSessionStub struct {
-validateErr error
+	validateErr error
 }
 
 func (s routerSessionStub) ValidateActiveSession(_ context.Context, _, _ string) error {
-return s.validateErr
+	return s.validateErr
 }
 func (routerSessionStub) ListSessions(_ context.Context, _ string, _ bool, _ int) ([]domain.SessionInfo, error) {
-return nil, nil
+	return nil, nil
 }
-func (routerSessionStub) RevokeSession(_ context.Context, _, _ string) error        { return nil }
+func (routerSessionStub) RevokeSession(_ context.Context, _, _ string) error { return nil }
 func (routerSessionStub) RevokeAllSessionsExcept(_ context.Context, _, _ string) error {
-return nil
+	return nil
 }
 
 // jwtTestConfig returns a router config with a valid JWT setup for active-session tests.
 // Must use the same HMAC secret as makeRouterTokens so tokens validate correctly.
 func jwtTestConfig() config.Config {
-cfg := testConfig()
-cfg.AuthJWTHMACSecret = strings.Repeat("a", 32)
-cfg.AuthJWTIssuer = "test-issuer"
-cfg.AuthJWTAudience = "test-audience"
-cfg.AuthAccessTokenTTLSeconds = 900
-cfg.AuthRefreshTokenTTLSeconds = 3600
-return cfg
+	cfg := testConfig()
+	cfg.AuthJWTHMACSecret = strings.Repeat("a", 32)
+	cfg.AuthJWTIssuer = "test-issuer"
+	cfg.AuthJWTAudience = "test-audience"
+	cfg.AuthAccessTokenTTLSeconds = 900
+	cfg.AuthRefreshTokenTTLSeconds = 3600
+	return cfg
 }
 
 // makeRouterTokens creates a TokenManager matching jwtTestConfig.
 func makeRouterTokens(t *testing.T) *service.TokenManager {
-t.Helper()
-tokens, err := service.NewTokenManager(service.TokenConfig{
-HMACSecret: strings.Repeat("a", 32),
-Issuer:     "test-issuer",
-Audience:   "test-audience",
-AccessTTL:  15 * time.Minute,
-RefreshTTL: 7 * 24 * time.Hour,
-})
-if err != nil {
-t.Fatalf("create router token manager: %v", err)
-}
-return tokens
+	t.Helper()
+	tokens, err := service.NewTokenManager(service.TokenConfig{
+		HMACSecret: strings.Repeat("a", 32),
+		Issuer:     "test-issuer",
+		Audience:   "test-audience",
+		AccessTTL:  15 * time.Minute,
+		RefreshTTL: 7 * 24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("create router token manager: %v", err)
+	}
+	return tokens
 }
 
 // mustAccessTokenForRouter generates a signed access token for router-level tests.
 func mustAccessTokenForRouter(t *testing.T, userID, sessionID string) string {
-t.Helper()
-tok, _, err := makeRouterTokens(t).GenerateAccessToken(userID, sessionID)
-if err != nil {
-t.Fatalf("generate access token: %v", err)
-}
-return tok
+	t.Helper()
+	tok, _, err := makeRouterTokens(t).GenerateAccessToken(userID, sessionID)
+	if err != nil {
+		t.Fatalf("generate access token: %v", err)
+	}
+	return tok
 }
 
 func TestLoginAttempts_RequiresActiveSession_RevokedSessionReturns401(t *testing.T) {
-// Valid JWT, but session is revoked/suspended → active-session guard must reject.
-accessToken := mustAccessTokenForRouter(t, "user-1", "session-revoked")
-sessions := routerSessionStub{validateErr: domain.ErrInvalidToken}
+	// Valid JWT, but session is revoked/suspended → active-session guard must reject.
+	accessToken := mustAccessTokenForRouter(t, "user-1", "session-revoked")
+	sessions := routerSessionStub{validateErr: domain.ErrInvalidToken}
 
-router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
 
-rec := httptest.NewRecorder()
-req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
-req.Header.Set("Authorization", "Bearer "+accessToken)
-router.ServeHTTP(rec, req)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
 
-if rec.Code != http.StatusUnauthorized {
-t.Fatalf("expected 401 for revoked session, got %d — %s", rec.Code, rec.Body.String())
-}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for revoked session, got %d — %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestLoginAttempts_RequiresActiveSession_MissingBearerReturns401(t *testing.T) {
-// No Authorization header — BearerAuth should reject before session check.
-sessions := routerSessionStub{validateErr: nil}
-router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+	// No Authorization header — BearerAuth should reject before session check.
+	sessions := routerSessionStub{validateErr: nil}
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
 
-rec := httptest.NewRecorder()
-router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil))
 
-if rec.Code != http.StatusUnauthorized {
-t.Fatalf("expected 401 for missing bearer, got %d — %s", rec.Code, rec.Body.String())
-}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing bearer, got %d — %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestLoginAttempts_RequiresActiveSession_ActiveSessionSucceeds(t *testing.T) {
-// Valid JWT + active session → handler must be reached (returns 200).
-// Session ID must be a valid UUID because RequireActiveSession validates UUID format.
-accessToken := mustAccessTokenForRouter(t, "user-2", "00000000-0000-0000-0000-000000000002")
-sessions := routerSessionStub{validateErr: nil}
+	// Valid JWT + active session → handler must be reached (returns 200).
+	// Session ID must be a valid UUID because RequireActiveSession validates UUID format.
+	accessToken := mustAccessTokenForRouter(t, "user-2", "00000000-0000-0000-0000-000000000002")
+	sessions := routerSessionStub{validateErr: nil}
 
-router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
 
-rec := httptest.NewRecorder()
-req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
-req.Header.Set("Authorization", "Bearer "+accessToken)
-router.ServeHTTP(rec, req)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
 
-if rec.Code != http.StatusOK {
-t.Fatalf("expected 200 for valid bearer + active session, got %d — %s", rec.Code, rec.Body.String())
-}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid bearer + active session, got %d — %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestLoginAttempts_RequiresActiveSession_NilSessionValidatorFailsClosed(t *testing.T) {
-// sessions is nil → RequireActiveSession must return 503 (fail-closed).
-accessToken := mustAccessTokenForRouter(t, "user-3", "session-any")
-router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, nil, nil)
+	// sessions is nil → RequireActiveSession must return 503 (fail-closed).
+	accessToken := mustAccessTokenForRouter(t, "user-3", "session-any")
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, nil, nil)
 
-rec := httptest.NewRecorder()
-req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
-req.Header.Set("Authorization", "Bearer "+accessToken)
-router.ServeHTTP(rec, req)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
 
-if rec.Code != http.StatusServiceUnavailable {
-t.Fatalf("expected 503 when session validator nil (fail-closed), got %d — %s", rec.Code, rec.Body.String())
-}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when session validator nil (fail-closed), got %d — %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestLoginAttempts_RequiresActiveSession_NotFoundSessionReturns401(t *testing.T) {
-// Valid JWT but session not found in DB → should be 401, not 200.
-accessToken := mustAccessTokenForRouter(t, "user-4", "session-gone")
-sessions := routerSessionStub{validateErr: domain.ErrNotFound}
+	// Valid JWT but session not found in DB → should be 401, not 200.
+	accessToken := mustAccessTokenForRouter(t, "user-4", "session-gone")
+	sessions := routerSessionStub{validateErr: domain.ErrNotFound}
 
-router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, routerLoginAttemptsStub{}, sessions, nil)
 
-rec := httptest.NewRecorder()
-req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
-req.Header.Set("Authorization", "Bearer "+accessToken)
-router.ServeHTTP(rec, req)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeLoginAttempts, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(rec, req)
 
-if rec.Code != http.StatusUnauthorized {
-t.Fatalf("expected 401 for not-found session, got %d — %s", rec.Code, rec.Body.String())
-}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for not-found session, got %d — %s", rec.Code, rec.Body.String())
+	}
 }
