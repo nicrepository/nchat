@@ -53,78 +53,78 @@ docs/runbooks/task-chat-domain-workspaces-channels-permissions.md
 
 ### `chat.workspaces`
 
-| Column     | Type        | Notes                         |
-|------------|-------------|-------------------------------|
-| id         | UUID        | PK, gen_random_uuid()         |
-| slug       | TEXT        | UNIQUE, lowercase snake_case  |
-| name       | TEXT        | Display name                  |
-| status     | TEXT        | active / disabled             |
-| created_at | TIMESTAMPTZ | DEFAULT now()                 |
-| updated_at | TIMESTAMPTZ | DEFAULT now()                 |
+| Column     | Type        | Notes                        |
+| ---------- | ----------- | ---------------------------- |
+| id         | UUID        | PK, gen_random_uuid()        |
+| slug       | TEXT        | UNIQUE, lowercase snake_case |
+| name       | TEXT        | Display name                 |
+| status     | TEXT        | active / disabled            |
+| created_at | TIMESTAMPTZ | DEFAULT now()                |
+| updated_at | TIMESTAMPTZ | DEFAULT now()                |
 
 Seeded: `id='00000000-0000-0000-0000-000000000001'`, `slug='default'`, `name='NChat'`, `status='active'`.
 
 ### `chat.channel_categories`
 
-| Column       | Type        | Notes                             |
-|--------------|-------------|-----------------------------------|
-| id           | UUID        | PK, gen_random_uuid()             |
-| workspace_id | UUID        | FK → chat.workspaces              |
-| name         | TEXT        | NOT NULL                          |
-| position     | INT         | Sort order, DEFAULT 0             |
-| created_at   | TIMESTAMPTZ |                                   |
-| updated_at   | TIMESTAMPTZ |                                   |
+| Column       | Type        | Notes                 |
+| ------------ | ----------- | --------------------- |
+| id           | UUID        | PK, gen_random_uuid() |
+| workspace_id | UUID        | FK → chat.workspaces  |
+| name         | TEXT        | NOT NULL              |
+| position     | INT         | Sort order, DEFAULT 0 |
+| created_at   | TIMESTAMPTZ |                       |
+| updated_at   | TIMESTAMPTZ |                       |
 
 ### `chat.channels`
 
-| Column       | Type        | Notes                                                |
-|--------------|-------------|------------------------------------------------------|
-| id           | UUID        | PK, gen_random_uuid()                                |
-| workspace_id | UUID        | FK → chat.workspaces                                 |
-| category_id  | UUID        | FK → chat.channel_categories, nullable               |
-| slug         | TEXT        | UNIQUE per workspace; UNIQUE(workspace_id, slug)     |
-| display_name | TEXT        | NOT NULL                                             |
-| type         | TEXT        | public / private; CHECK constraint                   |
-| status       | TEXT        | active / archived; CHECK constraint                  |
-| is_general   | BOOLEAN     | DEFAULT false; partial UNIQUE: one true per workspace|
-| position     | INT         | Sort order, DEFAULT 0                                |
-| created_by   | UUID        | user_id (no FK), nullable for system/seed rows       |
-| created_at   | TIMESTAMPTZ |                                                      |
-| updated_at   | TIMESTAMPTZ |                                                      |
+| Column       | Type        | Notes                                                 |
+| ------------ | ----------- | ----------------------------------------------------- |
+| id           | UUID        | PK, gen_random_uuid()                                 |
+| workspace_id | UUID        | FK → chat.workspaces                                  |
+| category_id  | UUID        | FK → chat.channel_categories, nullable                |
+| slug         | TEXT        | UNIQUE per workspace; UNIQUE(workspace_id, slug)      |
+| display_name | TEXT        | NOT NULL                                              |
+| type         | TEXT        | public / private; CHECK constraint                    |
+| status       | TEXT        | active / archived; CHECK constraint                   |
+| is_general   | BOOLEAN     | DEFAULT false; partial UNIQUE: one true per workspace |
+| position     | INT         | Sort order, DEFAULT 0                                 |
+| created_by   | UUID        | user_id (no FK), nullable for system/seed rows        |
+| created_at   | TIMESTAMPTZ |                                                       |
+| updated_at   | TIMESTAMPTZ |                                                       |
 
 Seeded: `id='00000000-0000-0000-0000-000000000002'`, `workspace_id=default`, `slug='geral'`,
 `display_name='Geral'`, `type='public'`, `is_general=true`.
 
 ### `chat.workspace_members`
 
-| Column       | Type        | Notes                                       |
-|--------------|-------------|---------------------------------------------|
-| workspace_id | UUID        | PK part, FK → chat.workspaces               |
-| user_id      | UUID        | PK part, no FK (auth.users ref, app-layer)  |
-| role         | TEXT        | owner / admin / member / guest              |
-| status       | TEXT        | active / suspended / left                   |
-| joined_at    | TIMESTAMPTZ | NOT NULL DEFAULT now()                      |
+| Column       | Type        | Notes                                      |
+| ------------ | ----------- | ------------------------------------------ |
+| workspace_id | UUID        | PK part, FK → chat.workspaces              |
+| user_id      | UUID        | PK part, no FK (auth.users ref, app-layer) |
+| role         | TEXT        | owner / admin / member / guest             |
+| status       | TEXT        | active / suspended / left                  |
+| joined_at    | TIMESTAMPTZ | NOT NULL DEFAULT now()                     |
 
 ### `chat.channel_members`
 
-| Column     | Type        | Notes                                         |
-|------------|-------------|-----------------------------------------------|
-| channel_id | UUID        | PK part, FK → chat.channels                   |
-| user_id    | UUID        | PK part, no FK (auth.users ref, app-layer)    |
-| role       | TEXT        | member / moderator                            |
-| joined_at  | TIMESTAMPTZ | NOT NULL DEFAULT now()                        |
+| Column     | Type        | Notes                                      |
+| ---------- | ----------- | ------------------------------------------ |
+| channel_id | UUID        | PK part, FK → chat.channels                |
+| user_id    | UUID        | PK part, no FK (auth.users ref, app-layer) |
+| role       | TEXT        | member / moderator                         |
+| joined_at  | TIMESTAMPTZ | NOT NULL DEFAULT now()                     |
 
 ---
 
 ## Permission Rules
 
-| Scenario                                           | Result |
-|----------------------------------------------------|--------|
-| User is active workspace member → read public ch.  | ALLOW  |
-| User is not workspace member → any channel         | DENY   |
-| User is workspace member → read private channel    | DENY (unless channel_member) |
-| User is channel_member → read/write private        | ALLOW  |
-| `is_general=true` channel → all workspace members  | ALLOW (auto-member on join) |
+| Scenario                                          | Result                       |
+| ------------------------------------------------- | ---------------------------- |
+| User is active workspace member → read public ch. | ALLOW                        |
+| User is not workspace member → any channel        | DENY                         |
+| User is workspace member → read private channel   | DENY (unless channel_member) |
+| User is channel_member → read/write private       | ALLOW                        |
+| `is_general=true` channel → all workspace members | ALLOW (auto-member on join)  |
 
 Functions: `CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool`
 and `CanWriteChannel(...)`.
