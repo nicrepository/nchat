@@ -1,0 +1,58 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
+)
+
+var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,49}$`)
+
+// WorkspaceService handles workspace and channel creation use cases.
+type WorkspaceService struct {
+	workspaces storage.WorkspaceStore
+	channels   storage.ChannelStore
+}
+
+func NewWorkspaceService(workspaces storage.WorkspaceStore, channels storage.ChannelStore) *WorkspaceService {
+	return &WorkspaceService{workspaces: workspaces, channels: channels}
+}
+
+// GetDefault returns the default workspace (slug='default').
+func (s *WorkspaceService) GetDefault(ctx context.Context) (domain.Workspace, error) {
+	return s.workspaces.GetDefaultWorkspace(ctx)
+}
+
+// CreateCategory creates a channel category in a workspace.
+func (s *WorkspaceService) CreateCategory(ctx context.Context, workspaceID, name string, position int) (domain.ChannelCategory, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return domain.ChannelCategory{}, fmt.Errorf("%w: name is required", domain.ErrInvalidInput)
+	}
+	return s.channels.CreateCategory(ctx, storage.CreateCategoryInput{
+		WorkspaceID: workspaceID,
+		Name:        name,
+		Position:    position,
+	})
+}
+
+// CreateChannel validates and creates a channel. The slug is normalized to lowercase.
+func (s *WorkspaceService) CreateChannel(ctx context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
+	input.Slug = strings.ToLower(strings.TrimSpace(input.Slug))
+	input.DisplayName = strings.TrimSpace(input.DisplayName)
+
+	if !slugRE.MatchString(input.Slug) {
+		return domain.Channel{}, fmt.Errorf("%w: slug must be lowercase alphanumeric with optional hyphens (max 50 chars)", domain.ErrInvalidInput)
+	}
+	if input.DisplayName == "" {
+		return domain.Channel{}, fmt.Errorf("%w: display_name is required", domain.ErrInvalidInput)
+	}
+	if input.Type != domain.ChannelTypePublic && input.Type != domain.ChannelTypePrivate {
+		return domain.Channel{}, fmt.Errorf("%w: type must be public or private", domain.ErrInvalidInput)
+	}
+	return s.channels.CreateChannel(ctx, input)
+}
