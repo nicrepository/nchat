@@ -51,9 +51,10 @@ func (s *PGXMemberStore) AddWorkspaceMember(ctx context.Context, workspaceID, us
 func (s *PGXMemberStore) GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
 	var m domain.WorkspaceMember
 	err := s.pool.QueryRow(ctx, `
-		SELECT workspace_id, user_id, role, status, joined_at
-		FROM chat.workspace_members
-		WHERE workspace_id = $1 AND user_id = $2`,
+		SELECT wm.workspace_id, wm.user_id, wm.role, wm.status, wm.joined_at
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w ON wm.workspace_id = w.id AND w.status = 'active'
+		WHERE wm.workspace_id = $1 AND wm.user_id = $2`,
 		workspaceID, userID,
 	).Scan(&m.WorkspaceID, &m.UserID, (*string)(&m.Role), (*string)(&m.Status), &m.JoinedAt)
 	if err != nil {
