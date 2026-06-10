@@ -11,12 +11,13 @@ import (
 
 // MemberService handles workspace and channel membership use cases.
 type MemberService struct {
-	members  storage.MemberStore
-	channels storage.ChannelStore
+	members    storage.MemberStore
+	channels   storage.ChannelStore
+	workspaces storage.WorkspaceStore
 }
 
-func NewMemberService(members storage.MemberStore, channels storage.ChannelStore) *MemberService {
-	return &MemberService{members: members, channels: channels}
+func NewMemberService(members storage.MemberStore, channels storage.ChannelStore, workspaces storage.WorkspaceStore) *MemberService {
+	return &MemberService{members: members, channels: channels, workspaces: workspaces}
 }
 
 // JoinWorkspace adds userID to workspaceID with the given role. If the user is
@@ -32,7 +33,34 @@ func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID s
 // JoinChannel adds userID to channelID with the given role. If the user is
 // already a channel member, the existing record is returned without error.
 func (s *MemberService) JoinChannel(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error) {
-	m, err := s.members.AddChannelMember(ctx, channelID, userID, role)
+	if role != domain.ChannelRoleMember {
+		return domain.ChannelMember{}, fmt.Errorf("%w: channel members can only be added with member role", domain.ErrInvalidInput)
+	}
+
+	channel, err := s.channels.GetChannelByID(ctx, channelID)
+	if err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("get channel: %w", err)
+	}
+	workspace, err := s.workspaces.GetWorkspaceByID(ctx, channel.WorkspaceID)
+	if err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("get channel workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+
+	workspaceMember, err := s.members.GetWorkspaceMember(ctx, channel.WorkspaceID, userID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+	if err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("get workspace member: %w", err)
+	}
+	if workspaceMember.Status != domain.MemberStatusActive || workspaceMember.WorkspaceID != channel.WorkspaceID || workspaceMember.UserID != userID {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+
+	m, err := s.members.AddChannelMember(ctx, channelID, userID, domain.ChannelRoleMember)
 	if errors.Is(err, domain.ErrAlreadyMember) {
 		return s.members.GetChannelMember(ctx, channelID, userID)
 	}

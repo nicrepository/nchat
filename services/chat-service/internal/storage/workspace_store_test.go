@@ -85,3 +85,61 @@ func TestPGXWorkspaceStore_GetDefaultWorkspace_DBError(t *testing.T) {
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
+
+func TestPGXWorkspaceStore_GetWorkspaceByID_ReturnsDisabledWorkspace(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(`SELECT id, slug, name, status, created_at, updated_at`).
+		WithArgs("ws-disabled").
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "slug", "name", "status", "created_at", "updated_at",
+		}).AddRow("ws-disabled", "disabled", "Disabled", "disabled", now, now))
+
+	workspace, err := storage.NewPGXWorkspaceStore(mock).GetWorkspaceByID(context.Background(), "ws-disabled")
+	if err != nil {
+		t.Fatalf("GetWorkspaceByID: %v", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusDisabled {
+		t.Fatalf("expected disabled workspace, got %q", workspace.Status)
+	}
+}
+
+func TestPGXWorkspaceStore_GetWorkspaceByID_NotFound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT id, slug, name, status, created_at, updated_at`).
+		WithArgs("missing").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "slug", "name", "status", "created_at", "updated_at"}))
+
+	_, err = storage.NewPGXWorkspaceStore(mock).GetWorkspaceByID(context.Background(), "missing")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestPGXWorkspaceStore_GetWorkspaceByID_DBError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	want := errors.New("database unavailable")
+	mock.ExpectQuery(`SELECT id, slug, name, status, created_at, updated_at`).
+		WithArgs("ws-1").
+		WillReturnError(want)
+
+	_, err = storage.NewPGXWorkspaceStore(mock).GetWorkspaceByID(context.Background(), "ws-1")
+	if !errors.Is(err, want) {
+		t.Fatalf("expected database error, got %v", err)
+	}
+}

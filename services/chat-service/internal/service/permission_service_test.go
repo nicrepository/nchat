@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -14,9 +15,8 @@ func activeMembership(workspaceID, userID string) domain.WorkspaceMember {
 
 func TestPermissionService_ListVisibleChannels_NonMember_Empty(t *testing.T) {
 	ms := newFakeMemberStore()
-	svc := service.NewPermissionService(ms, &fakeChannelStore{channels: []domain.Channel{
-		{ID: "ch-pub", Type: domain.ChannelTypePublic},
-	}})
+	channels := &fakeChannelStore{}
+	svc := service.NewPermissionService(ms, channels)
 	got, err := svc.ListVisibleChannels(context.Background(), "ws-1", "user-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -24,15 +24,19 @@ func TestPermissionService_ListVisibleChannels_NonMember_Empty(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("non-member should see no channels, got %d", len(got))
 	}
+	if channels.listVisibleCalls != 1 || channels.listCalls != 0 {
+		t.Fatalf("expected SQL-visible list only, visible=%d all=%d", channels.listVisibleCalls, channels.listCalls)
+	}
 }
 
 func TestPermissionService_ListVisibleChannels_ActiveMember_SeesPublicAndGeneral(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
-	svc := service.NewPermissionService(ms, &fakeChannelStore{channels: []domain.Channel{
-		{ID: "ch-pub", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic},
-		{ID: "ch-gen", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, IsGeneral: true},
-	}})
+	visible := []domain.Channel{
+		{ID: "ch-pub", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive},
+		{ID: "ch-gen", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true},
+	}
+	svc := service.NewPermissionService(ms, &fakeChannelStore{channels: visible, visibleChannels: visible})
 	got, err := svc.ListVisibleChannels(context.Background(), "ws-1", "user-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -45,9 +49,9 @@ func TestPermissionService_ListVisibleChannels_ActiveMember_SeesPublicAndGeneral
 func TestPermissionService_ListVisibleChannels_ActiveMember_DoesNotSeePrivate(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
-	svc := service.NewPermissionService(ms, &fakeChannelStore{channels: []domain.Channel{
-		{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate},
-	}})
+	svc := service.NewPermissionService(ms, &fakeChannelStore{
+		channels: []domain.Channel{{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}},
+	})
 	got, err := svc.ListVisibleChannels(context.Background(), "ws-1", "user-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -61,9 +65,8 @@ func TestPermissionService_ListVisibleChannels_SeesPrivateIfChannelMember(t *tes
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
 	ms.channelMembers[cmKey("ch-priv", "user-1")] = domain.ChannelMember{ChannelID: "ch-priv", UserID: "user-1"}
-	svc := service.NewPermissionService(ms, &fakeChannelStore{channels: []domain.Channel{
-		{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate},
-	}})
+	private := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+	svc := service.NewPermissionService(ms, &fakeChannelStore{channels: []domain.Channel{private}, visibleChannels: []domain.Channel{private}})
 	got, err := svc.ListVisibleChannels(context.Background(), "ws-1", "user-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -76,7 +79,7 @@ func TestPermissionService_ListVisibleChannels_SeesPrivateIfChannelMember(t *tes
 func TestPermissionService_CanRead_PublicChannel_WorkspaceMember_True(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
-	ch := domain.Channel{ID: "ch-pub", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic}
+	ch := domain.Channel{ID: "ch-pub", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
 	svc := service.NewPermissionService(ms, &fakeChannelStore{channel: ch})
 	ok, err := svc.CanRead(context.Background(), "ws-1", "ch-pub", "user-1")
 	if err != nil {
@@ -102,7 +105,7 @@ func TestPermissionService_CanRead_NonMember_False(t *testing.T) {
 func TestPermissionService_CanRead_PrivateChannel_NoChannelMembership_False(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
-	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate}
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
 	svc := service.NewPermissionService(ms, &fakeChannelStore{channel: ch})
 	ok, err := svc.CanRead(context.Background(), "ws-1", "ch-priv", "user-1")
 	if err != nil {
@@ -117,7 +120,7 @@ func TestPermissionService_CanRead_PrivateChannel_WithChannelMembership_True(t *
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
 	ms.channelMembers[cmKey("ch-priv", "user-1")] = domain.ChannelMember{ChannelID: "ch-priv", UserID: "user-1"}
-	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate}
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
 	svc := service.NewPermissionService(ms, &fakeChannelStore{channel: ch})
 	ok, err := svc.CanRead(context.Background(), "ws-1", "ch-priv", "user-1")
 	if err != nil {
@@ -131,7 +134,7 @@ func TestPermissionService_CanRead_PrivateChannel_WithChannelMembership_True(t *
 func TestPermissionService_CanRead_GeneralChannel_WorkspaceMember_True(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
-	ch := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, IsGeneral: true}
+	ch := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true}
 	svc := service.NewPermissionService(ms, &fakeChannelStore{channel: ch})
 	ok, err := svc.CanRead(context.Background(), "ws-1", "ch-geral", "user-1")
 	if err != nil {
@@ -145,7 +148,7 @@ func TestPermissionService_CanRead_GeneralChannel_WorkspaceMember_True(t *testin
 func TestPermissionService_CanWrite_MatchesCanRead(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
-	ch := domain.Channel{ID: "ch-pub", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic}
+	ch := domain.Channel{ID: "ch-pub", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
 	svc := service.NewPermissionService(ms, &fakeChannelStore{channel: ch})
 	canRead, _ := svc.CanRead(context.Background(), "ws-1", "ch-pub", "user-1")
 	canWrite, err := svc.CanWrite(context.Background(), "ws-1", "ch-pub", "user-1")
@@ -154,5 +157,99 @@ func TestPermissionService_CanWrite_MatchesCanRead(t *testing.T) {
 	}
 	if canWrite != canRead {
 		t.Fatalf("CanWrite must match CanRead: read=%v write=%v", canRead, canWrite)
+	}
+}
+
+func TestPermissionService_ListVisibleChannels_UsesSQLVisibilityFiltering(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
+	ms.channelMembers[cmKey("ch-private", "user-1")] = domain.ChannelMember{ChannelID: "ch-private", UserID: "user-1"}
+	channels := &fakeChannelStore{
+		channels: []domain.Channel{
+			{ID: "ch-public", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive},
+			{ID: "ch-private", WorkspaceID: "ws-2", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive},
+		},
+		visibleChannels: []domain.Channel{
+			{ID: "ch-public", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive},
+		},
+	}
+
+	got, err := service.NewPermissionService(ms, channels).ListVisibleChannels(context.Background(), "ws-1", "user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "ch-public" {
+		t.Fatalf("expected only SQL-visible public channel, got %+v", got)
+	}
+	if channels.listVisibleCalls != 1 || channels.listCalls != 0 {
+		t.Fatalf("expected SQL-visible list only, visible=%d all=%d", channels.listVisibleCalls, channels.listCalls)
+	}
+}
+
+func TestPermissionService_CanRead_CrossWorkspacePublicChannel_Denied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-a", "user-1")] = activeMembership("ws-a", "user-1")
+	channel := domain.Channel{ID: "ch-b", WorkspaceID: "ws-b", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+
+	ok, err := service.NewPermissionService(ms, &fakeChannelStore{channel: channel}).CanRead(context.Background(), "ws-a", "ch-b", "user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatal("workspace A member must not read a public channel from workspace B")
+	}
+}
+
+func TestPermissionService_CanRead_CrossWorkspaceGeneralChannel_Denied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-a", "user-1")] = activeMembership("ws-a", "user-1")
+	channel := domain.Channel{ID: "geral-b", WorkspaceID: "ws-b", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true}
+
+	ok, err := service.NewPermissionService(ms, &fakeChannelStore{channel: channel}).CanRead(context.Background(), "ws-a", "geral-b", "user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatal("workspace A member must not read #geral from workspace B")
+	}
+}
+
+func TestPermissionService_CanRead_StalePrivateMembershipCannotCrossWorkspace(t *testing.T) {
+	for _, status := range []domain.MemberStatus{domain.MemberStatusSuspended, domain.MemberStatusLeft} {
+		t.Run(string(status), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-a", "user-1")] = activeMembership("ws-a", "user-1")
+			ms.workspaceMembers[wmKey("ws-b", "user-1")] = domain.WorkspaceMember{WorkspaceID: "ws-b", UserID: "user-1", Status: status}
+			ms.channelMembers[cmKey("private-b", "user-1")] = domain.ChannelMember{ChannelID: "private-b", UserID: "user-1"}
+			channel := domain.Channel{ID: "private-b", WorkspaceID: "ws-b", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+
+			ok, err := service.NewPermissionService(ms, &fakeChannelStore{channel: channel}).CanRead(context.Background(), "ws-a", "private-b", "user-1")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ok {
+				t.Fatalf("%s workspace-B membership with stale channel membership must be denied", status)
+			}
+		})
+	}
+}
+
+func TestPermissionService_CanRead_ChannelMembershipDBError_Propagates(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
+	ms.getCMErr = errors.New("database unavailable")
+	channel := domain.Channel{ID: "private", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+
+	_, err := service.NewPermissionService(ms, &fakeChannelStore{channel: channel}).CanRead(context.Background(), "ws-1", "private", "user-1")
+	if err == nil {
+		t.Fatal("expected channel membership database error")
+	}
+}
+
+func TestPermissionService_ListVisibleChannels_StorageError_Propagates(t *testing.T) {
+	want := errors.New("database unavailable")
+	_, err := service.NewPermissionService(newFakeMemberStore(), &fakeChannelStore{listVisibleErr: want}).ListVisibleChannels(context.Background(), "ws-1", "user-1")
+	if !errors.Is(err, want) {
+		t.Fatalf("expected storage error, got %v", err)
 	}
 }

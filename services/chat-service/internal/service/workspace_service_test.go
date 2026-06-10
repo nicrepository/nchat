@@ -10,6 +10,10 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
+func activeWorkspaceStore(id string) *fakeWorkspaceStore {
+	return &fakeWorkspaceStore{workspace: domain.Workspace{ID: id, Status: domain.WorkspaceStatusActive}}
+}
+
 func TestWorkspaceService_GetDefault_Success(t *testing.T) {
 	ws := domain.Workspace{ID: "ws-1", Slug: "default", Status: domain.WorkspaceStatusActive}
 	svc := service.NewWorkspaceService(&fakeWorkspaceStore{workspace: ws}, &fakeChannelStore{})
@@ -40,7 +44,7 @@ func TestWorkspaceService_CreateCategory_EmptyName_Error(t *testing.T) {
 
 func TestWorkspaceService_CreateCategory_Success(t *testing.T) {
 	cat := domain.ChannelCategory{ID: "cat-1", WorkspaceID: "ws-1", Name: "General"}
-	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createdCategory: cat})
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), &fakeChannelStore{createdCategory: cat})
 	got, err := svc.CreateCategory(context.Background(), "ws-1", "General", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -81,7 +85,7 @@ func TestWorkspaceService_CreateChannel_InvalidType_Error(t *testing.T) {
 }
 
 func TestWorkspaceService_CreateChannel_DuplicateSlug_Propagated(t *testing.T) {
-	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createChanErr: domain.ErrDuplicateSlug})
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), &fakeChannelStore{createChanErr: domain.ErrDuplicateSlug})
 	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
 		WorkspaceID: "ws-1", Slug: "geral", DisplayName: "Geral", Type: domain.ChannelTypePublic,
 	})
@@ -92,7 +96,7 @@ func TestWorkspaceService_CreateChannel_DuplicateSlug_Propagated(t *testing.T) {
 
 func TestWorkspaceService_CreateChannel_NormalizesSlug(t *testing.T) {
 	ch := domain.Channel{ID: "ch-1", Slug: "general"}
-	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createdChannel: ch})
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), &fakeChannelStore{createdChannel: ch})
 	got, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
 		WorkspaceID: "ws-1", Slug: "  GENERAL  ", DisplayName: "General", Type: domain.ChannelTypePublic,
 	})
@@ -136,7 +140,7 @@ func TestWorkspaceService_CreateChannel_Backslash_Error(t *testing.T) {
 
 func TestWorkspaceService_CreateChannel_SingleChar_Valid(t *testing.T) {
 	ch := domain.Channel{ID: "ch-1", Slug: "a"}
-	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createdChannel: ch})
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), &fakeChannelStore{createdChannel: ch})
 	got, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
 		WorkspaceID: "ws-1", Slug: "a", DisplayName: "A", Type: domain.ChannelTypePublic,
 	})
@@ -150,7 +154,7 @@ func TestWorkspaceService_CreateChannel_SingleChar_Valid(t *testing.T) {
 
 func TestWorkspaceService_CreateChannel_InternalHyphen_Valid(t *testing.T) {
 	ch := domain.Channel{ID: "ch-1", Slug: "a-b"}
-	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createdChannel: ch})
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), &fakeChannelStore{createdChannel: ch})
 	got, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
 		WorkspaceID: "ws-1", Slug: "a-b", DisplayName: "A B", Type: domain.ChannelTypePublic,
 	})
@@ -163,11 +167,47 @@ func TestWorkspaceService_CreateChannel_InternalHyphen_Valid(t *testing.T) {
 }
 
 func TestWorkspaceService_CreateChannel_GeneralChannelExists_Error(t *testing.T) {
-	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createChanErr: domain.ErrGeneralChannelExists})
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), &fakeChannelStore{createChanErr: domain.ErrGeneralChannelExists})
 	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
 		WorkspaceID: "ws-1", Slug: "geral2", DisplayName: "Geral 2", Type: domain.ChannelTypePublic,
 	})
 	if !errors.Is(err, domain.ErrGeneralChannelExists) {
 		t.Fatalf("expected ErrGeneralChannelExists, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateCategory_DisabledWorkspace_Denied(t *testing.T) {
+	workspace := &fakeWorkspaceStore{workspace: domain.Workspace{ID: "ws-disabled", Status: domain.WorkspaceStatusDisabled}}
+	_, err := service.NewWorkspaceService(workspace, &fakeChannelStore{}).CreateCategory(context.Background(), "ws-disabled", "General", 0)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_DisabledWorkspace_Denied(t *testing.T) {
+	workspace := &fakeWorkspaceStore{workspace: domain.Workspace{ID: "ws-disabled", Status: domain.WorkspaceStatusDisabled}}
+	_, err := service.NewWorkspaceService(workspace, &fakeChannelStore{}).CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-disabled", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_WorkspaceLookupError_Propagates(t *testing.T) {
+	want := errors.New("database unavailable")
+	workspace := &fakeWorkspaceStore{getByIDErr: want}
+	_, err := service.NewWorkspaceService(workspace, &fakeChannelStore{}).CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("expected workspace lookup error, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateCategory_WorkspaceNotFound_Propagates(t *testing.T) {
+	_, err := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{}).CreateCategory(context.Background(), "missing", "General", 0)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

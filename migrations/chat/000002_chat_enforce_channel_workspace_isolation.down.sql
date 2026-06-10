@@ -1,6 +1,10 @@
 -- 000002_chat_enforce_channel_workspace_isolation.down.sql
 BEGIN;
 
+DROP TRIGGER IF EXISTS channels_require_general_channel ON chat.channels;
+DROP TRIGGER IF EXISTS workspaces_require_general_channel ON chat.workspaces;
+DROP FUNCTION IF EXISTS chat.enforce_workspace_general_channel();
+
 ALTER TABLE chat.channels
     DROP CONSTRAINT IF EXISTS channels_general_must_be_public_active;
 

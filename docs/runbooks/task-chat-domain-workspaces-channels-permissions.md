@@ -11,6 +11,13 @@
 - Domain structs, type constants, and permission helpers in `chat-service`.
 - Storage layer (pgx) with interfaces: `WorkspaceStore`, `ChannelStore`, `MemberStore`.
 - Service layer: `WorkspaceService`, `MemberService`, `PermissionService`.
+- Workspace-bound channel authorization prevents cross-workspace ID access.
+- User-visible channel lists enforce active workspace/member and private-channel
+  visibility in SQL.
+- Disabled workspaces deny channel list/read/write, category/channel creation,
+  and channel membership changes.
+- Database constraints enforce workspace/category consistency and exactly one
+  active public general channel per committed workspace.
 
 ## What this does NOT implement (out of scope)
 
@@ -48,10 +55,14 @@ Expected rows:
 - `workspaces`: 1 row with `slug='default'`
 - `channels`: 1 row with `slug='geral'`, `is_general=true`
 
+The seed insert is idempotent. The schema rejects a second general channel,
+private or archived general channels, cross-workspace category references, and
+workspace commits that do not include an active public general channel.
+
 ## Running tests
 
 ```bash
-cd services/chat-service && go test -count=1 ./...
+cd services/chat-service && go test -count=1 ./... -cover
 ```
 
 ## Validation checklist

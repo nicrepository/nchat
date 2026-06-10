@@ -107,13 +107,19 @@ type ChannelMember struct {
 // Public channels and #geral require active workspace membership only.
 // Private channels additionally require channel membership.
 func CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
-	if wm == nil || wm.Status != MemberStatusActive {
+	if wm == nil || wm.Status != MemberStatusActive || wm.WorkspaceID != ch.WorkspaceID {
 		return false
 	}
-	if ch.IsGeneral || ch.Type == ChannelTypePublic {
+	if ch.Status != ChannelStatusActive {
+		return false
+	}
+	if ch.IsGeneral {
+		return ch.Type == ChannelTypePublic
+	}
+	if ch.Type == ChannelTypePublic {
 		return true
 	}
-	return cm != nil
+	return ch.Type == ChannelTypePrivate && cm != nil && cm.ChannelID == ch.ID && cm.UserID == wm.UserID
 }
 
 // CanWriteChannel reports whether a user may post to ch.

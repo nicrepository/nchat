@@ -10,8 +10,11 @@ import (
 
 // fakeWorkspaceStore implements storage.WorkspaceStore.
 type fakeWorkspaceStore struct {
-	workspace domain.Workspace
-	getErr    error
+	workspace    domain.Workspace
+	workspaces   map[string]domain.Workspace
+	getErr       error
+	getByIDErr   error
+	getByIDCalls int
 }
 
 func (f *fakeWorkspaceStore) GetDefaultWorkspace(_ context.Context) (domain.Workspace, error) {
@@ -20,17 +23,39 @@ func (f *fakeWorkspaceStore) GetDefaultWorkspace(_ context.Context) (domain.Work
 func (f *fakeWorkspaceStore) GetWorkspaceBySlug(_ context.Context, _ string) (domain.Workspace, error) {
 	return f.workspace, f.getErr
 }
+func (f *fakeWorkspaceStore) GetWorkspaceByID(_ context.Context, id string) (domain.Workspace, error) {
+	f.getByIDCalls++
+	if f.getByIDErr != nil {
+		return domain.Workspace{}, f.getByIDErr
+	}
+	if f.workspaces != nil {
+		workspace, ok := f.workspaces[id]
+		if !ok {
+			return domain.Workspace{}, domain.ErrNotFound
+		}
+		return workspace, nil
+	}
+	if f.workspace.ID == id {
+		return f.workspace, nil
+	}
+	return domain.Workspace{}, domain.ErrNotFound
+}
 
 // fakeChannelStore implements storage.ChannelStore.
 type fakeChannelStore struct {
-	createdCategory domain.ChannelCategory
-	createCatErr    error
-	createdChannel  domain.Channel
-	createChanErr   error
-	channel         domain.Channel
-	getByIDErr      error
-	channels        []domain.Channel
-	listErr         error
+	createdCategory   domain.ChannelCategory
+	createCatErr      error
+	createdChannel    domain.Channel
+	createChanErr     error
+	channel           domain.Channel
+	getByIDErr        error
+	getInWorkspaceErr error
+	channels          []domain.Channel
+	listErr           error
+	visibleChannels   []domain.Channel
+	listVisibleErr    error
+	listCalls         int
+	listVisibleCalls  int
 }
 
 func (f *fakeChannelStore) CreateCategory(_ context.Context, _ storage.CreateCategoryInput) (domain.ChannelCategory, error) {
@@ -42,8 +67,25 @@ func (f *fakeChannelStore) CreateChannel(_ context.Context, _ storage.CreateChan
 func (f *fakeChannelStore) GetChannelByID(_ context.Context, _ string) (domain.Channel, error) {
 	return f.channel, f.getByIDErr
 }
+func (f *fakeChannelStore) GetChannelByIDInWorkspace(_ context.Context, workspaceID, id string) (domain.Channel, error) {
+	if f.getInWorkspaceErr != nil {
+		return domain.Channel{}, f.getInWorkspaceErr
+	}
+	if f.getByIDErr != nil {
+		return domain.Channel{}, f.getByIDErr
+	}
+	if f.channel.ID != id || f.channel.WorkspaceID != workspaceID || f.channel.Status != domain.ChannelStatusActive {
+		return domain.Channel{}, domain.ErrNotFound
+	}
+	return f.channel, nil
+}
 func (f *fakeChannelStore) ListChannelsByWorkspace(_ context.Context, _ string) ([]domain.Channel, error) {
+	f.listCalls++
 	return f.channels, f.listErr
+}
+func (f *fakeChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ string) ([]domain.Channel, error) {
+	f.listVisibleCalls++
+	return f.visibleChannels, f.listVisibleErr
 }
 
 // fakeMemberStore implements storage.MemberStore.
@@ -52,6 +94,8 @@ type fakeMemberStore struct {
 	channelMembers   map[string]domain.ChannelMember
 	addWMErr         error
 	addCMErr         error
+	getWMErr         error
+	getCMErr         error
 }
 
 func newFakeMemberStore() *fakeMemberStore {
@@ -81,6 +125,9 @@ func (f *fakeMemberStore) AddWorkspaceMember(_ context.Context, workspaceID, use
 }
 
 func (f *fakeMemberStore) GetWorkspaceMember(_ context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	if f.getWMErr != nil {
+		return domain.WorkspaceMember{}, f.getWMErr
+	}
 	m, ok := f.workspaceMembers[wmKey(workspaceID, userID)]
 	if !ok {
 		return domain.WorkspaceMember{}, domain.ErrNotFound
@@ -102,6 +149,9 @@ func (f *fakeMemberStore) AddChannelMember(_ context.Context, channelID, userID 
 }
 
 func (f *fakeMemberStore) GetChannelMember(_ context.Context, channelID, userID string) (domain.ChannelMember, error) {
+	if f.getCMErr != nil {
+		return domain.ChannelMember{}, f.getCMErr
+	}
 	m, ok := f.channelMembers[cmKey(channelID, userID)]
 	if !ok {
 		return domain.ChannelMember{}, domain.ErrNotFound

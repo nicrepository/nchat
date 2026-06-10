@@ -36,6 +36,9 @@ func (s *WorkspaceService) CreateCategory(ctx context.Context, workspaceID, name
 	if name == "" {
 		return domain.ChannelCategory{}, fmt.Errorf("%w: name is required", domain.ErrInvalidInput)
 	}
+	if err := s.requireActiveWorkspace(ctx, workspaceID); err != nil {
+		return domain.ChannelCategory{}, err
+	}
 	return s.channels.CreateCategory(ctx, storage.CreateCategoryInput{
 		WorkspaceID: workspaceID,
 		Name:        name,
@@ -57,5 +60,19 @@ func (s *WorkspaceService) CreateChannel(ctx context.Context, input storage.Crea
 	if input.Type != domain.ChannelTypePublic && input.Type != domain.ChannelTypePrivate {
 		return domain.Channel{}, fmt.Errorf("%w: type must be public or private", domain.ErrInvalidInput)
 	}
+	if err := s.requireActiveWorkspace(ctx, input.WorkspaceID); err != nil {
+		return domain.Channel{}, err
+	}
 	return s.channels.CreateChannel(ctx, input)
+}
+
+func (s *WorkspaceService) requireActiveWorkspace(ctx context.Context, workspaceID string) error {
+	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("get workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.ErrForbidden
+	}
+	return nil
 }

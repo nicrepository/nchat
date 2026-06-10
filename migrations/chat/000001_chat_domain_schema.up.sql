@@ -6,7 +6,7 @@
 --   - chat schema keeps tables separate from auth and public namespaces.
 --   - user_id columns reference auth.users.id by convention (no cross-schema FK).
 --   - Stable UUIDs for seed rows; ON CONFLICT (id) DO NOTHING makes inserts idempotent.
---   - Partial UNIQUE index enforces exactly one is_general channel per workspace.
+--   - Partial UNIQUE index enforces at most one is_general channel per workspace.
 
 BEGIN;
 

@@ -100,10 +100,12 @@ func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannel
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgCodeUniqueViolation {
-			if pgErr.ConstraintName == "idx_channels_one_general_per_workspace" {
+			switch pgErr.ConstraintName {
+			case "idx_channels_one_general_per_workspace":
 				return domain.Channel{}, domain.ErrGeneralChannelExists
+			case "channels_workspace_slug_unique":
+				return domain.Channel{}, domain.ErrDuplicateSlug
 			}
-			return domain.Channel{}, domain.ErrDuplicateSlug
 		}
 		return domain.Channel{}, fmt.Errorf("create channel: %w", err)
 	}
