@@ -1,0 +1,123 @@
+package domain
+
+import "time"
+
+type WorkspaceStatus string
+
+const (
+	WorkspaceStatusActive   WorkspaceStatus = "active"
+	WorkspaceStatusDisabled WorkspaceStatus = "disabled"
+)
+
+type ChannelType string
+
+const (
+	ChannelTypePublic  ChannelType = "public"
+	ChannelTypePrivate ChannelType = "private"
+)
+
+type ChannelStatus string
+
+const (
+	ChannelStatusActive   ChannelStatus = "active"
+	ChannelStatusArchived ChannelStatus = "archived"
+)
+
+type WorkspaceRole string
+
+const (
+	WorkspaceRoleOwner  WorkspaceRole = "owner"
+	WorkspaceRoleAdmin  WorkspaceRole = "admin"
+	WorkspaceRoleMember WorkspaceRole = "member"
+	WorkspaceRoleGuest  WorkspaceRole = "guest"
+)
+
+type MemberStatus string
+
+const (
+	MemberStatusActive    MemberStatus = "active"
+	MemberStatusSuspended MemberStatus = "suspended"
+	MemberStatusLeft      MemberStatus = "left"
+)
+
+type ChannelRole string
+
+const (
+	ChannelRoleMember    ChannelRole = "member"
+	ChannelRoleModerator ChannelRole = "moderator"
+)
+
+// Workspace represents a single team/organisation space.
+type Workspace struct {
+	ID        string
+	Slug      string
+	Name      string
+	Status    WorkspaceStatus
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ChannelCategory is an organisational folder for channels within a workspace.
+type ChannelCategory struct {
+	ID          string
+	WorkspaceID string
+	Name        string
+	Position    int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// Channel represents a public or private communication channel.
+// CategoryID and CreatedBy are empty string when NULL in the database.
+type Channel struct {
+	ID          string
+	WorkspaceID string
+	CategoryID  string
+	Slug        string
+	DisplayName string
+	Type        ChannelType
+	Status      ChannelStatus
+	IsGeneral   bool
+	Position    int
+	CreatedBy   string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// WorkspaceMember represents a user's membership in a workspace.
+type WorkspaceMember struct {
+	WorkspaceID string
+	UserID      string
+	Role        WorkspaceRole
+	Status      MemberStatus
+	JoinedAt    time.Time
+}
+
+// ChannelMember represents a user's membership in a specific channel.
+type ChannelMember struct {
+	ChannelID string
+	UserID    string
+	Role      ChannelRole
+	JoinedAt  time.Time
+}
+
+// CanReadChannel reports whether a user may read ch.
+// wm is the workspace membership (nil = non-member).
+// cm is the channel membership (nil = not a channel member).
+// Public channels and #geral require active workspace membership only.
+// Private channels additionally require channel membership.
+func CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
+	if wm == nil || wm.Status != MemberStatusActive {
+		return false
+	}
+	if ch.IsGeneral || ch.Type == ChannelTypePublic {
+		return true
+	}
+	return cm != nil
+}
+
+// CanWriteChannel reports whether a user may post to ch.
+// For MVP, write access follows the same rules as read access.
+func CanWriteChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
+	return CanReadChannel(wm, cm, ch)
+}
