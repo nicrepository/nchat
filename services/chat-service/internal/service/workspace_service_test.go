@@ -103,3 +103,71 @@ func TestWorkspaceService_CreateChannel_NormalizesSlug(t *testing.T) {
 		t.Fatalf("expected ch-1, got %q", got.ID)
 	}
 }
+
+func TestWorkspaceService_CreateChannel_TrailingHyphen_Error(t *testing.T) {
+	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{})
+	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "abc-", DisplayName: "Test", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("trailing hyphen slug should be ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_LeadingHyphen_Error(t *testing.T) {
+	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{})
+	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "-abc", DisplayName: "Test", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("leading hyphen slug should be ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_Backslash_Error(t *testing.T) {
+	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{})
+	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: `a\b`, DisplayName: "Test", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("backslash in slug should be ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_SingleChar_Valid(t *testing.T) {
+	ch := domain.Channel{ID: "ch-1", Slug: "a"}
+	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createdChannel: ch})
+	got, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "a", DisplayName: "A", Type: domain.ChannelTypePublic,
+	})
+	if err != nil {
+		t.Fatalf("single-char slug should be valid, got %v", err)
+	}
+	if got.ID != "ch-1" {
+		t.Fatalf("expected ch-1, got %q", got.ID)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_InternalHyphen_Valid(t *testing.T) {
+	ch := domain.Channel{ID: "ch-1", Slug: "a-b"}
+	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createdChannel: ch})
+	got, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "a-b", DisplayName: "A B", Type: domain.ChannelTypePublic,
+	})
+	if err != nil {
+		t.Fatalf("internal hyphen slug should be valid, got %v", err)
+	}
+	if got.ID != "ch-1" {
+		t.Fatalf("expected ch-1, got %q", got.ID)
+	}
+}
+
+func TestWorkspaceService_CreateChannel_GeneralChannelExists_Error(t *testing.T) {
+	svc := service.NewWorkspaceService(&fakeWorkspaceStore{}, &fakeChannelStore{createChanErr: domain.ErrGeneralChannelExists})
+	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "geral2", DisplayName: "Geral 2", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrGeneralChannelExists) {
+		t.Fatalf("expected ErrGeneralChannelExists, got %v", err)
+	}
+}

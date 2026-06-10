@@ -10,7 +10,10 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,49}$`)
+// slugRE accepts lowercase alphanumeric slugs with internal hyphens (no leading/trailing hyphens).
+// Single-char slugs are valid. Max 63 chars.
+// Rejects backslash, spaces, uppercase, leading/trailing hyphens.
+var slugRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // WorkspaceService handles workspace and channel creation use cases.
 type WorkspaceService struct {
@@ -46,7 +49,7 @@ func (s *WorkspaceService) CreateChannel(ctx context.Context, input storage.Crea
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 
 	if !slugRE.MatchString(input.Slug) {
-		return domain.Channel{}, fmt.Errorf("%w: slug must be lowercase alphanumeric with optional hyphens (max 50 chars)", domain.ErrInvalidInput)
+		return domain.Channel{}, fmt.Errorf("%w: slug must be lowercase alphanumeric with optional internal hyphens, no leading/trailing hyphens, max 63 chars", domain.ErrInvalidInput)
 	}
 	if input.DisplayName == "" {
 		return domain.Channel{}, fmt.Errorf("%w: display_name is required", domain.ErrInvalidInput)
