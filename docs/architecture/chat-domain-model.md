@@ -115,6 +115,54 @@ an active/public `CHECK`, and deferred constraint triggers. This permits creatin
 a workspace and `#geral` in one transaction while rejecting a commit that leaves
 an existing workspace without an active public general channel.
 
+## Channel CRUD foundation
+
+`ChannelService` implements the backend service/storage foundation for public
+and private channel CRUD. This PR intentionally does **not** expose HTTP CRUD
+handlers because `chat-service` currently has no authenticated user context or
+auth middleware. The REST API is deferred until the service can bind every
+request to a verified caller without inventing gateway or auth-service behavior.
+
+Implemented service/storage operations:
+
+- create public/private channels in an active workspace;
+- list channels visible to an active workspace member;
+- read one active channel by `(workspace_id, channel_id)` or
+  `(workspace_id, slug)` with SQL visibility checks;
+- update mutable fields on non-general channels: slug, display name,
+  category, position, and public/private type;
+- archive non-general channels by setting `status='archived'`.
+
+CRUD management uses the minimal role rule for this MVP: active workspace
+`owner` and `admin` may create, update, or archive channels. `member`, `guest`,
+suspended, left, missing, and disabled-workspace callers are denied. Full RBAC
+(RF-74) remains out of scope.
+
+Public/private visibility rules are enforced by SQL in the pgx channel store:
+the query joins `chat.workspaces`, active `chat.workspace_members`, and
+`chat.channel_members` for private channels. Public and `#geral` channels are
+visible to active workspace members; private channels are visible only to active
+workspace members who also have a `channel_members` row for that channel. Stale
+private membership alone grants nothing when the workspace is disabled or the
+workspace membership is inactive.
+
+Create/update inputs do not accept `is_general`, `status`, or `created_by` from
+clients/callers. The service sets `created_by` from the caller on create,
+always creates CRUD channels with `is_general=false`, and leaves archive as the
+only status mutation. Private-channel creation inserts the creator into
+`channel_members` in the same storage transaction. Public-channel creation does
+not fan out `channel_members` to every workspace member. Changing a public
+channel to private inserts the manager into `channel_members` in the same update
+transaction so the caller does not lose access.
+
+Categories remain workspace-bound: `category_id` is accepted only when the
+category belongs to the same workspace, and the composite FK remains the
+database backstop. Duplicate slugs map to `ErrDuplicateSlug`.
+
+`#geral` is immutable through CRUD. The service rejects attempts to create a
+regular channel with slug `geral`, rejects any update/archive of the general
+channel, and never exposes `is_general` as caller-controlled input.
+
 Full multi-workspace workflows (RF-68..RF-72) and the full RBAC matrix (RF-74)
 remain out of scope for this MVP foundation.
 

@@ -43,26 +43,61 @@ func (f *fakeWorkspaceStore) GetWorkspaceByID(_ context.Context, id string) (dom
 
 // fakeChannelStore implements storage.ChannelStore.
 type fakeChannelStore struct {
-	createdCategory   domain.ChannelCategory
-	createCatErr      error
-	createdChannel    domain.Channel
-	createChanErr     error
-	channel           domain.Channel
-	getByIDErr        error
-	getInWorkspaceErr error
-	channels          []domain.Channel
-	listErr           error
-	visibleChannels   []domain.Channel
-	listVisibleErr    error
-	listCalls         int
-	listVisibleCalls  int
+	createdCategory        domain.ChannelCategory
+	createCatErr           error
+	category               domain.ChannelCategory
+	getCategoryErr         error
+	createdChannel         domain.Channel
+	createChanErr          error
+	channel                domain.Channel
+	visibleChannel         domain.Channel
+	updatedChannel         domain.Channel
+	archivedChannel        domain.Channel
+	getByIDErr             error
+	getInWorkspaceErr      error
+	getVisibleErr          error
+	getVisibleBySlugErr    error
+	updateErr              error
+	archiveErr             error
+	channels               []domain.Channel
+	listErr                error
+	visibleChannels        []domain.Channel
+	listVisibleErr         error
+	lastCreateInput        storage.CreateChannelInput
+	lastCreateMemberUserID string
+	lastUpdateInput        storage.UpdateChannelInput
+	listCalls              int
+	listVisibleCalls       int
+	getVisibleByIDCalls    int
+	getVisibleBySlugCalls  int
+	createWithMemberCalls  int
+	archiveCalls           int
 }
 
 func (f *fakeChannelStore) CreateCategory(_ context.Context, _ storage.CreateCategoryInput) (domain.ChannelCategory, error) {
 	return f.createdCategory, f.createCatErr
 }
-func (f *fakeChannelStore) CreateChannel(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
+func (f *fakeChannelStore) CreateChannel(_ context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
+	f.lastCreateInput = input
 	return f.createdChannel, f.createChanErr
+}
+func (f *fakeChannelStore) CreateChannelWithMember(_ context.Context, input storage.CreateChannelInput, userID string, _ domain.ChannelRole) (domain.Channel, error) {
+	f.createWithMemberCalls++
+	f.lastCreateInput = input
+	f.lastCreateMemberUserID = userID
+	return f.createdChannel, f.createChanErr
+}
+func (f *fakeChannelStore) GetCategoryByIDInWorkspace(_ context.Context, workspaceID, id string) (domain.ChannelCategory, error) {
+	if f.getCategoryErr != nil {
+		return domain.ChannelCategory{}, f.getCategoryErr
+	}
+	if f.category.ID != "" {
+		if f.category.ID != id || f.category.WorkspaceID != workspaceID {
+			return domain.ChannelCategory{}, domain.ErrNotFound
+		}
+		return f.category, nil
+	}
+	return domain.ChannelCategory{ID: id, WorkspaceID: workspaceID}, nil
 }
 func (f *fakeChannelStore) GetChannelByID(_ context.Context, _ string) (domain.Channel, error) {
 	return f.channel, f.getByIDErr
@@ -79,6 +114,37 @@ func (f *fakeChannelStore) GetChannelByIDInWorkspace(_ context.Context, workspac
 	}
 	return f.channel, nil
 }
+func (f *fakeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID, id, _ string) (domain.Channel, error) {
+	f.getVisibleByIDCalls++
+	if f.getVisibleErr != nil {
+		return domain.Channel{}, f.getVisibleErr
+	}
+	ch := f.visibleChannel
+	if ch.ID == "" {
+		ch = f.channel
+	}
+	if ch.ID != id || ch.WorkspaceID != workspaceID || ch.Status != domain.ChannelStatusActive {
+		return domain.Channel{}, domain.ErrNotFound
+	}
+	return ch, nil
+}
+func (f *fakeChannelStore) GetVisibleChannelBySlug(_ context.Context, workspaceID, slug, _ string) (domain.Channel, error) {
+	f.getVisibleBySlugCalls++
+	if f.getVisibleBySlugErr != nil {
+		return domain.Channel{}, f.getVisibleBySlugErr
+	}
+	if f.getVisibleErr != nil {
+		return domain.Channel{}, f.getVisibleErr
+	}
+	ch := f.visibleChannel
+	if ch.ID == "" {
+		ch = f.channel
+	}
+	if ch.Slug != slug || ch.WorkspaceID != workspaceID || ch.Status != domain.ChannelStatusActive {
+		return domain.Channel{}, domain.ErrNotFound
+	}
+	return ch, nil
+}
 func (f *fakeChannelStore) ListChannelsByWorkspace(_ context.Context, _ string) ([]domain.Channel, error) {
 	f.listCalls++
 	return f.channels, f.listErr
@@ -86,6 +152,35 @@ func (f *fakeChannelStore) ListChannelsByWorkspace(_ context.Context, _ string) 
 func (f *fakeChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ string) ([]domain.Channel, error) {
 	f.listVisibleCalls++
 	return f.visibleChannels, f.listVisibleErr
+}
+func (f *fakeChannelStore) UpdateChannel(_ context.Context, input storage.UpdateChannelInput) (domain.Channel, error) {
+	f.lastUpdateInput = input
+	if f.updateErr != nil {
+		return domain.Channel{}, f.updateErr
+	}
+	if f.updatedChannel.ID != "" {
+		return f.updatedChannel, nil
+	}
+	return domain.Channel{
+		ID:          input.ChannelID,
+		WorkspaceID: input.WorkspaceID,
+		CategoryID:  input.CategoryID,
+		Slug:        input.Slug,
+		DisplayName: input.DisplayName,
+		Type:        input.Type,
+		Status:      domain.ChannelStatusActive,
+		Position:    input.Position,
+	}, nil
+}
+func (f *fakeChannelStore) ArchiveChannel(_ context.Context, workspaceID, channelID string) (domain.Channel, error) {
+	f.archiveCalls++
+	if f.archiveErr != nil {
+		return domain.Channel{}, f.archiveErr
+	}
+	if f.archivedChannel.ID != "" {
+		return f.archivedChannel, nil
+	}
+	return domain.Channel{ID: channelID, WorkspaceID: workspaceID, Status: domain.ChannelStatusArchived}, nil
 }
 
 // fakeMemberStore implements storage.MemberStore.

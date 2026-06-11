@@ -446,3 +446,461 @@ func TestPGXChannelStore_ListChannelsByWorkspace_DBError(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 }
+
+func TestPGXChannelStore_GetCategoryByIDInWorkspace_Success(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(`SELECT id, workspace_id, name, position`).
+		WithArgs("ws-1", "cat-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "workspace_id", "name", "position", "created_at", "updated_at"}).
+			AddRow("cat-1", "ws-1", "Team", 2, now, now))
+
+	store := storage.NewPGXChannelStore(mock)
+	category, err := store.GetCategoryByIDInWorkspace(context.Background(), "ws-1", "cat-1")
+	if err != nil {
+		t.Fatalf("GetCategoryByIDInWorkspace: %v", err)
+	}
+	if category.ID != "cat-1" || category.WorkspaceID != "ws-1" {
+		t.Fatalf("unexpected category: %+v", category)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_GetCategoryByIDInWorkspace_NotFound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT id, workspace_id, name, position`).
+		WithArgs("ws-1", "cat-other").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "workspace_id", "name", "position", "created_at", "updated_at"}))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.GetCategoryByIDInWorkspace(context.Background(), "ws-1", "cat-other")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestPGXChannelStore_GetCategoryByIDInWorkspace_DBError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT id, workspace_id, name, position`).
+		WithArgs("ws-1", "cat-1").
+		WillReturnError(errors.New("db unavailable"))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.GetCategoryByIDInWorkspace(context.Background(), "ws-1", "cat-1")
+	if err == nil {
+		t.Fatal("expected db error")
+	}
+}
+
+func TestPGXChannelStore_GetVisibleChannelByID_SQLVisibility(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(`(?s)FROM chat\.channels c.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.workspace_id = c\.workspace_id.*wm\.user_id = \$3.*wm\.status = 'active'.*LEFT JOIN chat\.channel_members cm.*cm\.channel_id = c\.id.*cm\.user_id = \$3.*WHERE c\.workspace_id = \$1.*c\.id = \$2.*c\.status = 'active'.*c\.is_general = true OR c\.type = 'public' OR cm\.channel_id IS NOT NULL`).
+		WithArgs("ws-1", "ch-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "private", "Private", "private", "active", false, 0, "", now, now))
+
+	store := storage.NewPGXChannelStore(mock)
+	ch, err := store.GetVisibleChannelByID(context.Background(), "ws-1", "ch-1", "user-1")
+	if err != nil {
+		t.Fatalf("GetVisibleChannelByID: %v", err)
+	}
+	if ch.ID != "ch-1" {
+		t.Fatalf("unexpected channel: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_GetVisibleChannelByID_DBError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.channels c`).
+		WithArgs("ws-1", "ch-1", "user-1").
+		WillReturnError(errors.New("db unavailable"))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.GetVisibleChannelByID(context.Background(), "ws-1", "ch-1", "user-1")
+	if err == nil {
+		t.Fatal("expected db error")
+	}
+}
+
+func TestPGXChannelStore_GetVisibleChannelBySlug_NotFoundForHiddenChannel(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`(?s)FROM chat\.channels c.*c\.slug = \$2.*cm\.channel_id IS NOT NULL`).
+		WithArgs("ws-1", "private", "user-1").
+		WillReturnRows(pgxmock.NewRows(channelCols()))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.GetVisibleChannelBySlug(context.Background(), "ws-1", "private", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestPGXChannelStore_CreateChannelWithMember_BeginError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin().WillReturnError(errors.New("begin failed"))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.CreateChannelWithMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "private", DisplayName: "Private", Type: domain.ChannelTypePrivate,
+	}, "owner-1", domain.ChannelRoleMember)
+	if err == nil {
+		t.Fatal("expected begin error")
+	}
+}
+
+func TestPGXChannelStore_CreateChannelWithMember_CommitsChannelAndMembership(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO chat.channels`).
+		WithArgs("ws-1", pgxmock.AnyArg(), "private", "Private", "private", false, 0, pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-private", "ws-1", "", "private", "Private", "private", "active", false, 0, "owner-1", now, now))
+	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+		WithArgs("ch-private", "owner-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	store := storage.NewPGXChannelStore(mock)
+	ch, err := store.CreateChannelWithMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "private", DisplayName: "Private", Type: domain.ChannelTypePrivate, CreatedBy: "owner-1",
+	}, "owner-1", domain.ChannelRoleMember)
+	if err != nil {
+		t.Fatalf("CreateChannelWithMember: %v", err)
+	}
+	if ch.ID != "ch-private" {
+		t.Fatalf("unexpected channel: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_CreateChannelWithMember_RollsBackWhenMembershipFails(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO chat.channels`).
+		WithArgs("ws-1", pgxmock.AnyArg(), "private", "Private", "private", false, 0, pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-private", "ws-1", "", "private", "Private", "private", "active", false, 0, "owner-1", now, now))
+	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+		WithArgs("ch-private", "owner-1", "member").
+		WillReturnError(errors.New("insert membership failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.CreateChannelWithMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "private", DisplayName: "Private", Type: domain.ChannelTypePrivate, CreatedBy: "owner-1",
+	}, "owner-1", domain.ChannelRoleMember)
+	if err == nil {
+		t.Fatal("expected membership error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_WorkspaceBound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(`(?s)UPDATE chat\.channels.*WHERE workspace_id = \$1.*id = \$2.*status = 'active'.*is_general = false`).
+		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team-updates", "Team Updates", "public", 20).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "cat-1", "team-updates", "Team Updates", "public", "active", false, 20, "owner-1", now, now))
+
+	store := storage.NewPGXChannelStore(mock)
+	ch, err := store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", CategoryID: "cat-1", Slug: "team-updates",
+		DisplayName: "Team Updates", Type: domain.ChannelTypePublic, Position: 20,
+	})
+	if err != nil {
+		t.Fatalf("UpdateChannel: %v", err)
+	}
+	if ch.Slug != "team-updates" || ch.WorkspaceID != "ws-1" {
+		t.Fatalf("unexpected channel: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_PublicToPrivateEnsuresMembershipInTransaction(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "private", 0).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "team", "Team", "private", "active", false, 0, "owner-1", now, now))
+	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+		WithArgs("ch-1", "owner-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	store := storage.NewPGXChannelStore(mock)
+	ch, err := store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team",
+		Type: domain.ChannelTypePrivate, EnsureMemberUserID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("UpdateChannel: %v", err)
+	}
+	if ch.Type != domain.ChannelTypePrivate {
+		t.Fatalf("unexpected channel: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_PublicToPrivateRollsBackWhenMembershipFails(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "private", 0).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "team", "Team", "private", "active", false, 0, "owner-1", now, now))
+	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+		WithArgs("ch-1", "owner-1", "member").
+		WillReturnError(errors.New("membership insert failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team",
+		Type: domain.ChannelTypePrivate, EnsureMemberUserID: "owner-1",
+	})
+	if err == nil {
+		t.Fatal("expected membership insert error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_BeginErrorWhenEnsuringMembership(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin().WillReturnError(errors.New("begin failed"))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team",
+		Type: domain.ChannelTypePrivate, EnsureMemberUserID: "owner-1",
+	})
+	if err == nil {
+		t.Fatal("expected begin error")
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_DuplicateSlug(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "existing", "Existing", "public", 0).
+		WillReturnError(&pgconn.PgError{Code: "23505", ConstraintName: "channels_workspace_slug_unique"})
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "existing", DisplayName: "Existing", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrDuplicateSlug) {
+		t.Fatalf("expected ErrDuplicateSlug, got %v", err)
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_NotFound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "missing", pgxmock.AnyArg(), "team", "Team", "public", 0).
+		WillReturnRows(pgxmock.NewRows(channelCols()))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "missing", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestPGXChannelStore_UpdateChannel_CrossWorkspaceCategoryMapsInvalidInput(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "public", 0).
+		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "channels_workspace_category_fk"})
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", CategoryID: "cat-other", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestPGXChannelStore_ArchiveChannel_WorkspaceBoundNoHardDelete(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(`(?s)UPDATE chat\.channels.*SET status = 'archived'.*WHERE workspace_id = \$1.*id = \$2.*status = 'active'.*is_general = false`).
+		WithArgs("ws-1", "ch-1").
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "team", "Team", "public", "archived", false, 0, "owner-1", now, now))
+
+	store := storage.NewPGXChannelStore(mock)
+	ch, err := store.ArchiveChannel(context.Background(), "ws-1", "ch-1")
+	if err != nil {
+		t.Fatalf("ArchiveChannel: %v", err)
+	}
+	if ch.Status != domain.ChannelStatusArchived {
+		t.Fatalf("expected archived channel, got %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_ArchiveChannel_NotFound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "missing").
+		WillReturnRows(pgxmock.NewRows(channelCols()))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.ArchiveChannel(context.Background(), "ws-1", "missing")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestPGXChannelStore_ArchiveChannel_DBError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1").
+		WillReturnError(errors.New("db unavailable"))
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.ArchiveChannel(context.Background(), "ws-1", "ch-1")
+	if err == nil {
+		t.Fatal("expected db error")
+	}
+}
+
+func TestPGXChannelStore_ArchiveChannel_ConstraintErrorMapsDomain(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1").
+		WillReturnError(&pgconn.PgError{Code: "23505", ConstraintName: "channels_workspace_slug_unique"})
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.ArchiveChannel(context.Background(), "ws-1", "ch-1")
+	if !errors.Is(err, domain.ErrDuplicateSlug) {
+		t.Fatalf("expected mapped domain error, got %v", err)
+	}
+}

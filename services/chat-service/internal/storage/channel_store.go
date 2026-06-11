@@ -11,8 +11,6 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-const pgCodeUniqueViolation = "23505"
-
 // CreateCategoryInput holds the fields for creating a channel category.
 type CreateCategoryInput struct {
 	WorkspaceID string
@@ -33,20 +31,39 @@ type CreateChannelInput struct {
 	CreatedBy   string
 }
 
+// UpdateChannelInput holds the complete mutable channel state to persist.
+// CategoryID and EnsureMemberUserID are optional (empty string = NULL / disabled).
+type UpdateChannelInput struct {
+	WorkspaceID        string
+	ChannelID          string
+	CategoryID         string
+	Slug               string
+	DisplayName        string
+	Type               domain.ChannelType
+	Position           int
+	EnsureMemberUserID string
+}
+
 // ChannelStore is the persistence interface for channel operations.
 type ChannelStore interface {
 	CreateCategory(ctx context.Context, input CreateCategoryInput) (domain.ChannelCategory, error)
 	CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error)
+	CreateChannelWithMember(ctx context.Context, input CreateChannelInput, userID string, role domain.ChannelRole) (domain.Channel, error)
+	GetCategoryByIDInWorkspace(ctx context.Context, workspaceID, id string) (domain.ChannelCategory, error)
 	GetChannelByID(ctx context.Context, id string) (domain.Channel, error)
 	// GetChannelByIDInWorkspace returns the channel only if it belongs to workspaceID.
 	// Returns ErrNotFound when the channel does not exist or belongs to a different workspace.
 	GetChannelByIDInWorkspace(ctx context.Context, workspaceID, id string) (domain.Channel, error)
+	GetVisibleChannelByID(ctx context.Context, workspaceID, channelID, userID string) (domain.Channel, error)
+	GetVisibleChannelBySlug(ctx context.Context, workspaceID, slug, userID string) (domain.Channel, error)
 	ListChannelsByWorkspace(ctx context.Context, workspaceID string) ([]domain.Channel, error)
 	// ListVisibleChannelsByUser returns active channels in workspaceID visible to userID.
 	// Visibility is enforced in SQL: active workspace + active workspace membership required;
 	// public and general channels are always included; private channels require channel membership.
 	// Returns an empty slice when the workspace is disabled or userID is not an active member.
 	ListVisibleChannelsByUser(ctx context.Context, workspaceID, userID string) ([]domain.Channel, error)
+	UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error)
+	ArchiveChannel(ctx context.Context, workspaceID, channelID string) (domain.Channel, error)
 }
 
 // PGXChannelStore implements ChannelStore using a pgx connection pool.
@@ -73,6 +90,36 @@ func (s *PGXChannelStore) CreateCategory(ctx context.Context, input CreateCatego
 }
 
 func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
+	return createChannel(ctx, s.pool, input)
+}
+
+func (s *PGXChannelStore) CreateChannelWithMember(ctx context.Context, input CreateChannelInput, userID string, role domain.ChannelRole) (domain.Channel, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Channel{}, fmt.Errorf("begin create channel with member: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	ch, err := createChannel(ctx, tx, input)
+	if err != nil {
+		return domain.Channel{}, err
+	}
+	if err := addChannelMember(ctx, tx, ch.ID, userID, role); err != nil {
+		return domain.Channel{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Channel{}, fmt.Errorf("commit create channel with member: %w", err)
+	}
+	committed = true
+	return ch, nil
+}
+
+func createChannel(ctx context.Context, q channelQuerier, input CreateChannelInput) (domain.Channel, error) {
 	var categoryID *string
 	if input.CategoryID != "" {
 		categoryID = &input.CategoryID
@@ -83,7 +130,7 @@ func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannel
 	}
 
 	var ch domain.Channel
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		INSERT INTO chat.channels
 			(workspace_id, category_id, slug, display_name, type, is_general, position, created_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -98,18 +145,47 @@ func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannel
 		&ch.CreatedAt, &ch.UpdatedAt,
 	)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == pgCodeUniqueViolation {
-			switch pgErr.ConstraintName {
-			case "idx_channels_one_general_per_workspace":
-				return domain.Channel{}, domain.ErrGeneralChannelExists
-			case "channels_workspace_slug_unique":
-				return domain.Channel{}, domain.ErrDuplicateSlug
-			}
+		if mapped := mapChannelWriteError(err); mapped != nil {
+			return domain.Channel{}, mapped
 		}
 		return domain.Channel{}, fmt.Errorf("create channel: %w", err)
 	}
 	return ch, nil
+}
+
+type channelQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func addChannelMember(ctx context.Context, q channelQuerier, channelID, userID string, role domain.ChannelRole) error {
+	_, err := q.Exec(ctx, `
+		INSERT INTO chat.channel_members (channel_id, user_id, role)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (channel_id, user_id) DO NOTHING`,
+		channelID, userID, string(role),
+	)
+	if err != nil {
+		return fmt.Errorf("add channel member: %w", err)
+	}
+	return nil
+}
+
+func (s *PGXChannelStore) GetCategoryByIDInWorkspace(ctx context.Context, workspaceID, id string) (domain.ChannelCategory, error) {
+	var c domain.ChannelCategory
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, workspace_id, name, position, created_at, updated_at
+		FROM chat.channel_categories
+		WHERE workspace_id = $1 AND id = $2`,
+		workspaceID, id,
+	).Scan(&c.ID, &c.WorkspaceID, &c.Name, &c.Position, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ChannelCategory{}, domain.ErrNotFound
+		}
+		return domain.ChannelCategory{}, fmt.Errorf("get category by id in workspace: %w", err)
+	}
+	return c, nil
 }
 
 func (s *PGXChannelStore) GetChannelByID(ctx context.Context, id string) (domain.Channel, error) {
@@ -154,6 +230,62 @@ func (s *PGXChannelStore) GetChannelByIDInWorkspace(ctx context.Context, workspa
 			return domain.Channel{}, domain.ErrNotFound
 		}
 		return domain.Channel{}, fmt.Errorf("get channel by id in workspace: %w", err)
+	}
+	return ch, nil
+}
+
+func (s *PGXChannelStore) GetVisibleChannelByID(ctx context.Context, workspaceID, channelID, userID string) (domain.Channel, error) {
+	return s.getVisibleChannel(ctx, `
+		SELECT c.id, c.workspace_id, COALESCE(c.category_id::text, ''), c.slug, c.display_name,
+		       c.type, c.status, c.is_general, c.position, COALESCE(c.created_by::text, ''),
+		       c.created_at, c.updated_at
+		FROM chat.channels c
+		JOIN chat.workspaces w
+		  ON c.workspace_id = w.id AND w.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = c.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
+		LEFT JOIN chat.channel_members cm
+		  ON cm.channel_id = c.id AND cm.user_id = $3
+		WHERE c.workspace_id = $1
+		  AND c.id = $2
+		  AND c.status = 'active'
+		  AND (c.is_general = true OR c.type = 'public' OR cm.channel_id IS NOT NULL)`,
+		workspaceID, channelID, userID,
+	)
+}
+
+func (s *PGXChannelStore) GetVisibleChannelBySlug(ctx context.Context, workspaceID, slug, userID string) (domain.Channel, error) {
+	return s.getVisibleChannel(ctx, `
+		SELECT c.id, c.workspace_id, COALESCE(c.category_id::text, ''), c.slug, c.display_name,
+		       c.type, c.status, c.is_general, c.position, COALESCE(c.created_by::text, ''),
+		       c.created_at, c.updated_at
+		FROM chat.channels c
+		JOIN chat.workspaces w
+		  ON c.workspace_id = w.id AND w.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = c.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
+		LEFT JOIN chat.channel_members cm
+		  ON cm.channel_id = c.id AND cm.user_id = $3
+		WHERE c.workspace_id = $1
+		  AND c.slug = $2
+		  AND c.status = 'active'
+		  AND (c.is_general = true OR c.type = 'public' OR cm.channel_id IS NOT NULL)`,
+		workspaceID, slug, userID,
+	)
+}
+
+func (s *PGXChannelStore) getVisibleChannel(ctx context.Context, query string, args ...any) (domain.Channel, error) {
+	var ch domain.Channel
+	err := s.pool.QueryRow(ctx, query, args...).Scan(
+		&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
+		(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
+		&ch.CreatedAt, &ch.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Channel{}, domain.ErrNotFound
+		}
+		return domain.Channel{}, fmt.Errorf("get visible channel: %w", err)
 	}
 	return ch, nil
 }
@@ -224,4 +356,120 @@ func (s *PGXChannelStore) ListVisibleChannelsByUser(ctx context.Context, workspa
 		channels = append(channels, ch)
 	}
 	return channels, rows.Err()
+}
+
+func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {
+	if input.EnsureMemberUserID == "" {
+		return updateChannel(ctx, s.pool, input)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Channel{}, fmt.Errorf("begin update channel: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	ch, err := updateChannel(ctx, tx, input)
+	if err != nil {
+		return domain.Channel{}, err
+	}
+	if err := addChannelMember(ctx, tx, ch.ID, input.EnsureMemberUserID, domain.ChannelRoleMember); err != nil {
+		return domain.Channel{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Channel{}, fmt.Errorf("commit update channel: %w", err)
+	}
+	committed = true
+	return ch, nil
+}
+
+func updateChannel(ctx context.Context, q channelQuerier, input UpdateChannelInput) (domain.Channel, error) {
+	var categoryID *string
+	if input.CategoryID != "" {
+		categoryID = &input.CategoryID
+	}
+	var ch domain.Channel
+	err := q.QueryRow(ctx, `
+		UPDATE chat.channels
+		SET category_id = $3,
+		    slug = $4,
+		    display_name = $5,
+		    type = $6,
+		    position = $7,
+		    updated_at = now()
+		WHERE workspace_id = $1
+		  AND id = $2
+		  AND status = 'active'
+		  AND is_general = false
+		RETURNING id, workspace_id, COALESCE(category_id::text, ''), slug, display_name,
+		          type, status, is_general, position, COALESCE(created_by::text, ''),
+		          created_at, updated_at`,
+		input.WorkspaceID, input.ChannelID, categoryID, input.Slug, input.DisplayName, string(input.Type), input.Position,
+	).Scan(
+		&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
+		(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
+		&ch.CreatedAt, &ch.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Channel{}, domain.ErrNotFound
+		}
+		if mapped := mapChannelWriteError(err); mapped != nil {
+			return domain.Channel{}, mapped
+		}
+		return domain.Channel{}, fmt.Errorf("update channel: %w", err)
+	}
+	return ch, nil
+}
+
+func (s *PGXChannelStore) ArchiveChannel(ctx context.Context, workspaceID, channelID string) (domain.Channel, error) {
+	var ch domain.Channel
+	err := s.pool.QueryRow(ctx, `
+		UPDATE chat.channels
+		SET status = 'archived',
+		    updated_at = now()
+		WHERE workspace_id = $1
+		  AND id = $2
+		  AND status = 'active'
+		  AND is_general = false
+		RETURNING id, workspace_id, COALESCE(category_id::text, ''), slug, display_name,
+		          type, status, is_general, position, COALESCE(created_by::text, ''),
+		          created_at, updated_at`,
+		workspaceID, channelID,
+	).Scan(
+		&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
+		(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
+		&ch.CreatedAt, &ch.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Channel{}, domain.ErrNotFound
+		}
+		if mapped := mapChannelWriteError(err); mapped != nil {
+			return domain.Channel{}, mapped
+		}
+		return domain.Channel{}, fmt.Errorf("archive channel: %w", err)
+	}
+	return ch, nil
+}
+
+func mapChannelWriteError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return nil
+	}
+	switch pgErr.ConstraintName {
+	case "idx_channels_one_general_per_workspace":
+		return domain.ErrGeneralChannelExists
+	case "channels_workspace_slug_unique":
+		return domain.ErrDuplicateSlug
+	case "channels_workspace_category_fk":
+		return domain.ErrInvalidInput
+	}
+	return nil
 }
