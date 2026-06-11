@@ -30,6 +30,12 @@ func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID s
 	return m, err
 }
 
+// ActivateWorkspaceMember reactivates an existing workspace membership and
+// ensures the member is synced into that workspace's #geral channel.
+func (s *MemberService) ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	return s.members.ActivateWorkspaceMember(ctx, workspaceID, userID)
+}
+
 // JoinChannel adds userID to channelID with the given role. If the user is
 // already a channel member, the existing record is returned without error.
 func (s *MemberService) JoinChannel(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error) {
@@ -68,18 +74,14 @@ func (s *MemberService) JoinChannel(ctx context.Context, channelID, userID strin
 }
 
 // EnsureGeneralMembership adds userID to the #geral channel for workspaceID if
-// not already a member. It is idempotent and should be called after JoinWorkspace.
-// Returns nil if no #geral channel exists (safe during bootstrap).
+// not already a member. It is idempotent and only applies to active workspace
+// members.
 func (s *MemberService) EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error {
-	channels, err := s.channels.ListChannelsByWorkspace(ctx, workspaceID)
-	if err != nil {
-		return fmt.Errorf("list channels for general: %w", err)
-	}
-	for _, ch := range channels {
-		if ch.IsGeneral {
-			_, err := s.JoinChannel(ctx, ch.ID, userID, domain.ChannelRoleMember)
-			return err
-		}
-	}
-	return nil
+	return s.members.EnsureGeneralMembership(ctx, workspaceID, userID)
+}
+
+// SyncGeneralMemberships repairs missing #geral channel_members rows for active
+// workspace members.
+func (s *MemberService) SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error) {
+	return s.members.SyncGeneralMemberships(ctx, workspaceID)
 }
