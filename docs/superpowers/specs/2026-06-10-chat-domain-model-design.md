@@ -40,7 +40,7 @@ services/chat-service/internal/
   service/
     workspace_service.go
     member_service.go
-    channel_service.go
+    permission_service.go
     [_test.go for each]
 
 docs/architecture/chat-domain-model.md
@@ -118,13 +118,17 @@ Seeded: `id='00000000-0000-0000-0000-000000000002'`, `workspace_id=default`, `sl
 
 ## Permission Rules
 
-| Scenario                                          | Result                       |
-| ------------------------------------------------- | ---------------------------- |
-| User is active workspace member → read public ch. | ALLOW                        |
-| User is not workspace member → any channel        | DENY                         |
-| User is workspace member → read private channel   | DENY (unless channel_member) |
-| User is channel_member → read/write private       | ALLOW                        |
-| `is_general=true` channel → all workspace members | ALLOW (auto-member on join)  |
+| Scenario                                             | Result                            |
+| ---------------------------------------------------- | --------------------------------- |
+| User is active workspace member → read public ch.    | ALLOW                             |
+| User is not workspace member → any channel           | DENY                              |
+| User is workspace member → read private channel      | DENY (unless channel_member)      |
+| User is channel_member → read/write private          | ALLOW                             |
+| `is_general=true` channel → active workspace members | ALLOW without channel_members row |
+
+Access to `#geral` depends on active workspace membership, not on a
+`channel_members` row. `EnsureGeneralMembership` inserts that row only when it is
+called explicitly; joining a workspace does not call it automatically.
 
 Functions: `CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool`
 and `CanWriteChannel(...)`.
