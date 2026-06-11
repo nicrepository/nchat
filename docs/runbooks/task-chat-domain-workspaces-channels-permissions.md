@@ -14,8 +14,12 @@
 - Workspace-bound channel authorization prevents cross-workspace ID access.
 - User-visible channel lists enforce active workspace/member and private-channel
   visibility in SQL.
+- Mandatory `#geral` membership sync: active workspace members are inserted into
+  that workspace's `#geral` `channel_members` row during join/reactivation.
+  `SyncGeneralMemberships(ctx, workspaceID)` backfills missing rows for active
+  members only.
 - Disabled workspaces deny channel list/read/write, category/channel creation,
-  and channel membership changes.
+  workspace membership auto-sync, and channel membership changes.
 - Database constraints enforce workspace/category consistency and exactly one
   active public general channel per committed workspace.
 
@@ -58,6 +62,28 @@ Expected rows:
 The seed insert is idempotent. The schema rejects a second general channel,
 private or archived general channels, cross-workspace category references, and
 workspace commits that do not include an active public general channel.
+
+## `#geral` membership sync
+
+`#geral` is mandatory for every active workspace. When `MemberService` joins or
+reactivates a workspace member, `chat-service` uses the storage transaction to:
+
+1. verify the workspace is active;
+2. create or activate the `workspace_members` row;
+3. load the active public general channel by the same `workspace_id`;
+4. insert the `channel_members` row with `ON CONFLICT DO NOTHING`.
+
+The join/reactivation and `#geral` insert are atomic in the pgx store. If the
+general channel is missing, the service returns `ErrGeneralChannelMissing`; it
+does not create `#geral` in the membership path. Unexpected database errors are
+propagated, and newly active members are not silently left unsynced. Duplicate
+membership conflicts remain idempotent.
+
+Suspended and left workspace members are not synced into `#geral`. Disabled
+workspaces deny the sync. Authorization does not rely solely on the
+`channel_members` row: active workspace membership still grants access to
+`#geral`, so the sync row is a consistency aid rather than the only permission
+source.
 
 ## Running tests
 

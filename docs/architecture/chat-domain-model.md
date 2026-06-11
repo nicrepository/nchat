@@ -25,6 +25,7 @@ Schema: `chat`
 | chat.channels   | 00000000-0000-0000-0000-000000000002 | slug='geral', is_general=true |
 
 Seed uses `ON CONFLICT (id) DO NOTHING` — idempotent on repeated migration runs.
+`#geral` is mandatory for each active workspace.
 
 ## Schema reference
 
@@ -82,6 +83,14 @@ Seed uses `ON CONFLICT (id) DO NOTHING` — idempotent on repeated migration run
 | role       | text        | member / moderator               |
 | joined_at  | timestamptz |                                  |
 
+Active workspace members are automatically synced into their workspace's
+mandatory `#geral` channel. The pgx member store performs workspace
+join/reactivation and `#geral` `channel_members` insertion in one transaction
+where the general channel is loaded by the same `workspace_id`. Duplicate rows
+are ignored with `ON CONFLICT DO NOTHING`; unexpected database errors propagate.
+If `#geral` is missing, membership sync returns an explicit error instead of
+creating the channel in this path.
+
 ## Permission rules
 
 | Scenario                                              | Access |
@@ -97,11 +106,17 @@ global channel IDs are never sufficient for authorization. Visible channel lists
 are filtered in SQL by active workspace, active workspace membership, channel
 status/type, and private channel membership. Disabled workspaces deny channel
 list, read, write, category creation, channel creation, and channel membership.
+`#geral` authorization does not depend solely on the synced `channel_members`
+row: any active workspace member may read/write the active public general
+channel, even if a repair sync has not yet inserted the consistency row.
 
 The database enforces the general-channel invariant with a partial unique index,
 an active/public `CHECK`, and deferred constraint triggers. This permits creating
 a workspace and `#geral` in one transaction while rejecting a commit that leaves
 an existing workspace without an active public general channel.
+
+Full multi-workspace workflows (RF-68..RF-72) and the full RBAC matrix (RF-74)
+remain out of scope for this MVP foundation.
 
 ## Cross-schema identity
 

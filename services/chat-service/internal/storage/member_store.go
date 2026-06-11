@@ -6,16 +6,24 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
 // MemberStore is the persistence interface for workspace and channel membership.
 type MemberStore interface {
+	// AddWorkspaceMember inserts an active workspace membership and syncs #geral.
+	// ErrAlreadyMember may be returned after a successful commit; the call may
+	// have repaired missing #geral membership before returning it. Callers must
+	// not treat ErrAlreadyMember as proof that no side effects occurred.
 	AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error)
+	ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
+	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
+	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
 }
 
 // PGXMemberStore implements MemberStore using a pgx connection pool.
@@ -27,12 +35,54 @@ func NewPGXMemberStore(pool Pool) *PGXMemberStore {
 	return &PGXMemberStore{pool: pool}
 }
 
-// AddWorkspaceMember inserts a workspace membership. Returns ErrAlreadyMember when
-// ON CONFLICT DO NOTHING fires (no row returned). Callers should follow up with
-// GetWorkspaceMember to retrieve the existing record if needed.
+type memberQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// AddWorkspaceMember inserts an active workspace membership and atomically syncs
+// the user to that workspace's #geral channel. Existing active members are also
+// synced idempotently before ErrAlreadyMember is returned. ErrAlreadyMember may
+// be returned after a successful commit; callers must not assume it means
+// rollback or no side effects.
 func (s *PGXMemberStore) AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.WorkspaceMember{}, fmt.Errorf("begin add workspace member: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := ensureWorkspaceActive(ctx, tx, workspaceID); err != nil {
+		return domain.WorkspaceMember{}, err
+	}
+
+	m, inserted, err := addWorkspaceMember(ctx, tx, workspaceID, userID, role)
+	if err != nil {
+		return domain.WorkspaceMember{}, err
+	}
+	if m.Status == domain.MemberStatusActive {
+		if err := ensureGeneralMembership(ctx, tx, workspaceID, userID); err != nil {
+			return domain.WorkspaceMember{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.WorkspaceMember{}, fmt.Errorf("commit add workspace member: %w", err)
+	}
+	committed = true
+	if !inserted {
+		return domain.WorkspaceMember{}, domain.ErrAlreadyMember
+	}
+	return m, nil
+}
+
+func addWorkspaceMember(ctx context.Context, q memberQuerier, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, bool, error) {
 	var m domain.WorkspaceMember
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		INSERT INTO chat.workspace_members (workspace_id, user_id, role, status)
 		VALUES ($1, $2, $3, 'active')
 		ON CONFLICT (workspace_id, user_id) DO NOTHING
@@ -41,16 +91,66 @@ func (s *PGXMemberStore) AddWorkspaceMember(ctx context.Context, workspaceID, us
 	).Scan(&m.WorkspaceID, &m.UserID, (*string)(&m.Role), (*string)(&m.Status), &m.JoinedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.WorkspaceMember{}, domain.ErrAlreadyMember
+			existing, getErr := getWorkspaceMember(ctx, q, workspaceID, userID)
+			if getErr != nil {
+				return domain.WorkspaceMember{}, false, getErr
+			}
+			return existing, false, nil
 		}
-		return domain.WorkspaceMember{}, fmt.Errorf("add workspace member: %w", err)
+		return domain.WorkspaceMember{}, false, fmt.Errorf("add workspace member: %w", err)
 	}
+	return m, true, nil
+}
+
+// ActivateWorkspaceMember marks an existing workspace member active and
+// atomically syncs them to that workspace's #geral channel.
+func (s *PGXMemberStore) ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.WorkspaceMember{}, fmt.Errorf("begin activate workspace member: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := ensureWorkspaceActive(ctx, tx, workspaceID); err != nil {
+		return domain.WorkspaceMember{}, err
+	}
+
+	var m domain.WorkspaceMember
+	err = tx.QueryRow(ctx, `
+		UPDATE chat.workspace_members
+		SET status = 'active'
+		WHERE workspace_id = $1 AND user_id = $2
+		RETURNING workspace_id, user_id, role, status, joined_at`,
+		workspaceID, userID,
+	).Scan(&m.WorkspaceID, &m.UserID, (*string)(&m.Role), (*string)(&m.Status), &m.JoinedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.WorkspaceMember{}, domain.ErrNotFound
+		}
+		return domain.WorkspaceMember{}, fmt.Errorf("activate workspace member: %w", err)
+	}
+	if err := ensureGeneralMembership(ctx, tx, workspaceID, userID); err != nil {
+		return domain.WorkspaceMember{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.WorkspaceMember{}, fmt.Errorf("commit activate workspace member: %w", err)
+	}
+	committed = true
 	return m, nil
 }
 
 func (s *PGXMemberStore) GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	return getWorkspaceMember(ctx, s.pool, workspaceID, userID)
+}
+
+func getWorkspaceMember(ctx context.Context, q memberQuerier, workspaceID, userID string) (domain.WorkspaceMember, error) {
 	var m domain.WorkspaceMember
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT wm.workspace_id, wm.user_id, wm.role, wm.status, wm.joined_at
 		FROM chat.workspace_members wm
 		JOIN chat.workspaces w ON wm.workspace_id = w.id AND w.status = 'active'
@@ -64,6 +164,150 @@ func (s *PGXMemberStore) GetWorkspaceMember(ctx context.Context, workspaceID, us
 		return domain.WorkspaceMember{}, fmt.Errorf("get workspace member: %w", err)
 	}
 	return m, nil
+}
+
+// EnsureGeneralMembership idempotently adds an active workspace member to that
+// workspace's #geral channel. Suspended and left members return
+// ErrMemberInactive and are not inserted.
+func (s *PGXMemberStore) EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin ensure general membership: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := ensureWorkspaceActive(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	member, err := getWorkspaceMember(ctx, tx, workspaceID, userID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ErrForbidden
+	}
+	if err != nil {
+		return err
+	}
+	if member.Status != domain.MemberStatusActive {
+		return domain.ErrMemberInactive
+	}
+	if err := ensureGeneralMembership(ctx, tx, workspaceID, userID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit ensure general membership: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// SyncGeneralMemberships backfills missing #geral memberships for active
+// workspace members only. It returns the number of inserted channel_members rows.
+func (s *PGXMemberStore) SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin sync general memberships: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := ensureWorkspaceActive(ctx, tx, workspaceID); err != nil {
+		return 0, err
+	}
+	generalChannelID, err := getGeneralChannelID(ctx, tx, workspaceID)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO chat.channel_members (channel_id, user_id, role)
+		SELECT $1, wm.user_id, $3
+		FROM chat.workspace_members wm
+		WHERE wm.workspace_id = $2
+		  AND wm.status = 'active'
+		ON CONFLICT (channel_id, user_id) DO NOTHING`,
+		generalChannelID, workspaceID, string(domain.ChannelRoleMember),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("sync general memberships: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit sync general memberships: %w", err)
+	}
+	committed = true
+	return tag.RowsAffected(), nil
+}
+
+func ensureWorkspaceActive(ctx context.Context, q memberQuerier, workspaceID string) error {
+	var status domain.WorkspaceStatus
+	err := q.QueryRow(ctx, `
+		SELECT status
+		FROM chat.workspaces
+		WHERE id = $1
+		FOR SHARE`,
+		workspaceID,
+	).Scan((*string)(&status))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		return fmt.Errorf("get workspace status: %w", err)
+	}
+	if status != domain.WorkspaceStatusActive {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
+func ensureGeneralMembership(ctx context.Context, q memberQuerier, workspaceID, userID string) error {
+	generalChannelID, err := getGeneralChannelID(ctx, q, workspaceID)
+	if err != nil {
+		return err
+	}
+	if err := addGeneralChannelMember(ctx, q, generalChannelID, userID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getGeneralChannelID(ctx context.Context, q memberQuerier, workspaceID string) (string, error) {
+	var channelID string
+	err := q.QueryRow(ctx, `
+		SELECT id
+		FROM chat.channels
+		WHERE workspace_id = $1
+		  AND is_general = true
+		  AND type = 'public'
+		  AND status = 'active'
+		FOR SHARE`,
+		workspaceID,
+	).Scan(&channelID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrGeneralChannelMissing
+		}
+		return "", fmt.Errorf("get general channel: %w", err)
+	}
+	return channelID, nil
+}
+
+func addGeneralChannelMember(ctx context.Context, q memberQuerier, channelID, userID string) error {
+	_, err := q.Exec(ctx, `
+		INSERT INTO chat.channel_members (channel_id, user_id, role)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (channel_id, user_id) DO NOTHING`,
+		channelID, userID, string(domain.ChannelRoleMember),
+	)
+	if err != nil {
+		return fmt.Errorf("add general channel member: %w", err)
+	}
+	return nil
 }
 
 // AddChannelMember inserts a channel membership. Returns ErrAlreadyMember when
