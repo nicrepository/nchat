@@ -494,6 +494,86 @@ func TestPGXMemberStore_ActivateWorkspaceMember_NotFoundRollsBack(t *testing.T) 
 	}
 }
 
+func TestPGXMemberStore_ActivateWorkspaceMember_DisabledWorkspaceDenied(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
+		WithArgs("ws-disabled").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("disabled"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXMemberStore(mock)
+	_, err = store.ActivateWorkspaceMember(context.Background(), "ws-disabled", "user-1")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_ActivateWorkspaceMember_MissingGeneralRollsBack(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
+			AddRow("ws-1", "user-1", "member", "active", now))
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXMemberStore(mock)
+	_, err = store.ActivateWorkspaceMember(context.Background(), "ws-1", "user-1")
+	if !errors.Is(err, domain.ErrGeneralChannelMissing) {
+		t.Fatalf("expected ErrGeneralChannelMissing, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_ActivateWorkspaceMember_UserIDScopedByWorkspace(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
+		WithArgs("ws-b").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
+		WithArgs("ws-b", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXMemberStore(mock)
+	_, err = store.ActivateWorkspaceMember(context.Background(), "ws-b", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestPGXMemberStore_ActivateWorkspaceMember_UpdateErrorRollsBack(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -554,7 +634,7 @@ func TestPGXMemberStore_EnsureGeneralMembership_AddsActiveMember(t *testing.T) {
 	}
 }
 
-func TestPGXMemberStore_EnsureGeneralMembership_InactiveMemberSkipped(t *testing.T) {
+func TestPGXMemberStore_EnsureGeneralMembership_InactiveMemberReturnsSentinel(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -573,8 +653,9 @@ func TestPGXMemberStore_EnsureGeneralMembership_InactiveMemberSkipped(t *testing
 	mock.ExpectRollback()
 
 	store := storage.NewPGXMemberStore(mock)
-	if err := store.EnsureGeneralMembership(context.Background(), "ws-1", "user-1"); err != nil {
-		t.Fatalf("inactive member should be skipped, got %v", err)
+	err = store.EnsureGeneralMembership(context.Background(), "ws-1", "user-1")
+	if !errors.Is(err, domain.ErrMemberInactive) {
+		t.Fatalf("expected ErrMemberInactive, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -632,6 +713,41 @@ func TestPGXMemberStore_EnsureGeneralMembership_MissingGeneralRollsBack(t *testi
 	err = store.EnsureGeneralMembership(context.Background(), "ws-1", "user-1")
 	if !errors.Is(err, domain.ErrGeneralChannelMissing) {
 		t.Fatalf("expected ErrGeneralChannelMissing, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_EnsureGeneralMembership_CommitErrorPropagates(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	want := errors.New("commit failed")
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectQuery(`SELECT wm\.workspace_id, wm\.user_id, wm\.role, wm\.status, wm\.joined_at`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
+			AddRow("ws-1", "user-1", "member", "active", now))
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
+	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+		WithArgs("ch-geral", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit().WillReturnError(want)
+
+	store := storage.NewPGXMemberStore(mock)
+	err = store.EnsureGeneralMembership(context.Background(), "ws-1", "user-1")
+	if !errors.Is(err, want) {
+		t.Fatalf("expected commit error, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

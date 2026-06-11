@@ -239,8 +239,8 @@ func TestMemberService_EnsureGeneralMembership_SuspendedAndLeftMembersAreSkipped
 			err := service.NewMemberService(ms, &fakeChannelStore{channels: []domain.Channel{general}}, &fakeWorkspaceStore{workspace: workspace}).EnsureGeneralMembership(
 				context.Background(), "ws-1", "user-1",
 			)
-			if err != nil {
-				t.Fatalf("inactive workspace member should be skipped without error, got %v", err)
+			if !errors.Is(err, domain.ErrMemberInactive) {
+				t.Fatalf("expected ErrMemberInactive, got %v", err)
 			}
 			if _, ok := ms.channelMembers[cmKey("ch-geral", "user-1")]; ok {
 				t.Fatal("inactive workspace member must not be added to #geral")

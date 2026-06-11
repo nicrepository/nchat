@@ -30,8 +30,8 @@ func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID s
 	return m, err
 }
 
-// ActivateWorkspaceMember reactivates an existing workspace membership and
-// ensures the member is synced into that workspace's #geral channel.
+// ActivateWorkspaceMember delegates reactivation to the member store. The store
+// implementation enforces #geral sync as part of that persistence operation.
 func (s *MemberService) ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
 	return s.members.ActivateWorkspaceMember(ctx, workspaceID, userID)
 }

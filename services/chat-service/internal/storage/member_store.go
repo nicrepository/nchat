@@ -13,6 +13,10 @@ import (
 
 // MemberStore is the persistence interface for workspace and channel membership.
 type MemberStore interface {
+	// AddWorkspaceMember inserts an active workspace membership and syncs #geral.
+	// ErrAlreadyMember may be returned after a successful commit; the call may
+	// have repaired missing #geral membership before returning it. Callers must
+	// not treat ErrAlreadyMember as proof that no side effects occurred.
 	AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error)
 	ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
@@ -38,7 +42,9 @@ type memberQuerier interface {
 
 // AddWorkspaceMember inserts an active workspace membership and atomically syncs
 // the user to that workspace's #geral channel. Existing active members are also
-// synced idempotently before ErrAlreadyMember is returned.
+// synced idempotently before ErrAlreadyMember is returned. ErrAlreadyMember may
+// be returned after a successful commit; callers must not assume it means
+// rollback or no side effects.
 func (s *PGXMemberStore) AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -161,7 +167,8 @@ func getWorkspaceMember(ctx context.Context, q memberQuerier, workspaceID, userI
 }
 
 // EnsureGeneralMembership idempotently adds an active workspace member to that
-// workspace's #geral channel. Suspended and left members are skipped.
+// workspace's #geral channel. Suspended and left members return
+// ErrMemberInactive and are not inserted.
 func (s *PGXMemberStore) EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -185,7 +192,7 @@ func (s *PGXMemberStore) EnsureGeneralMembership(ctx context.Context, workspaceI
 		return err
 	}
 	if member.Status != domain.MemberStatusActive {
-		return nil
+		return domain.ErrMemberInactive
 	}
 	if err := ensureGeneralMembership(ctx, tx, workspaceID, userID); err != nil {
 		return err

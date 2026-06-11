@@ -202,7 +202,7 @@ func (f *fakeMemberStore) EnsureGeneralMembership(_ context.Context, workspaceID
 		return domain.ErrForbidden
 	}
 	if m.Status != domain.MemberStatusActive {
-		return nil
+		return domain.ErrMemberInactive
 	}
 	return f.addGeneralMembership(workspaceID, userID)
 }
