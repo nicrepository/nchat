@@ -1,7 +1,7 @@
 # Task: Chat Domain — Workspaces, Channels & Permissions
 
-**Branch:** feat/chat-domain-workspaces-channels-permissions
-**Status:** MVP foundation
+**Branch:** feat/chat-channel-crud
+**Status:** MVP foundation + channel CRUD service/storage foundation
 
 ## What this implements
 
@@ -11,9 +11,21 @@
 - Domain structs, type constants, and permission helpers in `chat-service`.
 - Storage layer (pgx) with interfaces: `WorkspaceStore`, `ChannelStore`, `MemberStore`.
 - Service layer: `WorkspaceService`, `MemberService`, `PermissionService`.
+- Service/storage channel CRUD foundation through `ChannelService`:
+  create, list, read by ID/slug, update mutable fields, and archive.
 - Workspace-bound channel authorization prevents cross-workspace ID access.
 - User-visible channel lists enforce active workspace/member and private-channel
   visibility in SQL.
+- Visibility-bound channel reads enforce active workspace/member and
+  private-channel membership in SQL.
+- Private-channel creation adds the creator as a channel member transactionally.
+  Public-channel creation does not create channel membership rows for all
+  workspace members.
+- Public-to-private updates add the manager as a channel member in the same
+  storage transaction. Private-to-public updates are allowed for managers.
+- Archive is a status change (`status='archived'`), not a hard delete.
+- `#geral` is immutable through CRUD: callers cannot create slug `geral`, set
+  `is_general`, edit the general channel, or archive it.
 - Mandatory `#geral` membership sync: active workspace members are inserted into
   that workspace's `#geral` `channel_members` row during join/reactivation.
   `SyncGeneralMemberships(ctx, workspaceID)` backfills missing rows for active
@@ -22,6 +34,44 @@
   workspace membership auto-sync, and channel membership changes.
 - Database constraints enforce workspace/category consistency and exactly one
   active public general channel per committed workspace.
+
+## Channel CRUD service/storage contract
+
+No HTTP CRUD endpoints are exposed in this PR. `chat-service` currently exposes
+only health/readiness/version and has no authenticated user context or middleware.
+Adding public REST handlers now would create misleading authorization behavior
+or IDOR risk. The API surface below is deferred until the service can bind every
+request to a verified caller:
+
+- `POST /api/chat/workspaces/{workspace_id}/channels`
+- `GET /api/chat/workspaces/{workspace_id}/channels`
+- `GET /api/chat/workspaces/{workspace_id}/channels/{channel_id}`
+- `PATCH /api/chat/workspaces/{workspace_id}/channels/{channel_id}`
+- `DELETE /api/chat/workspaces/{workspace_id}/channels/{channel_id}`
+
+Current callable backend foundation:
+
+- `ChannelService.CreateChannel(ctx, input)` requires active workspace,
+  active caller membership, and manager role (`owner` or `admin`). The service
+  validates slug/display name/type/category, reserves slug `geral`, sets
+  `created_by` from the caller, and never accepts caller-provided `is_general`
+  or `status`.
+- `ChannelService.ListChannels(ctx, workspaceID, callerID)` requires active
+  workspace membership and delegates visibility to
+  `ChannelStore.ListVisibleChannelsByUser`.
+- `ChannelService.GetChannel(ctx, input)` requires active workspace membership
+  and reads by channel ID or slug through SQL visibility checks. Hidden private,
+  archived, missing, and cross-workspace channels return not found from storage.
+- `ChannelService.UpdateChannel(ctx, input)` requires `owner` or `admin`, rejects
+  `#geral`, validates duplicate/reserved slugs and workspace-bound categories,
+  and updates only mutable fields.
+- `ChannelService.ArchiveChannel(ctx, workspaceID, channelID, callerID)` requires
+  `owner` or `admin`, rejects `#geral`, and marks the channel archived.
+
+Manager permission is intentionally minimal for this foundation. Full RBAC
+(RF-74), full multi-workspace UX/workspace switching (RF-68..RF-72), frontend UI,
+messages, WebSocket, search, notifications, gateway changes, and auth-service
+changes remain out of scope.
 
 ## What this does NOT implement (out of scope)
 
