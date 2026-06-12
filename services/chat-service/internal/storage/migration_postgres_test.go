@@ -53,6 +53,7 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 	for _, name := range []string{
 		"000001_chat_domain_schema.up.sql",
 		"000002_chat_enforce_channel_workspace_isolation.up.sql",
+		"000003_chat_dm_conversations.up.sql",
 	} {
 		if _, err := conn.Exec(ctx, readChatMigration(t, name)); err != nil {
 			t.Fatalf("apply %s: %v", name, err)
@@ -267,6 +268,140 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			t.Fatalf("cleanup workspace: %v", err)
 		}
 	})
+
+	t.Run("direct dm uniqueness includes archived and remains workspace scoped", func(t *testing.T) {
+		_, err := conn.Exec(ctx, `
+			BEGIN;
+			INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+			VALUES
+				('00000000-0000-0000-0000-000000000001', '70000000-0000-0000-0000-000000000001', 'active'),
+				('00000000-0000-0000-0000-000000000001', '70000000-0000-0000-0000-000000000002', 'active')
+			ON CONFLICT (workspace_id, user_id) DO UPDATE SET status = EXCLUDED.status;
+			INSERT INTO chat.dm_conversations
+				(id, workspace_id, type, status, created_by, direct_pair_key)
+			VALUES
+				('70000000-0000-0000-0000-000000000003',
+				 '00000000-0000-0000-0000-000000000001',
+				 'direct',
+				 'archived',
+				 '70000000-0000-0000-0000-000000000001',
+				 '36:70000000-0000-0000-0000-00000000000136:70000000-0000-0000-0000-000000000002');
+			COMMIT;`)
+		if err != nil {
+			t.Fatalf("seed archived direct dm: %v", err)
+		}
+
+		_, err = conn.Exec(ctx, `
+			INSERT INTO chat.dm_conversations
+				(workspace_id, type, status, created_by, direct_pair_key)
+			VALUES
+				('00000000-0000-0000-0000-000000000001',
+				 'direct',
+				 'active',
+				 '70000000-0000-0000-0000-000000000002',
+				 '36:70000000-0000-0000-0000-00000000000136:70000000-0000-0000-0000-000000000002')`)
+		requirePostgresConstraint(t, err, "idx_dm_conversations_direct_pair_unique")
+
+		_, err = conn.Exec(ctx, `
+			BEGIN;
+			INSERT INTO chat.workspaces (id, slug, name)
+			VALUES ('70000000-0000-0000-0000-000000000004', 'dm-unique-b', 'DM Unique B');
+			INSERT INTO chat.channels (workspace_id, slug, display_name, type, is_general)
+			VALUES ('70000000-0000-0000-0000-000000000004', 'geral', 'Geral', 'public', true);
+			INSERT INTO chat.dm_conversations
+				(workspace_id, type, status, created_by, direct_pair_key)
+			VALUES
+				('70000000-0000-0000-0000-000000000004',
+				 'direct',
+				 'active',
+				 '70000000-0000-0000-0000-000000000001',
+				 '36:70000000-0000-0000-0000-00000000000136:70000000-0000-0000-0000-000000000002');
+			COMMIT;`)
+		if err != nil {
+			t.Fatalf("same pair key should be isolated by workspace: %v", err)
+		}
+	})
+
+	t.Run("dm SQL visibility excludes nonparticipants archived and inactive workspace members", func(t *testing.T) {
+		_, err := conn.Exec(ctx, `
+			BEGIN;
+			INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+			VALUES
+				('00000000-0000-0000-0000-000000000001', '80000000-0000-0000-0000-000000000001', 'active'),
+				('00000000-0000-0000-0000-000000000001', '80000000-0000-0000-0000-000000000002', 'active'),
+				('00000000-0000-0000-0000-000000000001', '80000000-0000-0000-0000-000000000003', 'active')
+			ON CONFLICT (workspace_id, user_id) DO UPDATE SET status = EXCLUDED.status;
+			INSERT INTO chat.dm_conversations
+				(id, workspace_id, type, status, created_by, direct_pair_key)
+			VALUES
+				('80000000-0000-0000-0000-000000000004',
+				 '00000000-0000-0000-0000-000000000001',
+				 'direct',
+				 'active',
+				 '80000000-0000-0000-0000-000000000001',
+				 '36:80000000-0000-0000-0000-00000000000136:80000000-0000-0000-0000-000000000002'),
+				('80000000-0000-0000-0000-000000000005',
+				 '00000000-0000-0000-0000-000000000001',
+				 'direct',
+				 'active',
+				 '80000000-0000-0000-0000-000000000002',
+				 '36:80000000-0000-0000-0000-00000000000236:80000000-0000-0000-0000-000000000003'),
+				('80000000-0000-0000-0000-000000000006',
+				 '00000000-0000-0000-0000-000000000001',
+				 'group',
+				 'archived',
+				 '80000000-0000-0000-0000-000000000001',
+				 NULL);
+			INSERT INTO chat.dm_members (conversation_id, user_id)
+			VALUES
+				('80000000-0000-0000-0000-000000000004', '80000000-0000-0000-0000-000000000001'),
+				('80000000-0000-0000-0000-000000000004', '80000000-0000-0000-0000-000000000002'),
+				('80000000-0000-0000-0000-000000000005', '80000000-0000-0000-0000-000000000002'),
+				('80000000-0000-0000-0000-000000000005', '80000000-0000-0000-0000-000000000003'),
+				('80000000-0000-0000-0000-000000000006', '80000000-0000-0000-0000-000000000001');
+			COMMIT;`)
+		if err != nil {
+			t.Fatalf("seed dm visibility cases: %v", err)
+		}
+
+		pool, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open dm visibility pool: %v", err)
+		}
+		defer pool.Close()
+		store := storage.NewPGXDMStore(pool)
+
+		conversations, err := store.ListVisibleConversationsByUser(ctx, "00000000-0000-0000-0000-000000000001", "80000000-0000-0000-0000-000000000001")
+		if err != nil {
+			t.Fatalf("list visible dm conversations: %v", err)
+		}
+		assertDMConversationIDs(t, conversations, map[string]bool{
+			"80000000-0000-0000-0000-000000000004": true,
+		})
+
+		if _, err := store.GetVisibleConversationByID(ctx, "00000000-0000-0000-0000-000000000001", "80000000-0000-0000-0000-000000000005", "80000000-0000-0000-0000-000000000001"); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("nonparticipant read should be ErrNotFound, got %v", err)
+		}
+		if _, err := store.GetVisibleConversationByID(ctx, "00000000-0000-0000-0000-000000000001", "80000000-0000-0000-0000-000000000006", "80000000-0000-0000-0000-000000000001"); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("archived read should be ErrNotFound, got %v", err)
+		}
+
+		_, err = conn.Exec(ctx, `
+			UPDATE chat.workspace_members
+			SET status = 'suspended'
+			WHERE workspace_id = '00000000-0000-0000-0000-000000000001'
+			  AND user_id = '80000000-0000-0000-0000-000000000001'`)
+		if err != nil {
+			t.Fatalf("suspend dm caller: %v", err)
+		}
+		conversations, err = store.ListVisibleConversationsByUser(ctx, "00000000-0000-0000-0000-000000000001", "80000000-0000-0000-0000-000000000001")
+		if err != nil {
+			t.Fatalf("list suspended dm caller: %v", err)
+		}
+		if len(conversations) != 0 {
+			t.Fatalf("suspended caller must see no DMs, got %+v", conversations)
+		}
+	})
 }
 
 func requirePostgresConstraint(t *testing.T, err error, constraint string) {
@@ -291,6 +426,18 @@ func assertChannelIDs(t *testing.T, channels []domain.Channel, expected map[stri
 	for _, channel := range channels {
 		if !expected[channel.ID] {
 			t.Fatalf("unexpected channel returned: %+v", channel)
+		}
+	}
+}
+
+func assertDMConversationIDs(t *testing.T, conversations []domain.DMConversation, expected map[string]bool) {
+	t.Helper()
+	if len(conversations) != len(expected) {
+		t.Fatalf("expected %d conversations, got %+v", len(expected), conversations)
+	}
+	for _, conversation := range conversations {
+		if !expected[conversation.ID] {
+			t.Fatalf("unexpected conversation returned: %+v", conversation)
 		}
 	}
 }
