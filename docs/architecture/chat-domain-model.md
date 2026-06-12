@@ -3,11 +3,12 @@
 > **MVP foundation only.** Single/default workspace.
 > Full multi-workspace (RF-68..RF-72) is out of scope.
 > Full RBAC (RF-74) is out of scope; only minimal role/permission foundation.
-> Messaging, WebSocket, E2E/MLS, search, and admin UI are out of scope.
+> WebSocket, E2E/MLS, search, and admin UI are out of scope.
 
-Migrations: `migrations/chat/000001_chat_domain_schema` and
-`migrations/chat/000002_chat_enforce_channel_workspace_isolation` and
-`migrations/chat/000003_chat_dm_conversations`
+Migrations: `migrations/chat/000001_chat_domain_schema`,
+`migrations/chat/000002_chat_enforce_channel_workspace_isolation`,
+`migrations/chat/000003_chat_dm_conversations`, and
+`migrations/chat/000004_chat_messages`
 Schema: `chat`
 
 ## Table summary
@@ -18,7 +19,8 @@ Schema: `chat`
     │   └── chat.channel_members (channel_id FK, CASCADE delete)
     ├── chat.dm_conversations    (workspace_id FK, CASCADE delete)
     │   └── chat.dm_members      (conversation_id FK, CASCADE delete)
-    └── chat.workspace_members   (workspace_id FK, CASCADE delete)
+    ├── chat.workspace_members   (workspace_id FK, CASCADE delete)
+    └── chat.messages            (workspace_id FK, CASCADE delete; composite channel/DM FKs)
 
 ## Seed data
 
@@ -121,6 +123,30 @@ where the general channel is loaded by the same `workspace_id`. Duplicate rows
 are ignored with `ON CONFLICT DO NOTHING`; unexpected database errors propagate.
 If `#geral` is missing, membership sync returns an explicit error instead of
 creating the channel in this path.
+
+### messages
+
+| Column                    | Type        | Notes                                                      |
+| ------------------------- | ----------- | ---------------------------------------------------------- |
+| id                        | uuid        | PK, gen_random_uuid()                                      |
+| workspace_id              | uuid        | FK → workspaces (CASCADE)                                  |
+| channel_id                | uuid        | Nullable; composite FK (workspace_id, channel_id)          |
+| dm_conversation_id        | uuid        | Nullable; composite FK (workspace_id, dm_conversation_id)  |
+| sender_id                 | uuid        | auth.users ref (no FK)                                     |
+| kind                      | text        | user / system                                              |
+| body_text                 | text        | Max 40,000 characters; plain text (rich text future scope) |
+| status                    | text        | active / deleted (soft delete)                             |
+| parent_message_id         | uuid        | Nullable; self-ref FK for quote-reply (RF-07)              |
+| forwarded_from_message_id | uuid        | Nullable; self-ref FK for forwarding (RF-08)               |
+| referenced_message_id     | uuid        | Nullable; self-ref FK for references (RF-09)               |
+| edited_at                 | timestamptz | Nullable; set on first edit (RF-13)                        |
+| deleted_at                | timestamptz | Nullable; set on soft delete (RF-14, RF-66)                |
+| created_at                | timestamptz |                                                            |
+| updated_at                | timestamptz |                                                            |
+
+Exactly one of `channel_id` and `dm_conversation_id` must be non-null
+(`CONSTRAINT messages_exactly_one_target`). Composite FKs ensure the referenced
+channel or DM belongs to the same workspace as the message.
 
 ## Permission rules
 
@@ -243,9 +269,79 @@ archived conversations, and non-participant access all return `ErrNotFound`.
 There are no HTTP endpoints yet because `chat-service` still lacks authenticated
 user context/middleware.
 
+## Message model foundation
+
+`MessageService` implements the backend service/storage foundation for messages
+in channels and DM conversations. This is message model foundation only.
+
+**Not implemented in this PR:**
+
+- No HTTP endpoints (service lacks authenticated user context/middleware).
+- No WebSocket / realtime delivery.
+- No reactions (RF-03), mentions notifications (RF-04), pinned (RF-05), or
+  favorites (RF-06) implementation — schema placeholders only.
+- No attachments / file upload.
+- No E2E/MLS encryption.
+- No auth-service changes or FK to `auth.users`.
+- No full retention worker / trash lifecycle (RF-64..RF-67); model-ready only.
+- No edit history table (RF-13); `edited_at` column is present for future use.
+- No delete operation (RF-14, RF-66); `deleted_at` and `status='deleted'` columns
+  are present as placeholders.
+
+**Implemented service/storage operations:**
+
+- post a message to a public or private channel;
+- post a message to a direct or group DM conversation;
+- list messages for a channel visible to the caller (SQL-enforced, up to 100);
+- list messages for a DM conversation visible to the caller (SQL-enforced, up to 100).
+
+### Message targets and exactly-one-target constraint
+
+A message belongs to exactly one target: a `channel_id` or a
+`dm_conversation_id`, never both, never neither. This is enforced at three
+layers:
+
+1. **Database** — `CONSTRAINT messages_exactly_one_target CHECK ((channel_id IS NULL) <> (dm_conversation_id IS NULL))`.
+2. **Database** — composite FKs `(workspace_id, channel_id)` and
+   `(workspace_id, dm_conversation_id)` enforce that the referenced channel/DM
+   belongs to the same workspace as the message.
+3. **Service** — `MessageService.CreateChannelMessage` only sets `channel_id`;
+   `CreateDMMessage` only sets `dm_conversation_id`.
+
+### Visibility and access control
+
+Channel message creation and listing enforce visibility via the SQL JOIN on
+`chat.channels`, `chat.workspaces`, `chat.workspace_members`, and
+`chat.channel_members` (for private channels), following the same pattern as
+`ListVisibleChannelsByUser`. DM message creation and listing enforce visibility
+via the same SQL JOINs used by `GetVisibleConversationByID`.
+
+Non-enumerating behavior: suspended/left workspace members, non-channel-members
+on private channels, non-DM-participants, archived targets, and cross-workspace
+target IDs all yield `ErrNotFound`.
+
+### Reference messages (parent, forwarded_from, referenced)
+
+`parent_message_id`, `forwarded_from_message_id`, and `referenced_message_id`
+are nullable placeholders for quote-reply (RF-07), forwarding (RF-08), and
+references (RF-09). When provided, the service validates:
+
+- The ID is a valid UUID.
+- The referenced message exists in the same workspace.
+- The referenced message belongs to the same target (channel or DM conversation).
+
+Cross-workspace and cross-target references are rejected with `ErrInvalidInput`.
+
+### Soft delete and message lifecycle
+
+Deletion is model-ready: `status` can be `'deleted'` and `deleted_at` records
+the soft-delete time. The service does not yet expose a delete operation; that
+is deferred to a future PR (RF-14, RF-66, RF-67). Listing returns messages with
+`status='deleted'` as placeholder records; body redaction policy is future scope.
+
 ## Cross-schema identity
 
-`workspace_members.user_id`, `channel_members.user_id`, and `dm_members.user_id`
-reference `auth.users.id` **by convention only** — no cross-schema FK
-constraint. This preserves service ownership boundaries and avoids tight
-coupling between auth and chat schemas.
+`workspace_members.user_id`, `channel_members.user_id`, `dm_members.user_id`,
+and `messages.sender_id` reference `auth.users.id` **by convention only** — no
+cross-schema FK constraint. This preserves service ownership boundaries and
+avoids tight coupling between auth and chat schemas.

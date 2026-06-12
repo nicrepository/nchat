@@ -12,4 +12,5 @@ var (
 	ErrGeneralChannelExists      = errors.New("workspace already has a general channel")
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
+	ErrInvalidMessageTarget      = errors.New("invalid message target")
 )
