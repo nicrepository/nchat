@@ -34,7 +34,6 @@ function renderCallback(initialEntry: string) {
 
 const SUCCESS_RESPONSE = {
   accessToken: "at",
-  refreshToken: "rt",
   tokenType: "Bearer",
   expiresIn: 900,
   user: { id: "u1", email: "sso@example.com", displayName: "SSO", mustChangePassword: false },
@@ -54,7 +53,7 @@ describe("OIDCCallbackPage", () => {
 
     await waitFor(() => {
       expect(mockOIDCExchange).toHaveBeenCalledWith("opaque-code");
-      expect(mockSetTokens).toHaveBeenCalledWith("at", "rt");
+      expect(mockSetTokens).toHaveBeenCalledWith("at");
       expect(mockNavigate).toHaveBeenCalledWith("/", { replace: true });
     });
     expect(mockOIDCExchange).toHaveBeenCalledTimes(1);

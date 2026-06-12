@@ -21,9 +21,9 @@ LoginPage  →  browser navigation  →  GET /auth/oidc/keycloak/login  (backend
                                            ↓
                                redirect → /oidc-callback?code=<opaque>
                                            ↓
-OIDCCallbackPage  →  POST /auth/oidc/keycloak/exchange  →  NChat access + refresh tokens
+OIDCCallbackPage  →  POST /auth/oidc/keycloak/exchange  →  access token (JSON) + nchat_rt (HttpOnly cookie)
                                            ↓
-                               sessionStorage  →  navigate /
+                               sessionStorage[nchat_at]  →  navigate /
 ```
 
 **Key points:**
@@ -34,9 +34,10 @@ OIDCCallbackPage  →  POST /auth/oidc/keycloak/exchange  →  NChat access + re
 - The exchange code is removed from the browser URL **before the network call** via
   `window.history.replaceState`, so it cannot leak through the `Referer` header on the `POST`
   and does not appear in browser history.
-- Tokens are stored via the existing `setTokens` helper from `authSession.ts` in `sessionStorage`
-  (keys `nchat_at`, `nchat_rt`), consistent with the email/password login flow. See
-  `task-frontend-auth-entry-flows.md` for storage rationale.
+- The backend response sets the refresh token as an `HttpOnly; Secure; SameSite=Strict` cookie
+  (`nchat_rt`). Only the access token is returned in the JSON body and stored in `sessionStorage`
+  (`nchat_at`). JavaScript cannot read the refresh token. See `task-frontend-auth-entry-flows.md`
+  for full storage rationale.
 
 ## Frontend components
 
@@ -88,12 +89,12 @@ written to `console`, or included in tests.
 ## Config
 
 The auth API base URL is read from the `VITE_AUTH_API_BASE_URL` env variable, defaulting to
-`/api/auth` for same-origin gateway calls. Override in `.env.local` for direct auth-service
-development:
+`/api/auth`. **Same-origin via the gateway is the only supported mode in this MVP.**
 
-```env
-VITE_AUTH_API_BASE_URL=http://localhost:8081/auth
-```
+> **Cross-origin is not supported.** `apiFetch` does not set `credentials: "include"`, so the
+> `nchat_rt` HttpOnly cookie is **not transmitted** on cross-origin requests. Setting
+> `VITE_AUTH_API_BASE_URL=http://localhost:8081/auth` would silently break token refresh and
+> logout. Use the gateway (`/api/auth`) for all development and testing.
 
 ## Out of scope
 

@@ -1,5 +1,4 @@
 const ACCESS_TOKEN_KEY = "nchat_at";
-const REFRESH_TOKEN_KEY = "nchat_rt";
 
 type AuthChangeListener = () => void;
 
@@ -13,7 +12,6 @@ function notifyAuthChange(): void {
 
 /**
  * Register a callback that fires whenever tokens are set or cleared.
- * The callback receives no arguments — callers read state via isAuthenticated().
  * Returns an unsubscribe function.
  */
 export function onAuthChange(listener: AuthChangeListener): () => void {
@@ -28,9 +26,13 @@ export function _resetListeners(): void {
   listeners.clear();
 }
 
-export function setTokens(accessToken: string, refreshToken: string): void {
+/**
+ * Persist the access token in sessionStorage.
+ * The refresh token is managed server-side via an HttpOnly cookie — it is
+ * never stored in Web Storage.
+ */
+export function setTokens(accessToken: string): void {
   sessionStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
-  sessionStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
   notifyAuthChange();
 }
 
@@ -38,13 +40,8 @@ export function getAccessToken(): string | null {
   return sessionStorage.getItem(ACCESS_TOKEN_KEY);
 }
 
-export function getRefreshToken(): string | null {
-  return sessionStorage.getItem(REFRESH_TOKEN_KEY);
-}
-
 export function clearTokens(): void {
   sessionStorage.removeItem(ACCESS_TOKEN_KEY);
-  sessionStorage.removeItem(REFRESH_TOKEN_KEY);
   notifyAuthChange();
 }
 

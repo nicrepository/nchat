@@ -43,9 +43,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	forgotTargetLimiter := newTargetAwareRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, rateLimitKeyer, "forgot-email")
 	resetTargetLimiter := newTargetAwareRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, rateLimitKeyer, "password-reset-"+"to"+"ken")
 	inviteAcceptTargetLimiter := newTargetAwareRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, rateLimitKeyer, "invite-accept-"+"to"+"ken")
-	mux.Handle(RouteAuthRefresh, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthRefresh(auth))))
+	mux.Handle(RouteAuthRefresh, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthRefresh(auth, cfg.AuthRefreshTokenTTLSeconds))))
 	mux.Handle(RouteAuthLogout, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthLogout(auth))))
-	mux.Handle(RouteAuthLogin, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthLogin(login, trustedProxyCIDRs))))
+	mux.Handle(RouteAuthLogin, httputil.MethodNotAllowed(http.MethodPost, tokenEndpointLimiter.Middleware(AuthLogin(login, trustedProxyCIDRs, cfg.AuthRefreshTokenTTLSeconds))))
 	forgotHandler := AuthForgotPassword(password, forgotTargetLimiter)
 	if password != nil && emailHandoffAvailable(password) {
 		forgotHandler = forgotIPLimiter.Middleware(forgotHandler)
@@ -59,7 +59,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	}
 	oidcLoginHandler := OIDCLogin(oidc)
 	oidcCallbackHandler := OIDCCallback(oidc, trustedProxyCIDRs)
-	oidcExchangeHandler := OIDCExchange(oidc)
+	oidcExchangeHandler := OIDCExchange(oidc, cfg.AuthRefreshTokenTTLSeconds)
 	if cfg.OIDCEnabled && oidc != nil {
 		oidcLoginHandler = oidcIPLimiter.Middleware(oidcLoginHandler)
 		oidcCallbackHandler = oidcIPLimiter.Middleware(oidcCallbackHandler)

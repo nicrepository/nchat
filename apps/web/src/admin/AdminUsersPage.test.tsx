@@ -22,7 +22,7 @@ vi.mock("./adminUsersApi", () => ({
 
 function renderAdminUsersRoute(authenticated = true) {
   if (authenticated) {
-    setTokens("at", "rt");
+    setTokens("at");
   } else {
     clearTokens();
   }
@@ -77,11 +77,10 @@ afterEach(() => {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 describe("AdminUsersPage — route protection", () => {
-  it("redirects unauthenticated user to /login", () => {
-    mockListAdminUsers.mockResolvedValue([]);
+  it("redirects unauthenticated user to /login", async () => {
     renderAdminUsersRoute(false);
 
-    expect(screen.getByText("Login page")).toBeInTheDocument();
+    expect(await screen.findByText("Login page")).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
 

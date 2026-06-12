@@ -8,14 +8,13 @@ export interface LoginInput {
   deviceName?: string;
 }
 
-export interface TokenPair {
+export interface TokenResponse {
   accessToken: string;
-  refreshToken: string;
   tokenType: string;
   expiresIn: number;
 }
 
-export interface LoginResponse extends TokenPair {
+export interface LoginResponse extends TokenResponse {
   user: {
     id: string;
     email: string;
@@ -41,7 +40,6 @@ export interface AcceptInviteResponse {
 
 type RawLoginResponse = {
   access_token: string;
-  refresh_token: string;
   token_type: string;
   expires_in: number;
   user: {
@@ -54,7 +52,6 @@ type RawLoginResponse = {
 
 type RawTokenResponse = {
   access_token: string;
-  refresh_token: string;
   token_type: string;
   expires_in: number;
 };
@@ -67,10 +64,9 @@ type RawAcceptInviteResponse = {
   created_at: string;
 };
 
-function mapTokenPair(raw: RawTokenResponse): TokenPair {
+function mapTokenPair(raw: RawTokenResponse): TokenResponse {
   return {
     accessToken: raw.access_token,
-    refreshToken: raw.refresh_token,
     tokenType: raw.token_type,
     expiresIn: raw.expires_in,
   };
@@ -114,19 +110,25 @@ export async function oidcExchange(code: string): Promise<LoginResponse> {
   return mapLoginResponse(raw);
 }
 
-export async function refresh(refreshToken: string): Promise<TokenPair> {
+/**
+ * Request a token refresh. The refresh token is carried automatically via the
+ * HttpOnly nchat_rt cookie — no token value is sent in the request body.
+ */
+export async function refresh(): Promise<TokenResponse> {
   const raw = await apiFetch<RawTokenResponse>(`${AUTH_BASE}/refresh`, {
     method: "POST",
-    body: JSON.stringify({ refresh_token: refreshToken }),
   });
 
   return mapTokenPair(raw);
 }
 
-export async function logout(refreshToken: string): Promise<void> {
+/**
+ * Log out the current session. The refresh token is carried automatically via
+ * the HttpOnly nchat_rt cookie — no token value is sent in the request body.
+ */
+export async function logout(): Promise<void> {
   await apiFetch<void>(`${AUTH_BASE}/logout`, {
     method: "POST",
-    body: JSON.stringify({ refresh_token: refreshToken }),
   });
 }
 

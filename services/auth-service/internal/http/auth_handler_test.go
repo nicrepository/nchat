@@ -33,6 +33,29 @@ func (f *fakeAuthService) Logout(_ context.Context, refreshToken string) error {
 	return f.logoutErr
 }
 
+// refreshCookieFor builds an *http.Cookie with the given value to attach to a test request.
+func refreshCookieFor(value string) *http.Cookie {
+	return &http.Cookie{
+		Name:     "nchat_rt",
+		Value:    value,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+// findRefreshCookie returns the nchat_rt Set-Cookie entry from the response, or nil if absent.
+func findRefreshCookie(rec *httptest.ResponseRecorder) *http.Cookie {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "nchat_rt" {
+			return c
+		}
+	}
+	return nil
+}
+
+// --- AuthRefresh tests ---
+
 func TestAuthRefresh_SuccessReturnsTokenResponse(t *testing.T) {
 	submitted := makeTestOpaqueValue("auth-refresh-submitted")
 	access := makeTestOpaqueValue("auth-refresh-access")
@@ -43,9 +66,10 @@ func TestAuthRefresh_SuccessReturnsTokenResponse(t *testing.T) {
 		TokenType:    "Bearer",
 		ExpiresIn:    900,
 	}}
-	handler := httpapi.AuthRefresh(auth)
+	handler := httpapi.AuthRefresh(auth, 3600)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, nil)
+	req.AddCookie(refreshCookieFor(submitted))
 
 	handler.ServeHTTP(rec, req)
 
@@ -60,24 +84,51 @@ func TestAuthRefresh_SuccessReturnsTokenResponse(t *testing.T) {
 		RefreshToken string `json:"refresh_token"`
 		TokenType    string `json:"token_type"`
 		ExpiresIn    int    `json:"expires_in"`
-		TokenHash    string `json:"refresh_token_hash"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.AccessToken != access || body.RefreshToken != nextRefresh || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
+	if body.AccessToken != access || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
 		t.Fatalf("unexpected response: %+v", body)
 	}
-	if body.TokenHash != "" || strings.Contains(rec.Body.String(), "hash") {
-		t.Fatalf("response must not include token hash: %s", rec.Body.String())
+	if body.RefreshToken != "" {
+		t.Fatalf("refresh_token must not appear in JSON body, got %q", body.RefreshToken)
+	}
+	// New refresh token must be delivered via Set-Cookie.
+	rtCookie := findRefreshCookie(rec)
+	if rtCookie == nil {
+		t.Fatal("expected nchat_rt Set-Cookie in response")
+	}
+	if rtCookie.Value != nextRefresh {
+		t.Fatalf("expected cookie value %q, got %q", nextRefresh, rtCookie.Value)
+	}
+	if !rtCookie.HttpOnly {
+		t.Fatal("expected nchat_rt cookie to be HttpOnly")
+	}
+	if !rtCookie.Secure {
+		t.Fatal("expected nchat_rt cookie to be Secure")
+	}
+	if rtCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("expected SameSite=Strict, got %v", rtCookie.SameSite)
+	}
+}
+
+func TestAuthRefresh_MissingCookieReturns401(t *testing.T) {
+	handler := httpapi.AuthRefresh(&fakeAuthService{}, 3600)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, nil)
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
 func TestAuthRefresh_MissingSecretOrStoreReturns503(t *testing.T) {
-	handler := httpapi.AuthRefresh(nil)
+	handler := httpapi.AuthRefresh(nil, 0)
 	rec := httptest.NewRecorder()
-	submitted := makeTestOpaqueValue("auth-refresh-unavailable")
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, nil)
 
 	handler.ServeHTTP(rec, req)
 
@@ -87,10 +138,11 @@ func TestAuthRefresh_MissingSecretOrStoreReturns503(t *testing.T) {
 }
 
 func TestAuthRefresh_RevokedOrExpiredRefreshRejected(t *testing.T) {
-	handler := httpapi.AuthRefresh(&fakeAuthService{refreshErr: domain.ErrInvalidRefreshToken})
+	handler := httpapi.AuthRefresh(&fakeAuthService{refreshErr: domain.ErrInvalidRefreshToken}, 3600)
 	rec := httptest.NewRecorder()
 	submitted := makeTestOpaqueValue("auth-refresh-invalid")
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, nil)
+	req.AddCookie(refreshCookieFor(submitted))
 
 	handler.ServeHTTP(rec, req)
 
@@ -99,10 +151,11 @@ func TestAuthRefresh_RevokedOrExpiredRefreshRejected(t *testing.T) {
 	}
 }
 
-func TestAuthRefresh_InvalidJSONReturns400(t *testing.T) {
-	handler := httpapi.AuthRefresh(&fakeAuthService{})
+func TestAuthRefresh_ServiceInvalidInputReturns400(t *testing.T) {
+	handler := httpapi.AuthRefresh(&fakeAuthService{refreshErr: domain.ErrInvalidInput}, 3600)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`not-json`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, nil)
+	req.AddCookie(refreshCookieFor("")) // empty value → service returns ErrInvalidInput
 
 	handler.ServeHTTP(rec, req)
 
@@ -111,72 +164,15 @@ func TestAuthRefresh_InvalidJSONReturns400(t *testing.T) {
 	}
 }
 
-func TestAuthRefresh_OversizedBodyReturns413(t *testing.T) {
-	auth := &fakeAuthService{pair: domain.TokenPair{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer", ExpiresIn: 900}}
-	handler := httpapi.AuthRefresh(auth)
-	rec := httptest.NewRecorder()
-	body := `{"refresh_token":"` + strings.Repeat("a", 5000) + `"}`
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(body))
+// --- AuthLogout tests ---
 
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if auth.refreshToken != "" {
-		t.Fatalf("oversized body must not reach service, got token %q", auth.refreshToken)
-	}
-	if strings.Contains(rec.Body.String(), strings.Repeat("a", 32)) {
-		t.Fatalf("response must not echo token material: %s", rec.Body.String())
-	}
-}
-
-func TestAuthRefresh_OversizedTrailingBodyReturns413(t *testing.T) {
-	auth := &fakeAuthService{pair: domain.TokenPair{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer", ExpiresIn: 900}}
-	handler := httpapi.AuthRefresh(auth)
-	rec := httptest.NewRecorder()
-	body := `{"refresh_token":"` + makeTestOpaqueValue("auth-refresh-trailing") + `"}` + strings.Repeat(" ", 5000)
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(body))
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if auth.refreshToken != "" {
-		t.Fatalf("oversized trailing body must not reach service, got token %q", auth.refreshToken)
-	}
-	if strings.Contains(rec.Body.String(), strings.Repeat(" ", 32)) {
-		t.Fatalf("response must not echo token material: %s", rec.Body.String())
-	}
-}
-
-func TestAuthLogout_OversizedBodyReturns413(t *testing.T) {
-	auth := &fakeAuthService{}
-	handler := httpapi.AuthLogout(auth)
-	rec := httptest.NewRecorder()
-	body := `{"refresh_token":"` + strings.Repeat("b", 5000) + `"}`
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(body))
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if auth.logoutToken != "" {
-		t.Fatalf("oversized body must not reach service, got token %q", auth.logoutToken)
-	}
-	if strings.Contains(rec.Body.String(), strings.Repeat("b", 32)) {
-		t.Fatalf("response must not echo token material: %s", rec.Body.String())
-	}
-}
-
-func TestAuthLogout_SuccessReturns204(t *testing.T) {
+func TestAuthLogout_SuccessReturns204AndClearsCookie(t *testing.T) {
 	auth := &fakeAuthService{}
 	handler := httpapi.AuthLogout(auth)
 	rec := httptest.NewRecorder()
 	submitted := makeTestOpaqueValue("auth-logout-submitted")
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, nil)
+	req.AddCookie(refreshCookieFor(submitted))
 
 	handler.ServeHTTP(rec, req)
 
@@ -189,13 +185,38 @@ func TestAuthLogout_SuccessReturns204(t *testing.T) {
 	if auth.logoutToken != submitted {
 		t.Fatalf("expected raw refresh token passed to service, got %q", auth.logoutToken)
 	}
+	// Response must include a Set-Cookie that clears nchat_rt.
+	rtCookie := findRefreshCookie(rec)
+	if rtCookie == nil {
+		t.Fatal("expected nchat_rt clear-cookie in logout response")
+	}
+	if rtCookie.MaxAge != -1 && rtCookie.Value != "" {
+		t.Fatalf("expected clear-cookie (MaxAge=-1 or empty value), got MaxAge=%d value=%q", rtCookie.MaxAge, rtCookie.Value)
+	}
+}
+
+func TestAuthLogout_MissingCookieReturns204AndClearsCookie(t *testing.T) {
+	handler := httpapi.AuthLogout(&fakeAuthService{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, nil)
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 when cookie absent, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rtCookie := findRefreshCookie(rec)
+	if rtCookie == nil {
+		t.Fatal("expected nchat_rt clear-cookie in response even when no cookie sent")
+	}
 }
 
 func TestAuthLogout_MissingSecretOrStoreReturns503(t *testing.T) {
 	handler := httpapi.AuthLogout(nil)
 	rec := httptest.NewRecorder()
 	submitted := makeTestOpaqueValue("auth-logout-unavailable")
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, nil)
+	req.AddCookie(refreshCookieFor(submitted))
 
 	handler.ServeHTTP(rec, req)
 
@@ -208,7 +229,8 @@ func TestAuthLogout_InvalidRefreshTokenReturns204(t *testing.T) {
 	handler := httpapi.AuthLogout(&fakeAuthService{logoutErr: domain.ErrInvalidRefreshToken})
 	rec := httptest.NewRecorder()
 	submitted := makeTestOpaqueValue("auth-logout-invalid")
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, nil)
+	req.AddCookie(refreshCookieFor(submitted))
 
 	handler.ServeHTTP(rec, req)
 
@@ -218,46 +240,34 @@ func TestAuthLogout_InvalidRefreshTokenReturns204(t *testing.T) {
 	if rec.Body.Len() != 0 {
 		t.Fatalf("expected empty body, got %s", rec.Body.String())
 	}
+	rtCookie := findRefreshCookie(rec)
+	if rtCookie == nil {
+		t.Fatal("expected nchat_rt clear-cookie for invalid refresh token")
+	}
+	if rtCookie.MaxAge != -1 {
+		t.Fatalf("expected MaxAge=-1 (clear-cookie), got MaxAge=%d", rtCookie.MaxAge)
+	}
 }
 
-func TestAuthLogout_InternalErrorReturns500(t *testing.T) {
+func TestAuthLogout_InternalErrorReturns500AndDoesNotClearCookie(t *testing.T) {
 	handler := httpapi.AuthLogout(&fakeAuthService{logoutErr: errors.New("db down")})
 	rec := httptest.NewRecorder()
 	submitted := makeTestOpaqueValue("auth-logout-internal")
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, nil)
+	req.AddCookie(refreshCookieFor(submitted))
 
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", rec.Code)
 	}
-}
-
-func TestAuthRefresh_ServiceInvalidInputReturns400(t *testing.T) {
-	handler := httpapi.AuthRefresh(&fakeAuthService{refreshErr: domain.ErrInvalidInput})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthRefresh, strings.NewReader(`{"refresh_token":""}`))
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", rec.Code)
+	rtCookie := findRefreshCookie(rec)
+	if rtCookie != nil && rtCookie.MaxAge == -1 {
+		t.Fatalf("expected no nchat_rt clear-cookie on internal error, got MaxAge=%d", rtCookie.MaxAge)
 	}
 }
 
-func TestAuthLogout_InvalidJSONReturns400(t *testing.T) {
-	handler := httpapi.AuthLogout(&fakeAuthService{})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogout, strings.NewReader(`not-json`))
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", rec.Code)
-	}
-}
-
-// --- Login handler tests ---
+// --- AuthLogin tests ---
 
 type fakeLoginService struct {
 	result domain.LoginResult
@@ -278,7 +288,7 @@ func TestAuthLogin_SuccessReturnsTokenAndSafeUser(t *testing.T) {
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "u1", Email: "user@example.com", DisplayName: "User", MustChangePassword: true},
 	}}
-	handler := httpapi.AuthLogin(svc, nil)
+	handler := httpapi.AuthLogin(svc, nil, 3600)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -303,16 +313,39 @@ func TestAuthLogin_SuccessReturnsTokenAndSafeUser(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body.AccessToken != "at" || body.RefreshToken != "rt" || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
+	if body.AccessToken != "at" || body.TokenType != "Bearer" || body.ExpiresIn != 900 {
 		t.Fatalf("unexpected tokens: %+v", body)
+	}
+	if body.RefreshToken != "" {
+		t.Fatalf("refresh_token must not appear in JSON body, got %q", body.RefreshToken)
 	}
 	if body.User.ID != "u1" || body.User.Email != "user@example.com" || !body.User.MustChangePassword {
 		t.Fatalf("unexpected user: %+v", body.User)
 	}
+	// Refresh token must be delivered via HttpOnly cookie.
+	rtCookie := findRefreshCookie(rec)
+	if rtCookie == nil {
+		t.Fatal("expected nchat_rt Set-Cookie in login response")
+	}
+	if rtCookie.Value != "rt" {
+		t.Fatalf("expected cookie value %q, got %q", "rt", rtCookie.Value)
+	}
+	if !rtCookie.HttpOnly {
+		t.Fatal("expected nchat_rt cookie to be HttpOnly")
+	}
+	if !rtCookie.Secure {
+		t.Fatal("expected nchat_rt cookie to be Secure")
+	}
+	if rtCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("expected SameSite=Strict, got %v", rtCookie.SameSite)
+	}
+	if rtCookie.Path != "/api/auth" {
+		t.Fatalf("expected Path=/api/auth, got %q", rtCookie.Path)
+	}
 }
 
 func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{err: domain.ErrInvalidCredentials}, nil)
+	handler := httpapi.AuthLogin(&fakeLoginService{err: domain.ErrInvalidCredentials}, nil, 0)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"wrong"}`))
@@ -328,7 +361,7 @@ func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {
 }
 
 func TestAuthLogin_InvalidJSONReturns400(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{}, nil)
+	handler := httpapi.AuthLogin(&fakeLoginService{}, nil, 0)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin, strings.NewReader(`not-json`))
 
@@ -340,7 +373,7 @@ func TestAuthLogin_InvalidJSONReturns400(t *testing.T) {
 }
 
 func TestAuthLogin_TrailingJSONReturns400(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}, nil)
+	handler := httpapi.AuthLogin(&fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}, nil, 0)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"e","password":"p"}{"extra":"junk"}`))
@@ -353,7 +386,7 @@ func TestAuthLogin_TrailingJSONReturns400(t *testing.T) {
 }
 
 func TestAuthLogin_OversizedBodyReturns413(t *testing.T) {
-	handler := httpapi.AuthLogin(&fakeLoginService{}, nil)
+	handler := httpapi.AuthLogin(&fakeLoginService{}, nil, 0)
 	rec := httptest.NewRecorder()
 	body := `{"email":"user@example.com","password":"` + strings.Repeat("a", 5000) + `"}`
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin, strings.NewReader(body))
@@ -366,7 +399,7 @@ func TestAuthLogin_OversizedBodyReturns413(t *testing.T) {
 }
 
 func TestAuthLogin_ServiceNilReturns503(t *testing.T) {
-	handler := httpapi.AuthLogin(nil, nil)
+	handler := httpapi.AuthLogin(nil, nil, 0)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -386,7 +419,7 @@ func TestAuthLogin_ResponseDoesNotLeakSensitiveFields(t *testing.T) {
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "u1", Email: "user@example.com"},
 	}}
-	handler := httpapi.AuthLogin(svc, nil)
+	handler := httpapi.AuthLogin(svc, nil, 0)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
 		strings.NewReader(`{"email":"user@example.com","password":"Pass@123"}`))
@@ -394,10 +427,7 @@ func TestAuthLogin_ResponseDoesNotLeakSensitiveFields(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	body := rec.Body.String()
-	// Verify no raw password material or hash fields are leaked.
-	// Note: "must_change_password" is an intentional boolean field — we check for sensitive
-	// key names that would expose credential data, not the bool flag.
-	for _, sensitive := range []string{"password_hash", "device_fingerprint_hash", `"password":`, `"raw_password"`} {
+	for _, sensitive := range []string{"password_hash", "device_fingerprint_hash", `"password":`, `"raw_password"`, `"refresh_token"`} {
 		if strings.Contains(body, sensitive) {
 			t.Fatalf("response must not include %q: %s", sensitive, body)
 		}
@@ -407,7 +437,7 @@ func TestAuthLogin_ResponseDoesNotLeakSensitiveFields(t *testing.T) {
 func TestAuthLogin_TrustedProxy_RecordsXFFAsClientIP(t *testing.T) {
 	svc := &fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}
 	cidrs := httputil.ParseCIDRs("10.0.0.0/8")
-	handler := httpapi.AuthLogin(svc, cidrs)
+	handler := httpapi.AuthLogin(svc, cidrs, 0)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
@@ -428,7 +458,7 @@ func TestAuthLogin_TrustedProxy_RecordsXFFAsClientIP(t *testing.T) {
 func TestAuthLogin_TrustedProxy_MalformedXFF_UsesRemoteAddr(t *testing.T) {
 	svc := &fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}
 	cidrs := httputil.ParseCIDRs("10.0.0.0/8")
-	handler := httpapi.AuthLogin(svc, cidrs)
+	handler := httpapi.AuthLogin(svc, cidrs, 0)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
@@ -448,7 +478,7 @@ func TestAuthLogin_TrustedProxy_MalformedXFF_UsesRemoteAddr(t *testing.T) {
 
 func TestAuthLogin_NoTrustedProxy_UsesRemoteAddr(t *testing.T) {
 	svc := &fakeLoginService{result: domain.LoginResult{TokenType: "Bearer"}}
-	handler := httpapi.AuthLogin(svc, nil)
+	handler := httpapi.AuthLogin(svc, nil, 0)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,

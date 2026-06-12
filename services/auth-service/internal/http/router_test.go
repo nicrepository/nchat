@@ -323,7 +323,14 @@ func TestAuthTokenEndpointRateLimiterAllowsRequestsUnderLimit(t *testing.T) {
 	submitted := makeInternalTestOpaqueValue("router-rate-limit-refresh")
 	for i := 0; i < 2; i++ {
 		response := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+		req := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, nil)
+		req.AddCookie(&http.Cookie{
+			Name:     "nchat_rt",
+			Value:    submitted,
+			Secure:   true,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
 		req.RemoteAddr = "203.0.113.10:12345"
 
 		router.ServeHTTP(response, req)
@@ -340,13 +347,20 @@ func TestAuthTokenEndpointRateLimiterRejectsRequestsOverLimit(t *testing.T) {
 
 	submitted := makeInternalTestOpaqueValue("router-rate-limit-secret")
 	first := httptest.NewRecorder()
-	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	firstReq := httptest.NewRequest(http.MethodPost, RouteAuthRefresh, nil)
+	firstReq.AddCookie(&http.Cookie{
+		Name:     "nchat_rt",
+		Value:    submitted,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 	firstReq.RemoteAddr = "203.0.113.20:12345"
 	router.ServeHTTP(first, firstReq)
 	assertJSONResponse(t, first, http.StatusOK)
 
 	second := httptest.NewRecorder()
-	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, strings.NewReader(`{"refresh_token":"`+submitted+`"}`))
+	secondReq := httptest.NewRequest(http.MethodPost, RouteAuthLogout, nil)
 	secondReq.RemoteAddr = "203.0.113.20:12345"
 	router.ServeHTTP(second, secondReq)
 

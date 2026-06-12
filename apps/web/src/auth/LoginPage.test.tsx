@@ -98,7 +98,7 @@ describe("LoginPage", () => {
     await userEvent.type(screen.getByLabelText(/senha/i), "pass");
     await userEvent.click(screen.getByRole("button", { name: /entrar$/i }));
     await waitFor(() => {
-      expect(mockSetTokens).toHaveBeenCalledWith("at", "rt");
+      expect(mockSetTokens).toHaveBeenCalledWith("at");
       expect(mockNavigate).toHaveBeenCalledWith("/", { replace: true });
     });
   });

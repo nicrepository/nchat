@@ -17,20 +17,22 @@ The prototype is a static visual reference only. Production code is implemented 
 | `/accept-invite` with query parameter `token`  | `AcceptInvitePage`          | `POST /auth/invites/accept`  |
 | protected app routes                           | `RequireAuth` -> `HomePage` | `POST /auth/refresh`         |
 
-`apps/web` defaults `VITE_AUTH_API_BASE_URL` to `/api/auth`, so same-origin gateway calls are sent as `/api/auth/*`. For direct auth-service development, override the base URL in `.env.local`:
+`apps/web` defaults `VITE_AUTH_API_BASE_URL` to `/api/auth`, so all auth calls are same-origin gateway requests to `/api/auth/*`. **Same-origin is the only supported mode in this MVP.**
 
-```env
-VITE_AUTH_API_BASE_URL=http://localhost:8081/auth
-```
+> **Cross-origin is not supported.** `apiFetch` does not set `credentials: "include"`, so the
+> `nchat_rt` HttpOnly cookie is **not transmitted** on cross-origin requests. Setting
+> `VITE_AUTH_API_BASE_URL=http://localhost:8081/auth` in `.env.local` would silently break token
+> refresh and logout while appearing to work for login. Use the gateway (`/api/auth`) for all
+> development and testing.
 
 ## Token storage decision
 
-The frontend stores access and refresh tokens in `sessionStorage` using keys `nchat_at` and `nchat_rt`.
+The access token (`nchat_at`) is kept in `sessionStorage`; the refresh token (`nchat_rt`) is stored exclusively in an `HttpOnly; Secure; SameSite=Strict` cookie set by the backend.
 
 - No `localStorage` is used.
-- `sessionStorage` is scoped to the current browser tab and is cleared by the browser when the tab closes.
-- `RequireAuth` allows a page reload when only the refresh token is present, attempts `POST /auth/refresh`, and redirects to `/login` if refresh fails.
-- If persistent sessions are needed later, prefer an `httpOnly` refresh-token cookie with backend coordination.
+- The access token is scoped to the current browser tab and is cleared when the tab closes.
+- The refresh token cookie is inaccessible to JavaScript, limiting the blast radius of an XSS exploit to the current access-token lifetime.
+- On page load, `RequireAuth` has no access token; it issues `POST /auth/refresh` so the browser sends the cookie automatically. If refresh fails (no cookie or revoked), the user is redirected to `/login`.
 
 ## Security notes
 
@@ -42,6 +44,7 @@ The frontend stores access and refresh tokens in `sessionStorage` using keys `nc
 - No frontend code logs passwords, access tokens, refresh tokens, reset tokens, invite tokens, or auth headers.
 - Invite acceptance does not auto-login because the backend returns user data, not tokens.
 - The SSO button is disabled because no supported frontend OIDC endpoint exists in this scope.
+- All auth calls are same-origin (`/api/auth`). Cross-origin is not supported in this MVP; see the `VITE_AUTH_API_BASE_URL` note above.
 
 ## Local commands
 

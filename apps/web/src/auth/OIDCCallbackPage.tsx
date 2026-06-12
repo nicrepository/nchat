@@ -38,7 +38,7 @@ export default function OIDCCallbackPage() {
     async function exchangeCode() {
       try {
         const result = await oidcExchange(code);
-        setTokens(result.accessToken, result.refreshToken);
+        setTokens(result.accessToken);
         navigate("/", { replace: true });
       } catch {
         setError(SSO_ERROR);

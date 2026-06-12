@@ -66,7 +66,7 @@ func OIDCCallback(oidc service.OIDCManager, trustedProxyCIDRs []*net.IPNet) http
 	})
 }
 
-func OIDCExchange(oidc service.OIDCManager) http.Handler {
+func OIDCExchange(oidc service.OIDCManager, refreshTTL int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if oidc == nil {
 			writeOIDCError(w, domain.ErrOIDCDisabled)
@@ -81,12 +81,11 @@ func OIDCExchange(oidc service.OIDCManager) http.Handler {
 			writeOIDCError(w, err)
 			return
 		}
-		//nolint:gosec // This endpoint serializes NChat tokens only after consuming a valid one-time OIDC exchange code.
+		//nolint:gosec // Access token returned to authenticated caller; refresh token set as HttpOnly cookie only.
 		body, marshalErr := json.Marshal(loginResponse{
-			AccessToken:  result.AccessToken,
-			RefreshToken: result.RefreshToken,
-			TokenType:    result.TokenType,
-			ExpiresIn:    result.ExpiresIn,
+			AccessToken: result.AccessToken,
+			TokenType:   result.TokenType,
+			ExpiresIn:   result.ExpiresIn,
 			User: loginUserResponse{
 				ID:                 result.User.ID,
 				Email:              result.User.Email,
@@ -98,6 +97,7 @@ func OIDCExchange(oidc service.OIDCManager) http.Handler {
 			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 			return
 		}
+		http.SetCookie(w, refreshCookie(result.RefreshToken, refreshTTL))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(append(body, '\n')) // nosemgrep
