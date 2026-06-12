@@ -115,3 +115,88 @@ func TestChatMigration_DMDownDoesNotDropSchemaCascade(t *testing.T) {
 		t.Fatal("dm down migration must not use cascade")
 	}
 }
+
+func TestChatMigration_AddsMessagesTable(t *testing.T) {
+	migration := readChatMigration(t, "000004_chat_messages.up.sql")
+	for _, expected := range []string{
+		"CREATE TABLE chat.messages",
+		"workspace_id",
+		"channel_id",
+		"dm_conversation_id",
+		"sender_id",
+		"body_text",
+		"parent_message_id",
+		"forwarded_from_message_id",
+		"referenced_message_id",
+		"edited_at",
+		"deleted_at",
+		"CHECK (kind   IN ('user', 'system'))",
+		"CHECK (status IN ('active', 'deleted'))",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("messages migration missing %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_EnforcesExactlyOneMessageTarget(t *testing.T) {
+	migration := readChatMigration(t, "000004_chat_messages.up.sql")
+	for _, expected := range []string{
+		"CONSTRAINT messages_exactly_one_target CHECK",
+		"(channel_id IS NULL) <> (dm_conversation_id IS NULL)",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("messages migration missing exactly-one-target constraint %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_EnforcesWorkspaceMessageTargetConsistency(t *testing.T) {
+	migration := readChatMigration(t, "000004_chat_messages.up.sql")
+	for _, expected := range []string{
+		"CONSTRAINT messages_workspace_channel_fk",
+		"FOREIGN KEY (workspace_id, channel_id)",
+		"REFERENCES chat.channels (workspace_id, id)",
+		"CONSTRAINT messages_workspace_dm_fk",
+		"FOREIGN KEY (workspace_id, dm_conversation_id)",
+		"REFERENCES chat.dm_conversations (workspace_id, id)",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("messages migration missing workspace-target consistency %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_AddsMessagesIndexes(t *testing.T) {
+	migration := readChatMigration(t, "000004_chat_messages.up.sql")
+	for _, expected := range []string{
+		"CREATE INDEX idx_messages_channel",
+		"CREATE INDEX idx_messages_dm",
+		"CREATE INDEX idx_messages_sender",
+		"CREATE INDEX idx_messages_parent",
+		"CREATE INDEX idx_messages_forwarded",
+		"CREATE INDEX idx_messages_referenced",
+		"WHERE channel_id IS NOT NULL",
+		"WHERE dm_conversation_id IS NOT NULL",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("messages migration missing index %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_MessagesDownDoesNotDropSchemaCascade(t *testing.T) {
+	migration := readChatMigration(t, "000004_chat_messages.down.sql")
+	if strings.Contains(strings.ToUpper(migration), "DROP SCHEMA") {
+		t.Fatal("messages down migration must not drop schema")
+	}
+	for _, expected := range []string{
+		"DROP TABLE IF EXISTS chat.messages",
+		"DROP CONSTRAINT IF EXISTS dm_conversations_workspace_id_id_unique",
+		"DROP CONSTRAINT IF EXISTS channels_workspace_id_id_unique",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("messages down migration missing %q", expected)
+		}
+	}
+}

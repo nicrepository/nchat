@@ -12,4 +12,9 @@ var (
 	ErrGeneralChannelExists      = errors.New("workspace already has a general channel")
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
+	ErrInvalidMessageTarget      = errors.New("invalid message target")
+	// ErrInvalidMessageReference is returned when a parent, forwarded_from, or
+	// referenced message ID fails validation. The error is intentionally generic so
+	// that callers cannot determine whether the referenced message exists.
+	ErrInvalidMessageReference = errors.New("invalid message reference")
 )

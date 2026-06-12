@@ -54,6 +54,7 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 		"000001_chat_domain_schema.up.sql",
 		"000002_chat_enforce_channel_workspace_isolation.up.sql",
 		"000003_chat_dm_conversations.up.sql",
+		"000004_chat_messages.up.sql",
 	} {
 		if _, err := conn.Exec(ctx, readChatMigration(t, name)); err != nil {
 			t.Fatalf("apply %s: %v", name, err)
