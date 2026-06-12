@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -898,5 +899,92 @@ func TestPGXMemberStore_GetChannelMember_DBError(t *testing.T) {
 	_, err = store.GetChannelMember(context.Background(), "ch-1", "user-1")
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestPGXMemberStore_RemoveChannelMember_Success(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-1", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
+	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
+		WithArgs("ch-1", "user-1").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+
+	store := storage.NewPGXMemberStore(mock)
+	if err := store.RemoveChannelMember(context.Background(), "ws-1", "ch-1", "user-1"); err != nil {
+		t.Fatalf("RemoveChannelMember: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_RemoveChannelMember_NotMember_Idempotent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-1", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
+	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
+		WithArgs("ch-1", "user-99").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+
+	store := storage.NewPGXMemberStore(mock)
+	if err := store.RemoveChannelMember(context.Background(), "ws-1", "ch-1", "user-99"); err != nil {
+		t.Fatalf("non-member remove should be idempotent, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_RemoveChannelMember_ChannelNotInWorkspace_Idempotent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-1", "ws-other").
+		WillReturnError(pgx.ErrNoRows)
+
+	store := storage.NewPGXMemberStore(mock)
+	if err := store.RemoveChannelMember(context.Background(), "ws-other", "ch-1", "user-1"); err != nil {
+		t.Fatalf("channel not in workspace should be idempotent, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_RemoveChannelMember_GeneralChannel_Denied(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-geral", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(true))
+
+	store := storage.NewPGXMemberStore(mock)
+	err = store.RemoveChannelMember(context.Background(), "ws-1", "ch-geral", "user-1")
+	if !errors.Is(err, domain.ErrCannotLeaveGeneralChannel) {
+		t.Fatalf("general channel remove should return ErrCannotLeaveGeneralChannel, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
