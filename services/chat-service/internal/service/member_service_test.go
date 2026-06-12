@@ -271,7 +271,7 @@ func TestMemberService_SelfJoinChannel_GeneralChannel_Idempotent(t *testing.T) {
 	}
 }
 
-func TestMemberService_SelfJoinChannel_PrivateChannel_Denied(t *testing.T) {
+func TestMemberService_SelfJoinChannel_PrivateChannel_ReturnsNotFound(t *testing.T) {
 	ms := newFakeMemberStore()
 	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
 	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
@@ -280,8 +280,8 @@ func TestMemberService_SelfJoinChannel_PrivateChannel_Denied(t *testing.T) {
 	}
 	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
 	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-priv", "user-1")
-	if !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("private channel self-join should return ErrForbidden, got: %v", err)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("private channel self-join must be non-enumerating (ErrNotFound), got: %v", err)
 	}
 }
 
@@ -303,10 +303,14 @@ func TestMemberService_SelfJoinChannel_SuspendedMember_Denied(t *testing.T) {
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
 		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended,
 	}
+	// Stale channel_members row must not bypass active workspace-member status check
+	ms.channelMembers[cmKey("ch-1", "user-1")] = domain.ChannelMember{
+		ChannelID: "ch-1", UserID: "user-1", Role: domain.ChannelRoleMember,
+	}
 	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
 	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-1", "user-1")
 	if !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("suspended member should get ErrForbidden, got: %v", err)
+		t.Fatalf("suspended member should get ErrForbidden even with stale channel membership row, got: %v", err)
 	}
 }
 
@@ -317,10 +321,14 @@ func TestMemberService_SelfJoinChannel_LeftMember_Denied(t *testing.T) {
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
 		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusLeft,
 	}
+	// Stale channel_members row must not bypass active workspace-member status check
+	ms.channelMembers[cmKey("ch-1", "user-1")] = domain.ChannelMember{
+		ChannelID: "ch-1", UserID: "user-1", Role: domain.ChannelRoleMember,
+	}
 	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
 	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-1", "user-1")
 	if !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("left member should get ErrForbidden, got: %v", err)
+		t.Fatalf("left member should get ErrForbidden even with stale channel membership row, got: %v", err)
 	}
 }
 
@@ -328,6 +336,10 @@ func TestMemberService_SelfJoinChannel_DisabledWorkspace_Denied(t *testing.T) {
 	ms := newFakeMemberStore()
 	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
 	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusDisabled}
+	// Seed active workspace membership so denial is from disabled workspace, not missing member
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
 	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
 	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-1", "user-1")
 	if !errors.Is(err, domain.ErrForbidden) {

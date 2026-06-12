@@ -50,7 +50,8 @@ func (s *MemberService) SyncGeneralMemberships(ctx context.Context, workspaceID 
 }
 
 // SelfJoinChannel adds userID to a public active channel in workspaceID.
-// Private channels are denied — no invitation model exists yet.
+// Private channel self-join returns ErrNotFound (non-enumerating: callers cannot
+// distinguish private channels from missing/archived/cross-workspace channels).
 // #geral explicit join is idempotent (returns existing membership).
 // The caller must be an active workspace member; the workspace must be active.
 // The channel role is always ChannelRoleMember; the caller cannot set it.
@@ -83,7 +84,10 @@ func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channe
 	}
 
 	if channel.Type == domain.ChannelTypePrivate {
-		return domain.ChannelMember{}, domain.ErrForbidden
+		// Non-enumerating: private channel existence must not be disclosed.
+		// Returns ErrNotFound so callers cannot distinguish private channels
+		// from missing/archived/cross-workspace channels.
+		return domain.ChannelMember{}, domain.ErrNotFound
 	}
 
 	m, err := s.members.AddChannelMember(ctx, channelID, userID, domain.ChannelRoleMember)
