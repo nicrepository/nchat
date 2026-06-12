@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -46,4 +47,48 @@ func (s *MemberService) EnsureGeneralMembership(ctx context.Context, workspaceID
 // workspace members.
 func (s *MemberService) SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error) {
 	return s.members.SyncGeneralMemberships(ctx, workspaceID)
+}
+
+// SelfJoinChannel adds userID to a public active channel in workspaceID.
+// Private channels are denied — no invitation model exists yet.
+// #geral explicit join is idempotent (returns existing membership).
+// The caller must be an active workspace member; the workspace must be active.
+// The channel role is always ChannelRoleMember; the caller cannot set it.
+func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channelID, userID string) (domain.ChannelMember, error) {
+	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
+	if err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("get channel: %w", err)
+	}
+
+	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.ChannelMember{}, domain.ErrForbidden
+		}
+		return domain.ChannelMember{}, fmt.Errorf("get workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+
+	wm, err := s.members.GetWorkspaceMember(ctx, workspaceID, userID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+	if err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("get workspace member: %w", err)
+	}
+	if wm.Status != domain.MemberStatusActive {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+
+	if channel.Type == domain.ChannelTypePrivate {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+
+	m, err := s.members.AddChannelMember(ctx, channelID, userID, domain.ChannelRoleMember)
+	if errors.Is(err, domain.ErrAlreadyMember) {
+		return s.members.GetChannelMember(ctx, channelID, userID)
+	}
+	return m, err
 }
