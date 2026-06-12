@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
@@ -54,27 +55,37 @@ func NewDMService(workspaces storage.WorkspaceStore, dms storage.DMStore, member
 // Archived direct DMs are reactivated by the storage upsert instead of creating duplicates.
 func (s *DMService) CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (domain.DMConversation, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	callerID := strings.TrimSpace(input.CallerID)
-	otherUserID := strings.TrimSpace(input.OtherUserID)
-	if workspaceID == "" || callerID == "" || otherUserID == "" {
+	rawCallerID := strings.TrimSpace(input.CallerID)
+	rawOtherUserID := strings.TrimSpace(input.OtherUserID)
+	if workspaceID == "" || rawCallerID == "" || rawOtherUserID == "" {
 		return domain.DMConversation{}, fmt.Errorf("%w: workspace_id, caller_id, and other_user_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(rawCallerID)
+	if err != nil {
+		return domain.DMConversation{}, err
+	}
+	otherUserID, err := canonicalizeUserID(rawOtherUserID)
+	if err != nil {
+		return domain.DMConversation{}, err
 	}
 	if callerID == otherUserID {
 		return domain.DMConversation{}, fmt.Errorf("%w: self-DM is not supported", domain.ErrInvalidInput)
 	}
 
-	if _, err := s.requireActiveWorkspaceMember(ctx, workspaceID, callerID); err != nil {
+	callerMember, err := s.requireActiveWorkspaceMember(ctx, workspaceID, callerID)
+	if err != nil {
 		return domain.DMConversation{}, err
 	}
-	if _, err := s.requireActiveWorkspaceMember(ctx, workspaceID, otherUserID); err != nil {
+	otherMember, err := s.requireActiveWorkspaceMember(ctx, workspaceID, otherUserID)
+	if err != nil {
 		return domain.DMConversation{}, err
 	}
 
 	conversation, err := s.dms.CreateDirectConversation(ctx, storage.CreateDirectConversationInput{
 		WorkspaceID:        workspaceID,
-		CreatedBy:          callerID,
-		DirectPairKey:      canonicalDirectPairKey(callerID, otherUserID),
-		ParticipantUserIDs: []string{callerID, otherUserID},
+		CreatedBy:          callerMember.UserID,
+		DirectPairKey:      canonicalDirectPairKey(callerMember.UserID, otherMember.UserID),
+		ParticipantUserIDs: []string{callerMember.UserID, otherMember.UserID},
 	})
 	if err != nil {
 		return domain.DMConversation{}, fmt.Errorf("create direct conversation: %w", err)
@@ -85,9 +96,13 @@ func (s *DMService) CreateDirectConversation(ctx context.Context, input CreateDi
 // CreateGroupConversation creates an ad-hoc group DM and automatically includes the caller.
 func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (domain.DMConversation, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	callerID := strings.TrimSpace(input.CallerID)
-	if workspaceID == "" || callerID == "" {
+	rawCallerID := strings.TrimSpace(input.CallerID)
+	if workspaceID == "" || rawCallerID == "" {
 		return domain.DMConversation{}, fmt.Errorf("%w: workspace_id and caller_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(rawCallerID)
+	if err != nil {
+		return domain.DMConversation{}, err
 	}
 	title, err := normalizeDMTitle(input.Title)
 	if err != nil {
@@ -98,17 +113,20 @@ func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGro
 		return domain.DMConversation{}, err
 	}
 
-	for _, userID := range participantUserIDs {
-		if _, err := s.requireActiveWorkspaceMember(ctx, workspaceID, userID); err != nil {
+	canonicalParticipants := make([]string, 0, len(participantUserIDs))
+	for _, uid := range participantUserIDs {
+		m, err := s.requireActiveWorkspaceMember(ctx, workspaceID, uid)
+		if err != nil {
 			return domain.DMConversation{}, err
 		}
+		canonicalParticipants = append(canonicalParticipants, m.UserID)
 	}
 
 	conversation, err := s.dms.CreateGroupConversation(ctx, storage.CreateGroupConversationInput{
 		WorkspaceID:        workspaceID,
 		CreatedBy:          callerID,
 		Title:              title,
-		ParticipantUserIDs: participantUserIDs,
+		ParticipantUserIDs: canonicalParticipants,
 	})
 	if err != nil {
 		return domain.DMConversation{}, fmt.Errorf("create group conversation: %w", err)
@@ -168,10 +186,14 @@ func (s *DMService) requireActiveWorkspaceMember(ctx context.Context, workspaceI
 
 func normalizeGroupDMParticipants(callerID string, invited []string) ([]string, error) {
 	participants := map[string]struct{}{callerID: {}}
-	for _, userID := range invited {
-		userID = strings.TrimSpace(userID)
-		if userID == "" {
+	for _, rawID := range invited {
+		rawID = strings.TrimSpace(rawID)
+		if rawID == "" {
 			return nil, fmt.Errorf("%w: participant_user_ids cannot contain empty user IDs", domain.ErrInvalidInput)
+		}
+		userID, err := canonicalizeUserID(rawID)
+		if err != nil {
+			return nil, err
 		}
 		participants[userID] = struct{}{}
 	}
@@ -201,4 +223,14 @@ func canonicalDirectPairKey(userA, userB string) string {
 		first, second = second, first
 	}
 	return fmt.Sprintf("%d:%s%d:%s", len(first), first, len(second), second)
+}
+
+// canonicalizeUserID parses s as a UUID and returns its lowercase canonical form.
+// Returns ErrInvalidInput for any input that is not a valid UUID.
+func canonicalizeUserID(s string) (string, error) {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("%w: user_id is not a valid UUID", domain.ErrInvalidInput)
+	}
+	return id.String(), nil
 }

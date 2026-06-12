@@ -206,6 +206,11 @@ body delivery, WebSocket delivery, notifications, search, file upload, HTTP
 handlers, frontend UI, or E2E/MLS key-service work. E2E/MLS remains V1.0 future
 scope.
 
+User IDs supplied to `CreateDirectConversation` and `CreateGroupConversation` are
+parsed and canonicalized as UUIDs before self-DM checks, de-duplication,
+`direct_pair_key` generation, and storage. `direct_pair_key` remains an internal
+database implementation detail; it is not part of any API contract.
+
 Implemented service/storage operations:
 
 - create or return the canonical direct DM for one unordered pair of active

@@ -18,6 +18,11 @@
 
 ## Direct 1:1 semantics
 
+User-provided caller and participant IDs are validated and canonicalized as UUIDs
+(lowercase, hyphenated) before any comparison, de-duplication, pair-key computation,
+or storage call. Non-UUID input returns `ErrInvalidInput` immediately, before any
+membership or workspace look-up.
+
 | Situation                                          | Outcome                                     |
 | -------------------------------------------------- | ------------------------------------------- |
 | Two active members in same workspace               | Create or return canonical direct DM        |
