@@ -537,3 +537,59 @@ func TestMemberService_RemoveMemberFromChannel_GeneralChannel_Denied(t *testing.
 		t.Fatalf("removing from #geral should return ErrForbidden, got: %v", err)
 	}
 }
+
+// Private channel non-enumeration for every caller state
+
+func TestMemberService_SelfJoinChannel_PrivateChannel_NonMember_ReturnsNotFound(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	// user-2 has no workspace membership
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-priv", "user-2")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("private channel + non-member must return ErrNotFound, got: %v", err)
+	}
+}
+
+func TestMemberService_SelfJoinChannel_PrivateChannel_SuspendedMember_ReturnsNotFound(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended,
+	}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-priv", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("private channel + suspended member must return ErrNotFound, got: %v", err)
+	}
+}
+
+func TestMemberService_SelfJoinChannel_PrivateChannel_LeftMember_ReturnsNotFound(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusLeft,
+	}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-priv", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("private channel + left member must return ErrNotFound, got: %v", err)
+	}
+}
+
+func TestMemberService_SelfJoinChannel_PrivateChannel_DisabledWorkspace_ReturnsNotFound(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusDisabled}
+	ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-priv", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("private channel + disabled workspace must return ErrNotFound, got: %v", err)
+	}
+}

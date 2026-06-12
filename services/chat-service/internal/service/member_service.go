@@ -60,6 +60,11 @@ func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channe
 	if err != nil {
 		return domain.ChannelMember{}, fmt.Errorf("get channel: %w", err)
 	}
+	// Non-enumerating: private channels return ErrNotFound for every caller state
+	// so callers cannot distinguish them from missing/archived/cross-workspace channels.
+	if channel.Type == domain.ChannelTypePrivate {
+		return domain.ChannelMember{}, domain.ErrNotFound
+	}
 
 	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
 	if err != nil {
@@ -81,13 +86,6 @@ func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channe
 	}
 	if wm.Status != domain.MemberStatusActive {
 		return domain.ChannelMember{}, domain.ErrForbidden
-	}
-
-	if channel.Type == domain.ChannelTypePrivate {
-		// Non-enumerating: private channel existence must not be disclosed.
-		// Returns ErrNotFound so callers cannot distinguish private channels
-		// from missing/archived/cross-workspace channels.
-		return domain.ChannelMember{}, domain.ErrNotFound
 	}
 
 	m, err := s.members.AddChannelMember(ctx, channelID, userID, domain.ChannelRoleMember)
