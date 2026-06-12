@@ -152,8 +152,6 @@ func TestMemberService_SyncGeneralMemberships_ActiveMembersOnly(t *testing.T) {
 	}
 }
 
-
-
 func TestMemberService_EnsureGeneralMembership_AddsToGeneral(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.generalChannels["ws-1"] = "ch-geral"
@@ -216,11 +214,6 @@ func TestMemberService_EnsureGeneralMembership_SuspendedAndLeftMembersAreSkipped
 		})
 	}
 }
-
-
-
-
-
 
 // --- SelfJoinChannel ---
 
