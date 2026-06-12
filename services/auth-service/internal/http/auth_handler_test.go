@@ -336,6 +336,12 @@ func TestAuthLogin_SuccessReturnsTokenAndSafeUser(t *testing.T) {
 	if !rtCookie.Secure {
 		t.Fatal("expected nchat_rt cookie to be Secure")
 	}
+	if rtCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("expected SameSite=Strict, got %v", rtCookie.SameSite)
+	}
+	if rtCookie.Path != "/api/auth" {
+		t.Fatalf("expected Path=/api/auth, got %q", rtCookie.Path)
+	}
 }
 
 func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {

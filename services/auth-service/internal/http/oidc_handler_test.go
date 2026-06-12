@@ -175,6 +175,15 @@ func TestOIDCExchange_ReturnsLoginShape(t *testing.T) {
 	if !rtCookie.HttpOnly {
 		t.Fatal("expected nchat_rt cookie to be HttpOnly")
 	}
+	if !rtCookie.Secure {
+		t.Fatal("expected nchat_rt cookie to be Secure")
+	}
+	if rtCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("expected SameSite=Strict, got %v", rtCookie.SameSite)
+	}
+	if rtCookie.Path != "/api/auth" {
+		t.Fatalf("expected Path=/api/auth, got %q", rtCookie.Path)
+	}
 }
 
 func TestOIDCExchange_DisabledReturns404(t *testing.T) {
