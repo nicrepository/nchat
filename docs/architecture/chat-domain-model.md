@@ -316,6 +316,25 @@ Channel message creation and listing enforce visibility via the SQL JOIN on
 `ListVisibleChannelsByUser`. DM message creation and listing enforce visibility
 via the same SQL JOINs used by `GetVisibleConversationByID`.
 
+**Atomic authorization in `CreateMessage`**: `PGXMessageStore.CreateMessage` uses
+a single `INSERT … SELECT … FROM (auth subquery)` CTE so that authorization is
+re-evaluated at write time, not only at service pre-check time. The auth subquery
+contains two branches joined by `UNION ALL`:
+
+- _Channel branch_ — active `chat.workspaces` + active `chat.workspace_members` +
+  active `chat.channels` in the same workspace + (public **or** active
+  `chat.channel_members` row for the sender).
+- _DM branch_ — active `chat.workspaces` + active `chat.workspace_members` +
+  active `chat.dm_conversations` in the same workspace + active `chat.dm_members`
+  row for the sender.
+
+If the sender is suspended or removed from the workspace, or the channel/DM is
+archived, or the sender loses private-channel/DM membership between the service
+pre-check and the INSERT, the auth subquery returns no rows and the INSERT inserts
+nothing. The zero-row result maps to `ErrNotFound` (non-enumerating TOCTOU backstop).
+The service layer performs typed pre-validation and returns specific errors;
+`ErrNotFound` from `CreateMessage` surfaces only on TOCTOU race conditions.
+
 Non-enumerating behavior: suspended/left workspace members, non-channel-members
 on private channels, non-DM-participants, archived targets, and cross-workspace
 target IDs all yield `ErrNotFound`.
@@ -333,8 +352,12 @@ and cross-DM references all return the same `domain.ErrInvalidMessageReference`
 sentinel. Callers cannot determine whether a referenced message exists.
 
 The storage layer enforces this as a backstop via a CTE in `CreateMessage`:
-the INSERT selects zero rows when any reference fails the same-workspace
-and same-target check, which maps to `ErrInvalidMessageReference`.
+the INSERT selects zero rows when any reference fails the same-workspace and
+same-target check. Because auth and reference checks share the same INSERT,
+both failure modes return `ErrNotFound` at the storage level (non-enumerating
+TOCTOU backstop). `ErrInvalidMessageReference` is returned by the service's
+pre-validation step (`ValidateRefMessageInTarget`) before `CreateMessage` is
+ever called.
 
 Cross-target references (channel → DM or DM → channel) are invalid in this PR.
 Allowing them is future scope and must be explicitly documented and tested if added.

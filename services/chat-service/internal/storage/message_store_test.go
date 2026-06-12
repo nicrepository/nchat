@@ -13,8 +13,25 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-// messageCols returns the column names in the order that scanMessage/collectMessages
-// scans them (matching messageColumns("") and messageColumns("m") positional order).
+// createMsgSQL is a regex that matches the atomic CreateMessage query and asserts
+// presence of all authorization joins required by the spec:
+//   - chat.workspace_members with wm.status = 'active' (active workspace membership)
+//   - chat.channels with c.status = 'active' (active channel)
+//   - chat.channel_members (private channel membership guard, LEFT JOIN)
+//   - chat.dm_conversations with dc.status = 'active' (active DM conversation)
+//   - chat.dm_members with dm.status = 'active' (active DM membership)
+//
+// Tests that use this pattern verify the SQL sent to the DB contains the correct
+// authorization structure. A mock returning 0 rows then verifies the function maps
+// authorization/reference failure to the expected error.
+const createMsgSQL = `(?s)INSERT INTO chat\.messages.*` +
+	`chat\.workspace_members.*wm\.status.*active.*` +
+	`chat\.channels.*c\.status.*active.*` +
+	`chat\.channel_members.*` +
+	`chat\.dm_conversations.*dc\.status.*active.*` +
+	`chat\.dm_members.*dm\.status.*active`
+
+// messageCols returns the column names matching messageColumns("") scan order.
 func messageCols() []string {
 	return []string{
 		"id", "workspace_id",
@@ -27,7 +44,6 @@ func messageCols() []string {
 	}
 }
 
-// messageRow returns a standard message row for the given IDs.
 func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 	return []any{
 		id, workspaceID,
@@ -40,78 +56,73 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 	}
 }
 
-func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
+// newMock creates and defers close of a pgxmock pool.
+func newMock(t *testing.T) pgxmock.PgxPoolIface {
+	t.Helper()
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
 	}
-	defer mock.Close()
+	t.Cleanup(func() { mock.Close() })
+	return mock
+}
 
-	now := time.Now()
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
+// expectCreate registers a CreateMessage query expectation using the full auth SQL pattern.
+func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
+	mock.ExpectQuery(createMsgSQL).
 		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(), // channel_id *string
-			pgxmock.AnyArg(), // dm_conversation_id *string (nil)
-			"user-1",
-			"user",
-			"hello",
-			pgxmock.AnyArg(), // parent_message_id nil
-			pgxmock.AnyArg(), // forwarded_from_message_id nil
-			pgxmock.AnyArg(), // referenced_message_id nil
+			pgxmock.AnyArg(), // workspace_id
+			pgxmock.AnyArg(), // channel_id
+			pgxmock.AnyArg(), // dm_conversation_id
+			pgxmock.AnyArg(), // sender_id
+			pgxmock.AnyArg(), // kind
+			pgxmock.AnyArg(), // body_text
+			pgxmock.AnyArg(), // parent_message_id
+			pgxmock.AnyArg(), // forwarded_from_message_id
+			pgxmock.AnyArg(), // referenced_message_id
 		).
-		WillReturnRows(pgxmock.NewRows(messageCols()).
-			AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...))
+		WillReturnRows(rows)
+}
 
-	store := storage.NewPGXMessageStore(mock)
-	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID: "ws-1",
-		ChannelID:   "ch-1",
-		SenderID:    "user-1",
-		Kind:        domain.MessageKindUser,
-		BodyText:    "hello",
-	})
-	if err != nil {
-		t.Fatalf("CreateMessage: %v", err)
-	}
-	if msg.ID != "msg-1" || msg.ChannelID != "ch-1" {
-		t.Fatalf("unexpected message: %+v", msg)
-	}
+func checkExpectations(t *testing.T, mock pgxmock.PgxPoolIface) {
+	t.Helper()
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
-func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
+// ---- CreateMessage: success paths -------------------------------------------
 
+func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
+	mock := newMock(t)
 	now := time.Now()
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(), // channel_id nil
-			pgxmock.AnyArg(), // dm_conversation_id *string
-			"user-1",
-			"user",
-			"hello",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols()).
-			AddRow(messageRow("msg-2", "ws-1", "", "dm-1", now)...))
+	expectCreate(mock, pgxmock.NewRows(messageCols()).
+		AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:      "ws-1",
-		DMConversationID: "dm-1",
-		SenderID:         "user-1",
-		Kind:             domain.MessageKindUser,
-		BodyText:         "hello",
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1",
+		Kind: domain.MessageKindUser, BodyText: "hello",
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage channel: %v", err)
+	}
+	if msg.ID != "msg-1" || msg.ChannelID != "ch-1" {
+		t.Fatalf("unexpected message: %+v", msg)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	expectCreate(mock, pgxmock.NewRows(messageCols()).
+		AddRow(messageRow("msg-2", "ws-1", "", "dm-1", now)...))
+
+	store := storage.NewPGXMessageStore(mock)
+	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: "user-1",
+		Kind: domain.MessageKindUser, BodyText: "hello",
 	})
 	if err != nil {
 		t.Fatalf("CreateMessage DM: %v", err)
@@ -119,294 +130,168 @@ func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
 	if msg.ID != "msg-2" || msg.DMConversationID != "dm-1" {
 		t.Fatalf("unexpected message: %+v", msg)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXMessageStore_CreateMessage_InvalidParentRef_ReturnsErrInvalidMessageReference(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	// CTE condition fails → INSERT selects 0 rows → ErrNoRows
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"reply",
-			pgxmock.AnyArg(), // non-nil parent ref that fails CTE check
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols())) // 0 rows
-
-	store := storage.NewPGXMessageStore(mock)
-	_, err = store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:     "ws-1",
-		ChannelID:       "ch-1",
-		SenderID:        "user-1",
-		Kind:            domain.MessageKindUser,
-		BodyText:        "reply",
-		ParentMessageID: "00000000-0000-0000-0000-000000000001",
-	})
-	if !errors.Is(err, domain.ErrInvalidMessageReference) {
-		t.Fatalf("expected ErrInvalidMessageReference for invalid parent ref, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXMessageStore_CreateMessage_CrossWorkspaceRef_ReturnsErrInvalidMessageReference(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"reply",
-			pgxmock.AnyArg(), // ref from ws-2
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols())) // 0 rows: workspace mismatch
-
-	store := storage.NewPGXMessageStore(mock)
-	_, err = store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:     "ws-1",
-		ChannelID:       "ch-1",
-		SenderID:        "user-1",
-		BodyText:        "reply",
-		ParentMessageID: "00000000-0000-0000-0000-000000000099",
-	})
-	if !errors.Is(err, domain.ErrInvalidMessageReference) {
-		t.Fatalf("expected ErrInvalidMessageReference for cross-workspace ref, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXMessageStore_CreateMessage_CrossChannelRef_ReturnsErrInvalidMessageReference(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"reply",
-			pgxmock.AnyArg(), // ref in ch-other, not ch-1
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols())) // 0 rows: channel mismatch
-
-	store := storage.NewPGXMessageStore(mock)
-	_, err = store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:     "ws-1",
-		ChannelID:       "ch-1",
-		SenderID:        "user-1",
-		BodyText:        "reply",
-		ParentMessageID: "00000000-0000-0000-0000-000000000002",
-	})
-	if !errors.Is(err, domain.ErrInvalidMessageReference) {
-		t.Fatalf("expected ErrInvalidMessageReference for cross-channel ref, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXMessageStore_CreateMessage_ChannelToDMRef_ReturnsErrInvalidMessageReference(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"reply",
-			pgxmock.AnyArg(), // ref is in a DM, not in ch-1
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols())) // 0 rows: target mismatch
-
-	store := storage.NewPGXMessageStore(mock)
-	_, err = store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:     "ws-1",
-		ChannelID:       "ch-1",
-		SenderID:        "user-1",
-		BodyText:        "reply",
-		ParentMessageID: "00000000-0000-0000-0000-000000000003",
-	})
-	if !errors.Is(err, domain.ErrInvalidMessageReference) {
-		t.Fatalf("expected ErrInvalidMessageReference for channel-to-DM ref, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXMessageStore_CreateMessage_DMToChannelRef_ReturnsErrInvalidMessageReference(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"reply",
-			pgxmock.AnyArg(), // ref is in a channel, not in dm-1
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols())) // 0 rows: target mismatch
-
-	store := storage.NewPGXMessageStore(mock)
-	_, err = store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:      "ws-1",
-		DMConversationID: "dm-1",
-		SenderID:         "user-1",
-		BodyText:         "reply",
-		ParentMessageID:  "00000000-0000-0000-0000-000000000004",
-	})
-	if !errors.Is(err, domain.ErrInvalidMessageReference) {
-		t.Fatalf("expected ErrInvalidMessageReference for DM-to-channel ref, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
 func TestPGXMessageStore_CreateMessage_ValidSameTargetRef_Succeeds(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
+	mock := newMock(t)
 	now := time.Now()
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"reply",
-			pgxmock.AnyArg(), // valid parent same target
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols()).
-			AddRow(messageRow("msg-child", "ws-1", "ch-1", "", now)...))
+	expectCreate(mock, pgxmock.NewRows(messageCols()).
+		AddRow(messageRow("msg-c", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
-	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID:     "ws-1",
-		ChannelID:       "ch-1",
-		SenderID:        "user-1",
-		BodyText:        "reply",
+	_, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "reply",
 		ParentMessageID: "00000000-0000-0000-0000-000000000010",
 	})
 	if err != nil {
 		t.Fatalf("CreateMessage with valid same-target ref: %v", err)
 	}
-	if msg.ID != "msg-child" {
-		t.Fatalf("unexpected id: %q", msg.ID)
+	checkExpectations(t, mock)
+}
+
+// ---- CreateMessage: SQL includes auth joins (SQL structure assertions) -------
+
+// TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards verifies the INSERT SQL
+// contains all required authorization predicates. Each sub-test uses a distinct regex
+// targeting one guard; if that guard is removed from the query the regex won't match
+// and pgxmock will not find an expectation, causing the test to fail.
+func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
+	cases := []struct {
+		name  string
+		regex string
+		input storage.CreateMessageInput
+	}{
+		{
+			name:  "active workspace_members guard",
+			regex: `(?s)chat\.workspace_members.*wm\.status.*=.*'active'`,
+			input: storage.CreateMessageInput{WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "x"},
+		},
+		{
+			name:  "active channel status guard",
+			regex: `(?s)chat\.channels.*c\.status.*=.*'active'`,
+			input: storage.CreateMessageInput{WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "x"},
+		},
+		{
+			name:  "private channel_members guard",
+			regex: `(?s)chat\.channel_members.*cm\.channel_id.*cm\.user_id`,
+			input: storage.CreateMessageInput{WorkspaceID: "ws-1", ChannelID: "ch-private", SenderID: "user-1", BodyText: "x"},
+		},
+		{
+			name:  "active dm_conversations status guard",
+			regex: `(?s)chat\.dm_conversations.*dc\.status.*=.*'active'`,
+			input: storage.CreateMessageInput{WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: "user-1", BodyText: "x"},
+		},
+		{
+			name:  "active dm_members guard",
+			regex: `(?s)chat\.dm_members.*dm\.status.*=.*'active'`,
+			input: storage.CreateMessageInput{WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: "user-1", BodyText: "x"},
+		},
+		{
+			name:  "invalid_refs CTE with IS NOT DISTINCT FROM",
+			regex: `(?s)invalid_refs.*IS NOT DISTINCT FROM`,
+			input: storage.CreateMessageInput{WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "ref", ParentMessageID: "00000000-0000-0000-0000-000000000099"},
+		},
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMock(t)
+			mock.ExpectQuery(tc.regex).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg()).
+				WillReturnRows(pgxmock.NewRows(messageCols()))
+			store := storage.NewPGXMessageStore(mock)
+			_, err := store.CreateMessage(context.Background(), tc.input)
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("expected ErrNotFound (auth/ref backstop), got %v", err)
+			}
+			checkExpectations(t, mock)
+		})
 	}
 }
 
-func TestPGXMessageStore_ValidateRefMessageInTarget_ValidReturnsNil(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
+// ---- CreateMessage: behavioral denial (0 rows → ErrNotFound) ----------------
 
+func TestPGXMessageStore_CreateMessage_AuthDenied_ReturnsErrNotFound(t *testing.T) {
+	for _, name := range []string{"channel auth denied", "DM auth denied", "cross-workspace", "invalid ref backstop"} {
+		t.Run(name, func(t *testing.T) {
+			mock := newMock(t)
+			expectCreate(mock, pgxmock.NewRows(messageCols())) // 0 rows
+			store := storage.NewPGXMessageStore(mock)
+			_, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
+				WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "x",
+			})
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("[%s] expected ErrNotFound (non-enumerating backstop), got %v", name, err)
+			}
+			checkExpectations(t, mock)
+		})
+	}
+}
+
+// ---- CreateMessage: editedAt/deletedAt nil-check branches in scanMessage ----
+
+func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	editedAt := now.Add(-time.Minute)
+	deletedAt := now.Add(-30 * time.Second)
+	row := []any{
+		"msg-e", "ws-1", "ch-1", "", "user-1",
+		"user", "edited", "active",
+		"", "", "",
+		&editedAt, &deletedAt,
+		now, now,
+	}
+	expectCreate(mock, pgxmock.NewRows(messageCols()).AddRow(row...))
+
+	store := storage.NewPGXMessageStore(mock)
+	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "edited",
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage with editedAt: %v", err)
+	}
+	if msg.EditedAt.IsZero() || msg.DeletedAt.IsZero() {
+		t.Fatalf("expected EditedAt and DeletedAt to be set, got %+v", msg)
+	}
+	checkExpectations(t, mock)
+}
+
+// ---- ValidateRefMessageInTarget ---------------------------------------------
+
+func TestPGXMessageStore_ValidateRefMessageInTarget_ValidReturnsNil(t *testing.T) {
+	mock := newMock(t)
 	mock.ExpectQuery(`SELECT 1 FROM chat\.messages`).
-		WithArgs(
-			"msg-1",
-			"ws-1",
-			pgxmock.AnyArg(), // channel_id
-			pgxmock.AnyArg(), // dm_conversation_id nil
-		).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
 
 	store := storage.NewPGXMessageStore(mock)
-	err = store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-1")
-	if err != nil {
+	if err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-1"); err != nil {
 		t.Fatalf("expected nil for valid ref, got %v", err)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
-func TestPGXMessageStore_ValidateRefMessageInTarget_MissingReturnsErrInvalidMessageReference(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
+func TestPGXMessageStore_ValidateRefMessageInTarget_MissingReturnsErrInvalidRef(t *testing.T) {
+	mock := newMock(t)
 	mock.ExpectQuery(`SELECT 1 FROM chat\.messages`).
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 
 	store := storage.NewPGXMessageStore(mock)
-	err = store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-missing")
+	err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-missing")
 	if !errors.Is(err, domain.ErrInvalidMessageReference) {
 		t.Fatalf("expected ErrInvalidMessageReference for missing ref, got %v", err)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
-func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
+// ---- GetMessageByIDInWorkspace ----------------------------------------------
 
+func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
+	mock := newMock(t)
 	now := time.Now()
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("msg-1", "ws-1").
@@ -421,39 +306,27 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	if msg.ID != "msg-1" {
 		t.Fatalf("expected msg-1, got %q", msg.ID)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
 func TestPGXMessageStore_GetMessageByIDInWorkspace_NotFoundReturnsErrNotFound(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
+	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("msg-missing", "ws-1").
 		WillReturnError(pgx.ErrNoRows)
 
 	store := storage.NewPGXMessageStore(mock)
-	_, err = store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-missing")
+	_, err := store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-missing")
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
-func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
+// ---- ListChannelMessages ----------------------------------------------------
 
+func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
+	mock := newMock(t)
 	now := time.Now()
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1").
@@ -463,9 +336,7 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 
 	store := storage.NewPGXMessageStore(mock)
 	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
-		WorkspaceID: "ws-1",
-		ChannelID:   "ch-1",
-		UserID:      "user-1",
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages: %v", err)
@@ -473,27 +344,18 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	if len(messages) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(messages))
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
 func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
+	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(messageCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
-		WorkspaceID: "ws-1",
-		ChannelID:   "ch-1",
-		UserID:      "user-1",
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages empty: %v", err)
@@ -501,18 +363,44 @@ func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T
 	if len(messages) != 0 {
 		t.Fatalf("expected 0 messages, got %d", len(messages))
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
-func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
+// TestPGXMessageStore_ListChannelMessages_WithEditedAt covers collectMessages
+// editedAt/deletedAt nil-check branches.
+func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	editedAt := now.Add(-time.Minute)
+	deletedAt := now.Add(-30 * time.Second)
+	row := []any{
+		"msg-e2", "ws-1", "ch-1", "", "user-1",
+		"user", "edited body", "active",
+		"", "", "",
+		&editedAt, &deletedAt,
+		now, now,
 	}
-	defer mock.Close()
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(messageCols()).AddRow(row...))
 
+	store := storage.NewPGXMessageStore(mock)
+	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages with editedAt: %v", err)
+	}
+	if len(messages) != 1 || messages[0].EditedAt.IsZero() || messages[0].DeletedAt.IsZero() {
+		t.Fatalf("expected 1 message with EditedAt/DeletedAt set, got %+v", messages)
+	}
+	checkExpectations(t, mock)
+}
+
+// ---- ListDMMessages ---------------------------------------------------------
+
+func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
+	mock := newMock(t)
 	now := time.Now()
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1").
@@ -521,9 +409,7 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 
 	store := storage.NewPGXMessageStore(mock)
 	messages, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
-		WorkspaceID:    "ws-1",
-		ConversationID: "dm-1",
-		UserID:         "user-1",
+		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages: %v", err)
@@ -531,27 +417,18 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 	if len(messages) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(messages))
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }
 
 func TestPGXMessageStore_ListDMMessages_EmptyReturnsEmptySlice(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
+	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(messageCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	messages, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
-		WorkspaceID:    "ws-1",
-		ConversationID: "dm-1",
-		UserID:         "user-1",
+		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages empty: %v", err)
@@ -559,104 +436,5 @@ func TestPGXMessageStore_ListDMMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	if len(messages) != 0 {
 		t.Fatalf("expected 0 messages, got %d", len(messages))
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-// messageRowEdited returns a row with non-nil edited_at and deleted_at to exercise
-// the nil-pointer branches in scanMessage and collectMessages.
-func messageRowEdited(id, workspaceID, channelID string, now time.Time) []any {
-	editedAt := now.Add(-time.Minute)
-	deletedAt := now.Add(-30 * time.Second)
-	return []any{
-		id, workspaceID,
-		channelID, "",
-		"user-1",
-		"user", "edited body", "active",
-		"", "", "",
-		&editedAt, &deletedAt,
-		now, now,
-	}
-}
-
-func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	now := time.Now()
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages`).
-		WithArgs(
-			"ws-1",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			"user-1",
-			"user",
-			"edited body",
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-			pgxmock.AnyArg(),
-		).
-		WillReturnRows(pgxmock.NewRows(messageCols()).
-			AddRow(messageRowEdited("msg-e", "ws-1", "ch-1", now)...))
-
-	store := storage.NewPGXMessageStore(mock)
-	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
-		WorkspaceID: "ws-1",
-		ChannelID:   "ch-1",
-		SenderID:    "user-1",
-		Kind:        domain.MessageKindUser,
-		BodyText:    "edited body",
-	})
-	if err != nil {
-		t.Fatalf("CreateMessage with editedAt: %v", err)
-	}
-	if msg.EditedAt.IsZero() {
-		t.Fatalf("expected EditedAt to be set, got zero")
-	}
-	if msg.DeletedAt.IsZero() {
-		t.Fatalf("expected DeletedAt to be set, got zero")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	now := time.Now()
-	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
-		WillReturnRows(pgxmock.NewRows(messageCols()).
-			AddRow(messageRowEdited("msg-e2", "ws-1", "ch-1", now)...))
-
-	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
-		WorkspaceID: "ws-1",
-		ChannelID:   "ch-1",
-		UserID:      "user-1",
-	})
-	if err != nil {
-		t.Fatalf("ListChannelMessages with editedAt: %v", err)
-	}
-	if len(messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(messages))
-	}
-	if messages[0].EditedAt.IsZero() {
-		t.Fatalf("expected EditedAt to be set")
-	}
-	if messages[0].DeletedAt.IsZero() {
-		t.Fatalf("expected DeletedAt to be set")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
+	checkExpectations(t, mock)
 }

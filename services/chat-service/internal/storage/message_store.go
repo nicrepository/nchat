@@ -147,12 +147,28 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	if kind == "" {
 		kind = domain.MessageKindUser
 	}
-	// The CTE validates that any provided reference messages (parent, forwarded_from,
-	// referenced) exist in the same workspace and the same target as the new message.
-	// channel_id IS NOT DISTINCT FROM $2 and dm_conversation_id IS NOT DISTINCT FROM $3
-	// enforce exact target match (including NULL equality) non-enumeratingly.
-	// When invalid_refs has a row, the INSERT selects zero rows, and QueryRow returns
-	// ErrNoRows, which is mapped to ErrInvalidMessageReference.
+	// Authorization and reference integrity are enforced atomically in one INSERT.
+	//
+	// The auth subquery (UNION ALL of channel branch + DM branch) yields exactly one
+	// row only when the sender is authorized at insert time:
+	//   channel branch ($2 IS NOT NULL):
+	//     - workspace active, sender is active workspace_member
+	//     - channel belongs to workspace, channel is active
+	//     - public channel: active workspace member is sufficient
+	//     - private channel: sender must also be an active channel_member
+	//   DM branch ($3 IS NOT NULL):
+	//     - workspace active, sender is active workspace_member
+	//     - DM conversation belongs to workspace, DM conversation is active
+	//     - sender must be an active dm_member
+	//
+	// Stale channel_members / dm_members cannot bypass an inactive/suspended/left
+	// workspace_member because the workspace_members JOIN filters wm.status = 'active'
+	// independently.
+	//
+	// The invalid_refs CTE fires when any provided reference message does not belong
+	// to the same workspace + same target. Both conditions are checked together;
+	// either failure results in 0 rows, which maps to ErrNotFound (non-enumerating
+	// TOCTOU backstop — the service layer performs typed pre-validation before insert).
 	row := s.pool.QueryRow(ctx, `
 		WITH invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
@@ -184,6 +200,32 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			 kind, body_text, status,
 			 parent_message_id, forwarded_from_message_id, referenced_message_id)
 		SELECT $1, $2, $3, $4, $5, $6, 'active', $7, $8, $9
+		FROM (
+			-- Channel message authorization branch.
+			SELECT 1
+			FROM chat.workspaces w
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = w.id AND wm.user_id = $4 AND wm.status = 'active'
+			JOIN chat.channels c
+			  ON c.id = $2 AND c.workspace_id = $1 AND c.status = 'active'
+			LEFT JOIN chat.channel_members cm
+			  ON cm.channel_id = c.id AND cm.user_id = $4
+			WHERE $2 IS NOT NULL
+			  AND w.id = $1 AND w.status = 'active'
+			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+			UNION ALL
+			-- DM message authorization branch.
+			SELECT 1
+			FROM chat.workspaces w
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = w.id AND wm.user_id = $4 AND wm.status = 'active'
+			JOIN chat.dm_conversations dc
+			  ON dc.id = $3 AND dc.workspace_id = $1 AND dc.status = 'active'
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = dc.id AND dm.user_id = $4 AND dm.status = 'active'
+			WHERE $3 IS NOT NULL
+			  AND w.id = $1 AND w.status = 'active'
+		) auth
 		WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 		RETURNING `+messageColumns(""),
 		input.WorkspaceID,
@@ -199,7 +241,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	msg, err := scanMessage(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Message{}, domain.ErrInvalidMessageReference
+			// Non-enumerating TOCTOU backstop: both auth failure and reference failure
+			// produce 0 rows. The service layer returns typed errors from pre-validation;
+			// this backstop returns ErrNotFound to avoid leaking target existence.
+			return domain.Message{}, domain.ErrNotFound
 		}
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
 	}
