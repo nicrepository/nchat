@@ -593,3 +593,58 @@ func TestMemberService_SelfJoinChannel_PrivateChannel_DisabledWorkspace_ReturnsN
 		t.Fatalf("private channel + disabled workspace must return ErrNotFound, got: %v", err)
 	}
 }
+
+// TestMemberService_SelfJoinChannel_NotFound_ExactErrorShape verifies that every
+// "not found" path (private channel, missing, archived, cross-workspace) returns
+// the exact bare domain.ErrNotFound sentinel — not a wrapped variant.
+// Using pointer equality (err != domain.ErrNotFound) ensures err.Error() is
+// indistinguishable across all paths.
+func TestMemberService_SelfJoinChannel_NotFound_ExactErrorShape(t *testing.T) {
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+
+	cases := []struct {
+		name string
+		cs   *fakeChannelStore
+	}{
+		{
+			name: "private channel",
+			cs: &fakeChannelStore{channel: domain.Channel{
+				ID: "ch-1", WorkspaceID: "ws-1",
+				Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive,
+			}},
+		},
+		{
+			name: "missing channel",
+			cs:   &fakeChannelStore{},
+		},
+		{
+			name: "archived channel",
+			cs: &fakeChannelStore{channel: domain.Channel{
+				ID: "ch-1", WorkspaceID: "ws-1",
+				Type: domain.ChannelTypePublic, Status: domain.ChannelStatusArchived,
+			}},
+		},
+		{
+			name: "cross-workspace channel",
+			cs: &fakeChannelStore{channel: domain.Channel{
+				ID: "ch-1", WorkspaceID: "ws-other",
+				Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive,
+			}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "user-1",
+				Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+			}
+			svc := service.NewMemberService(ms, tc.cs, &fakeWorkspaceStore{workspace: ws})
+			_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-1", "user-1")
+			if err != domain.ErrNotFound {
+				t.Fatalf("%s: want exact domain.ErrNotFound, got %T(%v)", tc.name, err, err)
+			}
+		})
+	}
+}

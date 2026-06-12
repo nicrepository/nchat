@@ -57,11 +57,14 @@ func (s *MemberService) SyncGeneralMemberships(ctx context.Context, workspaceID 
 // The channel role is always ChannelRoleMember; the caller cannot set it.
 func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channelID, userID string) (domain.ChannelMember, error) {
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ChannelMember{}, domain.ErrNotFound
+	}
 	if err != nil {
 		return domain.ChannelMember{}, fmt.Errorf("get channel: %w", err)
 	}
-	// Non-enumerating: private channels return ErrNotFound for every caller state
-	// so callers cannot distinguish them from missing/archived/cross-workspace channels.
+	// Non-enumerating: private channels must be indistinguishable from missing/
+	// archived/cross-workspace channels — all return the same bare ErrNotFound.
 	if channel.Type == domain.ChannelTypePrivate {
 		return domain.ChannelMember{}, domain.ErrNotFound
 	}
