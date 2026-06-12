@@ -36,14 +36,15 @@ func activeDMConversation(workspaceID, convID string) domain.DMConversation {
 // ---- fakeMessageStore ------------------------------------------------------
 
 type fakeMessageStore struct {
-	createdMessage  domain.Message
-	createErr       error
-	channelMessages []domain.Message
-	listChannelErr  error
-	dmMessages      []domain.Message
-	listDMErr       error
-	messagesByKey   map[string]domain.Message // key: workspaceID+":"+messageID
-	getByIDErr      error
+	createdMessage       domain.Message
+	createErr            error
+	channelMessages      []domain.Message
+	listChannelErr       error
+	dmMessages           []domain.Message
+	listDMErr            error
+	messagesByKey        map[string]domain.Message // key: workspaceID+":"+messageID
+	getByIDErr           error
+	validateRefTargetErr error
 
 	lastCreateInput  storage.CreateMessageInput
 	createCalls      int
@@ -69,6 +70,10 @@ func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspac
 		return domain.Message{}, domain.ErrNotFound
 	}
 	return domain.Message{}, domain.ErrNotFound
+}
+
+func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _ string) error {
+	return f.validateRefTargetErr
 }
 
 func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) ([]domain.Message, error) {
@@ -352,17 +357,10 @@ func TestMessageService_CreateDMMessage_EmptyRequiredFieldsDenied(t *testing.T) 
 func TestMessageService_CreateChannelMessage_ValidParentMessageSucceeds(t *testing.T) {
 	ch := publicActiveChannel("ws-1", "ch-1")
 	channels := &fakeChannelStore{visibleChannel: ch}
-	parentMsg := domain.Message{
-		ID: user1, WorkspaceID: "ws-1", ChannelID: "ch-1",
-		SenderID: user2, Kind: domain.MessageKindUser, BodyText: "parent",
-		Status: domain.MessageStatusActive,
-	}
 	msgs := &fakeMessageStore{
 		createdMessage: domain.Message{ID: "msg-child", WorkspaceID: "ws-1", ChannelID: "ch-1",
 			SenderID: user1, Status: domain.MessageStatusActive},
-		messagesByKey: map[string]domain.Message{
-			"ws-1:" + user1: parentMsg,
-		},
+		// validateRefTargetErr left nil = valid reference
 	}
 
 	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
@@ -384,8 +382,7 @@ func TestMessageService_CreateChannelMessage_ValidParentMessageSucceeds(t *testi
 func TestMessageService_CreateChannelMessage_RefMessageCrossWorkspaceDenied(t *testing.T) {
 	ch := publicActiveChannel("ws-1", "ch-1")
 	channels := &fakeChannelStore{visibleChannel: ch}
-	// Parent message exists but in ws-2, not ws-1.
-	msgs := &fakeMessageStore{getByIDErr: domain.ErrNotFound}
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
 
 	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
 		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
@@ -393,26 +390,17 @@ func TestMessageService_CreateChannelMessage_RefMessageCrossWorkspaceDenied(t *t
 			ChannelID:       "ch-1",
 			SenderID:        user1,
 			BodyText:        "reply",
-			ParentMessageID: user2, // valid UUID but ErrNotFound in ws-1
+			ParentMessageID: user2,
 		})
-	if !errors.Is(err, domain.ErrInvalidInput) {
-		t.Fatalf("expected ErrInvalidInput for cross-workspace ref, got %v", err)
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for cross-workspace ref, got %v", err)
 	}
 }
 
 func TestMessageService_CreateChannelMessage_RefMessageCrossTargetDenied(t *testing.T) {
 	ch := publicActiveChannel("ws-1", "ch-1")
 	channels := &fakeChannelStore{visibleChannel: ch}
-	// Parent message exists in ws-1 but in a different channel (ch-other).
-	crossChannelMsg := domain.Message{
-		ID: user2, WorkspaceID: "ws-1", ChannelID: "ch-other", SenderID: user1,
-		Status: domain.MessageStatusActive,
-	}
-	msgs := &fakeMessageStore{
-		messagesByKey: map[string]domain.Message{
-			"ws-1:" + user2: crossChannelMsg,
-		},
-	}
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
 
 	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
 		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
@@ -420,10 +408,64 @@ func TestMessageService_CreateChannelMessage_RefMessageCrossTargetDenied(t *test
 			ChannelID:       "ch-1",
 			SenderID:        user1,
 			BodyText:        "reply",
-			ParentMessageID: user2, // in ch-other, not ch-1
+			ParentMessageID: user2,
 		})
-	if !errors.Is(err, domain.ErrInvalidInput) {
-		t.Fatalf("expected ErrInvalidInput for cross-target ref, got %v", err)
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for cross-target ref, got %v", err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_RefMessageChannelToDMDenied(t *testing.T) {
+	ch := publicActiveChannel("ws-1", "ch-1")
+	channels := &fakeChannelStore{visibleChannel: ch}
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID:     "ws-1",
+			ChannelID:       "ch-1",
+			SenderID:        user1,
+			BodyText:        "reply",
+			ParentMessageID: user2, // storage returns invalid-ref (channel→DM)
+		})
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for channel-to-DM ref, got %v", err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_ForwardedFromInvalidDenied(t *testing.T) {
+	ch := publicActiveChannel("ws-1", "ch-1")
+	channels := &fakeChannelStore{visibleChannel: ch}
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID:            "ws-1",
+			ChannelID:              "ch-1",
+			SenderID:               user1,
+			BodyText:               "fwd",
+			ForwardedFromMessageID: user2,
+		})
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for invalid forwarded_from, got %v", err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_ReferencedInvalidDenied(t *testing.T) {
+	ch := publicActiveChannel("ws-1", "ch-1")
+	channels := &fakeChannelStore{visibleChannel: ch}
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID:         "ws-1",
+			ChannelID:           "ch-1",
+			SenderID:            user1,
+			BodyText:            "ref",
+			ReferencedMessageID: user2,
+		})
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for invalid referenced_message, got %v", err)
 	}
 }
 
@@ -439,8 +481,28 @@ func TestMessageService_CreateChannelMessage_RefMessageInvalidUUIDDenied(t *test
 		BodyText:        "hi",
 		ParentMessageID: "not-a-uuid",
 	})
-	if !errors.Is(err, domain.ErrInvalidInput) {
-		t.Fatalf("expected ErrInvalidInput for invalid UUID ref, got %v", err)
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for invalid UUID ref, got %v", err)
+	}
+}
+
+func TestMessageService_CreateDMMessage_RefMessageDMToChannelDenied(t *testing.T) {
+	dm := domain.DMConversation{
+		ID: "dm-1", WorkspaceID: "ws-1", Status: domain.DMConversationStatusActive,
+	}
+	dms := &fakeDMStore{visibleConversation: dm}
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
+
+	_, err := service.NewMessageService(&fakeChannelStore{}, dms, msgs).
+		CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+			WorkspaceID:     "ws-1",
+			ConversationID:  "dm-1",
+			SenderID:        user1,
+			BodyText:        "ref",
+			ParentMessageID: user2, // storage returns invalid-ref (DM→channel)
+		})
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for DM-to-channel ref, got %v", err)
 	}
 }
 

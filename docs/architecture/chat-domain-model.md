@@ -324,13 +324,20 @@ target IDs all yield `ErrNotFound`.
 
 `parent_message_id`, `forwarded_from_message_id`, and `referenced_message_id`
 are nullable placeholders for quote-reply (RF-07), forwarding (RF-08), and
-references (RF-09). When provided, the service validates:
+references (RF-09). In this foundation PR all three fields are **same-target only**:
+the referenced message must belong to the same workspace and the same target
+(channel or DM conversation) as the new message.
 
-- The ID is a valid UUID.
-- The referenced message exists in the same workspace.
-- The referenced message belongs to the same target (channel or DM conversation).
+Validation is **non-enumerating**: missing, cross-workspace, cross-channel,
+and cross-DM references all return the same `domain.ErrInvalidMessageReference`
+sentinel. Callers cannot determine whether a referenced message exists.
 
-Cross-workspace and cross-target references are rejected with `ErrInvalidInput`.
+The storage layer enforces this as a backstop via a CTE in `CreateMessage`:
+the INSERT selects zero rows when any reference fails the same-workspace
+and same-target check, which maps to `ErrInvalidMessageReference`.
+
+Cross-target references (channel → DM or DM → channel) are invalid in this PR.
+Allowing them is future scope and must be explicitly documented and tested if added.
 
 ### Soft delete and message lifecycle
 

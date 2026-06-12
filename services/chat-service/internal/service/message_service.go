@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -211,28 +210,19 @@ func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessage
 }
 
 // validateRefMessage validates an optional reference message ID (parent, forwarded_from,
-// or referenced). If refID is empty, it is a no-op. Otherwise it verifies the message
-// exists in the same workspace and the same target (channel or DM conversation).
-// Returns the trimmed ID or "" if empty.
+// or referenced). Returns "" when refID is empty. Returns ErrInvalidMessageReference
+// for any invalid case (invalid UUID, non-existent, cross-workspace, cross-channel,
+// channel-to-DM, DM-to-channel). The error is intentionally non-enumerating: callers
+// cannot determine whether the referenced message exists.
 func (s *MessageService) validateRefMessage(ctx context.Context, workspaceID, channelID, dmConversationID, refID string) (string, error) {
 	if refID == "" {
 		return "", nil
 	}
 	if _, err := uuid.Parse(refID); err != nil {
-		return "", fmt.Errorf("%w: reference message id is not a valid UUID", domain.ErrInvalidInput)
+		return "", domain.ErrInvalidMessageReference
 	}
-	ref, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, refID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return "", fmt.Errorf("%w: reference message not found in workspace", domain.ErrInvalidInput)
-		}
-		return "", fmt.Errorf("validate reference message: %w", err)
-	}
-	if channelID != "" && ref.ChannelID != channelID {
-		return "", fmt.Errorf("%w: reference message must be in the same channel", domain.ErrInvalidInput)
-	}
-	if dmConversationID != "" && ref.DMConversationID != dmConversationID {
-		return "", fmt.Errorf("%w: reference message must be in the same DM conversation", domain.ErrInvalidInput)
+	if err := s.messages.ValidateRefMessageInTarget(ctx, workspaceID, channelID, dmConversationID, refID); err != nil {
+		return "", err
 	}
 	return refID, nil
 }

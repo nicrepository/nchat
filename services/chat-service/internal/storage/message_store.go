@@ -46,12 +46,22 @@ type ListDMMessagesInput struct {
 // MessageStore is the persistence interface for message operations.
 type MessageStore interface {
 	// CreateMessage inserts a new message and returns the persisted record.
+	// Returns ErrInvalidMessageReference when any of the optional reference fields
+	// (parent, forwarded_from, referenced) do not belong to the same workspace and
+	// same target as the new message. This is a non-enumerating storage backstop:
+	// callers cannot determine whether the referenced message exists.
 	CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error)
 
 	// GetMessageByIDInWorkspace returns the message only if it belongs to workspaceID.
 	// Returns ErrNotFound when the message does not exist or belongs to a different
 	// workspace, preventing cross-workspace enumeration via message IDs.
 	GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID string) (domain.Message, error)
+
+	// ValidateRefMessageInTarget checks that messageID belongs to the given workspace
+	// and target (channelID or dmConversationID). Returns nil when valid.
+	// Returns ErrInvalidMessageReference for any invalid case — non-enumerating:
+	// missing, cross-workspace, cross-channel, and cross-DM all return the same error.
+	ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error
 
 	// ListChannelMessages returns messages for a channel in created_at/id order.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
@@ -137,12 +147,44 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	if kind == "" {
 		kind = domain.MessageKindUser
 	}
+	// The CTE validates that any provided reference messages (parent, forwarded_from,
+	// referenced) exist in the same workspace and the same target as the new message.
+	// channel_id IS NOT DISTINCT FROM $2 and dm_conversation_id IS NOT DISTINCT FROM $3
+	// enforce exact target match (including NULL equality) non-enumeratingly.
+	// When invalid_refs has a row, the INSERT selects zero rows, and QueryRow returns
+	// ErrNoRows, which is mapped to ErrInvalidMessageReference.
 	row := s.pool.QueryRow(ctx, `
+		WITH invalid_refs AS (
+			SELECT 1 FROM (VALUES (1)) v(x)
+			WHERE
+				($7 IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM chat.messages
+					WHERE id = $7
+					  AND workspace_id = $1
+					  AND channel_id IS NOT DISTINCT FROM $2
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3
+				))
+				OR ($8 IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM chat.messages
+					WHERE id = $8
+					  AND workspace_id = $1
+					  AND channel_id IS NOT DISTINCT FROM $2
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3
+				))
+				OR ($9 IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM chat.messages
+					WHERE id = $9
+					  AND workspace_id = $1
+					  AND channel_id IS NOT DISTINCT FROM $2
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3
+				))
+		)
 		INSERT INTO chat.messages
 			(workspace_id, channel_id, dm_conversation_id, sender_id,
 			 kind, body_text, status,
 			 parent_message_id, forwarded_from_message_id, referenced_message_id)
-		VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9)
+		SELECT $1, $2, $3, $4, $5, $6, 'active', $7, $8, $9
+		WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 		RETURNING `+messageColumns(""),
 		input.WorkspaceID,
 		nullableUUID(input.ChannelID),
@@ -156,9 +198,31 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	)
 	msg, err := scanMessage(row)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, domain.ErrInvalidMessageReference
+		}
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
 	}
 	return msg, nil
+}
+
+func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error {
+	var exists int
+	err := s.pool.QueryRow(ctx, `
+		SELECT 1 FROM chat.messages
+		WHERE id = $1
+		  AND workspace_id = $2
+		  AND channel_id IS NOT DISTINCT FROM $3
+		  AND dm_conversation_id IS NOT DISTINCT FROM $4`,
+		messageID, workspaceID, nullableUUID(channelID), nullableUUID(dmConversationID),
+	).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidMessageReference
+		}
+		return fmt.Errorf("validate ref message in target: %w", err)
+	}
+	return nil
 }
 
 func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID string) (domain.Message, error) {
