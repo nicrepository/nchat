@@ -41,7 +41,7 @@ export default function LoginPage() {
         setPasswordChangeRequired(true);
         return;
       }
-      setTokens(result.accessToken, result.refreshToken);
+      setTokens(result.accessToken);
       navigate(dest, { replace: true });
     } catch {
       setError(LOGIN_ERROR);

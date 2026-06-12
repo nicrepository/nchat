@@ -4,7 +4,6 @@ import {
   _resetListeners,
   clearTokens,
   getAccessToken,
-  getRefreshToken,
   isAuthenticated,
   onAuthChange,
   setTokens,
@@ -20,25 +19,24 @@ afterEach(() => {
 });
 
 describe("authSession", () => {
-  it("setTokens stores both tokens in sessionStorage", () => {
-    setTokens("acc_abc", "ref_xyz");
+  it("setTokens stores access token in sessionStorage", () => {
+    setTokens("acc_abc");
     expect(getAccessToken()).toBe("acc_abc");
-    expect(getRefreshToken()).toBe("ref_xyz");
+  });
+
+  it("setTokens does not persist refresh token to sessionStorage", () => {
+    setTokens("acc_abc");
+    expect(sessionStorage.getItem("nchat_rt")).toBeNull();
   });
 
   it("getAccessToken returns null when not set", () => {
     expect(getAccessToken()).toBeNull();
   });
 
-  it("getRefreshToken returns null when not set", () => {
-    expect(getRefreshToken()).toBeNull();
-  });
-
-  it("clearTokens removes both tokens", () => {
-    setTokens("acc_abc", "ref_xyz");
+  it("clearTokens removes access token", () => {
+    setTokens("acc_abc");
     clearTokens();
     expect(getAccessToken()).toBeNull();
-    expect(getRefreshToken()).toBeNull();
   });
 
   it("isAuthenticated returns true when access token is set", () => {
@@ -46,20 +44,14 @@ describe("authSession", () => {
     expect(isAuthenticated()).toBe(true);
   });
 
-  it("isAuthenticated returns false when only refresh token is set", () => {
-    sessionStorage.setItem("nchat_rt", "ref_xyz");
+  it("isAuthenticated returns false when no access token is stored", () => {
     expect(isAuthenticated()).toBe(false);
   });
 
-  it("isAuthenticated returns false when no tokens are stored", () => {
-    expect(isAuthenticated()).toBe(false);
-  });
-
-  it("setTokens overwrites existing tokens", () => {
-    setTokens("acc_1", "ref_1");
-    setTokens("acc_2", "ref_2");
+  it("setTokens overwrites existing access token", () => {
+    setTokens("acc_1");
+    setTokens("acc_2");
     expect(getAccessToken()).toBe("acc_2");
-    expect(getRefreshToken()).toBe("ref_2");
   });
 });
 
@@ -67,13 +59,13 @@ describe("onAuthChange", () => {
   it("calls listener after setTokens", () => {
     const listener = vi.fn();
     const unsub = onAuthChange(listener);
-    setTokens("at", "rt");
+    setTokens("at");
     expect(listener).toHaveBeenCalledTimes(1);
     unsub();
   });
 
   it("calls listener after clearTokens", () => {
-    setTokens("at", "rt");
+    setTokens("at");
     const listener = vi.fn();
     const unsub = onAuthChange(listener);
     clearTokens();
@@ -85,7 +77,7 @@ describe("onAuthChange", () => {
     const listener = vi.fn();
     const unsub = onAuthChange(listener);
     unsub();
-    setTokens("at", "rt");
+    setTokens("at");
     expect(listener).not.toHaveBeenCalled();
   });
 
@@ -94,7 +86,7 @@ describe("onAuthChange", () => {
     const b = vi.fn();
     const unsubA = onAuthChange(a);
     const unsubB = onAuthChange(b);
-    setTokens("at", "rt");
+    setTokens("at");
     expect(a).toHaveBeenCalledTimes(1);
     expect(b).toHaveBeenCalledTimes(1);
     unsubA();
@@ -104,7 +96,7 @@ describe("onAuthChange", () => {
   it("listener is called with no arguments (no token payload)", () => {
     const listener = vi.fn();
     const unsub = onAuthChange(listener);
-    setTokens("at", "rt");
+    setTokens("at");
     expect(listener).toHaveBeenCalledWith();
     unsub();
   });

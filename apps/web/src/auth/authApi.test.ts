@@ -34,7 +34,6 @@ describe("login", () => {
     mockFetch.mockResolvedValue(
       jsonOk({
         access_token: "at",
-        refresh_token: "rt",
         token_type: "Bearer",
         expires_in: 900,
         user: {
@@ -59,7 +58,6 @@ describe("login", () => {
     mockFetch.mockResolvedValue(
       jsonOk({
         access_token: "at",
-        refresh_token: "rt",
         token_type: "Bearer",
         expires_in: 900,
         user: {
@@ -72,9 +70,26 @@ describe("login", () => {
     );
     const result = await login({ email: "a@b.com", password: "pass" });
     expect(result.accessToken).toBe("at");
-    expect(result.refreshToken).toBe("rt");
     expect(result.user.displayName).toBe("Alice");
     expect(result.user.mustChangePassword).toBe(false);
+  });
+
+  it("response does not expose refresh token in mapped result", async () => {
+    mockFetch.mockResolvedValue(
+      jsonOk({
+        access_token: "at",
+        token_type: "Bearer",
+        expires_in: 900,
+        user: {
+          id: "u1",
+          email: "a@b.com",
+          display_name: "Alice",
+          must_change_password: false,
+        },
+      }),
+    );
+    const result = await login({ email: "a@b.com", password: "pass" });
+    expect(Object.prototype.hasOwnProperty.call(result, "refreshToken")).toBe(false);
   });
 
   it("propagates ApiRequestError on 401", async () => {
@@ -91,33 +106,35 @@ describe("login", () => {
 });
 
 describe("refresh", () => {
-  it("calls POST /api/auth/refresh with refresh_token body", async () => {
+  it("calls POST /api/auth/refresh with no body", async () => {
     mockFetch.mockResolvedValue(
-      jsonOk({ access_token: "at2", refresh_token: "rt2", token_type: "Bearer", expires_in: 900 }),
+      jsonOk({ access_token: "at2", token_type: "Bearer", expires_in: 900 }),
     );
-    await refresh("rt1");
+    await refresh();
     const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/auth/refresh");
-    expect(JSON.parse(init.body as string)).toEqual({ refresh_token: "rt1" });
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
   });
 
-  it("maps response to camelCase TokenPair", async () => {
+  it("maps response to camelCase TokenPair without refreshToken", async () => {
     mockFetch.mockResolvedValue(
-      jsonOk({ access_token: "at2", refresh_token: "rt2", token_type: "Bearer", expires_in: 900 }),
+      jsonOk({ access_token: "at2", token_type: "Bearer", expires_in: 900 }),
     );
-    const result = await refresh("rt1");
+    const result = await refresh();
     expect(result.accessToken).toBe("at2");
-    expect(result.refreshToken).toBe("rt2");
+    expect(Object.prototype.hasOwnProperty.call(result, "refreshToken")).toBe(false);
   });
 });
 
 describe("logout", () => {
-  it("calls POST /api/auth/logout with refresh_token body", async () => {
+  it("calls POST /api/auth/logout with no body", async () => {
     mockFetch.mockResolvedValue(emptyResponse(204));
-    await logout("rt1");
+    await logout();
     const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/auth/logout");
-    expect(JSON.parse(init.body as string)).toEqual({ refresh_token: "rt1" });
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
   });
 });
 
@@ -221,7 +238,6 @@ describe("oidcExchange", () => {
     mockFetch.mockResolvedValue(
       jsonOk({
         access_token: "at",
-        refresh_token: "rt",
         token_type: "Bearer",
         expires_in: 900,
         user: {
@@ -240,8 +256,8 @@ describe("oidcExchange", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ code: "opaque-code" });
     expect(result.accessToken).toBe("at");
-    expect(result.refreshToken).toBe("rt");
     expect(result.user.displayName).toBe("SSO User");
+    expect(Object.prototype.hasOwnProperty.call(result, "refreshToken")).toBe(false);
   });
 
   it("propagates generic OIDC ApiRequestError", async () => {

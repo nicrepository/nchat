@@ -1,6 +1,6 @@
-import { refresh, type TokenPair } from "../auth/authApi";
+import { refresh, type TokenResponse } from "../auth/authApi";
 import { ApiRequestError, apiFetch } from "./api";
-import { clearTokens, getAccessToken, getRefreshToken, setTokens } from "./authSession";
+import { clearTokens, getAccessToken, setTokens } from "./authSession";
 
 /**
  * Auth endpoint path prefixes (by pathname) excluded from auto-refresh.
@@ -18,10 +18,6 @@ export const AUTH_SKIP_PREFIXES = [
 
 /**
  * Returns true if the URL's pathname matches an auth endpoint prefix.
- * Uses exact-match or prefix+"/" boundary so /api/auth/loginExtra does NOT match
- * /api/auth/login, but /api/auth/login/sub does.
- * Parses the URL to avoid false positives from query-string values that contain
- * auth path segments (e.g. /api/search?next=/api/auth/login).
  */
 function isAuthUrl(url: string): boolean {
   let pathname: string;
@@ -36,13 +32,8 @@ function isAuthUrl(url: string): boolean {
 }
 
 /**
- * Normalize any HeadersInit form (plain object, Headers instance, or tuple array)
- * into a plain Record<string, string>, injecting the Authorization header when an
- * access token is provided. Creates a new Headers instance so the caller-provided
- * object is never mutated.
- *
- * Note: WHATWG Headers normalizes names to lowercase, so the returned object uses
- * lowercase header names (e.g. "authorization", "content-type").
+ * Normalize any HeadersInit form into a plain Record<string, string>, injecting
+ * the Authorization header when an access token is provided.
  */
 function buildHeaders(
   existing: HeadersInit | undefined,
@@ -57,25 +48,22 @@ function buildHeaders(
 
 /**
  * Records the most recent successful refresh rotation committed by this module.
- * Used by the late-arrival guard to distinguish a same-generation rotation (safe
- * to retry) from an external session change such as logout or a new login (must
- * not retry under the new session).
+ * Used by the late-arrival guard: maps the expired AT to the newly-issued AT.
+ * The refresh token is HttpOnly and never stored in JS.
  */
 type AppliedRefreshRotation = {
-  fromRefreshToken: string;
+  fromAccessToken: string;
   toAccessToken: string;
-  toRefreshToken: string;
 };
 
 /**
- * Generation-bound in-flight refresh state. Each session generation (identified by
- * its refresh token) has at most one pending refresh call. Cross-session requests
- * (different refresh token) each get their own independent refresh call and cannot
- * observe or mutate each other's in-flight state.
+ * Generation-bound in-flight refresh state. Each session generation (identified
+ * by the expired access token that triggered it) has at most one pending refresh
+ * call. Cross-session requests each get their own independent refresh call.
  */
 type InflightRefresh = {
-  refreshToken: string;
-  promise: Promise<TokenPair>;
+  accessToken: string | null; // the expired AT that triggered this refresh
+  promise: Promise<TokenResponse>;
 };
 
 let lastAppliedRefreshRotation: AppliedRefreshRotation | null = null;
@@ -92,31 +80,21 @@ export function _resetState(): void {
  *
  * - Injects `Authorization: Bearer <access_token>` for every call.
  * - On 401 from a non-auth endpoint, attempts a single token refresh and retries once.
+ * - The refresh token is HttpOnly and sent automatically by the browser via cookie;
+ *   it is never read or stored in JavaScript.
  * - Late-arrival guard: if the stored access token changed while the request was in
  *   flight (a concurrent request already refreshed), retries immediately with the
  *   newer token instead of triggering another refresh.
- * - Generation-bound concurrency guard: concurrent 401s sharing the same refresh
- *   token share one refresh promise. Requests with a different refresh token (cross-
- *   session) each create their own refresh call and cannot affect each other.
+ * - Generation-bound concurrency guard: concurrent 401s sharing the same expired AT
+ *   share one refresh promise. Requests with a different AT each create their own.
  * - Session-binding guard: after the refresh settles, actions are conditional on
- *   the stored refresh token:
- *     - First settler (RT unchanged): calls setTokens, then retries.
- *     - Concurrent waiter on same refresh (RT === newTokens.refreshToken): falls
- *       through to retry without re-calling setTokens.
- *     - External session change (logout / newer login): throws original 401 without
- *       retrying and without touching the new session's tokens.
- *
- * Refresh is request-driven only — no background timer, no keepalive.
- * Backend remains authoritative for idle/absolute session expiry.
- *
- * NOTE: `init.body` must be a non-stream type (string, Blob, ArrayBuffer, etc.).
- * ReadableStream bodies cannot be safely reused across a retry.
+ *   the stored access token:
+ *     - First settler (AT unchanged): calls setTokens, then retries.
+ *     - Concurrent waiter (AT === newTokens.accessToken): falls through to retry.
+ *     - External session change (logout / newer login): throws original 401.
  */
 export async function authenticatedFetch<T>(url: string, init: RequestInit): Promise<T> {
-  // Capture both tokens BEFORE the first call so the late-arrival guard can
-  // verify that any token change was caused by a same-generation rotation.
   const originalAccessToken = getAccessToken();
-  const originalRefreshToken = getRefreshToken();
 
   try {
     return await apiFetch<T>(url, {
@@ -128,18 +106,16 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
       throw err;
     }
 
-    // Late-arrival guard: if the stored access token changed, only retry when the
-    // change is known to be a same-generation rotation committed by this module.
-    // Retrying under a different session (logout or a newer login) is forbidden.
+    // Late-arrival guard: if the stored AT changed, only retry when the change is
+    // a known same-generation rotation committed by this module.
     const currentAccessToken = getAccessToken();
     if (currentAccessToken !== originalAccessToken) {
       const rotation = lastAppliedRefreshRotation;
       if (
-        originalRefreshToken !== null &&
+        originalAccessToken !== null &&
         rotation !== null &&
-        rotation.fromRefreshToken === originalRefreshToken &&
-        currentAccessToken === rotation.toAccessToken &&
-        getRefreshToken() === rotation.toRefreshToken
+        rotation.fromAccessToken === originalAccessToken &&
+        currentAccessToken === rotation.toAccessToken
       ) {
         return apiFetch<T>(url, {
           ...init,
@@ -150,29 +126,22 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
       throw err;
     }
 
-    // 401 on a non-auth endpoint: attempt a single refresh.
-    const refreshToken = getRefreshToken();
-    if (refreshToken === null) {
-      clearTokens();
-      throw err;
-    }
-
-    // Acquire or share a generation-bound in-flight refresh. Only share if the
-    // stored refresh token matches; cross-session requests each get their own call.
-    if (!inflightRefresh || inflightRefresh.refreshToken !== refreshToken) {
-      inflightRefresh = { refreshToken, promise: refresh(refreshToken) };
+    // 401 on a non-auth endpoint: attempt a single refresh via the HttpOnly cookie.
+    // Acquire or share a generation-bound in-flight refresh keyed by the expired AT.
+    if (!inflightRefresh || inflightRefresh.accessToken !== originalAccessToken) {
+      inflightRefresh = { accessToken: originalAccessToken, promise: refresh() };
     }
     const captured = inflightRefresh;
 
-    let newTokens: TokenPair;
+    let newTokens: TokenResponse;
     try {
       newTokens = await captured.promise;
     } catch {
       try {
         // Session-binding guard: only clear tokens if this session is still active.
-        if (getRefreshToken() === refreshToken) {
+        if (getAccessToken() === originalAccessToken) {
           clearTokens();
-          if (lastAppliedRefreshRotation?.fromRefreshToken === refreshToken) {
+          if (lastAppliedRefreshRotation?.fromAccessToken === originalAccessToken) {
             lastAppliedRefreshRotation = null;
           }
         }
@@ -182,32 +151,27 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
       }
     }
 
-    // Three-way session-binding guard. Keep inflightRefresh active until after the
-    // guarded commit/discard decision so no concurrent 401 for this generation can
-    // start a second refresh before the commit is complete.
+    // Three-way session-binding guard.
     try {
-      const currentRT = getRefreshToken();
-      if (currentRT === refreshToken) {
-        // First settler: commit the new tokens and record the rotation.
-        setTokens(newTokens.accessToken, newTokens.refreshToken);
+      const currentAT = getAccessToken();
+      if (currentAT === originalAccessToken) {
+        // First settler: commit the new access token and record the rotation.
+        setTokens(newTokens.accessToken);
         lastAppliedRefreshRotation = {
-          fromRefreshToken: refreshToken,
+          fromAccessToken: originalAccessToken ?? "",
           toAccessToken: newTokens.accessToken,
-          toRefreshToken: newTokens.refreshToken,
         };
-      } else if (currentRT === newTokens.refreshToken) {
-        // Concurrent waiter on the same session: first settler already committed the
-        // tokens. Fall through to retry with the now-current access token.
+      } else if (currentAT === newTokens.accessToken) {
+        // Concurrent waiter: first settler already committed the tokens.
       } else {
         // External session change (logout or newer login) while refresh was in flight.
-        // Do not retry under the new/empty session; return the original 401.
         throw err;
       }
     } finally {
       if (inflightRefresh === captured) inflightRefresh = null;
     }
 
-    // Retry the original request exactly once with the current access token.
+    // Retry the original request once with the current access token.
     const newAccessToken = getAccessToken();
     return apiFetch<T>(url, { ...init, headers: buildHeaders(init.headers, newAccessToken) });
   }

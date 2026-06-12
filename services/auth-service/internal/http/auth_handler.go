@@ -14,45 +14,81 @@ import (
 
 const (
 	errCodeInvalidRefreshToken       = "invalid_refresh_token"
-	errCodeInvalidCredentials        = "invalid_credentials" //nolint:gosec // G101: this is an error code string, not a credential value
+	errCodeInvalidCredentials        = "invalid_credentials" //nolint:gosec // G101: error code string, not a credential value
 	errCodeRequestTooLarge           = "request_too_large"
 	maxAuthRequestBodyBytes    int64 = 4 * 1024
+
+	refreshCookieName = "nchat_rt"
+	refreshCookiePath = "/api/auth"
 )
 
-type refreshRequest struct {
-	RefreshToken string `json:"refresh_token"`
+// refreshCookie builds an HttpOnly, Secure, SameSite=Strict cookie for the refresh token.
+func refreshCookie(token string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     refreshCookieName,
+		Value:    token,
+		Path:     refreshCookiePath,
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	}
 }
 
+// clearRefreshCookie returns a cookie directive that instructs the browser to delete nchat_rt.
+func clearRefreshCookie() *http.Cookie {
+	return &http.Cookie{
+		Name:     refreshCookieName,
+		Value:    "",
+		Path:     refreshCookiePath,
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	}
+}
+
+// readRefreshCookie extracts the refresh token value from the request cookie.
+func readRefreshCookie(r *http.Request) (string, bool) {
+	c, err := r.Cookie(refreshCookieName)
+	if err != nil {
+		return "", false
+	}
+	return c.Value, true
+}
+
+// tokenResponse is the JSON body returned by /auth/refresh.
+// The refresh token is no longer included in the body; it is set as an HttpOnly cookie.
 type tokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
 }
 
-func AuthRefresh(auth service.AuthSessionManager) http.Handler {
+func AuthRefresh(auth service.AuthSessionManager, refreshTTL int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if auth == nil {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "auth token endpoints disabled")
 			return
 		}
 
-		var req refreshRequest
-		if !decodeRefreshRequest(w, r, &req) {
+		refreshToken, ok := readRefreshCookie(r)
+		if !ok {
+			httputil.WriteError(w, http.StatusUnauthorized, errCodeInvalidRefreshToken, "invalid refresh token")
 			return
 		}
 
-		pair, err := auth.Refresh(r.Context(), req.RefreshToken)
+		pair, err := auth.Refresh(r.Context(), refreshToken)
 		if err != nil {
 			writeAuthError(w, err)
 			return
 		}
 
+		http.SetCookie(w, refreshCookie(pair.RefreshToken, refreshTTL))
 		writeTokenResponse(w, http.StatusOK, tokenResponse{
-			AccessToken:  pair.AccessToken,
-			RefreshToken: pair.RefreshToken,
-			TokenType:    pair.TokenType,
-			ExpiresIn:    pair.ExpiresIn,
+			AccessToken: pair.AccessToken,
+			TokenType:   pair.TokenType,
+			ExpiresIn:   pair.ExpiresIn,
 		})
 	})
 }
@@ -64,44 +100,22 @@ func AuthLogout(auth service.AuthSessionManager) http.Handler {
 			return
 		}
 
-		var req refreshRequest
-		if !decodeRefreshRequest(w, r, &req) {
+		refreshToken, ok := readRefreshCookie(r)
+		if !ok {
+			http.SetCookie(w, clearRefreshCookie())
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		if err := auth.Logout(r.Context(), req.RefreshToken); err != nil {
-			if errors.Is(err, domain.ErrInvalidRefreshToken) {
-				w.WriteHeader(http.StatusNoContent)
+		if err := auth.Logout(r.Context(), refreshToken); err != nil {
+			if !errors.Is(err, domain.ErrInvalidRefreshToken) {
+				writeAuthError(w, err)
 				return
 			}
-			writeAuthError(w, err)
-			return
 		}
+		http.SetCookie(w, clearRefreshCookie())
 		w.WriteHeader(http.StatusNoContent)
 	})
-}
-
-func decodeRefreshRequest(w http.ResponseWriter, r *http.Request, req *refreshRequest) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxAuthRequestBodyBytes)
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(req); err != nil {
-		writeDecodeError(w, err)
-		return false
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeDecodeError(w, err)
-		return false
-	}
-	return true
-}
-
-func writeDecodeError(w http.ResponseWriter, err error) {
-	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
-		httputil.WriteError(w, http.StatusRequestEntityTooLarge, errCodeRequestTooLarge, "request body too large")
-		return
-	}
-	httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid JSON body")
 }
 
 func writeAuthError(w http.ResponseWriter, err error) {
@@ -116,7 +130,7 @@ func writeAuthError(w http.ResponseWriter, err error) {
 }
 
 func writeTokenResponse(w http.ResponseWriter, status int, payload tokenResponse) {
-	//nolint:gosec // This endpoint must serialize tokens to the authenticated caller; token hashes are never included.
+	//nolint:gosec // This endpoint must serialize the access token to the authenticated caller.
 	body, err := json.Marshal(payload)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
@@ -144,19 +158,17 @@ type loginUserResponse struct {
 	MustChangePassword bool   `json:"must_change_password"`
 }
 
-// loginResponse is the JSON body returned on a successful login.
+// loginResponse is the JSON body returned on a successful login or OIDC exchange.
+// The refresh token is no longer included in the body; it is set as an HttpOnly cookie.
 type loginResponse struct {
-	AccessToken  string            `json:"access_token"`
-	RefreshToken string            `json:"refresh_token"`
-	TokenType    string            `json:"token_type"`
-	ExpiresIn    int               `json:"expires_in"`
-	User         loginUserResponse `json:"user"`
+	AccessToken string            `json:"access_token"`
+	TokenType   string            `json:"token_type"`
+	ExpiresIn   int               `json:"expires_in"`
+	User        loginUserResponse `json:"user"`
 }
 
 // AuthLogin returns an http.Handler for POST /auth/login.
-// It returns 503 when login service is nil (database not configured),
-// 401 for invalid credentials (including lockout), and 200 with tokens on success.
-func AuthLogin(login service.LoginManager, trustedProxyCIDRs []*net.IPNet) http.Handler {
+func AuthLogin(login service.LoginManager, trustedProxyCIDRs []*net.IPNet, refreshTTL int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if login == nil {
 			httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "auth login endpoint disabled")
@@ -168,7 +180,6 @@ func AuthLogin(login service.LoginManager, trustedProxyCIDRs []*net.IPNet) http.
 			return
 		}
 
-		// Extract real client IP using trusted-proxy-aware logic.
 		ipAddress := httputil.ClientIP(r, trustedProxyCIDRs)
 
 		result, err := login.Login(r.Context(), domain.LoginInput{
@@ -185,12 +196,11 @@ func AuthLogin(login service.LoginManager, trustedProxyCIDRs []*net.IPNet) http.
 			return
 		}
 
-		//nolint:gosec // JSON-serialised tokens returned only to the authenticated caller; no hashes or raw secrets included.
+		//nolint:gosec // Access token returned to authenticated caller; refresh token set as HttpOnly cookie only.
 		body, marshalErr := json.Marshal(loginResponse{
-			AccessToken:  result.AccessToken,
-			RefreshToken: result.RefreshToken,
-			TokenType:    result.TokenType,
-			ExpiresIn:    result.ExpiresIn,
+			AccessToken: result.AccessToken,
+			TokenType:   result.TokenType,
+			ExpiresIn:   result.ExpiresIn,
 			User: loginUserResponse{
 				ID:                 result.User.ID,
 				Email:              result.User.Email,
@@ -202,14 +212,14 @@ func AuthLogin(login service.LoginManager, trustedProxyCIDRs []*net.IPNet) http.
 			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 			return
 		}
+		http.SetCookie(w, refreshCookie(result.RefreshToken, refreshTTL))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(append(body, '\n')) // nosemgrep
 	})
 }
 
-// decodeLoginRequest decodes the login JSON body with the same 4 KiB cap and
-// trailing-garbage rejection used by decodeRefreshRequest.
+// decodeLoginRequest decodes the login JSON body with a 4 KiB cap and trailing-garbage rejection.
 func decodeLoginRequest(w http.ResponseWriter, r *http.Request, req *loginRequest) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxAuthRequestBodyBytes)
 	decoder := json.NewDecoder(r.Body)
@@ -222,6 +232,15 @@ func decodeLoginRequest(w http.ResponseWriter, r *http.Request, req *loginReques
 		return false
 	}
 	return true
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		httputil.WriteError(w, http.StatusRequestEntityTooLarge, errCodeRequestTooLarge, "request body too large")
+		return
+	}
+	httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid JSON body")
 }
 
 // writeLoginError maps login service errors to HTTP responses.

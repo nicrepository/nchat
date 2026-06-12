@@ -4,7 +4,6 @@ import { Navigate, useLocation } from "react-router-dom";
 import {
   clearTokens,
   getAccessToken,
-  getRefreshToken,
   isAuthenticated,
   onAuthChange,
   setTokens,
@@ -15,8 +14,9 @@ type AuthState = "authenticated" | "checking" | "unauthenticated";
 
 function initialAuthState(): AuthState {
   if (getAccessToken() !== null) return "authenticated";
-  if (getRefreshToken() !== null) return "checking";
-  return "unauthenticated";
+  // No access token: attempt silent refresh via the HttpOnly RT cookie.
+  // We can't read the cookie from JS; the browser sends it automatically.
+  return "checking";
 }
 
 interface RequireAuthProps {
@@ -28,7 +28,6 @@ export default function RequireAuth({ children }: RequireAuthProps) {
   const refreshStarted = useRef(false);
   const location = useLocation();
 
-  // React to setTokens / clearTokens called anywhere after mount.
   useEffect(() => {
     return onAuthChange(() => {
       setAuthState(isAuthenticated() ? "authenticated" : "unauthenticated");
@@ -40,22 +39,11 @@ export default function RequireAuth({ children }: RequireAuthProps) {
 
     refreshStarted.current = true;
     let cancelled = false;
-    const refreshToken = getRefreshToken();
 
-    if (refreshToken === null) {
-      clearTokens();
-      void Promise.resolve().then(() => {
-        if (!cancelled) setAuthState("unauthenticated");
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    refresh(refreshToken)
-      .then(({ accessToken, refreshToken: nextRefreshToken }) => {
+    refresh()
+      .then(({ accessToken }) => {
         if (cancelled) return;
-        setTokens(accessToken, nextRefreshToken);
+        setTokens(accessToken);
         setAuthState("authenticated");
       })
       .catch(() => {

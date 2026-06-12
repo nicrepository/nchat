@@ -27,6 +27,9 @@ func TestSecurityHeadersAppliesAPIHeaders(t *testing.T) {
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("expected Cache-Control no-store")
 	}
+	if response.Header().Get("Strict-Transport-Security") != "max-age=63072000; includeSubDomains" {
+		t.Fatalf("expected HSTS header, got %q", response.Header().Get("Strict-Transport-Security"))
+	}
 }
 
 func TestRequestIDGeneratesMissingID(t *testing.T) {

@@ -133,7 +133,7 @@ func TestOIDCExchange_ReturnsLoginShape(t *testing.T) {
 		ExpiresIn:    900,
 		User:         domain.LoginUser{ID: "u1", Email: "user@example.com", DisplayName: "User"},
 	}}
-	handler := httpapi.OIDCExchange(svc)
+	handler := httpapi.OIDCExchange(svc, 3600)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"opaque-code"}`)))
 
@@ -144,8 +144,9 @@ func TestOIDCExchange_ReturnsLoginShape(t *testing.T) {
 		t.Fatalf("expected raw exchange code passed to service, got %q", svc.gotExchangeCode)
 	}
 	var body struct {
-		AccessToken string `json:"access_token"`
-		User        struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		User         struct {
 			DisplayName string `json:"display_name"`
 		} `json:"user"`
 	}
@@ -155,10 +156,29 @@ func TestOIDCExchange_ReturnsLoginShape(t *testing.T) {
 	if body.AccessToken != "access" || body.User.DisplayName != "User" {
 		t.Fatalf("unexpected body: %+v", body)
 	}
+	if body.RefreshToken != "" {
+		t.Fatalf("refresh_token must not appear in JSON body, got %q", body.RefreshToken)
+	}
+	// Refresh token must be in Set-Cookie.
+	var rtCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "nchat_rt" {
+			rtCookie = c
+		}
+	}
+	if rtCookie == nil {
+		t.Fatal("expected nchat_rt Set-Cookie in OIDC exchange response")
+	}
+	if rtCookie.Value != "refresh" {
+		t.Fatalf("expected cookie value %q, got %q", "refresh", rtCookie.Value)
+	}
+	if !rtCookie.HttpOnly {
+		t.Fatal("expected nchat_rt cookie to be HttpOnly")
+	}
 }
 
 func TestOIDCExchange_DisabledReturns404(t *testing.T) {
-	handler := httpapi.OIDCExchange(nil)
+	handler := httpapi.OIDCExchange(nil, 0)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"opaque"}`)))
 
@@ -169,7 +189,7 @@ func TestOIDCExchange_DisabledReturns404(t *testing.T) {
 
 func TestOIDCExchange_InvalidRequestBodyReturns400AndSkipsService(t *testing.T) {
 	svc := &fakeOIDCManager{}
-	handler := httpapi.OIDCExchange(svc)
+	handler := httpapi.OIDCExchange(svc, 0)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"opaque"} {}`)))
 
@@ -183,7 +203,7 @@ func TestOIDCExchange_InvalidRequestBodyReturns400AndSkipsService(t *testing.T) 
 
 func TestOIDCExchange_TooLargeRequestBodyReturns413AndSkipsService(t *testing.T) {
 	svc := &fakeOIDCManager{}
-	handler := httpapi.OIDCExchange(svc)
+	handler := httpapi.OIDCExchange(svc, 0)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"`+strings.Repeat("a", 65_000)+`"}`)))
 
@@ -197,7 +217,7 @@ func TestOIDCExchange_TooLargeRequestBodyReturns413AndSkipsService(t *testing.T)
 
 func TestOIDCExchange_InvalidCodeIsGenericAndDoesNotEchoCode(t *testing.T) {
 	svc := &fakeOIDCManager{exchangeErr: domain.ErrInvalidToken}
-	handler := httpapi.OIDCExchange(svc)
+	handler := httpapi.OIDCExchange(svc, 0)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"sensitive-exchange-code"}`)))
 
@@ -240,7 +260,7 @@ func TestOIDCRouterDisabledRoutesReturn404BeforeRateLimit(t *testing.T) {
 }
 
 func TestOIDCErrorMappingConflict(t *testing.T) {
-	handler := httpapi.OIDCExchange(&fakeOIDCManager{exchangeErr: domain.ErrOIDCAccountConflict})
+	handler := httpapi.OIDCExchange(&fakeOIDCManager{exchangeErr: domain.ErrOIDCAccountConflict}, 0)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"opaque"}`)))
 	if rec.Code != http.StatusConflict {
@@ -249,7 +269,7 @@ func TestOIDCErrorMappingConflict(t *testing.T) {
 }
 
 func TestOIDCExchange_InternalErrorsAreGeneric(t *testing.T) {
-	handler := httpapi.OIDCExchange(&fakeOIDCManager{exchangeErr: errors.New("database leaked detail")})
+	handler := httpapi.OIDCExchange(&fakeOIDCManager{exchangeErr: errors.New("database leaked detail")}, 0)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, httpapi.RouteAuthOIDCKeycloakExchange, strings.NewReader(`{"code":"opaque"}`)))
 	if rec.Code != http.StatusInternalServerError {
