@@ -110,3 +110,46 @@ func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID
 	}
 	return nil
 }
+
+// RemoveMemberFromChannel removes targetUserID from channelID in workspaceID.
+// callerID must be an active owner or admin in the workspace.
+// Returns ErrForbidden when removing from #geral or when caller lacks manager permission.
+func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) error {
+	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
+	if err != nil {
+		return fmt.Errorf("get channel: %w", err)
+	}
+	if channel.IsGeneral {
+		return domain.ErrForbidden
+	}
+
+	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.ErrForbidden
+		}
+		return fmt.Errorf("get workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.ErrForbidden
+	}
+
+	caller, err := s.members.GetWorkspaceMember(ctx, workspaceID, callerID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ErrForbidden
+	}
+	if err != nil {
+		return fmt.Errorf("get caller workspace member: %w", err)
+	}
+	if caller.Status != domain.MemberStatusActive {
+		return domain.ErrForbidden
+	}
+	if caller.Role != domain.WorkspaceRoleOwner && caller.Role != domain.WorkspaceRoleAdmin {
+		return domain.ErrForbidden
+	}
+
+	if err := s.members.RemoveChannelMember(ctx, workspaceID, channelID, targetUserID); err != nil {
+		return fmt.Errorf("remove channel member: %w", err)
+	}
+	return nil
+}

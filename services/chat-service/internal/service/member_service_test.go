@@ -457,3 +457,78 @@ func TestMemberService_LeaveChannel_CrossWorkspace_ReturnsNotFound(t *testing.T)
 		t.Fatalf("cross-workspace leave should return ErrNotFound, got: %v", err)
 	}
 }
+
+// --- RemoveMemberFromChannel ---
+
+func TestMemberService_RemoveMemberFromChannel_OwnerCanRemove(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "owner-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "owner-1", Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive,
+	}
+	ms.channelMembers[cmKey("ch-1", "user-1")] = domain.ChannelMember{ChannelID: "ch-1", UserID: "user-1", Role: domain.ChannelRoleMember}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	if err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-1", "owner-1", "user-1"); err != nil {
+		t.Fatalf("owner should be able to remove member: %v", err)
+	}
+	if _, ok := ms.channelMembers[cmKey("ch-1", "user-1")]; ok {
+		t.Fatal("channel_members row should have been deleted")
+	}
+}
+
+func TestMemberService_RemoveMemberFromChannel_AdminCanRemove(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "admin-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "admin-1", Role: domain.WorkspaceRoleAdmin, Status: domain.MemberStatusActive,
+	}
+	ms.channelMembers[cmKey("ch-1", "user-1")] = domain.ChannelMember{ChannelID: "ch-1", UserID: "user-1", Role: domain.ChannelRoleMember}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	if err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-1", "admin-1", "user-1"); err != nil {
+		t.Fatalf("admin should be able to remove member: %v", err)
+	}
+	if _, ok := ms.channelMembers[cmKey("ch-1", "user-1")]; ok {
+		t.Fatal("channel_members row should have been deleted")
+	}
+}
+
+func TestMemberService_RemoveMemberFromChannel_MemberRoleDenied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "member-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "member-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	if err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-1", "member-1", "user-2"); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("member role should get ErrForbidden, got: %v", err)
+	}
+}
+
+func TestMemberService_RemoveMemberFromChannel_GuestRoleDenied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "guest-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "guest-1", Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive,
+	}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	if err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-1", "guest-1", "user-2"); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("guest role should get ErrForbidden, got: %v", err)
+	}
+}
+
+func TestMemberService_RemoveMemberFromChannel_GeneralChannel_Denied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true}
+	ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+	ms.workspaceMembers[wmKey("ws-1", "owner-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "owner-1", Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive,
+	}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+	if err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-geral", "owner-1", "user-1"); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("removing from #geral should return ErrForbidden, got: %v", err)
+	}
+}
