@@ -22,6 +22,10 @@ type MemberStore interface {
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
+	// RemoveChannelMember deletes the channel membership for userID in channelID, scoped to
+	// workspaceID. Returns ErrCannotLeaveGeneralChannel if the channel has is_general=true.
+	// Returns nil when the membership does not exist (idempotent).
+	RemoveChannelMember(ctx context.Context, workspaceID, channelID, userID string) error
 	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
 	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
 }
@@ -345,4 +349,34 @@ func (s *PGXMemberStore) GetChannelMember(ctx context.Context, channelID, userID
 		return domain.ChannelMember{}, fmt.Errorf("get channel member: %w", err)
 	}
 	return m, nil
+}
+
+// RemoveChannelMember deletes a channel membership, scoped to workspaceID.
+// Checks is_general first and returns ErrCannotLeaveGeneralChannel to prevent
+// bypassing the service-level guard via direct storage calls.
+// Returns nil when the channel is not in the workspace or the user is not a member.
+func (s *PGXMemberStore) RemoveChannelMember(ctx context.Context, workspaceID, channelID, userID string) error {
+	var isGeneral bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT is_general FROM chat.channels
+		WHERE id = $1 AND workspace_id = $2`,
+		channelID, workspaceID,
+	).Scan(&isGeneral)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("check channel for remove: %w", err)
+	}
+	if isGeneral {
+		return domain.ErrCannotLeaveGeneralChannel
+	}
+	if _, err := s.pool.Exec(ctx, `
+		DELETE FROM chat.channel_members
+		WHERE channel_id = $1 AND user_id = $2`,
+		channelID, userID,
+	); err != nil {
+		return fmt.Errorf("remove channel member: %w", err)
+	}
+	return nil
 }
