@@ -389,3 +389,71 @@ func TestMemberService_SelfJoinChannel_RoleIsAlwaysMember(t *testing.T) {
 		t.Fatalf("channel role must always be ChannelRoleMember even for owner, got %q", m.Role)
 	}
 }
+
+// --- LeaveChannel ---
+
+func TestMemberService_LeaveChannel_PublicChannel_RemovesRow(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	ms.channelMembers[cmKey("ch-1", "user-1")] = domain.ChannelMember{ChannelID: "ch-1", UserID: "user-1", Role: domain.ChannelRoleMember}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{})
+	if err := svc.LeaveChannel(context.Background(), "ws-1", "ch-1", "user-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := ms.channelMembers[cmKey("ch-1", "user-1")]; ok {
+		t.Fatal("channel_members row should have been deleted")
+	}
+}
+
+func TestMemberService_LeaveChannel_PrivateChannel_RemovesRow(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-priv", WorkspaceID: "ws-1", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+	ms.channelMembers[cmKey("ch-priv", "user-1")] = domain.ChannelMember{ChannelID: "ch-priv", UserID: "user-1", Role: domain.ChannelRoleMember}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{})
+	if err := svc.LeaveChannel(context.Background(), "ws-1", "ch-priv", "user-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := ms.channelMembers[cmKey("ch-priv", "user-1")]; ok {
+		t.Fatal("channel_members row should have been deleted")
+	}
+}
+
+func TestMemberService_LeaveChannel_GeneralChannel_Denied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{})
+	err := svc.LeaveChannel(context.Background(), "ws-1", "ch-geral", "user-1")
+	if !errors.Is(err, domain.ErrCannotLeaveGeneralChannel) {
+		t.Fatalf("leaving #geral should return ErrCannotLeaveGeneralChannel, got: %v", err)
+	}
+}
+
+func TestMemberService_LeaveChannel_NonMember_Idempotent(t *testing.T) {
+	ms := newFakeMemberStore()
+	ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{})
+	if err := svc.LeaveChannel(context.Background(), "ws-1", "ch-1", "user-1"); err != nil {
+		t.Fatalf("non-member leave should be idempotent (nil), got: %v", err)
+	}
+}
+
+func TestMemberService_LeaveChannel_ArchivedChannel_ReturnsNotFound(t *testing.T) {
+	ms := newFakeMemberStore()
+	// Archived channel: GetChannelByIDInWorkspace returns ErrNotFound (filters status=active)
+	archivedCh := domain.Channel{ID: "ch-arch", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusArchived}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: archivedCh}, &fakeWorkspaceStore{})
+	err := svc.LeaveChannel(context.Background(), "ws-1", "ch-arch", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("archived channel leave should return ErrNotFound, got: %v", err)
+	}
+}
+
+func TestMemberService_LeaveChannel_CrossWorkspace_ReturnsNotFound(t *testing.T) {
+	ms := newFakeMemberStore()
+	chInOtherWS := domain.Channel{ID: "ch-2", WorkspaceID: "ws-2", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	svc := service.NewMemberService(ms, &fakeChannelStore{channel: chInOtherWS}, &fakeWorkspaceStore{})
+	err := svc.LeaveChannel(context.Background(), "ws-1", "ch-2", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("cross-workspace leave should return ErrNotFound, got: %v", err)
+	}
+}

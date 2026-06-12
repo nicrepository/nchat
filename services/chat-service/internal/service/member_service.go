@@ -92,3 +92,21 @@ func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channe
 	}
 	return m, err
 }
+
+// LeaveChannel removes userID from channelID in workspaceID.
+// Returns ErrCannotLeaveGeneralChannel when channelID is the #geral channel.
+// Returns nil (idempotent) when userID is not a channel member.
+// Returns ErrNotFound when the channel is archived or belongs to a different workspace.
+func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID, userID string) error {
+	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
+	if err != nil {
+		return fmt.Errorf("get channel: %w", err)
+	}
+	if channel.IsGeneral {
+		return domain.ErrCannotLeaveGeneralChannel
+	}
+	if err := s.members.RemoveChannelMember(ctx, workspaceID, channelID, userID); err != nil {
+		return fmt.Errorf("remove channel member: %w", err)
+	}
+	return nil
+}
