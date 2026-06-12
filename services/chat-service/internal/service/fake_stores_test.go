@@ -191,6 +191,7 @@ type fakeMemberStore struct {
 	generalChannels  map[string]string
 	addWMErr         error
 	addCMErr         error
+	removeCMErr      error
 	getWMErr         error
 	getCMErr         error
 }
@@ -286,6 +287,14 @@ func (f *fakeMemberStore) GetChannelMember(_ context.Context, channelID, userID 
 		return domain.ChannelMember{}, domain.ErrNotFound
 	}
 	return m, nil
+}
+
+func (f *fakeMemberStore) RemoveChannelMember(_ context.Context, _, channelID, userID string) error {
+	if f.removeCMErr != nil {
+		return f.removeCMErr
+	}
+	delete(f.channelMembers, cmKey(channelID, userID))
+	return nil
 }
 
 func (f *fakeMemberStore) EnsureGeneralMembership(_ context.Context, workspaceID, userID string) error {
