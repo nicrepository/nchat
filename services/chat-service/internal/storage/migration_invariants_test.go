@@ -80,3 +80,38 @@ func TestChatMigration_DownRemovesGeneralChannelTriggers(t *testing.T) {
 		}
 	}
 }
+
+func TestChatMigration_AddsDMConversationTables(t *testing.T) {
+	migration := readChatMigration(t, "000003_chat_dm_conversations.up.sql")
+	for _, expected := range []string{
+		"CREATE TABLE chat.dm_conversations",
+		"CREATE TABLE chat.dm_members",
+		"direct_pair_key",
+		"CHECK (type IN ('direct', 'group'))",
+		"CHECK (status IN ('active', 'archived'))",
+		"CHECK (role IN ('member'))",
+		"CHECK (status IN ('active', 'left'))",
+		"CONSTRAINT dm_conversations_direct_pair_key_check CHECK",
+		"(type = 'direct' AND direct_pair_key IS NOT NULL)",
+		"(type = 'group' AND direct_pair_key IS NULL)",
+		"CREATE UNIQUE INDEX idx_dm_conversations_direct_pair_unique",
+		"ON chat.dm_conversations (workspace_id, direct_pair_key)",
+		"WHERE type = 'direct'",
+		"CREATE INDEX idx_dm_conversations_workspace",
+		"CREATE INDEX idx_dm_members_user",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("dm migration missing %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_DMDownDoesNotDropSchemaCascade(t *testing.T) {
+	migration := readChatMigration(t, "000003_chat_dm_conversations.down.sql")
+	if strings.Contains(strings.ToUpper(migration), "DROP SCHEMA") {
+		t.Fatal("dm down migration must not drop schema")
+	}
+	if strings.Contains(strings.ToUpper(migration), "CASCADE") {
+		t.Fatal("dm down migration must not use cascade")
+	}
+}

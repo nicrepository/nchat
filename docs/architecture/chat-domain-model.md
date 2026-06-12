@@ -3,10 +3,11 @@
 > **MVP foundation only.** Single/default workspace.
 > Full multi-workspace (RF-68..RF-72) is out of scope.
 > Full RBAC (RF-74) is out of scope; only minimal role/permission foundation.
-> Messaging, WebSocket, E2E, search, and admin UI are out of scope.
+> Messaging, WebSocket, E2E/MLS, search, and admin UI are out of scope.
 
 Migrations: `migrations/chat/000001_chat_domain_schema` and
-`migrations/chat/000002_chat_enforce_channel_workspace_isolation`
+`migrations/chat/000002_chat_enforce_channel_workspace_isolation` and
+`migrations/chat/000003_chat_dm_conversations`
 Schema: `chat`
 
 ## Table summary
@@ -15,6 +16,8 @@ Schema: `chat`
     ├── chat.channel_categories  (workspace_id FK, CASCADE delete)
     ├── chat.channels            (workspace_id FK, CASCADE delete; workspace-bound category FK)
     │   └── chat.channel_members (channel_id FK, CASCADE delete)
+    ├── chat.dm_conversations    (workspace_id FK, CASCADE delete)
+    │   └── chat.dm_members      (conversation_id FK, CASCADE delete)
     └── chat.workspace_members   (workspace_id FK, CASCADE delete)
 
 ## Seed data
@@ -82,6 +85,34 @@ Seed uses `ON CONFLICT (id) DO NOTHING` — idempotent on repeated migration run
 | user_id    | uuid        | PK part, auth.users ref (no FK)  |
 | role       | text        | member / moderator               |
 | joined_at  | timestamptz |                                  |
+
+### dm_conversations
+
+| Column       | Type        | Notes                        |
+| ------------ | ----------- | ---------------------------- |
+| id           | uuid        | PK, gen_random_uuid()        |
+| workspace_id | uuid        | FK -> workspaces (CASCADE)   |
+| type         | text        | direct / group               |
+| title        | text        | Nullable, max 120 characters |
+| status       | text        | active / archived            |
+| created_by   | uuid        | auth.users ref (no FK)       |
+| created_at   | timestamptz |                              |
+| updated_at   | timestamptz |                              |
+
+Direct 1:1 conversations also store an internal uniqueness column. It is a
+database/service implementation detail only: callers do not provide it, domain
+responses do not include it, and future HTTP responses must not expose it.
+
+### dm_members
+
+| Column          | Type        | Notes                                  |
+| --------------- | ----------- | -------------------------------------- |
+| conversation_id | uuid        | PK part, FK -> dm_conversations        |
+| user_id         | uuid        | PK part, auth.users ref (no FK)        |
+| role            | text        | member                                 |
+| status          | text        | active / left                          |
+| joined_at       | timestamptz |                                        |
+| left_at         | timestamptz | Nullable; set only when status is left |
 
 Active workspace members are automatically synced into their workspace's
 mandatory `#geral` channel. The pgx member store performs workspace
@@ -166,8 +197,50 @@ channel, and never exposes `is_general` as caller-controlled input.
 Full multi-workspace workflows (RF-68..RF-72) and the full RBAC matrix (RF-74)
 remain out of scope for this MVP foundation.
 
+## DM conversation foundation
+
+`DMService` implements the backend service/storage foundation for direct 1:1
+DMs and ad-hoc group DMs inside a workspace. This is conversation and membership
+foundation only. It intentionally does **not** add a messages table, message
+body delivery, WebSocket delivery, notifications, search, file upload, HTTP
+handlers, frontend UI, or E2E/MLS key-service work. E2E/MLS remains V1.0 future
+scope.
+
+Implemented service/storage operations:
+
+- create or return the canonical direct DM for one unordered pair of active
+  workspace members;
+- create ad-hoc group DMs with the caller automatically added;
+- list active DM conversations visible to the caller;
+- read one active DM conversation only when the caller is an active participant.
+
+Direct DM uniqueness is enforced in the database per `(workspace, unordered
+pair)`, not by Go-only lookup. The uniqueness rule intentionally includes
+archived direct conversations. When direct creation finds an archived direct DM
+for the same pair, storage reactivates that row and active member rows instead
+of creating a second conversation. The same pair in another workspace is a
+separate conversation.
+
+DM creation requires an active workspace and active workspace membership for
+every participant. Suspended, left, missing, or cross-workspace participants are
+denied. The caller cannot create a self-DM. Group DMs require at least three
+unique participants after adding the caller, because 1:1 conversations use the
+direct DM path. Group roles are always `member`; callers cannot set role, status,
+or `created_by`.
+
+Visible DM reads and lists are enforced by SQL in the pgx DM store. Queries join
+`chat.workspaces`, active `chat.workspace_members`, active `chat.dm_members`,
+and active `chat.dm_conversations`. A stale `dm_members` row does not grant
+access when the workspace is disabled or the workspace membership is inactive.
+
+DM reads are non-enumerating: missing conversation IDs, cross-workspace IDs,
+archived conversations, and non-participant access all return `ErrNotFound`.
+There are no HTTP endpoints yet because `chat-service` still lacks authenticated
+user context/middleware.
+
 ## Cross-schema identity
 
-`workspace_members.user_id` and `channel_members.user_id` reference `auth.users.id`
-**by convention only** — no cross-schema FK constraint. This preserves service
-ownership boundaries and avoids tight coupling between auth and chat schemas.
+`workspace_members.user_id`, `channel_members.user_id`, and `dm_members.user_id`
+reference `auth.users.id` **by convention only** — no cross-schema FK
+constraint. This preserves service ownership boundaries and avoids tight
+coupling between auth and chat schemas.

@@ -23,6 +23,20 @@ const (
 	ChannelStatusArchived ChannelStatus = "archived"
 )
 
+type DMConversationType string
+
+const (
+	DMConversationTypeDirect DMConversationType = "direct"
+	DMConversationTypeGroup  DMConversationType = "group"
+)
+
+type DMConversationStatus string
+
+const (
+	DMConversationStatusActive   DMConversationStatus = "active"
+	DMConversationStatusArchived DMConversationStatus = "archived"
+)
+
 type WorkspaceRole string
 
 const (
@@ -45,6 +59,19 @@ type ChannelRole string
 const (
 	ChannelRoleMember    ChannelRole = "member"
 	ChannelRoleModerator ChannelRole = "moderator"
+)
+
+type DMMemberRole string
+
+const (
+	DMMemberRoleMember DMMemberRole = "member"
+)
+
+type DMMemberStatus string
+
+const (
+	DMMemberStatusActive DMMemberStatus = "active"
+	DMMemberStatusLeft   DMMemberStatus = "left"
 )
 
 // Workspace represents a single team/organisation space.
@@ -99,6 +126,30 @@ type ChannelMember struct {
 	UserID    string
 	Role      ChannelRole
 	JoinedAt  time.Time
+}
+
+// DMConversation represents a direct or ad-hoc group DM conversation.
+// Title is empty string when NULL in the database.
+type DMConversation struct {
+	ID          string
+	WorkspaceID string
+	Type        DMConversationType
+	Title       string
+	Status      DMConversationStatus
+	CreatedBy   string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// DMMember represents membership in a DM conversation.
+// LeftAt is zero when NULL in the database.
+type DMMember struct {
+	ConversationID string
+	UserID         string
+	Role           DMMemberRole
+	Status         DMMemberStatus
+	JoinedAt       time.Time
+	LeftAt         time.Time
 }
 
 // CanReadChannel reports whether a user may read ch.
