@@ -41,3 +41,62 @@ func TestLoad_WSInstanceID(t *testing.T) {
 		t.Fatalf("expected WSInstanceID from env, got %q", cfg.WSInstanceID)
 	}
 }
+
+func TestLoad_WSInstanceID_ValidChars(t *testing.T) {
+	valid := []string{
+		"pod-abc123",
+		"instance.A",
+		"my_host-01",
+		"A",
+		"a-b.c_d",
+	}
+	for _, id := range valid {
+		t.Setenv("WS_INSTANCE_ID", id)
+		cfg := Load()
+		if cfg.WSInstanceID != id {
+			t.Errorf("valid WSInstanceID %q was rejected, got %q", id, cfg.WSInstanceID)
+		}
+	}
+}
+
+func TestLoad_WSInstanceID_InvalidChars_FallsBackToEmpty(t *testing.T) {
+	invalid := []string{
+		"bad instance id", // spaces
+		"id!@#$%",         // special chars
+		"id/slash",        // slash
+		"id:colon",        // colon
+	}
+	for _, id := range invalid {
+		t.Setenv("WS_INSTANCE_ID", id)
+		cfg := Load()
+		if cfg.WSInstanceID != "" {
+			t.Errorf("invalid WSInstanceID %q must fall back to empty, got %q", id, cfg.WSInstanceID)
+		}
+	}
+}
+
+func TestLoad_WSInstanceID_OversizedFallsBackToEmpty(t *testing.T) {
+	safe64 := string(make([]byte, 64))
+	for i := 0; i < 64; i++ {
+		safe64 = safe64[:i] + "a" + safe64[i+1:]
+	}
+	safe65 := safe64 + "a"
+
+	t.Setenv("WS_INSTANCE_ID", safe64)
+	if cfg := Load(); cfg.WSInstanceID != safe64 {
+		t.Errorf("64-char WSInstanceID must be accepted, got %q", cfg.WSInstanceID)
+	}
+
+	t.Setenv("WS_INSTANCE_ID", safe65)
+	if cfg := Load(); cfg.WSInstanceID != "" {
+		t.Errorf("65-char WSInstanceID must fall back to empty, got %q", cfg.WSInstanceID)
+	}
+}
+
+func TestLoad_WSInstanceID_EmptyRemainsEmpty(t *testing.T) {
+	t.Setenv("WS_INSTANCE_ID", "")
+	cfg := Load()
+	if cfg.WSInstanceID != "" {
+		t.Fatalf("empty WS_INSTANCE_ID must stay empty, got %q", cfg.WSInstanceID)
+	}
+}

@@ -66,7 +66,10 @@ Unregister, Subscribe) is in-process only.
 5. Valkey delivers the event to all chat-service instances via `PSUBSCRIBE nchat:chat:ws:broadcast:*`.
 6. Receiving instances call `handleRemoteBusEvent` which:
    - Drops self-echo events (`SourceInstanceID == h.instanceID`).
-   - Validates event type and target type — unknown values are dropped fail-secure.
+   - Validates event type, target type, and all UUID fields (`event_id`, `workspace_id`,
+     `target_id`, `message_id`) — unknown types and malformed UUIDs are dropped
+     fail-secure; valid UUIDs are canonicalized to lowercase.
+   - Validates `source_instance_id`: non-empty, bounded length, safe chars only.
    - Enqueues to `remoteBcast` channel for `run` goroutine processing.
 7. `run` goroutine calls `handleBroadcast` (same path as local events):
    - Auth re-check per subscriber via `SubscriptionAuthorizer.CanAccess`.
