@@ -32,19 +32,19 @@ type sidebarChannelJSON struct {
 }
 
 // sidebarDMJSON is the JSON shape for a DM conversation in the sidebar response.
+// participant_ids are intentionally omitted to avoid leaking member identity metadata.
 type sidebarDMJSON struct {
-	ID             string   `json:"id"`
-	Type           string   `json:"type"` // "direct" | "group"
-	Title          string   `json:"title,omitempty"`
-	Name           string   `json:"name"` // computed display name
-	ParticipantIDs []string `json:"participant_ids"`
+	ID    string `json:"id"`
+	Type  string `json:"type"` // "direct" | "group"
+	Title string `json:"title,omitempty"`
+	Name  string `json:"name"` // computed display name
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
 type sidebarResponseBody struct {
-	Workspace    sidebarWorkspaceJSON `json:"workspace"`
-	Channels     []sidebarChannelJSON `json:"channels"`
-	DMConvs      []sidebarDMJSON      `json:"dm_conversations"`
+	Workspace sidebarWorkspaceJSON `json:"workspace"`
+	Channels  []sidebarChannelJSON `json:"channels"`
+	DMConvs   []sidebarDMJSON      `json:"dm_conversations"`
 }
 
 // SidebarHandler handles GET /api/chat/sidebar.
@@ -121,19 +121,12 @@ func mapChannels(channels []domain.Channel) []sidebarChannelJSON {
 func mapDMs(dms []domain.DMConversationWithParticipantIDs, currentUserID string) []sidebarDMJSON {
 	out := make([]sidebarDMJSON, 0, len(dms))
 	for _, dm := range dms {
-		participantIDs := dm.ParticipantIDs
-		if participantIDs == nil {
-			participantIDs = []string{}
-		}
-
 		name := computeDMName(dm.Type, dm.Title, dm.ParticipantIDs, currentUserID)
-
 		out = append(out, sidebarDMJSON{
-			ID:             dm.ID,
-			Type:           string(dm.Type),
-			Title:          dm.Title,
-			Name:           name,
-			ParticipantIDs: participantIDs,
+			ID:    dm.ID,
+			Type:  string(dm.Type),
+			Title: dm.Title,
+			Name:  name,
 		})
 	}
 	return out

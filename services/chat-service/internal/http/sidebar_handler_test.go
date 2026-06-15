@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
-	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 )
 
@@ -34,8 +34,9 @@ func (s *stubSidebarProvider) GetSidebar(_ context.Context, _ string) (service.S
 }
 
 // sidebarRouter builds a test router wired with the given validator and stub.
+// allowAllSessionValidator accepts all sessions so tests focus on sidebar logic.
 func sidebarRouter(v *httpapi.TokenValidator, svc *stubSidebarProvider) http.Handler {
-	return httpapi.NewRouter(sidebarTestConfig(), nil, v, httpapi.NewSidebarHandler(svc))
+	return httpapi.NewRouter(sidebarTestConfig(), nil, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc))
 }
 
 // authGet returns an authenticated GET request to RouteSidebar.
@@ -51,7 +52,7 @@ func authGet(t *testing.T) *http.Request {
 
 func TestSidebarHandler_NilService_Returns503(t *testing.T) {
 	v := makeTestValidator(t)
-	router := httpapi.NewRouter(sidebarTestConfig(), nil, v, httpapi.NewSidebarHandler(nil))
+	router := httpapi.NewRouter(sidebarTestConfig(), nil, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil))
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, authGet(t))
 	if rr.Code != http.StatusServiceUnavailable {

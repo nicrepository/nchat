@@ -34,6 +34,7 @@ func New(cfg config.Config) *App {
 
 	// Database pool — nil when DATABASE_URL is not configured.
 	var sidebarSvc *service.SidebarService
+	var sessionValidator storage.SessionValidator
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
 		defer cancel()
@@ -41,6 +42,7 @@ func New(cfg config.Config) *App {
 		if dbErr != nil {
 			logger.Warn("database unavailable; sidebar endpoint disabled", "reason", "open_db_failed")
 		} else if validator != nil {
+			sessionValidator = storage.NewPGXSessionValidator(pool)
 			workspaces := storage.NewPGXWorkspaceStore(pool)
 			channels := storage.NewPGXChannelStore(pool)
 			members := storage.NewPGXMemberStore(pool)
@@ -54,7 +56,7 @@ func New(cfg config.Config) *App {
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, validator, sidebar),
+		Handler:         httpapi.NewRouter(cfg, logger, validator, sessionValidator, sidebar),
 		TracingShutdown: shutdown,
 	}
 }

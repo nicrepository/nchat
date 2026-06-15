@@ -6,6 +6,8 @@
  * session/cookie mechanism in authenticatedFetch.
  *
  * chatFixtures.ts is TEST-ONLY and must never be imported here.
+ * There is intentionally no module-level request cache: each call is independent
+ * so that a session change cannot cause one user to receive another user's data.
  */
 
 import { authenticatedFetch } from "../lib/authClient";
@@ -27,7 +29,6 @@ interface SidebarDMResponse {
   id: string;
   type: "direct" | "group";
   name: string;
-  participant_ids: string[];
 }
 
 interface SidebarResponse {
@@ -40,25 +41,13 @@ interface SidebarEnvelope {
   data: SidebarResponse;
 }
 
-// ── Module-level request deduplication ───────────────────────────────────────
-
-let _inflight: Promise<SidebarResponse> | null = null;
+// ── Internal fetch (no cross-request caching) ─────────────────────────────────
 
 async function fetchSidebar(): Promise<SidebarResponse> {
-  if (_inflight) return _inflight;
-  _inflight = authenticatedFetch<SidebarEnvelope>(`${CHAT_BASE}/sidebar`, {
+  const res = await authenticatedFetch<SidebarEnvelope>(`${CHAT_BASE}/sidebar`, {
     method: "GET",
-  }).then(
-    (res) => {
-      _inflight = null;
-      return res.data;
-    },
-    (err: unknown) => {
-      _inflight = null;
-      throw err;
-    },
-  );
-  return _inflight;
+  });
+  return res.data;
 }
 
 // ── Exported API ──────────────────────────────────────────────────────────────
