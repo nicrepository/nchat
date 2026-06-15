@@ -1,7 +1,7 @@
 # WebSocket Valkey Broadcast Bus
 
-**Status:** Distributed broadcast plumbing only. No real WebSocket upgrade yet.  
-**Service:** `chat-service`  
+**Status:** Distributed broadcast plumbing only. No real WebSocket upgrade yet.
+**Service:** `chat-service`
 **PR:** `feat/chat-valkey-pubsub-broadcast` → `develop`
 
 ---

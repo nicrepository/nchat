@@ -382,3 +382,27 @@ func TestValkeyBus_NewValkeyBus_InvalidURL_ReturnsError(t *testing.T) {
 	// valkey-go may or may not error at construction time; we just must not panic.
 	_ = err
 }
+
+func TestValkeyBus_Close_IsIdempotent(t *testing.T) {
+	ps := &fakePubSub{}
+	bus := newValkeyBusWithAdapter(ps, "inst-A", newTestLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bus.Subscribe(ctx, func(Event) {})
+	time.Sleep(20 * time.Millisecond)
+
+	// Close must not panic or block when called multiple times.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bus.Close()
+		bus.Close() // second call must be a no-op
+		bus.Close() // third call must also be a no-op
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close blocked or panicked on repeated calls — not idempotent")
+	}
+}
