@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	valkey "github.com/valkey-io/valkey-go"
 )
 
@@ -66,9 +67,10 @@ type ValkeyBus struct {
 	instanceID string
 	logger     *slog.Logger
 	// closeCtx is cancelled by Close(), stopping all subscriber goroutines.
-	closeCtx context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	closeCtx  context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // newValkeyBusWithAdapter constructs a ValkeyBus with an injected pubsubAdapter.
@@ -165,10 +167,13 @@ func (b *ValkeyBus) Subscribe(callerCtx context.Context, handler func(Event)) {
 
 // Close cancels the bus lifecycle context, stopping all subscriber goroutines,
 // then waits for them to finish and closes the underlying pub-sub connection.
+// Safe to call multiple times — subsequent calls are no-ops (idempotent).
 func (b *ValkeyBus) Close() {
-	b.cancel()
-	b.wg.Wait()
-	b.ps.Close()
+	b.closeOnce.Do(func() {
+		b.cancel()
+		b.wg.Wait()
+		b.ps.Close()
+	})
 }
 
 func (b *ValkeyBus) subscribeLoop(ctx context.Context, handler func(Event)) {
@@ -201,15 +206,14 @@ func (b *ValkeyBus) subscribeLoop(ctx context.Context, handler func(Event)) {
 }
 
 // channelForWorkspace returns the Valkey channel name for a workspace.
-// workspace_id is server-generated (UUID) and safe, but we validate anyway.
+// workspace_id must be a valid UUID; it is parsed and canonicalized to prevent
+// injection of glob characters or other unsafe values into the channel name.
 func channelForWorkspace(workspaceID string) (string, error) {
-	if workspaceID == "" {
-		return "", errors.New("ws: empty workspace_id for channel name")
+	id, err := uuid.Parse(workspaceID)
+	if err != nil {
+		return "", fmt.Errorf("ws: workspace_id is not a valid UUID: %w", err)
 	}
-	if strings.ContainsAny(workspaceID, " \t\n\r*?[]{}\\") {
-		return "", fmt.Errorf("ws: unsafe workspace_id for channel name")
-	}
-	return "nchat:chat:ws:broadcast:" + workspaceID, nil
+	return "nchat:chat:ws:broadcast:" + id.String(), nil
 }
 
 func min(a, b time.Duration) time.Duration {

@@ -83,11 +83,11 @@ func TestValkeyBus_Publish_SerializesEventToJSON(t *testing.T) {
 
 	evt := Event{
 		Type:             EventTypeMessageCreated,
-		WorkspaceID:      "ws-1",
+		WorkspaceID:      testWorkspaceID,
 		TargetType:       TargetTypeChannel,
-		TargetID:         "ch-1",
-		MessageID:        "msg-1",
-		EventID:          "evt-1",
+		TargetID:         testChannelID,
+		MessageID:        testMessageID,
+		EventID:          testEventID,
 		SourceInstanceID: "inst-A",
 		CreatedAt:        time.Now().UTC(),
 	}
@@ -102,8 +102,8 @@ func TestValkeyBus_Publish_SerializesEventToJSON(t *testing.T) {
 
 	msg, _ := ps.lastPublished()
 
-	// Channel must be workspace-scoped.
-	wantCh := "nchat:chat:ws:broadcast:ws-1"
+	// Channel must be workspace-scoped with canonical UUID.
+	wantCh := "nchat:chat:ws:broadcast:" + testWorkspaceID
 	if msg.channel != wantCh {
 		t.Errorf("channel = %q, want %q", msg.channel, wantCh)
 	}
@@ -113,8 +113,8 @@ func TestValkeyBus_Publish_SerializesEventToJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(msg.payload), &decoded); err != nil {
 		t.Fatalf("payload not valid JSON: %v", err)
 	}
-	if decoded.MessageID != "msg-1" {
-		t.Errorf("decoded MessageID = %q, want %q", decoded.MessageID, "msg-1")
+	if decoded.MessageID != testMessageID {
+		t.Errorf("decoded MessageID = %q, want %q", decoded.MessageID, testMessageID)
 	}
 }
 
@@ -125,10 +125,10 @@ func TestValkeyBus_Publish_FailsOnPubSubError(t *testing.T) {
 
 	err := bus.Publish(context.Background(), Event{
 		Type:             EventTypeMessageCreated,
-		WorkspaceID:      "ws-1",
+		WorkspaceID:      testWorkspaceID,
 		TargetType:       TargetTypeChannel,
-		TargetID:         "ch-1",
-		EventID:          "evt-2",
+		TargetID:         testChannelID,
+		EventID:          testEventID2,
 		SourceInstanceID: "inst-A",
 		CreatedAt:        time.Now().UTC(),
 	})
@@ -281,10 +281,10 @@ func TestValkeyBus_Publish_CancelledContext_ReturnsError(t *testing.T) {
 
 	err := bus.Publish(ctx, Event{
 		Type:             EventTypeMessageCreated,
-		WorkspaceID:      "ws-1",
+		WorkspaceID:      testWorkspaceID,
 		TargetType:       TargetTypeChannel,
-		TargetID:         "ch-1",
-		EventID:          "evt-5",
+		TargetID:         testChannelID,
+		EventID:          testEventID3,
 		SourceInstanceID: "inst-A",
 		CreatedAt:        time.Now().UTC(),
 	})

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,14 @@ import (
 // broadcast delivery. If the check exceeds this duration the event is not
 // delivered to that client for this broadcast.
 const broadcastAuthTimeout = 3 * time.Second
+
+// sourceInstanceIDMaxLen is the maximum allowed length for SourceInstanceID in
+// remote events. Bounded to prevent memory waste from malformed payloads.
+const sourceInstanceIDMaxLen = 64
+
+// sourceInstanceIDRe restricts SourceInstanceID to characters that are safe for
+// structured logging. Raw UUIDs, hostnames, and pod names all match.
+var sourceInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // targetKey uniquely identifies a subscription target within a workspace.
 // WorkspaceID is included to prevent cross-workspace subscription collisions.
@@ -228,12 +237,19 @@ func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, tar
 	}
 }
 
-// Shutdown stops the hub goroutine, cancels bus subscriptions, and closes all
-// client connections. Blocks until the run goroutine exits.
+// Shutdown stops the hub goroutine, cancels bus subscriptions, closes all
+// client connections, and closes the BroadcastBus. Blocks until the run
+// goroutine exits.
+//
+// Ownership: the hub started the bus subscription (via Subscribe in NewHub),
+// so it is responsible for closing it. Callers must not call bus.Close()
+// separately after hub.Shutdown() — BroadcastBus.Close is idempotent and
+// handles double-close safely.
 func (h *Hub) Shutdown() {
 	h.busCancel()
 	close(h.quit)
 	<-h.done
+	h.bus.Close() // stop subscriber goroutines; idempotent
 }
 
 // run is the hub's single background goroutine.
@@ -272,17 +288,19 @@ func (h *Hub) run() {
 }
 
 // handleRemoteBusEvent is called by the BroadcastBus Subscribe handler.
-// It validates the event, suppresses self-echo, encodes to JSON, and posts
-// to remoteBcast for the run goroutine to process. This method is called from
-// a bus-owned goroutine and must not touch hub state directly.
+// It suppresses self-echo, strictly validates and canonicalizes the event,
+// encodes to JSON, and posts to remoteBcast for the run goroutine.
+// Called from a bus-owned goroutine — must not touch hub state directly.
 func (h *Hub) handleRemoteBusEvent(evt Event) {
 	// Suppress self-echo: events we published must not be re-delivered locally.
 	if evt.SourceInstanceID == h.instanceID {
 		return
 	}
 
-	// Validate envelope — reject malformed or unknown events fail-secure.
-	if !isValidRemoteEvent(evt) {
+	// Strictly validate and canonicalize before any local delivery.
+	// Remote Pub/Sub events are untrusted; auth re-check alone is not sufficient.
+	canonical, ok := canonicalizeRemoteEvent(evt)
+	if !ok {
 		h.logger.WarnContext(context.Background(), "ws: dropped invalid remote bus event",
 			"event_type", string(evt.Type),
 			"target_type", string(evt.TargetType),
@@ -290,42 +308,93 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 		return
 	}
 
-	data, err := json.Marshal(evt)
+	data, err := json.Marshal(canonical)
 	if err != nil {
 		h.logger.ErrorContext(context.Background(), "ws: failed to marshal remote bus event", "error", err)
 		return
 	}
 
 	select {
-	case h.remoteBcast <- broadcastReq{event: evt, data: data}:
+	case h.remoteBcast <- broadcastReq{event: canonical, data: data}:
 	default:
 		// Drop if queue is full — bounded, no goroutine block.
 		h.logger.WarnContext(context.Background(), "ws: remote broadcast queue full; event dropped",
-			"workspace_id", evt.WorkspaceID,
-			"target_type", string(evt.TargetType),
+			"workspace_id", canonical.WorkspaceID,
+			"target_type", string(canonical.TargetType),
 		)
 	}
 }
 
-// isValidRemoteEvent checks that an event received from the bus has the
-// required fields and known types before delivery.
-func isValidRemoteEvent(evt Event) bool {
-	if evt.WorkspaceID == "" || evt.TargetID == "" || evt.SourceInstanceID == "" {
-		return false
-	}
+// canonicalizeRemoteEvent validates and canonicalizes a remote bus event.
+//
+// All ID fields (EventID, WorkspaceID, TargetID, MessageID for message.created)
+// must be valid UUIDs and are returned in canonical lowercase form. SourceInstanceID
+// is checked for length and character safety. Unknown event/target types are
+// rejected. Malformed events return (Event{}, false) — fail-secure.
+//
+// Security note: auth re-check (SubscriptionAuthorizer.CanAccess) is necessary
+// but not sufficient for untrusted Pub/Sub payloads. Canonicalization here
+// prevents spoofed workspace_id / target_id values from reaching the hub.
+func canonicalizeRemoteEvent(evt Event) (Event, bool) {
+	// Known event type required.
 	switch evt.Type {
 	case EventTypeMessageCreated:
-		// known
+		// OK
 	default:
-		return false
+		return Event{}, false
 	}
+
+	// Known target type required.
 	switch evt.TargetType {
 	case TargetTypeChannel, TargetTypeDM:
-		// known
+		// OK
 	default:
-		return false
+		return Event{}, false
 	}
-	return true
+
+	// source_instance_id: required, bounded length, safe characters only.
+	// Not a UUID — pod names, hostnames, or generated IDs are all acceptable.
+	if evt.SourceInstanceID == "" {
+		return Event{}, false
+	}
+	if len(evt.SourceInstanceID) > sourceInstanceIDMaxLen {
+		return Event{}, false
+	}
+	if !sourceInstanceIDRe.MatchString(evt.SourceInstanceID) {
+		return Event{}, false
+	}
+
+	// event_id: required, must be a valid UUID; canonicalize to lowercase.
+	eid, err := uuid.Parse(evt.EventID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.EventID = eid.String()
+
+	// workspace_id: required, must be a valid UUID; canonicalize to lowercase.
+	wid, err := uuid.Parse(evt.WorkspaceID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.WorkspaceID = wid.String()
+
+	// target_id: required, must be a valid UUID; canonicalize to lowercase.
+	tid, err := uuid.Parse(evt.TargetID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.TargetID = tid.String()
+
+	// message_id: required for message.created; must be a valid UUID.
+	if evt.Type == EventTypeMessageCreated {
+		mid, err := uuid.Parse(evt.MessageID)
+		if err != nil {
+			return Event{}, false
+		}
+		evt.MessageID = mid.String()
+	}
+
+	return evt, true
 }
 
 // dropClient removes a client and all its subscriptions from hub state,

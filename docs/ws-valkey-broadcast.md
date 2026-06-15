@@ -57,7 +57,9 @@ Unregister, Subscribe) is in-process only.
 
 ### Broadcast flow
 
-1. `MessageService` calls `hub.PublishMessageCreated(ctx, workspaceID, targetType, targetID, messageID)`.
+1. The caller (future: `MessageService`) calls `hub.PublishMessageCreated(ctx, workspaceID, targetType, targetID, messageID)`.
+   **Note:** `MessageService` wiring is not done in this PR — `hub.PublishMessageCreated` is the
+   intended integration point for a future PR that connects the message creation flow.
 2. Hub stamps `EventID` (UUID) and `SourceInstanceID` on the event.
 3. Hub enqueues local broadcast to its own `run` goroutine — **always succeeds**.
 4. Hub calls `bus.Publish(ctx, evt)` — best-effort; failure is logged, not propagated.
