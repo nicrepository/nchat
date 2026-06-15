@@ -242,6 +242,17 @@ function DMList({ dms, activeDMId, onSelect }: DMListProps) {
   );
 }
 
+// ── Safe URL decode ───────────────────────────────────────────────────────────
+
+function safeDecodeURIComponent(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    // Malformed percent-encoding (e.g. a bare `%` or `%ZZ`) — return raw segment.
+    return segment;
+  }
+}
+
 // ── Main sidebar ──────────────────────────────────────────────────────────────
 
 export default function ChatSidebar() {
@@ -254,7 +265,7 @@ export default function ChatSidebar() {
   const pathParts = location.pathname.split("/").filter(Boolean);
   // pathParts: ["chat", "channel"|"dm", encodedId]
   const activeType = pathParts[1] as "channel" | "dm" | undefined;
-  const activeId   = pathParts[2] ? decodeURIComponent(pathParts[2]) : undefined;
+  const activeId   = pathParts[2] ? safeDecodeURIComponent(pathParts[2]) : undefined;
 
   const activeChannelId = activeType === "channel" ? activeId : undefined;
   const activeDMId      = activeType === "dm"      ? activeId : undefined;

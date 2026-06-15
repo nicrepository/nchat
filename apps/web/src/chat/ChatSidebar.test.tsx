@@ -388,21 +388,41 @@ describe("ChatSidebar — error state", () => {
 // ── Security ──────────────────────────────────────────────────────────────────
 
 describe("ChatSidebar — storage safety", () => {
-  it("sidebar renders without writing to localStorage or sessionStorage", async () => {
+  it("sidebar mount and data-load add no storage writes", async () => {
     mockFetchChannels.mockResolvedValue(SAMPLE_CHANNELS);
     mockFetchDMs.mockResolvedValue(SAMPLE_DMS);
 
-    // Auth setup in renderChat() calls setTokens which writes nchat_at (expected).
-    // Spy before render, clear the auth-setup write, then assert no new writes
-    // are made by the sidebar itself during render or data load.
+    // Auth token written BEFORE the spy is installed so the nchat_at write
+    // from setTokens() is not captured. The spy then covers the full sidebar
+    // mount + async data-load window with no blind spots.
+    setTokens("test-at");
     const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
-    renderChat();
-    setItemSpy.mockClear(); // discard the nchat_at write from setTokens in renderChat
+
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <Routes>
+          <Route path="/login" element={<div>Login page</div>} />
+          <Route
+            path="/chat"
+            element={
+              <RequireAuth>
+                <ChatShell />
+              </RequireAuth>
+            }
+          >
+            <Route index element={<div>default</div>} />
+            <Route path="channel/:id" element={<div>channel</div>} />
+            <Route path="dm/:id" element={<div>dm</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
 
     await waitFor(() => {
       expect(screen.getByRole("option", { name: /canal geral/i })).toBeInTheDocument();
     });
 
+    // Sidebar mount + data load must write nothing to storage.
     expect(setItemSpy).not.toHaveBeenCalled();
     setItemSpy.mockRestore();
   });
@@ -463,5 +483,16 @@ describe("ChatSidebar — route encoding", () => {
 
     const btn = await screen.findByRole("option", { name: /canal equipe infra/i });
     expect(btn).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("does not crash with malformed percent-encoded route segment", async () => {
+    mockFetchChannels.mockResolvedValue(SAMPLE_CHANNELS);
+    mockFetchDMs.mockResolvedValue([]);
+    // `%` alone is invalid percent-encoding; decodeURIComponent would throw without the guard.
+    renderChat("/chat/channel/%");
+
+    // Sidebar must still render and show channels without throwing.
+    await screen.findByTestId("chat-sidebar");
+    expect(screen.getByTestId("chat-sidebar")).toBeInTheDocument();
   });
 });
