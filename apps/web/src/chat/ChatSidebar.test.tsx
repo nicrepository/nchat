@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
-import { FIXTURE_CURRENT_USER } from "./chatFixtures";
 import type { Channel, DMConversation } from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
@@ -445,23 +444,24 @@ describe("ChatSidebar — storage safety", () => {
 // ── Footer ────────────────────────────────────────────────────────────────────
 
 describe("ChatSidebar — footer", () => {
-  it("renders current user name from fixture data", async () => {
+  it("renders placeholder user name in footer", async () => {
     mockFetchChannels.mockResolvedValue([]);
     mockFetchDMs.mockResolvedValue([]);
     renderChat();
 
     await screen.findByTestId("chat-sidebar");
-    // Footer user info is aria-hidden for screen readers but visible in DOM
-    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent(FIXTURE_CURRENT_USER.displayName);
+    // Footer renders the placeholder user; real profile comes from a future /api/auth/me endpoint.
+    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent("Usuário");
   });
 
-  it("renders current user role from fixture data", async () => {
+  it("footer does not render fixture user identity", async () => {
     mockFetchChannels.mockResolvedValue([]);
     mockFetchDMs.mockResolvedValue([]);
     renderChat();
 
     await screen.findByTestId("chat-sidebar");
-    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent(FIXTURE_CURRENT_USER.role);
+    // The sidebar must never show hardcoded personal data.
+    expect(screen.getByTestId("chat-sidebar")).not.toHaveTextContent("Álvaro Neto");
   });
 });
 
@@ -507,5 +507,25 @@ describe("ChatSidebar — route encoding", () => {
     // Sidebar must still render and show channels without throwing.
     await screen.findByTestId("chat-sidebar");
     expect(screen.getByTestId("chat-sidebar")).toBeInTheDocument();
+  });
+});
+
+// ── No fixture import in production modules ───────────────────────────────────
+
+describe("chatApi — no runtime fixture import", () => {
+  it("chatApi.ts does not import from chatFixtures", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const src = readFileSync(resolve(__dirname, "chatApi.ts"), "utf-8");
+    expect(src).not.toMatch(/from\s+["'].*chatFixtures/);
+    expect(src).not.toMatch(/import\s*\(["'].*chatFixtures/);
+  });
+
+  it("ChatSidebar.tsx does not import from chatFixtures", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const src = readFileSync(resolve(__dirname, "ChatSidebar.tsx"), "utf-8");
+    expect(src).not.toMatch(/from\s+["'].*chatFixtures/);
+    expect(src).not.toMatch(/import\s*\(["'].*chatFixtures/);
   });
 });

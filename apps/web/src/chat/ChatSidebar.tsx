@@ -1,9 +1,19 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import "./ChatSidebar.css";
-import { FIXTURE_CURRENT_USER } from "./chatFixtures";
 import { useChatSidebar } from "./useChatSidebar";
-import type { Channel, DMConversation } from "./chatTypes";
+import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
+
+/**
+ * Placeholder user shown in the sidebar footer.
+ * Replace with a real profile API call once GET /api/auth/me is available.
+ */
+const PLACEHOLDER_USER: CurrentUser = {
+  displayName: "Usuário",
+  initials: "?",
+  color: "purple",
+  role: "",
+};
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
 
@@ -403,14 +413,14 @@ export default function ChatSidebar() {
         </Link>
         <div className="chat-sidebar__user">
           <Avatar
-            initials={FIXTURE_CURRENT_USER.initials}
-            color={FIXTURE_CURRENT_USER.color}
+            initials={PLACEHOLDER_USER.initials}
+            color={PLACEHOLDER_USER.color}
             status="online"
             size="md"
           />
           <div className="chat-sidebar__user-info" aria-hidden="true">
-            <div className="chat-sidebar__user-name">{FIXTURE_CURRENT_USER.displayName}</div>
-            <div className="chat-sidebar__user-role">{FIXTURE_CURRENT_USER.role}</div>
+            <div className="chat-sidebar__user-name">{PLACEHOLDER_USER.displayName}</div>
+            <div className="chat-sidebar__user-role">{PLACEHOLDER_USER.role}</div>
           </div>
         </div>
       </div>

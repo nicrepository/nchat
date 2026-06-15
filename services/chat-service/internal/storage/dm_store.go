@@ -33,6 +33,10 @@ type DMStore interface {
 	CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (domain.DMConversation, error)
 	CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (domain.DMConversation, error)
 	ListVisibleConversationsByUser(ctx context.Context, workspaceID, userID string) ([]domain.DMConversation, error)
+	// ListVisibleConversationsWithParticipantIDs returns active DM conversations
+	// visible to userID, each annotated with the full list of active member user
+	// IDs. A single SQL query (no N+1) is used to fetch participants.
+	ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error)
 	GetVisibleConversationByID(ctx context.Context, workspaceID, conversationID, userID string) (domain.DMConversation, error)
 }
 
@@ -213,6 +217,48 @@ func (s *PGXDMStore) ListVisibleConversationsByUser(ctx context.Context, workspa
 			return nil, fmt.Errorf("scan visible dm conversation: %w", err)
 		}
 		conversations = append(conversations, conversation)
+	}
+	return conversations, rows.Err()
+}
+
+func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT dc.id, dc.workspace_id, dc.type, COALESCE(dc.title, ''), dc.status,
+		       dc.created_by, dc.created_at, dc.updated_at,
+		       ARRAY(
+		           SELECT dm2.user_id::text
+		           FROM chat.dm_members dm2
+		           WHERE dm2.conversation_id = dc.id AND dm2.status = 'active'
+		           ORDER BY dm2.user_id
+		       ) AS participant_ids
+		FROM chat.dm_conversations dc
+		JOIN chat.workspaces w
+		  ON w.id = dc.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = dc.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
+		JOIN chat.dm_members dm
+		  ON dm.conversation_id = dc.id AND dm.user_id = $2 AND dm.status = 'active'
+		WHERE dc.workspace_id = $1
+		  AND dc.status = 'active'
+		ORDER BY dc.updated_at DESC, dc.created_at DESC`,
+		workspaceID, userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list visible dm conversations with participants: %w", err)
+	}
+	defer rows.Close()
+
+	var conversations []domain.DMConversationWithParticipantIDs
+	for rows.Next() {
+		var c domain.DMConversationWithParticipantIDs
+		if err := rows.Scan(
+			&c.ID, &c.WorkspaceID, (*string)(&c.Type),
+			&c.Title, (*string)(&c.Status), &c.CreatedBy,
+			&c.CreatedAt, &c.UpdatedAt, &c.ParticipantIDs,
+		); err != nil {
+			return nil, fmt.Errorf("scan visible dm conversation with participants: %w", err)
+		}
+		conversations = append(conversations, c)
 	}
 	return conversations, rows.Err()
 }

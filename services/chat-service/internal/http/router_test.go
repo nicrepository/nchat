@@ -14,7 +14,7 @@ import (
 )
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, NewSidebarHandler(nil))
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -43,7 +43,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, NewSidebarHandler(nil))
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -71,7 +71,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, NewSidebarHandler(nil))
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -89,7 +89,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, NewSidebarHandler(nil))
 
 	tests := []struct {
 		name   string
@@ -183,7 +183,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, NewSidebarHandler(nil))
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))

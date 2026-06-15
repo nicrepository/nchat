@@ -1,23 +1,10 @@
 /**
- * Chat sidebar fixture data.
+ * @test-only  Chat sidebar fixture data.
  *
- * PENDING BACKEND CONTRACT
- * ────────────────────────
- * These fixtures stand in for real API responses until the following
- * endpoints are implemented:
+ * This file is for TESTS ONLY. Production code must never import from here.
  *
- *   GET /api/chat/channels
- *     → Channel[]   (id, name, type, unreadCount?)
- *
- *   GET /api/chat/dms
- *     → DMConversation[]  (id, type, name, participants[], unreadCount?)
- *
- * Once those endpoints exist:
- *   1. Replace FIXTURE_CHANNELS / FIXTURE_DMS with real calls in chatApi.ts.
- *   2. Remove this file (or keep it for tests with a re-export).
- *
- * Auth: all endpoints require `Authorization: Bearer <access_token>` injected
- * by `authenticatedFetch`. Do NOT store tokens in localStorage/sessionStorage.
+ * The sidebar now consumes GET /api/chat/sidebar via authenticatedFetch.
+ * See chatApi.ts for the real implementation.
  */
 
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
