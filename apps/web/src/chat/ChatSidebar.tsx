@@ -1,6 +1,7 @@
-import { useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import "./ChatSidebar.css";
+import { FIXTURE_CURRENT_USER } from "./chatFixtures";
 import { useChatSidebar } from "./useChatSidebar";
 import type { Channel, DMConversation } from "./chatTypes";
 
@@ -249,20 +250,21 @@ export default function ChatSidebar() {
   const { state, retry } = useChatSidebar();
 
   // Derive active item from pathname: /chat/channel/:id or /chat/dm/:id
+  // decodeURIComponent handles IDs that were encoded with encodeURIComponent on navigate.
   const pathParts = location.pathname.split("/").filter(Boolean);
-  // pathParts: ["chat", "channel"|"dm", id]
+  // pathParts: ["chat", "channel"|"dm", encodedId]
   const activeType = pathParts[1] as "channel" | "dm" | undefined;
-  const activeId   = pathParts[2];
+  const activeId   = pathParts[2] ? decodeURIComponent(pathParts[2]) : undefined;
 
   const activeChannelId = activeType === "channel" ? activeId : undefined;
   const activeDMId      = activeType === "dm"      ? activeId : undefined;
 
   function handleChannelSelect(id: string) {
-    navigate(`/chat/channel/${id}`);
+    navigate(`/chat/channel/${encodeURIComponent(id)}`);
   }
 
   function handleDMSelect(id: string) {
-    navigate(`/chat/dm/${id}`);
+    navigate(`/chat/dm/${encodeURIComponent(id)}`);
   }
 
   return (
@@ -272,7 +274,7 @@ export default function ChatSidebar() {
       data-testid="chat-sidebar"
     >
       {/* ── Brand ── */}
-      <a href="/chat" className="chat-sidebar__brand" aria-label="NIC Chat — Workspace NIC-Labs">
+      <Link to="/chat" className="chat-sidebar__brand" aria-label="NIC Chat — Workspace NIC-Labs">
         <div className="chat-sidebar__brand-mark">
           <img src="/assets/nic-labs-icon.png" alt="" className="chat-sidebar__brand-img" />
         </div>
@@ -280,7 +282,7 @@ export default function ChatSidebar() {
           <p className="chat-sidebar__brand-title">NIC Chat</p>
           <p className="chat-sidebar__brand-sub">Workspace NIC-Labs</p>
         </div>
-      </a>
+      </Link>
 
       {/* ── New channel CTA ── */}
       <button
@@ -348,19 +350,24 @@ export default function ChatSidebar() {
 
       {/* ── Footer ── */}
       <div className="chat-sidebar__footer">
-        <a
-          href="/admin/users"
+        <Link
+          to="/admin/users"
           className="chat-sidebar__footer-item"
           aria-label="Configurações"
         >
           <IconSettings />
           <span>Configurações</span>
-        </a>
+        </Link>
         <div className="chat-sidebar__user">
-          <Avatar initials="AN" color="purple" status="online" size="md" />
+          <Avatar
+            initials={FIXTURE_CURRENT_USER.initials}
+            color={FIXTURE_CURRENT_USER.color}
+            status="online"
+            size="md"
+          />
           <div className="chat-sidebar__user-info" aria-hidden="true">
-            <div className="chat-sidebar__user-name">Álvaro Neto</div>
-            <div className="chat-sidebar__user-role">Infraestrutura &amp; Segurança</div>
+            <div className="chat-sidebar__user-name">{FIXTURE_CURRENT_USER.displayName}</div>
+            <div className="chat-sidebar__user-role">{FIXTURE_CURRENT_USER.role}</div>
           </div>
         </div>
       </div>

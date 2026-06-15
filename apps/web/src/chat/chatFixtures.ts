@@ -20,7 +20,7 @@
  * by `authenticatedFetch`. Do NOT store tokens in localStorage/sessionStorage.
  */
 
-import type { Channel, DMConversation } from "./chatTypes";
+import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
 
 export const FIXTURE_CHANNELS: Channel[] = [
   { id: "geral",          name: "geral",          type: "public"  },
@@ -84,3 +84,17 @@ export const FIXTURE_DMS: DMConversation[] = [
     ],
   },
 ];
+
+/**
+ * PENDING PROFILE/AUTH CONTRACT
+ * ──────────────────────────────
+ * Placeholder for the authenticated user shown in the sidebar footer.
+ * Replace with a call to the user profile endpoint once available:
+ *   GET /api/auth/me → { displayName, initials?, role?, ... }
+ */
+export const FIXTURE_CURRENT_USER: CurrentUser = {
+  displayName: "Álvaro Neto",
+  initials: "AN",
+  color: "purple",
+  role: "Infraestrutura & Segurança",
+};

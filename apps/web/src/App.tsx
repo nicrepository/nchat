@@ -31,8 +31,8 @@ export default function App() {
           }
         >
           <Route index element={<ChatPlaceholder />} />
-          <Route path="channel/:id" element={<ChatPlaceholder />} />
-          <Route path="dm/:id" element={<ChatPlaceholder />} />
+          <Route path="channel/:id" element={<ChatPlaceholder type="channel" />} />
+          <Route path="dm/:id" element={<ChatPlaceholder type="dm" />} />
         </Route>
 
         {/* ── Admin ─────────────────────────────────────────────────── */}

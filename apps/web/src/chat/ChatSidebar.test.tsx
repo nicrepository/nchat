@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
+import { FIXTURE_CURRENT_USER } from "./chatFixtures";
 import type { Channel, DMConversation } from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
@@ -386,36 +387,81 @@ describe("ChatSidebar — error state", () => {
 
 // ── Security ──────────────────────────────────────────────────────────────────
 
-describe("ChatSidebar — security", () => {
-  it("does not persist tokens to localStorage on render", async () => {
+describe("ChatSidebar — storage safety", () => {
+  it("sidebar renders without writing to localStorage or sessionStorage", async () => {
     mockFetchChannels.mockResolvedValue(SAMPLE_CHANNELS);
     mockFetchDMs.mockResolvedValue(SAMPLE_DMS);
+
+    // Auth setup in renderChat() calls setTokens which writes nchat_at (expected).
+    // Spy before render, clear the auth-setup write, then assert no new writes
+    // are made by the sidebar itself during render or data load.
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
     renderChat();
+    setItemSpy.mockClear(); // discard the nchat_at write from setTokens in renderChat
 
     await waitFor(() => {
       expect(screen.getByRole("option", { name: /canal geral/i })).toBeInTheDocument();
     });
 
-    const lsKeys = Object.keys(localStorage);
-    const tokenKeys = lsKeys.filter((k) =>
-      /token|access_token|refresh_token|bearer/i.test(k),
+    expect(setItemSpy).not.toHaveBeenCalled();
+    setItemSpy.mockRestore();
+  });
+});
+
+// ── Footer ────────────────────────────────────────────────────────────────────
+
+describe("ChatSidebar — footer", () => {
+  it("renders current user name from fixture data", async () => {
+    mockFetchChannels.mockResolvedValue([]);
+    mockFetchDMs.mockResolvedValue([]);
+    renderChat();
+
+    await screen.findByTestId("chat-sidebar");
+    // Footer user info is aria-hidden for screen readers but visible in DOM
+    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent(
+      FIXTURE_CURRENT_USER.displayName,
     );
-    expect(tokenKeys).toHaveLength(0);
   });
 
-  it("does not persist tokens to sessionStorage on render", async () => {
-    mockFetchChannels.mockResolvedValue(SAMPLE_CHANNELS);
-    mockFetchDMs.mockResolvedValue(SAMPLE_DMS);
+  it("renders current user role from fixture data", async () => {
+    mockFetchChannels.mockResolvedValue([]);
+    mockFetchDMs.mockResolvedValue([]);
     renderChat();
 
-    await waitFor(() => {
-      expect(screen.getByRole("option", { name: /canal geral/i })).toBeInTheDocument();
-    });
+    await screen.findByTestId("chat-sidebar");
+    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent(FIXTURE_CURRENT_USER.role);
+  });
+});
 
-    const ssKeys = Object.keys(sessionStorage);
-    const tokenKeys = ssKeys.filter((k) =>
-      /token|access_token|refresh_token|bearer/i.test(k),
-    );
-    expect(tokenKeys).toHaveLength(0);
+// ── Route encoding ────────────────────────────────────────────────────────────
+
+describe("ChatSidebar — route encoding", () => {
+  it("navigates with encoded channel ID containing special chars", async () => {
+    const user = userEvent.setup();
+    const channelWithSpace: Channel = { id: "equipe infra", name: "equipe infra", type: "public" };
+    mockFetchChannels.mockResolvedValue([channelWithSpace]);
+    mockFetchDMs.mockResolvedValue([]);
+    renderChat();
+
+    const btn = await screen.findByRole("option", { name: /canal equipe infra/i });
+    await user.click(btn);
+
+    // After clicking, the channel should become active (route changed, location decoded)
+    await waitFor(() => {
+      expect(
+        screen.getByRole("option", { name: /canal equipe infra/i }),
+      ).toHaveAttribute("aria-selected", "true");
+    });
+  });
+
+  it("marks channel active when route has encoded ID", async () => {
+    const channelWithSpace: Channel = { id: "equipe infra", name: "equipe infra", type: "public" };
+    mockFetchChannels.mockResolvedValue([channelWithSpace]);
+    mockFetchDMs.mockResolvedValue([]);
+    // Simulate pre-encoded URL: /chat/channel/equipe%20infra
+    renderChat("/chat/channel/equipe%20infra");
+
+    const btn = await screen.findByRole("option", { name: /canal equipe infra/i });
+    expect(btn).toHaveAttribute("aria-selected", "true");
   });
 });

@@ -2,14 +2,18 @@ import { useParams } from "react-router-dom";
 
 import "./ChatPlaceholder.css";
 
-export default function ChatPlaceholder() {
-  const params = useParams<{ type?: string; id?: string }>();
+interface Props {
+  type?: "channel" | "dm";
+}
+
+export default function ChatPlaceholder({ type }: Props) {
+  const { id } = useParams<{ id?: string }>();
 
   const label =
-    params.type === "channel"
-      ? `#${params.id ?? ""}`
-      : params.type === "dm"
-        ? params.id?.replace(/-/g, " ") ?? ""
+    type === "channel"
+      ? `#${id ?? ""}`
+      : type === "dm"
+        ? (id ?? "").replace(/-/g, " ")
         : "Selecione um canal ou mensagem direta";
 
   return (
@@ -22,7 +26,7 @@ export default function ChatPlaceholder() {
       </div>
       <h2 className="chat-placeholder__title">{label}</h2>
       <p className="chat-placeholder__sub">
-        {params.type
+        {type
           ? "As mensagens aparecerão aqui em breve."
           : "Escolha um canal ou uma conversa na barra lateral para começar."}
       </p>

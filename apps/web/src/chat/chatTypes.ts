@@ -31,6 +31,15 @@ export interface DMConversation {
   unreadCount?: number;
 }
 
+// ── Current user (sidebar footer) ───────────────────────────────────────────
+
+export interface CurrentUser {
+  displayName: string;
+  initials: string;
+  color: AvatarColor;
+  role: string;
+}
+
 // ── Sidebar active selection ─────────────────────────────────────────────────
 
 export type ActiveItem =
