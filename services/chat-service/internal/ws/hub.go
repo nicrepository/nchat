@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // broadcastAuthTimeout caps the per-client authorization re-check during
@@ -54,21 +56,26 @@ type broadcastReq struct {
 
 // Hub manages all active WebSocket connections for a single chat-service instance.
 //
-// In-process only. Distributed fan-out (Valkey/pub-sub) is future scope.
+// Distributed fan-out is provided by the optional BroadcastBus (e.g. ValkeyBus).
+// When bus is NopBus, delivery is in-process only.
 //
 // All internal state (clients, subs, clientSubs) is owned exclusively by the
 // run goroutine; callers must use the exported methods or the channel-based API
 // to ensure race safety.
 type Hub struct {
 	authorizer SubscriptionAuthorizer
+	bus        BroadcastBus
+	instanceID string
 	logger     *slog.Logger
+	busCancel  context.CancelFunc
 
-	register   chan registerReq
-	unregister chan *Client
-	subReq     chan subscribeReq
-	bcast      chan broadcastReq
-	quit       chan struct{}
-	done       chan struct{}
+	register    chan registerReq
+	unregister  chan *Client
+	subReq      chan subscribeReq
+	bcast       chan broadcastReq
+	remoteBcast chan broadcastReq // events received from the distributed bus
+	quit        chan struct{}
+	done        chan struct{}
 
 	// Owned exclusively by the run goroutine — do not access from other goroutines.
 	clients    map[string]*Client             // clientID → client
@@ -77,21 +84,38 @@ type Hub struct {
 }
 
 // NewHub creates a Hub and starts its background goroutine.
-// Call Shutdown to stop it gracefully.
-func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger) *Hub {
-	h := &Hub{
-		authorizer: authorizer,
-		logger:     logger,
-		register:   make(chan registerReq, 64),
-		unregister: make(chan *Client, 64),
-		subReq:     make(chan subscribeReq, 64),
-		bcast:      make(chan broadcastReq, 256),
-		quit:       make(chan struct{}),
-		done:       make(chan struct{}),
-		clients:    make(map[string]*Client),
-		subs:       make(map[string]map[string]struct{}),
-		clientSubs: make(map[string]map[string]struct{}),
+//
+// bus is the distributed broadcast bus. Pass NopBus{} for single-instance
+// deployments or when Valkey is not configured.
+//
+// instanceID is a stable identifier for this process instance, used for
+// echo-suppression of self-published events on the bus. If empty, a UUID
+// is generated automatically.
+//
+// Call Shutdown to stop the hub gracefully.
+func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus BroadcastBus, instanceID string) *Hub {
+	if instanceID == "" {
+		instanceID = uuid.New().String()
 	}
+	busCtx, busCancel := context.WithCancel(context.Background())
+	h := &Hub{
+		authorizer:  authorizer,
+		bus:         bus,
+		instanceID:  instanceID,
+		logger:      logger,
+		busCancel:   busCancel,
+		register:    make(chan registerReq, 64),
+		unregister:  make(chan *Client, 64),
+		subReq:      make(chan subscribeReq, 64),
+		bcast:       make(chan broadcastReq, 256),
+		remoteBcast: make(chan broadcastReq, 256),
+		quit:        make(chan struct{}),
+		done:        make(chan struct{}),
+		clients:     make(map[string]*Client),
+		subs:        make(map[string]map[string]struct{}),
+		clientSubs:  make(map[string]map[string]struct{}),
+	}
+	h.bus.Subscribe(busCtx, h.handleRemoteBusEvent)
 	go h.run()
 	return h
 }
@@ -156,41 +180,58 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 // PublishMessageCreated broadcasts a message.created event to all clients
 // subscribed to the message's target (channel or DM conversation).
 //
+// Local delivery happens first and is always attempted regardless of bus state.
+// Distributed delivery via bus.Publish is best-effort: failures are logged
+// but do not affect local delivery or cause a panic. Bus.Publish is called
+// from the caller's goroutine, not the hub run goroutine, so Valkey I/O never
+// blocks the hub.
+//
 // Authorization is re-checked per subscriber before delivery using a fresh
-// background context (not the caller's context, which may already be cancelled
-// by the time the hub goroutine processes the broadcast). If the re-check
-// returns an error, delivery is skipped for that client but the subscription
-// is kept — transient store errors must not unsubscribe authorized clients.
-// Only a definitive allowed=false with no error causes a subscription revocation.
+// background context. Transient auth errors skip delivery but keep the
+// subscription; only a definitive allowed=false revokes it.
 //
-// Delivery is best-effort in-process; no persistence or durability guarantee.
-// Valkey outbox fan-out for durability is future scope.
-//
+// Delivery guarantee: in-process best-effort. No durability, no replay.
 // Wiring: call this from MessageService after a message is persisted.
 func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID string) {
 	evt := Event{
-		Type:        EventTypeMessageCreated,
-		WorkspaceID: workspaceID,
-		TargetType:  targetType,
-		TargetID:    targetID,
-		MessageID:   messageID,
-		CreatedAt:   time.Now().UTC(),
+		Type:             EventTypeMessageCreated,
+		WorkspaceID:      workspaceID,
+		TargetType:       targetType,
+		TargetID:         targetID,
+		MessageID:        messageID,
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.instanceID,
+		CreatedAt:        time.Now().UTC(),
 	}
 	data, err := json.Marshal(evt)
 	if err != nil {
 		h.logger.ErrorContext(ctx, "ws: marshal message.created event", "error", err)
 		return
 	}
+
+	// Local delivery — independent of bus state.
 	select {
 	case h.bcast <- broadcastReq{event: evt, data: data}:
 	case <-ctx.Done():
+		return
 	case <-h.quit:
+		return
+	}
+
+	// Distributed publish — failure must not affect local delivery.
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: bus publish failed; local delivery unaffected",
+			"workspace_id", workspaceID,
+			"target_type", string(targetType),
+			"error", err,
+		)
 	}
 }
 
-// Shutdown stops the hub goroutine and closes all client connections.
-// Blocks until the goroutine exits.
+// Shutdown stops the hub goroutine, cancels bus subscriptions, and closes all
+// client connections. Blocks until the run goroutine exits.
 func (h *Hub) Shutdown() {
+	h.busCancel()
 	close(h.quit)
 	<-h.done
 }
@@ -217,6 +258,10 @@ func (h *Hub) run() {
 		case req := <-h.bcast:
 			h.handleBroadcast(req)
 
+		case req := <-h.remoteBcast:
+			// Remote events from the bus: deliver locally only; no re-publish.
+			h.handleBroadcast(req)
+
 		case <-h.quit:
 			for _, c := range h.clients {
 				c.close()
@@ -224,6 +269,63 @@ func (h *Hub) run() {
 			return
 		}
 	}
+}
+
+// handleRemoteBusEvent is called by the BroadcastBus Subscribe handler.
+// It validates the event, suppresses self-echo, encodes to JSON, and posts
+// to remoteBcast for the run goroutine to process. This method is called from
+// a bus-owned goroutine and must not touch hub state directly.
+func (h *Hub) handleRemoteBusEvent(evt Event) {
+	// Suppress self-echo: events we published must not be re-delivered locally.
+	if evt.SourceInstanceID == h.instanceID {
+		return
+	}
+
+	// Validate envelope — reject malformed or unknown events fail-secure.
+	if !isValidRemoteEvent(evt) {
+		h.logger.WarnContext(context.Background(), "ws: dropped invalid remote bus event",
+			"event_type", string(evt.Type),
+			"target_type", string(evt.TargetType),
+		)
+		return
+	}
+
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(context.Background(), "ws: failed to marshal remote bus event", "error", err)
+		return
+	}
+
+	select {
+	case h.remoteBcast <- broadcastReq{event: evt, data: data}:
+	default:
+		// Drop if queue is full — bounded, no goroutine block.
+		h.logger.WarnContext(context.Background(), "ws: remote broadcast queue full; event dropped",
+			"workspace_id", evt.WorkspaceID,
+			"target_type", string(evt.TargetType),
+		)
+	}
+}
+
+// isValidRemoteEvent checks that an event received from the bus has the
+// required fields and known types before delivery.
+func isValidRemoteEvent(evt Event) bool {
+	if evt.WorkspaceID == "" || evt.TargetID == "" || evt.SourceInstanceID == "" {
+		return false
+	}
+	switch evt.Type {
+	case EventTypeMessageCreated:
+		// known
+	default:
+		return false
+	}
+	switch evt.TargetType {
+	case TargetTypeChannel, TargetTypeDM:
+		// known
+	default:
+		return false
+	}
+	return true
 }
 
 // dropClient removes a client and all its subscriptions from hub state,

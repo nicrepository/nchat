@@ -28,20 +28,30 @@ const (
 	ClientMessageTypePing        ClientMessageType = "ping"
 )
 
-// Event is the outbound event envelope sent to WebSocket clients.
+// Event is the outbound event envelope sent to WebSocket clients and exchanged
+// over the distributed BroadcastBus.
 //
 // Security notes:
 //   - Payload must never contain message body text (no log-leakage risk).
 //   - WorkspaceID, TargetType, TargetID are server-generated; never client-provided.
 //   - No tokens, secrets, or credentials may appear in any field.
+//   - SourceInstanceID is used for echo-suppression only; do not trust it for
+//     authorization. Authorization re-check happens independently.
 type Event struct {
 	Type        EventType  `json:"type"`
 	WorkspaceID string     `json:"workspace_id"`
 	TargetType  TargetType `json:"target_type"`
 	TargetID    string     `json:"target_id"`
 	// MessageID is populated for message.created events.
-	MessageID string    `json:"message_id,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	MessageID string `json:"message_id,omitempty"`
+	// EventID is a server-generated UUID assigned at publish time.
+	// Used for idempotency and observability; not a security boundary.
+	EventID string `json:"event_id,omitempty"`
+	// SourceInstanceID identifies the chat-service instance that originated
+	// the event. Remote receivers use this to suppress self-echo — events
+	// with a matching SourceInstanceID are dropped without delivery.
+	SourceInstanceID string    `json:"source_instance_id,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // ClientMessage is an inbound control message from a connected WebSocket client.
