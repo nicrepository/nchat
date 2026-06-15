@@ -82,15 +82,21 @@ func fakeAuthKey(userID, workspaceID string, tt TargetType, targetID string) str
 	return userID + "|" + workspaceID + "|" + string(tt) + "|" + targetID
 }
 
+func newTestLogger() *slog.Logger { return slog.Default() }
+
 // newTestHub creates a Hub for white-box tests without starting the run goroutine.
 // Tests call handleSubscribe, handleBroadcast, and dropClient directly.
 func newTestHub(auth SubscriptionAuthorizer) *Hub {
 	return &Hub{
-		authorizer: auth,
-		logger:     slog.Default(),
-		clients:    make(map[string]*Client),
-		subs:       make(map[string]map[string]struct{}),
-		clientSubs: make(map[string]map[string]struct{}),
+		authorizer:  auth,
+		bus:         NopBus{},
+		instanceID:  "test-instance",
+		busCancel:   func() {},
+		logger:      newTestLogger(),
+		remoteBcast: make(chan broadcastReq, 256),
+		clients:     make(map[string]*Client),
+		subs:        make(map[string]map[string]struct{}),
+		clientSubs:  make(map[string]map[string]struct{}),
 	}
 }
 
@@ -533,7 +539,7 @@ func TestHub_Register_ThenSubscribe_AlwaysSucceeds(t *testing.T) {
 	// must never fail with "client not registered".
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
-	hub := NewHub(auth, slog.Default())
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "test-inst")
 	defer hub.Shutdown()
 
 	const iterations = 50
@@ -551,7 +557,7 @@ func TestHub_Register_ThenSubscribe_AlwaysSucceeds(t *testing.T) {
 func TestHub_Concurrent_RegisterSubscribeBroadcast_NoRace(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
-	hub := NewHub(auth, slog.Default())
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "test-inst")
 	defer hub.Shutdown()
 
 	const goroutines = 20
@@ -572,7 +578,7 @@ func TestHub_Concurrent_RegisterSubscribeBroadcast_NoRace(t *testing.T) {
 }
 
 func TestHub_Shutdown_ClosesAllClients(t *testing.T) {
-	hub := NewHub(&fakeAuthorizer{}, slog.Default())
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-inst")
 
 	snd1 := &fakeSender{}
 	snd2 := &fakeSender{}
