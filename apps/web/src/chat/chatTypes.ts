@@ -42,7 +42,4 @@ export interface CurrentUser {
 
 // ── Sidebar active selection ─────────────────────────────────────────────────
 
-export type ActiveItem =
-  | { kind: "channel"; id: string }
-  | { kind: "dm"; id: string }
-  | null;
+export type ActiveItem = { kind: "channel"; id: string } | { kind: "dm"; id: string } | null;

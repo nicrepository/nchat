@@ -13,20 +13,20 @@ import type { Channel, DMConversation } from "./chatTypes";
 
 const { mockFetchChannels, mockFetchDMs } = vi.hoisted(() => ({
   mockFetchChannels: vi.fn<() => Promise<Channel[]>>(),
-  mockFetchDMs:      vi.fn<() => Promise<DMConversation[]>>(),
+  mockFetchDMs: vi.fn<() => Promise<DMConversation[]>>(),
 }));
 
 vi.mock("./chatApi", () => ({
   fetchChannels: () => mockFetchChannels(),
-  fetchDMs:      () => mockFetchDMs(),
+  fetchDMs: () => mockFetchDMs(),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const SAMPLE_CHANNELS: Channel[] = [
-  { id: "geral",          name: "geral",         type: "public"  },
-  { id: "infraestrutura", name: "infraestrutura", type: "public"  },
-  { id: "projetos",       name: "projetos",       type: "private" },
+  { id: "geral", name: "geral", type: "public" },
+  { id: "infraestrutura", name: "infraestrutura", type: "public" },
+  { id: "projetos", name: "projetos", type: "private" },
 ];
 
 const SAMPLE_DMS: DMConversation[] = [
@@ -35,7 +35,13 @@ const SAMPLE_DMS: DMConversation[] = [
     type: "1:1",
     name: "Juliane Lino",
     participants: [
-      { id: "juliane", displayName: "Juliane Lino", initials: "JL", color: "rose", status: "online" },
+      {
+        id: "juliane",
+        displayName: "Juliane Lino",
+        initials: "JL",
+        color: "rose",
+        status: "online",
+      },
     ],
   },
   {
@@ -43,9 +49,21 @@ const SAMPLE_DMS: DMConversation[] = [
     type: "group",
     name: "Equipe Infra",
     participants: [
-      { id: "juliane", displayName: "Juliane Lino",     initials: "JL", color: "rose",  status: "online"  },
-      { id: "caio",    displayName: "Caio Almeida",     initials: "CA", color: "blue",  status: "away"    },
-      { id: "fernanda",displayName: "Fernanda Nicácio", initials: "FN", color: "teal",  status: "online"  },
+      {
+        id: "juliane",
+        displayName: "Juliane Lino",
+        initials: "JL",
+        color: "rose",
+        status: "online",
+      },
+      { id: "caio", displayName: "Caio Almeida", initials: "CA", color: "blue", status: "away" },
+      {
+        id: "fernanda",
+        displayName: "Fernanda Nicácio",
+        initials: "FN",
+        color: "teal",
+        status: "online",
+      },
     ],
   },
 ];
@@ -367,12 +385,8 @@ describe("ChatSidebar — error state", () => {
 
   it("retry button reloads data", async () => {
     const user = userEvent.setup();
-    mockFetchChannels
-      .mockRejectedValueOnce(new Error("fail"))
-      .mockResolvedValue(SAMPLE_CHANNELS);
-    mockFetchDMs
-      .mockRejectedValueOnce(new Error("fail"))
-      .mockResolvedValue([]);
+    mockFetchChannels.mockRejectedValueOnce(new Error("fail")).mockResolvedValue(SAMPLE_CHANNELS);
+    mockFetchDMs.mockRejectedValueOnce(new Error("fail")).mockResolvedValue([]);
 
     renderChat();
 
@@ -438,9 +452,7 @@ describe("ChatSidebar — footer", () => {
 
     await screen.findByTestId("chat-sidebar");
     // Footer user info is aria-hidden for screen readers but visible in DOM
-    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent(
-      FIXTURE_CURRENT_USER.displayName,
-    );
+    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent(FIXTURE_CURRENT_USER.displayName);
   });
 
   it("renders current user role from fixture data", async () => {
@@ -468,9 +480,10 @@ describe("ChatSidebar — route encoding", () => {
 
     // After clicking, the channel should become active (route changed, location decoded)
     await waitFor(() => {
-      expect(
-        screen.getByRole("option", { name: /canal equipe infra/i }),
-      ).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByRole("option", { name: /canal equipe infra/i })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     });
   });
 

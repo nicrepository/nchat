@@ -9,42 +9,74 @@ import type { Channel, DMConversation } from "./chatTypes";
 
 function IconHash() {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" className="chat-sidebar__icon" aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__icon"
+      aria-hidden="true"
+    >
       <line x1="10" y1="4" x2="8" y2="20" />
       <line x1="16" y1="4" x2="14" y2="20" />
-      <line x1="4"  y1="9" x2="20" y2="9"  />
-      <line x1="3"  y1="15" x2="19" y2="15"/>
+      <line x1="4" y1="9" x2="20" y2="9" />
+      <line x1="3" y1="15" x2="19" y2="15" />
     </svg>
   );
 }
 
 function IconLock() {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" className="chat-sidebar__icon chat-sidebar__icon--sm" aria-hidden="true">
-      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__icon chat-sidebar__icon--sm"
+      aria-hidden="true"
+    >
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
     </svg>
   );
 }
 
 function IconAdd() {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" className="chat-sidebar__add-icon" aria-hidden="true">
-      <line x1="12" y1="5" x2="12" y2="19"/>
-      <line x1="5"  y1="12" x2="19" y2="12"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__add-icon"
+      aria-hidden="true"
+    >
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <line x1="5" y1="12" x2="19" y2="12" />
     </svg>
   );
 }
 
 function IconSettings() {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" className="chat-sidebar__icon" aria-hidden="true">
-      <circle cx="12" cy="12" r="3"/>
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__icon"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 }
@@ -78,12 +110,16 @@ function GroupAvatars({ dm }: { dm: DMConversation }) {
   return (
     <span className="chat-sidebar__group-avatars" aria-hidden="true">
       {first && (
-        <span className={`chat-sidebar__avatar chat-sidebar__avatar--${first.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-back`}>
+        <span
+          className={`chat-sidebar__avatar chat-sidebar__avatar--${first.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-back`}
+        >
           {first.initials}
         </span>
       )}
       {second && (
-        <span className={`chat-sidebar__avatar chat-sidebar__avatar--${second.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-front`}>
+        <span
+          className={`chat-sidebar__avatar chat-sidebar__avatar--${second.color} chat-sidebar__avatar--sm chat-sidebar__avatar--group-front`}
+        >
           {second.initials}
         </span>
       )}
@@ -169,7 +205,10 @@ function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) 
               </span>
             )}
             {ch.unreadCount != null && ch.unreadCount > 0 && (
-              <span className="chat-sidebar__unread-badge" aria-label={`${ch.unreadCount} não lidas`}>
+              <span
+                className="chat-sidebar__unread-badge"
+                aria-label={`${ch.unreadCount} não lidas`}
+              >
                 {ch.unreadCount}
               </span>
             )}
@@ -226,12 +265,13 @@ function DMList({ dms, activeDMId, onSelect }: DMListProps) {
             ) : null}
             <span className="chat-sidebar__dm-name">{dm.name}</span>
             {isGroup && (
-              <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">
-                grupo
-              </span>
+              <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
             )}
             {dm.unreadCount != null && dm.unreadCount > 0 && (
-              <span className="chat-sidebar__unread-badge" aria-label={`${dm.unreadCount} não lidas`}>
+              <span
+                className="chat-sidebar__unread-badge"
+                aria-label={`${dm.unreadCount} não lidas`}
+              >
                 {dm.unreadCount}
               </span>
             )}
@@ -265,10 +305,10 @@ export default function ChatSidebar() {
   const pathParts = location.pathname.split("/").filter(Boolean);
   // pathParts: ["chat", "channel"|"dm", encodedId]
   const activeType = pathParts[1] as "channel" | "dm" | undefined;
-  const activeId   = pathParts[2] ? safeDecodeURIComponent(pathParts[2]) : undefined;
+  const activeId = pathParts[2] ? safeDecodeURIComponent(pathParts[2]) : undefined;
 
   const activeChannelId = activeType === "channel" ? activeId : undefined;
-  const activeDMId      = activeType === "dm"      ? activeId : undefined;
+  const activeDMId = activeType === "dm" ? activeId : undefined;
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -350,22 +390,14 @@ export default function ChatSidebar() {
                 <IconAdd />
               </button>
             </div>
-            <DMList
-              dms={state.dms}
-              activeDMId={activeDMId}
-              onSelect={handleDMSelect}
-            />
+            <DMList dms={state.dms} activeDMId={activeDMId} onSelect={handleDMSelect} />
           </>
         )}
       </div>
 
       {/* ── Footer ── */}
       <div className="chat-sidebar__footer">
-        <Link
-          to="/admin/users"
-          className="chat-sidebar__footer-item"
-          aria-label="Configurações"
-        >
+        <Link to="/admin/users" className="chat-sidebar__footer-item" aria-label="Configurações">
           <IconSettings />
           <span>Configurações</span>
         </Link>

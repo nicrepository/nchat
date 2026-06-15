@@ -23,11 +23,11 @@
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
 
 export const FIXTURE_CHANNELS: Channel[] = [
-  { id: "geral",          name: "geral",          type: "public"  },
-  { id: "infraestrutura", name: "infraestrutura",  type: "public"  },
-  { id: "suporte",        name: "suporte",         type: "public"  },
-  { id: "projetos",       name: "projetos",        type: "private" },
-  { id: "avisos",         name: "avisos",          type: "public"  },
+  { id: "geral", name: "geral", type: "public" },
+  { id: "infraestrutura", name: "infraestrutura", type: "public" },
+  { id: "suporte", name: "suporte", type: "public" },
+  { id: "projetos", name: "projetos", type: "private" },
+  { id: "avisos", name: "avisos", type: "public" },
 ];
 
 export const FIXTURE_DMS: DMConversation[] = [
@@ -78,9 +78,21 @@ export const FIXTURE_DMS: DMConversation[] = [
     type: "group",
     name: "Equipe Infra",
     participants: [
-      { id: "juliane", displayName: "Juliane Lino",     initials: "JL", color: "rose",  status: "online"  },
-      { id: "caio",    displayName: "Caio Almeida",     initials: "CA", color: "blue",  status: "away"    },
-      { id: "fernanda",displayName: "Fernanda Nicácio", initials: "FN", color: "teal",  status: "online"  },
+      {
+        id: "juliane",
+        displayName: "Juliane Lino",
+        initials: "JL",
+        color: "rose",
+        status: "online",
+      },
+      { id: "caio", displayName: "Caio Almeida", initials: "CA", color: "blue", status: "away" },
+      {
+        id: "fernanda",
+        displayName: "Fernanda Nicácio",
+        initials: "FN",
+        color: "teal",
+        status: "online",
+      },
     ],
   },
 ];

@@ -9,16 +9,16 @@
 
 .chat-sidebar {
   /* Prototype purple/dark palette scoped here */
-  --cs-sidebar-bg:       #1f1b2e;
-  --cs-sidebar-hover:    rgba(255, 255, 255, 0.06);
-  --cs-sidebar-active:   rgba(168, 101, 247, 0.14);
-  --cs-sidebar-text:     #e5e1f0;
-  --cs-sidebar-muted:    #9991b0;
-  --cs-sidebar-divider:  rgba(255, 255, 255, 0.08);
-  --cs-primary:          #6d28d9;
-  --cs-primary-strong:   #5b21b6;
-  --cs-primary-soft:     #a865f7;
-  --cs-sidebar-w:        240px;
+  --cs-sidebar-bg: #1f1b2e;
+  --cs-sidebar-hover: rgba(255, 255, 255, 0.06);
+  --cs-sidebar-active: rgba(168, 101, 247, 0.14);
+  --cs-sidebar-text: #e5e1f0;
+  --cs-sidebar-muted: #9991b0;
+  --cs-sidebar-divider: rgba(255, 255, 255, 0.08);
+  --cs-primary: #6d28d9;
+  --cs-primary-strong: #5b21b6;
+  --cs-primary-soft: #a865f7;
+  --cs-sidebar-w: 240px;
 
   width: var(--cs-sidebar-w);
   background: var(--cs-sidebar-bg);
@@ -160,7 +160,9 @@
   border-radius: 4px;
   cursor: pointer;
   padding: 0;
-  transition: background 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
 }
 
 .chat-sidebar__section-action:hover:not(:disabled) {
@@ -187,7 +189,9 @@
   background: transparent;
   border: none;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
   position: relative;
   width: 100%;
 }
@@ -255,7 +259,9 @@
   background: transparent;
   border: none;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
   width: 100%;
 }
 
@@ -301,12 +307,24 @@
   font-size: 11px;
 }
 
-.chat-sidebar__avatar--purple { background: linear-gradient(135deg, #7b43e8, #b485f4); }
-.chat-sidebar__avatar--green  { background: linear-gradient(135deg, #16a34a, #4ade80); }
-.chat-sidebar__avatar--blue   { background: linear-gradient(135deg, #2563eb, #60a5fa); }
-.chat-sidebar__avatar--rose   { background: linear-gradient(135deg, #db2777, #f472b6); }
-.chat-sidebar__avatar--amber  { background: linear-gradient(135deg, #d97706, #fbbf24); }
-.chat-sidebar__avatar--teal   { background: linear-gradient(135deg, #0d9488, #2dd4bf); }
+.chat-sidebar__avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.chat-sidebar__avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.chat-sidebar__avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.chat-sidebar__avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.chat-sidebar__avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.chat-sidebar__avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
+}
 
 .chat-sidebar__avatar-status {
   position: absolute;
@@ -318,9 +336,15 @@
   border: 2px solid var(--cs-sidebar-bg);
 }
 
-.chat-sidebar__avatar-status--online  { background: #22c55e; }
-.chat-sidebar__avatar-status--away    { background: #f59e0b; }
-.chat-sidebar__avatar-status--offline { background: #94a3b8; }
+.chat-sidebar__avatar-status--online {
+  background: #22c55e;
+}
+.chat-sidebar__avatar-status--away {
+  background: #f59e0b;
+}
+.chat-sidebar__avatar-status--offline {
+  background: #94a3b8;
+}
 
 /* ── Group avatars ───────────────────────────────────────────────────────────── */
 
@@ -389,7 +413,9 @@
   font-size: 13px;
   font-weight: 500;
   text-decoration: none;
-  transition: background 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
   margin: 2px 6px;
 }
 
@@ -461,8 +487,13 @@
 }
 
 @keyframes cs-pulse {
-  0%, 100% { opacity: 0.6; }
-  50%       { opacity: 1;   }
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 /* ── Error state ─────────────────────────────────────────────────────────────── */
