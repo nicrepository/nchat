@@ -328,21 +328,22 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_NotFoundReturnsErrNotFound(t 
 func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
+	// Default limit is 50; query uses limit+1 = 51 to detect next page.
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
+		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()).
 			AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...).
 			AddRow(messageRow("msg-2", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages: %v", err)
 	}
-	if len(messages) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(messages))
+	if len(result.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }
@@ -350,18 +351,18 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
+		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages empty: %v", err)
 	}
-	if len(messages) != 0 {
-		t.Fatalf("expected 0 messages, got %d", len(messages))
+	if len(result.Messages) != 0 {
+		t.Fatalf("expected 0 messages, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }
@@ -381,18 +382,18 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		now, now,
 	}
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
+		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()).AddRow(row...))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages with editedAt: %v", err)
 	}
-	if len(messages) != 1 || messages[0].EditedAt.IsZero() || messages[0].DeletedAt.IsZero() {
-		t.Fatalf("expected 1 message with EditedAt/DeletedAt set, got %+v", messages)
+	if len(result.Messages) != 1 || result.Messages[0].EditedAt.IsZero() || result.Messages[0].DeletedAt.IsZero() {
+		t.Fatalf("expected 1 message with EditedAt/DeletedAt set, got %+v", result.Messages)
 	}
 	checkExpectations(t, mock)
 }
@@ -403,19 +404,19 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "dm-1", "user-1").
+		WithArgs("ws-1", "dm-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()).
 			AddRow(messageRow("msg-3", "ws-1", "", "dm-1", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
 		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages: %v", err)
 	}
-	if len(messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(messages))
+	if len(result.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }
@@ -423,18 +424,18 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 func TestPGXMessageStore_ListDMMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "dm-1", "user-1").
+		WithArgs("ws-1", "dm-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
 		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages empty: %v", err)
 	}
-	if len(messages) != 0 {
-		t.Fatalf("expected 0 messages, got %d", len(messages))
+	if len(result.Messages) != 0 {
+		t.Fatalf("expected 0 messages, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }

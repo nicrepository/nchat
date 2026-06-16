@@ -76,14 +76,14 @@ func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _
 	return f.validateRefTargetErr
 }
 
-func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) ([]domain.Message, error) {
+func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {
 	f.listChannelCalls++
-	return f.channelMessages, f.listChannelErr
+	return storage.ListMessagesResult{Messages: f.channelMessages}, f.listChannelErr
 }
 
-func (f *fakeMessageStore) ListDMMessages(_ context.Context, _ storage.ListDMMessagesInput) ([]domain.Message, error) {
+func (f *fakeMessageStore) ListDMMessages(_ context.Context, _ storage.ListDMMessagesInput) (storage.ListMessagesResult, error) {
 	f.listDMCalls++
-	return f.dmMessages, f.listDMErr
+	return storage.ListMessagesResult{Messages: f.dmMessages}, f.listDMErr
 }
 
 // ---- channel message tests -------------------------------------------------
@@ -525,8 +525,8 @@ func TestMessageService_ListChannelMessages_DelegatesVisibilityToStorage(t *test
 	if err != nil {
 		t.Fatalf("ListChannelMessages: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(got))
+	if len(got.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(got.Messages))
 	}
 	if msgs.listChannelCalls != 1 {
 		t.Fatalf("expected one ListChannelMessages storage call, got %d", msgs.listChannelCalls)
@@ -544,8 +544,8 @@ func TestMessageService_ListChannelMessages_InaccessibleChannelReturnsEmptySlice
 	if err != nil {
 		t.Fatalf("ListChannelMessages for inaccessible: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("expected empty slice for inaccessible channel, got %d messages", len(got))
+	if len(got.Messages) != 0 {
+		t.Fatalf("expected empty slice for inaccessible channel, got %d messages", len(got.Messages))
 	}
 }
 
@@ -564,8 +564,8 @@ func TestMessageService_ListDMMessages_DelegatesVisibilityToStorage(t *testing.T
 	if err != nil {
 		t.Fatalf("ListDMMessages: %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("expected 1 dm message, got %d", len(got))
+	if len(got.Messages) != 1 {
+		t.Fatalf("expected 1 dm message, got %d", len(got.Messages))
 	}
 	if msgs.listDMCalls != 1 {
 		t.Fatalf("expected one ListDMMessages storage call, got %d", msgs.listDMCalls)
@@ -582,8 +582,8 @@ func TestMessageService_ListDMMessages_InaccessibleConversationReturnsEmptySlice
 	if err != nil {
 		t.Fatalf("ListDMMessages for inaccessible: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("expected empty slice for inaccessible DM, got %d messages", len(got))
+	if len(got.Messages) != 0 {
+		t.Fatalf("expected empty slice for inaccessible DM, got %d messages", len(got.Messages))
 	}
 }
 

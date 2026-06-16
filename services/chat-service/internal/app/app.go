@@ -32,31 +32,35 @@ func New(cfg config.Config) *App {
 		logger.Warn("sidebar auth disabled", "reason", "invalid_jwt_config")
 	}
 
-	// Database pool — nil when DATABASE_URL is not configured.
 	var sidebarSvc *service.SidebarService
+	var messageSvc *service.MessageService
+	var workspaceStore *storage.PGXWorkspaceStore
 	var sessionValidator storage.SessionValidator
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
 		defer cancel()
 		pool, dbErr := storage.OpenDB(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
 		if dbErr != nil {
-			logger.Warn("database unavailable; sidebar endpoint disabled", "reason", "open_db_failed")
+			logger.Warn("database unavailable; endpoints disabled", "reason", "open_db_failed")
 		} else if validator != nil {
 			sessionValidator = storage.NewPGXSessionValidator(pool)
-			workspaces := storage.NewPGXWorkspaceStore(pool)
+			workspaceStore = storage.NewPGXWorkspaceStore(pool)
 			channels := storage.NewPGXChannelStore(pool)
 			members := storage.NewPGXMemberStore(pool)
 			dms := storage.NewPGXDMStore(pool)
-			sidebarSvc = service.NewSidebarService(workspaces, channels, members, dms)
+			messages := storage.NewPGXMessageStore(pool)
+			sidebarSvc = service.NewSidebarService(workspaceStore, channels, members, dms)
+			messageSvc = service.NewMessageService(channels, dms, messages)
 		}
 	}
 
 	sidebar := httpapi.NewSidebarHandler(sidebarSvc)
+	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc)
 
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, validator, sessionValidator, sidebar),
+		Handler:         httpapi.NewRouter(cfg, logger, validator, sessionValidator, sidebar, messageHandler),
 		TracingShutdown: shutdown,
 	}
 }

@@ -18,4 +18,7 @@ var (
 	// referenced message ID fails validation. The error is intentionally generic so
 	// that callers cannot determine whether the referenced message exists.
 	ErrInvalidMessageReference = errors.New("invalid message reference")
+	// ErrInvalidCursor is returned when a pagination cursor cannot be decoded or
+	// contains values that fail validation (malformed timestamp, invalid UUID).
+	ErrInvalidCursor = errors.New("invalid pagination cursor")
 )

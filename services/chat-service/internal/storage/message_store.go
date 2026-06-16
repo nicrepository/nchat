@@ -2,14 +2,67 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
+
+// defaultMessageLimit is the number of messages returned when no limit is specified.
+const defaultMessageLimit = 50
+
+// maxMessageLimit is the maximum number of messages that may be requested per page.
+const maxMessageLimit = 100
+
+// MessageCursor identifies the stable position of a message in the time-ordered list.
+// It encodes (created_at, id) to allow keyset pagination without offset drift.
+type MessageCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// EncodeCursor serializes a MessageCursor to an opaque URL-safe base64 string.
+// Format (plaintext before encoding): RFC3339Nano "|" UUID.
+func EncodeCursor(c MessageCursor) string {
+	raw := c.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + c.ID
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// DecodeCursor parses an opaque cursor string produced by EncodeCursor.
+// Returns domain.ErrInvalidCursor for any malformed or invalid input.
+func DecodeCursor(s string) (MessageCursor, error) {
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return MessageCursor{}, domain.ErrInvalidCursor
+	}
+	parts := strings.SplitN(string(b), "|", 2)
+	if len(parts) != 2 {
+		return MessageCursor{}, domain.ErrInvalidCursor
+	}
+	ts, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return MessageCursor{}, domain.ErrInvalidCursor
+	}
+	if _, err := uuid.Parse(parts[1]); err != nil {
+		return MessageCursor{}, domain.ErrInvalidCursor
+	}
+	return MessageCursor{CreatedAt: ts.UTC(), ID: parts[1]}, nil
+}
+
+// ListMessagesResult is the result of a paginated message list query.
+// Messages are sorted oldest-first (ASC by created_at, id).
+// NextCursor, when non-nil, is the cursor to pass as BeforeCursor in a subsequent
+// request to retrieve the next (older) page.
+type ListMessagesResult struct {
+	Messages   []domain.Message
+	NextCursor *MessageCursor
+}
 
 // CreateMessageInput holds caller-validated fields for inserting a message.
 // Exactly one of ChannelID and DMConversationID must be non-empty.
@@ -33,6 +86,12 @@ type ListChannelMessagesInput struct {
 	ChannelID   string
 	// UserID is the requesting caller; SQL enforces channel visibility for this user.
 	UserID string
+	// BeforeCursor, when non-nil, restricts results to messages older than the cursor.
+	// When nil, the most recent Limit messages are returned.
+	BeforeCursor *MessageCursor
+	// Limit is the maximum number of messages to return. 0 uses the default (50).
+	// Values above maxMessageLimit (100) are capped.
+	Limit int
 }
 
 // ListDMMessagesInput identifies the paged message list for a DM conversation.
@@ -41,6 +100,12 @@ type ListDMMessagesInput struct {
 	ConversationID string
 	// UserID is the requesting caller; SQL enforces DM visibility for this user.
 	UserID string
+	// BeforeCursor, when non-nil, restricts results to messages older than the cursor.
+	// When nil, the most recent Limit messages are returned.
+	BeforeCursor *MessageCursor
+	// Limit is the maximum number of messages to return. 0 uses the default (50).
+	// Values above maxMessageLimit (100) are capped.
+	Limit int
 }
 
 // MessageStore is the persistence interface for message operations.
@@ -63,19 +128,19 @@ type MessageStore interface {
 	// missing, cross-workspace, cross-channel, and cross-DM all return the same error.
 	ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error
 
-	// ListChannelMessages returns messages for a channel in created_at/id order.
+	// ListChannelMessages returns a paginated set of messages for a channel.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
-	// active channel, and private-channel membership are all checked in the query.
-	// Returns an empty slice when the channel is not visible to UserID.
-	// Current implementation returns up to 100 messages (cursor pagination is future scope).
-	ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) ([]domain.Message, error)
+	// active channel, and private-channel membership are all required.
+	// Returns an empty result when the channel is not visible to UserID.
+	// Results are sorted oldest-first (ASC). NextCursor is nil when no older page exists.
+	ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) (ListMessagesResult, error)
 
-	// ListDMMessages returns messages for a DM conversation in created_at/id order.
+	// ListDMMessages returns a paginated set of messages for a DM conversation.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
-	// active DM conversation, and active DM membership are all checked in the query.
-	// Returns an empty slice when the conversation is not visible to UserID.
-	// Current implementation returns up to 100 messages (cursor pagination is future scope).
-	ListDMMessages(ctx context.Context, input ListDMMessagesInput) ([]domain.Message, error)
+	// active DM conversation, and active DM membership are all required.
+	// Returns an empty result when the conversation is not visible to UserID.
+	// Results are sorted oldest-first (ASC). NextCursor is nil when no older page exists.
+	ListDMMessages(ctx context.Context, input ListDMMessagesInput) (ListMessagesResult, error)
 }
 
 // PGXMessageStore implements MessageStore using a pgx connection pool.
@@ -87,8 +152,6 @@ type PGXMessageStore struct {
 func NewPGXMessageStore(pool Pool) *PGXMessageStore {
 	return &PGXMessageStore{pool: pool}
 }
-
-// messageColumns returns the SELECT column list for message queries.
 // When alias is non-empty (e.g. "m"), columns are prefixed to avoid ambiguity
 // in JOIN queries.
 func messageColumns(alias string) string {
@@ -287,63 +350,166 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 	return msg, nil
 }
 
-func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) ([]domain.Message, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT `+messageColumns("m")+`
-		FROM chat.messages m
-		JOIN chat.channels c
-		  ON c.id = m.channel_id
-		JOIN chat.workspaces w
-		  ON w.id = m.workspace_id AND w.status = 'active'
-		JOIN chat.workspace_members wm
-		  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
-		LEFT JOIN chat.channel_members cm
-		  ON cm.channel_id = m.channel_id AND cm.user_id = $3
-		WHERE m.workspace_id = $1
-		  AND m.channel_id = $2
-		  AND c.status = 'active'
-		  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
-		ORDER BY m.created_at ASC, m.id ASC
-		LIMIT 100`,
-		input.WorkspaceID, input.ChannelID, input.UserID,
-	)
+func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) (ListMessagesResult, error) {
+	limit := resolveLimit(input.Limit)
+
+	var rows pgx.Rows
+	var err error
+
+	if input.BeforeCursor != nil {
+		// Keyset pagination: fetch messages older than the cursor.
+		// Fetch limit+1 to detect whether a next page exists.
+		rows, err = s.pool.Query(ctx, `
+			SELECT `+messageColumns("m")+`
+			FROM chat.messages m
+			JOIN chat.channels c
+			  ON c.id = m.channel_id
+			JOIN chat.workspaces w
+			  ON w.id = m.workspace_id AND w.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
+			LEFT JOIN chat.channel_members cm
+			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
+			WHERE m.workspace_id = $1
+			  AND m.channel_id = $2
+			  AND c.status = 'active'
+			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+			  AND (m.created_at < $4 OR (m.created_at = $4 AND m.id::text < $5))
+			ORDER BY m.created_at DESC, m.id DESC
+			LIMIT $6`,
+			input.WorkspaceID, input.ChannelID, input.UserID,
+			input.BeforeCursor.CreatedAt, input.BeforeCursor.ID,
+			limit+1,
+		)
+	} else {
+		rows, err = s.pool.Query(ctx, `
+			SELECT `+messageColumns("m")+`
+			FROM chat.messages m
+			JOIN chat.channels c
+			  ON c.id = m.channel_id
+			JOIN chat.workspaces w
+			  ON w.id = m.workspace_id AND w.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
+			LEFT JOIN chat.channel_members cm
+			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
+			WHERE m.workspace_id = $1
+			  AND m.channel_id = $2
+			  AND c.status = 'active'
+			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+			ORDER BY m.created_at DESC, m.id DESC
+			LIMIT $4`,
+			input.WorkspaceID, input.ChannelID, input.UserID,
+			limit+1,
+		)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list channel messages: %w", err)
+		return ListMessagesResult{}, fmt.Errorf("list channel messages: %w", err)
 	}
 	defer rows.Close()
-	return collectMessages(rows)
+	return collectMessagesResult(rows, limit)
 }
 
-func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessagesInput) ([]domain.Message, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT `+messageColumns("m")+`
-		FROM chat.messages m
-		JOIN chat.dm_conversations dc
-		  ON dc.id = m.dm_conversation_id
-		JOIN chat.workspaces w
-		  ON w.id = m.workspace_id AND w.status = 'active'
-		JOIN chat.workspace_members wm
-		  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
-		JOIN chat.dm_members dm
-		  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
-		WHERE m.workspace_id = $1
-		  AND m.dm_conversation_id = $2
-		  AND dc.status = 'active'
-		ORDER BY m.created_at ASC, m.id ASC
-		LIMIT 100`,
-		input.WorkspaceID, input.ConversationID, input.UserID,
-	)
+func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessagesInput) (ListMessagesResult, error) {
+	limit := resolveLimit(input.Limit)
+
+	var rows pgx.Rows
+	var err error
+
+	if input.BeforeCursor != nil {
+		rows, err = s.pool.Query(ctx, `
+			SELECT `+messageColumns("m")+`
+			FROM chat.messages m
+			JOIN chat.dm_conversations dc
+			  ON dc.id = m.dm_conversation_id
+			JOIN chat.workspaces w
+			  ON w.id = m.workspace_id AND w.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
+			WHERE m.workspace_id = $1
+			  AND m.dm_conversation_id = $2
+			  AND dc.status = 'active'
+			  AND (m.created_at < $4 OR (m.created_at = $4 AND m.id::text < $5))
+			ORDER BY m.created_at DESC, m.id DESC
+			LIMIT $6`,
+			input.WorkspaceID, input.ConversationID, input.UserID,
+			input.BeforeCursor.CreatedAt, input.BeforeCursor.ID,
+			limit+1,
+		)
+	} else {
+		rows, err = s.pool.Query(ctx, `
+			SELECT `+messageColumns("m")+`
+			FROM chat.messages m
+			JOIN chat.dm_conversations dc
+			  ON dc.id = m.dm_conversation_id
+			JOIN chat.workspaces w
+			  ON w.id = m.workspace_id AND w.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
+			WHERE m.workspace_id = $1
+			  AND m.dm_conversation_id = $2
+			  AND dc.status = 'active'
+			ORDER BY m.created_at DESC, m.id DESC
+			LIMIT $4`,
+			input.WorkspaceID, input.ConversationID, input.UserID,
+			limit+1,
+		)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list dm messages: %w", err)
+		return ListMessagesResult{}, fmt.Errorf("list dm messages: %w", err)
 	}
 	defer rows.Close()
-	return collectMessages(rows)
+	return collectMessagesResult(rows, limit)
+}
+
+// resolveLimit returns a valid limit value: defaults to defaultMessageLimit when
+// input is 0, capped at maxMessageLimit.
+func resolveLimit(n int) int {
+	if n <= 0 {
+		return defaultMessageLimit
+	}
+	if n > maxMessageLimit {
+		return maxMessageLimit
+	}
+	return n
 }
 
 type messageRows interface {
 	Next() bool
 	Scan(dest ...any) error
 	Err() error
+}
+
+// collectMessagesResult reads all rows from the query (which was issued with LIMIT limit+1)
+// and returns a ListMessagesResult. Results fetched DESC are reversed to ASC order.
+// If more than limit rows are returned, the extra row is discarded and NextCursor
+// is set to the oldest returned message's cursor.
+func collectMessagesResult(rows messageRows, limit int) (ListMessagesResult, error) {
+	msgs, err := collectMessages(rows)
+	if err != nil {
+		return ListMessagesResult{}, err
+	}
+
+	var nextCursor *MessageCursor
+	if len(msgs) > limit {
+		// Extra row means there is an older page. Trim to limit.
+		msgs = msgs[:limit]
+		// The last element (after trimming, still DESC) is the oldest we're returning.
+		oldest := msgs[len(msgs)-1]
+		c := MessageCursor{CreatedAt: oldest.CreatedAt, ID: oldest.ID}
+		nextCursor = &c
+	}
+
+	// Reverse from DESC to ASC (oldest-first) for display.
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+
+	return ListMessagesResult{Messages: msgs, NextCursor: nextCursor}, nil
 }
 
 func collectMessages(rows messageRows) ([]domain.Message, error) {

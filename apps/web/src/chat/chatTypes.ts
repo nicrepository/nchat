@@ -43,3 +43,26 @@ export interface CurrentUser {
 // ── Sidebar active selection ─────────────────────────────────────────────────
 
 export type ActiveItem = { kind: "channel"; id: string } | { kind: "dm"; id: string } | null;
+
+// ── Messages ─────────────────────────────────────────────────────────────────
+
+export type MessageKind = "user" | "system";
+export type MessageStatus = "active" | "deleted";
+
+export interface Message {
+  id: string;
+  senderId: string;
+  kind: MessageKind;
+  /** Only present when status is "active". Empty for removed messages. */
+  bodyText: string;
+  isRemoved: boolean;
+  status: MessageStatus;
+  createdAt: string; // ISO 8601
+  updatedAt: string; // ISO 8601
+}
+
+export interface MessagePage {
+  messages: Message[];
+  /** Opaque cursor; non-empty when an older page is available. */
+  nextCursor: string;
+}
