@@ -16,6 +16,7 @@ import {
   fetchDMMessages,
   fetchDMs,
   fetchSidebarData,
+  messagesPath,
   postChannelMessage,
   postDMMessage,
 } from "./chatApi";
@@ -537,5 +538,33 @@ describe("postDMMessage", () => {
     const msg = await postDMMessage("dm-juliane", "Oi!");
     expect(msg.bodyText).toBe("Oi!");
     expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+// ── messagesPath ──────────────────────────────────────────────────────────────
+
+describe("messagesPath", () => {
+  it("returns channel messages path", () => {
+    expect(messagesPath("channel", "geral")).toMatch(/\/channels\/geral\/messages$/);
+  });
+
+  it("returns DM messages path", () => {
+    expect(messagesPath("dm", "dm-juliane")).toMatch(/\/dm\/dm-juliane\/messages$/);
+  });
+
+  it("percent-encodes channel ID", () => {
+    expect(messagesPath("channel", "equipe infra")).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("percent-encodes DM ID", () => {
+    expect(messagesPath("dm", "dm user/1")).toContain("/dm/dm%20user%2F1/messages");
+  });
+
+  it("channel and dm produce distinct paths for the same ID", () => {
+    const ch = messagesPath("channel", "abc");
+    const dm = messagesPath("dm", "abc");
+    expect(ch).not.toBe(dm);
+    expect(ch).toContain("/channels/");
+    expect(dm).toContain("/dm/");
   });
 });

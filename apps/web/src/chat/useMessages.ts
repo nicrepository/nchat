@@ -4,10 +4,13 @@
  * Security notes:
  * - No tokens are stored or exposed; authentication is handled by authenticatedFetch.
  * - No author_id is sent from the client; the server derives sender identity from the JWT.
- * - AbortController cancels in-flight requests on target change or unmount to prevent
- *   stale responses from rendering into the wrong target.
- * - A per-request "nonce" (requestId) guards against cross-target race conditions:
- *   if the target changes while a request is in flight, the stale response is discarded.
+ * - AbortController cancels in-flight list requests on target change or unmount.
+ * - latestTargetRef tracks the current route target. It is updated via useLayoutEffect
+ *   (no deps, runs after every render) which fires synchronously in the same JS task as
+ *   the render, before any microtasks. This means it is always updated before any pending
+ *   Promise callbacks (e.g. a stale POST) can run. Any async send path that captures a
+ *   sendKey at call time and compares against latestTargetRef.current after its await
+ *   will correctly discard results from a previous target.
  *
  * WebSocket realtime delivery:
  * PREREQUISITE MISSING — ws/handler.go returns 501 Not Implemented.
@@ -16,7 +19,7 @@
  * Until then, this hook is REST-only.
  */
 
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
   fetchChannelMessages,
@@ -46,8 +49,8 @@ type Action =
   | { type: "loaded"; page: MessagePage }
   | { type: "error" }
   | { type: "sending" }
-  | { type: "sent"; message: Message; requestId: string; currentRequestId: string }
-  | { type: "send_error"; error: string; requestId: string; currentRequestId: string };
+  | { type: "sent"; message: Message }
+  | { type: "send_error"; error: string };
 
 const initialState: MessagesState = {
   status: "idle",
@@ -74,8 +77,6 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     case "sending":
       return { ...state, sending: true, sendError: null };
     case "sent":
-      // Guard: discard if target has changed since send was initiated.
-      if (action.requestId !== action.currentRequestId) return state;
       return {
         ...state,
         messages: [...state.messages, action.message],
@@ -83,8 +84,6 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         sendError: null,
       };
     case "send_error":
-      // Guard: discard if target has changed since send was initiated.
-      if (action.requestId !== action.currentRequestId) return state;
       return { ...state, sending: false, sendError: action.error };
   }
 }
@@ -105,20 +104,28 @@ export interface UseMessagesResult {
 export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  // Track the current fetch request so stale responses are discarded.
-  const currentRequestRef = useRef<string>("");
+  // latestTargetRef always holds the current route target. It is updated via
+  // useLayoutEffect (no deps array) which fires synchronously after every render,
+  // in the same JS task, before any microtask callbacks can run. This guarantees
+  // that by the time any pending Promise (e.g. a stale POST) resolves, the ref
+  // already reflects the new target — closing the race window that exists when
+  // using useEffect (which is deferred and can fire after microtasks).
+  const latestTargetRef = useRef(`${kind}:${targetId}`);
+  useLayoutEffect(() => {
+    latestTargetRef.current = `${kind}:${targetId}`;
+  });
+
   // AbortController for the active list request.
   const abortRef = useRef<AbortController | null>(null);
 
   const load = useCallback((id: string, k: "channel" | "dm") => {
-    // Cancel previous in-flight request.
+    // Cancel previous in-flight list request.
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
-    // Mint a new request ID. Only this exact (kind, id) combo will update state.
-    const requestId = `${k}:${id}`;
-    currentRequestRef.current = requestId;
+    // Capture the load target key; compared against latestTargetRef to discard stale results.
+    const loadKey = `${k}:${id}`;
 
     dispatch({ type: "loading" });
 
@@ -129,11 +136,11 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
 
     fetchFn().then(
       (page) => {
-        if (currentRequestRef.current !== requestId) return; // stale — discard
+        if (latestTargetRef.current !== loadKey) return; // stale — discard
         dispatch({ type: "loaded", page });
       },
       (err: unknown) => {
-        if (currentRequestRef.current !== requestId) return;
+        if (latestTargetRef.current !== loadKey) return;
         if (err instanceof Error && err.name === "AbortError") return;
         dispatch({ type: "error" });
       },
@@ -158,7 +165,10 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
     async (body: string): Promise<void> => {
       if (!targetId || !body.trim()) return;
 
-      const requestId = `${kind}:${targetId}`;
+      // Capture the send target key synchronously at call time. After each await,
+      // compare against latestTargetRef.current — which useLayoutEffect keeps current —
+      // to detect whether the user has navigated to a different target.
+      const sendKey = `${kind}:${targetId}`;
       dispatch({ type: "sending" });
 
       try {
@@ -169,21 +179,14 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
 
         const msg = await sendFn();
 
-        // Append the new message only after server confirms; discard if target changed.
-        dispatch({
-          type: "sent",
-          message: msg,
-          requestId,
-          currentRequestId: currentRequestRef.current,
-        });
+        // Discard if target changed while POST was in-flight.
+        if (latestTargetRef.current !== sendKey) return;
+        dispatch({ type: "sent", message: msg });
       } catch (err: unknown) {
+        // Discard stale error — do not update state for a target the user already left.
+        if (latestTargetRef.current !== sendKey) return;
         const message = err instanceof Error ? err.message : "Não foi possível enviar a mensagem.";
-        dispatch({
-          type: "send_error",
-          error: message,
-          requestId,
-          currentRequestId: currentRequestRef.current,
-        });
+        dispatch({ type: "send_error", error: message });
         // Re-throw so callers (e.g. Composer) know the send failed and can preserve draft.
         throw err;
       }
