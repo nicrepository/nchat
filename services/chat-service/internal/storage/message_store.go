@@ -152,6 +152,7 @@ type PGXMessageStore struct {
 func NewPGXMessageStore(pool Pool) *PGXMessageStore {
 	return &PGXMessageStore{pool: pool}
 }
+
 // When alias is non-empty (e.g. "m"), columns are prefixed to avoid ambiguity
 // in JOIN queries.
 func messageColumns(alias string) string {

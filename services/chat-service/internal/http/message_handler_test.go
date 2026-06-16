@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,10 +40,12 @@ type fakeMessageProvider struct {
 
 	lastCreateChannelInput service.CreateChannelMessageInput
 	lastCreateDMInput      service.CreateDMMessageInput
+	lastListChannelInput   service.ListChannelMessagesInput
+	lastListDMInput        service.ListDMMessagesInput
 }
 
 func (f *fakeMessageProvider) ListChannelMessages(_ context.Context, in service.ListChannelMessagesInput) (service.ListChannelMessagesOutput, error) {
-	_ = in
+	f.lastListChannelInput = in
 	return f.channelOut, f.channelOutErr
 }
 
@@ -52,7 +55,7 @@ func (f *fakeMessageProvider) CreateChannelMessage(_ context.Context, in service
 }
 
 func (f *fakeMessageProvider) ListDMMessages(_ context.Context, in service.ListDMMessagesInput) (service.ListDMMessagesOutput, error) {
-	_ = in
+	f.lastListDMInput = in
 	return f.dmOut, f.dmOutErr
 }
 
@@ -67,7 +70,7 @@ const (
 	testWorkspaceID    = "11111111-1111-1111-1111-111111111111"
 	testChannelID      = "22222222-2222-2222-2222-222222222222"
 	testConversationID = "33333333-3333-3333-3333-333333333333"
-	msgTestUserID         = "44444444-4444-4444-4444-444444444444"
+	msgTestUserID      = "44444444-4444-4444-4444-444444444444"
 	testMessageID      = "55555555-5555-5555-5555-555555555555"
 )
 
@@ -81,15 +84,15 @@ func testNow() time.Time {
 
 func testMessage() domain.Message {
 	return domain.Message{
-		ID:        testMessageID,
+		ID:          testMessageID,
 		WorkspaceID: testWorkspaceID,
-		ChannelID: testChannelID,
-		SenderID:  msgTestUserID,
-		Kind:      domain.MessageKindUser,
-		BodyText:  "hello",
-		Status:    domain.MessageStatusActive,
-		CreatedAt: testNow(),
-		UpdatedAt: testNow(),
+		ChannelID:   testChannelID,
+		SenderID:    msgTestUserID,
+		Kind:        domain.MessageKindUser,
+		BodyText:    "hello",
+		Status:      domain.MessageStatusActive,
+		CreatedAt:   testNow(),
+		UpdatedAt:   testNow(),
 	}
 }
 
@@ -431,5 +434,273 @@ func TestMessageHandler_NilDeps_Returns503(t *testing.T) {
 	h.ListChannelMessages(rec, r)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+}
+
+// ── ListDMMessages: missing coverage tests ───────────────────────────────────
+
+func TestMessageHandler_ListDMMessages_UnauthenticatedReturns401(t *testing.T) {
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_ListDMMessages_InvalidConvIDReturns400(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/not-a-uuid/messages", nil)
+	r.SetPathValue("conversationID", "not-a-uuid")
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid conv ID, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_ListDMMessages_InvalidCursorReturns400(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages?before=!!!bad!!!", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid cursor, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_ListDMMessages_WorkspaceNotFoundReturns404(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{err: domain.ErrNotFound}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for workspace not found, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_ListDMMessages_InternalErrorReturns500(t *testing.T) {
+	msgs := &fakeMessageProvider{dmOutErr: errors.New("some internal error")}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for internal error, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_ListDMMessages_EmptyListReturnsEmptyArray(t *testing.T) {
+	msgs := &fakeMessageProvider{dmOut: service.ListDMMessagesOutput{Messages: nil}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := decodeBody(t, rec)
+	msgsArr, ok := body["data"].(map[string]any)["messages"].([]any)
+	if !ok || msgsArr == nil {
+		t.Fatalf("expected non-null empty array, got %v", body["data"].(map[string]any)["messages"])
+	}
+}
+
+func TestMessageHandler_ListDMMessages_NextCursorPresentWhenMorePages(t *testing.T) {
+	cursor := storage.EncodeCursor(storage.MessageCursor{CreatedAt: testNow(), ID: testMessageID})
+	msgs := &fakeMessageProvider{dmOut: service.ListDMMessagesOutput{
+		Messages:   []domain.Message{testMessage()},
+		NextCursor: cursor,
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := decodeBody(t, rec)
+	if nc, _ := body["data"].(map[string]any)["next_cursor"].(string); nc == "" {
+		t.Fatal("expected non-empty next_cursor when more DM pages available")
+	}
+}
+
+// ── CreateDMMessage: missing coverage tests ──────────────────────────────────
+
+func TestMessageHandler_CreateDMMessage_UnauthenticatedReturns401(t *testing.T) {
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
+		strings.NewReader(`{"body_text":"hello"}`))
+	r.SetPathValue("conversationID", testConversationID)
+	h.CreateDMMessage(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_CreateDMMessage_InvalidConvIDReturns400(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/not-a-uuid/messages",
+		strings.NewReader(`{"body_text":"hello"}`))
+	r.SetPathValue("conversationID", "not-a-uuid")
+	h.CreateDMMessage(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid conv ID, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_CreateDMMessage_AuthorIDCannotBeSpoofed(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
+		strings.NewReader(`{"body_text":"hello","author_id":"attacker"}`))
+	r.SetPathValue("conversationID", testConversationID)
+	h.CreateDMMessage(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown field author_id, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_CreateDMMessage_MalformedBodyReturns400(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
+		strings.NewReader("not json"))
+	r.SetPathValue("conversationID", testConversationID)
+	h.CreateDMMessage(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed body, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_CreateDMMessage_WorkspaceNotFoundReturns404(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{err: domain.ErrNotFound}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
+		strings.NewReader(`{"body_text":"hello"}`))
+	r.SetPathValue("conversationID", testConversationID)
+	h.CreateDMMessage(rec, r)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for workspace not found, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_CreateDMMessage_InternalErrorReturns500(t *testing.T) {
+	msgs := &fakeMessageProvider{createDMErr: errors.New("some internal error")}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
+		strings.NewReader(`{"body_text":"hello"}`))
+	r.SetPathValue("conversationID", testConversationID)
+	h.CreateDMMessage(rec, r)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for internal error, got %d", rec.Code)
+	}
+}
+
+// ── mapServiceError: missing cases ───────────────────────────────────────────
+
+func TestMessageHandler_MapServiceError_ForbiddenReturns403(t *testing.T) {
+	msgs := &fakeMessageProvider{channelOutErr: domain.ErrForbidden}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for ErrForbidden, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_MapServiceError_InvalidCursorReturns400(t *testing.T) {
+	msgs := &fakeMessageProvider{channelOutErr: domain.ErrInvalidCursor}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ErrInvalidCursor, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_MapServiceError_UnknownErrorReturns500(t *testing.T) {
+	msgs := &fakeMessageProvider{channelOutErr: errors.New("some internal error")}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for unknown error, got %d", rec.Code)
+	}
+}
+
+// ── parseLimitParam: coverage ─────────────────────────────────────────────────
+
+func TestMessageHandler_ListChannelMessages_LimitParamForwardedToService(t *testing.T) {
+	msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages?limit=25", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if msgs.lastListChannelInput.Limit != 25 {
+		t.Fatalf("expected Limit=25 forwarded to service, got %d", msgs.lastListChannelInput.Limit)
+	}
+}
+
+func TestMessageHandler_ListChannelMessages_NegativeLimitDefaultsToZero(t *testing.T) {
+	msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages?limit=-5", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if msgs.lastListChannelInput.Limit != 0 {
+		t.Fatalf("expected Limit=0 (default) for negative limit, got %d", msgs.lastListChannelInput.Limit)
+	}
+}
+
+func TestMessageHandler_ListChannelMessages_NonNumericLimitDefaultsToZero(t *testing.T) {
+	msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages?limit=abc", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if msgs.lastListChannelInput.Limit != 0 {
+		t.Fatalf("expected Limit=0 for non-numeric limit, got %d", msgs.lastListChannelInput.Limit)
+	}
+}
+
+// ── resolveWorkspaceID: internal error path ──────────────────────────────────
+
+func TestMessageHandler_ListChannelMessages_WorkspaceInternalErrorReturns500(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{err: errors.New("some internal error")}, &fakeMessageProvider{})
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for workspace internal error, got %d", rec.Code)
 	}
 }

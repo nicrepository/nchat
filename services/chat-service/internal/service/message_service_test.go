@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
@@ -36,15 +37,17 @@ func activeDMConversation(workspaceID, convID string) domain.DMConversation {
 // ---- fakeMessageStore ------------------------------------------------------
 
 type fakeMessageStore struct {
-	createdMessage       domain.Message
-	createErr            error
-	channelMessages      []domain.Message
-	listChannelErr       error
-	dmMessages           []domain.Message
-	listDMErr            error
-	messagesByKey        map[string]domain.Message // key: workspaceID+":"+messageID
-	getByIDErr           error
-	validateRefTargetErr error
+	createdMessage        domain.Message
+	createErr             error
+	channelMessages       []domain.Message
+	listChannelErr        error
+	listChannelNextCursor *storage.MessageCursor
+	dmMessages            []domain.Message
+	listDMErr             error
+	listDMNextCursor      *storage.MessageCursor
+	messagesByKey         map[string]domain.Message // key: workspaceID+":"+messageID
+	getByIDErr            error
+	validateRefTargetErr  error
 
 	lastCreateInput  storage.CreateMessageInput
 	createCalls      int
@@ -78,12 +81,12 @@ func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _
 
 func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {
 	f.listChannelCalls++
-	return storage.ListMessagesResult{Messages: f.channelMessages}, f.listChannelErr
+	return storage.ListMessagesResult{Messages: f.channelMessages, NextCursor: f.listChannelNextCursor}, f.listChannelErr
 }
 
 func (f *fakeMessageStore) ListDMMessages(_ context.Context, _ storage.ListDMMessagesInput) (storage.ListMessagesResult, error) {
 	f.listDMCalls++
-	return storage.ListMessagesResult{Messages: f.dmMessages}, f.listDMErr
+	return storage.ListMessagesResult{Messages: f.dmMessages, NextCursor: f.listDMNextCursor}, f.listDMErr
 }
 
 // ---- channel message tests -------------------------------------------------
@@ -614,5 +617,89 @@ func TestMessageService_ListDMMessages_EmptyRequiredFieldsDenied(t *testing.T) {
 		if !errors.Is(err, domain.ErrInvalidInput) {
 			t.Fatalf("expected ErrInvalidInput for input %+v, got %v", tc, err)
 		}
+	}
+}
+
+// ---- ListChannelMessages: cursor and next-cursor paths ---------------------
+
+func TestMessageService_ListChannelMessages_InvalidCursorReturnsErrInvalidCursor(t *testing.T) {
+	msgs := &fakeMessageStore{channelMessages: nil}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+
+	_, err := svc.ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
+		WorkspaceID:  "ws-1",
+		ChannelID:    "ch-1",
+		CallerID:     user1,
+		BeforeCursor: "!!!not-a-valid-cursor!!!",
+	})
+	if !errors.Is(err, domain.ErrInvalidCursor) {
+		t.Fatalf("expected ErrInvalidCursor for invalid cursor, got %v", err)
+	}
+}
+
+func TestMessageService_ListChannelMessages_ValidCursorWithNextCursorEncoded(t *testing.T) {
+	now := time.Now()
+	// Storage returns a NextCursor; service must encode it.
+	nextCursor := &storage.MessageCursor{CreatedAt: now, ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+	msgs := &fakeMessageStore{
+		channelMessages:       []domain.Message{{ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1}},
+		listChannelNextCursor: nextCursor,
+	}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+
+	encoded := storage.EncodeCursor(*nextCursor)
+	// Pass the encoded cursor as BeforeCursor to exercise the decode path.
+	out, err := svc.ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
+		WorkspaceID:  "ws-1",
+		ChannelID:    "ch-1",
+		CallerID:     user1,
+		BeforeCursor: encoded,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages with valid cursor: %v", err)
+	}
+	if out.NextCursor == "" {
+		t.Fatal("expected NextCursor to be set in output when storage returns a cursor")
+	}
+}
+
+// ---- ListDMMessages: cursor and next-cursor paths --------------------------
+
+func TestMessageService_ListDMMessages_InvalidCursorReturnsErrInvalidCursor(t *testing.T) {
+	msgs := &fakeMessageStore{}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+
+	_, err := svc.ListDMMessages(context.Background(), service.ListDMMessagesInput{
+		WorkspaceID:    "ws-1",
+		ConversationID: "dm-1",
+		CallerID:       user1,
+		BeforeCursor:   "!!!invalid!!!",
+	})
+	if !errors.Is(err, domain.ErrInvalidCursor) {
+		t.Fatalf("expected ErrInvalidCursor for invalid DM cursor, got %v", err)
+	}
+}
+
+func TestMessageService_ListDMMessages_ValidCursorWithNextCursorEncoded(t *testing.T) {
+	now := time.Now()
+	nextCursor := &storage.MessageCursor{CreatedAt: now, ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+	msgs := &fakeMessageStore{
+		dmMessages:       []domain.Message{{ID: "dm-1", WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: user1}},
+		listDMNextCursor: nextCursor,
+	}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+
+	encoded := storage.EncodeCursor(*nextCursor)
+	out, err := svc.ListDMMessages(context.Background(), service.ListDMMessagesInput{
+		WorkspaceID:    "ws-1",
+		ConversationID: "dm-1",
+		CallerID:       user1,
+		BeforeCursor:   encoded,
+	})
+	if err != nil {
+		t.Fatalf("ListDMMessages with valid cursor: %v", err)
+	}
+	if out.NextCursor == "" {
+		t.Fatal("expected NextCursor to be set in DM output when storage returns a cursor")
 	}
 }
