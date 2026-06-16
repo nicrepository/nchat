@@ -95,6 +95,8 @@ function renderDMArea(dmId = "dm-juliane") {
 beforeEach(() => {
   setTokens("test-at");
   vi.clearAllMocks();
+  // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
+  window.Element.prototype.scrollIntoView = vi.fn();
 });
 
 afterEach(() => {
@@ -366,7 +368,25 @@ describe("ChatMessageArea — send message", () => {
     await user.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => {
-      // Error banner must appear.
+      expect(screen.getByTestId("chat-send-error")).toBeInTheDocument();
+    });
+
+    // Draft must be preserved so the user can retry or edit.
+    expect(input).toHaveValue("mensagem com erro");
+  });
+
+  it("non-Error rejection shows generic error message", async () => {
+    const user = userEvent.setup();
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    // Reject with a non-Error value (e.g. a plain string) to cover the fallback error message.
+    mockPostChannelMessage.mockRejectedValue("raw string failure");
+    renderChannelArea();
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await user.type(input, "test");
+    await user.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
       expect(screen.getByTestId("chat-send-error")).toBeInTheDocument();
     });
   });
@@ -419,6 +439,94 @@ describe("ChatMessageArea — stale response guard", () => {
 
     // Canal-1 stale message must NOT appear.
     expect(screen.queryByText("Mensagem do canal 1")).not.toBeInTheDocument();
+  });
+
+  it("stale send error from old target does not appear in new target", async () => {
+    const user = userEvent.setup();
+
+    // Canal-1 messages load immediately; canal-2 messages load immediately.
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    let rejectSendA: (err: Error) => void;
+    const sendAPromise = new Promise<never>((_, rej) => (rejectSendA = rej));
+    mockPostChannelMessage.mockReturnValueOnce(sendAPromise);
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    // Wait for canal-1 to be ready, then type + send (POST hangs).
+    const input = await screen.findByTestId("chat-composer-input");
+    await user.type(input, "mensagem A");
+    await user.click(screen.getByTestId("chat-send-btn"));
+
+    // Navigate to canal-2 while POST for canal-1 is still in-flight.
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+
+    // Fail the stale POST for canal-1 after navigation.
+    rejectSendA!(new Error("Erro do canal A"));
+
+    // Allow microtasks to settle.
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-send-error")).not.toBeInTheDocument();
+    });
+  });
+
+  it("successful send from old target does not add message to new target", async () => {
+    const user = userEvent.setup();
+
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    let resolveSendA: (m: ReturnType<typeof makeMessage>) => void;
+    const sendAPromise = new Promise<ReturnType<typeof makeMessage>>((res) => (resolveSendA = res));
+    mockPostChannelMessage.mockReturnValueOnce(sendAPromise);
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await user.type(input, "mensagem A sucesso");
+    await user.click(screen.getByTestId("chat-send-btn"));
+
+    // Navigate to canal-2 while POST for canal-1 is still in-flight.
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+
+    // Successfully resolve the stale POST for canal-1.
+    resolveSendA!(makeMessage({ bodyText: "mensagem A sucesso" }));
+
+    await waitFor(() => {
+      // Canal-2 is ready (empty state or loading done).
+      expect(screen.queryByText("mensagem A sucesso")).not.toBeInTheDocument();
+    });
   });
 });
 

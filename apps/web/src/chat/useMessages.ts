@@ -47,7 +47,7 @@ type Action =
   | { type: "error" }
   | { type: "sending" }
   | { type: "sent"; message: Message; requestId: string; currentRequestId: string }
-  | { type: "send_error"; error: string };
+  | { type: "send_error"; error: string; requestId: string; currentRequestId: string };
 
 const initialState: MessagesState = {
   status: "idle",
@@ -83,6 +83,8 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         sendError: null,
       };
     case "send_error":
+      // Guard: discard if target has changed since send was initiated.
+      if (action.requestId !== action.currentRequestId) return state;
       return { ...state, sending: false, sendError: action.error };
   }
 }
@@ -176,7 +178,14 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Não foi possível enviar a mensagem.";
-        dispatch({ type: "send_error", error: message });
+        dispatch({
+          type: "send_error",
+          error: message,
+          requestId,
+          currentRequestId: currentRequestRef.current,
+        });
+        // Re-throw so callers (e.g. Composer) know the send failed and can preserve draft.
+        throw err;
       }
     },
     [kind, targetId],

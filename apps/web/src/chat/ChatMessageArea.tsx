@@ -340,10 +340,12 @@ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
   async function handleSend() {
     if (!canSend) return;
     const body = draft.trim();
-    setDraft("");
     setSending(true);
     try {
       await onSend(body);
+      setDraft(""); // clear only after confirmed success
+    } catch {
+      // onSend threw (send failed) — draft preserved for retry
     } finally {
       setSending(false);
     }
