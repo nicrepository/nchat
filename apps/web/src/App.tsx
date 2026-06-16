@@ -8,7 +8,8 @@ import LoginPage from "./auth/LoginPage";
 import OIDCCallbackPage from "./auth/OIDCCallbackPage";
 import RequireAuth from "./auth/RequireAuth";
 import ResetPasswordPage from "./auth/ResetPasswordPage";
-import HomePage from "./home/HomePage";
+import ChatPlaceholder from "./chat/ChatPlaceholder";
+import ChatShell from "./chat/ChatShell";
 
 export default function App() {
   return (
@@ -19,14 +20,22 @@ export default function App() {
         <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/accept-invite" element={<AcceptInvitePage />} />
         <Route path="/oidc-callback" element={<OIDCCallbackPage />} />
+
+        {/* ── Chat shell (authenticated) ─────────────────────────────── */}
         <Route
-          path="/"
+          path="/chat"
           element={
             <RequireAuth>
-              <HomePage />
+              <ChatShell />
             </RequireAuth>
           }
-        />
+        >
+          <Route index element={<ChatPlaceholder />} />
+          <Route path="channel/:id" element={<ChatPlaceholder type="channel" />} />
+          <Route path="dm/:id" element={<ChatPlaceholder type="dm" />} />
+        </Route>
+
+        {/* ── Admin ─────────────────────────────────────────────────── */}
         <Route
           path="/admin/users"
           element={
@@ -35,7 +44,10 @@ export default function App() {
             </RequireAuth>
           }
         />
-        <Route path="*" element={<Navigate to="/" replace />} />
+
+        {/* ── Redirects ─────────────────────────────────────────────── */}
+        <Route path="/" element={<Navigate to="/chat" replace />} />
+        <Route path="*" element={<Navigate to="/chat" replace />} />
       </Routes>
     </BrowserRouter>
   );

@@ -406,3 +406,13 @@ func TestValkeyBus_Close_IsIdempotent(t *testing.T) {
 		t.Fatal("Close blocked or panicked on repeated calls — not idempotent")
 	}
 }
+
+func TestMin_ReturnsSmaller(t *testing.T) {
+	if got := min(2*time.Second, 5*time.Second); got != 2*time.Second {
+		t.Errorf("min(2s, 5s) = %v; want 2s", got)
+	}
+	// Cover the return-b branch (a >= b).
+	if got := min(8*time.Second, 5*time.Second); got != 5*time.Second {
+		t.Errorf("min(8s, 5s) = %v; want 5s", got)
+	}
+}

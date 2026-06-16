@@ -568,6 +568,10 @@ func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ stri
 	return f.visibleConversation, nil
 }
 
+func (f *fakeDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Context, _, _ string) ([]domain.DMConversationWithParticipantIDs, error) {
+	return nil, nil
+}
+
 func assertSameStringSet(t *testing.T, got, want []string) {
 	t.Helper()
 	gotCopy := append([]string(nil), got...)

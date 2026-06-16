@@ -204,3 +204,88 @@ func TestPGXDMStore_GetVisibleConversationByID_NotFound(t *testing.T) {
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
+
+// ── ListVisibleConversationsWithParticipantIDs tests ──────────────────────────
+
+func dmWithParticipantCols() []string {
+	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids"}
+}
+
+func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	// SQL must join workspace, workspace_members, and dm_members for current user.
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}))
+
+	store := storage.NewPGXDMStore(mock)
+	convs, err := store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(convs) != 1 {
+		t.Fatalf("expected 1 conversation, got %d", len(convs))
+	}
+	if convs[0].ID != "dm-1" {
+		t.Fatalf("expected dm-1, got %q", convs[0].ID)
+	}
+	if len(convs[0].ParticipantIDs) != 2 {
+		t.Fatalf("expected 2 participant IDs, got %d", len(convs[0].ParticipantIDs))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_EmptyForNonMember(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	// Non-member: the dm_members join filters out all rows — return empty result.
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
+		WithArgs("ws-1", "user-other").
+		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()))
+
+	store := storage.NewPGXDMStore(mock)
+	convs, err := store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-other")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(convs) != 0 {
+		t.Fatalf("expected no conversations for non-member, got %d", len(convs))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_DBError_Propagates(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc`).
+		WithArgs("ws-1", "user-1").
+		WillReturnError(errors.New("connection refused"))
+
+	store := storage.NewPGXDMStore(mock)
+	_, err = store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}

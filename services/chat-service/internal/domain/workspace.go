@@ -152,6 +152,13 @@ type DMMember struct {
 	LeftAt         time.Time
 }
 
+// DMConversationWithParticipantIDs extends DMConversation with the list of
+// active member user IDs, used by the sidebar query to avoid N+1 fetches.
+type DMConversationWithParticipantIDs struct {
+	DMConversation
+	ParticipantIDs []string
+}
+
 // CanReadChannel reports whether a user may read ch.
 // wm is the workspace membership (nil = non-member).
 // cm is the channel membership (nil = not a channel member).

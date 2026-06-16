@@ -10,6 +10,9 @@ const (
 	serviceName = "chat-service"
 	defaultPort = 8082
 
+	defaultJWTIssuer   = "nchat-auth"
+	defaultJWTAudience = "nchat-api"
+
 	// wsInstanceIDMaxLen matches sourceInstanceIDMaxLen in the ws package.
 	// Kept in sync manually; both must allow the same set of valid identifiers.
 	wsInstanceIDMaxLen = 64
@@ -27,6 +30,16 @@ type Config struct {
 	ReadHeaderTimeoutSeconds int
 	DatabaseURL              string
 	DBConnectTimeoutSeconds  int
+
+	// AuthJWTHMACSecret is the shared HMAC secret used to validate access tokens
+	// issued by auth-service. Must match AUTH_JWT_HMAC_SECRET in auth-service.
+	// When empty or too short, the sidebar and all authenticated endpoints
+	// return 503.
+	AuthJWTHMACSecret string
+	// AuthJWTIssuer is the expected JWT issuer claim. Must match auth-service.
+	AuthJWTIssuer string
+	// AuthJWTAudience is the expected JWT audience claim. Must match auth-service.
+	AuthJWTAudience string
 
 	// ValkeyURL is the connection string for the Valkey instance.
 	// Example: "valkey://localhost:6379". Empty disables Valkey features.
@@ -50,6 +63,9 @@ func Load() Config {
 		ReadHeaderTimeoutSeconds: platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
 		DatabaseURL:              platformconfig.GetString("DATABASE_URL", ""),
 		DBConnectTimeoutSeconds:  platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
+		AuthJWTHMACSecret:        platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthJWTIssuer:            platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
+		AuthJWTAudience:          platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
 		ValkeyURL:                platformconfig.GetString("VALKEY_URL", ""),
 		ValkeyWSBroadcastEnabled: platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
 		WSInstanceID:             sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),

@@ -6,6 +6,7 @@ var (
 	ErrNotFound                  = errors.New("not found")
 	ErrForbidden                 = errors.New("forbidden")
 	ErrInvalidInput              = errors.New("invalid input")
+	ErrInvalidToken              = errors.New("invalid token")
 	ErrDuplicateSlug             = errors.New("slug already in use")
 	ErrAlreadyMember             = errors.New("already a member")
 	ErrMemberInactive            = errors.New("workspace member is inactive")

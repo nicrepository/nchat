@@ -37,6 +37,9 @@ func (f *fakeDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ str
 func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	return f.conversation, f.err
 }
+func (f *fakeDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Context, _, _ string) ([]domain.DMConversationWithParticipantIDs, error) {
+	return nil, nil
+}
 
 // ── serviceAuthorizer tests ───────────────────────────────────────────────────
 

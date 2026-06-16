@@ -11,7 +11,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler) http.Handler {
 	_ = logger
 
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
@@ -22,6 +22,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger) http.Handler {
 	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
+
+	// Authenticated sidebar endpoint: JWT validity + active session + active workspace member.
+	mux.Handle(RouteSidebar, httputil.MethodNotAllowed(http.MethodGet,
+		BearerAuth(validator)(RequireActiveSession(sessionValidator)(sidebar)),
+	))
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	})
