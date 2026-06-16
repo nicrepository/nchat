@@ -5,7 +5,7 @@
  * The component itself is the unit under test.
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -525,8 +525,110 @@ describe("ChatMessageArea — stale response guard", () => {
 
     await waitFor(() => {
       // Canal-2 is ready (empty state or loading done).
-      expect(screen.queryByText("mensagem A sucesso")).not.toBeInTheDocument();
+      // Check only message bubbles — not the composer textarea which may still hold the draft.
+      const bubbles = screen.queryAllByTestId("chat-msg-bubble");
+      expect(bubbles.some((b) => b.textContent?.includes("mensagem A sucesso"))).toBe(false);
     });
+  });
+
+  it("stale send success does not clear draft still in composer after target change", async () => {
+    const user = userEvent.setup();
+
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    let resolveSendA: (m: ReturnType<typeof makeMessage>) => void;
+    const sendAPromise = new Promise<ReturnType<typeof makeMessage>>((res) => (resolveSendA = res));
+    mockPostChannelMessage.mockReturnValueOnce(sendAPromise);
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    // Wait for canal-1 to be ready, type message, and send (POST hangs).
+    const input = await screen.findByTestId("chat-composer-input");
+    await user.type(input, "rascunho canal 1");
+    await user.click(screen.getByTestId("chat-send-btn"));
+
+    // Navigate to canal-2 while POST for canal-1 is still in-flight.
+    // Composer still carries "rascunho canal 1" (draft not cleared yet) and is disabled.
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+
+    // Resolve the stale POST for canal-1 — should return { status: "stale" }.
+    // With the bug: handleSend would call setDraft("") → draft erased.
+    await act(async () => {
+      resolveSendA!(makeMessage({ bodyText: "rascunho canal 1" }));
+    });
+
+    // Draft must still be present — stale success must not clear it.
+    expect(screen.getByTestId("chat-composer-input")).toHaveValue("rascunho canal 1");
+    // Canal-1 message must not appear in canal-2's message bubble list.
+    const bubbles = screen.queryAllByTestId("chat-msg-bubble");
+    expect(bubbles.some((b) => b.textContent?.includes("rascunho canal 1"))).toBe(false);
+    // No error banner in canal-2.
+    expect(screen.queryByTestId("chat-send-error")).not.toBeInTheDocument();
+    // Send button usable (not stuck in sending state).
+    expect(screen.getByTestId("chat-send-btn")).not.toBeDisabled();
+  });
+
+  it("stale send failure does not show error or clear draft in new target", async () => {
+    const user = userEvent.setup();
+
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    let rejectSendA: (err: Error) => void;
+    const sendAPromise = new Promise<never>((_, rej) => (rejectSendA = rej));
+    mockPostChannelMessage.mockReturnValueOnce(sendAPromise);
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await user.type(input, "rascunho canal 1");
+    await user.click(screen.getByTestId("chat-send-btn"));
+
+    // Navigate to canal-2 while POST is still in-flight.
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+
+    // Reject the stale POST for canal-1 — should return { status: "stale" }, no throw.
+    await act(async () => {
+      rejectSendA!(new Error("Erro do canal A"));
+    });
+
+    // Draft must still be present — stale failure must not clear it.
+    expect(screen.getByTestId("chat-composer-input")).toHaveValue("rascunho canal 1");
+    // No error banner in canal-2.
+    expect(screen.queryByTestId("chat-send-error")).not.toBeInTheDocument();
+    // Send button usable (not stuck in sending state).
+    expect(screen.getByTestId("chat-send-btn")).not.toBeDisabled();
   });
 });
 

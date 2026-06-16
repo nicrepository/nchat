@@ -21,6 +21,7 @@ import { useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
 import type { Message } from "./chatTypes";
+import type { SendResult } from "./useMessages";
 import { useMessages } from "./useMessages";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -328,7 +329,7 @@ function MessageList({ messages }: MessageListProps) {
 interface ComposerProps {
   placeholder: string;
   disabled?: boolean;
-  onSend: (body: string) => Promise<void>;
+  onSend: (body: string) => Promise<SendResult>;
 }
 
 function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
@@ -342,10 +343,13 @@ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
     const body = draft.trim();
     setSending(true);
     try {
-      await onSend(body);
-      setDraft(""); // clear only after confirmed success
+      const result = await onSend(body);
+      if (result.status === "sent") {
+        setDraft(""); // clear only on confirmed success for the current target
+      }
+      // result.status === "stale": target changed — draft preserved, no error shown
     } catch {
-      // onSend threw (send failed) — draft preserved for retry
+      // current-target failure — draft preserved for retry, error shown by parent
     } finally {
       setSending(false);
     }
@@ -407,9 +411,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const { state, sendMessage, retry } = useMessages({ kind, targetId });
 
   const handleSend = useCallback(
-    async (body: string) => {
-      await sendMessage(body);
-    },
+    (body: string): Promise<SendResult> => sendMessage(body),
     [sendMessage],
   );
 
