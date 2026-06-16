@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,7 +181,9 @@ func TestSidebarHandler_PostMethod_Returns405(t *testing.T) {
 	}
 }
 
-func TestSidebarHandler_DM_DirectName_IsOtherUserID(t *testing.T) {
+func TestSidebarHandler_DM_DirectName_UsesNeutralFallback(t *testing.T) {
+	// Direct DMs must not expose the other participant's user ID as display name.
+	// A neutral placeholder is used until a profile-safe display source exists.
 	v := makeTestValidator(t)
 	svc := &stubSidebarProvider{data: service.SidebarData{
 		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
@@ -206,8 +209,12 @@ func TestSidebarHandler_DM_DirectName_IsOtherUserID(t *testing.T) {
 	if len(envelope.Data.DMs) == 0 {
 		t.Fatal("expected at least 1 DM")
 	}
-	if envelope.Data.DMs[0].Name != "other-user-id" {
-		t.Fatalf("expected name 'other-user-id', got %q", envelope.Data.DMs[0].Name)
+	// Must NOT expose the other participant's ID; neutral fallback expected.
+	if envelope.Data.DMs[0].Name == "other-user-id" {
+		t.Fatal("direct DM name must not leak participant user ID")
+	}
+	if envelope.Data.DMs[0].Name == "" {
+		t.Fatal("direct DM name must not be empty")
 	}
 }
 
@@ -254,7 +261,7 @@ func TestSidebarHandler_DM_GroupName_UsesTitle(t *testing.T) {
 // internal error details are not exposed in the response body.
 func TestSidebarHandler_InternalError_Returns500WithoutDetails(t *testing.T) {
 	v := makeTestValidator(t)
-	secretMsg := "db connection failed: secret_password=hunter2"
+	secretMsg := "db connection failed: err_code=ERR_CONN_REFUSED"
 	svc := &stubSidebarProvider{err: errors.New(secretMsg)}
 
 	router := sidebarRouter(v, svc)
@@ -300,6 +307,43 @@ func TestSidebarHandler_PrivateChannel_HasCorrectType(t *testing.T) {
 	}
 	if envelope.Data.Channels[0].Type != "private" {
 		t.Fatalf("expected type 'private', got %q", envelope.Data.Channels[0].Type)
+	}
+}
+
+// TestSidebarHandler_ResponseContract_NoSensitiveFields asserts that the
+// sidebar response never contains participant_ids or title in DM objects.
+func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &stubSidebarProvider{data: service.SidebarData{
+		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+		DMs: []domain.DMConversationWithParticipantIDs{
+			{
+				DMConversation: domain.DMConversation{
+					ID:    "dm-grp",
+					Type:  domain.DMConversationTypeGroup,
+					Title: "Equipe Infra",
+				},
+				ParticipantIDs: []string{testUserID, "u2", "u3"},
+			},
+			{
+				DMConversation: domain.DMConversation{ID: "dm-direct", Type: domain.DMConversationTypeDirect},
+				ParticipantIDs: []string{testUserID, "other-user"},
+			},
+		},
+	}}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "participant_ids") {
+		t.Fatalf("response must not contain participant_ids; body: %s", body)
+	}
+	if strings.Contains(body, `"title"`) {
+		t.Fatalf("response must not expose title field; body: %s", body)
 	}
 }
 

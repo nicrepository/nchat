@@ -86,6 +86,19 @@ func (v *TokenValidator) validate(raw string) (string, string, error) {
 	if !token.Valid || claims.Subject == "" {
 		return "", "", fmt.Errorf("invalid token claims")
 	}
+	// Enforce all claims required by the auth-service access-token contract.
+	if claims.SessionID == "" {
+		return "", "", fmt.Errorf("missing sid claim")
+	}
+	if claims.ID == "" {
+		return "", "", fmt.Errorf("missing jti claim")
+	}
+	if claims.IssuedAt == nil {
+		return "", "", fmt.Errorf("missing iat claim")
+	}
+	if claims.NotBefore == nil {
+		return "", "", fmt.Errorf("missing nbf claim")
+	}
 	return claims.Subject, claims.SessionID, nil
 }
 

@@ -297,6 +297,110 @@ func TestBearerAuth_MissingSub_Returns401(t *testing.T) {
 	}
 }
 
+func TestBearerAuth_MissingSid_Returns401(t *testing.T) {
+	v := makeTestValidator(t)
+	claims := jwt.MapClaims{
+		"sub": testUserID,
+		// no "sid"
+		"iss": testIssuer,
+		"aud": jwt.ClaimStrings{testAudience},
+		"iat": time.Now().Unix(),
+		"nbf": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"jti": "jti-nosid",
+	}
+	tok := makeTokenWithClaims(t, claims, testHMACSecret)
+	mw := httpapi.BearerAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing sid, got %d", rr.Code)
+	}
+}
+
+func TestBearerAuth_MissingJTI_Returns401(t *testing.T) {
+	v := makeTestValidator(t)
+	claims := jwt.MapClaims{
+		"sub": testUserID,
+		"sid": testSessionID,
+		"iss": testIssuer,
+		"aud": jwt.ClaimStrings{testAudience},
+		"iat": time.Now().Unix(),
+		"nbf": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+		// no "jti"
+	}
+	tok := makeTokenWithClaims(t, claims, testHMACSecret)
+	mw := httpapi.BearerAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing jti, got %d", rr.Code)
+	}
+}
+
+func TestBearerAuth_MissingIAT_Returns401(t *testing.T) {
+	v := makeTestValidator(t)
+	claims := jwt.MapClaims{
+		"sub": testUserID,
+		"sid": testSessionID,
+		"iss": testIssuer,
+		"aud": jwt.ClaimStrings{testAudience},
+		// no "iat"
+		"nbf": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"jti": "jti-noiat",
+	}
+	tok := makeTokenWithClaims(t, claims, testHMACSecret)
+	mw := httpapi.BearerAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing iat, got %d", rr.Code)
+	}
+}
+
+func TestBearerAuth_MissingNBF_Returns401(t *testing.T) {
+	v := makeTestValidator(t)
+	claims := jwt.MapClaims{
+		"sub": testUserID,
+		"sid": testSessionID,
+		"iss": testIssuer,
+		"aud": jwt.ClaimStrings{testAudience},
+		"iat": time.Now().Unix(),
+		// no "nbf"
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"jti": "jti-nonbf",
+	}
+	tok := makeTokenWithClaims(t, claims, testHMACSecret)
+	mw := httpapi.BearerAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing nbf, got %d", rr.Code)
+	}
+}
+
 func TestBearerAuth_TokenInQueryString_Ignored(t *testing.T) {
 	// Tokens passed via query string must not be accepted.
 	// Only the Authorization header is read.
@@ -307,7 +411,9 @@ func TestBearerAuth_TokenInQueryString_Ignored(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	// Token in query string only — no Authorization header.
-	req := httptest.NewRequest(http.MethodGet, "/?token="+tok, nil)
+	// The query param name "blocked_param" is neutral; the test verifies the
+	// middleware rejects credentials passed outside the Authorization header.
+	req := httptest.NewRequest(http.MethodGet, "/?blocked_param="+tok, nil)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useReducer } from "react";
 
-import { fetchChannels, fetchDMs } from "./chatApi";
+import { fetchSidebarData } from "./chatApi";
 import type { Channel, DMConversation } from "./chatTypes";
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -35,8 +35,8 @@ export function useChatSidebar() {
     let cancelled = false;
     dispatch({ type: "reload" });
 
-    Promise.all([fetchChannels(), fetchDMs()])
-      .then(([channels, dms]) => {
+    fetchSidebarData()
+      .then(({ channels, dms }) => {
         if (!cancelled) dispatch({ type: "loaded", channels, dms });
       })
       .catch((err: unknown) => {

@@ -32,12 +32,13 @@ type sidebarChannelJSON struct {
 }
 
 // sidebarDMJSON is the JSON shape for a DM conversation in the sidebar response.
-// participant_ids are intentionally omitted to avoid leaking member identity metadata.
+// participant_ids and title are intentionally omitted: participant_ids would
+// leak member identity metadata, and title is an internal field not consumed
+// by the sidebar UI (the computed display name is in Name).
 type sidebarDMJSON struct {
-	ID    string `json:"id"`
-	Type  string `json:"type"` // "direct" | "group"
-	Title string `json:"title,omitempty"`
-	Name  string `json:"name"` // computed display name
+	ID   string `json:"id"`
+	Type string `json:"type"` // "direct" | "group"
+	Name string `json:"name"` // computed display name
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -123,10 +124,9 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs, currentUserID string)
 	for _, dm := range dms {
 		name := computeDMName(dm.Type, dm.Title, dm.ParticipantIDs, currentUserID)
 		out = append(out, sidebarDMJSON{
-			ID:    dm.ID,
-			Type:  string(dm.Type),
-			Title: dm.Title,
-			Name:  name,
+			ID:   dm.ID,
+			Type: string(dm.Type),
+			Name: name,
 		})
 	}
 	return out
@@ -134,7 +134,9 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs, currentUserID string)
 
 // computeDMName derives a sidebar display name for a DM conversation.
 // Group DMs use their title (or "Grupo DM" if untitled).
-// Direct DMs use the other participant's user ID as a fallback identifier.
+// Direct DMs use a neutral placeholder pending a profile-safe display source.
+// Participant IDs are used internally for group fallback counting but are not
+// returned in the JSON response.
 func computeDMName(dmType domain.DMConversationType, title string, participantIDs []string, currentUserID string) string {
 	if dmType == domain.DMConversationTypeGroup {
 		if title != "" {
@@ -142,11 +144,9 @@ func computeDMName(dmType domain.DMConversationType, title string, participantID
 		}
 		return "Grupo DM"
 	}
-	// Direct DM: return the other participant's ID.
-	for _, id := range participantIDs {
-		if id != currentUserID {
-			return id
-		}
-	}
-	return "DM"
+	// Direct DM: neutral fallback to avoid leaking participant user IDs.
+	// Real display name will come from a profile service in a future iteration.
+	_ = currentUserID
+	_ = participantIDs
+	return "Mensagem Direta"
 }

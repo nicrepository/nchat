@@ -10,7 +10,7 @@ vi.mock("../lib/authClient", () => ({
   authenticatedFetch: (...args: unknown[]) => mockAuthFetch(...args),
 }));
 
-import { fetchChannels, fetchDMs } from "./chatApi";
+import { fetchChannels, fetchDMs, fetchSidebarData } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -178,5 +178,57 @@ describe("fetchDMs", () => {
     // B gets B's own data, not A's.
     expect(resultB[0].id).toBe("dm-b");
     expect(resultB[0].name).toBe("User B DM");
+  });
+});
+
+// ── fetchSidebarData ──────────────────────────────────────────────────────────
+
+describe("fetchSidebarData", () => {
+  it("returns both channels and DMs in one request", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          { id: "ch-1", slug: "geral", display_name: "geral", type: "public", is_general: true },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Juliane" }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels).toHaveLength(1);
+    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public" });
+    expect(dms).toHaveLength(1);
+    expect(dms[0]).toEqual({ id: "dm-1", type: "1:1", name: "Juliane", participants: [] });
+    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps group DM type correctly", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({ dms: [{ id: "dm-g", type: "group", name: "Equipe" }] }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms[0].type).toBe("group");
+  });
+
+  it("returns empty arrays when sidebar lists are empty", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarResponse());
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels).toEqual([]);
+    expect(dms).toEqual([]);
+  });
+
+  it("falls back to slug when display_name is empty", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [{ id: "ch-1", slug: "geral", display_name: "", type: "public" }],
+      }),
+    );
+    const { channels } = await fetchSidebarData();
+    expect(channels[0].name).toBe("geral");
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("network error"));
+    await expect(fetchSidebarData()).rejects.toThrow("network error");
   });
 });

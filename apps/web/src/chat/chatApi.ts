@@ -70,3 +70,27 @@ export async function fetchDMs(): Promise<DMConversation[]> {
     participants: [],
   }));
 }
+
+/**
+ * Fetches the full sidebar in a single request and returns both channels and DMs.
+ * Prefer this over calling fetchChannels() + fetchDMs() separately to avoid
+ * making two HTTP requests per load.
+ */
+export async function fetchSidebarData(): Promise<{
+  channels: Channel[];
+  dms: DMConversation[];
+}> {
+  const sidebar = await fetchSidebar();
+  const channels = (sidebar.channels ?? []).map((ch) => ({
+    id: ch.id,
+    name: ch.display_name || ch.slug,
+    type: ch.type,
+  }));
+  const dms = (sidebar.dm_conversations ?? []).map((dm) => ({
+    id: dm.id,
+    type: dm.type === "group" ? ("group" as const) : ("1:1" as const),
+    name: dm.name,
+    participants: [],
+  }));
+  return { channels, dms };
+}
