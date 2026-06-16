@@ -38,9 +38,11 @@ type CreateDMMessageInput struct {
 
 // ListChannelMessagesInput identifies the channel and caller for a message list.
 type ListChannelMessagesInput struct {
-	WorkspaceID string
-	ChannelID   string
-	CallerID    string
+	WorkspaceID  string
+	ChannelID    string
+	CallerID     string
+	BeforeCursor string // opaque encoded cursor; empty = most recent page
+	Limit        int    // 0 = default (50); capped at 100
 }
 
 // ListDMMessagesInput identifies the DM conversation and caller for a message list.
@@ -48,6 +50,22 @@ type ListDMMessagesInput struct {
 	WorkspaceID    string
 	ConversationID string
 	CallerID       string
+	BeforeCursor   string // opaque encoded cursor; empty = most recent page
+	Limit          int    // 0 = default (50); capped at 100
+}
+
+// ListChannelMessagesOutput is the result of a paginated channel message list.
+// Messages are sorted oldest-first. NextCursor is non-empty when an older page exists.
+type ListChannelMessagesOutput struct {
+	Messages   []domain.Message
+	NextCursor string
+}
+
+// ListDMMessagesOutput is the result of a paginated DM message list.
+// Messages are sorted oldest-first. NextCursor is non-empty when an older page exists.
+type ListDMMessagesOutput struct {
+	Messages   []domain.Message
+	NextCursor string
 }
 
 // MessageService handles message creation and listing for channels and DM conversations.
@@ -171,42 +189,78 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 
 // ListChannelMessages returns messages for a channel visible to the caller.
 // Visibility is enforced in SQL; an empty slice is returned for inaccessible channels.
-func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) ([]domain.Message, error) {
+// BeforeCursor and Limit in the input control pagination. Returns ErrInvalidCursor
+// for a non-empty cursor that cannot be decoded.
+func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) (ListChannelMessagesOutput, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
 	channelID := strings.TrimSpace(input.ChannelID)
 	callerID := strings.TrimSpace(input.CallerID)
 	if workspaceID == "" || channelID == "" || callerID == "" {
-		return nil, fmt.Errorf("%w: workspace_id, channel_id, and caller_id are required", domain.ErrInvalidInput)
+		return ListChannelMessagesOutput{}, fmt.Errorf("%w: workspace_id, channel_id, and caller_id are required", domain.ErrInvalidInput)
 	}
-	msgs, err := s.messages.ListChannelMessages(ctx, storage.ListChannelMessagesInput{
+
+	storageInput := storage.ListChannelMessagesInput{
 		WorkspaceID: workspaceID,
 		ChannelID:   channelID,
 		UserID:      callerID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list channel messages: %w", err)
+		Limit:       input.Limit,
 	}
-	return msgs, nil
+	if input.BeforeCursor != "" {
+		c, err := storage.DecodeCursor(input.BeforeCursor)
+		if err != nil {
+			return ListChannelMessagesOutput{}, domain.ErrInvalidCursor
+		}
+		storageInput.BeforeCursor = &c
+	}
+
+	result, err := s.messages.ListChannelMessages(ctx, storageInput)
+	if err != nil {
+		return ListChannelMessagesOutput{}, fmt.Errorf("list channel messages: %w", err)
+	}
+
+	var nextCursor string
+	if result.NextCursor != nil {
+		nextCursor = storage.EncodeCursor(*result.NextCursor)
+	}
+	return ListChannelMessagesOutput{Messages: result.Messages, NextCursor: nextCursor}, nil
 }
 
 // ListDMMessages returns messages for a DM conversation visible to the caller.
 // Visibility is enforced in SQL; an empty slice is returned for inaccessible conversations.
-func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessagesInput) ([]domain.Message, error) {
+// BeforeCursor and Limit in the input control pagination. Returns ErrInvalidCursor
+// for a non-empty cursor that cannot be decoded.
+func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessagesInput) (ListDMMessagesOutput, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
 	conversationID := strings.TrimSpace(input.ConversationID)
 	callerID := strings.TrimSpace(input.CallerID)
 	if workspaceID == "" || conversationID == "" || callerID == "" {
-		return nil, fmt.Errorf("%w: workspace_id, conversation_id, and caller_id are required", domain.ErrInvalidInput)
+		return ListDMMessagesOutput{}, fmt.Errorf("%w: workspace_id, conversation_id, and caller_id are required", domain.ErrInvalidInput)
 	}
-	msgs, err := s.messages.ListDMMessages(ctx, storage.ListDMMessagesInput{
+
+	storageInput := storage.ListDMMessagesInput{
 		WorkspaceID:    workspaceID,
 		ConversationID: conversationID,
 		UserID:         callerID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list dm messages: %w", err)
+		Limit:          input.Limit,
 	}
-	return msgs, nil
+	if input.BeforeCursor != "" {
+		c, err := storage.DecodeCursor(input.BeforeCursor)
+		if err != nil {
+			return ListDMMessagesOutput{}, domain.ErrInvalidCursor
+		}
+		storageInput.BeforeCursor = &c
+	}
+
+	result, err := s.messages.ListDMMessages(ctx, storageInput)
+	if err != nil {
+		return ListDMMessagesOutput{}, fmt.Errorf("list dm messages: %w", err)
+	}
+
+	var nextCursor string
+	if result.NextCursor != nil {
+		nextCursor = storage.EncodeCursor(*result.NextCursor)
+	}
+	return ListDMMessagesOutput{Messages: result.Messages, NextCursor: nextCursor}, nil
 }
 
 // validateRefMessage validates an optional reference message ID (parent, forwarded_from,

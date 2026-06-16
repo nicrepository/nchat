@@ -328,21 +328,22 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_NotFoundReturnsErrNotFound(t 
 func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
+	// Default limit is 50; query uses limit+1 = 51 to detect next page.
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
+		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()).
 			AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...).
 			AddRow(messageRow("msg-2", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages: %v", err)
 	}
-	if len(messages) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(messages))
+	if len(result.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }
@@ -350,18 +351,18 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
+		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages empty: %v", err)
 	}
-	if len(messages) != 0 {
-		t.Fatalf("expected 0 messages, got %d", len(messages))
+	if len(result.Messages) != 0 {
+		t.Fatalf("expected 0 messages, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }
@@ -381,18 +382,18 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		now, now,
 	}
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "ch-1", "user-1").
+		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()).AddRow(row...))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListChannelMessages with editedAt: %v", err)
 	}
-	if len(messages) != 1 || messages[0].EditedAt.IsZero() || messages[0].DeletedAt.IsZero() {
-		t.Fatalf("expected 1 message with EditedAt/DeletedAt set, got %+v", messages)
+	if len(result.Messages) != 1 || result.Messages[0].EditedAt.IsZero() || result.Messages[0].DeletedAt.IsZero() {
+		t.Fatalf("expected 1 message with EditedAt/DeletedAt set, got %+v", result.Messages)
 	}
 	checkExpectations(t, mock)
 }
@@ -403,19 +404,19 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "dm-1", "user-1").
+		WithArgs("ws-1", "dm-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()).
 			AddRow(messageRow("msg-3", "ws-1", "", "dm-1", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
 		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages: %v", err)
 	}
-	if len(messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(messages))
+	if len(result.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }
@@ -423,18 +424,233 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 func TestPGXMessageStore_ListDMMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("ws-1", "dm-1", "user-1").
+		WithArgs("ws-1", "dm-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(messageCols()))
 
 	store := storage.NewPGXMessageStore(mock)
-	messages, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
 		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages empty: %v", err)
 	}
-	if len(messages) != 0 {
-		t.Fatalf("expected 0 messages, got %d", len(messages))
+	if len(result.Messages) != 0 {
+		t.Fatalf("expected 0 messages, got %d", len(result.Messages))
+	}
+	checkExpectations(t, mock)
+}
+
+// ---- EncodeCursor / DecodeCursor -------------------------------------------
+
+func TestEncodeCursor_DecodeCursor_Roundtrip(t *testing.T) {
+	now := time.Date(2025, 6, 1, 12, 0, 0, 123456789, time.UTC)
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	c := storage.MessageCursor{CreatedAt: now, ID: id}
+
+	encoded := storage.EncodeCursor(c)
+	if encoded == "" {
+		t.Fatal("EncodeCursor returned empty string")
+	}
+
+	decoded, err := storage.DecodeCursor(encoded)
+	if err != nil {
+		t.Fatalf("DecodeCursor roundtrip error: %v", err)
+	}
+	if !decoded.CreatedAt.Equal(now) {
+		t.Fatalf("CreatedAt mismatch: want %v, got %v", now, decoded.CreatedAt)
+	}
+	if decoded.ID != id {
+		t.Fatalf("ID mismatch: want %q, got %q", id, decoded.ID)
+	}
+}
+
+func TestDecodeCursor_InvalidInputs(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"not base64", "!!!invalid!!!"},
+		{"missing pipe separator", "aGVsbG8="},
+		{"bad timestamp", "YmFkfGFhYWFhYWFhLWJiYmItY2NjYy1kZGRkLWVlZWVlZWVlZWVlZQ=="},
+		{"empty string", ""},
+		{"valid base64 bad uuid", storage.EncodeCursor(storage.MessageCursor{CreatedAt: time.Now(), ID: "not-a-uuid"})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := storage.DecodeCursor(tc.input)
+			if err == nil {
+				t.Fatalf("expected error for input %q, got nil", tc.input)
+			}
+		})
+	}
+}
+
+// ---- resolveLimit (via ListChannelMessages Limit param) --------------------
+
+func TestPGXMessageStore_ListChannelMessages_DefaultLimit(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	// Default limit is 50 → query uses limit+1 = 51.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(messageCols()).
+			AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...))
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1", Limit: 0,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages default limit: %v", err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result.Messages))
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ListChannelMessages_LimitCappedAtMax(t *testing.T) {
+	mock := newMock(t)
+	// Limit 999 → capped at 100 → query uses 101.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 101).
+		WillReturnRows(pgxmock.NewRows(messageCols()))
+
+	store := storage.NewPGXMessageStore(mock)
+	_, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1", Limit: 999,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages capped limit: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ListChannelMessages_CustomLimitWithinBounds(t *testing.T) {
+	mock := newMock(t)
+	// Explicit limit 10 → query uses 11.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 11).
+		WillReturnRows(pgxmock.NewRows(messageCols()))
+
+	store := storage.NewPGXMessageStore(mock)
+	_, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1", Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages custom limit: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// ---- collectMessagesResult: next page detection ----------------------------
+
+func TestPGXMessageStore_ListChannelMessages_HasNextPage_SetsNextCursor(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	// Return limit+1 rows (default 50 → 51 rows) to trigger NextCursor.
+	rows := pgxmock.NewRows(messageCols())
+	for i := range 51 {
+		id := "msg-" + string(rune('a'+i%26))
+		rows.AddRow(messageRow(id, "ws-1", "ch-1", "", now)...)
+	}
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(rows)
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages next page: %v", err)
+	}
+	if len(result.Messages) != 50 {
+		t.Fatalf("expected 50 messages (trimmed), got %d", len(result.Messages))
+	}
+	if result.NextCursor == nil {
+		t.Fatal("expected NextCursor to be set when more pages exist")
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ListDMMessages_HasNextPage_SetsNextCursor(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	rows := pgxmock.NewRows(messageCols())
+	for i := range 51 {
+		id := "dm-msg-" + string(rune('a'+i%26))
+		rows.AddRow(messageRow(id, "ws-1", "", "dm-1", now)...)
+	}
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "dm-1", "user-1", 51).
+		WillReturnRows(rows)
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListDMMessages next page: %v", err)
+	}
+	if len(result.Messages) != 50 {
+		t.Fatalf("expected 50 messages (trimmed), got %d", len(result.Messages))
+	}
+	if result.NextCursor == nil {
+		t.Fatal("expected NextCursor to be set when more pages exist")
+	}
+	checkExpectations(t, mock)
+}
+
+// ---- BeforeCursor path: keyset pagination branch ----------------------------
+
+func TestPGXMessageStore_ListChannelMessages_WithBeforeCursor(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	cursorID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	cursor := &storage.MessageCursor{CreatedAt: now, ID: cursorID}
+
+	// When BeforeCursor is set, query has 6 args: ws, ch, user, ts, id, limit+1.
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", pgxmock.AnyArg(), cursorID, 51).
+		WillReturnRows(pgxmock.NewRows(messageCols()).
+			AddRow(messageRow("msg-older", "ws-1", "ch-1", "", now.Add(-time.Minute))...))
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+		BeforeCursor: cursor,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages with cursor: %v", err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result.Messages))
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ListDMMessages_WithBeforeCursor(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	cursorID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	cursor := &storage.MessageCursor{CreatedAt: now, ID: cursorID}
+
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "dm-1", "user-1", pgxmock.AnyArg(), cursorID, 51).
+		WillReturnRows(pgxmock.NewRows(messageCols()).
+			AddRow(messageRow("dm-older", "ws-1", "", "dm-1", now.Add(-time.Minute))...))
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+		WorkspaceID: "ws-1", ConversationID: "dm-1", UserID: "user-1",
+		BeforeCursor: cursor,
+	})
+	if err != nil {
+		t.Fatalf("ListDMMessages with cursor: %v", err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("expected 1 DM message, got %d", len(result.Messages))
 	}
 	checkExpectations(t, mock)
 }

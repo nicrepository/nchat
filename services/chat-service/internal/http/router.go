@@ -11,7 +11,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler) http.Handler {
 	_ = logger
 
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
@@ -26,6 +26,26 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	// Authenticated sidebar endpoint: JWT validity + active session + active workspace member.
 	mux.Handle(RouteSidebar, httputil.MethodNotAllowed(http.MethodGet,
 		BearerAuth(validator)(RequireActiveSession(sessionValidator)(sidebar)),
+	))
+
+	authMiddleware := func(h http.Handler) http.Handler {
+		return BearerAuth(validator)(RequireActiveSession(sessionValidator)(h))
+	}
+
+	// Channel message endpoints: GET list, POST create.
+	mux.Handle("GET "+RouteChannelMessages, authMiddleware(
+		http.HandlerFunc(messages.ListChannelMessages),
+	))
+	mux.Handle("POST "+RouteChannelMessages, authMiddleware(
+		http.HandlerFunc(messages.CreateChannelMessage),
+	))
+
+	// DM message endpoints: GET list, POST create.
+	mux.Handle("GET "+RouteDMMessages, authMiddleware(
+		http.HandlerFunc(messages.ListDMMessages),
+	))
+	mux.Handle("POST "+RouteDMMessages, authMiddleware(
+		http.HandlerFunc(messages.CreateDMMessage),
 	))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

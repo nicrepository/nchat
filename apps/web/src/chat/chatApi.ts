@@ -11,7 +11,7 @@
  */
 
 import { authenticatedFetch } from "../lib/authClient";
-import type { Channel, DMConversation } from "./chatTypes";
+import type { Channel, DMConversation, Message, MessagePage } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
 
@@ -93,4 +93,112 @@ export async function fetchSidebarData(): Promise<{
     participants: [],
   }));
   return { channels, dms };
+}
+
+// ── Message API response shapes ───────────────────────────────────────────────
+
+interface MessageResponse {
+  id: string;
+  sender_id: string;
+  kind: string;
+  body_text?: string;
+  is_removed?: boolean;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface MessageListData {
+  messages: MessageResponse[];
+  next_cursor?: string;
+}
+
+interface MessageListEnvelope {
+  data: MessageListData;
+}
+
+interface MessageEnvelope {
+  data: MessageResponse;
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+function mapMessage(r: MessageResponse): Message {
+  return {
+    id: r.id,
+    senderId: r.sender_id,
+    kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
+    bodyText: r.body_text ?? "",
+    isRemoved: r.is_removed ?? false,
+    status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+/** Returns the base path for the message collection of a channel or DM. */
+export function messagesPath(kind: "channel" | "dm", id: string): string {
+  const segment = kind === "channel" ? "channels" : "dm";
+  return `${CHAT_BASE}/${segment}/${encodeURIComponent(id)}/messages`;
+}
+
+function buildMessagesUrl(base: string, beforeCursor?: string): string {
+  if (!beforeCursor) return base;
+  return `${base}?before=${encodeURIComponent(beforeCursor)}`;
+}
+
+// ── Exported message API ──────────────────────────────────────────────────────
+
+export async function fetchChannelMessages(
+  channelId: string,
+  beforeCursor?: string,
+  signal?: AbortSignal,
+): Promise<MessagePage> {
+  const url = buildMessagesUrl(messagesPath("channel", channelId), beforeCursor);
+  const res = await authenticatedFetch<MessageListEnvelope>(url, { method: "GET", signal });
+  return {
+    messages: (res.data.messages ?? []).map(mapMessage),
+    nextCursor: res.data.next_cursor ?? "",
+  };
+}
+
+export async function postChannelMessage(
+  channelId: string,
+  bodyText: string,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body_text: bodyText }),
+    signal,
+  });
+  return mapMessage(res.data);
+}
+
+export async function fetchDMMessages(
+  conversationId: string,
+  beforeCursor?: string,
+  signal?: AbortSignal,
+): Promise<MessagePage> {
+  const url = buildMessagesUrl(messagesPath("dm", conversationId), beforeCursor);
+  const res = await authenticatedFetch<MessageListEnvelope>(url, { method: "GET", signal });
+  return {
+    messages: (res.data.messages ?? []).map(mapMessage),
+    nextCursor: res.data.next_cursor ?? "",
+  };
+}
+
+export async function postDMMessage(
+  conversationId: string,
+  bodyText: string,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body_text: bodyText }),
+    signal,
+  });
+  return mapMessage(res.data);
 }

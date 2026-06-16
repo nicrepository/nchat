@@ -8,6 +8,7 @@ import LoginPage from "./auth/LoginPage";
 import OIDCCallbackPage from "./auth/OIDCCallbackPage";
 import RequireAuth from "./auth/RequireAuth";
 import ResetPasswordPage from "./auth/ResetPasswordPage";
+import ChatMessageArea from "./chat/ChatMessageArea";
 import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
 
@@ -31,8 +32,8 @@ export default function App() {
           }
         >
           <Route index element={<ChatPlaceholder />} />
-          <Route path="channel/:id" element={<ChatPlaceholder type="channel" />} />
-          <Route path="dm/:id" element={<ChatPlaceholder type="dm" />} />
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
         </Route>
 
         {/* ── Admin ─────────────────────────────────────────────────── */}

@@ -10,7 +10,16 @@ vi.mock("../lib/authClient", () => ({
   authenticatedFetch: (...args: unknown[]) => mockAuthFetch(...args),
 }));
 
-import { fetchChannels, fetchDMs, fetchSidebarData } from "./chatApi";
+import {
+  fetchChannelMessages,
+  fetchChannels,
+  fetchDMMessages,
+  fetchDMs,
+  fetchSidebarData,
+  messagesPath,
+  postChannelMessage,
+  postDMMessage,
+} from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -230,5 +239,332 @@ describe("fetchSidebarData", () => {
   it("propagates errors from authenticatedFetch", async () => {
     mockAuthFetch.mockRejectedValue(new Error("network error"));
     await expect(fetchSidebarData()).rejects.toThrow("network error");
+  });
+
+  it("handles missing dm_conversations field with empty array fallback", async () => {
+    // Covers the `?? []` null-coalescing branch for dm_conversations.
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
+        channels: [],
+        // dm_conversations intentionally omitted
+      },
+    });
+    const { dms } = await fetchSidebarData();
+    expect(dms).toEqual([]);
+  });
+});
+
+// ── Message API helpers ───────────────────────────────────────────────────────
+
+function msgRaw(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "msg-1",
+    sender_id: "user-abc",
+    kind: "user",
+    body_text: "Olá",
+    is_removed: false,
+    status: "active",
+    created_at: "2024-01-15T10:00:00Z",
+    updated_at: "2024-01-15T10:00:00Z",
+    ...overrides,
+  };
+}
+
+function msgListEnvelope(messages: object[] = [], nextCursor?: string) {
+  return { data: { messages, next_cursor: nextCursor } };
+}
+
+function msgEnvelope(msg: object) {
+  return { data: msg };
+}
+
+// ── fetchChannelMessages ──────────────────────────────────────────────────────
+
+describe("fetchChannelMessages", () => {
+  it("calls the correct URL for a channel", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("geral");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/geral/messages");
+  });
+
+  it("percent-encodes channel ID with special characters", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("equipe infra");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("appends before cursor as query param when provided", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("geral", "cursor==abc");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("?before=cursor%3D%3Dabc");
+  });
+
+  it("does not append before param when cursor is absent", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("geral");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).not.toContain("?before=");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    const ctrl = new AbortController();
+    await fetchChannelMessages("geral", undefined, ctrl.signal);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("maps snake_case response fields to camelCase Message", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages).toHaveLength(1);
+    expect(page.messages[0]).toMatchObject({
+      id: "msg-1",
+      senderId: "user-abc",
+      kind: "user",
+      bodyText: "Olá",
+      isRemoved: false,
+      status: "active",
+      createdAt: "2024-01-15T10:00:00Z",
+      updatedAt: "2024-01-15T10:00:00Z",
+    });
+  });
+
+  it("returns nextCursor from response", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()], "next-page-cursor"));
+    const page = await fetchChannelMessages("geral");
+    expect(page.nextCursor).toBe("next-page-cursor");
+  });
+
+  it("returns empty nextCursor when not in response", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.nextCursor).toBe("");
+  });
+
+  it("sets isRemoved true for removed message", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ is_removed: true, body_text: undefined })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isRemoved).toBe(true);
+    expect(page.messages[0].bodyText).toBe("");
+  });
+
+  it("handles absent is_removed field as false", async () => {
+    // Covers `r.is_removed ?? false` null-coalescing branch when field is absent.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { is_removed: _, ...withoutRemoved } = msgRaw();
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([withoutRemoved]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isRemoved).toBe(false);
+  });
+
+  it("maps status deleted correctly", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ status: "deleted" })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].status).toBe("deleted");
+  });
+
+  it("handles absent messages field as empty array", async () => {
+    // Covers `res.data.messages ?? []` null-coalescing branch when field is absent.
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages).toEqual([]);
+    expect(page.nextCursor).toBe("");
+  });
+});
+
+// ── fetchDMMessages ───────────────────────────────────────────────────────────
+
+describe("fetchDMMessages", () => {
+  it("calls the correct URL for a DM conversation", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchDMMessages("dm-juliane");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm-juliane/messages");
+  });
+
+  it("percent-encodes DM ID with special characters", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchDMMessages("dm user/special");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm%20user%2Fspecial/messages");
+  });
+
+  it("appends before cursor when provided", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchDMMessages("dm-juliane", "abc123");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("?before=abc123");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    const ctrl = new AbortController();
+    await fetchDMMessages("dm-juliane", undefined, ctrl.signal);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("maps response fields correctly", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ kind: "system" })]));
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].kind).toBe("system");
+  });
+
+  it("handles absent messages field as empty array", async () => {
+    // Covers `res.data.messages ?? []` null-coalescing branch in fetchDMMessages.
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages).toEqual([]);
+    expect(page.nextCursor).toBe("");
+  });
+});
+
+// ── postChannelMessage ────────────────────────────────────────────────────────
+
+describe("postChannelMessage", () => {
+  it("calls the correct URL for a channel", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/geral/messages");
+  });
+
+  it("percent-encodes channel ID", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("equipe infra", "Hello");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("uses POST method", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello");
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("sends body_text in JSON payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello world");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({ body_text: "Hello world" });
+  });
+
+  it("does not include author_id in payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("author_id");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postChannelMessage("geral", "Hello", ctrl.signal);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("returns mapped Message from response", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ body_text: "Hello" })));
+    const msg = await postChannelMessage("geral", "Hello");
+    expect(msg.bodyText).toBe("Hello");
+    expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+// ── postDMMessage ─────────────────────────────────────────────────────────────
+
+describe("postDMMessage", () => {
+  it("calls the correct URL for a DM conversation", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Oi!");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm-juliane/messages");
+  });
+
+  it("percent-encodes DM ID", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm user/1", "Oi!");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm%20user%2F1/messages");
+  });
+
+  it("sends body_text in JSON payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Mensagem direta");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({ body_text: "Mensagem direta" });
+  });
+
+  it("does not include author_id in payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Hi");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("author_id");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postDMMessage("dm-juliane", "Hi", ctrl.signal);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("returns mapped Message from response", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ body_text: "Oi!" })));
+    const msg = await postDMMessage("dm-juliane", "Oi!");
+    expect(msg.bodyText).toBe("Oi!");
+    expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+// ── messagesPath ──────────────────────────────────────────────────────────────
+
+describe("messagesPath", () => {
+  it("returns channel messages path", () => {
+    expect(messagesPath("channel", "geral")).toMatch(/\/channels\/geral\/messages$/);
+  });
+
+  it("returns DM messages path", () => {
+    expect(messagesPath("dm", "dm-juliane")).toMatch(/\/dm\/dm-juliane\/messages$/);
+  });
+
+  it("percent-encodes channel ID", () => {
+    expect(messagesPath("channel", "equipe infra")).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("percent-encodes DM ID", () => {
+    expect(messagesPath("dm", "dm user/1")).toContain("/dm/dm%20user%2F1/messages");
+  });
+
+  it("channel and dm produce distinct paths for the same ID", () => {
+    const ch = messagesPath("channel", "abc");
+    const dm = messagesPath("dm", "abc");
+    expect(ch).not.toBe(dm);
+    expect(ch).toContain("/channels/");
+    expect(dm).toContain("/dm/");
   });
 });
