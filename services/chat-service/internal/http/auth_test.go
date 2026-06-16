@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────

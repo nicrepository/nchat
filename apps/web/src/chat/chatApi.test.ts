@@ -14,10 +14,12 @@ import { fetchChannels, fetchDMs } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function sidebarResponse(overrides: {
-  channels?: object[];
-  dms?: object[];
-} = {}) {
+function sidebarResponse(
+  overrides: {
+    channels?: object[];
+    dms?: object[];
+  } = {},
+) {
   return {
     data: {
       workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
@@ -52,7 +54,9 @@ describe("fetchChannels", () => {
   it("falls back to slug when display_name is empty", async () => {
     mockAuthFetch.mockResolvedValue(
       sidebarResponse({
-        channels: [{ id: "ch-1", slug: "geral", display_name: "", type: "public", is_general: false }],
+        channels: [
+          { id: "ch-1", slug: "geral", display_name: "", type: "public", is_general: false },
+        ],
       }),
     );
 
@@ -83,10 +87,18 @@ describe("fetchChannels", () => {
   it("makes an independent request per call (no cross-call caching)", async () => {
     mockAuthFetch
       .mockResolvedValueOnce(
-        sidebarResponse({ channels: [{ id: "ch-a", slug: "a", display_name: "a", type: "public", is_general: false }] }),
+        sidebarResponse({
+          channels: [
+            { id: "ch-a", slug: "a", display_name: "a", type: "public", is_general: false },
+          ],
+        }),
       )
       .mockResolvedValueOnce(
-        sidebarResponse({ channels: [{ id: "ch-b", slug: "b", display_name: "b", type: "public", is_general: false }] }),
+        sidebarResponse({
+          channels: [
+            { id: "ch-b", slug: "b", display_name: "b", type: "public", is_general: false },
+          ],
+        }),
       );
 
     const first = await fetchChannels();
@@ -148,9 +160,7 @@ describe("fetchDMs", () => {
       dms: [{ id: "dm-b", type: "direct", name: "User B DM" }],
     });
 
-    mockAuthFetch
-      .mockReturnValueOnce(userAPromise)
-      .mockResolvedValueOnce(userBResponse);
+    mockAuthFetch.mockReturnValueOnce(userAPromise).mockResolvedValueOnce(userBResponse);
 
     // User A starts a request (in-flight, not yet resolved).
     const userADMs = fetchDMs();
@@ -159,9 +169,7 @@ describe("fetchDMs", () => {
     const userBDMs = fetchDMs();
 
     // Resolve user A's request — must not affect B's independent promise.
-    resolveUserA(
-      sidebarResponse({ dms: [{ id: "dm-a", type: "direct", name: "User A DM" }] }),
-    );
+    resolveUserA(sidebarResponse({ dms: [{ id: "dm-a", type: "direct", name: "User A DM" }] }));
 
     const [resultA, resultB] = await Promise.all([userADMs, userBDMs]);
 
