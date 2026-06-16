@@ -337,7 +337,7 @@ export default function ChatSidebar() {
       {/* ── Brand ── */}
       <Link to="/chat" className="chat-sidebar__brand" aria-label="NIC Chat — Workspace NIC-Labs">
         <div className="chat-sidebar__brand-mark">
-          <img src="/assets/nic-labs-icon.png" alt="" className="chat-sidebar__brand-img" />
+          <img src="/assets/nic-labs-icon.png" alt="NIC-Labs" className="chat-sidebar__brand-img" />
         </div>
         <div>
           <p className="chat-sidebar__brand-title">NIC Chat</p>

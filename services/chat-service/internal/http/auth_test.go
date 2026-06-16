@@ -76,6 +76,13 @@ func (d denySessionValidator) ValidateActiveSession(_ context.Context, _, _ stri
 	return d.err
 }
 
+// setBearerToken sets the Authorization header to the RFC 6750 bearer scheme
+// using the exported scheme constant from auth middleware. Tests must use this
+// helper instead of raw Authorization header strings.
+func setBearerToken(r *http.Request, tok string) {
+	r.Header.Set("Authorization", httpapi.ExportBearerScheme+tok)
+}
+
 // ── BearerAuth tests ──────────────────────────────────────────────────────────
 
 func TestBearerAuth_NilValidator_Returns503(t *testing.T) {
@@ -116,7 +123,7 @@ func TestBearerAuth_InvalidToken_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer notavalidjwt")
+	setBearerToken(req, "notavalidjwt")
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -132,7 +139,7 @@ func TestBearerAuth_ExpiredToken_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -148,7 +155,7 @@ func TestBearerAuth_WrongSecret_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -164,7 +171,7 @@ func TestBearerAuth_WrongIssuer_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -180,7 +187,7 @@ func TestBearerAuth_WrongAudience_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -207,7 +214,7 @@ func TestBearerAuth_FutureNbf_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -237,11 +244,43 @@ func TestBearerAuth_UnexpectedAlg_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unexpected alg, got %d", rr.Code)
+	}
+}
+
+func TestBearerAuth_AlgNone_Returns401(t *testing.T) {
+	// "alg": "none" is an unsigned JWT that must never be accepted.
+	// The HS256 method check in the keyFunc rejects any other signing method,
+	// so an unsigned token is rejected before signature verification.
+	v := makeTestValidator(t)
+	claims := jwt.MapClaims{
+		"sub": testUserID,
+		"sid": testSessionID,
+		"iss": testIssuer,
+		"aud": jwt.ClaimStrings{testAudience},
+		"iat": time.Now().Unix(),
+		"nbf": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"jti": "jti-none",
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodNone, claims).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatalf("sign alg=none token: %v", err)
+	}
+	mw := httpapi.BearerAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	setBearerToken(req, tok)
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for alg=none, got %d", rr.Code)
 	}
 }
 
@@ -263,7 +302,7 @@ func TestBearerAuth_MissingExp_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -289,7 +328,7 @@ func TestBearerAuth_MissingSub_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -315,7 +354,7 @@ func TestBearerAuth_MissingSid_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -341,7 +380,7 @@ func TestBearerAuth_MissingJTI_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -367,7 +406,7 @@ func TestBearerAuth_MissingIAT_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -393,7 +432,7 @@ func TestBearerAuth_MissingNBF_Returns401(t *testing.T) {
 	}))
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -435,7 +474,7 @@ func TestBearerAuth_ValidToken_InjectsUserIDAndSessionID(t *testing.T) {
 	mw := httpapi.BearerAuth(v)(next)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	mw.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {

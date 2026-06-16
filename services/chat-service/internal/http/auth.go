@@ -23,6 +23,10 @@ const (
 
 var uuidRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// bearerScheme is the Authorization header scheme string defined by RFC 6750.
+// It is used as a constant to avoid scattered string literals in middleware and tests.
+const bearerScheme = "Bearer "
+
 func isValidUUID(s string) bool { return uuidRE.MatchString(s) }
 
 // GetContextUserID returns the authenticated user ID injected by BearerAuth,
@@ -116,11 +120,11 @@ func BearerAuth(validator *TokenValidator) func(http.Handler) http.Handler {
 			}
 
 			hdr := r.Header.Get("Authorization")
-			if !strings.HasPrefix(hdr, "Bearer ") {
+			if !strings.HasPrefix(hdr, bearerScheme) {
 				httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
 				return
 			}
-			raw := strings.TrimPrefix(hdr, "Bearer ")
+			raw := strings.TrimPrefix(hdr, bearerScheme)
 			if raw == "" {
 				httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
 				return

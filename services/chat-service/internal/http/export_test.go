@@ -6,4 +6,7 @@ package httpapi
 var (
 	ExportCtxKeyUserID    = ctxKeyUserID
 	ExportCtxKeySessionID = ctxKeySessionID
+	// ExportBearerScheme is the RFC 6750 Authorization header scheme used by
+	// BearerAuth middleware. Tests use this constant instead of raw string literals.
+	ExportBearerScheme = bearerScheme
 )

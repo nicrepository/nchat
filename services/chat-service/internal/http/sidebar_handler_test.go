@@ -45,7 +45,7 @@ func authGet(t *testing.T) *http.Request {
 	t.Helper()
 	tok := makeTestToken(t, testUserID, testHMACSecret, testIssuer, testAudience, time.Hour)
 	req := httptest.NewRequest(http.MethodGet, httpapi.RouteSidebar, nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 	return req
 }
 
@@ -172,7 +172,7 @@ func TestSidebarHandler_PostMethod_Returns405(t *testing.T) {
 
 	tok := makeTestToken(t, testUserID, testHMACSecret, testIssuer, testAudience, time.Hour)
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteSidebar, nil)
-	req.Header.Set("Authorization", "Bearer "+tok)
+	setBearerToken(req, tok)
 
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)

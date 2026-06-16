@@ -11,8 +11,7 @@ import type { Channel, DMConversation } from "./chatTypes";
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
 const { mockFetchSidebarData } = vi.hoisted(() => ({
-  mockFetchSidebarData:
-    vi.fn<() => Promise<{ channels: Channel[]; dms: DMConversation[] }>>(),
+  mockFetchSidebarData: vi.fn<() => Promise<{ channels: Channel[]; dms: DMConversation[] }>>(),
 }));
 
 vi.mock("./chatApi", () => ({
@@ -146,6 +145,16 @@ describe("ChatShell — shell structure", () => {
     const sidebar = await screen.findByTestId("chat-sidebar");
     expect(sidebar).toHaveTextContent("NIC Chat");
     expect(sidebar).toHaveTextContent("Workspace NIC-Labs");
+  });
+
+  it("sidebar header renders NIC-Labs logo with accessible alt text", async () => {
+    mockFetchSidebarData.mockResolvedValue({ channels: [], dms: [] });
+    renderChat();
+
+    await screen.findByTestId("chat-sidebar");
+    const logo = screen.getByRole("img", { name: /nic-labs/i });
+    expect(logo).toBeInTheDocument();
+    expect(logo).toHaveAttribute("src", "/assets/nic-labs-icon.png");
   });
 });
 
