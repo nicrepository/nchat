@@ -403,6 +403,68 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			t.Fatalf("suspended caller must see no DMs, got %+v", conversations)
 		}
 	})
+
+	t.Run("message store creates channel and dm messages with nil optional refs", func(t *testing.T) {
+		_, err := conn.Exec(ctx, `
+			BEGIN;
+			INSERT INTO chat.workspaces (id, slug, name)
+			VALUES ('90000000-0000-0000-0000-000000000001', 'messages-create', 'Messages Create');
+			INSERT INTO chat.channels (workspace_id, slug, display_name, type, is_general)
+			VALUES ('90000000-0000-0000-0000-000000000001', 'geral', 'Geral', 'public', true);
+			INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+			VALUES
+				('90000000-0000-0000-0000-000000000001', '90000000-0000-0000-0000-000000000002', 'active');
+			INSERT INTO chat.channels (id, workspace_id, slug, display_name, type)
+			VALUES
+				('90000000-0000-0000-0000-000000000003', '90000000-0000-0000-0000-000000000001', 'messages-public', 'Messages Public', 'public');
+			INSERT INTO chat.dm_conversations (id, workspace_id, type, status, created_by, direct_pair_key)
+			VALUES
+				('90000000-0000-0000-0000-000000000004',
+				 '90000000-0000-0000-0000-000000000001',
+				 'group',
+				 'active',
+				 '90000000-0000-0000-0000-000000000002',
+				 NULL);
+			INSERT INTO chat.dm_members (conversation_id, user_id)
+			VALUES ('90000000-0000-0000-0000-000000000004', '90000000-0000-0000-0000-000000000002');
+			COMMIT;`)
+		if err != nil {
+			t.Fatalf("seed message create cases: %v", err)
+		}
+
+		pool, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open message pool: %v", err)
+		}
+		defer pool.Close()
+		store := storage.NewPGXMessageStore(pool)
+
+		channelMsg, err := store.CreateMessage(ctx, storage.CreateMessageInput{
+			WorkspaceID: "90000000-0000-0000-0000-000000000001",
+			ChannelID:   "90000000-0000-0000-0000-000000000003",
+			SenderID:    "90000000-0000-0000-0000-000000000002",
+			BodyText:    "channel message without refs",
+		})
+		if err != nil {
+			t.Fatalf("create channel message without refs: %v", err)
+		}
+		if channelMsg.ChannelID != "90000000-0000-0000-0000-000000000003" || channelMsg.SenderID != "90000000-0000-0000-0000-000000000002" {
+			t.Fatalf("unexpected channel message: %+v", channelMsg)
+		}
+
+		dmMsg, err := store.CreateMessage(ctx, storage.CreateMessageInput{
+			WorkspaceID:      "90000000-0000-0000-0000-000000000001",
+			DMConversationID: "90000000-0000-0000-0000-000000000004",
+			SenderID:         "90000000-0000-0000-0000-000000000002",
+			BodyText:         "dm message without refs",
+		})
+		if err != nil {
+			t.Fatalf("create dm message without refs: %v", err)
+		}
+		if dmMsg.DMConversationID != "90000000-0000-0000-0000-000000000004" || dmMsg.SenderID != "90000000-0000-0000-0000-000000000002" {
+			t.Fatalf("unexpected dm message: %+v", dmMsg)
+		}
+	})
 }
 
 func requirePostgresConstraint(t *testing.T, err error, constraint string) {

@@ -27,6 +27,31 @@ if git -C "$ROOT_DIR" ls-files --error-unmatch infra/compose/.env.dev >/dev/null
   exit 1
 fi
 
+if ! grep -q 'rewrite-auth-api-prefix:' "$TRAEFIK_DYNAMIC_CONFIG"; then
+  echo "Local gateway must rewrite /api/auth/* to auth-service /auth/* paths." >&2
+  exit 1
+fi
+
+if ! grep -q 'nchat-auth-health:' "$TRAEFIK_DYNAMIC_CONFIG"; then
+  echo "Local gateway must keep /api/auth/healthz probe routing explicit." >&2
+  exit 1
+fi
+
+if ! grep -q 'nchat-chat-health:' "$TRAEFIK_DYNAMIC_CONFIG"; then
+  echo "Local gateway must keep /api/chat/healthz probe routing explicit." >&2
+  exit 1
+fi
+
+if sed -n '/nchat-chat:/,/nchat-chat-https:/p' "$TRAEFIK_DYNAMIC_CONFIG" | grep -q 'strip-chat-prefix'; then
+  echo "Local gateway must not strip /api/chat for normal chat API routes." >&2
+  exit 1
+fi
+
+if sed -n '/nchat-chat-https:/,/nchat-files:/p' "$TRAEFIK_DYNAMIC_CONFIG" | grep -q 'strip-chat-prefix'; then
+  echo "Local gateway must not strip /api/chat for normal HTTPS chat API routes." >&2
+  exit 1
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker not found; skipping Docker-based gateway config validation."
   echo "Gateway config check passed."

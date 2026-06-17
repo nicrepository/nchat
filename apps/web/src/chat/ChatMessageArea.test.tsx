@@ -199,6 +199,26 @@ describe("ChatMessageArea — error state", () => {
       expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
     });
   });
+
+  it("inaccessible channel route shows safe error state and disables composer", async () => {
+    mockFetchChannelMessages.mockRejectedValue(new Error("not_found"));
+    renderChannelArea("private-target");
+
+    expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-composer-input")).toBeDisabled();
+    expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+  });
+
+  it("inaccessible DM route shows safe error state and disables composer", async () => {
+    mockFetchDMMessages.mockRejectedValue(new Error("not_found"));
+    renderDMArea("dm-private-target");
+
+    expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-composer-input")).toBeDisabled();
+    expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+  });
 });
 
 // ── Empty state ───────────────────────────────────────────────────────────────

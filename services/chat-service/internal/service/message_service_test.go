@@ -511,7 +511,8 @@ func TestMessageService_CreateDMMessage_RefMessageDMToChannelDenied(t *testing.T
 
 // ---- list messages tests ---------------------------------------------------
 
-func TestMessageService_ListChannelMessages_DelegatesVisibilityToStorage(t *testing.T) {
+func TestMessageService_ListChannelMessages_VisibleChannelDelegatesToStorage(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
 	msgs := &fakeMessageStore{
 		channelMessages: []domain.Message{
 			{ID: "m1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
@@ -520,7 +521,7 @@ func TestMessageService_ListChannelMessages_DelegatesVisibilityToStorage(t *test
 				BodyText: "second", Status: domain.MessageStatusActive},
 		},
 	}
-	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs)
 
 	got, err := svc.ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", CallerID: user1,
@@ -534,32 +535,39 @@ func TestMessageService_ListChannelMessages_DelegatesVisibilityToStorage(t *test
 	if msgs.listChannelCalls != 1 {
 		t.Fatalf("expected one ListChannelMessages storage call, got %d", msgs.listChannelCalls)
 	}
+	if channels.getVisibleByIDCalls != 1 {
+		t.Fatalf("expected one channel visibility check, got %d", channels.getVisibleByIDCalls)
+	}
 }
 
-func TestMessageService_ListChannelMessages_InaccessibleChannelReturnsEmptySlice(t *testing.T) {
-	// When the storage returns empty (SQL visibility check fails), the service returns empty.
-	msgs := &fakeMessageStore{channelMessages: nil}
-	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+func TestMessageService_ListChannelMessages_InaccessibleChannelDeniedNonEnumerating(t *testing.T) {
+	channels := &fakeChannelStore{getVisibleErr: domain.ErrNotFound}
+	msgs := &fakeMessageStore{}
+	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs)
 
-	got, err := svc.ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
+	_, err := svc.ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-private", CallerID: "non-member",
 	})
-	if err != nil {
-		t.Fatalf("ListChannelMessages for inaccessible: %v", err)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for inaccessible channel, got %v", err)
 	}
-	if len(got.Messages) != 0 {
-		t.Fatalf("expected empty slice for inaccessible channel, got %d messages", len(got.Messages))
+	if msgs.listChannelCalls != 0 {
+		t.Fatalf("inaccessible channel must not list messages, got %d calls", msgs.listChannelCalls)
+	}
+	if channels.getVisibleByIDCalls != 1 {
+		t.Fatalf("expected one channel visibility check, got %d", channels.getVisibleByIDCalls)
 	}
 }
 
-func TestMessageService_ListDMMessages_DelegatesVisibilityToStorage(t *testing.T) {
+func TestMessageService_ListDMMessages_VisibleConversationDelegatesToStorage(t *testing.T) {
+	dms := &fakeDMStore{visibleConversation: activeDMConversation("ws-1", "dm-1")}
 	msgs := &fakeMessageStore{
 		dmMessages: []domain.Message{
 			{ID: "m3", WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: user1,
 				BodyText: "dm msg", Status: domain.MessageStatusActive},
 		},
 	}
-	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+	svc := service.NewMessageService(&fakeChannelStore{}, dms, msgs)
 
 	got, err := svc.ListDMMessages(context.Background(), service.ListDMMessagesInput{
 		WorkspaceID: "ws-1", ConversationID: "dm-1", CallerID: user1,
@@ -573,20 +581,27 @@ func TestMessageService_ListDMMessages_DelegatesVisibilityToStorage(t *testing.T
 	if msgs.listDMCalls != 1 {
 		t.Fatalf("expected one ListDMMessages storage call, got %d", msgs.listDMCalls)
 	}
+	if dms.getVisibleCalls != 1 {
+		t.Fatalf("expected one DM visibility check, got %d", dms.getVisibleCalls)
+	}
 }
 
-func TestMessageService_ListDMMessages_InaccessibleConversationReturnsEmptySlice(t *testing.T) {
-	msgs := &fakeMessageStore{dmMessages: nil}
-	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+func TestMessageService_ListDMMessages_InaccessibleConversationDeniedNonEnumerating(t *testing.T) {
+	dms := &fakeDMStore{getVisibleErr: domain.ErrNotFound}
+	msgs := &fakeMessageStore{}
+	svc := service.NewMessageService(&fakeChannelStore{}, dms, msgs)
 
-	got, err := svc.ListDMMessages(context.Background(), service.ListDMMessagesInput{
+	_, err := svc.ListDMMessages(context.Background(), service.ListDMMessagesInput{
 		WorkspaceID: "ws-1", ConversationID: "dm-other", CallerID: "non-participant",
 	})
-	if err != nil {
-		t.Fatalf("ListDMMessages for inaccessible: %v", err)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for inaccessible DM, got %v", err)
 	}
-	if len(got.Messages) != 0 {
-		t.Fatalf("expected empty slice for inaccessible DM, got %d messages", len(got.Messages))
+	if msgs.listDMCalls != 0 {
+		t.Fatalf("inaccessible DM must not list messages, got %d calls", msgs.listDMCalls)
+	}
+	if dms.getVisibleCalls != 1 {
+		t.Fatalf("expected one DM visibility check, got %d", dms.getVisibleCalls)
 	}
 }
 
@@ -645,7 +660,8 @@ func TestMessageService_ListChannelMessages_ValidCursorWithNextCursorEncoded(t *
 		channelMessages:       []domain.Message{{ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1}},
 		listChannelNextCursor: nextCursor,
 	}
-	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs)
 
 	encoded := storage.EncodeCursor(*nextCursor)
 	// Pass the encoded cursor as BeforeCursor to exercise the decode path.
@@ -687,7 +703,8 @@ func TestMessageService_ListDMMessages_ValidCursorWithNextCursorEncoded(t *testi
 		dmMessages:       []domain.Message{{ID: "dm-1", WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: user1}},
 		listDMNextCursor: nextCursor,
 	}
-	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, msgs)
+	dms := &fakeDMStore{visibleConversation: activeDMConversation("ws-1", "dm-1")}
+	svc := service.NewMessageService(&fakeChannelStore{}, dms, msgs)
 
 	encoded := storage.EncodeCursor(*nextCursor)
 	out, err := svc.ListDMMessages(context.Background(), service.ListDMMessagesInput{
