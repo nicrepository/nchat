@@ -163,7 +163,7 @@ describe("ChatShell — shell structure", () => {
 
 describe("ChatSidebar — loading state", () => {
   it("shows loading skeleton while request is pending", async () => {
-    let resolveData: (v: { channels: Channel[]; dms: DMConversation[] }) => void;
+    let resolveData: (v: { currentUserId: string; channels: Channel[]; dms: DMConversation[] }) => void;
     mockFetchSidebarData.mockReturnValue(new Promise((r) => (resolveData = r)));
 
     renderChat();
@@ -171,7 +171,7 @@ describe("ChatSidebar — loading state", () => {
     await screen.findByTestId("chat-sidebar");
     expect(screen.getByRole("status", { name: /carregando/i })).toBeInTheDocument();
 
-    resolveData!({ channels: [], dms: [] });
+    resolveData!({ currentUserId: "", channels: [], dms: [] });
   });
 });
 
@@ -179,7 +179,11 @@ describe("ChatSidebar — loading state", () => {
 
 describe("ChatSidebar — channels", () => {
   it("renders the channels section", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     await waitFor(() => {
@@ -188,7 +192,11 @@ describe("ChatSidebar — channels", () => {
   });
 
   it("renders #geral channel", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     await waitFor(() => {
@@ -197,7 +205,11 @@ describe("ChatSidebar — channels", () => {
   });
 
   it("renders all channels", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     await waitFor(() => {
@@ -209,7 +221,11 @@ describe("ChatSidebar — channels", () => {
   });
 
   it("renders private channel indicator in accessible label", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     await waitFor(() => {
@@ -261,7 +277,11 @@ describe("ChatSidebar — DMs", () => {
   });
 
   it("shows empty DMs state when list is empty", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     await waitFor(() => {
@@ -275,7 +295,11 @@ describe("ChatSidebar — DMs", () => {
 describe("ChatSidebar — active selection", () => {
   it("clicking a channel marks it as selected", async () => {
     const user = userEvent.setup();
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     const btn = await screen.findByRole("option", { name: /canal geral/i });
@@ -306,7 +330,11 @@ describe("ChatSidebar — active selection", () => {
 
   it("clicking a channel renders the channel route", async () => {
     const user = userEvent.setup();
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat();
 
     const btn = await screen.findByRole("option", { name: /canal geral/i });
@@ -331,7 +359,11 @@ describe("ChatSidebar — active selection", () => {
   });
 
   it("channel active on matching route param", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     renderChat("/chat/channel/geral");
 
     const btn = await screen.findByRole("option", { name: /canal geral/i });
@@ -374,7 +406,7 @@ describe("ChatSidebar — error state", () => {
     const user = userEvent.setup();
     mockFetchSidebarData
       .mockRejectedValueOnce(new Error("fail"))
-      .mockResolvedValue({ channels: SAMPLE_CHANNELS, dms: [] });
+      .mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
 
     renderChat();
 
@@ -391,7 +423,11 @@ describe("ChatSidebar — error state", () => {
 
 describe("ChatSidebar — storage safety", () => {
   it("sidebar mount and data-load add no storage writes", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: SAMPLE_DMS });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: SAMPLE_DMS,
+    });
 
     // Auth token written BEFORE the spy is installed so the nchat_at write
     // from setTokens() is not captured. The spy then covers the full sidebar
@@ -457,7 +493,11 @@ describe("ChatSidebar — route encoding", () => {
   it("navigates with encoded channel ID containing special chars", async () => {
     const user = userEvent.setup();
     const channelWithSpace: Channel = { id: "equipe infra", name: "equipe infra", type: "public" };
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: [channelWithSpace], dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: [channelWithSpace],
+      dms: [],
+    });
     renderChat();
 
     const btn = await screen.findByRole("option", { name: /canal equipe infra/i });
@@ -474,7 +514,11 @@ describe("ChatSidebar — route encoding", () => {
 
   it("marks channel active when route has encoded ID", async () => {
     const channelWithSpace: Channel = { id: "equipe infra", name: "equipe infra", type: "public" };
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: [channelWithSpace], dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: [channelWithSpace],
+      dms: [],
+    });
     // Simulate pre-encoded URL: /chat/channel/equipe%20infra
     renderChat("/chat/channel/equipe%20infra");
 
@@ -483,7 +527,11 @@ describe("ChatSidebar — route encoding", () => {
   });
 
   it("does not crash with malformed percent-encoded route segment", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: SAMPLE_CHANNELS, dms: [] });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
     // `%` alone is invalid percent-encoding; decodeURIComponent would throw without the guard.
     renderChat("/chat/channel/%");
 
