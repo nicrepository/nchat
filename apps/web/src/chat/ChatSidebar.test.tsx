@@ -163,7 +163,11 @@ describe("ChatShell — shell structure", () => {
 
 describe("ChatSidebar — loading state", () => {
   it("shows loading skeleton while request is pending", async () => {
-    let resolveData: (v: { currentUserId: string; channels: Channel[]; dms: DMConversation[] }) => void;
+    let resolveData: (v: {
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+    }) => void;
     mockFetchSidebarData.mockReturnValue(new Promise((r) => (resolveData = r)));
 
     renderChat();

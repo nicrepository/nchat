@@ -502,14 +502,6 @@ type messageRows interface {
 	Err() error
 }
 
-// collectMessagesResult reads all rows from the query (which was issued with LIMIT limit+1)
-// and returns a ListMessagesResult. Results fetched DESC are reversed to ASC order.
-// If more than limit rows are returned, the extra row is discarded and NextCursor
-// is set to the oldest returned message's cursor.
-func collectMessagesResult(rows messageRows, limit int) (ListMessagesResult, error) {
-	return doCollectMessagesResult(rows, limit, false)
-}
-
 func collectListMessagesResult(rows messageRows, limit int) (ListMessagesResult, error) {
 	return doCollectMessagesResult(rows, limit, true)
 }
@@ -536,14 +528,6 @@ func doCollectMessagesResult(rows messageRows, limit int, withSender bool) (List
 	}
 
 	return ListMessagesResult{Messages: msgs, NextCursor: nextCursor}, nil
-}
-
-func collectMessages(rows messageRows) ([]domain.Message, error) {
-	return collectMessagesWithSender(rows, false)
-}
-
-func collectListMessages(rows messageRows) ([]domain.Message, error) {
-	return collectMessagesWithSender(rows, true)
 }
 
 func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Message, error) {
