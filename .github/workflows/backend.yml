@@ -45,6 +45,9 @@ jobs:
       - name: Test
         run: bash scripts/ci/go-test.sh
 
+      - name: Run Go race tests
+        run: bash scripts/ci/go-test.sh -race
+
       - name: Test coverage
         run: bash scripts/ci/go-coverage-check.sh
 

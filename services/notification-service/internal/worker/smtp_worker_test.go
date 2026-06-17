@@ -20,6 +20,7 @@ type fakeOutboxStore struct {
 	rows               []storage.OutboxRow
 	claimErr           error
 	claimCalls         []claimCall
+	claimCh            chan struct{}
 	successCalls       []string
 	failureCalls       []failureCall
 	nextRetryWasSet    bool
@@ -44,6 +45,12 @@ type failureCall struct {
 
 func (f *fakeOutboxStore) ClaimBatch(_ context.Context, maxAttempts, deadlineSeconds, batchSize int) ([]storage.OutboxRow, error) {
 	f.claimCalls = append(f.claimCalls, claimCall{maxAttempts: maxAttempts, deadlineSeconds: deadlineSeconds, batchSize: batchSize})
+	if f.claimCh != nil {
+		select {
+		case f.claimCh <- struct{}{}:
+		default:
+		}
+	}
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
@@ -288,7 +295,8 @@ func TestWorkerPoll_ClaimError(t *testing.T) {
 }
 
 func TestWorkerStart_PollsUntilCancelled(t *testing.T) {
-	store := &fakeOutboxStore{}
+	claimCh := make(chan struct{}, 1)
+	store := &fakeOutboxStore{claimCh: claimCh}
 	worker := New(testWorkerConfig(), store, newTestEncryptor(t), &FakeSender{}, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -298,19 +306,15 @@ func TestWorkerStart_PollsUntilCancelled(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.Now().Add(1500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(store.claimCalls) > 0 {
-			cancel()
-			<-done
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-claimCh:
+		cancel()
+		<-done
+	case <-time.After(1500 * time.Millisecond):
+		cancel()
+		<-done
+		t.Fatal("expected Start to poll at least once")
 	}
-
-	cancel()
-	<-done
-	t.Fatal("expected Start to poll at least once")
 }
 
 func TestWorkerProcess_EmptyBaseURL(t *testing.T) {

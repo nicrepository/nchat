@@ -121,6 +121,9 @@ jobs:
       - name: Test Go
         run: bash scripts/ci/go-test.sh
 
+      - name: Run Go race tests
+        run: bash scripts/ci/go-test.sh -race
+
       - name: Check Go coverage
         run: bash scripts/ci/go-coverage-check.sh
 
