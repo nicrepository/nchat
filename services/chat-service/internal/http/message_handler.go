@@ -52,14 +52,16 @@ func NewMessageHandler(workspaces workspaceResolver, messages messageProvider) *
 // messageJSON is the outbound representation of a single message.
 // body_text is suppressed for deleted messages; is_removed is set instead.
 type messageJSON struct {
-	ID        string    `json:"id"`
-	SenderID  string    `json:"sender_id"`
-	Kind      string    `json:"kind"`
-	BodyText  string    `json:"body_text,omitempty"`
-	IsRemoved bool      `json:"is_removed,omitempty"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                string    `json:"id"`
+	SenderID          string    `json:"sender_id"`
+	SenderDisplayName string    `json:"sender_display_name,omitempty"`
+	SenderEmail       string    `json:"sender_email,omitempty"`
+	Kind              string    `json:"kind"`
+	BodyText          string    `json:"body_text,omitempty"`
+	IsRemoved         bool      `json:"is_removed,omitempty"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // listMessagesResponseData is the data envelope for list endpoints.
@@ -129,12 +131,14 @@ func parseLimitParam(r *http.Request) int {
 // For deleted messages, body_text is withheld and is_removed is set.
 func mapToMessageJSON(m domain.Message) messageJSON {
 	j := messageJSON{
-		ID:        m.ID,
-		SenderID:  m.SenderID,
-		Kind:      string(m.Kind),
-		Status:    string(m.Status),
-		CreatedAt: m.CreatedAt,
-		UpdatedAt: m.UpdatedAt,
+		ID:                m.ID,
+		SenderID:          m.SenderID,
+		SenderDisplayName: m.SenderDisplayName,
+		SenderEmail:       m.SenderEmail,
+		Kind:              string(m.Kind),
+		Status:            string(m.Status),
+		CreatedAt:         m.CreatedAt,
+		UpdatedAt:         m.UpdatedAt,
 	}
 	if m.Status == domain.MessageStatusDeleted {
 		j.IsRemoved = true

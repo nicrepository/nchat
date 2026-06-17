@@ -17,9 +17,10 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
+import type { ChatOutletContext } from "./ChatShell";
 import type { Message } from "./chatTypes";
 import type { SendResult } from "./useMessages";
 import { useMessages } from "./useMessages";
@@ -40,6 +41,22 @@ function formatTime(iso: string): string {
   } catch {
     return "";
   }
+}
+
+function senderLabel(msg: Message): string {
+  return msg.senderDisplayName || msg.senderEmail || msg.senderId.slice(0, 8);
+}
+
+function senderInitials(msg: Message): string {
+  const label = msg.senderDisplayName || msg.senderEmail;
+  if (label) {
+    return label
+      .split(" ")
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase() ?? "")
+      .join("");
+  }
+  return msg.senderId.slice(0, 2).toUpperCase();
 }
 
 function formatDate(iso: string): string {
@@ -257,21 +274,21 @@ function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
     >
       {!isMine && (
         <div className="chat-msg-area__msg-avatar" aria-hidden="true">
-          {message.senderId.slice(0, 2).toUpperCase()}
+          {senderInitials(message)}
         </div>
       )}
       <div className="chat-msg-area__msg-body">
         <div className="chat-msg-area__msg-meta">
           {!isMine && (
-            <span className="chat-msg-area__msg-sender">{message.senderId.slice(0, 8)}</span>
+            <span className="chat-msg-area__msg-sender" data-testid="chat-msg-sender">
+              {senderLabel(message)}
+            </span>
           )}
           <span className="chat-msg-area__msg-time">{time}</span>
         </div>
         <div
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
-          {/* Text is rendered as a React text node — no dangerouslySetInnerHTML. */}
-          {/* Line breaks preserved via CSS white-space: pre-wrap. */}
           {message.isRemoved ? "Mensagem removida." : message.bodyText}
         </div>
       </div>
@@ -281,9 +298,10 @@ function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
 
 interface MessageListProps {
   messages: Message[];
+  currentUserId: string;
 }
 
-function MessageList({ messages }: MessageListProps) {
+function MessageList({ messages, currentUserId }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Scroll to bottom when new messages arrive.
@@ -316,7 +334,11 @@ function MessageList({ messages }: MessageListProps) {
             {item.label}
           </div>
         ) : (
-          <MessageBubble key={item.message.id} message={item.message} />
+          <MessageBubble
+            key={item.message.id}
+            message={item.message}
+            isMine={!!currentUserId && item.message.senderId === currentUserId}
+          />
         ),
       )}
       <div ref={bottomRef} />
@@ -406,7 +428,12 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const rawId = params.id ?? "";
   const targetId = safeDecodeURIComponent(rawId);
 
-  const displayName = kind === "channel" ? `#${targetId}` : targetId;
+  const ctx = useOutletContext<ChatOutletContext>() ?? { currentUserId: "", channels: [], dms: [] };
+
+  const resolvedName =
+    kind === "channel"
+      ? (ctx.channels.find((ch) => ch.id === targetId)?.name ?? targetId)
+      : (ctx.dms.find((dm) => dm.id === targetId)?.name ?? targetId);
 
   const { state, sendMessage, retry } = useMessages({ kind, targetId });
 
@@ -417,20 +444,22 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   return (
     <div className="chat-msg-area" data-testid="chat-message-area">
-      {kind === "channel" ? <HeaderChannel name={targetId} /> : <HeaderDM name={displayName} />}
+      {kind === "channel" ? (
+        <HeaderChannel name={resolvedName} />
+      ) : (
+        <HeaderDM name={resolvedName} />
+      )}
 
       {state.status === "loading" && <LoadingSkeleton />}
 
       {state.status === "error" && <ErrorState onRetry={retry} />}
 
       {state.status === "ready" && state.messages.length === 0 && (
-        <>
-          <EmptyState kind={kind} name={targetId} />
-        </>
+        <EmptyState kind={kind} name={resolvedName} />
       )}
 
       {state.status === "ready" && state.messages.length > 0 && (
-        <MessageList messages={state.messages} />
+        <MessageList messages={state.messages} currentUserId={ctx.currentUserId} />
       )}
 
       {state.sendError && (
@@ -442,7 +471,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
       <Composer
         placeholder={
-          kind === "channel" ? `Mensagem para #${targetId}…` : `Mensagem para ${displayName}…`
+          kind === "channel"
+            ? `Mensagem para #${resolvedName}…`
+            : `Mensagem para ${resolvedName}…`
         }
         disabled={state.status !== "ready"}
         onSend={handleSend}

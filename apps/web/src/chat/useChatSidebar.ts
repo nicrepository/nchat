@@ -8,17 +8,17 @@ import type { Channel, DMConversation } from "./chatTypes";
 type SidebarState =
   | { status: "loading" }
   | { status: "error"; error: string }
-  | { status: "ready"; channels: Channel[]; dms: DMConversation[] };
+  | { status: "ready"; currentUserId: string; channels: Channel[]; dms: DMConversation[] };
 
 type Action =
-  | { type: "loaded"; channels: Channel[]; dms: DMConversation[] }
+  | { type: "loaded"; currentUserId: string; channels: Channel[]; dms: DMConversation[] }
   | { type: "error"; error: string }
   | { type: "reload" };
 
 function reducer(_state: SidebarState, action: Action): SidebarState {
   switch (action.type) {
     case "loaded":
-      return { status: "ready", channels: action.channels, dms: action.dms };
+      return { status: "ready", currentUserId: action.currentUserId, channels: action.channels, dms: action.dms };
     case "error":
       return { status: "error", error: action.error };
     case "reload":
@@ -36,8 +36,8 @@ export function useChatSidebar() {
     dispatch({ type: "reload" });
 
     fetchSidebarData()
-      .then(({ channels, dms }) => {
-        if (!cancelled) dispatch({ type: "loaded", channels, dms });
+      .then(({ currentUserId, channels, dms }) => {
+        if (!cancelled) dispatch({ type: "loaded", currentUserId, channels, dms });
       })
       .catch((err: unknown) => {
         if (!cancelled) {

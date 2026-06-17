@@ -52,6 +52,8 @@ export type MessageStatus = "active" | "deleted";
 export interface Message {
   id: string;
   senderId: string;
+  senderDisplayName: string;
+  senderEmail: string;
   kind: MessageKind;
   /** Only present when status is "active". Empty for removed messages. */
   bodyText: string;
