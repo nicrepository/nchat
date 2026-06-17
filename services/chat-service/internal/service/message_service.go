@@ -188,7 +188,8 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 }
 
 // ListChannelMessages returns messages for a channel visible to the caller.
-// Visibility is enforced in SQL; an empty slice is returned for inaccessible channels.
+// Target visibility is checked before listing so inaccessible targets return a
+// non-enumerating ErrNotFound instead of a misleading empty conversation.
 // BeforeCursor and Limit in the input control pagination. Returns ErrInvalidCursor
 // for a non-empty cursor that cannot be decoded.
 func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) (ListChannelMessagesOutput, error) {
@@ -212,6 +213,9 @@ func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChan
 		}
 		storageInput.BeforeCursor = &c
 	}
+	if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID); err != nil {
+		return ListChannelMessagesOutput{}, err
+	}
 
 	result, err := s.messages.ListChannelMessages(ctx, storageInput)
 	if err != nil {
@@ -226,7 +230,8 @@ func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChan
 }
 
 // ListDMMessages returns messages for a DM conversation visible to the caller.
-// Visibility is enforced in SQL; an empty slice is returned for inaccessible conversations.
+// Target visibility is checked before listing so inaccessible targets return a
+// non-enumerating ErrNotFound instead of a misleading empty conversation.
 // BeforeCursor and Limit in the input control pagination. Returns ErrInvalidCursor
 // for a non-empty cursor that cannot be decoded.
 func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessagesInput) (ListDMMessagesOutput, error) {
@@ -249,6 +254,9 @@ func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessage
 			return ListDMMessagesOutput{}, domain.ErrInvalidCursor
 		}
 		storageInput.BeforeCursor = &c
+	}
+	if _, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, conversationID, callerID); err != nil {
+		return ListDMMessagesOutput{}, err
 	}
 
 	result, err := s.messages.ListDMMessages(ctx, storageInput)

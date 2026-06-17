@@ -160,10 +160,10 @@ func messageColumns(alias string) string {
 	if alias != "" {
 		p = alias + "."
 	}
-	return p + `id, ` + p + `workspace_id,
+	return p + `id::text, ` + p + `workspace_id::text,
 	COALESCE(` + p + `channel_id::text, ''),
 	COALESCE(` + p + `dm_conversation_id::text, ''),
-	` + p + `sender_id,
+	` + p + `sender_id::text,
 	` + p + `kind, ` + p + `body_text, ` + p + `status,
 	COALESCE(` + p + `parent_message_id::text, ''),
 	COALESCE(` + p + `forwarded_from_message_id::text, ''),
@@ -237,58 +237,59 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		WITH invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
 			WHERE
-				($7 IS NOT NULL AND NOT EXISTS (
+				($7::uuid IS NOT NULL AND NOT EXISTS (
 					SELECT 1 FROM chat.messages
-					WHERE id = $7
-					  AND workspace_id = $1
-					  AND channel_id IS NOT DISTINCT FROM $2
-					  AND dm_conversation_id IS NOT DISTINCT FROM $3
+					WHERE id = $7::uuid
+					  AND workspace_id = $1::uuid
+					  AND channel_id IS NOT DISTINCT FROM $2::uuid
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
-				OR ($8 IS NOT NULL AND NOT EXISTS (
+				OR ($8::uuid IS NOT NULL AND NOT EXISTS (
 					SELECT 1 FROM chat.messages
-					WHERE id = $8
-					  AND workspace_id = $1
-					  AND channel_id IS NOT DISTINCT FROM $2
-					  AND dm_conversation_id IS NOT DISTINCT FROM $3
+					WHERE id = $8::uuid
+					  AND workspace_id = $1::uuid
+					  AND channel_id IS NOT DISTINCT FROM $2::uuid
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
-				OR ($9 IS NOT NULL AND NOT EXISTS (
+				OR ($9::uuid IS NOT NULL AND NOT EXISTS (
 					SELECT 1 FROM chat.messages
-					WHERE id = $9
-					  AND workspace_id = $1
-					  AND channel_id IS NOT DISTINCT FROM $2
-					  AND dm_conversation_id IS NOT DISTINCT FROM $3
+					WHERE id = $9::uuid
+					  AND workspace_id = $1::uuid
+					  AND channel_id IS NOT DISTINCT FROM $2::uuid
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
 		)
 		INSERT INTO chat.messages
 			(workspace_id, channel_id, dm_conversation_id, sender_id,
 			 kind, body_text, status,
 			 parent_message_id, forwarded_from_message_id, referenced_message_id)
-		SELECT $1, $2, $3, $4, $5, $6, 'active', $7, $8, $9
+		SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, 'active',
+		       $7::uuid, $8::uuid, $9::uuid
 		FROM (
 			-- Channel message authorization branch.
 			SELECT 1
 			FROM chat.workspaces w
 			JOIN chat.workspace_members wm
-			  ON wm.workspace_id = w.id AND wm.user_id = $4 AND wm.status = 'active'
+			  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
 			JOIN chat.channels c
-			  ON c.id = $2 AND c.workspace_id = $1 AND c.status = 'active'
+			  ON c.id = $2::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'
 			LEFT JOIN chat.channel_members cm
-			  ON cm.channel_id = c.id AND cm.user_id = $4
-			WHERE $2 IS NOT NULL
-			  AND w.id = $1 AND w.status = 'active'
+			  ON cm.channel_id = c.id AND cm.user_id = $4::uuid
+			WHERE $2::uuid IS NOT NULL
+			  AND w.id = $1::uuid AND w.status = 'active'
 			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
 			UNION ALL
 			-- DM message authorization branch.
 			SELECT 1
 			FROM chat.workspaces w
 			JOIN chat.workspace_members wm
-			  ON wm.workspace_id = w.id AND wm.user_id = $4 AND wm.status = 'active'
+			  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
 			JOIN chat.dm_conversations dc
-			  ON dc.id = $3 AND dc.workspace_id = $1 AND dc.status = 'active'
+			  ON dc.id = $3::uuid AND dc.workspace_id = $1::uuid AND dc.status = 'active'
 			JOIN chat.dm_members dm
-			  ON dm.conversation_id = dc.id AND dm.user_id = $4 AND dm.status = 'active'
-			WHERE $3 IS NOT NULL
-			  AND w.id = $1 AND w.status = 'active'
+			  ON dm.conversation_id = dc.id AND dm.user_id = $4::uuid AND dm.status = 'active'
+			WHERE $3::uuid IS NOT NULL
+			  AND w.id = $1::uuid AND w.status = 'active'
 		) auth
 		WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 		RETURNING `+messageColumns(""),

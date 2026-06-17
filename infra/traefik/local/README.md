@@ -25,7 +25,11 @@ Nginx permanece como alternativa futura porque os requisitos aceitam Traefik ou 
 | `/api/search`        | `http://host.docker.internal:8086` |
 | `/api/media`         | `http://host.docker.internal:8087` |
 
-Os routers de API aplicam `StripPrefix`, entao `http://nchat.local:8080/api/auth/healthz` e `https://nchat.local:8443/api/auth/healthz` chegam ao `auth-service` como `/healthz`.
+O gateway local preserva os caminhos esperados pelo frontend:
+
+- `/api/auth/*` e reescrito para `/auth/*` no `auth-service`.
+- `/api/chat/*` chega ao `chat-service` sem strip, pois o servico monta rotas em `/api/chat/*`.
+- Rotas de probe como `/api/auth/healthz` e `/api/chat/healthz` usam routers explicitos para chegar aos handlers `/healthz` dos servicos.
 
 WebSocket nao exige configuracao especial no Traefik para o caso basico; headers `Upgrade` e `Connection` sao encaminhados pelo proxy. Esta tarefa nao implementa WebSocket real nos servicos.
 

@@ -15,6 +15,29 @@ http:
       rule: PathPrefix(`/api`) || PathPrefix(`/dashboard`)
       service: api@internal
 
+    nchat-auth-health:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && (Path(`/api/auth/healthz`) || Path(`/api/auth/readyz`) || Path(`/api/auth/version`))
+      priority: 200
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-probe-prefix
+
+    nchat-auth-health-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && (Path(`/api/auth/healthz`) || Path(`/api/auth/readyz`) || Path(`/api/auth/version`))
+      priority: 200
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-probe-prefix
+      tls: {}
+
     nchat-auth:
       entryPoints:
         - web
@@ -24,7 +47,7 @@ http:
       middlewares:
         - security-headers
         - compress
-        - strip-auth-prefix
+        - rewrite-auth-api-prefix
 
     nchat-auth-https:
       entryPoints:
@@ -35,7 +58,30 @@ http:
       middlewares:
         - security-headers
         - compress
-        - strip-auth-prefix
+        - rewrite-auth-api-prefix
+      tls: {}
+
+    nchat-chat-health:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && (Path(`/api/chat/healthz`) || Path(`/api/chat/readyz`) || Path(`/api/chat/version`))
+      priority: 200
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
+
+    nchat-chat-health-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && (Path(`/api/chat/healthz`) || Path(`/api/chat/readyz`) || Path(`/api/chat/version`))
+      priority: 200
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
       tls: {}
 
     nchat-chat:
@@ -47,7 +93,6 @@ http:
       middlewares:
         - security-headers
         - compress
-        - strip-chat-prefix
 
     nchat-chat-https:
       entryPoints:
@@ -58,7 +103,6 @@ http:
       middlewares:
         - security-headers
         - compress
-        - strip-chat-prefix
       tls: {}
 
     nchat-files:
@@ -251,10 +295,15 @@ http:
     compress:
       compress: {}
 
-    strip-auth-prefix:
-      stripPrefix:
-        prefixes:
-          - /api/auth
+    rewrite-auth-api-prefix:
+      replacePathRegex:
+        regex: "^/api/auth/(.*)"
+        replacement: "/auth/${1}"
+
+    rewrite-auth-probe-prefix:
+      replacePathRegex:
+        regex: "^/api/auth/(healthz|readyz|version)$"
+        replacement: "/${1}"
 
     strip-chat-prefix:
       stripPrefix:
