@@ -172,6 +172,14 @@ func messageColumns(alias string) string {
 	` + p + `created_at, ` + p + `updated_at`
 }
 
+// listMessageColumns returns messageColumns plus sender display info from auth.users.
+// Requires a LEFT JOIN auth.users aliased as "u" in the query.
+func listMessageColumns(alias string) string {
+	return messageColumns(alias) + `,
+	COALESCE(u.display_name, ''),
+	COALESCE(u.email::text, '')`
+}
+
 // scanMessage reads a single message row into a domain.Message.
 // It must be called with exactly the columns listed in messageSelectColumns.
 func scanMessage(row pgx.Row) (domain.Message, error) {
@@ -362,7 +370,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		// Keyset pagination: fetch messages older than the cursor.
 		// Fetch limit+1 to detect whether a next page exists.
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+messageColumns("m")+`
+			SELECT `+listMessageColumns("m")+`
 			FROM chat.messages m
 			JOIN chat.channels c
 			  ON c.id = m.channel_id
@@ -372,6 +380,8 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
 			LEFT JOIN chat.channel_members cm
 			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
+			LEFT JOIN auth.users u
+			  ON u.id = m.sender_id
 			WHERE m.workspace_id = $1
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
@@ -385,7 +395,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+messageColumns("m")+`
+			SELECT `+listMessageColumns("m")+`
 			FROM chat.messages m
 			JOIN chat.channels c
 			  ON c.id = m.channel_id
@@ -395,6 +405,8 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
 			LEFT JOIN chat.channel_members cm
 			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
+			LEFT JOIN auth.users u
+			  ON u.id = m.sender_id
 			WHERE m.workspace_id = $1
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
@@ -409,7 +421,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		return ListMessagesResult{}, fmt.Errorf("list channel messages: %w", err)
 	}
 	defer rows.Close()
-	return collectMessagesResult(rows, limit)
+	return collectListMessagesResult(rows, limit)
 }
 
 func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessagesInput) (ListMessagesResult, error) {
@@ -420,7 +432,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 
 	if input.BeforeCursor != nil {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+messageColumns("m")+`
+			SELECT `+listMessageColumns("m")+`
 			FROM chat.messages m
 			JOIN chat.dm_conversations dc
 			  ON dc.id = m.dm_conversation_id
@@ -430,6 +442,8 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
 			JOIN chat.dm_members dm
 			  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
+			LEFT JOIN auth.users u
+			  ON u.id = m.sender_id
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
@@ -442,7 +456,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+messageColumns("m")+`
+			SELECT `+listMessageColumns("m")+`
 			FROM chat.messages m
 			JOIN chat.dm_conversations dc
 			  ON dc.id = m.dm_conversation_id
@@ -452,6 +466,8 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
 			JOIN chat.dm_members dm
 			  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
+			LEFT JOIN auth.users u
+			  ON u.id = m.sender_id
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
@@ -465,7 +481,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 		return ListMessagesResult{}, fmt.Errorf("list dm messages: %w", err)
 	}
 	defer rows.Close()
-	return collectMessagesResult(rows, limit)
+	return collectListMessagesResult(rows, limit)
 }
 
 // resolveLimit returns a valid limit value: defaults to defaultMessageLimit when
@@ -486,12 +502,12 @@ type messageRows interface {
 	Err() error
 }
 
-// collectMessagesResult reads all rows from the query (which was issued with LIMIT limit+1)
-// and returns a ListMessagesResult. Results fetched DESC are reversed to ASC order.
-// If more than limit rows are returned, the extra row is discarded and NextCursor
-// is set to the oldest returned message's cursor.
-func collectMessagesResult(rows messageRows, limit int) (ListMessagesResult, error) {
-	msgs, err := collectMessages(rows)
+func collectListMessagesResult(rows messageRows, limit int) (ListMessagesResult, error) {
+	return doCollectMessagesResult(rows, limit, true)
+}
+
+func doCollectMessagesResult(rows messageRows, limit int, withSender bool) (ListMessagesResult, error) {
+	msgs, err := collectMessagesWithSender(rows, withSender)
 	if err != nil {
 		return ListMessagesResult{}, err
 	}
@@ -514,12 +530,12 @@ func collectMessagesResult(rows messageRows, limit int) (ListMessagesResult, err
 	return ListMessagesResult{Messages: msgs, NextCursor: nextCursor}, nil
 }
 
-func collectMessages(rows messageRows) ([]domain.Message, error) {
+func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Message, error) {
 	var messages []domain.Message
 	for rows.Next() {
 		var msg domain.Message
 		var editedAt, deletedAt *time.Time
-		err := rows.Scan(
+		dest := []any{
 			&msg.ID, &msg.WorkspaceID,
 			&msg.ChannelID, &msg.DMConversationID,
 			&msg.SenderID,
@@ -527,7 +543,11 @@ func collectMessages(rows messageRows) ([]domain.Message, error) {
 			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 			&editedAt, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
-		)
+		}
+		if withSender {
+			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail)
+		}
+		err := rows.Scan(dest...)
 		if err != nil {
 			return nil, fmt.Errorf("scan message row: %w", err)
 		}

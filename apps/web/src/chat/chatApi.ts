@@ -32,6 +32,7 @@ interface SidebarDMResponse {
 }
 
 interface SidebarResponse {
+  current_user_id: string;
   workspace: { id: string; name: string; slug: string };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
@@ -77,6 +78,7 @@ export async function fetchDMs(): Promise<DMConversation[]> {
  * making two HTTP requests per load.
  */
 export async function fetchSidebarData(): Promise<{
+  currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
 }> {
@@ -92,7 +94,7 @@ export async function fetchSidebarData(): Promise<{
     name: dm.name,
     participants: [],
   }));
-  return { channels, dms };
+  return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
 }
 
 // ── Message API response shapes ───────────────────────────────────────────────
@@ -100,6 +102,8 @@ export async function fetchSidebarData(): Promise<{
 interface MessageResponse {
   id: string;
   sender_id: string;
+  sender_display_name?: string;
+  sender_email?: string;
   kind: string;
   body_text?: string;
   is_removed?: boolean;
@@ -127,6 +131,8 @@ function mapMessage(r: MessageResponse): Message {
   return {
     id: r.id,
     senderId: r.sender_id,
+    senderDisplayName: r.sender_display_name ?? "",
+    senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
     bodyText: r.body_text ?? "",
     isRemoved: r.is_removed ?? false,

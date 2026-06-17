@@ -46,4 +46,8 @@ type Message struct {
 	DeletedAt              time.Time
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+
+	// Populated by list queries that JOIN auth.users; empty for create results.
+	SenderDisplayName string
+	SenderEmail       string
 }

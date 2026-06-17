@@ -7,7 +7,9 @@
 
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
+import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router-dom";
+
+import type { ChatOutletContext } from "./ChatShell";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
@@ -55,6 +57,8 @@ vi.mock("./chatApi", () => ({
 const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   id: "msg-1",
   senderId: "user-abc",
+  senderDisplayName: "",
+  senderEmail: "",
   kind: "user",
   bodyText: "Olá, mundo!",
   isRemoved: false,
@@ -745,5 +749,209 @@ describe("ChatMessageArea — route decoding", () => {
 
     // Must not throw; area should mount with whatever raw value is available.
     expect(await screen.findByTestId("chat-message-area")).toBeInTheDocument();
+  });
+});
+
+// ── Outlet context helper ─────────────────────────────────────────────────────
+
+function ParentWithContext({ ctx }: { ctx: ChatOutletContext }) {
+  return (
+    <div>
+      <Outlet context={ctx} />
+    </div>
+  );
+}
+
+// ── Message alignment ─────────────────────────────────────────────────────────
+
+describe("ChatMessageArea — message alignment", () => {
+  it("own message has --mine modifier class", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    expect(bubble.className).toContain("chat-msg-area__msg--mine");
+  });
+
+  it("other user message does not have --mine modifier class", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Outro" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    expect(bubble.className).not.toContain("chat-msg-area__msg--mine");
+  });
+});
+
+// ── Sender display name ───────────────────────────────────────────────────────
+
+describe("ChatMessageArea — sender display", () => {
+  it("shows senderDisplayName in sender span", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "Fernanda Nicácio",
+          senderEmail: "",
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-msg-sender")).toHaveTextContent("Fernanda Nicácio");
+    });
+  });
+
+  it("falls back to senderEmail when senderDisplayName is empty", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "",
+          senderEmail: "fernanda@example.com",
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-msg-sender")).toHaveTextContent("fernanda@example.com");
+    });
+  });
+
+  it("falls back to senderId prefix when both display fields are empty", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "abcdef12-0000-0000-0000-000000000000",
+          senderDisplayName: "",
+          senderEmail: "",
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-msg-sender")).toHaveTextContent("abcdef12");
+    });
+  });
+
+  it("own message does not show sender span", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.queryByTestId("chat-msg-sender")).not.toBeInTheDocument();
+  });
+});
+
+// ── Header and composer use resolved display name ─────────────────────────────
+
+describe("ChatMessageArea — resolved display name", () => {
+  it("channel header shows display_name from context instead of raw UUID", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/ch-uuid-001"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "",
+                  channels: [{ id: "ch-uuid-001", name: "geral", type: "public" }],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(header).toHaveTextContent("geral");
+    expect(header).not.toHaveTextContent("ch-uuid-001");
+  });
+
+  it("composer placeholder uses resolved channel display_name", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/ch-uuid-001"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "",
+                  channels: [{ id: "ch-uuid-001", name: "geral", type: "public" }],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    expect(input).toHaveAttribute("placeholder", "Mensagem para #geral…");
+  });
+
+  it("falls back to raw targetId when channel not found in context", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    renderChannelArea("geral");
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(header).toHaveTextContent("geral");
   });
 });

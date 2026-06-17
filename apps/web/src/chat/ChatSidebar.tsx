@@ -1,7 +1,6 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import "./ChatSidebar.css";
-import { useChatSidebar } from "./useChatSidebar";
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
 
 /**
@@ -305,10 +304,19 @@ function safeDecodeURIComponent(segment: string): string {
 
 // ── Main sidebar ──────────────────────────────────────────────────────────────
 
-export default function ChatSidebar() {
+type SidebarState =
+  | { status: "loading" }
+  | { status: "error"; error: string }
+  | { status: "ready"; currentUserId: string; channels: Channel[]; dms: DMConversation[] };
+
+interface ChatSidebarProps {
+  state: SidebarState;
+  retry: () => void;
+}
+
+export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
-  const { state, retry } = useChatSidebar();
 
   // Derive active item from pathname: /chat/channel/:id or /chat/dm/:id
   // decodeURIComponent handles IDs that were encoded with encodeURIComponent on navigate.

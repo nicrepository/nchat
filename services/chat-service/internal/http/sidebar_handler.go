@@ -43,9 +43,10 @@ type sidebarDMJSON struct {
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
 type sidebarResponseBody struct {
-	Workspace sidebarWorkspaceJSON `json:"workspace"`
-	Channels  []sidebarChannelJSON `json:"channels"`
-	DMConvs   []sidebarDMJSON      `json:"dm_conversations"`
+	CurrentUserID string               `json:"current_user_id"`
+	Workspace     sidebarWorkspaceJSON `json:"workspace"`
+	Channels      []sidebarChannelJSON `json:"channels"`
+	DMConvs       []sidebarDMJSON      `json:"dm_conversations"`
 }
 
 // SidebarHandler handles GET /api/chat/sidebar.
@@ -85,6 +86,7 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := sidebarResponseBody{
+		CurrentUserID: userID,
 		Workspace: sidebarWorkspaceJSON{
 			ID:   data.Workspace.ID,
 			Name: data.Workspace.Name,
