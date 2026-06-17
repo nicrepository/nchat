@@ -471,9 +471,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
       <Composer
         placeholder={
-          kind === "channel"
-            ? `Mensagem para #${resolvedName}…`
-            : `Mensagem para ${resolvedName}…`
+          kind === "channel" ? `Mensagem para #${resolvedName}…` : `Mensagem para ${resolvedName}…`
         }
         disabled={state.status !== "ready"}
         onSend={handleSend}

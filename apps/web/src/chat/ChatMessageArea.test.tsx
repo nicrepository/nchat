@@ -816,7 +816,11 @@ describe("ChatMessageArea — sender display", () => {
   it("shows senderDisplayName in sender span", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
-        makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda Nicácio", senderEmail: "" }),
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "Fernanda Nicácio",
+          senderEmail: "",
+        }),
       ]),
     );
     renderChannelArea();
@@ -829,7 +833,11 @@ describe("ChatMessageArea — sender display", () => {
   it("falls back to senderEmail when senderDisplayName is empty", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
-        makeMessage({ senderId: "other-456", senderDisplayName: "", senderEmail: "fernanda@example.com" }),
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "",
+          senderEmail: "fernanda@example.com",
+        }),
       ]),
     );
     renderChannelArea();

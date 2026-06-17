@@ -18,7 +18,12 @@ type Action =
 function reducer(_state: SidebarState, action: Action): SidebarState {
   switch (action.type) {
     case "loaded":
-      return { status: "ready", currentUserId: action.currentUserId, channels: action.channels, dms: action.dms };
+      return {
+        status: "ready",
+        currentUserId: action.currentUserId,
+        channels: action.channels,
+        dms: action.dms,
+      };
     case "error":
       return { status: "error", error: action.error };
     case "reload":
