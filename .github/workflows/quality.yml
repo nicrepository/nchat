@@ -91,6 +91,9 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Run Go race tests
+        run: bash scripts/ci/go-test.sh -race
+
       - name: Test coverage
         run: pnpm test:coverage
 
