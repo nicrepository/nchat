@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -68,9 +69,9 @@ type broadcastReq struct {
 // Distributed fan-out is provided by the optional BroadcastBus (e.g. ValkeyBus).
 // When bus is NopBus, delivery is in-process only.
 //
-// All internal state (clients, subs, clientSubs) is owned exclusively by the
-// run goroutine; callers must use the exported methods or the channel-based API
-// to ensure race safety.
+// All internal state (clients, subs, clientSubs) is protected by mu. Helpers
+// that read or mutate those maps are mutex-safe and must not hold mu while
+// performing auth checks, connection I/O, or outbound queue operations.
 type Hub struct {
 	authorizer SubscriptionAuthorizer
 	bus        BroadcastBus
@@ -86,7 +87,8 @@ type Hub struct {
 	quit        chan struct{}
 	done        chan struct{}
 
-	// Owned exclusively by the run goroutine — do not access from other goroutines.
+	mu sync.RWMutex
+
 	clients    map[string]*Client             // clientID → client
 	subs       map[string]map[string]struct{} // targetKey.String() → set of clientIDs
 	clientSubs map[string]map[string]struct{} // clientID → set of targetKey strings
@@ -252,15 +254,20 @@ func (h *Hub) Shutdown() {
 	h.bus.Close() // stop subscriber goroutines; idempotent
 }
 
-// run is the hub's single background goroutine.
-// All state mutations happen here, ensuring race safety without additional locking.
+// run is the hub's main coordination goroutine.
+// Map state is still protected by h.mu so helper paths and future pumps can be
+// exercised safely without relying on single-goroutine ownership.
 func (h *Hub) run() {
 	defer close(h.done)
 	for {
 		select {
 		case req := <-h.register:
-			h.clients[req.client.id] = req.client
-			h.clientSubs[req.client.id] = make(map[string]struct{})
+			if !h.addClient(req.client) {
+				h.logger.WarnContext(context.Background(), "ws: duplicate client registration; dropping new client",
+					"client_id", req.client.id,
+				)
+				req.client.close()
+			}
 			close(req.ack)
 
 		case c := <-h.unregister:
@@ -279,7 +286,7 @@ func (h *Hub) run() {
 			h.handleBroadcast(req)
 
 		case <-h.quit:
-			for _, c := range h.clients {
+			for _, c := range h.clearClients() {
 				c.close()
 			}
 			return
@@ -399,10 +406,37 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 
 // dropClient removes a client and all its subscriptions from hub state,
 // then closes the underlying connection.
-// Must be called only from the run goroutine.
+// It does not hold h.mu while closing the underlying connection.
 func (h *Hub) dropClient(c *Client) {
-	if _, ok := h.clients[c.id]; !ok {
+	if c == nil {
 		return
+	}
+
+	removed := h.removeClient(c)
+	if removed != nil {
+		removed.close()
+	}
+}
+
+func (h *Hub) addClient(c *Client) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.clients[c.id]; exists {
+		return false
+	}
+	h.clients[c.id] = c
+	h.clientSubs[c.id] = make(map[string]struct{})
+	return true
+}
+
+func (h *Hub) removeClient(c *Client) *Client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	removed, ok := h.clients[c.id]
+	if !ok {
+		return nil
 	}
 	delete(h.clients, c.id)
 	for key := range h.clientSubs[c.id] {
@@ -414,16 +448,35 @@ func (h *Hub) dropClient(c *Client) {
 		}
 	}
 	delete(h.clientSubs, c.id)
-	c.close()
+	return removed
+}
+
+func (h *Hub) clearClients() []*Client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Snapshot clients so connection close happens after releasing h.mu.
+	clients := make([]*Client, 0, len(h.clients))
+	for _, c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.clients = make(map[string]*Client)
+	h.subs = make(map[string]map[string]struct{})
+	h.clientSubs = make(map[string]map[string]struct{})
+	return clients
 }
 
 // handleSubscribe processes a subscription request.
-// Must be called only from the run goroutine.
+// Authorization is checked outside h.mu because it can perform storage I/O.
 func (h *Hub) handleSubscribe(req subscribeReq) error {
 	c := req.client
-	if _, ok := h.clients[c.id]; !ok {
+	h.mu.RLock()
+	_, registered := h.clients[c.id]
+	h.mu.RUnlock()
+	if !registered {
 		return fmt.Errorf("client not registered")
 	}
+
 	// Authorization uses only the server-asserted client identity.
 	ok, err := h.authorizer.CanAccess(req.ctx, c.userID, c.workspaceID, req.targetType, req.targetID)
 	if err != nil {
@@ -432,7 +485,16 @@ func (h *Hub) handleSubscribe(req subscribeReq) error {
 	if !ok {
 		return ErrSubscribeForbidden
 	}
+
 	key := targetKey{workspaceID: c.workspaceID, targetType: req.targetType, targetID: req.targetID}.String()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, registered := h.clients[c.id]; !registered {
+		return fmt.Errorf("client not registered")
+	}
+	// The target set is created lazily on first subscription; clientSubs is
+	// initialized by addClient before a client can subscribe.
 	if h.subs[key] == nil {
 		h.subs[key] = make(map[string]struct{})
 	}
@@ -454,7 +516,8 @@ func (h *Hub) handleSubscribe(req subscribeReq) error {
 //   - any auth error          → skip delivery for this client; subscription kept.
 //     A transient DB error must not unsubscribe an authorized client.
 //
-// Must be called only from the run goroutine.
+// It snapshots subscribers under h.mu, then performs auth checks and enqueue
+// operations without holding h.mu.
 func (h *Hub) handleBroadcast(req broadcastReq) {
 	if req.done != nil {
 		defer close(req.done)
@@ -466,14 +529,13 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 		targetID:    req.event.TargetID,
 	}.String()
 
-	subs := h.subs[key]
-	if len(subs) == 0 {
+	clients := h.broadcastSnapshot(key)
+	if len(clients) == 0 {
 		return
 	}
 
-	for clientID := range subs {
-		c, ok := h.clients[clientID]
-		if !ok {
+	for _, c := range clients {
+		if !h.isSubscribed(c.id, key) {
 			continue
 		}
 
@@ -496,11 +558,7 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 
 		if !allowed {
 			// Definitive revocation: access denied with no error.
-			delete(subs, clientID)
-			delete(h.clientSubs[clientID], key)
-			if len(subs) == 0 {
-				delete(h.subs, key)
-			}
+			h.revokeSubscription(c.id, key)
 			h.logger.DebugContext(context.Background(), "ws: subscription revoked on broadcast",
 				"user_id", c.userID,
 				"target_type", string(req.event.TargetType),
@@ -516,4 +574,51 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 			h.dropClient(c)
 		}
 	}
+}
+
+func (h *Hub) broadcastSnapshot(key string) []*Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	subs := h.subs[key]
+	if len(subs) == 0 {
+		return nil
+	}
+
+	clients := make([]*Client, 0, len(subs))
+	for clientID := range subs {
+		if c, ok := h.clients[clientID]; ok {
+			clients = append(clients, c)
+		}
+	}
+	return clients
+}
+
+func (h *Hub) revokeSubscription(clientID, key string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if set, ok := h.subs[key]; ok {
+		delete(set, clientID)
+		if len(set) == 0 {
+			delete(h.subs, key)
+		}
+	}
+	if clientSubs, ok := h.clientSubs[clientID]; ok {
+		delete(clientSubs, key)
+	}
+}
+
+func (h *Hub) isSubscribed(clientID, key string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if _, ok := h.clients[clientID]; !ok {
+		return false
+	}
+	if clientSubs, ok := h.clientSubs[clientID]; ok {
+		_, ok = clientSubs[key]
+		return ok
+	}
+	return false
 }
