@@ -101,9 +101,45 @@ func newTestHub(auth SubscriptionAuthorizer) *Hub {
 }
 
 // registerInHub adds a client to hub state directly, as if Register had been called.
-func registerInHub(h *Hub, c *Client) {
-	h.clients[c.id] = c
-	h.clientSubs[c.id] = make(map[string]struct{})
+func registerInHub(t *testing.T, h *Hub, c *Client) {
+	t.Helper()
+	if !h.addClient(c) {
+		t.Fatalf("register client %q: duplicate client ID", c.id)
+	}
+}
+
+func hubHasClient(h *Hub, clientID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.clients[clientID]
+	return ok
+}
+
+func hubGetClient(h *Hub, clientID string) *Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.clients[clientID]
+}
+
+func hubHasClientSubs(h *Hub, clientID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.clientSubs[clientID]
+	return ok
+}
+
+func hubHasSubscription(h *Hub, key, clientID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.subs[key][clientID]
+	return ok
+}
+
+func hubHasSubscriptionTarget(h *Hub, key string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.subs[key]
+	return ok
 }
 
 func makeEvent(workspaceID string, tt TargetType, targetID, messageID string) (Event, []byte) {
@@ -139,13 +175,37 @@ func TestHub_Register_TracksClient(t *testing.T) {
 	h := newTestHub(&fakeAuthorizer{})
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 
-	if _, ok := h.clients["c1"]; !ok {
+	if !hubHasClient(h, "c1") {
 		t.Fatal("client should be tracked after register")
 	}
-	if _, ok := h.clientSubs["c1"]; !ok {
+	if !hubHasClientSubs(h, "c1") {
 		t.Fatal("clientSubs entry should exist after register")
+	}
+}
+
+func TestHub_Register_DuplicateClientID_DropsNewClient(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-inst")
+	defer hub.Shutdown()
+
+	originalSender := &fakeSender{}
+	duplicateSender := &fakeSender{}
+	original := newClient("c1", "user-1", "ws-1", originalSender)
+	duplicate := newClient("c1", "user-2", "ws-1", duplicateSender)
+
+	hub.Register(original)
+	hub.Register(duplicate)
+
+	if originalSender.isClosed() {
+		t.Fatal("original client must remain connected after duplicate registration")
+	}
+	if !duplicateSender.isClosed() {
+		t.Fatal("duplicate client must be closed instead of panicking")
+	}
+
+	if got := hubGetClient(hub, "c1"); got != original {
+		t.Fatal("duplicate registration must not replace existing client")
 	}
 }
 
@@ -156,24 +216,24 @@ func TestHub_Unregister_RemovesClientAndSubscriptions(t *testing.T) {
 	h := newTestHub(auth)
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	// Verify subscription was recorded.
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
-	if _, ok := h.subs[key]["c1"]; !ok {
+	if !hubHasSubscription(h, key, "c1") {
 		t.Fatal("subscription should exist before unregister")
 	}
 
 	h.dropClient(c)
 
-	if _, ok := h.clients["c1"]; ok {
+	if hubHasClient(h, "c1") {
 		t.Fatal("client should be removed after unregister")
 	}
-	if _, ok := h.subs[key]; ok {
+	if hubHasSubscriptionTarget(h, key) {
 		t.Fatal("subscription entry should be cleaned up after unregister")
 	}
-	if _, ok := h.clientSubs["c1"]; ok {
+	if hubHasClientSubs(h, "c1") {
 		t.Fatal("clientSubs entry should be cleaned up after unregister")
 	}
 }
@@ -193,7 +253,7 @@ func TestHub_Subscribe_Allowed_AddsSubscription(t *testing.T) {
 	h := newTestHub(auth)
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 
 	req := subscribeReq{
 		ctx:        context.Background(),
@@ -207,7 +267,7 @@ func TestHub_Subscribe_Allowed_AddsSubscription(t *testing.T) {
 	}
 
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-pub"}.String()
-	if _, ok := h.subs[key]["c1"]; !ok {
+	if !hubHasSubscription(h, key, "c1") {
 		t.Fatal("subscription should exist after allowed subscribe")
 	}
 }
@@ -218,7 +278,7 @@ func TestHub_Subscribe_Denied_ReturnsForbidden(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 
 	req := subscribeReq{
 		ctx:        context.Background(),
@@ -239,11 +299,11 @@ func TestHub_Subscribe_DM_Allowed(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeDM, "dm-1")
 
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeDM, targetID: "dm-1"}.String()
-	if _, ok := h.subs[key]["c1"]; !ok {
+	if !hubHasSubscription(h, key, "c1") {
 		t.Fatal("DM subscription should exist")
 	}
 }
@@ -251,7 +311,7 @@ func TestHub_Subscribe_DM_Allowed(t *testing.T) {
 func TestHub_Subscribe_DM_NotMember_Denied(t *testing.T) {
 	h := newTestHub(&fakeAuthorizer{})
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 
 	req := subscribeReq{
 		ctx:        context.Background(),
@@ -270,7 +330,7 @@ func TestHub_Subscribe_PrivateChannel_NonMember_Denied_NonEnumerating(t *testing
 	// so callers cannot enumerate whether the channel exists.
 	h := newTestHub(&fakeAuthorizer{})
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 
 	req := subscribeReq{
 		ctx:        context.Background(),
@@ -311,7 +371,7 @@ func TestHub_Broadcast_DeliversToSubscriber(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	evt, data := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-1")
@@ -329,7 +389,7 @@ func TestHub_Broadcast_DoesNotDeliverToUnsubscribed(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	// Client is registered but NOT subscribed to ch-1.
 
 	evt, data := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-1")
@@ -347,7 +407,7 @@ func TestHub_Broadcast_AuthRevoked_AfterSubscribe_NoDelivery(t *testing.T) {
 	h := newTestHub(auth)
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	// Revoke access (e.g., user removed from channel or workspace).
@@ -362,7 +422,7 @@ func TestHub_Broadcast_AuthRevoked_AfterSubscribe_NoDelivery(t *testing.T) {
 
 	// Subscription should also be removed.
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
-	if _, ok := h.subs[key]; ok {
+	if hubHasSubscriptionTarget(h, key) {
 		t.Fatal("subscription should be removed after auth revocation")
 	}
 }
@@ -376,7 +436,7 @@ func TestHub_Broadcast_StaleDMMembership_NoDelivery(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeDM, "dm-1")
 
 	// Simulate DM membership becoming stale.
@@ -404,7 +464,7 @@ func TestHub_Broadcast_SlowClient_DropsConnection(t *testing.T) {
 	h := newTestHub(auth)
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	// Fill outbox to capacity.
@@ -418,14 +478,14 @@ func TestHub_Broadcast_SlowClient_DropsConnection(t *testing.T) {
 	evt, data := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-overflow")
 	h.handleBroadcast(broadcastReq{event: evt, data: data})
 
-	if _, ok := h.clients["c1"]; ok {
+	if hubHasClient(h, "c1") {
 		t.Fatal("slow client should be removed from hub after overflow")
 	}
 	if !snd.isClosed() {
 		t.Fatal("slow client connection should be closed after overflow")
 	}
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
-	if _, ok := h.subs[key]; ok {
+	if hubHasSubscriptionTarget(h, key) {
 		t.Fatal("slow client subscriptions should be cleaned up after drop")
 	}
 }
@@ -438,7 +498,7 @@ func TestHub_Broadcast_SlowClient_HubNotBlocked(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	for i := 0; i < outboxSize; i++ {
@@ -469,12 +529,12 @@ func TestHub_Broadcast_MultipleSubscribers_OnlyAuthorized(t *testing.T) {
 
 	sndA := &fakeSender{}
 	cA := newClient("cA", "allowed", "ws-1", sndA)
-	registerInHub(h, cA)
+	registerInHub(t, h, cA)
 	mustSubscribe(t, h, cA, TargetTypeChannel, "ch-1")
 
 	sndD := &fakeSender{}
 	cD := newClient("cD", "denied", "ws-1", sndD)
-	registerInHub(h, cD)
+	registerInHub(t, h, cD)
 	// cD subscribes while allowed; then revoked before broadcast.
 	auth.setAccess("denied", "ws-1", TargetTypeChannel, "ch-1", true)
 	mustSubscribe(t, h, cD, TargetTypeChannel, "ch-1")
@@ -517,7 +577,7 @@ func TestHub_Subscribe_CrossWorkspace_DeniedByServerIdentity(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-2", &fakeSender{}) // client is in ws-2
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 
 	req := subscribeReq{
 		ctx:        context.Background(),
@@ -577,6 +637,45 @@ func TestHub_Concurrent_RegisterSubscribeBroadcast_NoRace(t *testing.T) {
 	wg.Wait()
 }
 
+func TestHub_ConcurrentBroadcastAndUnregister_NoRace(t *testing.T) {
+	// This test validates the map locking contract when run with -race.
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
+
+	h := newTestHub(auth)
+	clients := make([]*Client, 64)
+	for i := range clients {
+		c := newClient(fmt.Sprintf("c%d", i), "user-1", "ws-1", &fakeSender{})
+		registerInHub(t, h, c)
+		mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
+		clients[i] = c
+	}
+
+	evt, data := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-1")
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 200; i++ {
+			h.handleBroadcast(broadcastReq{event: evt, data: data})
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-start
+		for _, c := range clients {
+			h.dropClient(c)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+}
+
 func TestHub_Shutdown_ClosesAllClients(t *testing.T) {
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-inst")
 
@@ -609,7 +708,7 @@ func TestHub_Broadcast_AuthError_SkipsDeliveryKeepsSubscription(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	// Simulate a transient auth error.
@@ -625,7 +724,7 @@ func TestHub_Broadcast_AuthError_SkipsDeliveryKeepsSubscription(t *testing.T) {
 
 	// Subscription must be kept.
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
-	if _, ok := h.subs[key]["c1"]; !ok {
+	if !hubHasSubscription(h, key, "c1") {
 		t.Fatal("subscription must be kept after transient auth error")
 	}
 }
@@ -637,7 +736,7 @@ func TestHub_Broadcast_AuthError_ThenRecovery_Delivers(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	// First broadcast: auth error → no delivery, sub kept.
@@ -665,7 +764,7 @@ func TestHub_Broadcast_TransientAuthError_KeepsSubscription(t *testing.T) {
 
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(h, c)
+	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
 
 	// handleBroadcast uses its own bounded background context for re-checks.
@@ -674,7 +773,7 @@ func TestHub_Broadcast_TransientAuthError_KeepsSubscription(t *testing.T) {
 
 	// Subscription must still exist; transient error is not a revocation.
 	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
-	if _, ok := h.subs[key]["c1"]; !ok {
+	if !hubHasSubscription(h, key, "c1") {
 		t.Fatal("subscription must not be revoked on transient auth error")
 	}
 }
