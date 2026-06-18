@@ -28,7 +28,9 @@ import (
 //  5. Create a Client with newClient(id, userID, workspaceID, wsSender{conn}).
 //  6. Call hub.Register(client).
 //  7. Defer hub.Unregister(client) and conn.Close.
-//  8. Start read pump goroutine (handles subscribe/unsubscribe/ping control messages).
+//  8. Start read pump goroutine: reads ClientMessage frames, calls
+//     hub.handleClientMessage for each (records presence activity and dispatches
+//     subscribe/unsubscribe/ping).
 //
 // # Security invariants (enforced now; must remain enforced after upgrade)
 //

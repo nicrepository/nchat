@@ -64,6 +64,19 @@ type broadcastReq struct {
 	done chan struct{}
 }
 
+// HubOption is a functional option for NewHub.
+type HubOption func(*Hub)
+
+// WithPresence attaches a PresenceTracker to the Hub. When set, the Hub
+// calls Connect on register and Disconnect on unregister so that presence
+// state stays in sync with WebSocket lifecycle events.
+//
+// The caller retains ownership of the PresenceTracker and is responsible
+// for calling its Stop method after Hub.Shutdown returns.
+func WithPresence(p *PresenceTracker) HubOption {
+	return func(h *Hub) { h.presence = p }
+}
+
 // Hub manages all active WebSocket connections for a single chat-service instance.
 //
 // Distributed fan-out is provided by the optional BroadcastBus (e.g. ValkeyBus).
@@ -78,6 +91,8 @@ type Hub struct {
 	instanceID string
 	logger     *slog.Logger
 	busCancel  context.CancelFunc
+
+	presence *PresenceTracker // optional; nil-safe throughout
 
 	register    chan registerReq
 	unregister  chan *Client
@@ -103,8 +118,10 @@ type Hub struct {
 // echo-suppression of self-published events on the bus. If empty, a UUID
 // is generated automatically.
 //
+// opts may include WithPresence to attach a PresenceTracker.
+//
 // Call Shutdown to stop the hub gracefully.
-func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus BroadcastBus, instanceID string) *Hub {
+func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus BroadcastBus, instanceID string, opts ...HubOption) *Hub {
 	if instanceID == "" {
 		instanceID = uuid.New().String()
 	}
@@ -125,6 +142,9 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 		clients:     make(map[string]*Client),
 		subs:        make(map[string]map[string]struct{}),
 		clientSubs:  make(map[string]map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(h)
 	}
 	h.bus.Subscribe(busCtx, h.handleRemoteBusEvent)
 	go h.run()
@@ -267,6 +287,9 @@ func (h *Hub) run() {
 					"client_id", req.client.id,
 				)
 				req.client.close()
+			} else if h.presence != nil {
+				// Connect is called after addClient releases h.mu — no lock held.
+				h.presence.Connect(req.client.workspaceID, req.client.userID, req.client.id)
 			}
 			close(req.ack)
 
@@ -286,8 +309,14 @@ func (h *Hub) run() {
 			h.handleBroadcast(req)
 
 		case <-h.quit:
+			// clearClients removes all clients from hub state and returns a snapshot.
+			// close() and Disconnect() are called after the lock is released, so
+			// neither is ever invoked while h.mu is held.
 			for _, c := range h.clearClients() {
 				c.close()
+				if h.presence != nil {
+					h.presence.Disconnect(c.workspaceID, c.userID, c.id)
+				}
 			}
 			return
 		}
@@ -415,6 +444,10 @@ func (h *Hub) dropClient(c *Client) {
 	removed := h.removeClient(c)
 	if removed != nil {
 		removed.close()
+		if h.presence != nil {
+			// Disconnect is called after removeClient releases h.mu — no lock held.
+			h.presence.Disconnect(removed.workspaceID, removed.userID, removed.id)
+		}
 	}
 }
 
@@ -574,6 +607,44 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 			h.dropClient(c)
 		}
 	}
+}
+
+// handleClientMessage processes a single inbound control message from a WebSocket
+// client. This is the entry point the read pump calls for every frame received
+// from the client.
+//
+// Package-private by design: the read pump must live inside package ws so that
+// it can access unexported Client fields (workspaceID, userID, id) directly.
+// Those fields are server-asserted at connection time; nothing from the msg
+// payload should ever be used to identify the caller.
+//
+// Every message is treated as activity and refreshes the client's presence timer,
+// transitioning away → online if needed.
+//
+// No Hub lock or Presence lock is held on entry; each subordinate call acquires
+// its own lock as needed.
+//
+// TODO(presence-broadcast): once a presence event type is defined in event.go,
+// emit a workspace-scoped transition event when status changes away → online.
+func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMessage) error {
+	// Record activity — any inbound frame is evidence the client is present.
+	// RecordActivity uses PresenceTracker.mu; Hub.mu is not held.
+	if h.presence != nil {
+		h.presence.RecordActivity(c.workspaceID, c.userID, c.id)
+	}
+
+	switch msg.Type {
+	case ClientMessageTypeSubscribe:
+		return h.Subscribe(ctx, c, msg.TargetType, msg.TargetID)
+	case ClientMessageTypeUnsubscribe:
+		key := targetKey{workspaceID: c.workspaceID, targetType: msg.TargetType, targetID: msg.TargetID}.String()
+		h.revokeSubscription(c.id, key)
+	case ClientMessageTypePing:
+		// Activity already recorded above; nothing else to do.
+	default:
+		return fmt.Errorf("ws: unknown client message type %q", msg.Type)
+	}
+	return nil
 }
 
 func (h *Hub) broadcastSnapshot(key string) []*Client {
