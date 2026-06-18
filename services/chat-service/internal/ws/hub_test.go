@@ -27,6 +27,15 @@ func (f *fakeSender) Send(_ []byte) error {
 	return nil
 }
 
+func (f *fakeSender) Ping(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return errors.New("connection closed")
+	}
+	return nil
+}
+
 func (f *fakeSender) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -153,6 +162,23 @@ func makeEvent(workspaceID string, tt TargetType, targetID, messageID string) (E
 	}
 	data, _ := json.Marshal(evt)
 	return evt, data
+}
+
+// eventually polls condition until it returns true or timeout elapses.
+// It is the canonical polling helper for hub-state assertions that are
+// inherently asynchronous: hub.Unregister is a non-blocking channel send
+// processed by the hub run goroutine, so hub state may not yet reflect the
+// unregister when the calling goroutine checks immediately after pump exit.
+func eventually(t *testing.T, condition func() bool, timeout time.Duration, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s: %s", timeout, msg)
 }
 
 func mustSubscribe(t *testing.T, h *Hub, c *Client, tt TargetType, targetID string) {

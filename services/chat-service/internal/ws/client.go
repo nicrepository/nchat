@@ -1,17 +1,33 @@
 package ws
 
-import "sync"
+import (
+	"context"
+	"log/slog"
+	"sync"
+)
 
 // outboxSize is the maximum number of JSON-encoded events buffered per client.
 // On overflow the client is dropped immediately; this bounds per-connection memory.
 const outboxSize = 256
 
 // sender abstracts the write side of a WebSocket connection.
-// The production implementation wraps coder/websocket; tests use fakeSender.
+//
+// Concurrency: all methods MUST be safe for concurrent use from multiple
+// goroutines. writePump calls Send exclusively from its goroutine;
+// startHeartbeat calls Ping exclusively from its goroutine; and dropClient
+// may call Close from the hub run goroutine at teardown, overlapping with
+// an in-progress Send or Ping. Implementations must handle this safely.
+// coder/websocket satisfies this requirement natively.
+// Test implementations must use a mutex (see controllableSender, fakeSender).
 type sender interface {
 	// Send transmits data to the remote end. Must not block indefinitely.
 	Send(data []byte) error
-	// Close terminates the underlying connection.
+	// Ping sends a WebSocket ping frame and waits for the pong reply.
+	// ctx limits the wait; a timeout or cancellation returns a non-nil error.
+	// Used by startHeartbeat to detect dead connections.
+	Ping(ctx context.Context) error
+	// Close terminates the underlying connection. Safe to call concurrently
+	// with Send or Ping; the connection is closed exactly once.
 	Close()
 }
 
@@ -58,4 +74,44 @@ func (c *Client) close() {
 	c.closeOnce.Do(func() {
 		c.snd.Close()
 	})
+}
+
+// writePump drains c.outbox and forwards each message to the underlying
+// connection via c.snd.Send. It must run in a dedicated goroutine.
+//
+// When used via startConnectionPumps, the wrapper goroutine's deferred
+// connCancel propagates any exit — fatal or clean — to the sibling
+// startHeartbeat goroutine so it stops promptly.
+//
+// On a send error hub.Unregister(c) (deferred) triggers the full cleanup
+// chain (removeClient → close → presence.Disconnect). Additionally, c.close()
+// is called eagerly so that any in-progress Ping in the sibling startHeartbeat
+// goroutine receives an immediate connection-closed error rather than blocking
+// until the ping timeout. On ctx cancellation hub.Unregister is still called
+// via the defer, and c.close() is not called again (idempotent via sync.Once).
+//
+// Lock ordering: c.snd.Send is never called while hub.mu is held; writePump
+// always runs outside the hub run goroutine, so this invariant holds.
+func (c *Client) writePump(ctx context.Context, hub *Hub, logger *slog.Logger) {
+	defer hub.Unregister(c)
+	for {
+		select {
+		case data, ok := <-c.outbox:
+			if !ok {
+				return
+			}
+			if err := c.snd.Send(data); err != nil {
+				logger.WarnContext(ctx, "ws: send error; dropping client",
+					"client_id", c.id,
+				)
+				// Close the underlying connection immediately so that any
+				// in-progress Ping in the sibling heartbeat goroutine fails
+				// fast rather than blocking until the ping timeout.
+				c.close()
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }

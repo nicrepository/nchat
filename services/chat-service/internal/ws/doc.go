@@ -8,6 +8,9 @@
 //   - Bounded per-client outbound queue; slow clients are dropped deterministically.
 //   - ServeWS handler is a stub (returns 501); WS upgrade is deferred until an
 //     authenticated request context pattern is available in chat-service.
+//   - writePump, startHeartbeat, and startConnectionPumps are implemented as
+//     ready-to-use infrastructure. They will be wired to ServeWS once the handler
+//     leaves stub mode and the authenticated context pattern is in place.
 //
 // # Out of scope
 //
