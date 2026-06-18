@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"context"
 	"sync"
 	"testing"
 )
@@ -82,5 +83,6 @@ type countingCloseSender struct {
 	onClose func()
 }
 
-func (s *countingCloseSender) Send(_ []byte) error { return nil }
-func (s *countingCloseSender) Close()              { s.onClose() }
+func (s *countingCloseSender) Send(_ []byte) error          { return nil }
+func (s *countingCloseSender) Ping(_ context.Context) error { return nil }
+func (s *countingCloseSender) Close()                       { s.onClose() }
