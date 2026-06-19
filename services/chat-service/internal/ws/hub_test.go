@@ -117,6 +117,13 @@ func registerInHub(t *testing.T, h *Hub, c *Client) {
 	}
 }
 
+func registerInRunningHub(t *testing.T, h *Hub, c *Client) {
+	t.Helper()
+	if !h.Register(c) {
+		t.Fatalf("register client %q: hub rejected registration", c.id)
+	}
+}
+
 func hubHasClient(h *Hub, clientID string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -220,8 +227,12 @@ func TestHub_Register_DuplicateClientID_DropsNewClient(t *testing.T) {
 	original := newClient("c1", "user-1", "ws-1", originalSender)
 	duplicate := newClient("c1", "user-2", "ws-1", duplicateSender)
 
-	hub.Register(original)
-	hub.Register(duplicate)
+	if !hub.Register(original) {
+		t.Fatal("original client registration should succeed")
+	}
+	if hub.Register(duplicate) {
+		t.Fatal("duplicate client registration should report failure")
+	}
 
 	if originalSender.isClosed() {
 		t.Fatal("original client must remain connected after duplicate registration")
@@ -232,6 +243,24 @@ func TestHub_Register_DuplicateClientID_DropsNewClient(t *testing.T) {
 
 	if got := hubGetClient(hub, "c1"); got != original {
 		t.Fatal("duplicate registration must not replace existing client")
+	}
+}
+
+func TestHub_RegisterAfterShutdown_ReturnsFalse(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-inst")
+	hub.Shutdown()
+
+	snd := &fakeSender{}
+	c := newClient("after-shutdown", "user-1", "ws-1", snd)
+
+	if hub.Register(c) {
+		t.Fatal("registration must fail when hub is already shut down")
+	}
+	if hubHasClient(hub, "after-shutdown") {
+		t.Fatal("client must not be tracked after failed registration")
+	}
+	if snd.isClosed() {
+		t.Fatal("Hub.Register should only report failure; connection cleanup belongs to caller")
 	}
 }
 
@@ -631,7 +660,7 @@ func TestHub_Register_ThenSubscribe_AlwaysSucceeds(t *testing.T) {
 	const iterations = 50
 	for i := 0; i < iterations; i++ {
 		c := newClient(fmt.Sprintf("c%d", i), "user-1", "ws-1", &fakeSender{})
-		hub.Register(c) // synchronous: client is in hub state when this returns
+		registerInRunningHub(t, hub, c) // synchronous: client is in hub state when this returns
 		err := hub.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1")
 		if err != nil {
 			t.Fatalf("iteration %d: Subscribe after Register must not fail, got: %v", i, err)
@@ -654,7 +683,7 @@ func TestHub_Concurrent_RegisterSubscribeBroadcast_NoRace(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			c := newClient(fmt.Sprintf("c%d", n), "user-1", "ws-1", &fakeSender{})
-			hub.Register(c) // synchronous: safe to Subscribe immediately after
+			registerInRunningHub(t, hub, c) // synchronous: safe to Subscribe immediately after
 			_ = hub.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1")
 			hub.PublishMessageCreated(context.Background(), "ws-1", TargetTypeChannel, "ch-1", fmt.Sprintf("msg-%d", n))
 			hub.Unregister(c)
@@ -710,8 +739,8 @@ func TestHub_Shutdown_ClosesAllClients(t *testing.T) {
 	c1 := newClient("c1", "u1", "ws-1", snd1)
 	c2 := newClient("c2", "u2", "ws-1", snd2)
 	// Register is synchronous; both clients are in hub state when Shutdown runs.
-	hub.Register(c1)
-	hub.Register(c2)
+	registerInRunningHub(t, hub, c1)
+	registerInRunningHub(t, hub, c2)
 
 	hub.Shutdown()
 

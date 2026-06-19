@@ -1,20 +1,36 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/nicrepository/nchat/libs/go/platform/health"
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
 )
 
+const (
+	routerTestIssuer    = "nchat-auth"
+	routerTestAudience  = "nchat-api"
+	routerTestUserID    = "router-user"
+	routerTestSessionID = "b1e2c3d4-0000-0000-0000-000000000001"
+)
+
+type allowRouterSessionValidator struct{}
+
+func (allowRouterSessionValidator) ValidateActiveSession(_ context.Context, _, _ string) error {
+	return nil
+}
+
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -43,7 +59,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -71,7 +87,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -89,7 +105,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
 
 	tests := []struct {
 		name   string
@@ -183,7 +199,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil))
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -195,4 +211,51 @@ func TestMetricsRouteReturns200(t *testing.T) {
 	if body == "" {
 		t.Fatal("expected non-empty metrics body")
 	}
+}
+
+func TestNewRouter_NilWSHandlerReturns503AfterAuth(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	router := NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		validator,
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		NewMessageHandler(nil, nil),
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, RouteWS, nil)
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, req)
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+}
+
+func routerTestSigningKey() string {
+	return strings.Repeat("r", 40)
+}
+
+func makeRouterTestToken(t *testing.T) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"sub": routerTestUserID,
+		"sid": routerTestSessionID,
+		"iss": routerTestIssuer,
+		"aud": jwt.ClaimStrings{routerTestAudience},
+		"iat": time.Now().Unix(),
+		"nbf": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"jti": "router-test-token",
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(routerTestSigningKey()))
+	if err != nil {
+		t.Fatalf("sign router test token: %v", err)
+	}
+	return token
 }

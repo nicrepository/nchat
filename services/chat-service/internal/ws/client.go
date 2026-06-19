@@ -93,6 +93,7 @@ func (c *Client) close() {
 // Lock ordering: c.snd.Send is never called while hub.mu is held; writePump
 // always runs outside the hub run goroutine, so this invariant holds.
 func (c *Client) writePump(ctx context.Context, hub *Hub, logger *slog.Logger) {
+	logger = normalizeLogger(logger)
 	defer hub.Unregister(c)
 	for {
 		select {

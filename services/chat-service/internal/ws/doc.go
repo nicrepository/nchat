@@ -1,32 +1,36 @@
 // Package ws implements an in-process WebSocket hub for chat-service.
 //
-// # Scope (this PR)
+// # Current state
 //
+//   - ServeWS performs a real WebSocket upgrade using github.com/coder/websocket.
+//   - Authentication is enforced server-side via BearerAuth middleware context;
+//     clients never provide their own identity or workspaceID.
+//   - Credentials in URL query strings are rejected case-insensitively before upgrade.
+//   - Per-user connection limits are enforced before upgrade (429 on excess).
+//   - writePump, startHeartbeat, and startConnectionPumps are wired to ServeWS.
+//   - PresenceTracker is attached via WithPresence; presence updates on connect/disconnect.
 //   - In-process hub only; no distributed fan-out (Valkey/pub-sub is future scope).
 //   - Subscription authorization for channels and DM conversations.
-//   - Authorization is re-checked before every broadcast delivery to protect against stale membership.
+//   - Authorization is re-checked before every broadcast delivery.
 //   - Bounded per-client outbound queue; slow clients are dropped deterministically.
-//   - ServeWS handler is a stub (returns 501); WS upgrade is deferred until an
-//     authenticated request context pattern is available in chat-service.
-//   - writePump, startHeartbeat, and startConnectionPumps are implemented as
-//     ready-to-use infrastructure. They will be wired to ServeWS once the handler
-//     leaves stub mode and the authenticated context pattern is in place.
+//   - Inbound message rate limiting (token bucket) and invalid-message flood protection
+//     are applied per connection in the read loop using HandlerConfig limits.
 //
-// # Out of scope
+// # Out of scope (future work)
 //
-//   - Notifications, presence, typing indicators.
+//   - Browser reconnect / exponential backoff.
+//   - Scroll-infinite pagination and cursor-based history.
+//   - Presence broadcast to other clients.
 //   - End-to-end encryption / MLS key service.
 //   - Valkey or any distributed pub-sub.
-//   - Frontend integration.
-//   - Sending chat messages over WebSocket (deferred; prefer HTTP REST for writes).
+//   - Sending chat messages over WebSocket (prefer HTTP REST for writes).
 //
-// # Auth and origin assumptions
+// # Auth invariants (permanent)
 //
-//   - The WS handler MUST NOT upgrade unauthenticated connections.
-//   - Access tokens MUST NOT be passed in query strings; cookie or header only.
-//   - Origin validation MUST be enforced before websocket.Accept is called.
-//   - Refresh tokens MUST NOT be used for WebSocket auth.
-//   - All of the above are enforced once the handler is fully implemented.
+//   - The WS handler never upgrades unauthenticated connections.
+//   - Access tokens must never appear in query strings; Authorization header only.
+//   - Origin validation is handled by coder/websocket defaults (Origin == Host).
+//   - Refresh tokens must not be used for WebSocket auth.
 //
 // # Backpressure / slow client policy
 //

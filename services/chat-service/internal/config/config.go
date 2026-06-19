@@ -4,6 +4,7 @@ import (
 	"regexp"
 
 	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
 const (
@@ -53,23 +54,46 @@ type Config struct {
 	// Generated automatically at startup if not set via WS_INSTANCE_ID or if
 	// the configured value fails validation (non-empty, ≤64 chars, [A-Za-z0-9._-]).
 	WSInstanceID string
+
+	// WebSocket resource controls. Values are loaded from:
+	// WS_MAX_CONNECTIONS_PER_USER, WS_INBOUND_MESSAGES_PER_MINUTE,
+	// WS_INBOUND_BURST, and WS_MAX_INVALID_MESSAGES.
+	// Missing, non-integer, zero, or negative values fall back to the safe
+	// defaults from ws.DefaultHandlerConfig().
+	WSMaxConnectionsPerUser    int
+	WSInboundMessagesPerMinute int
+	WSInboundBurst             int
+	WSMaxInvalidMessages       int
 }
 
 func Load() Config {
+	wsDefaults := ws.DefaultHandlerConfig()
 	return Config{
-		ServiceName:              serviceName,
-		Env:                      platformconfig.GetString("APP_ENV", "development"),
-		Port:                     platformconfig.GetInt("PORT", defaultPort),
-		ReadHeaderTimeoutSeconds: platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
-		DatabaseURL:              platformconfig.GetString("DATABASE_URL", ""),
-		DBConnectTimeoutSeconds:  platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
-		AuthJWTHMACSecret:        platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
-		AuthJWTIssuer:            platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
-		AuthJWTAudience:          platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
-		ValkeyURL:                platformconfig.GetString("VALKEY_URL", ""),
-		ValkeyWSBroadcastEnabled: platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
-		WSInstanceID:             sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		ServiceName:                serviceName,
+		Env:                        platformconfig.GetString("APP_ENV", "development"),
+		Port:                       platformconfig.GetInt("PORT", defaultPort),
+		ReadHeaderTimeoutSeconds:   platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
+		DatabaseURL:                platformconfig.GetString("DATABASE_URL", ""),
+		DBConnectTimeoutSeconds:    platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
+		AuthJWTHMACSecret:          platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthJWTIssuer:              platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
+		AuthJWTAudience:            platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
+		ValkeyURL:                  platformconfig.GetString("VALKEY_URL", ""),
+		ValkeyWSBroadcastEnabled:   platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
+		WSInstanceID:               sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		WSMaxConnectionsPerUser:    getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
+		WSInboundMessagesPerMinute: getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
+		WSInboundBurst:             getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
+		WSMaxInvalidMessages:       getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
 	}
+}
+
+func getPositiveInt(key string, fallback int) int {
+	value := platformconfig.GetInt(key, fallback)
+	if value <= 0 {
+		return fallback
+	}
+	return value
 }
 
 // sanitizeWSInstanceID returns id if it passes validation, or empty string to

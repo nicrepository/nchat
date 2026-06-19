@@ -178,7 +178,7 @@ func TestHeartbeat_DropsClientOnPingFailure(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-hb-fail", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	snd.setNextPingError(errors.New("ping timeout"))
 
@@ -199,6 +199,27 @@ func TestHeartbeat_DropsClientOnPingFailure(t *testing.T) {
 	eventually(t, func() bool { return !hubHasClient(hub, "c-hb-fail") }, 2*time.Second, "client removed from hub after ping failure")
 }
 
+func TestHeartbeat_NilLoggerPingFailureDoesNotPanic(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, nil, NopBus{}, "test-inst")
+	defer hub.Shutdown()
+
+	snd := &controllableSender{}
+	c := newClient("c-hb-nil-logger", "u1", "ws1", snd)
+	registerInRunningHub(t, hub, c)
+	snd.setNextPingError(errors.New("ping timeout"))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		startHeartbeat(context.Background(), c, hub, nil, time.Millisecond, 5*time.Millisecond)
+	}()
+
+	awaitGoroutineExit(t, done, "heartbeat")
+	if !snd.isClosed() {
+		t.Fatal("connection should be closed after ping failure with nil logger")
+	}
+}
+
 // TestHeartbeat_SuccessfulPingsKeepClientRegistered verifies that successful
 // pings do not drop the client. Uses a ping notification channel to observe
 // at least one real Ping call before asserting.
@@ -210,7 +231,7 @@ func TestHeartbeat_SuccessfulPingsKeepClientRegistered(t *testing.T) {
 	snd := &controllableSender{}
 	snd.setPingNotifyCh(pingSignal)
 	c := newClient("c-hb-ok", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -242,7 +263,7 @@ func TestHeartbeat_ExitsOnContextCancelWithoutDroppingClient(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-hb-cancel", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately before ticker ever fires
@@ -272,7 +293,7 @@ func TestHeartbeat_ContextCancelDuringPingExitsCleanly(t *testing.T) {
 	pingBlock := make(chan struct{})
 	snd := &blockingSender{block: pingBlock, started: make(chan struct{})}
 	c := newClient("c-hb-ctxcancel", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -308,7 +329,7 @@ func TestConnectionPumps_PingFailureCancelsBoth(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-lc", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	snd.setNextPingError(errors.New("ping timeout"))
 
@@ -330,7 +351,7 @@ func TestConnectionPumps_SendErrorCancelsHeartbeat(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-lc-send", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	// Close before starting pumps so the first Send fails.
 	snd.Close()
@@ -348,6 +369,27 @@ func TestConnectionPumps_SendErrorCancelsHeartbeat(t *testing.T) {
 	eventually(t, func() bool { return !hubHasClient(hub, "c-lc-send") }, 2*time.Second, "client removed from hub after send error")
 }
 
+func TestConnectionPumps_NilLoggerSendErrorDoesNotPanic(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, nil, NopBus{}, "test-inst")
+	defer hub.Shutdown()
+
+	snd := &controllableSender{}
+	c := newClient("c-lc-nil-logger", "u1", "ws1", snd)
+	registerInRunningHub(t, hub, c)
+	snd.Close()
+
+	done, stop := startConnectionPumps(
+		context.Background(), c, hub, nil,
+		time.Hour, 5*time.Second,
+	)
+	defer stop()
+
+	c.enqueue([]byte(`{"type":"test"}`))
+
+	awaitGoroutineExit(t, done, "connection pumps")
+	eventually(t, func() bool { return !hubHasClient(hub, "c-lc-nil-logger") }, 2*time.Second, "client removed from hub after send error")
+}
+
 // TestConnectionPumps_CleanShutdownOnContextCancel verifies that cancelling
 // the parent context exits both pumps cleanly. writePump unconditionally defers
 // hub.Unregister, so the client is removed from hub state even on clean exit.
@@ -357,7 +399,7 @@ func TestConnectionPumps_CleanShutdownOnContextCancel(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-lc-clean", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -386,7 +428,7 @@ func TestConnectionPumps_StopCancelsBothImmediately(t *testing.T) {
 	// if stop() did not cancel the shared context immediately.
 	snd := &controllableSender{}
 	c := newClient("c-lc-stop", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	done, stop := startConnectionPumps(
 		context.Background(), c, hub, slog.Default(),
@@ -411,7 +453,7 @@ func TestConnectionPumps_StopInterruptsBlockedSend(t *testing.T) {
 
 	snd := newBlockingSendSender()
 	c := newClient("c-lc-blocked", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	done, stop := startConnectionPumps(
 		context.Background(), c, hub, slog.Default(),
@@ -442,7 +484,7 @@ func TestWritePump_DropsClientOnSendError(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-wp-fail", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	snd.Close() // next Send returns an error
 
@@ -463,6 +505,29 @@ func TestWritePump_DropsClientOnSendError(t *testing.T) {
 	eventually(t, func() bool { return !hubHasClient(hub, "c-wp-fail") }, 2*time.Second, "client removed from hub after send error")
 }
 
+func TestWritePump_NilLoggerSendErrorDoesNotPanic(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, nil, NopBus{}, "test-inst")
+	defer hub.Shutdown()
+
+	snd := &controllableSender{}
+	c := newClient("c-wp-nil-logger", "u1", "ws1", snd)
+	registerInRunningHub(t, hub, c)
+	snd.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.writePump(context.Background(), hub, nil)
+	}()
+
+	if !c.enqueue([]byte(`{"type":"test"}`)) {
+		t.Fatal("enqueue should succeed")
+	}
+
+	awaitGoroutineExit(t, done, "writePump")
+	eventually(t, func() bool { return !hubHasClient(hub, "c-wp-nil-logger") }, 2*time.Second, "client removed from hub after send error")
+}
+
 // TestWritePump_ExitsOnContextCancel verifies no goroutine leak when the
 // context is cancelled while the pump is idle.
 func TestWritePump_ExitsOnContextCancel(t *testing.T) {
@@ -471,7 +536,7 @@ func TestWritePump_ExitsOnContextCancel(t *testing.T) {
 
 	snd := &controllableSender{}
 	c := newClient("c-wp-cancel", "u1", "ws1", snd)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -503,7 +568,7 @@ func TestWritePump_ForwardsEnqueuedMessages(t *testing.T) {
 	}
 
 	c := newClient("c-wp-fwd", "u1", "ws1", trackingSender)
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

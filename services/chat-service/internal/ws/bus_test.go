@@ -144,7 +144,7 @@ func TestHub_Bus_NopBus_LocalDeliveryStillWorks(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestHub_Bus_PublishCallsBusOnce(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestHub_Bus_PublishFailure_LocalDeliveryStillWorks(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestHub_Bus_RemoteEvent_DeliversLocally_NoBusRepublish(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestHub_Bus_SelfOriginEvent_Ignored(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestHub_Bus_RemoteEvent_ReChecksAuth_Allowed(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestHub_Bus_RemoteEvent_AuthDenied_RevokesSubscription(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestHub_Bus_RemoteEvent_AuthError_SkipsDeliveryKeepsSubscription(t *testing
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -426,7 +426,7 @@ func TestHub_Bus_RemoteEvent_ClientReceivesValidJSON(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -456,7 +456,7 @@ func newBusNegHub(t *testing.T) (*Hub, *fakeBus, *Client) {
 	bus := &fakeBus{}
 	hub := newBusTestHub(auth, bus)
 	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}

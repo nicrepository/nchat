@@ -23,7 +23,7 @@ func main() {
 
 	application.Logger.Info("service starting", "port", cfg.Port)
 	serveErr := httpServer.ListenAndServe()
-	_ = application.TracingShutdown(context.Background())
+	_ = application.Shutdown(context.Background())
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatalf("%s failed: %v", cfg.ServiceName, serveErr)
 	}
