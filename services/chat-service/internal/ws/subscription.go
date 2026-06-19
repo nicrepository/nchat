@@ -19,6 +19,15 @@ type SubscriptionAuthorizer interface {
 	CanAccess(ctx context.Context, userID, workspaceID string, targetType TargetType, targetID string) (bool, error)
 }
 
+// NopAuthorizer is a SubscriptionAuthorizer that denies all access.
+// Use when no database is available; ServeWS returns 503 before any client
+// can register in that case, so this authorizer is never actually invoked.
+type NopAuthorizer struct{}
+
+func (NopAuthorizer) CanAccess(_ context.Context, _, _ string, _ TargetType, _ string) (bool, error) {
+	return false, nil
+}
+
 // channelReadChecker is the subset of PermissionService used by serviceAuthorizer.
 // Using an interface here keeps the ws package decoupled from the concrete service type.
 type channelReadChecker interface {
@@ -42,15 +51,9 @@ type serviceAuthorizer struct {
 // NewServiceAuthorizer returns a SubscriptionAuthorizer backed by the provided
 // channel checker and DM store.
 //
-// Dependency note: github.com/coder/websocket is NOT imported in this PR.
-// The ServeWS handler is a non-upgrading stub; websocket.Accept is not yet called.
-// When authenticated upgrade support is implemented, coder/websocket is the preferred
-// library because:
-//   - No existing WebSocket dependency is present in go.mod.
-//   - coder/websocket (formerly nhooyr.io/websocket) is actively maintained,
-//     pure Go (no CGO), context-native, and supports WASM compilation.
-//   - gorilla/websocket is in maintenance mode (no new features since 2023).
-//   - gobwas/ws is low-level and would require significant wrapper code.
+// github.com/coder/websocket is imported and used by ServeWS (see handler.go).
+// coder/websocket (formerly nhooyr.io/websocket) was chosen because it is
+// actively maintained, pure Go (no CGO), context-native, and supports WASM.
 func NewServiceAuthorizer(channels channelReadChecker, dms storage.DMStore) SubscriptionAuthorizer {
 	return &serviceAuthorizer{channels: channels, dms: dms}
 }

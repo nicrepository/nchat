@@ -43,7 +43,7 @@ func (k targetKey) String() string {
 // call will never fail with "client not registered".
 type registerReq struct {
 	client *Client
-	ack    chan struct{} // closed by hub when the client has been registered
+	ack    chan bool // hub sends true only when the client is tracked
 }
 
 // subscribeReq is an internal request to add a subscription.
@@ -125,6 +125,7 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 	if instanceID == "" {
 		instanceID = uuid.New().String()
 	}
+	logger = normalizeLogger(logger)
 	busCtx, busCancel := context.WithCancel(context.Background())
 	h := &Hub{
 		authorizer:  authorizer,
@@ -152,19 +153,38 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 }
 
 // Register adds a client to the hub and blocks until the hub has acknowledged
-// the registration. After Register returns the client is guaranteed to be
+// the registration. If Register returns true, the client is guaranteed to be
 // visible to Subscribe, so callers may call Subscribe immediately afterwards
 // without a race.
-func (h *Hub) Register(c *Client) {
-	ack := make(chan struct{})
+//
+// It returns false if the hub is shutting down or if the client ID is already
+// registered. On false, the caller owns connection cleanup unless the hub has
+// already closed the client as part of duplicate handling.
+func (h *Hub) Register(c *Client) bool {
+	if h.isShuttingDown() {
+		return false
+	}
+
+	ack := make(chan bool, 1)
 	select {
 	case h.register <- registerReq{client: c, ack: ack}:
 	case <-h.quit:
-		return
+		return false
 	}
 	select {
-	case <-ack:
+	case ok := <-ack:
+		return ok
 	case <-h.quit:
+		return false
+	}
+}
+
+func (h *Hub) isShuttingDown() bool {
+	select {
+	case <-h.quit:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -282,7 +302,12 @@ func (h *Hub) run() {
 	for {
 		select {
 		case req := <-h.register:
-			if !h.addClient(req.client) {
+			if h.isShuttingDown() {
+				req.ack <- false
+				continue
+			}
+			registered := h.addClient(req.client)
+			if !registered {
 				h.logger.WarnContext(context.Background(), "ws: duplicate client registration; dropping new client",
 					"client_id", req.client.id,
 				)
@@ -291,7 +316,7 @@ func (h *Hub) run() {
 				// Connect is called after addClient releases h.mu — no lock held.
 				h.presence.Connect(req.client.workspaceID, req.client.userID, req.client.id)
 			}
-			close(req.ack)
+			req.ack <- registered
 
 		case c := <-h.unregister:
 			h.dropClient(c)

@@ -48,13 +48,12 @@ const DefaultHeartbeatTimeout = 10 * time.Second
 // blocking indefinitely on an empty outbox after a heartbeat failure, and
 // prevents the heartbeat from ticking after a write error.
 //
-// # Infrastructure note
+// # Handler integration
 //
-// writePump and startHeartbeat are implemented as ready-to-use infrastructure.
-// They are not yet wired to the real WebSocket handler (ServeWS returns 501
-// until an authenticated request-context pattern is available). Integration
-// will follow when ServeWS is fully implemented. Browser-side reconnect with
-// exponential backoff will be implemented in the PR that wires the real handler.
+// ServeWS performs the real WebSocket upgrade and wires each accepted
+// connection through startConnectionPumps, so writePump and startHeartbeat are
+// active for browser clients. Browser-side reconnect/backoff remains outside
+// this server lifecycle, and scroll-infinite pagination is outside this package.
 //
 // interval and timeout must both be positive. If either is ≤ 0 the function
 // falls back to the defaults to avoid a runtime panic from time.NewTicker.
@@ -68,6 +67,7 @@ func startConnectionPumps(
 	logger *slog.Logger,
 	interval, timeout time.Duration,
 ) (done <-chan struct{}, stop func()) {
+	logger = normalizeLogger(logger)
 	if interval <= 0 {
 		interval = DefaultHeartbeatInterval
 	}
@@ -133,6 +133,7 @@ func startHeartbeat(
 	logger *slog.Logger,
 	interval, timeout time.Duration,
 ) {
+	logger = normalizeLogger(logger)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 

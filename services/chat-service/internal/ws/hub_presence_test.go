@@ -74,7 +74,7 @@ func TestHub_WithPresence_ActivityViaClientMessage_RestoresOnline(t *testing.T) 
 	c := newClient("c1", "user-1", "ws-1", snd)
 
 	// Register is synchronous; the run goroutine calls p.Connect before returning.
-	hub.Register(c)
+	registerInRunningHub(t, hub, c)
 	if got := p.Status("ws-1", "user-1"); got != PresenceOnline {
 		t.Fatalf("connect: expected online, got %q", got)
 	}
@@ -113,7 +113,7 @@ func TestHub_HandleClientMessage_Subscribe_RecordsActivity(t *testing.T) {
 	defer hub.Shutdown()
 
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	hub.Register(c) // synchronous; run goroutine calls p.Connect → online
+	registerInRunningHub(t, hub, c) // synchronous; run goroutine calls p.Connect → online
 
 	// Go away.
 	clk.Advance(awayTimeout + time.Second)
