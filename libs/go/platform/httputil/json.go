@@ -16,30 +16,30 @@ type ErrorResponse struct {
 }
 
 func WriteJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(Envelope{Data: payload})
-	if err != nil {
+	env := Envelope{Data: payload}
+	// Pre-marshal to detect errors before response headers are committed.
+	if _, err := json.Marshal(env); err != nil {
 		WriteError(w, http.StatusInternalServerError, ErrCodeInternal, "internal error")
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(append(body, '\n'))
+	_ = json.NewEncoder(w).Encode(env)
 }
 
 func WriteError(w http.ResponseWriter, status int, code string, message string) {
-	body, err := json.Marshal(Envelope{
+	env := Envelope{
 		Error: &ErrorResponse{
 			Code:    code,
 			Message: message,
 		},
-	})
-	if err != nil {
-		body = []byte(`{"error":{"code":"internal_error","message":"internal error"}}`)
+	}
+	// Pre-marshal to detect errors before response headers are committed.
+	if _, err := json.Marshal(env); err != nil {
+		env = Envelope{Error: &ErrorResponse{Code: "internal_error", Message: "internal error"}}
 		status = http.StatusInternalServerError
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(append(body, '\n'))
+	_ = json.NewEncoder(w).Encode(env)
 }

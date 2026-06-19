@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
-	plaintemplate "text/template"
+	plaintemplate "text/template" // nosemgrep: go.lang.security.audit.xss.import-text-template.import-text-template -- used only for plaintext email bodies; html/template is used separately for HTML rendering
 	"time"
 )
 
