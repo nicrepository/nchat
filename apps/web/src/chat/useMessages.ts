@@ -30,6 +30,13 @@ import type { Message, MessagePage } from "./chatTypes";
 
 type MessagesStatus = "idle" | "loading" | "ready" | "error";
 
+/**
+ * Explicit record of the most recent messages mutation.
+ * Used by MessageList's useLayoutEffect to apply the correct scroll strategy
+ * without relying on fragile first/last ID comparisons.
+ */
+export type LastMutation = "initial" | "append" | "prepend" | "none";
+
 export interface MessagesState {
   status: MessagesStatus;
   messages: Message[];
@@ -37,6 +44,10 @@ export interface MessagesState {
   nextCursor: string;
   sendError: string | null;
   sending: boolean;
+  /** True while an older-page fetch is in progress. */
+  loadingMore: boolean;
+  /** Describes the most recent change to the messages array for scroll management. */
+  lastMutation: LastMutation;
 }
 
 // ── Send result ───────────────────────────────────────────────────────────────
@@ -61,7 +72,10 @@ type Action =
   | { type: "error" }
   | { type: "sending" }
   | { type: "sent"; message: Message }
-  | { type: "send_error"; error: string };
+  | { type: "send_error"; error: string }
+  | { type: "prepending" }
+  | { type: "prepended"; page: MessagePage }
+  | { type: "prepend_error" };
 
 const initialState: MessagesState = {
   status: "idle",
@@ -69,13 +83,23 @@ const initialState: MessagesState = {
   nextCursor: "",
   sendError: null,
   sending: false,
+  loadingMore: false,
+  lastMutation: "none",
 };
 
 function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
     case "loading":
-      // Reset sending when a new target load starts to avoid carry-over from a prior send.
-      return { ...state, status: "loading", sendError: null, sending: false };
+      // Reset cursor and loadingMore so stale pagination state does not carry over.
+      return {
+        ...state,
+        status: "loading",
+        sendError: null,
+        sending: false,
+        loadingMore: false,
+        nextCursor: "",
+        lastMutation: "none",
+      };
     case "loaded":
       return {
         status: "ready",
@@ -83,20 +107,44 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         nextCursor: action.page.nextCursor,
         sendError: null,
         sending: false,
+        loadingMore: false,
+        lastMutation: "initial",
       };
     case "error":
-      return { ...state, status: "error", sending: false };
+      return { ...state, status: "error", sending: false, lastMutation: "none" };
     case "sending":
       return { ...state, sending: true, sendError: null };
-    case "sent":
+    case "sent": {
+      // Deduplicate: a realtime event or a prior send might have already added this message.
+      const alreadyPresent = state.messages.some((m) => m.id === action.message.id);
       return {
         ...state,
-        messages: [...state.messages, action.message],
+        messages: alreadyPresent ? state.messages : [...state.messages, action.message],
         sending: false,
         sendError: null,
+        lastMutation: alreadyPresent ? "none" : "append",
       };
+    }
     case "send_error":
       return { ...state, sending: false, sendError: action.error };
+    case "prepending":
+      return { ...state, loadingMore: true, lastMutation: "none" };
+    case "prepended": {
+      // Prepend older messages; deduplicate by ID to guard against cursor overlaps.
+      const existingIds = new Set(state.messages.map((m) => m.id));
+      const fresh = action.page.messages.filter((m) => !existingIds.has(m.id));
+      // If every message in this page was already present, no DOM change occurs:
+      // skip the scroll delta calculation by keeping lastMutation as "none".
+      return {
+        ...state,
+        messages: fresh.length > 0 ? [...fresh, ...state.messages] : state.messages,
+        nextCursor: action.page.nextCursor,
+        loadingMore: false,
+        lastMutation: fresh.length > 0 ? "prepend" : "none",
+      };
+    }
+    case "prepend_error":
+      return { ...state, loadingMore: false, lastMutation: "none" };
   }
 }
 
@@ -111,23 +159,33 @@ export interface UseMessagesResult {
   state: MessagesState;
   sendMessage: (body: string) => Promise<SendResult>;
   retry: () => void;
+  loadMore: () => void;
 }
 
 export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  // latestTargetRef always holds the current route target. useLayoutEffect (no deps)
-  // fires synchronously after every render in the same JS task, before microtasks.
-  // Any stale POST that resolves after a route change will see the updated ref.
-  const latestTargetRef = useRef(`${kind}:${targetId}`);
+  // stateRef holds values that stable callbacks (loadMore, sendMessage, load) read
+  // after async gaps, so they always see the current target and pagination state.
+  // useLayoutEffect (no deps) fires synchronously after every render, before any
+  // microtask, ensuring the ref is up-to-date before any async resolution can run.
+  const stateRef = useRef({
+    target: `${kind}:${targetId}`,
+    nextCursor: state.nextCursor,
+    loadingMore: state.loadingMore,
+  });
   useLayoutEffect(() => {
-    latestTargetRef.current = `${kind}:${targetId}`;
+    stateRef.current.target = `${kind}:${targetId}`;
+    stateRef.current.nextCursor = state.nextCursor;
+    stateRef.current.loadingMore = state.loadingMore;
   });
 
   const abortRef = useRef<AbortController | null>(null);
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
 
   const load = useCallback((id: string, k: "channel" | "dm") => {
     abortRef.current?.abort();
+    loadMoreAbortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
@@ -141,11 +199,11 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
 
     fetchFn().then(
       (page) => {
-        if (latestTargetRef.current !== loadKey) return;
+        if (stateRef.current.target !== loadKey) return;
         dispatch({ type: "loaded", page });
       },
       (err: unknown) => {
-        if (latestTargetRef.current !== loadKey) return;
+        if (stateRef.current.target !== loadKey) return;
         if (err instanceof Error && err.name === "AbortError") return;
         dispatch({ type: "error" });
       },
@@ -153,6 +211,7 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
 
     return () => {
       ctrl.abort();
+      loadMoreAbortRef.current?.abort();
     };
   }, []);
 
@@ -164,6 +223,44 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
   const retry = useCallback(() => {
     if (targetId) load(targetId, kind);
   }, [kind, targetId, load]);
+
+  const loadMore = useCallback(() => {
+    const { nextCursor, loadingMore } = stateRef.current;
+    if (!nextCursor || loadingMore) return;
+
+    // Update the in-flight flag synchronously — before any async work — so that a
+    // second loadMore() call in the same microtask tick (e.g., two IO callbacks
+    // fired before the next React render) fails the guard above and does not
+    // dispatch a duplicate fetch. The flag is cleared in both success and error paths.
+    stateRef.current.loadingMore = true;
+
+    const loadKey = `${kind}:${targetId}`;
+
+    loadMoreAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    loadMoreAbortRef.current = ctrl;
+
+    dispatch({ type: "prepending" });
+
+    const fetchFn: () => Promise<MessagePage> =
+      kind === "channel"
+        ? () => fetchChannelMessages(targetId, nextCursor, ctrl.signal)
+        : () => fetchDMMessages(targetId, nextCursor, ctrl.signal);
+
+    fetchFn().then(
+      (page) => {
+        stateRef.current.loadingMore = false;
+        if (stateRef.current.target !== loadKey) return;
+        dispatch({ type: "prepended", page });
+      },
+      (err: unknown) => {
+        stateRef.current.loadingMore = false;
+        if (stateRef.current.target !== loadKey) return;
+        if (err instanceof Error && err.name === "AbortError") return;
+        dispatch({ type: "prepend_error" });
+      },
+    );
+  }, [kind, targetId]);
 
   const sendMessage = useCallback(
     async (body: string): Promise<SendResult> => {
@@ -180,12 +277,12 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
 
         const msg = await sendFn();
 
-        if (latestTargetRef.current !== sendKey) return { status: "stale" };
+        if (stateRef.current.target !== sendKey) return { status: "stale" };
         dispatch({ type: "sent", message: msg });
         return { status: "sent" };
       } catch (err: unknown) {
         // Stale failure: silently discard — do not update state for a previous target.
-        if (latestTargetRef.current !== sendKey) return { status: "stale" };
+        if (stateRef.current.target !== sendKey) return { status: "stale" };
         const message = err instanceof Error ? err.message : "Não foi possível enviar a mensagem.";
         dispatch({ type: "send_error", error: message });
         // Re-throw for current-target failures so callers can preserve the draft.
@@ -195,5 +292,5 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
     [kind, targetId],
   );
 
-  return { state, sendMessage, retry };
+  return { state, sendMessage, retry, loadMore };
 }

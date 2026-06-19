@@ -386,7 +386,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
 			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
-			  AND (m.created_at < $4 OR (m.created_at = $4 AND m.id::text < $5))
+			  AND (m.created_at, m.id) < ($4, $5::uuid)
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $6`,
 			input.WorkspaceID, input.ChannelID, input.UserID,
@@ -447,7 +447,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
-			  AND (m.created_at < $4 OR (m.created_at = $4 AND m.id::text < $5))
+			  AND (m.created_at, m.id) < ($4, $5::uuid)
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $6`,
 			input.WorkspaceID, input.ConversationID, input.UserID,

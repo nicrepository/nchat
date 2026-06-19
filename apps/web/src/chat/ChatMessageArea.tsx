@@ -16,14 +16,13 @@
  * (b) BearerAuth equivalent for WS, (c) ServeWS implementation, (d) frontend WS client.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
 import type { ChatOutletContext } from "./ChatShell";
 import type { Message } from "./chatTypes";
-import type { SendResult } from "./useMessages";
-import { useMessages } from "./useMessages";
+import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -299,18 +298,91 @@ function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
 interface MessageListProps {
   messages: Message[];
   currentUserId: string;
+  hasMore: boolean;
+  loadingMore: boolean;
+  lastMutation: LastMutation;
+  onLoadMore: () => void;
 }
 
-function MessageList({ messages, currentUserId }: MessageListProps) {
+function MessageList({
+  messages,
+  currentUserId,
+  hasMore,
+  loadingMore,
+  lastMutation,
+  onLoadMore,
+}: MessageListProps) {
+  const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const topSentinelRef = useRef<HTMLDivElement>(null);
 
-  // Scroll to bottom when new messages arrive.
-  // scrollIntoView may be unavailable in test environments (jsdom).
-  useEffect(() => {
-    if (typeof bottomRef.current?.scrollIntoView === "function") {
-      bottomRef.current.scrollIntoView({ behavior: "smooth" });
+  // Stable ref for the loadMore callback so the IO observer never needs to be
+  // recreated due to a new function reference.
+  const onLoadMoreRef = useRef(onLoadMore);
+  useLayoutEffect(() => {
+    onLoadMoreRef.current = onLoadMore;
+  });
+
+  // Track previous scrollHeight for prepend scroll-delta restoration.
+  const prevScrollHeightRef = useRef(0);
+
+  // Scroll management driven by lastMutation — explicit and race-condition-free.
+  // "prepend" → restore position via scrollHeight delta (older messages added above).
+  // "initial" | "append" → scroll to bottom.
+  // "none" → no action (intermediate transition, e.g. "prepending" sets loadingMore=true
+  //           which inserts the loading spinner before the fetch resolves).
+  //
+  // prevScrollHeightRef is captured ONLY on stable mutations ("initial", "append",
+  // "prepend") — never on "none". This prevents the spinner's height from polluting
+  // the reference value used to compute the scroll delta on the subsequent "prepend".
+  // If we captured on "none", the delta would be wrong by the spinner height (~36px),
+  // causing a visible jump after every successful loadMore.
+  useLayoutEffect(() => {
+    if (!listRef.current) return;
+    const el = listRef.current;
+
+    if (lastMutation === "prepend") {
+      // Shift scrollTop by the amount the container grew so the user's view is stable.
+      el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
+    } else if (lastMutation === "initial" || lastMutation === "append") {
+      if (typeof bottomRef.current?.scrollIntoView === "function") {
+        bottomRef.current.scrollIntoView({ behavior: "smooth" });
+      }
     }
-  }, [messages]);
+
+    // Only snapshot scrollHeight in a stable state — not during "none" transitions
+    // where the loading spinner may inflate the measurement.
+    if (lastMutation !== "none") {
+      prevScrollHeightRef.current = el.scrollHeight;
+    }
+  }, [messages, lastMutation]);
+
+  // IntersectionObserver: fire loadMore when the top sentinel enters the viewport.
+  //
+  // Deps are [hasMore] only — NOT [loadingMore] or [onLoadMore].
+  //
+  // Excluding loadingMore prevents the observer from being torn down and recreated
+  // each time a fetch starts/finishes. In browsers, recreating the observer while
+  // the sentinel is still visible causes an immediate re-fire, leading to a loop of
+  // extra fetches. The guard against concurrent fetches lives inside loadMore() via
+  // stateRef, so removing loadingMore from deps here is safe.
+  //
+  // onLoadMore is excluded because onLoadMoreRef keeps it stable without recreation.
+  useEffect(() => {
+    const sentinel = topSentinelRef.current;
+    if (!sentinel || !hasMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          onLoadMoreRef.current();
+        }
+      },
+      { threshold: 0 },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore]);
 
   // Group messages by day for dividers.
   const withDividers: Array<
@@ -327,7 +399,22 @@ function MessageList({ messages, currentUserId }: MessageListProps) {
   }
 
   return (
-    <div className="chat-msg-area__list" role="log" aria-live="polite" aria-label="Mensagens">
+    <div
+      ref={listRef}
+      className="chat-msg-area__list"
+      role="log"
+      aria-live="polite"
+      aria-label="Mensagens"
+    >
+      <div ref={topSentinelRef} aria-hidden="true" />
+      {loadingMore && (
+        <div
+          className="chat-msg-area__load-more"
+          role="status"
+          aria-label="Carregando mensagens anteriores"
+          data-testid="load-more-indicator"
+        />
+      )}
       {withDividers.map((item, i) =>
         item.type === "divider" ? (
           <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
@@ -435,7 +522,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       ? (ctx.channels.find((ch) => ch.id === targetId)?.name ?? targetId)
       : (ctx.dms.find((dm) => dm.id === targetId)?.name ?? targetId);
 
-  const { state, sendMessage, retry } = useMessages({ kind, targetId });
+  const { state, sendMessage, retry, loadMore } = useMessages({ kind, targetId });
 
   const handleSend = useCallback(
     (body: string): Promise<SendResult> => sendMessage(body),
@@ -459,7 +546,14 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       )}
 
       {state.status === "ready" && state.messages.length > 0 && (
-        <MessageList messages={state.messages} currentUserId={ctx.currentUserId} />
+        <MessageList
+          messages={state.messages}
+          currentUserId={ctx.currentUserId}
+          hasMore={state.nextCursor !== ""}
+          loadingMore={state.loadingMore}
+          lastMutation={state.lastMutation}
+          onLoadMore={loadMore}
+        />
       )}
 
       {state.sendError && (

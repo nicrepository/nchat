@@ -532,6 +532,44 @@ func TestMessageHandler_ListDMMessages_NextCursorPresentWhenMorePages(t *testing
 	}
 }
 
+// ── Cursor forwarding (pagination integration) ────────────────────────────────
+
+func TestMessageHandler_ListChannelMessages_CursorForwardedToService(t *testing.T) {
+	cursor := storage.EncodeCursor(storage.MessageCursor{CreatedAt: testNow(), ID: testMessageID})
+	msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{
+		Messages: []domain.Message{testMessage()},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages?before="+cursor, nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if msgs.lastListChannelInput.BeforeCursor != cursor {
+		t.Fatalf("cursor not forwarded: got %q, want %q", msgs.lastListChannelInput.BeforeCursor, cursor)
+	}
+}
+
+func TestMessageHandler_ListDMMessages_CursorForwardedToService(t *testing.T) {
+	cursor := storage.EncodeCursor(storage.MessageCursor{CreatedAt: testNow(), ID: testMessageID})
+	msgs := &fakeMessageProvider{dmOut: service.ListDMMessagesOutput{
+		Messages: []domain.Message{testMessage()},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages?before="+cursor, nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if msgs.lastListDMInput.BeforeCursor != cursor {
+		t.Fatalf("cursor not forwarded: got %q, want %q", msgs.lastListDMInput.BeforeCursor, cursor)
+	}
+}
+
 // ── CreateDMMessage: missing coverage tests ──────────────────────────────────
 
 func TestMessageHandler_CreateDMMessage_UnauthenticatedReturns401(t *testing.T) {

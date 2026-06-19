@@ -326,7 +326,25 @@
   gap: 8px;
 }
 
-/* ── Composer ────────────────────────────────────────────────────────────────── */
+/* ── Load-more indicator (infinite scroll) ───────────────────────────────────── */
+
+.chat-msg-area__load-more {
+  align-self: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--color-border, #e8e3f0);
+  border-top-color: var(--color-primary, #6d28d9);
+  animation: chat-load-more-spin 0.7s linear infinite;
+  margin: 8px 0;
+  flex-shrink: 0;
+}
+
+@keyframes chat-load-more-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 
 .chat-msg-area__composer {
   flex-shrink: 0;
