@@ -668,3 +668,54 @@ func TestPGXMessageStore_ListDMMessages_WithBeforeCursor(t *testing.T) {
 	}
 	checkExpectations(t, mock)
 }
+
+// ---- Stable ordering: SQL tie-break on id when created_at ties --------------
+
+// TestPGXMessageStore_ListChannelMessages_KeysetSQLContainsIDTieBreaker verifies the
+// keyset pagination SQL uses a row comparison (m.created_at, m.id) < ($4, $5::uuid)
+// so that results are stable even when multiple messages share the same created_at
+// timestamp. The row comparison uses native UUID ordering (no text cast) and aligns
+// with the ORDER BY m.created_at DESC, m.id DESC clause.
+func TestPGXMessageStore_ListChannelMessages_KeysetSQLContainsIDTieBreaker(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	cursor := &storage.MessageCursor{CreatedAt: now, ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+
+	// Match the row-comparison keyset clause in the query.
+	mock.ExpectQuery(`(?s)\(m\.created_at,\s*m\.id\)\s*<\s*\(\$4,\s*\$5::uuid\)`).
+		WithArgs("ws-1", "ch-1", "user-1", pgxmock.AnyArg(), cursor.ID, 51).
+		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+
+	store := storage.NewPGXMessageStore(mock)
+	_, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+		BeforeCursor: cursor,
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages keyset tie-break: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// TestPGXMessageStore_ListDMMessages_KeysetSQLContainsIDTieBreaker mirrors the channel
+// test for DM conversations, ensuring the same row-comparison predicate is present.
+func TestPGXMessageStore_ListDMMessages_KeysetSQLContainsIDTieBreaker(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	cursor := &storage.MessageCursor{CreatedAt: now, ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+
+	// Match the row-comparison keyset clause in the DM query.
+	mock.ExpectQuery(`(?s)\(m\.created_at,\s*m\.id\)\s*<\s*\(\$4,\s*\$5::uuid\)`).
+		WithArgs("ws-1", "conv-1", "user-1", pgxmock.AnyArg(), cursor.ID, 51).
+		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+
+	store := storage.NewPGXMessageStore(mock)
+	_, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
+		WorkspaceID: "ws-1", ConversationID: "conv-1", UserID: "user-1",
+		BeforeCursor: cursor,
+	})
+	if err != nil {
+		t.Fatalf("ListDMMessages keyset tie-break: %v", err)
+	}
+	checkExpectations(t, mock)
+}

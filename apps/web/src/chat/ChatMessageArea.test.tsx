@@ -473,6 +473,10 @@ describe("ChatMessageArea — stale response guard", () => {
 
     let rejectSendA: (err: Error) => void;
     const sendAPromise = new Promise<never>((_, rej) => (rejectSendA = rej));
+    // Prevent Node.js / Vitest from reporting this as unhandled before
+    // sendMessage's catch block runs. The no-op .catch marks the promise as
+    // handled so the unhandledRejection event never fires.
+    sendAPromise.catch(() => undefined);
     mockPostChannelMessage.mockReturnValueOnce(sendAPromise);
 
     function TwoChannelTest() {
@@ -615,6 +619,10 @@ describe("ChatMessageArea — stale response guard", () => {
 
     let rejectSendA: (err: Error) => void;
     const sendAPromise = new Promise<never>((_, rej) => (rejectSendA = rej));
+    // Prevent Node.js / Vitest from reporting this as unhandled before
+    // sendMessage's catch block runs. The no-op .catch marks the promise as
+    // handled so the unhandledRejection event never fires.
+    sendAPromise.catch(() => undefined);
     mockPostChannelMessage.mockReturnValueOnce(sendAPromise);
 
     function TwoChannelTest() {
@@ -695,6 +703,286 @@ describe("ChatMessageArea — storage safety", () => {
 
     expect(setItemSpy).not.toHaveBeenCalled();
     setItemSpy.mockRestore();
+  });
+});
+
+// ── Infinite scroll (load older messages) ─────────────────────────────────────
+
+// capturedIOCallback is scoped to this describe so that it is isolated from
+// tests that don't interact with IntersectionObserver.
+describe("ChatMessageArea — infinite scroll", () => {
+  let capturedIOCallback: IntersectionObserverCallback | null = null;
+
+  beforeEach(() => {
+    capturedIOCallback = null;
+    // jsdom does not implement IntersectionObserver — provide a class-based stub.
+    // Arrow functions cannot be used as constructors with `new`, so a class is required.
+    class MockIO {
+      constructor(cb: IntersectionObserverCallback) {
+        capturedIOCallback = cb;
+      }
+      observe = vi.fn();
+      disconnect = vi.fn();
+      unobserve = vi.fn();
+    }
+    vi.stubGlobal("IntersectionObserver", MockIO);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("loads older messages when top sentinel becomes visible and renders them", async () => {
+    const cursor = "dGVzdC1jdXJzb3I";
+    const oldMsg = makeMessage({ id: "old-1", bodyText: "Mensagem antiga" });
+    const newMsg = makeMessage({ id: "new-1", bodyText: "Mensagem recente" });
+
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [newMsg], nextCursor: cursor })
+      .mockResolvedValueOnce({ messages: [oldMsg], nextCursor: "" });
+
+    renderChannelArea();
+
+    // Wait for first page to render.
+    await waitFor(() => {
+      expect(screen.getByText("Mensagem recente")).toBeInTheDocument();
+    });
+
+    // Simulate user scrolling to top — IntersectionObserver fires.
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    // Older message should appear.
+    await waitFor(() => {
+      expect(screen.getByText("Mensagem antiga")).toBeInTheDocument();
+    });
+    // Recent message still visible (no replacement).
+    expect(screen.getByText("Mensagem recente")).toBeInTheDocument();
+    // fetchChannelMessages called twice: initial + loadMore with cursor.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
+    expect(mockFetchChannelMessages).toHaveBeenNthCalledWith(
+      2,
+      "geral",
+      cursor,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("shows loading indicator while older messages are fetching", async () => {
+    const cursor = "dGVzdA";
+    let resolveLoadMore: (p: MessagePage) => void;
+    const loadMorePromise = new Promise<MessagePage>((r) => (resolveLoadMore = r));
+
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "m1" })], nextCursor: cursor })
+      .mockReturnValueOnce(loadMorePromise);
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    expect(await screen.findByTestId("load-more-indicator")).toBeInTheDocument();
+
+    resolveLoadMore!({ messages: [], nextCursor: "" });
+    await waitFor(() => expect(screen.queryByTestId("load-more-indicator")).not.toBeInTheDocument());
+  });
+
+  it("does not call loadMore when nextCursor is empty (hasMore=false)", async () => {
+    mockFetchChannelMessages.mockResolvedValue({ messages: [makeMessage()], nextCursor: "" });
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    // With hasMore=false no IntersectionObserver is created, so callback is null.
+    // Invoking it (a no-op) should not trigger a second fetch.
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not duplicate messages returned by both pages", async () => {
+    const cursor = "dGVzdC1jdXJzb3I";
+    const dupMsg = makeMessage({ id: "dup-1", bodyText: "Mensagem duplicada" });
+    const uniqueOld = makeMessage({ id: "old-2", bodyText: "Mensagem única antiga" });
+
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [dupMsg], nextCursor: cursor })
+      .mockResolvedValueOnce({ messages: [uniqueOld, dupMsg], nextCursor: "" });
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getByText("Mensagem duplicada")).toBeInTheDocument());
+
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    await waitFor(() => expect(screen.getByText("Mensagem única antiga")).toBeInTheDocument());
+
+    // Duplicate message should appear exactly once despite being in both pages.
+    expect(screen.getAllByText("Mensagem duplicada")).toHaveLength(1);
+  });
+
+  it("DM: loads older messages on scroll to top", async () => {
+    const cursor = "ZG0tY3Vyc29y";
+    const oldMsg = makeMessage({ id: "dm-old-1", bodyText: "DM antiga" });
+    const newMsg = makeMessage({ id: "dm-new-1", bodyText: "DM recente" });
+
+    mockFetchDMMessages
+      .mockResolvedValueOnce({ messages: [newMsg], nextCursor: cursor })
+      .mockResolvedValueOnce({ messages: [oldMsg], nextCursor: "" });
+
+    renderDMArea();
+
+    await waitFor(() => expect(screen.getByText("DM recente")).toBeInTheDocument());
+
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    await waitFor(() => expect(screen.getByText("DM antiga")).toBeInTheDocument());
+    expect(mockFetchDMMessages).toHaveBeenCalledTimes(2);
+    expect(mockFetchDMMessages).toHaveBeenNthCalledWith(2, "dm-juliane", cursor, expect.any(AbortSignal));
+  });
+
+  // ── IO loop prevention ──────────────────────────────────────────────────────
+
+  it("does not loop-fetch when sentinel stays visible after loadingMore resets", async () => {
+    // This test uses an auto-firing mock: observe() immediately triggers the callback
+    // to simulate a sentinel that never leaves the viewport. With the old implementation
+    // (loadingMore in effect deps), recreating the observer after each fetch would cause
+    // an extra fetch per cycle. With the new implementation ([hasMore] deps only), the
+    // observer is not recreated when loadingMore changes, so no extra fetch occurs.
+    let observeCallCount = 0;
+    let localCaptured: IntersectionObserverCallback | null = null;
+    class AutoFireMockIO {
+      constructor(cb: IntersectionObserverCallback) { localCaptured = cb; }
+      observe = vi.fn(() => {
+        observeCallCount++;
+        localCaptured?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      });
+      disconnect = vi.fn();
+      unobserve = vi.fn();
+    }
+    vi.stubGlobal("IntersectionObserver", AutoFireMockIO);
+
+    const cursor = "bG9vcC1jdXJzb3I";
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "n1", bodyText: "Nova" })], nextCursor: cursor })
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "o1", bodyText: "Antiga" })], nextCursor: "" });
+
+    renderChannelArea();
+
+    // Wait for both fetches to complete (initial + one loadMore triggered by auto-fire).
+    await waitFor(() => expect(screen.getByText("Antiga")).toBeInTheDocument());
+
+    // The observer was created once (when hasMore became true) and observe() fired once.
+    // After prepend, hasMore=false → effect re-runs with !hasMore → returns early, no new observer.
+    expect(observeCallCount).toBe(1);
+    // Exactly two fetches: initial load + one loadMore.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
+  });
+
+  it("fires only one loadMore fetch when IO callback fires twice in the same tick", async () => {
+    // Verifies that stateRef.current.loadingMore is updated synchronously inside
+    // loadMore() so that a second IO callback in the same act() — before React
+    // re-renders — fails the guard and does not dispatch a duplicate request.
+    const cursor = "ZG91YmxlY3Vyc29y";
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "n1" })], nextCursor: cursor })
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "o1" })], nextCursor: "" });
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    // Fire the IO callback twice in the same act() — simulates two rapid sentinel
+    // visibility events before the next React render. Only one loadMore should start.
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(2));
+
+    // Initial load (1) + exactly one loadMore (1) = 2 total calls.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
+  });
+
+  // ── loadMore error recovery ─────────────────────────────────────────────────
+
+  it("loadingMore resets to false when loadMore fetch fails", async () => {
+    const cursor = "ZXJyb3JDdXJzb3I";
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "m1" })], nextCursor: cursor })
+      .mockRejectedValueOnce(new Error("network error"));
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    // Loading indicator appears then disappears as error resets loadingMore.
+    await waitFor(() => expect(screen.queryByTestId("load-more-indicator")).not.toBeInTheDocument());
+    // Component is still usable — messages still visible.
+    expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1);
+  });
+
+  // ── Scroll behavior ─────────────────────────────────────────────────────────
+
+  it("does not call scrollIntoView on prepend (scroll delta is used instead)", async () => {
+    const cursor = "cHJlcGVuZEN1cnNvcg";
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "n1" })], nextCursor: cursor })
+      .mockResolvedValueOnce({ messages: [makeMessage({ id: "o1" })], nextCursor: "" });
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    // beforeEach sets window.Element.prototype.scrollIntoView = vi.fn().
+    // Clear its call history here to only count calls triggered by prepend.
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+
+    act(() => {
+      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(2));
+
+    // Prepend must not call scrollIntoView (it uses scrollTop delta instead).
+    expect(scrollMock).not.toHaveBeenCalled();
+  });
+
+  it("calls scrollIntoView when a new message is sent (append)", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "m1" })],
+      nextCursor: "",
+    });
+    mockPostChannelMessage.mockResolvedValue(makeMessage({ id: "m2", bodyText: "Enviada" }));
+
+    renderChannelArea();
+    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    // beforeEach sets window.Element.prototype.scrollIntoView = vi.fn().
+    // Clear its call history here to only count calls triggered by the send.
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+
+    const input = screen.getByTestId("chat-composer-input");
+    await userEvent.type(input, "Enviada");
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => expect(screen.getByText("Enviada")).toBeInTheDocument());
+
+    // Append (sent) must scroll to bottom.
+    expect(scrollMock).toHaveBeenCalledTimes(1);
   });
 });
 

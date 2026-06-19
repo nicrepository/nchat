@@ -3,11 +3,17 @@ package httpapi
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
 )
+
+// msgListRateLimit is the maximum number of message-listing requests an
+// authenticated user may make per minute. Pagination fetches are cheap on the
+// server but an unconstrained scroll could cause excessive DB reads.
+const msgListRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
@@ -35,9 +41,17 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		return BearerAuth(validator)(RequireActiveSession(sessionValidator)(h))
 	}
 
+	// Shared rate limiter for message-listing routes (GET only; POST/send is not limited here).
+	// The GC goroutine started by NewUserRateLimiter runs for the process lifetime; in
+	// production this is fine (OS cleans up on exit). Tests that call NewRouter directly
+	// (e.g., integration/auth-chain tests) accept this goroutine as a known bounded leak
+	// — it is stopped by the test process exit and does not affect correctness or -race.
+	// Unit tests that build a limiter explicitly use t.Cleanup(limiter.Stop).
+	msgListLimiter := NewUserRateLimiter(msgListRateLimit, time.Minute)
+
 	// Channel message endpoints: GET list, POST create.
 	mux.Handle("GET "+RouteChannelMessages, authMiddleware(
-		http.HandlerFunc(messages.ListChannelMessages),
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListChannelMessages)),
 	))
 	mux.Handle("POST "+RouteChannelMessages, authMiddleware(
 		http.HandlerFunc(messages.CreateChannelMessage),
@@ -45,7 +59,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 
 	// DM message endpoints: GET list, POST create.
 	mux.Handle("GET "+RouteDMMessages, authMiddleware(
-		http.HandlerFunc(messages.ListDMMessages),
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListDMMessages)),
 	))
 	mux.Handle("POST "+RouteDMMessages, authMiddleware(
 		http.HandlerFunc(messages.CreateDMMessage),
