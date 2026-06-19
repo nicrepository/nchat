@@ -750,7 +750,10 @@ describe("ChatMessageArea — infinite scroll", () => {
 
     // Simulate user scrolling to top — IntersectionObserver fires.
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     // Older message should appear.
@@ -782,13 +785,18 @@ describe("ChatMessageArea — infinite scroll", () => {
     await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
 
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     expect(await screen.findByTestId("load-more-indicator")).toBeInTheDocument();
 
     resolveLoadMore!({ messages: [], nextCursor: "" });
-    await waitFor(() => expect(screen.queryByTestId("load-more-indicator")).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByTestId("load-more-indicator")).not.toBeInTheDocument(),
+    );
   });
 
   it("does not call loadMore when nextCursor is empty (hasMore=false)", async () => {
@@ -800,7 +808,10 @@ describe("ChatMessageArea — infinite scroll", () => {
     // With hasMore=false no IntersectionObserver is created, so callback is null.
     // Invoking it (a no-op) should not trigger a second fetch.
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
@@ -819,7 +830,10 @@ describe("ChatMessageArea — infinite scroll", () => {
     await waitFor(() => expect(screen.getByText("Mensagem duplicada")).toBeInTheDocument());
 
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     await waitFor(() => expect(screen.getByText("Mensagem única antiga")).toBeInTheDocument());
@@ -842,12 +856,20 @@ describe("ChatMessageArea — infinite scroll", () => {
     await waitFor(() => expect(screen.getByText("DM recente")).toBeInTheDocument());
 
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     await waitFor(() => expect(screen.getByText("DM antiga")).toBeInTheDocument());
     expect(mockFetchDMMessages).toHaveBeenCalledTimes(2);
-    expect(mockFetchDMMessages).toHaveBeenNthCalledWith(2, "dm-juliane", cursor, expect.any(AbortSignal));
+    expect(mockFetchDMMessages).toHaveBeenNthCalledWith(
+      2,
+      "dm-juliane",
+      cursor,
+      expect.any(AbortSignal),
+    );
   });
 
   // ── IO loop prevention ──────────────────────────────────────────────────────
@@ -861,10 +883,15 @@ describe("ChatMessageArea — infinite scroll", () => {
     let observeCallCount = 0;
     let localCaptured: IntersectionObserverCallback | null = null;
     class AutoFireMockIO {
-      constructor(cb: IntersectionObserverCallback) { localCaptured = cb; }
+      constructor(cb: IntersectionObserverCallback) {
+        localCaptured = cb;
+      }
       observe = vi.fn(() => {
         observeCallCount++;
-        localCaptured?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+        localCaptured?.(
+          [{ isIntersecting: true } as IntersectionObserverEntry],
+          {} as IntersectionObserver,
+        );
       });
       disconnect = vi.fn();
       unobserve = vi.fn();
@@ -873,8 +900,14 @@ describe("ChatMessageArea — infinite scroll", () => {
 
     const cursor = "bG9vcC1jdXJzb3I";
     mockFetchChannelMessages
-      .mockResolvedValueOnce({ messages: [makeMessage({ id: "n1", bodyText: "Nova" })], nextCursor: cursor })
-      .mockResolvedValueOnce({ messages: [makeMessage({ id: "o1", bodyText: "Antiga" })], nextCursor: "" });
+      .mockResolvedValueOnce({
+        messages: [makeMessage({ id: "n1", bodyText: "Nova" })],
+        nextCursor: cursor,
+      })
+      .mockResolvedValueOnce({
+        messages: [makeMessage({ id: "o1", bodyText: "Antiga" })],
+        nextCursor: "",
+      });
 
     renderChannelArea();
 
@@ -903,8 +936,14 @@ describe("ChatMessageArea — infinite scroll", () => {
     // Fire the IO callback twice in the same act() — simulates two rapid sentinel
     // visibility events before the next React render. Only one loadMore should start.
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(2));
@@ -925,11 +964,16 @@ describe("ChatMessageArea — infinite scroll", () => {
     await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
 
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     // Loading indicator appears then disappears as error resets loadingMore.
-    await waitFor(() => expect(screen.queryByTestId("load-more-indicator")).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByTestId("load-more-indicator")).not.toBeInTheDocument(),
+    );
     // Component is still usable — messages still visible.
     expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1);
   });
@@ -951,7 +995,10 @@ describe("ChatMessageArea — infinite scroll", () => {
     scrollMock.mockClear();
 
     act(() => {
-      capturedIOCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      capturedIOCallback?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      );
     });
 
     await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(2));

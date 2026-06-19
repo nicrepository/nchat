@@ -341,9 +341,10 @@
 }
 
 @keyframes chat-load-more-spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
-
 
 .chat-msg-area__composer {
   flex-shrink: 0;

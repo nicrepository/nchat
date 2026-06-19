@@ -91,7 +91,15 @@ function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
     case "loading":
       // Reset cursor and loadingMore so stale pagination state does not carry over.
-      return { ...state, status: "loading", sendError: null, sending: false, loadingMore: false, nextCursor: "", lastMutation: "none" };
+      return {
+        ...state,
+        status: "loading",
+        sendError: null,
+        sending: false,
+        loadingMore: false,
+        nextCursor: "",
+        lastMutation: "none",
+      };
     case "loaded":
       return {
         status: "ready",
@@ -161,7 +169,11 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
   // after async gaps, so they always see the current target and pagination state.
   // useLayoutEffect (no deps) fires synchronously after every render, before any
   // microtask, ensuring the ref is up-to-date before any async resolution can run.
-  const stateRef = useRef({ target: `${kind}:${targetId}`, nextCursor: state.nextCursor, loadingMore: state.loadingMore });
+  const stateRef = useRef({
+    target: `${kind}:${targetId}`,
+    nextCursor: state.nextCursor,
+    loadingMore: state.loadingMore,
+  });
   useLayoutEffect(() => {
     stateRef.current.target = `${kind}:${targetId}`;
     stateRef.current.nextCursor = state.nextCursor;

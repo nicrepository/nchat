@@ -304,7 +304,14 @@ interface MessageListProps {
   onLoadMore: () => void;
 }
 
-function MessageList({ messages, currentUserId, hasMore, loadingMore, lastMutation, onLoadMore }: MessageListProps) {
+function MessageList({
+  messages,
+  currentUserId,
+  hasMore,
+  loadingMore,
+  lastMutation,
+  onLoadMore,
+}: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
@@ -312,7 +319,9 @@ function MessageList({ messages, currentUserId, hasMore, loadingMore, lastMutati
   // Stable ref for the loadMore callback so the IO observer never needs to be
   // recreated due to a new function reference.
   const onLoadMoreRef = useRef(onLoadMore);
-  useLayoutEffect(() => { onLoadMoreRef.current = onLoadMore; });
+  useLayoutEffect(() => {
+    onLoadMoreRef.current = onLoadMore;
+  });
 
   // Track previous scrollHeight for prepend scroll-delta restoration.
   const prevScrollHeightRef = useRef(0);
@@ -390,7 +399,13 @@ function MessageList({ messages, currentUserId, hasMore, loadingMore, lastMutati
   }
 
   return (
-    <div ref={listRef} className="chat-msg-area__list" role="log" aria-live="polite" aria-label="Mensagens">
+    <div
+      ref={listRef}
+      className="chat-msg-area__list"
+      role="log"
+      aria-live="polite"
+      aria-label="Mensagens"
+    >
       <div ref={topSentinelRef} aria-hidden="true" />
       {loadingMore && (
         <div
