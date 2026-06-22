@@ -4,11 +4,34 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
+
+const (
+	// DefaultPublishTimeout caps how long a detached post-persist broadcast
+	// goroutine may wait on hub or broker backpressure.
+	DefaultPublishTimeout = 5 * time.Second
+	// DefaultPublishQueueCapacity bounds concurrent detached broadcasts so
+	// bursts cannot accumulate unobserved goroutines behind broker backpressure.
+	DefaultPublishQueueCapacity = 64
+)
+
+// MessageEventPublisher publishes message lifecycle events.
+// It is satisfied by *ws.Hub (via an adapter in app/) to avoid a circular import.
+// All methods must be safe for concurrent use.
+type MessageEventPublisher interface {
+	// PublishMessageCreated broadcasts a message.created event to subscribers of
+	// the given target. targetType must be "channel" or "dm". Callers must only
+	// invoke this after the message has been committed to the database.
+	// msg must be the full domain.Message returned by storage (including sender info).
+	PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message)
+}
 
 const maxMessageBodyRunes = 40_000
 
@@ -68,16 +91,63 @@ type ListDMMessagesOutput struct {
 	NextCursor string
 }
 
+// GetChannelMessageInput identifies a single channel message to fetch.
+type GetChannelMessageInput struct {
+	WorkspaceID string
+	ChannelID   string
+	CallerID    string
+	MessageID   string
+}
+
+// GetDMMessageInput identifies a single DM message to fetch.
+type GetDMMessageInput struct {
+	WorkspaceID    string
+	ConversationID string
+	CallerID       string
+	MessageID      string
+}
+
 // MessageService handles message creation and listing for channels and DM conversations.
 type MessageService struct {
-	channels storage.ChannelStore
-	dms      storage.DMStore
-	messages storage.MessageStore
+	channels    storage.ChannelStore
+	dms         storage.DMStore
+	messages    storage.MessageStore
+	publisherMu sync.RWMutex
+	publisher   MessageEventPublisher // optional; nil means no broadcast
+
+	publishSlots      chan struct{}
+	droppedPublishCnt atomic.Int64
 }
 
 // NewMessageService creates a MessageService backed by the provided stores.
 func NewMessageService(channels storage.ChannelStore, dms storage.DMStore, messages storage.MessageStore) *MessageService {
-	return &MessageService{channels: channels, dms: dms, messages: messages}
+	return &MessageService{
+		channels:     channels,
+		dms:          dms,
+		messages:     messages,
+		publishSlots: make(chan struct{}, DefaultPublishQueueCapacity),
+	}
+}
+
+// SetPublisher attaches an event publisher. Call after creating both the service
+// and the hub (e.g. in app.New). Safe for concurrent use with message creation.
+func (s *MessageService) SetPublisher(p MessageEventPublisher) {
+	s.publisherMu.Lock()
+	defer s.publisherMu.Unlock()
+	s.publisher = p
+}
+
+func (s *MessageService) getPublisher() MessageEventPublisher {
+	s.publisherMu.RLock()
+	defer s.publisherMu.RUnlock()
+	return s.publisher
+}
+
+// DroppedPublishCount returns how many post-persist broadcasts were dropped
+// because the bounded async publish queue was saturated. Message persistence is
+// not rolled back when this counter increments.
+func (s *MessageService) DroppedPublishCount() int64 {
+	return s.droppedPublishCnt.Load()
 }
 
 // CreateChannelMessage posts a message to a channel.
@@ -131,6 +201,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create channel message: %w", err)
 	}
+	s.publishMessageCreated(ctx, workspaceID, "channel", channelID, msg)
 	return msg, nil
 }
 
@@ -184,7 +255,31 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create dm message: %w", err)
 	}
+	s.publishMessageCreated(ctx, workspaceID, "dm", conversationID, msg)
 	return msg, nil
+}
+
+func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
+	publisher := s.getPublisher()
+	if publisher == nil {
+		return
+	}
+
+	select {
+	case s.publishSlots <- struct{}{}:
+	default:
+		s.droppedPublishCnt.Add(1)
+		return
+	}
+
+	baseCtx := context.WithoutCancel(ctx)
+	go func() {
+		defer func() { <-s.publishSlots }()
+
+		publishCtx, cancel := context.WithTimeout(baseCtx, DefaultPublishTimeout)
+		defer cancel()
+		publisher.PublishMessageCreated(publishCtx, workspaceID, targetType, targetID, msg)
+	}()
 }
 
 // ListChannelMessages returns messages for a channel visible to the caller.
@@ -297,4 +392,58 @@ func validateMessageBody(body string) error {
 		return fmt.Errorf("%w: body_text exceeds maximum length of %d characters", domain.ErrInvalidInput, maxMessageBodyRunes)
 	}
 	return nil
+}
+
+// GetChannelMessage returns a single channel message visible to the caller.
+// Caller must be a member with read access to the channel.
+// Returns ErrNotFound when the message does not exist or belongs to a different channel.
+func (s *MessageService) GetChannelMessage(ctx context.Context, input GetChannelMessageInput) (domain.Message, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	channelID := strings.TrimSpace(input.ChannelID)
+	callerID := strings.TrimSpace(input.CallerID)
+	messageID := strings.TrimSpace(input.MessageID)
+	if workspaceID == "" || channelID == "" || callerID == "" || messageID == "" {
+		return domain.Message{}, fmt.Errorf("%w: workspace_id, channel_id, caller_id, and message_id are required", domain.ErrInvalidInput)
+	}
+
+	if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID); err != nil {
+		return domain.Message{}, err
+	}
+
+	msg, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	// Non-enumerating: a message in a different channel looks like not found.
+	if msg.ChannelID != channelID {
+		return domain.Message{}, domain.ErrNotFound
+	}
+	return msg, nil
+}
+
+// GetDMMessage returns a single DM message visible to the caller.
+// Caller must be an active participant in the DM conversation.
+// Returns ErrNotFound when the message does not exist or belongs to a different conversation.
+func (s *MessageService) GetDMMessage(ctx context.Context, input GetDMMessageInput) (domain.Message, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	conversationID := strings.TrimSpace(input.ConversationID)
+	callerID := strings.TrimSpace(input.CallerID)
+	messageID := strings.TrimSpace(input.MessageID)
+	if workspaceID == "" || conversationID == "" || callerID == "" || messageID == "" {
+		return domain.Message{}, fmt.Errorf("%w: workspace_id, conversation_id, caller_id, and message_id are required", domain.ErrInvalidInput)
+	}
+
+	if _, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, conversationID, callerID); err != nil {
+		return domain.Message{}, err
+	}
+
+	msg, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	// Non-enumerating: a message in a different conversation looks like not found.
+	if msg.DMConversationID != conversationID {
+		return domain.Message{}, domain.ErrNotFound
+	}
+	return msg, nil
 }

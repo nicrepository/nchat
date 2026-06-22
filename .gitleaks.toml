@@ -4,6 +4,19 @@ title = "nchat gitleaks configuration"
 useDefault = true
 
 [[rules]]
+id = "jwt"
+
+  [[rules.allowlists]]
+  description = "Test-only JWT-shaped fixtures for WebSocket subprotocol tests. The variable name 'realisticJWTSubprotocol' identifies these inert test values; the runtime-built replacement in the current tree no longer triggers this rule."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['''realisticJWTSubprotocol''']
+  paths = [
+    '^services/chat-service/internal/http/ws_auth_test\.go$',
+    '^services/chat-service/internal/wsutil/subprotocol_test\.go$',
+  ]
+
+[[rules]]
 id = "generic-api-key"
 
   [[rules.allowlists]]

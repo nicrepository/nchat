@@ -177,6 +177,25 @@ describe("ChatSidebar — loading state", () => {
 
     resolveData!({ currentUserId: "", channels: [], dms: [] });
   });
+
+  it("does not dispatch state updates after unmount (cancelled guard)", async () => {
+    let resolveData: (v: {
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+    }) => void;
+    mockFetchSidebarData.mockReturnValue(new Promise((r) => (resolveData = r)));
+
+    const { unmount } = renderChat();
+
+    await screen.findByTestId("chat-sidebar");
+
+    // Unmount before fetch resolves — sets the cancelled flag in useChatSidebar.
+    unmount();
+
+    // Resolving after unmount must not cause a state update or React warning.
+    resolveData!({ currentUserId: "", channels: [], dms: [] });
+  });
 });
 
 // ── Channels ──────────────────────────────────────────────────────────────────
@@ -420,6 +439,19 @@ describe("ChatSidebar — error state", () => {
     await waitFor(() => {
       expect(screen.getByRole("option", { name: /canal geral/i })).toBeInTheDocument();
     });
+  });
+
+  it("shows generic error message when rejection is not an Error instance", async () => {
+    // Covers the `err instanceof Error ? ... : "Não foi possível carregar os dados."` branch
+    // in useChatSidebar when the caught value is not an Error object.
+    mockFetchSidebarData.mockRejectedValue("string rejection");
+    renderChat();
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/não foi possível carregar os canais/i)).toBeInTheDocument();
   });
 });
 

@@ -231,6 +231,9 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 // PublishMessageCreated broadcasts a message.created event to all clients
 // subscribed to the message's target (channel or DM conversation).
 //
+// The payload carries the full message DTO (same contract as the list endpoint)
+// so that browser clients can render the message without an additional GET.
+//
 // Local delivery happens first and is always attempted regardless of bus state.
 // Distributed delivery via bus.Publish is best-effort: failures are logged
 // but do not affect local delivery or cause a panic. Bus.Publish is called
@@ -243,13 +246,15 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 //
 // Delivery guarantee: in-process best-effort. No durability, no replay.
 // Wiring: call this from MessageService after a message is persisted.
-func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID string) {
+func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, targetType TargetType, targetID string, payload MessagePayload) {
 	evt := Event{
+		SchemaVersion:    CurrentEventSchemaVersion,
 		Type:             EventTypeMessageCreated,
 		WorkspaceID:      workspaceID,
 		TargetType:       targetType,
 		TargetID:         targetID,
-		MessageID:        messageID,
+		MessageID:        payload.ID,
+		Payload:          &payload,
 		EventID:          uuid.New().String(),
 		SourceInstanceID: h.instanceID,
 		CreatedAt:        time.Now().UTC(),
@@ -270,7 +275,9 @@ func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, tar
 	}
 
 	// Distributed publish — failure must not affect local delivery.
-	if err := h.bus.Publish(ctx, evt); err != nil {
+	busEvt := evt
+	busEvt.Payload = nil
+	if err := h.bus.Publish(ctx, busEvt); err != nil {
 		h.logger.WarnContext(ctx, "ws: bus publish failed; local delivery unaffected",
 			"workspace_id", workspaceID,
 			"target_type", string(targetType),
@@ -397,6 +404,17 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 // but not sufficient for untrusted Pub/Sub payloads. Canonicalization here
 // prevents spoofed workspace_id / target_id values from reaching the hub.
 func canonicalizeRemoteEvent(evt Event) (Event, bool) {
+	switch evt.SchemaVersion {
+	case 0:
+		// Older chat-service instances did not emit schema_version. Treat absence
+		// as v1 so rolling deploys continue to deliver route-only remote events.
+		evt.SchemaVersion = CurrentEventSchemaVersion
+	case CurrentEventSchemaVersion:
+		// OK
+	default:
+		return Event{}, false
+	}
+
 	// Known event type required.
 	switch evt.Type {
 	case EventTypeMessageCreated:
@@ -454,6 +472,10 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 		}
 		evt.MessageID = mid.String()
 	}
+
+	// Remote bus payloads may contain body_text or legacy sender_email. Strip
+	// them so remote nodes route by IDs only; clients fetch by ID if needed.
+	evt.Payload = nil
 
 	return evt, true
 }

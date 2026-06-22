@@ -4,27 +4,35 @@
  * Security notes:
  * - No tokens are stored or exposed; authentication is handled by authenticatedFetch.
  * - No author_id is sent from the client; the server derives sender identity from the JWT.
- * - AbortController cancels in-flight list requests on target change or unmount.
+ * - AbortController cancels in-flight list and fallback single-message requests
+ *   on target change or unmount.
  * - latestTargetRef is updated via useLayoutEffect (no deps) after every render,
  *   synchronously in the same JS task, before any microtask can run. This ensures
  *   stale POST completions are detected reliably regardless of effect scheduling.
  *
  * WebSocket realtime delivery:
- * PREREQUISITE MISSING — ws/handler.go returns 501 Not Implemented.
- * A secure browser-usable WebSocket auth design (auth ticket or same-origin cookie-based
- * upgrade, never token-in-URL) must be implemented before WS can be wired here.
- * Until then, this hook is REST-only.
+ * Connected to /api/chat/ws via useChatWebSocket. Auth uses the Bearer access
+ * token passed as the Sec-WebSocket-Protocol subprotocol (browser WebSocket
+ * upgrade does not support custom headers; token-in-URL is explicitly rejected
+ * by the server). Incoming message.created events carry the full message DTO
+ * in evt.payload and are inserted directly into the timeline without an
+ * additional GET (dedup by id in reducer). If payload is absent (old server
+ * during rolling deploy) a targeted GET is used as fallback.
+ * Cleanup happens on unmount and target change via useChatWebSocket's effect.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
+  fetchChannelMessage,
   fetchChannelMessages,
+  fetchDMMessage,
   fetchDMMessages,
   postChannelMessage,
   postDMMessage,
 } from "./chatApi";
 import type { Message, MessagePage } from "./chatTypes";
+import { useChatWebSocket, type WSMessageCreatedEvent } from "./useChatWebSocket";
 
 // ── State shape ───────────────────────────────────────────────────────────────
 
@@ -34,8 +42,11 @@ type MessagesStatus = "idle" | "loading" | "ready" | "error";
  * Explicit record of the most recent messages mutation.
  * Used by MessageList's useLayoutEffect to apply the correct scroll strategy
  * without relying on fragile first/last ID comparisons.
+ *
+ * "ws_append" — message appended from a WebSocket event; MessageList scrolls
+ *               to bottom only when the user is already near the bottom.
  */
-export type LastMutation = "initial" | "append" | "prepend" | "none";
+export type LastMutation = "initial" | "append" | "prepend" | "ws_append" | "none";
 
 export interface MessagesState {
   status: MessagesStatus;
@@ -48,6 +59,8 @@ export interface MessagesState {
   loadingMore: boolean;
   /** Describes the most recent change to the messages array for scroll management. */
   lastMutation: LastMutation;
+  /** Recoverable realtime fallback error; initial loads and manual retries remain authoritative. */
+  realtimeError: string | null;
 }
 
 // ── Send result ───────────────────────────────────────────────────────────────
@@ -75,7 +88,9 @@ type Action =
   | { type: "send_error"; error: string }
   | { type: "prepending" }
   | { type: "prepended"; page: MessagePage }
-  | { type: "prepend_error" };
+  | { type: "prepend_error" }
+  | { type: "ws_received"; message: Message }
+  | { type: "ws_fetch_error"; error: string };
 
 const initialState: MessagesState = {
   status: "idle",
@@ -85,7 +100,10 @@ const initialState: MessagesState = {
   sending: false,
   loadingMore: false,
   lastMutation: "none",
+  realtimeError: null,
 };
+
+const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
 
 function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
@@ -99,6 +117,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         loadingMore: false,
         nextCursor: "",
         lastMutation: "none",
+        realtimeError: null,
       };
     case "loaded":
       return {
@@ -109,6 +128,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         sending: false,
         loadingMore: false,
         lastMutation: "initial",
+        realtimeError: null,
       };
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
@@ -123,6 +143,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         sending: false,
         sendError: null,
         lastMutation: alreadyPresent ? "none" : "append",
+        realtimeError: null,
       };
     }
     case "send_error":
@@ -145,6 +166,42 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "prepend_error":
       return { ...state, loadingMore: false, lastMutation: "none" };
+    case "ws_received": {
+      // Dedup: if the message is already present (e.g. our own POST response
+      // arrived before the WS event), this is a pure no-op.
+      const alreadyPresent = state.messages.some((m) => m.id === action.message.id);
+      if (alreadyPresent) return { ...state, realtimeError: null };
+
+      // Insert in stable (createdAt, id) order to handle out-of-order delivery.
+      // Most WS messages are newer than all existing ones, so a quick tail-check
+      // avoids a full sort in the common case.
+      const msg = action.message;
+      const msgs = state.messages;
+      const isNewer =
+        msgs.length === 0 ||
+        msg.createdAt > msgs[msgs.length - 1].createdAt ||
+        (msg.createdAt === msgs[msgs.length - 1].createdAt && msg.id > msgs[msgs.length - 1].id);
+
+      const newMessages = isNewer
+        ? [...msgs, msg]
+        : [...msgs, msg].sort((a, b) => {
+            if (a.createdAt < b.createdAt) return -1;
+            if (a.createdAt > b.createdAt) return 1;
+            return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+          });
+
+      return {
+        ...state,
+        messages: newMessages,
+        // ws_append: MessageList scrolls to bottom only if the user is already
+        // near the bottom, preserving position when reading history.
+        // If the message was inserted mid-list (out-of-order), no auto-scroll.
+        lastMutation: isNewer ? "ws_append" : "none",
+        realtimeError: null,
+      };
+    }
+    case "ws_fetch_error":
+      return { ...state, realtimeError: action.error, lastMutation: "none" };
   }
 }
 
@@ -182,38 +239,48 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
 
   const abortRef = useRef<AbortController | null>(null);
   const loadMoreAbortRef = useRef<AbortController | null>(null);
+  const wsFallbackAbortRef = useRef<AbortController | null>(null);
 
-  const load = useCallback((id: string, k: "channel" | "dm") => {
-    abortRef.current?.abort();
-    loadMoreAbortRef.current?.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-
-    const loadKey = `${k}:${id}`;
-    dispatch({ type: "loading" });
-
-    const fetchFn: () => Promise<MessagePage> =
-      k === "channel"
-        ? () => fetchChannelMessages(id, undefined, ctrl.signal)
-        : () => fetchDMMessages(id, undefined, ctrl.signal);
-
-    fetchFn().then(
-      (page) => {
-        if (stateRef.current.target !== loadKey) return;
-        dispatch({ type: "loaded", page });
-      },
-      (err: unknown) => {
-        if (stateRef.current.target !== loadKey) return;
-        if (err instanceof Error && err.name === "AbortError") return;
-        dispatch({ type: "error" });
-      },
-    );
-
-    return () => {
-      ctrl.abort();
-      loadMoreAbortRef.current?.abort();
-    };
+  const isCurrentTarget = useCallback((loadKey: string) => {
+    return stateRef.current.target === loadKey;
   }, []);
+
+  const load = useCallback(
+    (id: string, k: "channel" | "dm") => {
+      abortRef.current?.abort();
+      loadMoreAbortRef.current?.abort();
+      wsFallbackAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+
+      const loadKey = `${k}:${id}`;
+      dispatch({ type: "loading" });
+
+      const fetchFn: () => Promise<MessagePage> =
+        k === "channel"
+          ? () => fetchChannelMessages(id, undefined, ctrl.signal)
+          : () => fetchDMMessages(id, undefined, ctrl.signal);
+
+      fetchFn().then(
+        (page) => {
+          if (!isCurrentTarget(loadKey)) return;
+          dispatch({ type: "loaded", page });
+        },
+        (err: unknown) => {
+          if (!isCurrentTarget(loadKey)) return;
+          if (err instanceof Error && err.name === "AbortError") return;
+          dispatch({ type: "error" });
+        },
+      );
+
+      return () => {
+        ctrl.abort();
+        loadMoreAbortRef.current?.abort();
+        wsFallbackAbortRef.current?.abort();
+      };
+    },
+    [isCurrentTarget],
+  );
 
   useEffect(() => {
     if (!targetId) return;
@@ -250,17 +317,17 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
     fetchFn().then(
       (page) => {
         stateRef.current.loadingMore = false;
-        if (stateRef.current.target !== loadKey) return;
+        if (!isCurrentTarget(loadKey)) return;
         dispatch({ type: "prepended", page });
       },
       (err: unknown) => {
         stateRef.current.loadingMore = false;
-        if (stateRef.current.target !== loadKey) return;
+        if (!isCurrentTarget(loadKey)) return;
         if (err instanceof Error && err.name === "AbortError") return;
         dispatch({ type: "prepend_error" });
       },
     );
-  }, [kind, targetId]);
+  }, [kind, targetId, isCurrentTarget]);
 
   const sendMessage = useCallback(
     async (body: string): Promise<SendResult> => {
@@ -291,6 +358,70 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
     },
     [kind, targetId],
   );
+
+  // Handle incoming message.created WS events.
+  //
+  // Primary path: use evt.payload (full DTO from server) to insert the message
+  // directly — no additional GET required.
+  //
+  // Fallback path: if payload is absent (old server version during rolling deploy),
+  // fall back to a targeted GET to avoid silent message loss.
+  //
+  // Target check: events for other channels/DMs are ignored (defence-in-depth on
+  // top of the WS hook's own filter).
+  const handleWsMessageCreated = useCallback(
+    (evt: WSMessageCreatedEvent) => {
+      const loadKey = `${kind}:${targetId}`;
+
+      // Double-check target (ws hook already filters, but guard here too).
+      if (evt.target_id !== targetId) return;
+
+      if (evt.payload) {
+        wsFallbackAbortRef.current?.abort();
+        // Build Message from the full DTO carried in the event.
+        const p = evt.payload;
+        const msg: Message = {
+          id: p.id,
+          senderId: p.sender_id,
+          senderDisplayName: p.sender_display_name,
+          senderEmail: p.sender_email ?? "",
+          kind: p.kind as Message["kind"],
+          bodyText: p.body_text,
+          isRemoved: p.is_removed,
+          status: p.status as Message["status"],
+          createdAt: p.created_at,
+          updatedAt: p.updated_at,
+        };
+        if (!isCurrentTarget(loadKey)) return;
+        dispatch({ type: "ws_received", message: msg });
+        return;
+      }
+
+      // Fallback: payload absent — fetch the message by ID.
+      wsFallbackAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      wsFallbackAbortRef.current = ctrl;
+      const fetchFn =
+        kind === "channel"
+          ? () => fetchChannelMessage(targetId, evt.message_id, ctrl.signal)
+          : () => fetchDMMessage(targetId, evt.message_id, ctrl.signal);
+
+      fetchFn().then(
+        (msg) => {
+          if (!isCurrentTarget(loadKey)) return;
+          dispatch({ type: "ws_received", message: msg });
+        },
+        (err: unknown) => {
+          if (!isCurrentTarget(loadKey)) return;
+          if (err instanceof Error && err.name === "AbortError") return;
+          dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
+        },
+      );
+    },
+    [kind, targetId, isCurrentTarget],
+  );
+
+  useChatWebSocket({ kind, targetId, onMessageCreated: handleWsMessageCreated });
 
   return { state, sendMessage, retry, loadMore };
 }

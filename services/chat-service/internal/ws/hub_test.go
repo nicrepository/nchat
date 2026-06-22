@@ -685,7 +685,11 @@ func TestHub_Concurrent_RegisterSubscribeBroadcast_NoRace(t *testing.T) {
 			c := newClient(fmt.Sprintf("c%d", n), "user-1", "ws-1", &fakeSender{})
 			registerInRunningHub(t, hub, c) // synchronous: safe to Subscribe immediately after
 			_ = hub.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1")
-			hub.PublishMessageCreated(context.Background(), "ws-1", TargetTypeChannel, "ch-1", fmt.Sprintf("msg-%d", n))
+			hub.PublishMessageCreated(context.Background(), "ws-1", TargetTypeChannel, "ch-1", MessagePayload{
+				ID: fmt.Sprintf("44444444-0000-0000-0000-%012d", n), WorkspaceID: "ws-1",
+				ChannelID: "ch-1", SenderID: "user-1", Kind: "user", Status: "active",
+				CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+			})
 			hub.Unregister(c)
 		}(i)
 	}

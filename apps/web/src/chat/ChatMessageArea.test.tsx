@@ -5,7 +5,7 @@
  * The component itself is the unit under test.
  */
 
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router-dom";
 
@@ -15,28 +15,38 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import ChatMessageArea from "./ChatMessageArea";
 import type { Message, MessagePage } from "./chatTypes";
+import type { WSMessageCreatedEvent } from "./useChatWebSocket";
+import { useChatWebSocket } from "./useChatWebSocket";
+import * as chatApi from "./chatApi";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
-const { mockFetchChannelMessages, mockPostChannelMessage, mockFetchDMMessages, mockPostDMMessage } =
-  vi.hoisted(() => ({
-    mockFetchChannelMessages:
-      vi.fn<
-        (channelId: string, beforeCursor?: string, signal?: AbortSignal) => Promise<MessagePage>
-      >(),
-    mockPostChannelMessage:
-      vi.fn<(channelId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
-    mockFetchDMMessages:
-      vi.fn<
-        (
-          conversationId: string,
-          beforeCursor?: string,
-          signal?: AbortSignal,
-        ) => Promise<MessagePage>
-      >(),
-    mockPostDMMessage:
-      vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
-  }));
+const {
+  mockFetchChannelMessages,
+  mockFetchChannelMessage,
+  mockPostChannelMessage,
+  mockFetchDMMessages,
+  mockPostDMMessage,
+  wsMockState,
+} = vi.hoisted(() => ({
+  mockFetchChannelMessages:
+    vi.fn<
+      (channelId: string, beforeCursor?: string, signal?: AbortSignal) => Promise<MessagePage>
+    >(),
+  mockFetchChannelMessage:
+    vi.fn<(channelId: string, messageId: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockPostChannelMessage:
+    vi.fn<(channelId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchDMMessages:
+    vi.fn<
+      (conversationId: string, beforeCursor?: string, signal?: AbortSignal) => Promise<MessagePage>
+    >(),
+  mockPostDMMessage:
+    vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
+  wsMockState: {
+    capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
+  },
+}));
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: vi.fn(),
@@ -44,12 +54,24 @@ vi.mock("./chatApi", () => ({
   fetchDMs: vi.fn(),
   fetchChannelMessages: (channelId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchChannelMessages(channelId, beforeCursor, signal),
+  fetchChannelMessage: mockFetchChannelMessage,
   postChannelMessage: (channelId: string, bodyText: string, signal?: AbortSignal) =>
     mockPostChannelMessage(channelId, bodyText, signal),
   fetchDMMessages: (conversationId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchDMMessages(conversationId, beforeCursor, signal),
   postDMMessage: (conversationId: string, bodyText: string, signal?: AbortSignal) =>
     mockPostDMMessage(conversationId, bodyText, signal),
+  fetchDMMessage: vi.fn(),
+}));
+
+// useChatWebSocket is a no-op in component tests — WS behaviour is tested in
+// useChatWebSocket.test.ts.
+vi.mock("./useChatWebSocket", () => ({
+  useChatWebSocket: vi.fn(
+    ({ onMessageCreated }: { onMessageCreated: (event: WSMessageCreatedEvent) => void }) => {
+      wsMockState.capturedWSMessageCreated = onMessageCreated;
+    },
+  ),
 }));
 
 // ── Fixtures (test-only) ──────────────────────────────────────────────────────
@@ -98,6 +120,7 @@ function renderDMArea(dmId = "dm-juliane") {
 
 beforeEach(() => {
   setTokens("test-at");
+  wsMockState.capturedWSMessageCreated = null;
   vi.clearAllMocks();
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
@@ -222,6 +245,33 @@ describe("ChatMessageArea — error state", () => {
     expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
     expect(screen.getByTestId("chat-composer-input")).toBeDisabled();
     expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+  });
+
+  it("shows a discreet realtime instability banner without technical details", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const sensitiveError = "HTTP 429 " + "tok" + "en=" + "sec" + "ret payload=body";
+    mockFetchChannelMessage.mockRejectedValue(new Error(sensitiveError));
+    renderChannelArea("geral");
+
+    await screen.findByTestId("chat-msg-empty");
+
+    act(() => {
+      wsMockState.capturedWSMessageCreated?.({
+        type: "message.created",
+        schema_version: 1,
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "msg-realtime-fallback",
+        event_id: "evt-1",
+        created_at: new Date().toISOString(),
+      });
+    });
+
+    const banner = await screen.findByTestId("chat-realtime-error");
+    expect(banner).toHaveTextContent("Conexão em tempo real instável. Tentando reconectar...");
+    expect(banner).not.toHaveTextContent("tok" + "en=" + "sec" + "ret");
+    expect(banner).not.toHaveTextContent("payload=body");
   });
 });
 
@@ -987,7 +1037,15 @@ describe("ChatMessageArea — infinite scroll", () => {
       .mockResolvedValueOnce({ messages: [makeMessage({ id: "o1" })], nextCursor: "" });
 
     renderChannelArea();
-    await waitFor(() => expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1));
+
+    // Wait for first page AND for the IntersectionObserver to be registered (useEffect
+    // has run). In slow CI environments waitFor can return as soon as the DOM condition
+    // is met, before the [hasMore] effect has fully committed. Combining both checks in
+    // one waitFor guarantees capturedIOCallback is non-null before we fire it.
+    await waitFor(() => {
+      expect(screen.getAllByTestId("chat-msg-bubble")).toHaveLength(1);
+      expect(capturedIOCallback).not.toBeNull();
+    });
 
     // beforeEach sets window.Element.prototype.scrollIntoView = vi.fn().
     // Clear its call history here to only count calls triggered by prepend.
@@ -995,7 +1053,7 @@ describe("ChatMessageArea — infinite scroll", () => {
     scrollMock.mockClear();
 
     act(() => {
-      capturedIOCallback?.(
+      capturedIOCallback!(
         [{ isIntersecting: true } as IntersectionObserverEntry],
         {} as IntersectionObserver,
       );
@@ -1288,5 +1346,126 @@ describe("ChatMessageArea — resolved display name", () => {
 
     const header = await screen.findByTestId("chat-msg-header");
     expect(header).toHaveTextContent("geral");
+  });
+});
+
+// ── WS realtime scroll behavior ───────────────────────────────────────────────
+//
+// ws_append (from WS message.created events) must NOT call scrollIntoView when
+// the user is reading history (not near the bottom), but SHOULD call it when
+// the user is already near the bottom.
+//
+// useChatWebSocket is overridden per-test to capture the onMessageCreated
+// callback — this is NOT a no-op mock; it exercises the real callback path.
+
+describe("ChatMessageArea — WS message scroll behavior", () => {
+  let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
+
+  beforeEach(() => {
+    capturedOnMessageCreated = null;
+    // Override to capture the onMessageCreated callback instead of dropping it.
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({
+        onMessageCreated,
+      }: {
+        kind: string;
+        targetId: string;
+        onMessageCreated: (evt: WSMessageCreatedEvent) => void;
+      }) => {
+        capturedOnMessageCreated = onMessageCreated;
+      },
+    );
+  });
+
+  afterEach(() => {
+    // Restore to the default no-op so other test suites are not affected.
+    vi.mocked(useChatWebSocket).mockImplementation(vi.fn());
+  });
+
+  it("does NOT call scrollIntoView when user is reading history (not near bottom)", async () => {
+    // Provide an initial message so MessageList renders (it only renders when
+    // messages.length > 0, which exposes the role="log" list element).
+    const initialMsg = makeMessage({ id: "msg-initial", bodyText: "Initial message" });
+    const wsMsg = makeMessage({ id: "msg-ws-hist", bodyText: "WS history message" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [initialMsg], nextCursor: "" });
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+
+    renderChannelArea("geral");
+    // Wait for MessageList to render with the initial message.
+    await waitFor(() => expect(screen.getByText("Initial message")).toBeInTheDocument());
+
+    // Get the scrollable list element.
+    const list = screen.getByRole("log");
+
+    // Simulate user scrolled far up: scrollHeight=1000, clientHeight=400, scrollTop=0
+    // → distance from bottom = 1000 - 0 - 400 = 600 > 150 → not near bottom.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
+    fireEvent.scroll(list);
+
+    // Clear any scrollIntoView calls from the initial load.
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+
+    // Simulate a WS message.created event.
+    expect(capturedOnMessageCreated).not.toBeNull();
+    await act(async () => {
+      capturedOnMessageCreated?.({
+        type: "message.created",
+        event_id: "evt-1",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "msg-ws-hist",
+      });
+    });
+
+    // Message appears in the list.
+    await waitFor(() => expect(screen.getByText("WS history message")).toBeInTheDocument());
+
+    // scrollIntoView must NOT be called — user is reading history.
+    expect(scrollMock).not.toHaveBeenCalled();
+  });
+
+  it("calls scrollIntoView when user is near bottom", async () => {
+    const initialMsg = makeMessage({ id: "msg-initial-bot", bodyText: "Initial bot message" });
+    const wsMsg = makeMessage({ id: "msg-ws-bot", bodyText: "Near bottom message" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [initialMsg], nextCursor: "" });
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+
+    renderChannelArea("geral");
+    await waitFor(() => expect(screen.getByText("Initial bot message")).toBeInTheDocument());
+
+    const list = screen.getByRole("log");
+    // Simulate near-bottom scroll: scrollHeight=500, clientHeight=400, scrollTop=99
+    // → distance from bottom = 500 - 99 - 400 = 1 ≤ 150 → near bottom.
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 500 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 99 });
+    fireEvent.scroll(list);
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+
+    expect(capturedOnMessageCreated).not.toBeNull();
+    await act(async () => {
+      capturedOnMessageCreated?.({
+        type: "message.created",
+        event_id: "evt-1",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "msg-ws-bot",
+      });
+    });
+
+    // Message appears.
+    await waitFor(() => expect(screen.getByText("Near bottom message")).toBeInTheDocument());
+
+    // scrollIntoView SHOULD be called — user is near the bottom.
+    await waitFor(() => expect(scrollMock).toHaveBeenCalledTimes(1));
   });
 });

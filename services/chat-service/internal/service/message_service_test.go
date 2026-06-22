@@ -39,6 +39,7 @@ func activeDMConversation(workspaceID, convID string) domain.DMConversation {
 type fakeMessageStore struct {
 	createdMessage        domain.Message
 	createErr             error
+	afterCreate           func()
 	channelMessages       []domain.Message
 	listChannelErr        error
 	listChannelNextCursor *storage.MessageCursor
@@ -58,6 +59,9 @@ type fakeMessageStore struct {
 func (f *fakeMessageStore) CreateMessage(_ context.Context, input storage.CreateMessageInput) (domain.Message, error) {
 	f.createCalls++
 	f.lastCreateInput = input
+	if f.createErr == nil && f.afterCreate != nil {
+		f.afterCreate()
+	}
 	return f.createdMessage, f.createErr
 }
 
