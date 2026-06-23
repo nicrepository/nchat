@@ -2,6 +2,7 @@ package observability
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,5 +126,63 @@ func TestResponseWriterDoesNotOverwriteStatus(t *testing.T) {
 
 	if rw.statusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 after double WriteHeader, got %d", rw.statusCode)
+	}
+}
+
+// TestResponseWriterPreservesHijacker confirms that a WebSocket upgrade
+// (HTTP/1.1 → 101 Switching Protocols) succeeds when the handler is wrapped
+// by the observability middleware.
+func TestResponseWriterPreservesHijacker(t *testing.T) {
+	cfg := Config{ServiceName: "test-svc", MetricsEnabled: true}
+	m := NewMetrics(cfg)
+
+	handler := HTTPMiddleware(cfg, m)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijack not supported", http.StatusNotImplemented)
+			return
+		}
+		conn, bufrw, err := hijacker.Hijack()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer conn.Close()
+		_, _ = bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = bufrw.Flush()
+	}))
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	upgradeReq := "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+	if _, err = conn.Write([]byte(upgradeReq)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+
+	response := string(buf[:n])
+	if !strings.HasPrefix(response, "HTTP/1.1 101") {
+		t.Fatalf("expected 101 Switching Protocols, got:\n%s", response)
+	}
+}
+
+func TestResponseWriterUnwrap(t *testing.T) {
+	rr := httptest.NewRecorder()
+	rw := &responseWriter{ResponseWriter: rr, statusCode: http.StatusOK}
+
+	if rw.Unwrap() != rr {
+		t.Fatal("Unwrap() did not return the underlying ResponseWriter")
 	}
 }

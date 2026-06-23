@@ -1,7 +1,9 @@
 package observability
 
 import (
+	"bufio"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -79,4 +81,24 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 		rw.written = true
 	}
 	return rw.ResponseWriter.Write(b)
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (rw *responseWriter) Flush() {
+	flusher, ok := rw.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
+	}
+	flusher.Flush()
+}
+
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
 }
