@@ -147,7 +147,7 @@ func TestResponseWriterPreservesHijacker(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_, _ = bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 		_ = bufrw.Flush()
 	}))
@@ -159,7 +159,7 @@ func TestResponseWriterPreservesHijacker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	upgradeReq := "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
 	if _, err = conn.Write([]byte(upgradeReq)); err != nil {
@@ -184,5 +184,65 @@ func TestResponseWriterUnwrap(t *testing.T) {
 
 	if rw.Unwrap() != rr {
 		t.Fatal("Unwrap() did not return the underlying ResponseWriter")
+	}
+}
+
+// TestResponseWriterFlushMarksWritten verifies that Flush() locks in 200 OK so
+// a subsequent WriteHeader(500) does not corrupt the recorded status code.
+// This prevents metrics and tracing from reporting 500 when the client already
+// received an implicit 200.
+func TestResponseWriterFlushMarksWritten(t *testing.T) {
+	rr := httptest.NewRecorder()
+	rw := &responseWriter{ResponseWriter: rr, statusCode: http.StatusOK}
+
+	rw.Flush()
+
+	if !rw.written {
+		t.Fatal("Flush() must mark rw.written = true")
+	}
+	if rw.statusCode != http.StatusOK {
+		t.Fatalf("Flush() must set statusCode to 200, got %d", rw.statusCode)
+	}
+
+	// A WriteHeader after Flush must be ignored for status tracking.
+	rw.WriteHeader(http.StatusInternalServerError)
+	if rw.statusCode != http.StatusOK {
+		t.Fatalf("WriteHeader(500) after Flush() must not change recorded statusCode, got %d", rw.statusCode)
+	}
+}
+
+// TestHTTPMiddlewareFlushThenWriteHeaderRecords200 exercises the full middleware
+// stack: a handler that flushes first and then tries to set a 500 header must
+// result in 200 being recorded in metrics, not 500.
+func TestHTTPMiddlewareFlushThenWriteHeaderRecords200(t *testing.T) {
+	cfg := Config{ServiceName: "test-svc", MetricsEnabled: true}
+	m := NewMetrics(cfg)
+
+	handler := HTTPMiddleware(cfg, m)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Flush locks in the implicit 200.
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// This WriteHeader arrives after Flush — must be a no-op for status tracking.
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// The underlying recorder will have received WriteHeader(500) because we
+	// delegate it, but our wrapper must have recorded 200 for metrics.
+	// We verify the wrapper state indirectly via the metrics output.
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRR := httptest.NewRecorder()
+	m.Handler().ServeHTTP(metricsRR, metricsReq)
+
+	body := metricsRR.Body.String()
+	if !strings.Contains(body, `status="200"`) {
+		t.Fatalf("expected status=\"200\" in metrics, got:\n%s", body)
+	}
+	if strings.Contains(body, `status="500"`) {
+		t.Fatalf("unexpected status=\"500\" in metrics after Flush-then-WriteHeader(500):\n%s", body)
 	}
 }

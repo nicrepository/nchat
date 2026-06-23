@@ -96,6 +96,10 @@ func (rw *responseWriter) Flush() {
 	if !ok {
 		return
 	}
+	if !rw.written {
+		rw.statusCode = http.StatusOK
+		rw.written = true
+	}
 	flusher.Flush()
 }
 
