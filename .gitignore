@@ -117,3 +117,7 @@ poc-results/*
 # Playwright local artifacts
 apps/web/playwright-report/
 apps/web/test-results/
+
+# Security scan artifacts
+results.sarif
+*.sarif
