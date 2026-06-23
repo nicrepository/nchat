@@ -288,6 +288,128 @@ func TestMiddleware_LimitIsPerUser(t *testing.T) {
 	}
 }
 
+// ── POST (send-message) rate limit ─────────────────────────────────────────────
+//
+// The message-send (POST) path has its own per-user rate limiter (msgPostLimiter).
+// When the limit is exceeded the middleware must return 429 without calling the
+// inner handler — guaranteeing that no message is persisted and no broadcast fires.
+
+// authedPOSTRequest creates a POST request with userID in context to simulate
+// what BearerAuth + RequireActiveSession produce for write paths.
+func authedPOSTRequest(userID, url string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, url, strings.NewReader(`{"body":"hi"}`))
+	r.Header.Set("Content-Type", "application/json")
+	ctx := context.WithValue(r.Context(), ctxKeyUserID, userID)
+	return r.WithContext(ctx)
+}
+
+func TestRateLimit_PostChannelMessage_Returns429WhenExceeded(t *testing.T) {
+	sentinel := &rateLimitSentinel{}
+	l := NewUserRateLimiter(2, time.Minute)
+	t.Cleanup(l.Stop)
+	handler := l.Middleware(sentinel)
+
+	for i := range 2 {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, authedPOSTRequest("user-p1", RouteChannelMessages))
+		if w.Code != http.StatusOK {
+			t.Fatalf("POST %d should be allowed; got %d", i+1, w.Code)
+		}
+	}
+
+	// Third POST exceeds the limit — inner handler must not be called.
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, authedPOSTRequest("user-p1", RouteChannelMessages))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on rate-limited POST; got %d", w.Code)
+	}
+	if sentinel.calls != 2 {
+		t.Fatalf("inner handler should not be called on 429; calls=%d", sentinel.calls)
+	}
+	if ra := w.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("expected Retry-After header on 429")
+	}
+}
+
+func TestRateLimit_PostDMMessage_Returns429WhenExceeded(t *testing.T) {
+	sentinel := &rateLimitSentinel{}
+	l := NewUserRateLimiter(2, time.Minute)
+	t.Cleanup(l.Stop)
+	handler := l.Middleware(sentinel)
+
+	for i := range 2 {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, authedPOSTRequest("user-p2", RouteDMMessages))
+		if w.Code != http.StatusOK {
+			t.Fatalf("POST DM %d should be allowed; got %d", i+1, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, authedPOSTRequest("user-p2", RouteDMMessages))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on rate-limited DM POST; got %d", w.Code)
+	}
+	if sentinel.calls != 2 {
+		t.Fatalf("inner handler should not be called on 429; calls=%d", sentinel.calls)
+	}
+}
+
+// ── GET single-message rate limit ─────────────────────────────────────────────
+//
+// GET single-message has a dedicated budget so realtime fallback does not
+// consume paginated list capacity. The tests below verify the middleware shape.
+
+func TestRateLimit_GetChannelMessage_Returns429WhenExceeded(t *testing.T) {
+	sentinel := &rateLimitSentinel{}
+	l := NewUserRateLimiter(2, time.Minute)
+	t.Cleanup(l.Stop)
+	handler := l.Middleware(sentinel)
+
+	url := "/api/chat/channels/ch-1/messages/msg-1"
+	for i := range 2 {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, authedRLRequestURL("user-p3", url))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET single-msg %d should be allowed; got %d", i+1, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, authedRLRequestURL("user-p3", url))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on rate-limited GET single-msg; got %d", w.Code)
+	}
+	if sentinel.calls != 2 {
+		t.Fatalf("inner handler must not be called on 429; calls=%d", sentinel.calls)
+	}
+}
+
+func TestRateLimit_GetDMMessage_Returns429WhenExceeded(t *testing.T) {
+	sentinel := &rateLimitSentinel{}
+	l := NewUserRateLimiter(2, time.Minute)
+	t.Cleanup(l.Stop)
+	handler := l.Middleware(sentinel)
+
+	url := "/api/chat/dm/conv-1/messages/msg-1"
+	for i := range 2 {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, authedRLRequestURL("user-p4", url))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET DM single-msg %d should be allowed; got %d", i+1, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, authedRLRequestURL("user-p4", url))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on rate-limited GET DM single-msg; got %d", w.Code)
+	}
+	if sentinel.calls != 2 {
+		t.Fatalf("inner handler must not be called on 429; calls=%d", sentinel.calls)
+	}
+}
+
 // ── Authorization chain test ──────────────────────────────────────────────────
 
 // TestUserRateLimiter_Middleware_DoesNotBreakAuthorization verifies that the

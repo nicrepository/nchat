@@ -208,3 +208,23 @@ export async function postDMMessage(
   });
   return mapMessage(res.data);
 }
+
+export async function fetchChannelMessage(
+  channelId: string,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const url = `${messagesPath("channel", channelId)}/${encodeURIComponent(messageId)}`;
+  const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
+  return mapMessage(res.data);
+}
+
+export async function fetchDMMessage(
+  conversationId: string,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const url = `${messagesPath("dm", conversationId)}/${encodeURIComponent(messageId)}`;
+  const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
+  return mapMessage(res.data);
+}

@@ -18,6 +18,10 @@ const (
 	EventTypeMessageCreated EventType = "message.created"
 )
 
+// CurrentEventSchemaVersion is the version of the outbound WebSocket event
+// envelope. Missing schema_version is treated as v1 for rolling deploys.
+const CurrentEventSchemaVersion = 1
+
 // ClientMessageType is the type of inbound control message a client may send.
 // Clients are limited to control actions; they may not send chat messages over WS.
 type ClientMessageType string
@@ -28,22 +32,51 @@ const (
 	ClientMessageTypePing        ClientMessageType = "ping"
 )
 
+// MessagePayload carries the full message DTO for message.created events.
+// It mirrors the non-sensitive render fields returned by the list endpoints so
+// that the browser can render the message immediately without an additional GET.
+//
+// Security notes:
+//   - BodyText must NEVER be included in server logs (user-generated content).
+//   - All fields are server-populated from the authoritative DB record.
+//   - No tokens, secrets, credentials, or sender email may appear in any field.
+type MessagePayload struct {
+	ID                string     `json:"id"`
+	WorkspaceID       string     `json:"workspace_id"`
+	ChannelID         string     `json:"channel_id,omitempty"`
+	DMConversationID  string     `json:"dm_conversation_id,omitempty"`
+	SenderID          string     `json:"sender_id"`
+	SenderDisplayName string     `json:"sender_display_name"`
+	Kind              string     `json:"kind"`
+	BodyText          string     `json:"body_text"`
+	Status            string     `json:"status"`
+	IsRemoved         bool       `json:"is_removed"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	EditedAt          *time.Time `json:"edited_at,omitempty"`
+	DeletedAt         *time.Time `json:"deleted_at,omitempty"`
+}
+
 // Event is the outbound event envelope sent to WebSocket clients and exchanged
 // over the distributed BroadcastBus.
 //
 // Security notes:
-//   - Payload must never contain message body text (no log-leakage risk).
+//   - Payload.BodyText must not be included in any server log statement.
 //   - WorkspaceID, TargetType, TargetID are server-generated; never client-provided.
 //   - No tokens, secrets, or credentials may appear in any field.
 //   - SourceInstanceID is used for echo-suppression only; do not trust it for
 //     authorization. Authorization re-check happens independently.
 type Event struct {
-	Type        EventType  `json:"type"`
-	WorkspaceID string     `json:"workspace_id"`
-	TargetType  TargetType `json:"target_type"`
-	TargetID    string     `json:"target_id"`
-	// MessageID is populated for message.created events.
+	SchemaVersion int        `json:"schema_version"`
+	Type          EventType  `json:"type"`
+	WorkspaceID   string     `json:"workspace_id"`
+	TargetType    TargetType `json:"target_type"`
+	TargetID      string     `json:"target_id"`
+	// MessageID is populated for message.created events (retained for bus relay).
 	MessageID string `json:"message_id,omitempty"`
+	// Payload carries the full message DTO for direct browser insertion.
+	// Omitted on canonicalized remote events (body_text is not re-trusted from bus).
+	Payload *MessagePayload `json:"payload,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`

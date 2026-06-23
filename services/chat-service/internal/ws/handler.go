@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/wsutil"
 )
 
 // credentialParamNames is the set of query parameter names (lowercased) whose
@@ -218,9 +219,24 @@ func resolveWorkspace(w http.ResponseWriter, r *http.Request, workspaces Workspa
 // runConnection upgrades the HTTP connection to WebSocket, registers the client
 // in the hub, starts the I/O pumps, and runs the read loop until the connection
 // closes. Cleanup is idempotent via stop/done and sync.Once in wsSender.
+//
+// If the request carries a Sec-WebSocket-Protocol header (set by browser clients
+// that pass the Bearer token as the subprotocol), runConnection echoes it back
+// via AcceptOptions.Subprotocols so the browser keeps the connection open.
 func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID string, cfg HandlerConfig) {
 	logger = normalizeLogger(logger)
-	conn, err := websocket.Accept(w, r, nil)
+
+	var acceptOpts *websocket.AcceptOptions
+	if proto, ok := wsutil.SubprotocolHeader(r.Header); ok {
+		if !wsutil.IsValidSubprotocolToken(proto) {
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid websocket subprotocol")
+			return
+		}
+		// Auth-service JWTs are unpadded Base64URL segments, which are valid
+		// WebSocket subprotocol tokens; echo the exact token so browsers proceed.
+		acceptOpts = &websocket.AcceptOptions{Subprotocols: []string{proto}}
+	}
+	conn, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		// websocket.Accept writes the error response itself.
 		logger.WarnContext(r.Context(), "ws: upgrade failed")

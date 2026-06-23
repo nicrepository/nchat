@@ -31,8 +31,10 @@ type workspaceResolver interface {
 type messageProvider interface {
 	ListChannelMessages(ctx context.Context, in service.ListChannelMessagesInput) (service.ListChannelMessagesOutput, error)
 	CreateChannelMessage(ctx context.Context, in service.CreateChannelMessageInput) (domain.Message, error)
+	GetChannelMessage(ctx context.Context, in service.GetChannelMessageInput) (domain.Message, error)
 	ListDMMessages(ctx context.Context, in service.ListDMMessagesInput) (service.ListDMMessagesOutput, error)
 	CreateDMMessage(ctx context.Context, in service.CreateDMMessageInput) (domain.Message, error)
+	GetDMMessage(ctx context.Context, in service.GetDMMessageInput) (domain.Message, error)
 }
 
 // MessageHandler handles message list and create endpoints for channels and DMs.
@@ -358,6 +360,90 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
+
+// GetChannelMessage handles GET /api/chat/channels/{channelID}/messages/{messageID}.
+// Returns a single message. The caller must have read access to the channel.
+func (h *MessageHandler) GetChannelMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+
+	messageID := r.PathValue("messageID")
+	if !validateTargetID(w, messageID, "message_id") {
+		return
+	}
+
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+
+	wsID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	msg, err := h.messages.GetChannelMessage(r.Context(), service.GetChannelMessageInput{
+		WorkspaceID: wsID,
+		ChannelID:   channelID,
+		CallerID:    userID,
+		MessageID:   messageID,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+
+	httputil.WriteJSON(w, http.StatusOK, mapToMessageJSON(msg))
+}
+
+// GetDMMessage handles GET /api/chat/dm/{conversationID}/messages/{messageID}.
+// Returns a single message. The caller must be a participant in the DM conversation.
+func (h *MessageHandler) GetDMMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+
+	convID := r.PathValue("conversationID")
+	if !validateTargetID(w, convID, "conversation_id") {
+		return
+	}
+
+	messageID := r.PathValue("messageID")
+	if !validateTargetID(w, messageID, "message_id") {
+		return
+	}
+
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+
+	wsID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	msg, err := h.messages.GetDMMessage(r.Context(), service.GetDMMessageInput{
+		WorkspaceID:    wsID,
+		ConversationID: convID,
+		CallerID:       userID,
+		MessageID:      messageID,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+
+	httputil.WriteJSON(w, http.StatusOK, mapToMessageJSON(msg))
+}
 
 func mapMessages(msgs []domain.Message) []messageJSON {
 	out := make([]messageJSON, 0, len(msgs))

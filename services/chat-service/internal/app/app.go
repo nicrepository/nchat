@@ -111,6 +111,12 @@ func New(cfg config.Config) *App {
 	hub := ws.NewHub(authorizer, logger, ws.NopBus{}, cfg.WSInstanceID, ws.WithPresence(presence))
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
 
+	// Wire the hub as the broadcast publisher for message creation events.
+	// SetPublisher is called after both messageSvc and hub are ready.
+	if messageSvc != nil {
+		messageSvc.SetPublisher(&hubBroadcaster{hub: hub})
+	}
+
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
@@ -144,4 +150,42 @@ func (r *appWSWorkspaceResolver) GetDefaultWorkspaceID(ctx context.Context) (str
 		return "", err
 	}
 	return workspace.ID, nil
+}
+
+// hubBroadcaster adapts ws.Hub to service.MessageEventPublisher.
+// It converts the string targetType to ws.TargetType and domain.Message to
+// ws.MessagePayload, keeping the service package free of a direct ws import.
+type hubBroadcaster struct{ hub *ws.Hub }
+
+func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
+	payload := domainMessageToWSPayload(msg)
+	b.hub.PublishMessageCreated(ctx, workspaceID, ws.TargetType(targetType), targetID, payload)
+}
+
+func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
+	var editedAt, deletedAt *time.Time
+	if !msg.EditedAt.IsZero() {
+		t := msg.EditedAt
+		editedAt = &t
+	}
+	if !msg.DeletedAt.IsZero() {
+		t := msg.DeletedAt
+		deletedAt = &t
+	}
+	return ws.MessagePayload{
+		ID:                msg.ID,
+		WorkspaceID:       msg.WorkspaceID,
+		ChannelID:         msg.ChannelID,
+		DMConversationID:  msg.DMConversationID,
+		SenderID:          msg.SenderID,
+		SenderDisplayName: msg.SenderDisplayName,
+		Kind:              string(msg.Kind),
+		BodyText:          msg.BodyText,
+		Status:            string(msg.Status),
+		IsRemoved:         deletedAt != nil,
+		CreatedAt:         msg.CreatedAt,
+		UpdatedAt:         msg.UpdatedAt,
+		EditedAt:          editedAt,
+		DeletedAt:         deletedAt,
+	}
 }

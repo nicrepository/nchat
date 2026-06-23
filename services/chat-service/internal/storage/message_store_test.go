@@ -13,17 +13,16 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-// createMsgSQL is a regex that matches the atomic CreateMessage query and asserts
-// presence of all authorization joins required by the spec:
+// createMsgSQL is a regex that matches the atomic CreateMessage CTE query and
+// asserts presence of all authorization joins required by the spec:
 //   - chat.workspace_members with wm.status = 'active' (active workspace membership)
 //   - chat.channels with c.status = 'active' (active channel)
 //   - chat.channel_members (private channel membership guard, LEFT JOIN)
 //   - chat.dm_conversations with dc.status = 'active' (active DM conversation)
 //   - chat.dm_members with dm.status = 'active' (active DM membership)
 //
-// Tests that use this pattern verify the SQL sent to the DB contains the correct
-// authorization structure. A mock returning 0 rows then verifies the function maps
-// authorization/reference failure to the expected error.
+// The INSERT is wrapped in a CTE (inserted AS (INSERT ... RETURNING ...)) so the
+// outer SELECT can JOIN auth.users and return sender display info in one round-trip.
 const createMsgSQL = `(?s)INSERT INTO chat\.messages.*` +
 	`chat\.workspace_members.*wm\.status.*active.*` +
 	`chat\.channels.*c\.status.*active.*` +
@@ -106,8 +105,8 @@ func checkExpectations(t *testing.T, mock pgxmock.PgxPoolIface) {
 func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	expectCreate(mock, pgxmock.NewRows(messageCols()).
-		AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...))
+	expectCreate(mock, pgxmock.NewRows(listMessageCols()).
+		AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -126,8 +125,8 @@ func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
 func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	expectCreate(mock, pgxmock.NewRows(messageCols()).
-		AddRow(messageRow("msg-2", "ws-1", "", "dm-1", now)...))
+	expectCreate(mock, pgxmock.NewRows(listMessageCols()).
+		AddRow(listMessageRow("msg-2", "ws-1", "", "dm-1", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -146,8 +145,8 @@ func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
 func TestPGXMessageStore_CreateMessage_ValidSameTargetRef_Succeeds(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	expectCreate(mock, pgxmock.NewRows(messageCols()).
-		AddRow(messageRow("msg-c", "ws-1", "ch-1", "", now)...))
+	expectCreate(mock, pgxmock.NewRows(listMessageCols()).
+		AddRow(listMessageRow("msg-c", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	_, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -210,7 +209,7 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg()).
-				WillReturnRows(pgxmock.NewRows(messageCols()))
+				WillReturnRows(pgxmock.NewRows(listMessageCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
 			if !errors.Is(err, domain.ErrNotFound) {
@@ -227,7 +226,7 @@ func TestPGXMessageStore_CreateMessage_AuthDenied_ReturnsErrNotFound(t *testing.
 	for _, name := range []string{"channel auth denied", "DM auth denied", "cross-workspace", "invalid ref backstop"} {
 		t.Run(name, func(t *testing.T) {
 			mock := newMock(t)
-			expectCreate(mock, pgxmock.NewRows(messageCols())) // 0 rows
+			expectCreate(mock, pgxmock.NewRows(listMessageCols())) // 0 rows
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
 				WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "x",
@@ -253,8 +252,9 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"", "", "",
 		&editedAt, &deletedAt,
 		now, now,
+		"Test User", "test@example.com",
 	}
-	expectCreate(mock, pgxmock.NewRows(messageCols()).AddRow(row...))
+	expectCreate(mock, pgxmock.NewRows(listMessageCols()).AddRow(row...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -303,10 +303,12 @@ func TestPGXMessageStore_ValidateRefMessageInTarget_MissingReturnsErrInvalidRef(
 func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
+	// GetMessageByIDInWorkspace now uses listMessageColumns + auth.users JOIN,
+	// matching the list endpoint contract (includes sender_display_name, sender_email).
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("msg-1", "ws-1").
-		WillReturnRows(pgxmock.NewRows(messageCols()).
-			AddRow(messageRow("msg-1", "ws-1", "ch-1", "", now)...))
+		WillReturnRows(pgxmock.NewRows(listMessageCols()).
+			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-1")
@@ -315,6 +317,12 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	}
 	if msg.ID != "msg-1" {
 		t.Fatalf("expected msg-1, got %q", msg.ID)
+	}
+	if msg.SenderDisplayName != "Test User" {
+		t.Fatalf("expected sender_display_name 'Test User', got %q", msg.SenderDisplayName)
+	}
+	if msg.SenderEmail != "test@example.com" {
+		t.Fatalf("expected sender_email 'test@example.com', got %q", msg.SenderEmail)
 	}
 	checkExpectations(t, mock)
 }

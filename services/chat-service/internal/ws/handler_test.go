@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // ── helpers for handler tests ─────────────────────────────────────────────────
@@ -203,6 +205,34 @@ func dialWS(t *testing.T, srv *httptest.Server) *websocket.Conn {
 	return conn
 }
 
+func realisticAccessTokenSubprotocol(t *testing.T) string {
+	t.Helper()
+	now := time.Now().UTC()
+	claims := struct {
+		SessionID string `json:"sid"`
+		jwt.RegisteredClaims
+	}{
+		SessionID: "123e4567-e89b-12d3-a456-426614174001",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "123e4567-e89b-12d3-a456-426614174000",
+			Issuer:    "nchat-auth",
+			Audience:  jwt.ClaimStrings{"nchat"},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			ID:        "123e4567-e89b-12d3-a456-426614174002",
+		},
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("01234567890123456789012345678901"))
+	if err != nil {
+		t.Fatalf("sign realistic access token: %v", err)
+	}
+	if strings.Contains(token, "=") {
+		t.Fatalf("JWT subprotocol must use unpadded base64url, got %q", token)
+	}
+	return token
+}
+
 func TestDefaultHandlerConfigDocumentsResourceDefaults(t *testing.T) {
 	cfg := DefaultHandlerConfig()
 	if cfg.MaxConnectionsPerUser != 5 ||
@@ -295,6 +325,104 @@ func TestServeWS_AuthenticatedConnection_RegistersClientInHub(t *testing.T) {
 	}, 2*time.Second, "client registered in hub")
 
 	_ = conn.CloseNow()
+}
+
+func TestServeWS_JWTSubprotocolHandshakeEchoesTokenAndStaysOpen(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-jwt-subprotocol")
+	defer hub.Shutdown()
+
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: "ws-jwt"}, "user-jwt")
+	token := realisticAccessTokenSubprotocol(t)
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+	url := "ws" + srv.URL[len("http"):]
+
+	conn, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+		Subprotocols: []string{token},
+	})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial ws with JWT subprotocol: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.CloseNow() })
+	if got := conn.Subprotocol(); got != token {
+		t.Fatalf("server echoed subprotocol %q, want JWT token", got)
+	}
+
+	eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		for _, c := range hub.clients {
+			if c.userID == "user-jwt" && c.workspaceID == "ws-jwt" {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, "JWT subprotocol client registered")
+
+	ping, _ := json.Marshal(ClientMessage{Type: ClientMessageTypePing})
+	if err := conn.Write(ctx, websocket.MessageText, ping); err != nil {
+		t.Fatalf("connection should remain writable after JWT subprotocol handshake: %v", err)
+	}
+}
+
+func TestServeWS_SubprotocolHeaderAbsent_UsesAuthenticatedContext(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-no-subprotocol")
+	defer hub.Shutdown()
+
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: "ws-no-subprotocol"}, "user-no-subprotocol")
+	conn := dialWS(t, srv)
+
+	if got := conn.Subprotocol(); got != "" {
+		t.Fatalf("server echoed unexpected subprotocol %q", got)
+	}
+	eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		for _, c := range hub.clients {
+			if c.userID == "user-no-subprotocol" && c.workspaceID == "ws-no-subprotocol" {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, "client registered without subprotocol when auth context is present")
+}
+
+func TestServeWS_InvalidSubprotocolTokenReturns400(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty_value", value: ""},
+		{name: "space", value: "bad token"},
+		{name: "comma", value: "bad,token"},
+		{name: "crlf", value: "bad\r\ntoken"},
+		{name: "separator", value: "bad/token"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-invalid-subprotocol-"+tc.name)
+			defer hub.Shutdown()
+
+			req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Sec-WebSocket-Version", "13")
+			req.Header.Set("Sec-WebSocket-Key", testSecWebSocketKey())
+			req.Header["Sec-Websocket-Protocol"] = []string{tc.value}
+			w := httptest.NewRecorder()
+
+			ServeWS(hub, nil, &fakeWorkspaceResolver{id: "ws-invalid-subprotocol"}, userIDFromCtxFn("user-invalid-subprotocol")).
+				ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %q, got %d — body: %s", tc.value, w.Code, w.Body.String())
+			}
+		})
+	}
 }
 
 // TestServeWS_ReadLoop_CallsHandleClientMessage verifies that a client message

@@ -110,6 +110,7 @@ func newBusTestHub(auth SubscriptionAuthorizer, bus BroadcastBus) *Hub {
 // remoteEvt returns a valid remote Event from another instance with all required UUID fields.
 func remoteEvt(eventID string) Event {
 	return Event{
+		SchemaVersion:    CurrentEventSchemaVersion,
 		Type:             EventTypeMessageCreated,
 		WorkspaceID:      testWorkspaceID,
 		TargetType:       TargetTypeChannel,
@@ -118,6 +119,60 @@ func remoteEvt(eventID string) Event {
 		EventID:          eventID,
 		SourceInstanceID: "instance-B",
 		CreatedAt:        time.Now().UTC(),
+	}
+}
+
+// testPayload returns a minimal MessagePayload for test calls to PublishMessageCreated.
+func testPayload() MessagePayload {
+	return MessagePayload{
+		ID:                testMessageID,
+		WorkspaceID:       testWorkspaceID,
+		ChannelID:         testChannelID,
+		SenderID:          "user-1",
+		SenderDisplayName: "Alice",
+		Kind:              "user",
+		Status:            "active",
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
+	}
+}
+
+func TestCanonicalizeRemoteEvent_StripsSensitivePayload(t *testing.T) {
+	evt := remoteEvt(strings.ToUpper(testEventID))
+	evt.WorkspaceID = strings.ToUpper(testWorkspaceID)
+	evt.TargetID = strings.ToUpper(testChannelID)
+	evt.MessageID = strings.ToUpper(testMessageID)
+	evt.Payload = &MessagePayload{
+		ID:          testMessageID,
+		WorkspaceID: testWorkspaceID,
+		ChannelID:   testChannelID,
+		SenderID:    "user-1",
+		BodyText:    "sensitive message body",
+		Kind:        "user",
+		Status:      "active",
+	}
+
+	canonical, ok := canonicalizeRemoteEvent(evt)
+	if !ok {
+		t.Fatal("expected remote event to canonicalize")
+	}
+	if canonical.Payload != nil {
+		t.Fatalf("remote bus payload must be stripped, got %+v", canonical.Payload)
+	}
+	if canonical.EventID != testEventID {
+		t.Errorf("EventID = %q, want %q", canonical.EventID, testEventID)
+	}
+	if canonical.WorkspaceID != testWorkspaceID {
+		t.Errorf("WorkspaceID = %q, want %q", canonical.WorkspaceID, testWorkspaceID)
+	}
+	if canonical.TargetID != testChannelID {
+		t.Errorf("TargetID = %q, want %q", canonical.TargetID, testChannelID)
+	}
+	if canonical.MessageID != testMessageID {
+		t.Errorf("MessageID = %q, want %q", canonical.MessageID, testMessageID)
+	}
+	if canonical.SourceInstanceID != "instance-B" {
+		t.Errorf("SourceInstanceID = %q, want instance-B", canonical.SourceInstanceID)
 	}
 }
 
@@ -149,7 +204,7 @@ func TestHub_Bus_NopBus_LocalDeliveryStillWorks(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testMessageID)
+	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testPayload())
 
 	if !waitForOutbox(c, 1) {
 		t.Fatalf("expected 1 event in outbox with NopBus, got %d", len(c.outbox))
@@ -171,7 +226,7 @@ func TestHub_Bus_PublishCallsBusOnce(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testMessageID)
+	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testPayload())
 
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -182,6 +237,68 @@ func TestHub_Bus_PublishCallsBusOnce(t *testing.T) {
 	}
 	if n := bus.publishCount(); n != 1 {
 		t.Fatalf("expected bus.Publish called once, got %d", n)
+	}
+}
+
+func TestHub_Bus_PublishedEvent_StripsPayloadFromBusButKeepsLocalPayload(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", testWorkspaceID, TargetTypeChannel, testChannelID, true)
+
+	bus := &fakeBus{}
+	hub := newBusTestHub(auth, bus)
+	defer hub.Shutdown()
+
+	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
+	registerInRunningHub(t, hub, c)
+	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	payload := testPayload()
+	payload.BodyText = "sensitive local body"
+	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, payload)
+
+	if !waitForOutbox(c, 1) {
+		t.Fatal("expected local delivery")
+	}
+	raw := <-c.outbox
+	if strings.Contains(string(raw), "sender_email") {
+		t.Fatalf("local WS payload must not include sender_email: %s", string(raw))
+	}
+	var local Event
+	if err := json.Unmarshal(raw, &local); err != nil {
+		t.Fatalf("local event JSON: %v", err)
+	}
+	if local.Payload == nil {
+		t.Fatal("local delivery must retain payload for direct browser insertion")
+	}
+	if local.Payload.BodyText != "sensitive local body" ||
+		local.Payload.SenderDisplayName != "Alice" {
+		t.Fatalf("local payload was not preserved: %+v", local.Payload)
+	}
+	if local.SchemaVersion != CurrentEventSchemaVersion {
+		t.Fatalf("local SchemaVersion = %d, want %d", local.SchemaVersion, CurrentEventSchemaVersion)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if bus.publishCount() >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	evt, ok := bus.lastPublished()
+	if !ok {
+		t.Fatal("expected bus to receive a published event")
+	}
+	if evt.Payload != nil {
+		t.Fatalf("distributed bus event must not include payload, got %+v", evt.Payload)
+	}
+	if evt.MessageID != payload.ID {
+		t.Errorf("bus event MessageID = %q, want %q", evt.MessageID, payload.ID)
+	}
+	if evt.SchemaVersion != CurrentEventSchemaVersion {
+		t.Errorf("bus event SchemaVersion = %d, want %d", evt.SchemaVersion, CurrentEventSchemaVersion)
 	}
 }
 
@@ -200,7 +317,7 @@ func TestHub_Bus_PublishFailure_LocalDeliveryStillWorks(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testMessageID)
+	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testPayload())
 
 	if !waitForOutbox(c, 1) {
 		t.Fatalf("expected 1 event despite bus failure, got %d", len(c.outbox))
@@ -360,7 +477,7 @@ func TestHub_Bus_PublishedEvent_HasInstanceIDAndEventID(t *testing.T) {
 	hub := newBusTestHub(&fakeAuthorizer{}, bus)
 	defer hub.Shutdown()
 
-	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testMessageID)
+	hub.PublishMessageCreated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, testPayload())
 
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -379,6 +496,40 @@ func TestHub_Bus_PublishedEvent_HasInstanceIDAndEventID(t *testing.T) {
 	}
 	if evt.EventID == "" {
 		t.Error("expected non-empty EventID")
+	}
+	if evt.SchemaVersion != CurrentEventSchemaVersion {
+		t.Errorf("expected SchemaVersion %d, got %d", CurrentEventSchemaVersion, evt.SchemaVersion)
+	}
+}
+
+func TestHub_Bus_RemoteEventWithoutSchemaVersion_StillDeliversForCompatibility(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", testWorkspaceID, TargetTypeChannel, testChannelID, true)
+
+	bus := &fakeBus{}
+	hub := newBusTestHub(auth, bus)
+	defer hub.Shutdown()
+
+	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
+	registerInRunningHub(t, hub, c)
+	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, testChannelID); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	evt := remoteEvt(testEventIDJSON)
+	evt.SchemaVersion = 0 // old server during rolling deploy
+	bus.inject(evt)
+
+	if !waitForOutbox(c, 1) {
+		t.Fatal("remote event without schema_version should still deliver")
+	}
+	raw := <-c.outbox
+	var decoded Event
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("delivered event JSON: %v", err)
+	}
+	if decoded.SchemaVersion != CurrentEventSchemaVersion {
+		t.Fatalf("decoded SchemaVersion = %d, want %d", decoded.SchemaVersion, CurrentEventSchemaVersion)
 	}
 }
 

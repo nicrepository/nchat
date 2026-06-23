@@ -33,15 +33,21 @@ type fakeMessageProvider struct {
 	channelOutErr error
 	createdMsg    domain.Message
 	createChErr   error
+	channelMsg    domain.Message
+	channelMsgErr error
 	dmOut         service.ListDMMessagesOutput
 	dmOutErr      error
 	createDMMsg   domain.Message
 	createDMErr   error
+	dmMsg         domain.Message
+	dmMsgErr      error
 
 	lastCreateChannelInput service.CreateChannelMessageInput
 	lastCreateDMInput      service.CreateDMMessageInput
 	lastListChannelInput   service.ListChannelMessagesInput
 	lastListDMInput        service.ListDMMessagesInput
+	lastGetChannelInput    service.GetChannelMessageInput
+	lastGetDMInput         service.GetDMMessageInput
 }
 
 func (f *fakeMessageProvider) ListChannelMessages(_ context.Context, in service.ListChannelMessagesInput) (service.ListChannelMessagesOutput, error) {
@@ -62,6 +68,16 @@ func (f *fakeMessageProvider) ListDMMessages(_ context.Context, in service.ListD
 func (f *fakeMessageProvider) CreateDMMessage(_ context.Context, in service.CreateDMMessageInput) (domain.Message, error) {
 	f.lastCreateDMInput = in
 	return f.createDMMsg, f.createDMErr
+}
+
+func (f *fakeMessageProvider) GetChannelMessage(_ context.Context, in service.GetChannelMessageInput) (domain.Message, error) {
+	f.lastGetChannelInput = in
+	return f.channelMsg, f.channelMsgErr
+}
+
+func (f *fakeMessageProvider) GetDMMessage(_ context.Context, in service.GetDMMessageInput) (domain.Message, error) {
+	f.lastGetDMInput = in
+	return f.dmMsg, f.dmMsgErr
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -318,6 +334,53 @@ func TestMessageHandler_CreateChannelMessage_InvalidInputReturns400(t *testing.T
 	}
 }
 
+// ── GetChannelMessage ───────────────────────────────────────────────────────
+
+func TestMessageHandler_GetChannelMessage_Success(t *testing.T) {
+	msg := testMessage()
+	msg.BodyText = "channel hello"
+	msgs := &fakeMessageProvider{channelMsg: msg}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages/"+testMessageID, nil)
+	r.SetPathValue("channelID", testChannelID)
+	r.SetPathValue("messageID", testMessageID)
+
+	h.GetChannelMessage(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	data := decodeBody(t, rec)["data"].(map[string]any)
+	if data["id"] != testMessageID {
+		t.Fatalf("expected message id %q, got %v", testMessageID, data["id"])
+	}
+	if data["body_text"] != "channel hello" {
+		t.Fatalf("expected channel body_text, got %v", data["body_text"])
+	}
+	if msgs.lastGetChannelInput.WorkspaceID != testWorkspaceID ||
+		msgs.lastGetChannelInput.ChannelID != testChannelID ||
+		msgs.lastGetChannelInput.CallerID != msgTestUserID ||
+		msgs.lastGetChannelInput.MessageID != testMessageID {
+		t.Fatalf("unexpected get channel input: %+v", msgs.lastGetChannelInput)
+	}
+}
+
+func TestMessageHandler_GetChannelMessage_NotFoundReturns404(t *testing.T) {
+	msgs := &fakeMessageProvider{channelMsgErr: domain.ErrNotFound}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages/"+testMessageID, nil)
+	r.SetPathValue("channelID", testChannelID)
+	r.SetPathValue("messageID", testMessageID)
+
+	h.GetChannelMessage(rec, r)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // ── ListDMMessages ───────────────────────────────────────────────────────────
 
 func TestMessageHandler_ListDMMessages_Success(t *testing.T) {
@@ -399,6 +462,55 @@ func TestMessageHandler_CreateDMMessage_NonParticipantReturns404(t *testing.T) {
 	h.CreateDMMessage(rec, r)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for non-participant DM, got %d", rec.Code)
+	}
+}
+
+// ── GetDMMessage ─────────────────────────────────────────────────────────────
+
+func TestMessageHandler_GetDMMessage_Success(t *testing.T) {
+	dmMsg := testMessage()
+	dmMsg.ChannelID = ""
+	dmMsg.DMConversationID = testConversationID
+	dmMsg.BodyText = "dm hello"
+	msgs := &fakeMessageProvider{dmMsg: dmMsg}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages/"+testMessageID, nil)
+	r.SetPathValue("conversationID", testConversationID)
+	r.SetPathValue("messageID", testMessageID)
+
+	h.GetDMMessage(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	data := decodeBody(t, rec)["data"].(map[string]any)
+	if data["id"] != testMessageID {
+		t.Fatalf("expected dm message id %q, got %v", testMessageID, data["id"])
+	}
+	if data["body_text"] != "dm hello" {
+		t.Fatalf("expected dm body_text, got %v", data["body_text"])
+	}
+	if msgs.lastGetDMInput.WorkspaceID != testWorkspaceID ||
+		msgs.lastGetDMInput.ConversationID != testConversationID ||
+		msgs.lastGetDMInput.CallerID != msgTestUserID ||
+		msgs.lastGetDMInput.MessageID != testMessageID {
+		t.Fatalf("unexpected get dm input: %+v", msgs.lastGetDMInput)
+	}
+}
+
+func TestMessageHandler_GetDMMessage_NotFoundReturns404(t *testing.T) {
+	msgs := &fakeMessageProvider{dmMsgErr: domain.ErrNotFound}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages/"+testMessageID, nil)
+	r.SetPathValue("conversationID", testConversationID)
+	r.SetPathValue("messageID", testMessageID)
+
+	h.GetDMMessage(rec, r)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d — body: %s", rec.Code, rec.Body.String())
 	}
 }
 

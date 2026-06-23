@@ -180,9 +180,9 @@ func listMessageColumns(alias string) string {
 	COALESCE(u.email::text, '')`
 }
 
-// scanMessage reads a single message row into a domain.Message.
-// It must be called with exactly the columns listed in messageSelectColumns.
-func scanMessage(row pgx.Row) (domain.Message, error) {
+// scanMessageWithSender reads a single message row including sender display info.
+// It must be called with exactly the columns listed in listMessageColumns.
+func scanMessageWithSender(row pgx.Row) (domain.Message, error) {
 	var msg domain.Message
 	var editedAt, deletedAt *time.Time
 	err := row.Scan(
@@ -193,6 +193,7 @@ func scanMessage(row pgx.Row) (domain.Message, error) {
 		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 		&editedAt, &deletedAt,
 		&msg.CreatedAt, &msg.UpdatedAt,
+		&msg.SenderDisplayName, &msg.SenderEmail,
 	)
 	if err != nil {
 		return domain.Message{}, err
@@ -241,6 +242,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	// to the same workspace + same target. Both conditions are checked together;
 	// either failure results in 0 rows, which maps to ErrNotFound (non-enumerating
 	// TOCTOU backstop — the service layer performs typed pre-validation before insert).
+	//
+	// The INSERT is wrapped in a CTE so the outer SELECT can JOIN auth.users and
+	// return sender display info (sender_display_name, sender_email) in the same
+	// round-trip. This avoids a separate GET after insert for the broadcast payload.
 	row := s.pool.QueryRow(ctx, `
 		WITH invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
@@ -266,41 +271,49 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 					  AND channel_id IS NOT DISTINCT FROM $2::uuid
 					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
+		),
+		inserted AS (
+			INSERT INTO chat.messages
+				(workspace_id, channel_id, dm_conversation_id, sender_id,
+				 kind, body_text, status,
+				 parent_message_id, forwarded_from_message_id, referenced_message_id)
+			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, 'active',
+			       $7::uuid, $8::uuid, $9::uuid
+			FROM (
+				-- Channel message authorization branch.
+				SELECT 1
+				FROM chat.workspaces w
+				JOIN chat.workspace_members wm
+				  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
+				JOIN chat.channels c
+				  ON c.id = $2::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'
+				LEFT JOIN chat.channel_members cm
+				  ON cm.channel_id = c.id AND cm.user_id = $4::uuid
+				WHERE $2::uuid IS NOT NULL
+				  AND w.id = $1::uuid AND w.status = 'active'
+				  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+				UNION ALL
+				-- DM message authorization branch.
+				SELECT 1
+				FROM chat.workspaces w
+				JOIN chat.workspace_members wm
+				  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
+				JOIN chat.dm_conversations dc
+				  ON dc.id = $3::uuid AND dc.workspace_id = $1::uuid AND dc.status = 'active'
+				JOIN chat.dm_members dm
+				  ON dm.conversation_id = dc.id AND dm.user_id = $4::uuid AND dm.status = 'active'
+				WHERE $3::uuid IS NOT NULL
+				  AND w.id = $1::uuid AND w.status = 'active'
+			) auth
+			WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
+			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
+			          kind, body_text, status,
+			          parent_message_id, forwarded_from_message_id, referenced_message_id,
+			          edited_at, deleted_at, created_at, updated_at
 		)
-		INSERT INTO chat.messages
-			(workspace_id, channel_id, dm_conversation_id, sender_id,
-			 kind, body_text, status,
-			 parent_message_id, forwarded_from_message_id, referenced_message_id)
-		SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, 'active',
-		       $7::uuid, $8::uuid, $9::uuid
-		FROM (
-			-- Channel message authorization branch.
-			SELECT 1
-			FROM chat.workspaces w
-			JOIN chat.workspace_members wm
-			  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
-			JOIN chat.channels c
-			  ON c.id = $2::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'
-			LEFT JOIN chat.channel_members cm
-			  ON cm.channel_id = c.id AND cm.user_id = $4::uuid
-			WHERE $2::uuid IS NOT NULL
-			  AND w.id = $1::uuid AND w.status = 'active'
-			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
-			UNION ALL
-			-- DM message authorization branch.
-			SELECT 1
-			FROM chat.workspaces w
-			JOIN chat.workspace_members wm
-			  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
-			JOIN chat.dm_conversations dc
-			  ON dc.id = $3::uuid AND dc.workspace_id = $1::uuid AND dc.status = 'active'
-			JOIN chat.dm_members dm
-			  ON dm.conversation_id = dc.id AND dm.user_id = $4::uuid AND dm.status = 'active'
-			WHERE $3::uuid IS NOT NULL
-			  AND w.id = $1::uuid AND w.status = 'active'
-		) auth
-		WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
-		RETURNING `+messageColumns(""),
+		SELECT `+listMessageColumns("m")+`
+		FROM inserted m
+		LEFT JOIN auth.users u ON u.id = m.sender_id`,
 		input.WorkspaceID,
 		nullableUUID(input.ChannelID),
 		nullableUUID(input.DMConversationID),
@@ -311,7 +324,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		nullableUUID(input.ForwardedFromMessageID),
 		nullableUUID(input.ReferencedMessageID),
 	)
-	msg, err := scanMessage(row)
+	msg, err := scanMessageWithSender(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Non-enumerating TOCTOU backstop: both auth failure and reference failure
@@ -344,13 +357,16 @@ func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, worksp
 }
 
 func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID string) (domain.Message, error) {
+	// Use listMessageColumns so the result includes sender_display_name and
+	// sender_email — the same contract as the list endpoints.
 	row := s.pool.QueryRow(ctx, `
-		SELECT `+messageColumns("")+`
-		FROM chat.messages
-		WHERE id = $1 AND workspace_id = $2`,
+		SELECT `+listMessageColumns("m")+`
+		FROM chat.messages m
+		LEFT JOIN auth.users u ON u.id = m.sender_id
+		WHERE m.id = $1 AND m.workspace_id = $2`,
 		messageID, workspaceID,
 	)
-	msg, err := scanMessage(row)
+	msg, err := scanMessageWithSender(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Message{}, domain.ErrNotFound

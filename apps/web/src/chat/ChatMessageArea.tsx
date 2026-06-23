@@ -10,10 +10,9 @@
  * - author_id is never sent; sender identity comes from the server-side JWT.
  *
  * WebSocket realtime delivery:
- * NOT IMPLEMENTED — prerequisite missing.
- * ws/handler.go returns 501 Not Implemented; no secure browser WS auth path exists.
- * A future PR must implement: (a) auth ticket or same-origin cookie WS upgrade design,
- * (b) BearerAuth equivalent for WS, (c) ServeWS implementation, (d) frontend WS client.
+ * Implemented — see useMessages and useChatWebSocket.
+ * Auth uses Sec-WebSocket-Protocol to pass the Bearer token (browser WebSocket
+ * upgrade cannot set custom headers; token-in-URL is rejected server-side).
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -326,17 +325,38 @@ function MessageList({
   // Track previous scrollHeight for prepend scroll-delta restoration.
   const prevScrollHeightRef = useRef(0);
 
+  // isNearBottomRef tracks whether the user is scrolled near the bottom of the
+  // list. Updated on every scroll event. Used to decide whether a WS-received
+  // message should auto-scroll the view or preserve the user's current position
+  // (e.g. when reading history).
+  //
+  // Threshold: user is "near bottom" when the distance from the bottom edge of
+  // the scroll container to the actual bottom is ≤ 150 px (roughly one message).
+  // Starts true because the initial ready view is rendered at the latest messages.
+  const isNearBottomRef = useRef(true);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 150;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
   // Scroll management driven by lastMutation — explicit and race-condition-free.
-  // "prepend" → restore position via scrollHeight delta (older messages added above).
-  // "initial" | "append" → scroll to bottom.
-  // "none" → no action (intermediate transition, e.g. "prepending" sets loadingMore=true
-  //           which inserts the loading spinner before the fetch resolves).
+  // "prepend"    → restore position via scrollHeight delta (older messages added above).
+  // "initial" | "append" → scroll to bottom unconditionally.
+  // "ws_append"  → scroll to bottom only when the user is already near the bottom;
+  //                otherwise preserve position so reading history is not interrupted.
+  // "none"       → no action (intermediate transition).
   //
   // prevScrollHeightRef is captured ONLY on stable mutations ("initial", "append",
-  // "prepend") — never on "none". This prevents the spinner's height from polluting
-  // the reference value used to compute the scroll delta on the subsequent "prepend".
-  // If we captured on "none", the delta would be wrong by the spinner height (~36px),
-  // causing a visible jump after every successful loadMore.
+  // "ws_append", "prepend") — never on "none". This prevents the spinner's height
+  // from polluting the reference value used to compute the scroll delta on the
+  // subsequent "prepend". If we captured on "none", the delta would be wrong by
+  // the spinner height (~36px), causing a visible jump after every successful loadMore.
   useLayoutEffect(() => {
     if (!listRef.current) return;
     const el = listRef.current;
@@ -345,6 +365,11 @@ function MessageList({
       // Shift scrollTop by the amount the container grew so the user's view is stable.
       el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
     } else if (lastMutation === "initial" || lastMutation === "append") {
+      if (typeof bottomRef.current?.scrollIntoView === "function") {
+        bottomRef.current.scrollIntoView({ behavior: "smooth" });
+      }
+    } else if (lastMutation === "ws_append" && isNearBottomRef.current) {
+      // Only auto-scroll on WS messages when user is already near the bottom.
       if (typeof bottomRef.current?.scrollIntoView === "function") {
         bottomRef.current.scrollIntoView({ behavior: "smooth" });
       }
@@ -560,6 +585,17 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         <div className="chat-msg-area__send-error" role="alert" data-testid="chat-send-error">
           <IconWarning />
           {state.sendError}
+        </div>
+      )}
+
+      {state.realtimeError && (
+        <div
+          className="chat-msg-area__realtime-error"
+          role="status"
+          data-testid="chat-realtime-error"
+        >
+          <IconWarning />
+          Conexão em tempo real instável. Tentando reconectar...
         </div>
       )}
 

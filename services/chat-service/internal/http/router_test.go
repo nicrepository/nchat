@@ -259,3 +259,170 @@ func makeRouterTestToken(t *testing.T) string {
 	}
 	return token
 }
+
+// ── NewRouter POST rate limit integration tests ───────────────────────────────
+//
+// These tests verify that the msgPostLimiter wired in NewRouter returns 429
+// before the message handler is invoked, ensuring no DB write and no broadcast
+// occur when the per-user budget is exhausted.
+//
+// Approach: pass a NewMessageHandler(nil, nil) so that any handler invocation
+// would panic (nil service). Exhaust the budget by sending msgPostRateLimit
+// requests through the full router stack, then verify the next request returns
+// 429 without panicking.
+
+// newRouterForRateLimit builds a full router suitable for POST rate-limit
+// integration testing. The token validator and session validator are real so
+// the auth middleware is exercised; the message handler uses nil services so
+// any unintended handler invocation panics.
+func newRouterForRateLimit(t *testing.T) http.Handler {
+	t.Helper()
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	return NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		validator,
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		NewMessageHandler(nil, nil),
+		nil,
+	)
+}
+
+// routerPOSTRequest creates an authenticated POST request for a send-message URL.
+func routerPOSTRequest(t *testing.T, url string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(`{"body":"hello"}`))
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func routerGETRequest(t *testing.T, url string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	return req
+}
+
+// TestNewRouter_PostChannelMessage_Returns429AfterBudgetExhausted verifies that
+// POST /api/chat/channels/{channelID}/messages returns 429 when the per-user
+// msgPostRateLimit budget is exceeded, and does NOT invoke the handler.
+//
+// The inner handler is NewMessageHandler(nil, nil) — if any handler method is
+// called it will panic because the services are nil. A panic here means the
+// test fails with a clear signal that the rate limiter is not working.
+func TestNewRouter_PostChannelMessage_Returns429AfterBudgetExhausted(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	url := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+
+	// Exhaust the full budget. All requests will return 500 (nil service panics
+	// recovered by the middleware stack), NOT 429 — confirming they reach the handler.
+	for i := range msgPostRateLimit {
+		w := httptest.NewRecorder()
+		func() {
+			defer func() { recover() }() //nolint:errcheck
+			router.ServeHTTP(w, routerPOSTRequest(t, url))
+		}()
+		// Must not be 429 while within budget.
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d should not be 429 (within budget); got 429", i+1)
+		}
+	}
+
+	// The next request must be rate-limited at the router level.
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerPOSTRequest(t, url))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after budget exhausted; got %d", w.Code)
+	}
+	if ra := w.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("expected Retry-After header on 429 response")
+	}
+}
+
+// TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted verifies the same
+// guarantee for POST /api/chat/dm/{conversationID}/messages.
+func TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	url := "/api/chat/dm/22222222-2222-2222-2222-222222222222/messages"
+
+	for i := range msgPostRateLimit {
+		w := httptest.NewRecorder()
+		func() {
+			defer func() { recover() }() //nolint:errcheck
+			router.ServeHTTP(w, routerPOSTRequest(t, url))
+		}()
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("DM POST %d should not be 429 (within budget); got 429", i+1)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerPOSTRequest(t, url))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after DM POST budget exhausted; got %d", w.Code)
+	}
+}
+
+func TestNewRouter_GetSingleMessage_Returns429AfterSingleBudgetExhausted(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	url := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/22222222-2222-2222-2222-222222222222"
+
+	for i := range msgGetSingleRateLimit {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, routerGETRequest(t, url))
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("GET single request %d should not be 429 within budget", i+1)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerGETRequest(t, url))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after GET single budget exhausted; got %d", w.Code)
+	}
+}
+
+func TestNewRouter_GetSingleBudgetDoesNotConsumeListBudget(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	singleURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/22222222-2222-2222-2222-222222222222"
+	listURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+
+	for range msgGetSingleRateLimit {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, routerGETRequest(t, singleURL))
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("GET single should stay within its own budget")
+		}
+	}
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerGETRequest(t, listURL))
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatal("exhausting GET single budget must not consume list budget")
+	}
+}
+
+func TestNewRouter_ListBudgetDoesNotConsumeGetSingleBudget(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	listURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+	singleURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/22222222-2222-2222-2222-222222222222"
+
+	for range msgListRateLimit {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, routerGETRequest(t, listURL))
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("GET list should stay within its own budget")
+		}
+	}
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerGETRequest(t, singleURL))
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatal("exhausting list budget must not consume GET single budget")
+	}
+}

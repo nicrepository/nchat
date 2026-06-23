@@ -15,6 +15,15 @@ import (
 // server but an unconstrained scroll could cause excessive DB reads.
 const msgListRateLimit = 30
 
+// msgGetSingleRateLimit is the maximum number of single-message fetches an
+// authenticated user may make per minute. WebSocket fallback uses this route;
+// a separate budget prevents realtime recovery from degrading scroll/listing.
+const msgGetSingleRateLimit = 120
+
+// msgPostRateLimit is the maximum number of message-send requests an authenticated
+// user may make per minute across all channels and DMs.
+const msgPostRateLimit = 60
+
 const RouteMetrics = "/metrics"
 
 func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler) http.Handler {
@@ -41,33 +50,43 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		return BearerAuth(validator)(RequireActiveSession(sessionValidator)(h))
 	}
 
-	// Shared rate limiter for message-listing routes (GET only; POST/send is not limited here).
-	// The GC goroutine started by NewUserRateLimiter runs for the process lifetime; in
-	// production this is fine (OS cleans up on exit). Tests that call NewRouter directly
-	// (e.g., integration/auth-chain tests) accept this goroutine as a known bounded leak
-	// — it is stopped by the test process exit and does not affect correctness or -race.
-	// Unit tests that build a limiter explicitly use t.Cleanup(limiter.Stop).
+	// Shared rate limiters.
+	// msgListLimiter: guards paginated GET list endpoints.
+	// msgGetSingleLimiter: guards GET single-message fallback used by realtime WS.
+	// msgPostLimiter: guards POST send-message (write endpoint).
+	// GC goroutines run for the process lifetime; tests that build a limiter
+	// explicitly use t.Cleanup(limiter.Stop).
 	msgListLimiter := NewUserRateLimiter(msgListRateLimit, time.Minute)
+	msgGetSingleLimiter := NewUserRateLimiter(msgGetSingleRateLimit, time.Minute)
+	msgPostLimiter := NewUserRateLimiter(msgPostRateLimit, time.Minute)
 
-	// Channel message endpoints: GET list, POST create.
+	// Channel message endpoints: GET list, POST create, GET single.
 	mux.Handle("GET "+RouteChannelMessages, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListChannelMessages)),
 	))
 	mux.Handle("POST "+RouteChannelMessages, authMiddleware(
-		http.HandlerFunc(messages.CreateChannelMessage),
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.CreateChannelMessage)),
+	))
+	mux.Handle("GET "+RouteChannelMessage, authMiddleware(
+		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetChannelMessage)),
 	))
 
-	// DM message endpoints: GET list, POST create.
+	// DM message endpoints: GET list, POST create, GET single.
 	mux.Handle("GET "+RouteDMMessages, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListDMMessages)),
 	))
 	mux.Handle("POST "+RouteDMMessages, authMiddleware(
-		http.HandlerFunc(messages.CreateDMMessage),
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.CreateDMMessage)),
+	))
+	mux.Handle("GET "+RouteDMMessage, authMiddleware(
+		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
 	))
 
-	// WebSocket endpoint: auth middleware runs before upgrade so that
-	// userID is in context when ServeWS reads it.
-	mux.Handle(RouteWS, authMiddleware(wsHandler))
+	// WebSocket endpoint: WSTokenMiddleware extracts a Bearer token from
+	// Sec-WebSocket-Protocol for browser clients that cannot set Authorization
+	// headers on WebSocket upgrades. auth middleware runs before upgrade so
+	// that userID is in context when ServeWS reads it.
+	mux.Handle(RouteWS, WSTokenMiddleware(authMiddleware(wsHandler)))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
