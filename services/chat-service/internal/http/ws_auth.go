@@ -18,14 +18,15 @@ import (
 //
 //	new WebSocket(url, [accessToken])
 //
-// The server then echoes back the subprotocol so the browser keeps the
-// connection open (handled in ws.runConnection via AcceptOptions.Subprotocols).
+// The server validates the token server-side but does NOT echo it back in the
+// response Sec-WebSocket-Protocol header, preventing JWT exposure in responses.
 //
 // Security notes:
 //   - Only active for requests with Upgrade: websocket.
 //   - Does not override an existing Authorization header.
 //   - The token value is never logged by this middleware.
 //   - Downstream BearerAuth validates the injected token before any WS upgrade.
+//   - The JWT is never reflected in response headers.
 func WSTokenMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {

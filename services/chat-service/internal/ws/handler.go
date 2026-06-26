@@ -220,23 +220,21 @@ func resolveWorkspace(w http.ResponseWriter, r *http.Request, workspaces Workspa
 // in the hub, starts the I/O pumps, and runs the read loop until the connection
 // closes. Cleanup is idempotent via stop/done and sync.Once in wsSender.
 //
-// If the request carries a Sec-WebSocket-Protocol header (set by browser clients
-// that pass the Bearer token as the subprotocol), runConnection echoes it back
-// via AcceptOptions.Subprotocols so the browser keeps the connection open.
+// If the request carries a Sec-WebSocket-Protocol header the token is validated
+// but never echoed back; the JWT must not appear in the response headers.
 func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID string, cfg HandlerConfig) {
 	logger = normalizeLogger(logger)
 
-	var acceptOpts *websocket.AcceptOptions
 	if proto, ok := wsutil.SubprotocolHeader(r.Header); ok {
 		if !wsutil.IsValidSubprotocolToken(proto) {
 			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid websocket subprotocol")
 			return
 		}
-		// Auth-service JWTs are unpadded Base64URL segments, which are valid
-		// WebSocket subprotocol tokens; echo the exact token so browsers proceed.
-		acceptOpts = &websocket.AcceptOptions{Subprotocols: []string{proto}}
+		// Token already extracted and validated by WSTokenMiddleware + BearerAuth.
+		// Do NOT echo the JWT as a negotiated subprotocol — that would leak it in
+		// the response Sec-WebSocket-Protocol header visible to proxies and DevTools.
 	}
-	conn, err := websocket.Accept(w, r, acceptOpts)
+	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		// websocket.Accept writes the error response itself.
 		logger.WarnContext(r.Context(), "ws: upgrade failed")
