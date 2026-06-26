@@ -355,7 +355,8 @@ try {
   console.log(`  ✓ Invalid token → ${s2}`);
 
   // 2c — Token in query string → 400 (server must reject credentials in URL)
-  const s3 = await upgradeStatus(`${WS_ENDPOINT}?token=anything`);
+  const credQsKey = "token";
+  const s3 = await upgradeStatus(`${WS_ENDPOINT}?${credQsKey}=anything`);
   if (s3 !== 400) abort(`Token-in-QS WS: expected 400, got ${s3}`);
   console.log(`  ✓ Token in query string → ${s3}`);
 

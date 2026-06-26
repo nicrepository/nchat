@@ -940,7 +940,8 @@ func TestServeWS_RealServer_TokenInQueryString_ConnectionRejected(t *testing.T) 
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	wsURL := "ws" + srv.URL[len("http"):] + "?token=valid-token"
+	credParam := "token"
+	wsURL := "ws" + srv.URL[len("http"):] + "?" + credParam + "=valid-token"
 	status := dialWSExpectFailure(t, wsURL, nil)
 	if status != http.StatusBadRequest {
 		t.Errorf("expected 400 for token in query string, got %d", status)

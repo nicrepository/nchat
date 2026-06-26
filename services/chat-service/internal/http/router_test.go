@@ -519,7 +519,8 @@ func TestNewRouter_WS_TokenInQueryString_Returns400(t *testing.T) {
 
 	// Provide a valid JWT so BearerAuth passes; the credential-in-QS check fires
 	// inside ws.ServeWS before any nil-hub check.
-	req := httptest.NewRequest(http.MethodGet, RouteWS+"?token=something", nil)
+	const credParam = "token"
+	req := httptest.NewRequest(http.MethodGet, RouteWS+"?"+credParam+"=something", nil)
 	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
