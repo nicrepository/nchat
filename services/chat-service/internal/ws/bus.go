@@ -31,7 +31,8 @@ type BroadcastBus interface {
 	// The handler is called from a goroutine owned by the bus; callers must
 	// not block inside handler. Subscribe starts background goroutines that
 	// exit when ctx is cancelled or Close is called.
-	Subscribe(ctx context.Context, handler func(Event))
+	// Returns ErrBusClosed if the bus has already been closed.
+	Subscribe(ctx context.Context, handler func(Event)) error
 
 	// Close stops subscriber goroutines and releases resources.
 	// Safe to call multiple times.
@@ -42,6 +43,6 @@ type BroadcastBus interface {
 // that do not require distributed broadcast. Local hub delivery is unaffected.
 type NopBus struct{}
 
-func (NopBus) Publish(_ context.Context, _ Event) error   { return nil }
-func (NopBus) Subscribe(_ context.Context, _ func(Event)) {}
-func (NopBus) Close()                                     {}
+func (NopBus) Publish(_ context.Context, _ Event) error         { return nil }
+func (NopBus) Subscribe(_ context.Context, _ func(Event)) error { return nil }
+func (NopBus) Close()                                           {}

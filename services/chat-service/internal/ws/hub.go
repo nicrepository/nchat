@@ -147,7 +147,9 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 	for _, opt := range opts {
 		opt(h)
 	}
-	h.bus.Subscribe(busCtx, h.handleRemoteBusEvent)
+	if err := h.bus.Subscribe(busCtx, h.handleRemoteBusEvent); err != nil {
+		logger.Warn("ws: bus subscribe failed; remote broadcast disabled", "error", err)
+	}
 	go h.run()
 	return h
 }
@@ -218,13 +220,15 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-h.quit:
-		return fmt.Errorf("hub is shutting down")
+		return ErrHubShutdown
 	}
 	select {
 	case err := <-resp:
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-h.quit:
+		return ErrHubShutdown
 	}
 }
 
