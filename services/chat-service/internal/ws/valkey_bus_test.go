@@ -167,9 +167,11 @@ func TestValkeyBus_Subscribe_InvokesHandlerOnMessage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bus.Subscribe(ctx, func(evt Event) {
+	if err := bus.Subscribe(ctx, func(evt Event) {
 		received <- evt
-	})
+	}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 
 	// Allow subscriber goroutine to start.
 	time.Sleep(20 * time.Millisecond)
@@ -206,9 +208,11 @@ func TestValkeyBus_Subscribe_IgnoresMalformedJSON(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bus.Subscribe(ctx, func(evt Event) {
+	if err := bus.Subscribe(ctx, func(evt Event) {
 		received <- evt
-	})
+	}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 
 	time.Sleep(20 * time.Millisecond)
 
@@ -229,7 +233,9 @@ func TestValkeyBus_Subscribe_ExitsCleanlyOnContextCancel(t *testing.T) {
 	defer bus.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	bus.Subscribe(ctx, func(Event) {})
+	if err := bus.Subscribe(ctx, func(Event) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 
 	time.Sleep(20 * time.Millisecond)
 
@@ -256,7 +262,9 @@ func TestValkeyBus_Close_StopsSubscriber(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bus.Subscribe(ctx, func(Event) {})
+	if err := bus.Subscribe(ctx, func(Event) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 	time.Sleep(20 * time.Millisecond)
 
 	done := make(chan struct{})
@@ -345,9 +353,11 @@ func TestValkeyBus_SubscribeLoop_ReconnectsAfterError(t *testing.T) {
 	defer cancel()
 
 	received := make(chan Event, 1)
-	bus.Subscribe(ctx, func(evt Event) {
+	if err := bus.Subscribe(ctx, func(evt Event) {
 		received <- evt
-	})
+	}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 
 	// Wait for reconnect — the second PSubscribe call should be active.
 	deadline := time.Now().Add(2 * time.Second)
@@ -389,7 +399,9 @@ func TestValkeyBus_Close_IsIdempotent(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	bus.Subscribe(ctx, func(Event) {})
+	if err := bus.Subscribe(ctx, func(Event) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 	time.Sleep(20 * time.Millisecond)
 
 	// Close must not panic or block when called multiple times.
@@ -414,5 +426,67 @@ func TestMin_ReturnsSmaller(t *testing.T) {
 	// Cover the return-b branch (a >= b).
 	if got := min(8*time.Second, 5*time.Second); got != 5*time.Second {
 		t.Errorf("min(8s, 5s) = %v; want 5s", got)
+	}
+}
+
+func TestValkeyBus_Subscribe_AfterClose_ReturnsError(t *testing.T) {
+	ps := &fakePubSub{}
+	bus := newValkeyBusWithAdapter(ps, "inst-A", newTestLogger())
+
+	bus.Close()
+
+	err := bus.Subscribe(context.Background(), func(Event) {})
+	if err == nil {
+		t.Fatal("Subscribe after Close must return error, got nil")
+	}
+	if !errors.Is(err, ErrBusClosed) {
+		t.Errorf("Subscribe after Close must return ErrBusClosed, got: %v", err)
+	}
+}
+
+func TestValkeyBus_SubscribeConcurrentWithClose(t *testing.T) {
+	t.Parallel()
+	// Runs Subscribe and Close concurrently to verify: no panic, no hang,
+	// and Subscribe returns only nil or ErrBusClosed (never any other error).
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		ps := &fakePubSub{}
+		bus := newValkeyBusWithAdapter(ps, "inst-A", newTestLogger())
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			err := bus.Subscribe(ctx, func(Event) {})
+			if err != nil && !errors.Is(err, ErrBusClosed) {
+				t.Errorf("iteration %d: Subscribe returned unexpected error: %v", i, err)
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+			bus.Close()
+		}()
+
+		close(start)
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatalf("iteration %d: Subscribe or Close hung — possible deadlock or goroutine leak", i)
+		}
+		cancel()
 	}
 }

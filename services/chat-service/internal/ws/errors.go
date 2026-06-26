@@ -6,3 +6,9 @@ import "errors"
 // to a target. The error is intentionally non-enumerating: it does not reveal
 // whether the target exists or the exact reason for denial.
 var ErrSubscribeForbidden = errors.New("subscribe forbidden")
+
+// ErrHubShutdown is returned by Hub.Subscribe when the hub is shutting down.
+var ErrHubShutdown = errors.New("hub is shutting down")
+
+// ErrBusClosed is returned by BroadcastBus.Subscribe when the bus is already closed.
+var ErrBusClosed = errors.New("bus is closed")

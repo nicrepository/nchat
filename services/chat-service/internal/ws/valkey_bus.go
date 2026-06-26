@@ -71,6 +71,13 @@ type ValkeyBus struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	closeOnce sync.Once
+	// mu serialises the closed check + wg.Add in Subscribe against the
+	// closed.Store + entry into wg.Wait in Close, closing the TOCTOU window
+	// where wg.Add could race with wg.Wait in progress.
+	// Hold only while mutating/reading closed and calling wg.Add — never
+	// while blocking on goroutine I/O or Valkey network calls.
+	mu     sync.Mutex
+	closed bool
 }
 
 // newValkeyBusWithAdapter constructs a ValkeyBus with an injected pubsubAdapter.
@@ -142,12 +149,22 @@ func (b *ValkeyBus) Publish(ctx context.Context, evt Event) error {
 // is responsible for self-echo suppression and validation (handled by hub).
 // Reconnects with bounded backoff on error. Exits when either callerCtx is
 // cancelled OR Close is called — whichever happens first.
-func (b *ValkeyBus) Subscribe(callerCtx context.Context, handler func(Event)) {
+// Returns ErrBusClosed if the bus has already been closed.
+func (b *ValkeyBus) Subscribe(callerCtx context.Context, handler func(Event)) error {
+	// Hold mu while checking closed and calling wg.Add(2) so that Close cannot
+	// set closed = true and enter wg.Wait between the two operations.
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return ErrBusClosed
+	}
+	b.wg.Add(2)
+	b.mu.Unlock()
+
 	// Derive a context cancelled by either the bus lifecycle (Close) or the caller.
 	subCtx, subCancel := context.WithCancel(b.closeCtx)
 
 	// Propagate caller cancellation into subCtx.
-	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
 		defer subCancel()
@@ -157,12 +174,12 @@ func (b *ValkeyBus) Subscribe(callerCtx context.Context, handler func(Event)) {
 		}
 	}()
 
-	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
 		defer subCancel()
 		b.subscribeLoop(subCtx, handler)
 	}()
+	return nil
 }
 
 // Close cancels the bus lifecycle context, stopping all subscriber goroutines,
@@ -170,6 +187,11 @@ func (b *ValkeyBus) Subscribe(callerCtx context.Context, handler func(Event)) {
 // Safe to call multiple times — subsequent calls are no-ops (idempotent).
 func (b *ValkeyBus) Close() {
 	b.closeOnce.Do(func() {
+		// Set closed under mu before calling wg.Wait so that no concurrent
+		// Subscribe can call wg.Add after wg.Wait begins.
+		b.mu.Lock()
+		b.closed = true
+		b.mu.Unlock()
 		b.cancel()
 		b.wg.Wait()
 		b.ps.Close()

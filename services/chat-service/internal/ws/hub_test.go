@@ -836,3 +836,34 @@ func TestHub_Broadcast_TransientAuthError_KeepsSubscription(t *testing.T) {
 		t.Fatal("subscription must not be revoked on transient auth error")
 	}
 }
+
+func TestHub_Subscribe_DuringShutdown_ReturnsError(t *testing.T) {
+	// Verifies that Subscribe does not block indefinitely when Shutdown has
+	// closed h.quit — the second select (waiting for resp) must observe <-h.quit
+	// and return ErrHubShutdown rather than blocking forever.
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "test-inst")
+
+	c := newClient("c-shutdown", "user-1", "ws-1", &fakeSender{})
+	registerInRunningHub(t, hub, c)
+
+	// Shut down the hub so h.quit is closed.
+	hub.Shutdown()
+
+	// Subscribe must return promptly — both selects observe <-h.quit.
+	// Use background context so any block is detectable via the timeout below.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- hub.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1")
+	}()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrHubShutdown) {
+			t.Fatalf("Subscribe after Shutdown must return ErrHubShutdown, got: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Subscribe blocked indefinitely after Shutdown — <-h.quit missing in select")
+	}
+}
