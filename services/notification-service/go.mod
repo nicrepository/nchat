@@ -1,6 +1,7 @@
 module github.com/nicrepository/nchat/services/notification-service
 
-go 1.25.0
+go 1.25.11
+toolchain go1.25.11
 
 require (
 	github.com/jackc/pgx/v5 v5.9.2

@@ -1,6 +1,7 @@
 module github.com/nicrepository/nchat/services/chat-service
 
-go 1.25.0
+go 1.25.11
+toolchain go1.25.11
 
 require (
 	github.com/coder/websocket v1.8.13
