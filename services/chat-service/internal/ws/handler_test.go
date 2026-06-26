@@ -327,7 +327,7 @@ func TestServeWS_AuthenticatedConnection_RegistersClientInHub(t *testing.T) {
 	_ = conn.CloseNow()
 }
 
-func TestServeWS_JWTSubprotocolHandshakeEchoesTokenAndStaysOpen(t *testing.T) {
+func TestServeWS_JWTSubprotocolHandshake_DoesNotEchoToken(t *testing.T) {
 	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-jwt-subprotocol")
 	defer hub.Shutdown()
 
@@ -347,8 +347,10 @@ func TestServeWS_JWTSubprotocolHandshakeEchoesTokenAndStaysOpen(t *testing.T) {
 		t.Fatalf("dial ws with JWT subprotocol: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.CloseNow() })
-	if got := conn.Subprotocol(); got != token {
-		t.Fatalf("server echoed subprotocol %q, want JWT token", got)
+
+	// The server must NOT echo the JWT back as a negotiated subprotocol.
+	if got := conn.Subprotocol(); got != "" {
+		t.Fatalf("server must not echo JWT as subprotocol, got %q", got)
 	}
 
 	eventually(t, func() bool {

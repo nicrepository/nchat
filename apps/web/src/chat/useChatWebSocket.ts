@@ -4,7 +4,7 @@
  * Auth: passes the Bearer access token as the WebSocket subprotocol so that
  * browser clients (which cannot set arbitrary HTTP headers on the upgrade
  * request) can authenticate without putting the token in the URL query string.
- * The server echoes the subprotocol back to keep the connection open.
+ * The server validates the token but does not echo it back in the response.
  *
  * Security notes:
  * - Token is passed as Sec-WebSocket-Protocol, not in the URL query string.
@@ -113,7 +113,7 @@ export function useChatWebSocket({
       let socket: WebSocket;
       try {
         // Pass the access token as the WebSocket subprotocol.
-        // The server (WSTokenMiddleware) extracts it as a Bearer token.
+        // WSTokenMiddleware extracts it as a Bearer token; the server does not echo it back.
         socket = new WebSocket(CHAT_WS_URL, [token]);
       } catch {
         // WebSocket constructor may throw on invalid URL.
