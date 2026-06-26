@@ -47,10 +47,11 @@ func (f *fakeBus) Publish(_ context.Context, evt Event) error {
 	return nil
 }
 
-func (f *fakeBus) Subscribe(_ context.Context, h func(Event)) {
+func (f *fakeBus) Subscribe(_ context.Context, h func(Event)) error {
 	f.mu.Lock()
 	f.handler = h
 	f.mu.Unlock()
+	return nil
 }
 
 func (f *fakeBus) Close() {}
@@ -102,7 +103,9 @@ func newBusTestHub(auth SubscriptionAuthorizer, bus BroadcastBus) *Hub {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.busCancel = cancel
-	h.bus.Subscribe(ctx, h.handleRemoteBusEvent)
+	if err := h.bus.Subscribe(ctx, h.handleRemoteBusEvent); err != nil {
+		panic("newBusTestHub: bus.Subscribe failed: " + err.Error())
+	}
 	go h.run()
 	return h
 }
