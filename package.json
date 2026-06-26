@@ -93,6 +93,7 @@
     ]
   },
   "devDependencies": {
-    "prettier": "^3.8.3"
+    "prettier": "^3.8.3",
+    "ws": "^8.18.3"
   }
 }

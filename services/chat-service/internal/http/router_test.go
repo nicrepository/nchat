@@ -14,6 +14,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
+	ws "github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
 const (
@@ -424,5 +425,106 @@ func TestNewRouter_ListBudgetDoesNotConsumeGetSingleBudget(t *testing.T) {
 	router.ServeHTTP(w, routerGETRequest(t, singleURL))
 	if w.Code == http.StatusTooManyRequests {
 		t.Fatal("exhausting list budget must not consume GET single budget")
+	}
+}
+
+// ── WebSocket route auth integration tests (real JWT + real session validator) ─
+//
+// These tests exercise the full auth chain for RouteWS (/api/chat/ws):
+//   WSTokenMiddleware → BearerAuth(real TokenValidator) → RequireActiveSession → wsHandler
+//
+// They cover the gaps left by handler_test.go, which uses a simulated
+// authCheckingUserIDFn and does not exercise JWT validation or session checks.
+
+// newRouterWithWS builds a full router with real JWT auth and a custom wsHandler.
+func newRouterWithWS(t *testing.T, wsHandler http.Handler) http.Handler {
+	t.Helper()
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("NewTokenValidator: %v", err)
+	}
+	return NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		validator,
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		NewMessageHandler(nil, nil),
+		wsHandler,
+	)
+}
+
+// wsAcceptHandler is a minimal wsHandler that always returns 200 to signal the
+// request reached the handler (i.e. passed all auth middleware).
+func wsAcceptHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+// TestNewRouter_WS_NoToken_Returns401 verifies that a GET to RouteWS with no
+// Authorization header is rejected with 401 by BearerAuth before any upgrade.
+func TestNewRouter_WS_NoToken_Returns401(t *testing.T) {
+	router := newRouterWithWS(t, wsAcceptHandler())
+
+	req := httptest.NewRequest(http.MethodGet, RouteWS, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no-token WS: expected 401, got %d", w.Code)
+	}
+}
+
+// TestNewRouter_WS_InvalidJWT_Returns401 verifies that a GET to RouteWS with a
+// syntactically invalid or wrongly-signed JWT is rejected with 401 by BearerAuth.
+func TestNewRouter_WS_InvalidJWT_Returns401(t *testing.T) {
+	router := newRouterWithWS(t, wsAcceptHandler())
+
+	req := httptest.NewRequest(http.MethodGet, RouteWS, nil)
+	req.Header.Set("Authorization", bearerScheme+"not.a.valid.jwt")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("invalid-JWT WS: expected 401, got %d", w.Code)
+	}
+}
+
+// TestNewRouter_WS_ValidJWT_ReachesHandler verifies that a GET to RouteWS with
+// a correctly signed JWT and an active session reaches the wsHandler. The wsHandler
+// used here returns 200 rather than attempting a real upgrade, so no ws library is
+// needed. A 200 proves all auth middleware passed without 401/403.
+func TestNewRouter_WS_ValidJWT_ReachesHandler(t *testing.T) {
+	router := newRouterWithWS(t, wsAcceptHandler())
+
+	req := httptest.NewRequest(http.MethodGet, RouteWS, nil)
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("valid-JWT WS: expected 200 (wsAcceptHandler), got %d — auth may have rejected", w.Code)
+	}
+}
+
+// TestNewRouter_WS_TokenInQueryString_Returns400 verifies that a GET to RouteWS
+// with a credential in the query string is rejected with 400. The wsHandler is
+// ws.ServeWS(nil, nil, nil, nil) — the real handler — so this test exercises the
+// actual credentialParamNames set from handler.go without duplicating it here.
+// rejectCredentialQueryParams fires before requireAuthenticatedUser, so BearerAuth
+// passes (valid JWT in header) while the credential-in-QS gate returns 400.
+func TestNewRouter_WS_TokenInQueryString_Returns400(t *testing.T) {
+	router := newRouterWithWS(t, ws.ServeWS(nil, nil, nil, nil))
+
+	// Provide a valid JWT so BearerAuth passes; the credential-in-QS check fires
+	// inside ws.ServeWS before any nil-hub check.
+	req := httptest.NewRequest(http.MethodGet, RouteWS+"?token=something", nil)
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("token-in-QS WS: expected 400, got %d", w.Code)
 	}
 }

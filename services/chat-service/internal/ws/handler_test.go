@@ -223,7 +223,7 @@ func realisticAccessTokenSubprotocol(t *testing.T) string {
 			ID:        "123e4567-e89b-12d3-a456-426614174002",
 		},
 	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("01234567890123456789012345678901"))
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("01234567890123456789012345678901")) //nolint:gosec // test-only fake HMAC secret
 	if err != nil {
 		t.Fatalf("sign realistic access token: %v", err)
 	}
@@ -861,4 +861,153 @@ func TestServeWS_WithPresence_OnlineAndOffline(t *testing.T) {
 	eventually(t, func() bool {
 		return p.Status("ws-presence", "user-presence") == PresenceOffline
 	}, 2*time.Second, "presence offline after disconnect")
+}
+
+// ── ServeWS handler-level auth gating tests (real TCP, simulated auth) ───────
+//
+// These tests exercise ServeWS's own auth gate (credential-in-query-string
+// check and userIDFromCtx gating) over a real TCP connection. They use
+// authCheckingUserIDFn, which simulates the auth contract by inspecting the
+// Authorization header directly — NOT a real JWT validator. JWT validation is
+// covered separately in internal/http/router_test.go via NewRouter + real
+// TokenValidator + RequireActiveSession.
+//
+// Limitation: these tests do not exercise BearerAuth or RequireActiveSession.
+// They validate that ServeWS correctly gates on userIDFromCtx returning "" and
+// that credential-in-URL is rejected before any upgrade. Full JWT integration
+// is tested in TestNewRouter_WS_* in router_test.go.
+
+// authCheckingUserIDFn returns a userIDFromCtx function that inspects the
+// Authorization header and returns userID only when it carries validToken.
+// All other requests return "" (unauthenticated).
+func authCheckingUserIDFn(validToken, userID string) func(*http.Request) string {
+	want := "Bearer " + validToken
+	return func(r *http.Request) string {
+		if r.Header.Get("Authorization") == want {
+			return userID
+		}
+		return ""
+	}
+}
+
+// dialWSExpectFailure dials the given wsURL and asserts that the dial fails
+// (i.e. the connection is rejected). It returns the HTTP response status code
+// if a response was received, or -1 if no response was returned.
+func dialWSExpectFailure(t *testing.T, wsURL string, opts *websocket.DialOptions) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL, opts)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		_ = conn.CloseNow()
+		t.Fatal("expected dial to fail (connection should be rejected)")
+	}
+	if resp == nil {
+		return -1
+	}
+	return resp.StatusCode
+}
+
+// TestServeWS_RealServer_NoAuth_ConnectionRejected verifies that a WebSocket
+// dial to a real server with no Authorization header is rejected with 401.
+func TestServeWS_RealServer_NoAuth_ConnectionRejected(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-realauth-noauth")
+	defer hub.Shutdown()
+
+	handler := ServeWS(hub, slog.Default(), &fakeWorkspaceResolver{id: "ws-realauth"},
+		authCheckingUserIDFn("valid-token", "user-realauth"))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	wsURL := "ws" + srv.URL[len("http"):]
+	status := dialWSExpectFailure(t, wsURL, nil)
+	if status != http.StatusUnauthorized {
+		t.Errorf("expected 401 for no-auth connection, got %d", status)
+	}
+}
+
+// TestServeWS_RealServer_TokenInQueryString_ConnectionRejected verifies that
+// passing the token as a query parameter is rejected with 400.
+func TestServeWS_RealServer_TokenInQueryString_ConnectionRejected(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-realauth-qs")
+	defer hub.Shutdown()
+
+	handler := ServeWS(hub, slog.Default(), &fakeWorkspaceResolver{id: "ws-realauth-qs"},
+		authCheckingUserIDFn("valid-token", "user-realauth-qs"))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	wsURL := "ws" + srv.URL[len("http"):] + "?token=valid-token"
+	status := dialWSExpectFailure(t, wsURL, nil)
+	if status != http.StatusBadRequest {
+		t.Errorf("expected 400 for token in query string, got %d", status)
+	}
+}
+
+// TestServeWS_RealServer_InvalidToken_ConnectionRejected verifies that a
+// WebSocket dial with an invalid Bearer token is rejected with 401.
+func TestServeWS_RealServer_InvalidToken_ConnectionRejected(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-realauth-bad")
+	defer hub.Shutdown()
+
+	handler := ServeWS(hub, slog.Default(), &fakeWorkspaceResolver{id: "ws-realauth-bad"},
+		authCheckingUserIDFn("valid-token", "user-realauth-bad"))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	wsURL := "ws" + srv.URL[len("http"):]
+	status := dialWSExpectFailure(t, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer wrong-token"}},
+	})
+	if status != http.StatusUnauthorized {
+		t.Errorf("expected 401 for invalid token, got %d", status)
+	}
+}
+
+// TestServeWS_RealServer_ValidToken_ConnectionAccepted verifies that a
+// WebSocket dial with a valid Bearer token in the Authorization header is
+// accepted and the client is registered in the hub.
+func TestServeWS_RealServer_ValidToken_ConnectionAccepted(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-realauth-ok")
+	defer hub.Shutdown()
+
+	const (
+		validToken = "valid-token-realserver"
+		userID     = "user-realauth-ok"
+		wsID       = "ws-realauth-ok"
+	)
+
+	handler := ServeWS(hub, slog.Default(), &fakeWorkspaceResolver{id: wsID},
+		authCheckingUserIDFn(validToken, userID))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	wsURL := "ws" + srv.URL[len("http"):]
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + validToken}},
+	})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("expected valid-token dial to succeed, got: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		for _, c := range hub.clients {
+			if c.userID == userID {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, "valid-token client must be registered in hub")
 }
