@@ -158,8 +158,7 @@
   font-size: 13.5px;
   line-height: 1.55;
   color: var(--color-ink, #16121f);
-  /* Safe text rendering: no HTML injection, preserve intentional line breaks */
-  white-space: pre-wrap;
+  white-space: pre-wrap; /* preserves spaces/newlines; <pre> inside overrides with white-space:pre */
   word-break: break-word;
 }
 
@@ -412,10 +411,9 @@
 .chat-msg-area__composer-bar {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   padding: 6px 10px;
   border-top: 1px solid var(--color-border, #e8e3f0);
-  gap: 6px;
 }
 
 .chat-msg-area__send-btn {
@@ -442,4 +440,160 @@
 .chat-msg-area__send-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* ── Rich text renderer (RichTextRenderer.tsx) ───────────────────────────────── */
+
+.chat-msg-area__msg-bubble .rtr-inline-code {
+  background: var(--color-surface-2, #faf8fd);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 0.875em;
+}
+
+.chat-msg-area__msg-bubble .rtr-code-block {
+  background: var(--color-surface-2, #faf8fd);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  padding: 10px 12px;
+  margin: 4px 0 0;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: normal;
+}
+
+.chat-msg-area__msg-bubble .rtr-code-block code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.chat-msg-area__msg-bubble .rtr-list {
+  margin: 4px 0 0;
+  padding-left: 20px;
+}
+
+.chat-msg-area__msg-bubble .rtr-list li {
+  line-height: 1.55;
+}
+
+.chat-msg-area__msg-bubble .rtr-list + .rtr-list {
+  margin-top: 4px;
+}
+
+/* ── ComposerToolbar ─────────────────────────────────────────────────────────── */
+
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.composer-toolbar__wrap {
+  position: relative;
+}
+
+.composer-toolbar__btn {
+  width: 32px;
+  height: 30px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md, 10px);
+  color: var(--color-muted, #7c7390);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+  flex-shrink: 0;
+}
+
+.composer-toolbar__btn:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.composer-toolbar__btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Format dropdown */
+.composer-toolbar__dropdown {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
+  padding: 6px;
+  min-width: 180px;
+  z-index: 200;
+}
+
+.composer-toolbar__format-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md, 10px);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--color-ink, #16121f);
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.composer-toolbar__format-item:hover,
+.composer-toolbar__format-item:focus {
+  background: var(--color-surface-2, #faf8fd);
+  outline: none;
+}
+
+/* Emoji picker */
+.composer-toolbar__emoji-picker {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
+  padding: 8px;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 2px;
+  width: 184px;
+  z-index: 200;
+}
+
+.composer-toolbar__emoji-btn {
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  width: 32px;
+  height: 32px;
+  font-size: 17px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.composer-toolbar__emoji-btn:hover {
+  background: var(--color-surface-2, #faf8fd);
 }

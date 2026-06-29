@@ -1,0 +1,95 @@
+/**
+ * RichTextRenderer unit tests — RF-11
+ *
+ * Covers: bold, italic, inline code, code block, unordered list, ordered list,
+ * XSS resistance, and plain text pass-through.
+ */
+
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import RichTextRenderer from "./RichTextRenderer";
+
+describe("RichTextRenderer", () => {
+  it("renders bold text correctly", () => {
+    const { container } = render(<RichTextRenderer text="Hello **world**!" />);
+    const strong = container.querySelector("strong");
+    expect(strong).not.toBeNull();
+    expect(strong?.textContent).toBe("world");
+    expect(screen.getByText("world")).toBeInTheDocument();
+  });
+
+  it("renders italic text correctly", () => {
+    const { container } = render(<RichTextRenderer text="Hello *world*!" />);
+    const em = container.querySelector("em");
+    expect(em).not.toBeNull();
+    expect(em?.textContent).toBe("world");
+  });
+
+  it("renders inline code correctly", () => {
+    const { container } = render(<RichTextRenderer text="Run `npm install` now" />);
+    const code = container.querySelector("code");
+    expect(code).not.toBeNull();
+    expect(code?.textContent).toBe("npm install");
+    expect(code?.className).toContain("rtr-inline-code");
+  });
+
+  it("renders a fenced code block correctly", () => {
+    const text = "```js\nconsole.log('hello');\n```";
+    const { container } = render(<RichTextRenderer text={text} />);
+    const pre = container.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.className).toContain("rtr-code-block");
+    expect(pre?.textContent).toContain("console.log");
+  });
+
+  it("renders unordered list correctly", () => {
+    const text = "- apple\n- banana\n- cherry";
+    const { container } = render(<RichTextRenderer text={text} />);
+    const ul = container.querySelector("ul");
+    expect(ul).not.toBeNull();
+    expect(ul?.className).toContain("rtr-list");
+    const items = ul?.querySelectorAll("li");
+    expect(items?.length).toBe(3);
+    expect(items?.[0].textContent).toBe("apple");
+    expect(items?.[1].textContent).toBe("banana");
+    expect(items?.[2].textContent).toBe("cherry");
+  });
+
+  it("renders ordered list correctly", () => {
+    const text = "1. first\n2. second\n3. third";
+    const { container } = render(<RichTextRenderer text={text} />);
+    const ol = container.querySelector("ol");
+    expect(ol).not.toBeNull();
+    expect(ol?.className).toContain("rtr-list");
+    const items = ol?.querySelectorAll("li");
+    expect(items?.length).toBe(3);
+    expect(items?.[0].textContent).toBe("first");
+  });
+
+  it("blocks XSS: script input does not execute and no script element is injected", () => {
+    const xss = "<script>window.__xss_rf11 = true;</script>";
+    const { container } = render(<RichTextRenderer text={xss} />);
+    expect(container.querySelector("script")).toBeNull();
+    expect((window as unknown as Record<string, unknown>).__xss_rf11).toBeUndefined();
+    // The raw string appears as literal text, not as HTML
+    expect(document.body.textContent).toContain("<script>");
+  });
+
+  it("renders plain text without modification", () => {
+    const { container } = render(<RichTextRenderer text="Just a plain message." />);
+    expect(screen.getByText("Just a plain message.")).toBeInTheDocument();
+    expect(container.querySelector("strong")).toBeNull();
+    expect(container.querySelector("em")).toBeNull();
+    expect(container.querySelector("code")).toBeNull();
+  });
+
+  // ponytail: whitespace preservation is a CSS concern (white-space: pre-wrap on bubble).
+  // We test that the renderer emits <br> elements between paragraph lines — the React
+  // behaviour that works *with* the CSS — rather than textContent (always true).
+  it("inserts <br> between paragraph lines", () => {
+    const { container } = render(<RichTextRenderer text={"line1\nline2"} />);
+    expect(container.querySelector("br")).not.toBeNull();
+    expect(container.textContent).toContain("line1");
+    expect(container.textContent).toContain("line2");
+  });
+});

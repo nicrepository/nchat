@@ -42,4 +42,5 @@
   /* Typography */
   --font-sans:
     "Inter", "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
