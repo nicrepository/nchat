@@ -92,4 +92,33 @@ describe("RichTextRenderer", () => {
     expect(container.textContent).toContain("line1");
     expect(container.textContent).toContain("line2");
   });
+
+  // Branch: `if (!text) return null`
+  it("returns null for empty string", () => {
+    const { container } = render(<RichTextRenderer text="" />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  // Branch: `if (i < lines.length) i++` false — unclosed fence has no closing ```.
+  it("handles unclosed code fence gracefully", () => {
+    const { container } = render(<RichTextRenderer text={"```\ncode without closing"} />);
+    const pre = container.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.textContent).toContain("code without closing");
+  });
+
+  // Branch: `if (!chunk) return []` true — split produces empty strings when marker is at
+  // the very start/end of text (e.g. "**bold**" → ["", "**bold**", ""]).
+  it("renders inline bold with no surrounding text (marker at boundaries)", () => {
+    const { container } = render(<RichTextRenderer text="**bold**" />);
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+  });
+
+  // Branch: `para.lines.some(l => l.length > 0)` false — blank-only input produces an
+  // all-empty paragraph that must be skipped (not pushed to blocks).
+  it("renders nothing for blank-only input", () => {
+    const { container } = render(<RichTextRenderer text={"\n\n"} />);
+    // No block or inline elements — just an empty fragment.
+    expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
+  });
 });

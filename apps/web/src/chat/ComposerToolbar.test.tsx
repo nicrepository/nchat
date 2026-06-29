@@ -8,7 +8,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type RefObject, useRef, useState } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import ComposerToolbar from "./ComposerToolbar";
 
 // ── Test wrapper ──────────────────────────────────────────────────────────────
@@ -281,5 +281,53 @@ describe("ComposerToolbar — disabled state", () => {
     expect(screen.getByTestId("toolbar-format-btn")).toBeDisabled();
     expect(screen.getByTestId("toolbar-emoji-btn")).toBeDisabled();
     // ponytail: GIF and upload buttons removed (RF-12 not yet implemented).
+  });
+});
+
+// ── Null textareaRef defensive paths ─────────────────────────────────────────
+
+describe("ComposerToolbar — null textareaRef", () => {
+  // Covers: `if (ta)` false branch in snapSel, `if (!ta) return` true in handleFormat.
+  it("does not throw and does not call setDraft when textareaRef is null on format", async () => {
+    const user = userEvent.setup();
+    const mockSetDraft = vi.fn();
+    render(
+      <div>
+        <ComposerToolbar
+          textareaRef={{ current: null } as RefObject<HTMLTextAreaElement | null>}
+          setDraft={mockSetDraft}
+          disabled={false}
+        />
+      </div>,
+    );
+
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("fmt-bold"));
+    // handleFormat returns early — setDraft never called.
+    expect(mockSetDraft).not.toHaveBeenCalled();
+  });
+
+  // Covers: `if (!ta) return` true branch in handleEmoji.
+  it("does not throw and does not call setDraft when textareaRef is null on emoji", async () => {
+    const user = userEvent.setup();
+    const mockSetDraft = vi.fn();
+    render(
+      <div>
+        <ComposerToolbar
+          textareaRef={{ current: null } as RefObject<HTMLTextAreaElement | null>}
+          setDraft={mockSetDraft}
+          disabled={false}
+        />
+      </div>,
+    );
+
+    await user.click(screen.getByTestId("toolbar-emoji-btn"));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    await user.click(screen.getByText("😀"));
+    // handleEmoji returns early — setDraft never called.
+    expect(mockSetDraft).not.toHaveBeenCalled();
   });
 });
