@@ -1,0 +1,1223 @@
+diff --git a/apps/web/src/chat/ChatMessageArea.css b/apps/web/src/chat/ChatMessageArea.css
+index 44c4386..db8bd9f 100644
+--- a/apps/web/src/chat/ChatMessageArea.css
++++ b/apps/web/src/chat/ChatMessageArea.css
+@@ -158,8 +158,7 @@
+   font-size: 13.5px;
+   line-height: 1.55;
+   color: var(--color-ink, #16121f);
+-  /* Safe text rendering: no HTML injection, preserve intentional line breaks */
+-  white-space: pre-wrap;
++  white-space: pre-wrap; /* preserves spaces/newlines; <pre> inside overrides with white-space:pre */
+   word-break: break-word;
+ }
+ 
+@@ -412,10 +411,9 @@
+ .chat-msg-area__composer-bar {
+   display: flex;
+   align-items: center;
+-  justify-content: flex-end;
++  justify-content: space-between;
+   padding: 6px 10px;
+   border-top: 1px solid var(--color-border, #e8e3f0);
+-  gap: 6px;
+ }
+ 
+ .chat-msg-area__send-btn {
+@@ -443,3 +441,159 @@
+   opacity: 0.4;
+   cursor: not-allowed;
+ }
++
++/* ── Rich text renderer (RichTextRenderer.tsx) ───────────────────────────────── */
++
++.chat-msg-area__msg-bubble .rtr-inline-code {
++  background: var(--color-surface-2, #faf8fd);
++  border: 1px solid var(--color-border, #e8e3f0);
++  border-radius: 4px;
++  padding: 1px 5px;
++  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace);
++  font-size: 0.875em;
++}
++
++.chat-msg-area__msg-bubble .rtr-code-block {
++  background: var(--color-surface-2, #faf8fd);
++  border: 1px solid var(--color-border, #e8e3f0);
++  border-radius: var(--radius-sm, 6px);
++  padding: 10px 12px;
++  margin: 4px 0 0;
++  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace);
++  font-size: 12.5px;
++  line-height: 1.6;
++  overflow-x: auto;
++  white-space: pre;
++  word-break: normal;
++}
++
++.chat-msg-area__msg-bubble .rtr-code-block code {
++  background: none;
++  border: none;
++  padding: 0;
++  font-family: inherit;
++  font-size: inherit;
++}
++
++.chat-msg-area__msg-bubble .rtr-list {
++  margin: 4px 0 0;
++  padding-left: 20px;
++}
++
++.chat-msg-area__msg-bubble .rtr-list li {
++  line-height: 1.55;
++}
++
++.chat-msg-area__msg-bubble .rtr-list + .rtr-list {
++  margin-top: 4px;
++}
++
++/* ── ComposerToolbar ─────────────────────────────────────────────────────────── */
++
++.composer-toolbar {
++  display: flex;
++  align-items: center;
++  gap: 2px;
++  flex-shrink: 0;
++}
++
++.composer-toolbar__wrap {
++  position: relative;
++}
++
++.composer-toolbar__btn {
++  width: 32px;
++  height: 30px;
++  background: transparent;
++  border: none;
++  border-radius: var(--radius-md, 10px);
++  color: var(--color-muted, #7c7390);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  cursor: pointer;
++  transition:
++    background 0.12s,
++    color 0.12s;
++  flex-shrink: 0;
++}
++
++.composer-toolbar__btn:hover:not(:disabled) {
++  background: var(--color-surface-2, #faf8fd);
++  color: var(--color-ink-2, #3d3550);
++}
++
++.composer-toolbar__btn:disabled {
++  opacity: 0.35;
++  cursor: not-allowed;
++}
++
++/* Format dropdown */
++.composer-toolbar__dropdown {
++  position: absolute;
++  bottom: calc(100% + 6px);
++  left: 0;
++  background: var(--color-surface, #fff);
++  border: 1px solid var(--color-border, #e8e3f0);
++  border-radius: var(--radius-lg, 14px);
++  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
++  padding: 6px;
++  min-width: 180px;
++  z-index: 200;
++}
++
++.composer-toolbar__format-item {
++  display: block;
++  width: 100%;
++  text-align: left;
++  background: transparent;
++  border: none;
++  border-radius: var(--radius-md, 10px);
++  padding: 8px 12px;
++  font-size: 13px;
++  font-family: inherit;
++  color: var(--color-ink, #16121f);
++  cursor: pointer;
++  transition: background 0.12s;
++}
++
++.composer-toolbar__format-item:hover,
++.composer-toolbar__format-item:focus {
++  background: var(--color-surface-2, #faf8fd);
++  outline: none;
++}
++
++/* Emoji picker */
++.composer-toolbar__emoji-picker {
++  position: absolute;
++  bottom: calc(100% + 6px);
++  left: 0;
++  background: var(--color-surface, #fff);
++  border: 1px solid var(--color-border, #e8e3f0);
++  border-radius: var(--radius-lg, 14px);
++  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
++  padding: 8px;
++  display: grid;
++  grid-template-columns: repeat(5, 1fr);
++  gap: 2px;
++  width: 184px;
++  z-index: 200;
++}
++
++.composer-toolbar__emoji-btn {
++  background: transparent;
++  border: none;
++  border-radius: var(--radius-sm, 6px);
++  width: 32px;
++  height: 32px;
++  font-size: 17px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  cursor: pointer;
++  transition: background 0.12s;
++}
++
++.composer-toolbar__emoji-btn:hover {
++  background: var(--color-surface-2, #faf8fd);
++}
+diff --git a/apps/web/src/chat/ChatMessageArea.tsx b/apps/web/src/chat/ChatMessageArea.tsx
+index ec8be9b..860d08a 100644
+--- a/apps/web/src/chat/ChatMessageArea.tsx
++++ b/apps/web/src/chat/ChatMessageArea.tsx
+@@ -22,6 +22,8 @@ import "./ChatMessageArea.css";
+ import type { ChatOutletContext } from "./ChatShell";
+ import type { Message } from "./chatTypes";
+ import { useMessages, type LastMutation, type SendResult } from "./useMessages";
++import RichTextRenderer from "./RichTextRenderer";
++import ComposerToolbar from "./ComposerToolbar";
+ 
+ // ── Helpers ───────────────────────────────────────────────────────────────────
+ 
+@@ -287,7 +289,7 @@ function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
+         <div
+           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
+         >
+-          {message.isRemoved ? "Mensagem removida." : message.bodyText}
++          {message.isRemoved ? "Mensagem removida." : <RichTextRenderer text={message.bodyText} />}
+         </div>
+       </div>
+     </div>
+@@ -469,6 +471,7 @@ interface ComposerProps {
+ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
+   const [draft, setDraft] = useState("");
+   const [sending, setSending] = useState(false);
++  const textareaRef = useRef<HTMLTextAreaElement>(null);
+ 
+   const canSend = draft.trim().length > 0 && !sending && !disabled;
+ 
+@@ -502,6 +505,7 @@ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
+         className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}`}
+       >
+         <textarea
++          ref={textareaRef}
+           className="chat-msg-area__composer-input"
+           placeholder={placeholder}
+           value={draft}
+@@ -513,6 +517,11 @@ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
+           data-testid="chat-composer-input"
+         />
+         <div className="chat-msg-area__composer-bar">
++          <ComposerToolbar
++            textareaRef={textareaRef}
++            setDraft={setDraft}
++            disabled={disabled || sending}
++          />
+           <button
+             type="button"
+             className="chat-msg-area__send-btn"
+diff --git a/apps/web/src/chat/ComposerToolbar.test.tsx b/apps/web/src/chat/ComposerToolbar.test.tsx
+new file mode 100644
+index 0000000..ea66807
+--- /dev/null
++++ b/apps/web/src/chat/ComposerToolbar.test.tsx
+@@ -0,0 +1,285 @@
++/**
++ * ComposerToolbar tests — RF-11 toolbar
++ *
++ * Uses userEvent for realistic interaction simulation (focus, keyboard, pointer).
++ * TestWrapper provides a controlled textarea + setDraft to test insertion logic.
++ */
++
++import { render, screen, waitFor } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { type RefObject, useRef, useState } from "react";
++import { describe, expect, it } from "vitest";
++import ComposerToolbar from "./ComposerToolbar";
++
++// ── Test wrapper ──────────────────────────────────────────────────────────────
++
++function TestWrapper({ initialDraft = "" }: { initialDraft?: string }) {
++  const [draft, setDraft] = useState(initialDraft);
++  const ref = useRef<HTMLTextAreaElement>(null) as RefObject<HTMLTextAreaElement | null>;
++  return (
++    <div>
++      <textarea
++        ref={ref}
++        value={draft}
++        onChange={(e) => setDraft(e.target.value)}
++        data-testid="ta"
++      />
++      <ComposerToolbar textareaRef={ref} setDraft={setDraft} />
++    </div>
++  );
++}
++
++// ── Format insertion (inline markers) ────────────────────────────────────────
++
++describe("ComposerToolbar — inline format insertion", () => {
++  it("wraps selection with ** for Negrito", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="texto" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 5);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-bold"));
++
++    expect(ta).toHaveValue("**texto**");
++  });
++
++  it("wraps selection with * for Itálico", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="texto" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 5);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-italic"));
++
++    expect(ta).toHaveValue("*texto*");
++  });
++
++  it("wraps selection with backtick for Código", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="hello" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 5);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-code"));
++
++    expect(ta).toHaveValue("`hello`");
++  });
++
++  it("cursor vazio — coloca cursor entre marcadores ao inserir negrito sem seleção", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="texto" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(2, 2); // cursor at pos 2, no selection
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-bold"));
++
++    expect(ta).toHaveValue("te****xto"); // ** + empty + ** inserted at pos 2
++    // Cursor must be collapsed between the markers (pos 4), not selecting them.
++    await waitFor(() => {
++      expect(ta.selectionStart).toBe(4);
++      expect(ta.selectionEnd).toBe(4);
++    });
++  });
++
++  it("cursor posicionado sobre texto envolvido após negrito com seleção", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="texto" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 5);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-bold"));
++
++    // selectionStart/End should be on the wrapped content, not the ** markers.
++    await waitFor(() => {
++      expect(ta.selectionStart).toBe(2); // after opening **
++      expect(ta.selectionEnd).toBe(7); // before closing **
++    });
++  });
++
++  it("closes format menu after inserting", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper />);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    expect(screen.getByRole("menu")).toBeInTheDocument();
++
++    await user.click(screen.getByTestId("fmt-bold"));
++    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
++  });
++});
++
++// ── Block format insertion ────────────────────────────────────────────────────
++
++describe("ComposerToolbar — block format insertion", () => {
++  it("wraps multiline selection in code fence", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft={"line1\nline2\nline3"} />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 17); // select all
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-codeblock"));
++
++    expect(ta).toHaveValue("```\nline1\nline2\nline3\n```");
++  });
++
++  it("cursor posicionado dentro do bloco de código (após a cerca de abertura)", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="hello" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 5);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-codeblock"));
++
++    expect(ta).toHaveValue("```\nhello\n```");
++    // Cursor must be inside the fence (after "```\n"), not selecting the markers.
++    await waitFor(() => {
++      expect(ta.selectionStart).toBe(4);
++      expect(ta.selectionEnd).toBe(4);
++    });
++  });
++
++  it("expande até limites de linha — inserção no meio da linha (ul)", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="prefix hello suffix" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(7, 12); // select "hello" — mid-line
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-ul"));
++
++    // Entire line must be prefixed, not just "hello".
++    expect(ta).toHaveValue("- prefix hello suffix");
++  });
++
++  it("prefixes each selected line with '- ' for ul", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft={"item1\nitem2\nitem3"} />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 17);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-ul"));
++
++    expect(ta).toHaveValue("- item1\n- item2\n- item3");
++  });
++
++  it("prefixes each selected line with numbered prefix for ol", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft={"alpha\nbeta"} />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(0, 10);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-ol"));
++
++    expect(ta).toHaveValue("1. alpha\n2. beta");
++  });
++});
++
++// ── Keyboard accessibility ────────────────────────────────────────────────────
++
++describe("ComposerToolbar — keyboard accessibility", () => {
++  it("Escape closes format menu and returns focus to format button", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper />);
++    const btn = screen.getByTestId("toolbar-format-btn");
++
++    await user.click(btn);
++    expect(screen.getByRole("menu")).toBeInTheDocument();
++
++    await user.keyboard("{Escape}");
++
++    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
++    expect(document.activeElement).toBe(btn);
++  });
++
++  it("Escape closes emoji picker and returns focus to emoji button", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper />);
++    const btn = screen.getByTestId("toolbar-emoji-btn");
++
++    await user.click(btn);
++    expect(screen.getByRole("dialog")).toBeInTheDocument();
++
++    await user.keyboard("{Escape}");
++
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    expect(document.activeElement).toBe(btn);
++  });
++
++  it("seleção obsoleta — reabrir menu usa posição atual do cursor, não posição antiga", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="abcde" />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    // Open menu with "abc" selected.
++    ta.setSelectionRange(0, 3);
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++
++    // Close via Escape (clears savedSel).
++    await user.keyboard("{Escape}");
++
++    // Move cursor to "de".
++    ta.setSelectionRange(3, 5);
++
++    // Reopen — onPointerDown snapshots fresh selection.
++    await user.click(screen.getByTestId("toolbar-format-btn"));
++    await user.click(screen.getByTestId("fmt-bold"));
++
++    // Must have wrapped "de", not "abc".
++    expect(ta).toHaveValue("abc**de**");
++  });
++});
++
++// ── Emoji insertion ───────────────────────────────────────────────────────────
++
++describe("ComposerToolbar — emoji insertion", () => {
++  it("inserts emoji at cursor position", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper initialDraft="Olá " />);
++    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
++
++    ta.setSelectionRange(4, 4);
++    await user.click(screen.getByTestId("toolbar-emoji-btn"));
++    await user.click(screen.getByText("😀"));
++
++    expect(ta).toHaveValue("Olá 😀");
++  });
++
++  it("closes emoji picker after inserting", async () => {
++    const user = userEvent.setup();
++    render(<TestWrapper />);
++    await user.click(screen.getByTestId("toolbar-emoji-btn"));
++    expect(screen.getByRole("dialog")).toBeInTheDocument();
++
++    await user.click(screen.getByText("😀"));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++  });
++});
++
++// ── Disabled state ────────────────────────────────────────────────────────────
++
++describe("ComposerToolbar — disabled state", () => {
++  it("disables format and emoji buttons when disabled=true", () => {
++    render(
++      <div>
++        <textarea ref={() => {}} data-testid="ta" />
++        <ComposerToolbar
++          textareaRef={{ current: null } as unknown as RefObject<HTMLTextAreaElement | null>}
++          setDraft={() => {}}
++          disabled
++        />
++      </div>,
++    );
++
++    expect(screen.getByTestId("toolbar-format-btn")).toBeDisabled();
++    expect(screen.getByTestId("toolbar-emoji-btn")).toBeDisabled();
++    // ponytail: GIF and upload buttons removed (RF-12 not yet implemented).
++  });
++});
+diff --git a/apps/web/src/chat/ComposerToolbar.tsx b/apps/web/src/chat/ComposerToolbar.tsx
+new file mode 100644
+index 0000000..ac741b6
+--- /dev/null
++++ b/apps/web/src/chat/ComposerToolbar.tsx
+@@ -0,0 +1,336 @@
++/**
++ * ComposerToolbar — formatting toolbar for the message composer.
++ * Security: all insertions are plain string operations — no innerHTML injection.
++ * ponytail: emoji picker has no search (add when requested); GIF/upload are RF-12+.
++ */
++
++import { useEffect, useLayoutEffect, useRef, useState } from "react";
++import type { RefObject } from "react";
++import { FORMAT_ITEMS } from "./richTextGrammar";
++import type { FormatItem } from "./richTextGrammar";
++
++// ── Toolbar-specific presentation (labels/testIds are not grammar concerns) ────
++
++interface ToolbarItem extends FormatItem {
++  label: string;
++  testId: string;
++}
++
++const TOOLBAR_ITEMS: ToolbarItem[] = [
++  { ...FORMAT_ITEMS[0], label: "Negrito", testId: "fmt-bold" },
++  { ...FORMAT_ITEMS[1], label: "Itálico", testId: "fmt-italic" },
++  { ...FORMAT_ITEMS[2], label: "Código", testId: "fmt-code" },
++  { ...FORMAT_ITEMS[3], label: "Bloco de código", testId: "fmt-codeblock" },
++  { ...FORMAT_ITEMS[4], label: "Lista", testId: "fmt-ul" },
++  { ...FORMAT_ITEMS[5], label: "Lista ordenada", testId: "fmt-ol" },
++];
++
++// ── Emoji list ─────────────────────────────────────────────────────────────────
++
++// ponytail: 20 frequent emojis; expand to full picker when users request search
++const EMOJIS = [
++  "😀",
++  "😂",
++  "🙏",
++  "👍",
++  "👎",
++  "❤️",
++  "🔥",
++  "✅",
++  "⚠️",
++  "🎉",
++  "💡",
++  "📝",
++  "🚀",
++  "🐛",
++  "💬",
++  "📌",
++  "🔒",
++  "⚡",
++  "🎯",
++  "🌟",
++];
++
++// ── Insertion helpers ─────────────────────────────────────────────────────────
++
++type Sel = { s: number; e: number };
++
++/** Expand sel to the full lines it touches (start-of-line ↔ end-of-line). */
++function expandToLines(val: string, sel: Sel): Sel {
++  let s = sel.s;
++  while (s > 0 && val[s - 1] !== "\n") s--;
++  let e = sel.e;
++  while (e < val.length && val[e] !== "\n") e++;
++  return { s, e };
++}
++
++function wrapInline(
++  ta: HTMLTextAreaElement,
++  setDraft: (v: string) => void,
++  mark: string,
++  sel: Sel,
++) {
++  const text = ta.value.slice(sel.s, sel.e);
++  setDraft(ta.value.slice(0, sel.s) + mark + text + mark + ta.value.slice(sel.e));
++  // Cursor stays on wrapped content (not selecting markers); collapsed when no selection.
++  requestAnimationFrame(() => {
++    ta.focus();
++    ta.setSelectionRange(sel.s + mark.length, sel.s + mark.length + text.length);
++  });
++}
++
++function wrapBlock(
++  ta: HTMLTextAreaElement,
++  setDraft: (v: string) => void,
++  kind: "code" | "ul" | "ol",
++  sel: Sel,
++) {
++  // Always expand to full line boundaries so mid-line cursors are handled correctly.
++  const exp = expandToLines(ta.value, sel);
++  const text = ta.value.slice(exp.s, exp.e);
++  let insert: string;
++  let cursor: number;
++  if (kind === "code") {
++    const body = text || "";
++    insert = "```\n" + body + (body && !body.endsWith("\n") ? "\n" : "") + "```";
++    cursor = exp.s + 4; // inside fence, after "```\n"
++  } else {
++    const lines = text.split("\n");
++    insert =
++      kind === "ul"
++        ? lines.map((l) => "- " + l).join("\n")
++        : lines.map((l, i) => `${i + 1}. ${l}`).join("\n");
++    cursor = exp.s + insert.length; // after all prefixed lines
++  }
++  setDraft(ta.value.slice(0, exp.s) + insert + ta.value.slice(exp.e));
++  // Collapsed cursor — never leave markers selected so they aren't replaced on first keystroke.
++  requestAnimationFrame(() => {
++    ta.focus();
++    ta.setSelectionRange(cursor, cursor);
++  });
++}
++
++// ── Icons ─────────────────────────────────────────────────────────────────────
++
++const IconFormat = () => (
++  <svg
++    width="16"
++    height="16"
++    viewBox="0 0 18 18"
++    fill="none"
++    stroke="currentColor"
++    strokeWidth="1.6"
++    strokeLinecap="round"
++    strokeLinejoin="round"
++    aria-hidden="true"
++  >
++    <path d="M3 14L7.5 3 12 14" />
++    <path d="M4.6 10.5h5.8" />
++    <path d="M2 17h14" />
++  </svg>
++);
++const IconEmoji = () => (
++  <svg
++    width="18"
++    height="18"
++    viewBox="0 0 20 20"
++    fill="none"
++    stroke="currentColor"
++    strokeWidth="1.6"
++    strokeLinecap="round"
++    aria-hidden="true"
++  >
++    <circle cx="10" cy="10" r="7.5" />
++    <circle cx="7.5" cy="8.5" r="0.7" fill="currentColor" stroke="none" />
++    <circle cx="12.5" cy="8.5" r="0.7" fill="currentColor" stroke="none" />
++    <path d="M7 12.5c1 1.8 5 1.8 6 0" />
++  </svg>
++);
++
++// ── Component ─────────────────────────────────────────────────────────────────
++
++export interface ComposerToolbarProps {
++  textareaRef: RefObject<HTMLTextAreaElement | null>;
++  setDraft: (v: string) => void;
++  disabled?: boolean;
++}
++
++export default function ComposerToolbar({
++  textareaRef,
++  setDraft,
++  disabled = false,
++}: ComposerToolbarProps) {
++  const [formatOpen, setFormatOpen] = useState(false);
++  const [emojiOpen, setEmojiOpen] = useState(false);
++  const containerRef = useRef<HTMLDivElement>(null);
++  const formatBtnRef = useRef<HTMLButtonElement>(null);
++  const emojiBtnRef = useRef<HTMLButtonElement>(null);
++  const firstFmtRef = useRef<HTMLButtonElement>(null);
++  const firstEmojiRef = useRef<HTMLButtonElement>(null);
++  // Snapshot textarea selection on pointerdown (before button click steals focus).
++  const savedSel = useRef<Sel | null>(null);
++
++  // Close panels + clear savedSel on outside click.
++  useEffect(() => {
++    const onDown = (ev: MouseEvent) => {
++      if (containerRef.current && !containerRef.current.contains(ev.target as Node)) {
++        setFormatOpen(false);
++        setEmojiOpen(false);
++        savedSel.current = null; // stale selection is no longer valid
++      }
++    };
++    document.addEventListener("mousedown", onDown);
++    return () => document.removeEventListener("mousedown", onDown);
++  }, []);
++
++  // Synchronous focus on first item when panel opens (useLayoutEffect avoids rAF).
++  useLayoutEffect(() => {
++    if (formatOpen) firstFmtRef.current?.focus();
++  }, [formatOpen]);
++  useLayoutEffect(() => {
++    if (emojiOpen) firstEmojiRef.current?.focus();
++  }, [emojiOpen]);
++
++  function snapSel() {
++    const ta = textareaRef.current;
++    if (ta) savedSel.current = { s: ta.selectionStart, e: ta.selectionEnd };
++  }
++
++  function getSel(): Sel {
++    if (savedSel.current) return savedSel.current;
++    const ta = textareaRef.current;
++    return ta ? { s: ta.selectionStart, e: ta.selectionEnd } : { s: 0, e: 0 };
++  }
++
++  function handleFormat({ kind, marker }: ToolbarItem) {
++    const ta = textareaRef.current;
++    if (!ta) return;
++    const sel = getSel();
++    if (kind === "inline") wrapInline(ta, setDraft, marker, sel);
++    else if (kind === "block-code") wrapBlock(ta, setDraft, "code", sel);
++    else if (kind === "list-ul") wrapBlock(ta, setDraft, "ul", sel);
++    else wrapBlock(ta, setDraft, "ol", sel);
++    setFormatOpen(false);
++    savedSel.current = null;
++  }
++
++  function handleEmoji(emoji: string) {
++    const ta = textareaRef.current;
++    if (!ta) return;
++    const { s, e } = getSel();
++    setDraft(ta.value.slice(0, s) + emoji + ta.value.slice(e));
++    requestAnimationFrame(() => {
++      ta.focus();
++      ta.setSelectionRange(s + emoji.length, s + emoji.length);
++    });
++    setEmojiOpen(false);
++    savedSel.current = null;
++  }
++
++  const closeFormat = () => {
++    setFormatOpen(false);
++    savedSel.current = null;
++    formatBtnRef.current?.focus();
++  };
++  const closeEmoji = () => {
++    setEmojiOpen(false);
++    savedSel.current = null;
++    emojiBtnRef.current?.focus();
++  };
++
++  return (
++    <div className="composer-toolbar" ref={containerRef}>
++      {/* Format button + dropdown */}
++      <div className="composer-toolbar__wrap">
++        <button
++          ref={formatBtnRef}
++          type="button"
++          className="composer-toolbar__btn"
++          aria-label="Formatação de texto"
++          aria-haspopup="menu"
++          aria-expanded={formatOpen}
++          disabled={disabled}
++          data-testid="toolbar-format-btn"
++          onPointerDown={snapSel}
++          onClick={() => {
++            setFormatOpen((o) => !o);
++            setEmojiOpen(false);
++          }}
++        >
++          <IconFormat />
++        </button>
++
++        {formatOpen && (
++          <div
++            role="menu"
++            className="composer-toolbar__dropdown"
++            data-testid="toolbar-format-menu"
++            onKeyDown={(ev) => {
++              if (ev.key === "Escape") closeFormat();
++            }}
++          >
++            {TOOLBAR_ITEMS.map((item, i) => (
++              <button
++                key={item.testId}
++                ref={i === 0 ? firstFmtRef : undefined}
++                type="button"
++                role="menuitem"
++                className="composer-toolbar__format-item"
++                onClick={() => handleFormat(item)}
++                data-testid={item.testId}
++              >
++                {item.label}
++              </button>
++            ))}
++          </div>
++        )}
++      </div>
++
++      {/* Emoji button + picker */}
++      <div className="composer-toolbar__wrap">
++        <button
++          ref={emojiBtnRef}
++          type="button"
++          className="composer-toolbar__btn"
++          aria-label="Inserir emoji"
++          aria-haspopup="dialog"
++          aria-expanded={emojiOpen}
++          disabled={disabled}
++          data-testid="toolbar-emoji-btn"
++          onPointerDown={snapSel}
++          onClick={() => {
++            setEmojiOpen((o) => !o);
++            setFormatOpen(false);
++          }}
++        >
++          <IconEmoji />
++        </button>
++
++        {emojiOpen && (
++          <div
++            role="dialog"
++            aria-label="Seletor de emoji"
++            className="composer-toolbar__emoji-picker"
++            data-testid="toolbar-emoji-picker"
++            onKeyDown={(ev) => {
++              if (ev.key === "Escape") closeEmoji();
++            }}
++          >
++            {EMOJIS.map((emoji, i) => (
++              <button
++                key={emoji}
++                ref={i === 0 ? firstEmojiRef : undefined}
++                type="button"
++                className="composer-toolbar__emoji-btn"
++                aria-label={emoji}
++                onClick={() => handleEmoji(emoji)}
++              >
++                {emoji}
++              </button>
++            ))}
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/web/src/chat/RichTextRenderer.test.tsx b/apps/web/src/chat/RichTextRenderer.test.tsx
+new file mode 100644
+index 0000000..21cf9cd
+--- /dev/null
++++ b/apps/web/src/chat/RichTextRenderer.test.tsx
+@@ -0,0 +1,95 @@
++/**
++ * RichTextRenderer unit tests — RF-11
++ *
++ * Covers: bold, italic, inline code, code block, unordered list, ordered list,
++ * XSS resistance, and plain text pass-through.
++ */
++
++import { render, screen } from "@testing-library/react";
++import { describe, expect, it } from "vitest";
++import RichTextRenderer from "./RichTextRenderer";
++
++describe("RichTextRenderer", () => {
++  it("renders bold text correctly", () => {
++    const { container } = render(<RichTextRenderer text="Hello **world**!" />);
++    const strong = container.querySelector("strong");
++    expect(strong).not.toBeNull();
++    expect(strong?.textContent).toBe("world");
++    expect(screen.getByText("world")).toBeInTheDocument();
++  });
++
++  it("renders italic text correctly", () => {
++    const { container } = render(<RichTextRenderer text="Hello *world*!" />);
++    const em = container.querySelector("em");
++    expect(em).not.toBeNull();
++    expect(em?.textContent).toBe("world");
++  });
++
++  it("renders inline code correctly", () => {
++    const { container } = render(<RichTextRenderer text="Run `npm install` now" />);
++    const code = container.querySelector("code");
++    expect(code).not.toBeNull();
++    expect(code?.textContent).toBe("npm install");
++    expect(code?.className).toContain("rtr-inline-code");
++  });
++
++  it("renders a fenced code block correctly", () => {
++    const text = "```js\nconsole.log('hello');\n```";
++    const { container } = render(<RichTextRenderer text={text} />);
++    const pre = container.querySelector("pre");
++    expect(pre).not.toBeNull();
++    expect(pre?.className).toContain("rtr-code-block");
++    expect(pre?.textContent).toContain("console.log");
++  });
++
++  it("renders unordered list correctly", () => {
++    const text = "- apple\n- banana\n- cherry";
++    const { container } = render(<RichTextRenderer text={text} />);
++    const ul = container.querySelector("ul");
++    expect(ul).not.toBeNull();
++    expect(ul?.className).toContain("rtr-list");
++    const items = ul?.querySelectorAll("li");
++    expect(items?.length).toBe(3);
++    expect(items?.[0].textContent).toBe("apple");
++    expect(items?.[1].textContent).toBe("banana");
++    expect(items?.[2].textContent).toBe("cherry");
++  });
++
++  it("renders ordered list correctly", () => {
++    const text = "1. first\n2. second\n3. third";
++    const { container } = render(<RichTextRenderer text={text} />);
++    const ol = container.querySelector("ol");
++    expect(ol).not.toBeNull();
++    expect(ol?.className).toContain("rtr-list");
++    const items = ol?.querySelectorAll("li");
++    expect(items?.length).toBe(3);
++    expect(items?.[0].textContent).toBe("first");
++  });
++
++  it("blocks XSS: script input does not execute and no script element is injected", () => {
++    const xss = "<script>window.__xss_rf11 = true;</script>";
++    const { container } = render(<RichTextRenderer text={xss} />);
++    expect(container.querySelector("script")).toBeNull();
++    expect((window as unknown as Record<string, unknown>).__xss_rf11).toBeUndefined();
++    // The raw string appears as literal text, not as HTML
++    expect(document.body.textContent).toContain("<script>");
++  });
++
++  it("renders plain text without modification", () => {
++    const { container } = render(<RichTextRenderer text="Just a plain message." />);
++    expect(screen.getByText("Just a plain message.")).toBeInTheDocument();
++    expect(container.querySelector("strong")).toBeNull();
++    expect(container.querySelector("em")).toBeNull();
++    expect(container.querySelector("code")).toBeNull();
++  });
++
++  // ponytail: whitespace preservation is a CSS concern (white-space: pre-wrap on bubble).
++  // We test that the renderer emits <br> elements between paragraph lines — the React
++  // behaviour that works *with* the CSS — rather than textContent (always true).
++  it("inserts <br> between paragraph lines", () => {
++    const { container } = render(<RichTextRenderer text={"line1\nline2"} />);
++    expect(container.querySelector("br")).not.toBeNull();
++    expect(container.textContent).toContain("line1");
++    expect(container.textContent).toContain("line2");
++  });
++});
+diff --git a/apps/web/src/chat/RichTextRenderer.tsx b/apps/web/src/chat/RichTextRenderer.tsx
+new file mode 100644
+index 0000000..2bec743
+--- /dev/null
++++ b/apps/web/src/chat/RichTextRenderer.tsx
+@@ -0,0 +1,187 @@
++/**
++ * RichTextRenderer — client-side Markdown-like renderer for chat messages.
++ *
++ * Security: never uses dangerouslySetInnerHTML. All output is React nodes.
++ * XSS-safe by construction: strings become text nodes, never markup.
++ *
++ * Supported:  **bold**  *italic*  `code`  ```block```  - ul  1. ol
++ *
++ * ponytail: no nested formatting, no auto-links, no tables — add when spec grows.
++ */
++
++import { Fragment } from "react";
++import type { ReactNode } from "react";
++import {
++  BOLD_MARKER,
++  ITALIC_MARKER,
++  CODE_MARKER,
++  INLINE_RE,
++  isCodeFence,
++  isUlLine,
++  isOlLine,
++} from "./richTextGrammar";
++
++// ── Inline tokenizer (returns data, not JSX) ──────────────────────────────────
++
++type InlineToken = string | { type: "bold" | "italic" | "code"; text: string };
++
++function tokenizeInline(text: string): InlineToken[] {
++  return text.split(INLINE_RE).flatMap((chunk): InlineToken[] => {
++    if (!chunk) return [];
++    if (chunk.startsWith(BOLD_MARKER) && chunk.endsWith(BOLD_MARKER))
++      return [{ type: "bold", text: chunk.slice(BOLD_MARKER.length, -BOLD_MARKER.length) }];
++    if (chunk.startsWith(CODE_MARKER) && chunk.endsWith(CODE_MARKER))
++      return [{ type: "code", text: chunk.slice(CODE_MARKER.length, -CODE_MARKER.length) }];
++    if (chunk.startsWith(ITALIC_MARKER) && chunk.endsWith(ITALIC_MARKER))
++      return [{ type: "italic", text: chunk.slice(ITALIC_MARKER.length, -ITALIC_MARKER.length) }];
++    return [chunk];
++  });
++}
++
++function renderTokens(tokens: InlineToken[], keyPrefix: string): ReactNode[] {
++  return tokens.map((t, i): ReactNode => {
++    if (typeof t === "string") return t; // plain text → text node, XSS-safe
++    const k = `${keyPrefix}-${i}`;
++    if (t.type === "bold") return <strong key={k}>{t.text}</strong>;
++    if (t.type === "code")
++      return (
++        <code key={k} className="rtr-inline-code">
++          {t.text}
++        </code>
++      );
++    return <em key={k}>{t.text}</em>;
++  });
++}
++
++// ── Block types ───────────────────────────────────────────────────────────────
++
++// ponytail: `lang` removed — unused until syntax highlighting is spec'd (YAGNI).
++type Block =
++  | { type: "code"; content: string }
++  | { type: "ul"; items: string[] }
++  | { type: "ol"; items: string[] }
++  | { type: "para"; lines: string[] };
++
++// ── Block sub-parsers (each CC <= 4) ─────────────────────────────────────────
++
++function parseCodeFence(lines: string[], i: number): [Block, number] {
++  const codeLines: string[] = [];
++  i++; // skip opening fence (which may carry a lang tag — ignored)
++  while (i < lines.length && !isCodeFence(lines[i])) {
++    codeLines.push(lines[i]);
++    i++;
++  }
++  if (i < lines.length) i++; // skip closing fence
++  return [{ type: "code", content: codeLines.join("\n") }, i];
++}
++
++function parseUlBlock(lines: string[], i: number): [Block, number] {
++  const items: string[] = [];
++  while (i < lines.length && isUlLine(lines[i])) {
++    items.push(lines[i].slice(2));
++    i++;
++  }
++  return [{ type: "ul", items }, i];
++}
++
++function parseOlBlock(lines: string[], i: number): [Block, number] {
++  const items: string[] = [];
++  while (i < lines.length && isOlLine(lines[i])) {
++    items.push(lines[i].replace(/^\d+\. /, ""));
++    i++;
++  }
++  return [{ type: "ol", items }, i];
++}
++
++function parseParagraph(lines: string[], i: number): [{ type: "para"; lines: string[] }, number] {
++  const paraLines: string[] = [];
++  while (i < lines.length && !isCodeFence(lines[i]) && !isUlLine(lines[i]) && !isOlLine(lines[i])) {
++    paraLines.push(lines[i]);
++    i++;
++  }
++  return [{ type: "para", lines: paraLines }, i];
++}
++
++// ── Block dispatcher (CC = 5) ─────────────────────────────────────────────────
++
++function parseBlocks(text: string): Block[] {
++  const lines = text.split("\n");
++  const blocks: Block[] = [];
++  let i = 0;
++  while (i < lines.length) {
++    const line = lines[i];
++    if (isCodeFence(line)) {
++      const [block, next] = parseCodeFence(lines, i);
++      blocks.push(block);
++      i = next;
++    } else if (isUlLine(line)) {
++      const [block, next] = parseUlBlock(lines, i);
++      blocks.push(block);
++      i = next;
++    } else if (isOlLine(line)) {
++      const [block, next] = parseOlBlock(lines, i);
++      blocks.push(block);
++      i = next;
++    } else {
++      const [para, next] = parseParagraph(lines, i);
++      if (para.lines.some((l) => l.length > 0)) blocks.push(para);
++      i = next;
++    }
++  }
++  return blocks;
++}
++
++// ── Component ─────────────────────────────────────────────────────────────────
++
++interface RichTextRendererProps {
++  text: string;
++}
++
++export default function RichTextRenderer({ text }: RichTextRendererProps) {
++  if (!text) return null;
++
++  return (
++    <>
++      {parseBlocks(text).map((block, bi) => {
++        if (block.type === "code") {
++          return (
++            <pre key={bi} className="rtr-code-block">
++              <code>{block.content}</code>
++            </pre>
++          );
++        }
++
++        if (block.type === "ul") {
++          return (
++            <ul key={bi} className="rtr-list">
++              {block.items.map((item, ii) => (
++                <li key={ii}>{renderTokens(tokenizeInline(item), `${bi}-${ii}`)}</li>
++              ))}
++            </ul>
++          );
++        }
++
++        if (block.type === "ol") {
++          return (
++            <ol key={bi} className="rtr-list">
++              {block.items.map((item, ii) => (
++                <li key={ii}>{renderTokens(tokenizeInline(item), `${bi}-${ii}`)}</li>
++              ))}
++            </ol>
++          );
++        }
++
++        return (
++          <Fragment key={bi}>
++            {block.lines.map((line, li, arr) => (
++              <Fragment key={li}>
++                {renderTokens(tokenizeInline(line), `${bi}-${li}`)}
++                {li < arr.length - 1 && <br />}
++              </Fragment>
++            ))}
++          </Fragment>
++        );
++      })}
++    </>
++  );
++}
+diff --git a/apps/web/src/chat/richTextGrammar.ts b/apps/web/src/chat/richTextGrammar.ts
+new file mode 100644
+index 0000000..6e4e194
+--- /dev/null
++++ b/apps/web/src/chat/richTextGrammar.ts
+@@ -0,0 +1,44 @@
++/**
++ * richTextGrammar — single source of truth for the chat rich-text syntax.
++ *
++ * Contains only syntax (markers), predicates, and format operations.
++ * Presentation concerns (labels, testIds) live in the consumers.
++ *
++ * Both RichTextRenderer (display) and ComposerToolbar (insertion) import
++ * from here. The toolbar does NOT depend on the renderer component.
++ */
++
++// ── Inline markers ────────────────────────────────────────────────────────────
++
++export const BOLD_MARKER = "**" as const;
++export const ITALIC_MARKER = "*" as const;
++export const CODE_MARKER = "`" as const;
++
++// Order matters: ** must come before * to avoid partial matches.
++// This regex corresponds 1:1 to BOLD_MARKER, ITALIC_MARKER, CODE_MARKER above.
++export const INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/;
++
++// ── Block predicates ──────────────────────────────────────────────────────────
++
++export const isCodeFence = (line: string): boolean => line.startsWith("```");
++export const isUlLine = (line: string): boolean => /^[-*] /.test(line);
++export const isOlLine = (line: string): boolean => /^\d+\. /.test(line);
++
++// ── Format items (syntax only — no labels or testIds) ─────────────────────────
++
++export type FormatKind = "inline" | "block-code" | "list-ul" | "list-ol";
++
++/** Syntax-level format descriptor. Presentation (label, testId) goes in the toolbar. */
++export interface FormatItem {
++  kind: FormatKind;
++  marker: string;
++}
++
++export const FORMAT_ITEMS: FormatItem[] = [
++  { kind: "inline", marker: BOLD_MARKER },
++  { kind: "inline", marker: ITALIC_MARKER },
++  { kind: "inline", marker: CODE_MARKER },
++  { kind: "block-code", marker: "" },
++  { kind: "list-ul", marker: "" },
++  { kind: "list-ol", marker: "" },
++];
+diff --git a/apps/web/src/tokens.css b/apps/web/src/tokens.css
+index c2fa0a9..091ebc7 100644
+--- a/apps/web/src/tokens.css
++++ b/apps/web/src/tokens.css
+@@ -42,4 +42,5 @@
+   /* Typography */
+   --font-sans:
+     "Inter", "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
++  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+ }
