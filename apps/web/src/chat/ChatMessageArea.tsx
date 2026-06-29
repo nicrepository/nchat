@@ -22,6 +22,8 @@ import "./ChatMessageArea.css";
 import type { ChatOutletContext } from "./ChatShell";
 import type { Message } from "./chatTypes";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
+import RichTextRenderer from "./RichTextRenderer";
+import ComposerToolbar from "./ComposerToolbar";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -287,7 +289,7 @@ function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
         <div
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
-          {message.isRemoved ? "Mensagem removida." : message.bodyText}
+          {message.isRemoved ? "Mensagem removida." : <RichTextRenderer text={message.bodyText} />}
         </div>
       </div>
     </div>
@@ -469,6 +471,7 @@ interface ComposerProps {
 function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const canSend = draft.trim().length > 0 && !sending && !disabled;
 
@@ -502,6 +505,7 @@ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
         className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}`}
       >
         <textarea
+          ref={textareaRef}
           className="chat-msg-area__composer-input"
           placeholder={placeholder}
           value={draft}
@@ -513,6 +517,11 @@ function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
           data-testid="chat-composer-input"
         />
         <div className="chat-msg-area__composer-bar">
+          <ComposerToolbar
+            textareaRef={textareaRef}
+            setDraft={setDraft}
+            disabled={disabled || sending}
+          />
           <button
             type="button"
             className="chat-msg-area__send-btn"
