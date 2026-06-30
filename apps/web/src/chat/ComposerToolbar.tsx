@@ -2,6 +2,10 @@
  * ComposerToolbar — formatting toolbar for the message composer.
  * Security: all insertions are plain string operations — no innerHTML injection.
  * ponytail: emoji picker has no search (add when requested); GIF/upload are RF-12+.
+ *
+ * RF-11: bold/italic/ul exposed as direct buttons (Material Symbols icons).
+ *        code/codeblock/ol remain in the "more formats" dropdown.
+ *        link/attach/mic: removed — add back when the backing RF lands.
  */
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -16,12 +20,21 @@ interface ToolbarItem extends FormatItem {
   testId: string;
 }
 
-const TOOLBAR_ITEMS: ToolbarItem[] = [
-  { ...FORMAT_ITEMS[0], label: "Negrito", testId: "fmt-bold" },
-  { ...FORMAT_ITEMS[1], label: "Itálico", testId: "fmt-italic" },
+interface DirectItem extends ToolbarItem {
+  icon: string; // Material Symbols ligature name
+}
+
+// Direct visible buttons (bold, italic, ul) — linked to RF-11 grammar.
+const DIRECT_ITEMS: DirectItem[] = [
+  { ...FORMAT_ITEMS[0], label: "Negrito", testId: "fmt-bold", icon: "format_bold" },
+  { ...FORMAT_ITEMS[1], label: "Itálico", testId: "fmt-italic", icon: "format_italic" },
+  { ...FORMAT_ITEMS[4], label: "Lista", testId: "fmt-ul", icon: "format_list_bulleted" },
+];
+
+// "More formats" dropdown: items not shown as direct buttons.
+const DROPDOWN_ITEMS: ToolbarItem[] = [
   { ...FORMAT_ITEMS[2], label: "Código", testId: "fmt-code" },
   { ...FORMAT_ITEMS[3], label: "Bloco de código", testId: "fmt-codeblock" },
-  { ...FORMAT_ITEMS[4], label: "Lista", testId: "fmt-ul" },
   { ...FORMAT_ITEMS[5], label: "Lista ordenada", testId: "fmt-ol" },
 ];
 
@@ -111,40 +124,17 @@ function wrapBlock(
 }
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
+// Using Material Symbols (self-hosted) to match shell.html prototype visual.
 
-const IconFormat = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 18 18"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.6"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M3 14L7.5 3 12 14" />
-    <path d="M4.6 10.5h5.8" />
-    <path d="M2 17h14" />
-  </svg>
+const IconMoreFormat = () => (
+  <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+    text_format
+  </span>
 );
 const IconEmoji = () => (
-  <svg
-    width="18"
-    height="18"
-    viewBox="0 0 20 20"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.6"
-    strokeLinecap="round"
-    aria-hidden="true"
-  >
-    <circle cx="10" cy="10" r="7.5" />
-    <circle cx="7.5" cy="8.5" r="0.7" fill="currentColor" stroke="none" />
-    <circle cx="12.5" cy="8.5" r="0.7" fill="currentColor" stroke="none" />
-    <path d="M7 12.5c1 1.8 5 1.8 6 0" />
-  </svg>
+  <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 20 }}>
+    mood
+  </span>
 );
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -202,7 +192,8 @@ export default function ComposerToolbar({
     return ta ? { s: ta.selectionStart, e: ta.selectionEnd } : { s: 0, e: 0 };
   }
 
-  function handleFormat({ kind, marker }: ToolbarItem) {
+  /** Core insertion — shared by direct buttons and the dropdown. Closes all panels. */
+  function insert({ kind, marker }: FormatItem) {
     const ta = textareaRef.current;
     if (!ta) return;
     const sel = getSel();
@@ -211,7 +202,12 @@ export default function ComposerToolbar({
     else if (kind === "list-ul") wrapBlock(ta, setDraft, "ul", sel);
     else wrapBlock(ta, setDraft, "ol", sel);
     setFormatOpen(false);
+    setEmojiOpen(false);
     savedSel.current = null;
+  }
+
+  function handleFormat(item: ToolbarItem) {
+    insert(item); // insert() already closes formatOpen and emojiOpen
   }
 
   function handleEmoji(emoji: string) {
@@ -240,13 +236,13 @@ export default function ComposerToolbar({
 
   return (
     <div className="composer-toolbar" ref={containerRef}>
-      {/* Format button + dropdown */}
+      {/* ── "More formats" dropdown: code, codeblock, ordered list ── */}
       <div className="composer-toolbar__wrap">
         <button
           ref={formatBtnRef}
           type="button"
           className="composer-toolbar__btn"
-          aria-label="Formatação de texto"
+          aria-label="Mais formatações"
           aria-haspopup="menu"
           aria-expanded={formatOpen}
           disabled={disabled}
@@ -257,7 +253,7 @@ export default function ComposerToolbar({
             setEmojiOpen(false);
           }}
         >
-          <IconFormat />
+          <IconMoreFormat />
         </button>
 
         {formatOpen && (
@@ -269,7 +265,7 @@ export default function ComposerToolbar({
               if (ev.key === "Escape") closeFormat();
             }}
           >
-            {TOOLBAR_ITEMS.map((item, i) => (
+            {DROPDOWN_ITEMS.map((item, i) => (
               <button
                 key={item.testId}
                 ref={i === 0 ? firstFmtRef : undefined}
@@ -286,7 +282,25 @@ export default function ComposerToolbar({
         )}
       </div>
 
-      {/* Emoji button + picker */}
+      {/* ── Direct RF-11 buttons: bold, italic, list ── */}
+      {DIRECT_ITEMS.map((item) => (
+        <button
+          key={item.testId}
+          type="button"
+          className="composer-toolbar__btn"
+          aria-label={item.label}
+          disabled={disabled}
+          data-testid={item.testId}
+          onPointerDown={snapSel}
+          onClick={() => insert(item)}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+            {item.icon}
+          </span>
+        </button>
+      ))}
+
+      {/* ── Emoji button + picker ── */}
       <div className="composer-toolbar__wrap">
         <button
           ref={emojiBtnRef}

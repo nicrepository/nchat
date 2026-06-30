@@ -38,7 +38,6 @@ describe("ComposerToolbar — inline format insertion", () => {
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
     ta.setSelectionRange(0, 5);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-bold"));
 
     expect(ta).toHaveValue("**texto**");
@@ -50,7 +49,6 @@ describe("ComposerToolbar — inline format insertion", () => {
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
     ta.setSelectionRange(0, 5);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-italic"));
 
     expect(ta).toHaveValue("*texto*");
@@ -74,7 +72,6 @@ describe("ComposerToolbar — inline format insertion", () => {
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
     ta.setSelectionRange(2, 2); // cursor at pos 2, no selection
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-bold"));
 
     expect(ta).toHaveValue("te****xto"); // ** + empty + ** inserted at pos 2
@@ -91,7 +88,6 @@ describe("ComposerToolbar — inline format insertion", () => {
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
     ta.setSelectionRange(0, 5);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-bold"));
 
     // selectionStart/End should be on the wrapped content, not the ** markers.
@@ -101,13 +97,13 @@ describe("ComposerToolbar — inline format insertion", () => {
     });
   });
 
-  it("closes format menu after inserting", async () => {
+  it("closes format menu after inserting via dropdown", async () => {
     const user = userEvent.setup();
     render(<TestWrapper />);
     await user.click(screen.getByTestId("toolbar-format-btn"));
     expect(screen.getByRole("menu")).toBeInTheDocument();
 
-    await user.click(screen.getByTestId("fmt-bold"));
+    await user.click(screen.getByTestId("fmt-code"));
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 });
@@ -150,7 +146,6 @@ describe("ComposerToolbar — block format insertion", () => {
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
     ta.setSelectionRange(7, 12); // select "hello" — mid-line
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-ul"));
 
     // Entire line must be prefixed, not just "hello".
@@ -163,7 +158,6 @@ describe("ComposerToolbar — block format insertion", () => {
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
     ta.setSelectionRange(0, 17);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-ul"));
 
     expect(ta).toHaveValue("- item1\n- item2\n- item3");
@@ -218,22 +212,54 @@ describe("ComposerToolbar — keyboard accessibility", () => {
     render(<TestWrapper initialDraft="abcde" />);
     const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
 
-    // Open menu with "abc" selected.
+    // Open format dropdown with "abc" selected (tests savedSel for dropdown).
     ta.setSelectionRange(0, 3);
     await user.click(screen.getByTestId("toolbar-format-btn"));
 
     // Close via Escape (clears savedSel).
     await user.keyboard("{Escape}");
 
-    // Move cursor to "de".
+    // Move cursor to "de" and click direct bold button.
+    // onPointerDown on fmt-bold snapshots fresh selection {s:3,e:5}.
     ta.setSelectionRange(3, 5);
-
-    // Reopen — onPointerDown snapshots fresh selection.
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-bold"));
 
     // Must have wrapped "de", not "abc".
     expect(ta).toHaveValue("abc**de**");
+  });
+
+  it("direct bold closes format dropdown if it is open", async () => {
+    const user = userEvent.setup();
+    render(<TestWrapper initialDraft="texto" />);
+    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+
+    // Open the format dropdown.
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    // Click the direct bold button — must close the dropdown AND apply bold.
+    ta.setSelectionRange(0, 5);
+    await user.click(screen.getByTestId("fmt-bold"));
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(ta).toHaveValue("**texto**");
+  });
+
+  it("direct bold closes emoji picker if it is open", async () => {
+    const user = userEvent.setup();
+    render(<TestWrapper initialDraft="texto" />);
+    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+
+    // Open the emoji picker.
+    await user.click(screen.getByTestId("toolbar-emoji-btn"));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    // Click the direct bold button — must close the picker AND apply bold.
+    ta.setSelectionRange(0, 5);
+    await user.click(screen.getByTestId("fmt-bold"));
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(ta).toHaveValue("**texto**");
   });
 });
 
@@ -266,7 +292,7 @@ describe("ComposerToolbar — emoji insertion", () => {
 // ── Disabled state ────────────────────────────────────────────────────────────
 
 describe("ComposerToolbar — disabled state", () => {
-  it("disables format and emoji buttons when disabled=true", () => {
+  it("disables format, emoji and direct-format buttons when disabled=true", () => {
     render(
       <div>
         <textarea ref={() => {}} data-testid="ta" />
@@ -280,14 +306,17 @@ describe("ComposerToolbar — disabled state", () => {
 
     expect(screen.getByTestId("toolbar-format-btn")).toBeDisabled();
     expect(screen.getByTestId("toolbar-emoji-btn")).toBeDisabled();
-    // ponytail: GIF and upload buttons removed (RF-12 not yet implemented).
+    expect(screen.getByTestId("fmt-bold")).toBeDisabled();
+    expect(screen.getByTestId("fmt-italic")).toBeDisabled();
+    expect(screen.getByTestId("fmt-ul")).toBeDisabled();
+    // ponytail: link/attach/mic removed — add back when the backing RF lands.
   });
 });
 
 // ── Null textareaRef defensive paths ─────────────────────────────────────────
 
 describe("ComposerToolbar — null textareaRef", () => {
-  // Covers: `if (ta)` false branch in snapSel, `if (!ta) return` true in handleFormat.
+  // Covers: `if (ta)` false branch in snapSel, `if (!ta) return` true in insert.
   it("does not throw and does not call setDraft when textareaRef is null on format", async () => {
     const user = userEvent.setup();
     const mockSetDraft = vi.fn();
@@ -301,11 +330,9 @@ describe("ComposerToolbar — null textareaRef", () => {
       </div>,
     );
 
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-
+    // Direct bold button — no dropdown needed.
     await user.click(screen.getByTestId("fmt-bold"));
-    // handleFormat returns early — setDraft never called.
+    // insert() returns early — setDraft never called.
     expect(mockSetDraft).not.toHaveBeenCalled();
   });
 

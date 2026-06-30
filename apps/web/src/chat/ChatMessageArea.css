@@ -36,7 +36,7 @@
 }
 
 .chat-msg-area__header-title {
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 700;
   color: var(--color-ink, #16121f);
   margin: 0;
@@ -177,7 +177,17 @@
   font-size: 13px;
 }
 
-/* ── Empty state ─────────────────────────────────────────────────────────────── */
+/* ── Message grouping (same sender, same minute) ─────────────────────────────── */
+
+/* ponytail: opacity-0 ghost keeps column alignment for grouped avatar slots */
+.chat-msg-area__msg--grouped {
+  margin-top: -8px;
+}
+
+.chat-msg-area__msg--grouped .chat-msg-area__msg-avatar {
+  opacity: 0;
+  pointer-events: none;
+}
 
 .chat-msg-area__empty {
   flex: 1;
@@ -411,12 +421,13 @@
 .chat-msg-area__composer-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 4px;
   padding: 6px 10px;
   border-top: 1px solid var(--color-border, #e8e3f0);
 }
 
 .chat-msg-area__send-btn {
+  margin-left: auto; /* push to the right of the toolbar */
   background: var(--color-primary, #6d28d9);
   color: #fff;
   border: none;
