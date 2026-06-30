@@ -19,7 +19,7 @@ import {
   isCodeFence,
   isUlLine,
   isOlLine,
-} from "./richTextGrammar";
+} from "./richTextMarkers";
 
 // ── Inline tokenizer (returns data, not JSX) ──────────────────────────────────
 

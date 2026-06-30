@@ -407,15 +407,36 @@
   font-size: 13.5px;
   font-family: inherit;
   color: var(--color-ink, #16121f);
-  resize: none;
   min-height: 20px;
   max-height: 200px;
   line-height: 1.5;
   box-sizing: border-box;
+  overflow-y: auto;
+  word-break: break-word;
 }
 
-.chat-msg-area__composer-input::placeholder {
+/* Remove browser-default paragraph margins inside TipTap editor */
+.chat-msg-area__composer-input p {
+  margin: 0;
+}
+
+/* ── TipTap editor wrapper (relative-positioned for placeholder) ── */
+
+.chat-msg-area__composer-editor-wrap {
+  position: relative;
+}
+
+.chat-msg-area__composer-placeholder {
+  position: absolute;
+  top: 12px;
+  left: 16px;
   color: var(--color-muted-2, #a39cb3);
+  pointer-events: none;
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  max-width: calc(100% - 32px);
 }
 
 .chat-msg-area__composer-bar {

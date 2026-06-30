@@ -1,6 +1,8 @@
 /**
- * ComposerToolbar — formatting toolbar for the message composer.
- * Security: all insertions are plain string operations — no innerHTML injection.
+ * ComposerToolbar — formatting toolbar for the TipTap-based message composer.
+ *
+ * All format buttons call TipTap editor chain commands; no string insertion.
+ * Emoji picker inserts content via editor.chain().insertContent().
  * ponytail: emoji picker has no search (add when requested); GIF/upload are RF-12+.
  *
  * RF-11: bold/italic/ul exposed as direct buttons (Material Symbols icons).
@@ -9,13 +11,12 @@
  */
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { RefObject } from "react";
-import { FORMAT_ITEMS } from "./richTextGrammar";
-import type { FormatItem } from "./richTextGrammar";
+import type { Editor } from "@tiptap/core";
 
-// ── Toolbar-specific presentation (labels/testIds are not grammar concerns) ────
+// ── Toolbar item descriptors ──────────────────────────────────────────────────
 
-interface ToolbarItem extends FormatItem {
+interface ToolbarItem {
+  run: (editor: Editor) => void;
   label: string;
   testId: string;
 }
@@ -24,18 +25,43 @@ interface DirectItem extends ToolbarItem {
   icon: string; // Material Symbols ligature name
 }
 
-// Direct visible buttons (bold, italic, ul) — linked to RF-11 grammar.
 const DIRECT_ITEMS: DirectItem[] = [
-  { ...FORMAT_ITEMS[0], label: "Negrito", testId: "fmt-bold", icon: "format_bold" },
-  { ...FORMAT_ITEMS[1], label: "Itálico", testId: "fmt-italic", icon: "format_italic" },
-  { ...FORMAT_ITEMS[4], label: "Lista", testId: "fmt-ul", icon: "format_list_bulleted" },
+  {
+    run: (e) => e.chain().focus().toggleBold().run(),
+    label: "Negrito",
+    testId: "fmt-bold",
+    icon: "format_bold",
+  },
+  {
+    run: (e) => e.chain().focus().toggleItalic().run(),
+    label: "Itálico",
+    testId: "fmt-italic",
+    icon: "format_italic",
+  },
+  {
+    run: (e) => e.chain().focus().toggleBulletList().run(),
+    label: "Lista",
+    testId: "fmt-ul",
+    icon: "format_list_bulleted",
+  },
 ];
 
-// "More formats" dropdown: items not shown as direct buttons.
 const DROPDOWN_ITEMS: ToolbarItem[] = [
-  { ...FORMAT_ITEMS[2], label: "Código", testId: "fmt-code" },
-  { ...FORMAT_ITEMS[3], label: "Bloco de código", testId: "fmt-codeblock" },
-  { ...FORMAT_ITEMS[5], label: "Lista ordenada", testId: "fmt-ol" },
+  {
+    run: (e) => e.chain().focus().toggleCode().run(),
+    label: "Código",
+    testId: "fmt-code",
+  },
+  {
+    run: (e) => e.chain().focus().toggleCodeBlock().run(),
+    label: "Bloco de código",
+    testId: "fmt-codeblock",
+  },
+  {
+    run: (e) => e.chain().focus().toggleOrderedList().run(),
+    label: "Lista ordenada",
+    testId: "fmt-ol",
+  },
 ];
 
 // ── Emoji list ─────────────────────────────────────────────────────────────────
@@ -64,67 +90,7 @@ const EMOJIS = [
   "🌟",
 ];
 
-// ── Insertion helpers ─────────────────────────────────────────────────────────
-
-type Sel = { s: number; e: number };
-
-/** Expand sel to the full lines it touches (start-of-line ↔ end-of-line). */
-function expandToLines(val: string, sel: Sel): Sel {
-  let s = sel.s;
-  while (s > 0 && val[s - 1] !== "\n") s--;
-  let e = sel.e;
-  while (e < val.length && val[e] !== "\n") e++;
-  return { s, e };
-}
-
-function wrapInline(
-  ta: HTMLTextAreaElement,
-  setDraft: (v: string) => void,
-  mark: string,
-  sel: Sel,
-) {
-  const text = ta.value.slice(sel.s, sel.e);
-  setDraft(ta.value.slice(0, sel.s) + mark + text + mark + ta.value.slice(sel.e));
-  // Cursor stays on wrapped content (not selecting markers); collapsed when no selection.
-  requestAnimationFrame(() => {
-    ta.focus();
-    ta.setSelectionRange(sel.s + mark.length, sel.s + mark.length + text.length);
-  });
-}
-
-function wrapBlock(
-  ta: HTMLTextAreaElement,
-  setDraft: (v: string) => void,
-  kind: "code" | "ul" | "ol",
-  sel: Sel,
-) {
-  // Always expand to full line boundaries so mid-line cursors are handled correctly.
-  const exp = expandToLines(ta.value, sel);
-  const text = ta.value.slice(exp.s, exp.e);
-  let insert: string;
-  let cursor: number;
-  if (kind === "code") {
-    const body = text || "";
-    insert = "```\n" + body + (body && !body.endsWith("\n") ? "\n" : "") + "```";
-    cursor = exp.s + 4; // inside fence, after "```\n"
-  } else {
-    const lines = text.split("\n");
-    insert =
-      kind === "ul"
-        ? lines.map((l) => "- " + l).join("\n")
-        : lines.map((l, i) => `${i + 1}. ${l}`).join("\n");
-    cursor = exp.s + insert.length; // after all prefixed lines
-  }
-  setDraft(ta.value.slice(0, exp.s) + insert + ta.value.slice(exp.e));
-  // Collapsed cursor — never leave markers selected so they aren't replaced on first keystroke.
-  requestAnimationFrame(() => {
-    ta.focus();
-    ta.setSelectionRange(cursor, cursor);
-  });
-}
-
 // ── Icons ─────────────────────────────────────────────────────────────────────
-// Using Material Symbols (self-hosted) to match shell.html prototype visual.
 
 const IconMoreFormat = () => (
   <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
@@ -140,16 +106,11 @@ const IconEmoji = () => (
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export interface ComposerToolbarProps {
-  textareaRef: RefObject<HTMLTextAreaElement | null>;
-  setDraft: (v: string) => void;
+  editor: Editor | null;
   disabled?: boolean;
 }
 
-export default function ComposerToolbar({
-  textareaRef,
-  setDraft,
-  disabled = false,
-}: ComposerToolbarProps) {
+export default function ComposerToolbar({ editor, disabled = false }: ComposerToolbarProps) {
   const [formatOpen, setFormatOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -157,23 +118,19 @@ export default function ComposerToolbar({
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
   const firstFmtRef = useRef<HTMLButtonElement>(null);
   const firstEmojiRef = useRef<HTMLButtonElement>(null);
-  // Snapshot textarea selection on pointerdown (before button click steals focus).
-  const savedSel = useRef<Sel | null>(null);
 
-  // Close panels + clear savedSel on outside click.
+  // Close panels on outside click.
   useEffect(() => {
     const onDown = (ev: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(ev.target as Node)) {
         setFormatOpen(false);
         setEmojiOpen(false);
-        savedSel.current = null; // stale selection is no longer valid
       }
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
   }, []);
 
-  // Synchronous focus on first item when panel opens (useLayoutEffect avoids rAF).
   useLayoutEffect(() => {
     if (formatOpen) firstFmtRef.current?.focus();
   }, [formatOpen]);
@@ -181,56 +138,27 @@ export default function ComposerToolbar({
     if (emojiOpen) firstEmojiRef.current?.focus();
   }, [emojiOpen]);
 
-  function snapSel() {
-    const ta = textareaRef.current;
-    if (ta) savedSel.current = { s: ta.selectionStart, e: ta.selectionEnd };
-  }
-
-  function getSel(): Sel {
-    if (savedSel.current) return savedSel.current;
-    const ta = textareaRef.current;
-    return ta ? { s: ta.selectionStart, e: ta.selectionEnd } : { s: 0, e: 0 };
-  }
-
-  /** Core insertion — shared by direct buttons and the dropdown. Closes all panels. */
-  function insert({ kind, marker }: FormatItem) {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const sel = getSel();
-    if (kind === "inline") wrapInline(ta, setDraft, marker, sel);
-    else if (kind === "block-code") wrapBlock(ta, setDraft, "code", sel);
-    else if (kind === "list-ul") wrapBlock(ta, setDraft, "ul", sel);
-    else wrapBlock(ta, setDraft, "ol", sel);
+  function closeAll() {
     setFormatOpen(false);
     setEmojiOpen(false);
-    savedSel.current = null;
   }
 
   function handleFormat(item: ToolbarItem) {
-    insert(item); // insert() already closes formatOpen and emojiOpen
+    if (editor) item.run(editor);
+    closeAll();
   }
 
   function handleEmoji(emoji: string) {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const { s, e } = getSel();
-    setDraft(ta.value.slice(0, s) + emoji + ta.value.slice(e));
-    requestAnimationFrame(() => {
-      ta.focus();
-      ta.setSelectionRange(s + emoji.length, s + emoji.length);
-    });
+    editor?.chain().focus().insertContent(emoji).run();
     setEmojiOpen(false);
-    savedSel.current = null;
   }
 
   const closeFormat = () => {
     setFormatOpen(false);
-    savedSel.current = null;
     formatBtnRef.current?.focus();
   };
   const closeEmoji = () => {
     setEmojiOpen(false);
-    savedSel.current = null;
     emojiBtnRef.current?.focus();
   };
 
@@ -247,7 +175,6 @@ export default function ComposerToolbar({
           aria-expanded={formatOpen}
           disabled={disabled}
           data-testid="toolbar-format-btn"
-          onPointerDown={snapSel}
           onClick={() => {
             setFormatOpen((o) => !o);
             setEmojiOpen(false);
@@ -291,8 +218,7 @@ export default function ComposerToolbar({
           aria-label={item.label}
           disabled={disabled}
           data-testid={item.testId}
-          onPointerDown={snapSel}
-          onClick={() => insert(item)}
+          onClick={() => handleFormat(item)}
         >
           <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
             {item.icon}
@@ -311,7 +237,6 @@ export default function ComposerToolbar({
           aria-expanded={emojiOpen}
           disabled={disabled}
           data-testid="toolbar-emoji-btn"
-          onPointerDown={snapSel}
           onClick={() => {
             setEmojiOpen((o) => !o);
             setFormatOpen(false);

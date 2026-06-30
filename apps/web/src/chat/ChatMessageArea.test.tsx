@@ -19,6 +19,33 @@ import type { WSMessageCreatedEvent } from "./useChatWebSocket";
 import { useChatWebSocket } from "./useChatWebSocket";
 import * as chatApi from "./chatApi";
 
+// ── TipTap test helper ────────────────────────────────────────────────────────
+//
+// user.type() doesn't insert text into TipTap's contenteditable in JSDOM.
+// Instead, poll for the editor instance exposed via __tiptapEditor (non-prod builds)
+// and insert content at the ProseMirror model level.
+
+/** Typed DOM element that carries the TipTap editor reference in non-prod builds. */
+interface TipTapTestElement extends HTMLElement {
+  __tiptapEditor?: import("@tiptap/core").Editor;
+}
+
+async function fillEditor(element: HTMLElement, text: string) {
+  // Poll until __tiptapEditor is available (useEditor is async in React).
+  await waitFor(
+    () => {
+      if (!(element as TipTapTestElement).__tiptapEditor) {
+        throw new Error("Waiting for __tiptapEditor to be set on the editor DOM element");
+      }
+    },
+    { timeout: 3000, interval: 50 },
+  );
+  const editor = (element as TipTapTestElement).__tiptapEditor!;
+  await act(async () => {
+    editor.commands.insertContent(text);
+  });
+}
+
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
 const {
@@ -186,7 +213,7 @@ describe("ChatMessageArea — loading state", () => {
     renderChannelArea();
 
     const input = await screen.findByTestId("chat-composer-input");
-    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute("aria-disabled", "true");
 
     resolve!(emptyPage);
   });
@@ -233,7 +260,7 @@ describe("ChatMessageArea — error state", () => {
 
     expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
     expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-input")).toBeDisabled();
+    expect(screen.getByTestId("chat-composer-input")).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
   });
 
@@ -243,7 +270,7 @@ describe("ChatMessageArea — error state", () => {
 
     expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
     expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-input")).toBeDisabled();
+    expect(screen.getByTestId("chat-composer-input")).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
   });
 
@@ -490,7 +517,7 @@ describe("ChatMessageArea — send message", () => {
     renderChannelArea("geral");
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "Nova mensagem");
+    await fillEditor(input, "Nova mensagem");
 
     const sendBtn = screen.getByTestId("chat-send-btn");
     await user.click(sendBtn);
@@ -511,7 +538,7 @@ describe("ChatMessageArea — send message", () => {
     renderDMArea("dm-juliane");
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "Oi!");
+    await fillEditor(input, "Oi!");
 
     const sendBtn = screen.getByTestId("chat-send-btn");
     await user.click(sendBtn);
@@ -531,11 +558,11 @@ describe("ChatMessageArea — send message", () => {
     renderChannelArea();
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "Teste");
+    await fillEditor(input, "Teste");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => {
-      expect(input).toHaveValue("");
+      expect(input.textContent?.trim()).toBe("");
     });
   });
 
@@ -547,18 +574,40 @@ describe("ChatMessageArea — send message", () => {
     expect(sendBtn).toBeDisabled();
   });
 
-  it("Enter key sends message", async () => {
-    const user = userEvent.setup();
+  it("Enter key sends message via TipTap keyboard shortcut (exercises submitOnEnter extension)", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     mockPostChannelMessage.mockResolvedValue(makeMessage({ bodyText: "Enter send" }));
     renderChannelArea();
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "Enter send{Enter}");
+    await fillEditor(input, "Enter send");
+
+    // Use TipTap's own keyboard shortcut API — exercises the real submitOnEnter extension.
+    await act(async () =>
+      (input as TipTapTestElement).__tiptapEditor!.commands.keyboardShortcut("Enter"),
+    );
 
     await waitFor(() => {
       expect(mockPostChannelMessage).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it("Shift+Enter creates a hard break instead of sending", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    renderChannelArea();
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await fillEditor(input, "line one");
+
+    // Shift+Enter must NOT send — it should invoke HardBreak from StarterKit.
+    await act(() =>
+      (input as TipTapTestElement).__tiptapEditor!.commands.keyboardShortcut("Shift-Enter"),
+    );
+
+    // Nothing sent.
+    expect(mockPostChannelMessage).not.toHaveBeenCalled();
+    // Editor still has content (hard break was inserted, not cleared).
+    expect((input as TipTapTestElement).__tiptapEditor!.isEmpty).toBe(false);
   });
 
   it("failed send shows error banner and keeps draft", async () => {
@@ -568,15 +617,15 @@ describe("ChatMessageArea — send message", () => {
     renderChannelArea();
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "mensagem com erro");
+    await fillEditor(input, "mensagem com erro");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => {
       expect(screen.getByTestId("chat-send-error")).toBeInTheDocument();
     });
 
-    // Draft must be preserved so the user can retry or edit.
-    expect(input).toHaveValue("mensagem com erro");
+    // Content must be preserved so the user can retry or edit.
+    expect(input).toHaveTextContent("mensagem com erro");
   });
 
   it("non-Error rejection shows generic error message", async () => {
@@ -587,7 +636,7 @@ describe("ChatMessageArea — send message", () => {
     renderChannelArea();
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "test");
+    await fillEditor(input, "test");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => {
@@ -679,7 +728,7 @@ describe("ChatMessageArea — stale response guard", () => {
 
     // Wait for canal-1 to be ready, then type + send (POST hangs).
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "mensagem A");
+    await fillEditor(input, "mensagem A");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     // Navigate to canal-2 while POST for canal-1 is still in-flight.
@@ -722,7 +771,7 @@ describe("ChatMessageArea — stale response guard", () => {
     );
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "mensagem A sucesso");
+    await fillEditor(input, "mensagem A sucesso");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     // Navigate to canal-2 while POST for canal-1 is still in-flight.
@@ -768,7 +817,7 @@ describe("ChatMessageArea — stale response guard", () => {
 
     // Wait for canal-1 to be ready, type message, and send (POST hangs).
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "rascunho canal 1");
+    await fillEditor(input, "rascunho canal 1");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     // Navigate to canal-2 while POST for canal-1 is still in-flight.
@@ -781,8 +830,8 @@ describe("ChatMessageArea — stale response guard", () => {
       resolveSendA!(makeMessage({ bodyText: "rascunho canal 1" }));
     });
 
-    // Draft must still be present — stale success must not clear it.
-    expect(screen.getByTestId("chat-composer-input")).toHaveValue("rascunho canal 1");
+    // Content must still be present — stale success must not clear it.
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho canal 1");
     // Canal-1 message must not appear in canal-2's message bubble list.
     const bubbles = screen.queryAllByTestId("chat-msg-bubble");
     expect(bubbles.some((b) => b.textContent?.includes("rascunho canal 1"))).toBe(false);
@@ -824,7 +873,7 @@ describe("ChatMessageArea — stale response guard", () => {
     );
 
     const input = await screen.findByTestId("chat-composer-input");
-    await user.type(input, "rascunho canal 1");
+    await fillEditor(input, "rascunho canal 1");
     await user.click(screen.getByTestId("chat-send-btn"));
 
     // Navigate to canal-2 while POST is still in-flight.
@@ -835,8 +884,8 @@ describe("ChatMessageArea — stale response guard", () => {
       rejectSendA!(new Error("Erro do canal A"));
     });
 
-    // Draft must still be present — stale failure must not clear it.
-    expect(screen.getByTestId("chat-composer-input")).toHaveValue("rascunho canal 1");
+    // Content must still be present — stale failure must not clear it.
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho canal 1");
     // No error banner in canal-2.
     expect(screen.queryByTestId("chat-send-error")).not.toBeInTheDocument();
     // Send button usable (not stuck in sending state).
@@ -1211,7 +1260,7 @@ describe("ChatMessageArea — infinite scroll", () => {
     scrollMock.mockClear();
 
     const input = screen.getByTestId("chat-composer-input");
-    await userEvent.type(input, "Enviada");
+    await fillEditor(input, "Enviada");
     await userEvent.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => expect(screen.getByText("Enviada")).toBeInTheDocument());
@@ -1467,7 +1516,7 @@ describe("ChatMessageArea — resolved display name", () => {
     );
 
     const input = await screen.findByTestId("chat-composer-input");
-    expect(input).toHaveAttribute("placeholder", "Mensagem para #geral…");
+    expect(input).toHaveAttribute("aria-label", "Mensagem para #geral…");
   });
 
   it("falls back to raw targetId when channel not found in context", async () => {
