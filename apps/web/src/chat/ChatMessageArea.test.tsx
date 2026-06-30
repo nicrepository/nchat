@@ -348,7 +348,137 @@ describe("ChatMessageArea — message list", () => {
   });
 });
 
-// ── Send message ──────────────────────────────────────────────────────────────
+// ── Message grouping (same sender / same minute) ──────────────────────────────
+
+describe("ChatMessageArea — message grouping", () => {
+  // Helper: build an ISO timestamp at a specific "YYYY-MM-DDTHH:MM" minute.
+  function isoAt(minute: string, seconds = "00") {
+    return `${minute}:${seconds}.000Z`;
+  }
+
+  const SENDER_A = "user-alice";
+  const SENDER_B = "user-bob";
+
+  it("consecutive messages from the same sender in the same minute — second has no sender label", async () => {
+    const sameMinute = "2024-01-15T10:04";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Primeira",
+          createdAt: isoAt(sameMinute, "10"),
+        }),
+        makeMessage({
+          id: "m2",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Segunda",
+          createdAt: isoAt(sameMinute, "45"),
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => expect(screen.getByText("Primeira")).toBeInTheDocument());
+
+    // Both messages visible
+    expect(screen.getByText("Segunda")).toBeInTheDocument();
+
+    // Alice's name appears only ONCE (only the first message shows sender)
+    const senderLabels = screen.getAllByTestId("chat-msg-sender");
+    expect(senderLabels).toHaveLength(1);
+    expect(senderLabels[0]).toHaveTextContent("Alice");
+  });
+
+  it("different sender — sender label appears on every message", async () => {
+    const sameMinute = "2024-01-15T10:04";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Olá",
+          createdAt: isoAt(sameMinute, "10"),
+        }),
+        makeMessage({
+          id: "m2",
+          senderId: SENDER_B,
+          senderDisplayName: "Bob",
+          bodyText: "Oi",
+          createdAt: isoAt(sameMinute, "45"),
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => expect(screen.getByText("Olá")).toBeInTheDocument());
+
+    // Both senders must have their label visible
+    const senderLabels = screen.getAllByTestId("chat-msg-sender");
+    expect(senderLabels).toHaveLength(2);
+    expect(senderLabels[0]).toHaveTextContent("Alice");
+    expect(senderLabels[1]).toHaveTextContent("Bob");
+  });
+
+  it("same sender but different minute — second message shows sender label", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Mensagem das 10:04",
+          createdAt: isoAt("2024-01-15T10:04", "00"),
+        }),
+        makeMessage({
+          id: "m2",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Mensagem das 10:05",
+          createdAt: isoAt("2024-01-15T10:05", "00"),
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => expect(screen.getByText("Mensagem das 10:04")).toBeInTheDocument());
+
+    // Different minutes → no grouping → two sender labels
+    const senderLabels = screen.getAllByTestId("chat-msg-sender");
+    expect(senderLabels).toHaveLength(2);
+  });
+
+  it("day divider resets grouping — first message after divider shows sender label", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Ontem",
+          createdAt: "2024-01-14T10:04:00.000Z",
+        }),
+        makeMessage({
+          id: "m2",
+          senderId: SENDER_A,
+          senderDisplayName: "Alice",
+          bodyText: "Hoje",
+          createdAt: "2024-01-15T10:04:00.000Z",
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await waitFor(() => expect(screen.getByText("Ontem")).toBeInTheDocument());
+
+    // Day divider breaks grouping — both messages must show sender label
+    const senderLabels = screen.getAllByTestId("chat-msg-sender");
+    expect(senderLabels).toHaveLength(2);
+  });
+});
 
 describe("ChatMessageArea — send message", () => {
   it("send button calls postChannelMessage with correct args", async () => {

@@ -262,14 +262,16 @@ interface MessageBubbleProps {
   message: Message;
   /** True when this message is from the viewing user (we don't know real user ID here). */
   isMine?: boolean;
+  /** True when consecutive messages from the same sender within the same minute. */
+  isGrouped?: boolean;
 }
 
-function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
+function MessageBubble({ message, isMine = false, isGrouped = false }: MessageBubbleProps) {
   const time = formatTime(message.createdAt);
 
   return (
     <div
-      className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}`}
+      className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}${isGrouped ? " chat-msg-area__msg--grouped" : ""}`}
       data-testid="chat-msg-bubble"
     >
       {!isMine && (
@@ -278,14 +280,16 @@ function MessageBubble({ message, isMine = false }: MessageBubbleProps) {
         </div>
       )}
       <div className="chat-msg-area__msg-body">
-        <div className="chat-msg-area__msg-meta">
-          {!isMine && (
-            <span className="chat-msg-area__msg-sender" data-testid="chat-msg-sender">
-              {senderLabel(message)}
-            </span>
-          )}
-          <span className="chat-msg-area__msg-time">{time}</span>
-        </div>
+        {!isGrouped && (
+          <div className="chat-msg-area__msg-meta">
+            {!isMine && (
+              <span className="chat-msg-area__msg-sender" data-testid="chat-msg-sender">
+                {senderLabel(message)}
+              </span>
+            )}
+            <span className="chat-msg-area__msg-time">{time}</span>
+          </div>
+        )}
         <div
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
@@ -411,18 +415,26 @@ function MessageList({
     return () => observer.disconnect();
   }, [hasMore]);
 
-  // Group messages by day for dividers.
+  // Group messages by day for dividers; track same-sender/same-minute for visual grouping.
   const withDividers: Array<
-    { type: "divider"; label: string } | { type: "msg"; message: Message }
+    { type: "divider"; label: string } | { type: "msg"; message: Message; isGrouped: boolean }
   > = [];
   let lastDay = "";
+  let lastSenderId = "";
+  let lastMinute = "";
   for (const msg of messages) {
     const day = formatDate(msg.createdAt);
     if (day !== lastDay) {
       withDividers.push({ type: "divider", label: day });
       lastDay = day;
+      lastSenderId = "";
+      lastMinute = "";
     }
-    withDividers.push({ type: "msg", message: msg });
+    const minute = formatTime(msg.createdAt);
+    const isGrouped = msg.senderId === lastSenderId && minute === lastMinute;
+    withDividers.push({ type: "msg", message: msg, isGrouped });
+    lastSenderId = msg.senderId;
+    lastMinute = minute;
   }
 
   return (
@@ -452,6 +464,7 @@ function MessageList({
             key={item.message.id}
             message={item.message}
             isMine={!!currentUserId && item.message.senderId === currentUserId}
+            isGrouped={item.isGrouped}
           />
         ),
       )}

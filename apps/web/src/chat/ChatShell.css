@@ -1,9 +1,46 @@
 /*
  * ChatShell — full-screen chat layout.
  * Sidebar (240px) + main content area.
+ * Scoped token overrides mirror AdminShell.css — purple palette for the chat
+ * context without touching the global teal tokens used by auth.
  */
 
+/* ── Scoped tokens ──────────────────────────────────────────────────────────── */
 .chat-app {
+  /* Prototype purple accent */
+  --color-primary: #6d28d9;
+  --color-primary-strong: #5b21b6;
+  --color-primary-tint: #f3ebfb;
+  --color-primary-tint-strong: #e6d7f7;
+
+  /* Prototype light surfaces */
+  --color-bg: #f7f5fb;
+  --color-surface: #ffffff;
+  --color-surface-2: #faf8fd;
+  --color-border: #e8e3f0;
+  --color-border-strong: #d4cde3;
+
+  /* Prototype text */
+  --color-ink: #16121f;
+  --color-ink-2: #3d3550;
+  --color-muted: #7c7390;
+  --color-muted-2: #a39cb3;
+
+  /* Semantic */
+  --color-danger: #dc2626;
+  --color-danger-tint: #fee2e2;
+  --color-danger-ink: #991b1b;
+  --color-warning-tint: #fef3c7;
+  --color-warning-ink: #92400e;
+
+  /* Prototype radius scale */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  /* Shadow */
+  --shadow-md: 0 4px 16px rgba(22, 18, 31, 0.06);
+
   display: grid;
   grid-template-columns: 240px 1fr;
   height: 100vh;
