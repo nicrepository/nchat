@@ -21,7 +21,7 @@ through `insertContent()` and a production DOM backdoor.
 list indentation, and block predicates. Serializer and renderer import those
 definitions rather than duplicating syntax.
 
-```text
+````text
 bold          ::= **escaped-content**
 italic        ::= *escaped-content*
 bold-italic   ::= ***escaped-content***
@@ -30,7 +30,7 @@ code-block    ::= ``` "\n" escaped-content "\n" ```
 unordered     ::= indent "- " inline-content
 ordered       ::= indent number ". " inline-content
 indent        ::= two spaces per nesting level
-```
+````
 
 Code remains exclusive when combined with presentation marks because TipTap's
 configured Code extension excludes them. Bold and italic together use the
@@ -45,14 +45,14 @@ nodes are never silently dropped.
 
 Literal text is escaped before mark delimiters are added:
 
-| Literal | Stored form |
-| --- | --- |
-| `\` | `\\` |
-| `*` | `\*` |
-| `_` | `\_` |
-| backtick | backslash + backtick |
-| `-` | `\-` |
-| `.` immediately after a digit | `\.` |
+| Literal                       | Stored form          |
+| ----------------------------- | -------------------- |
+| `\`                           | `\\`                 |
+| `*`                           | `\*`                 |
+| `_`                           | `\_`                 |
+| backtick                      | backslash + backtick |
+| `-`                           | `\-`                 |
+| `.` immediately after a digit | `\.`                 |
 
 Escaping `-` and digit-followed dots everywhere is intentionally canonical and
 context-free; it covers list-capable line starts without relying on text-node
