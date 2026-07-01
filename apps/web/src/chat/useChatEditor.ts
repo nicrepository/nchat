@@ -85,9 +85,10 @@ export function useChatEditor({ placeholder, disabled, onSend }: UseChatEditorOp
         name: "submitOnEnter",
         addKeyboardShortcuts() {
           return {
-            // Declarative: Shift-Enter defers to HardBreak; Enter sends.
+            // Shift-Enter defers to HardBreak; list Enter defers to ListItem.
             "Shift-Enter": () => false,
             Enter: () => {
+              if (this.editor.isActive("listItem")) return false;
               void handleSendRef.current?.();
               return true;
             },
