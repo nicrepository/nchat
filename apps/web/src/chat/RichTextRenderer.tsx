@@ -1,139 +1,190 @@
 /**
- * RichTextRenderer — client-side Markdown-like renderer for chat messages.
- *
- * Security: never uses dangerouslySetInnerHTML. All output is React nodes.
- * XSS-safe by construction: strings become text nodes, never markup.
- *
- * Supported:  **bold**  *italic*  `code`  ```block```  - ul  1. ol
- *
- * ponytail: no nested formatting, no auto-links, no tables — add when spec grows.
+ * XSS-safe renderer for the canonical chat grammar in richTextMarkers.ts.
+ * Strings remain React text nodes; HTML is never interpreted here.
  */
 
 import { Fragment } from "react";
 import type { ReactNode } from "react";
 import {
-  BOLD_MARKER,
-  ITALIC_MARKER,
-  CODE_MARKER,
-  INLINE_RE,
+  INLINE_MARKERS,
+  findUnescapedMarker,
   isCodeFence,
-  isUlLine,
-  isOlLine,
+  parseListLine,
+  unescapeRichText,
 } from "./richTextMarkers";
+import type { InlineMarkerType, ListType } from "./richTextMarkers";
 
-// ── Inline tokenizer (returns data, not JSX) ──────────────────────────────────
-
-type InlineToken = string | { type: "bold" | "italic" | "code"; text: string };
+type InlineToken = string | { type: InlineMarkerType; text: string };
 
 function tokenizeInline(text: string): InlineToken[] {
-  return text.split(INLINE_RE).flatMap((chunk): InlineToken[] => {
-    if (!chunk) return [];
-    if (chunk.startsWith(BOLD_MARKER) && chunk.endsWith(BOLD_MARKER))
-      return [{ type: "bold", text: chunk.slice(BOLD_MARKER.length, -BOLD_MARKER.length) }];
-    if (chunk.startsWith(CODE_MARKER) && chunk.endsWith(CODE_MARKER))
-      return [{ type: "code", text: chunk.slice(CODE_MARKER.length, -CODE_MARKER.length) }];
-    if (chunk.startsWith(ITALIC_MARKER) && chunk.endsWith(ITALIC_MARKER))
-      return [{ type: "italic", text: chunk.slice(ITALIC_MARKER.length, -ITALIC_MARKER.length) }];
-    return [chunk];
-  });
+  const tokens: InlineToken[] = [];
+  let plain = "";
+  let i = 0;
+
+  const flushPlain = () => {
+    if (plain) tokens.push(unescapeRichText(plain));
+    plain = "";
+  };
+
+  while (i < text.length) {
+    if (text[i] === "\\" && i + 1 < text.length) {
+      plain += text.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+
+    const opening = INLINE_MARKERS.find(({ marker }) => text.startsWith(marker, i));
+    if (opening) {
+      const contentStart = i + opening.marker.length;
+      const closing = findUnescapedMarker(text, opening.marker, contentStart);
+      if (closing > contentStart) {
+        flushPlain();
+        tokens.push({
+          type: opening.type,
+          text: unescapeRichText(text.slice(contentStart, closing)),
+        });
+        i = closing + opening.marker.length;
+        continue;
+      }
+    }
+
+    plain += text[i];
+    i++;
+  }
+
+  flushPlain();
+  return tokens;
 }
 
 function renderTokens(tokens: InlineToken[], keyPrefix: string): ReactNode[] {
-  return tokens.map((t, i): ReactNode => {
-    if (typeof t === "string") return t; // plain text → text node, XSS-safe
-    const k = `${keyPrefix}-${i}`;
-    if (t.type === "bold") return <strong key={k}>{t.text}</strong>;
-    if (t.type === "code")
+  return tokens.map((token, index): ReactNode => {
+    if (typeof token === "string") return token;
+    const key = `${keyPrefix}-${index}`;
+    if (token.type === "bold") return <strong key={key}>{token.text}</strong>;
+    if (token.type === "boldItalic")
       return (
-        <code key={k} className="rtr-inline-code">
-          {t.text}
+        <strong key={key}>
+          <em>{token.text}</em>
+        </strong>
+      );
+    if (token.type === "code")
+      return (
+        <code key={key} className="rtr-inline-code">
+          {token.text}
         </code>
       );
-    return <em key={k}>{t.text}</em>;
+    return <em key={key}>{token.text}</em>;
   });
 }
 
-// ── Block types ───────────────────────────────────────────────────────────────
+interface ListItemBlock {
+  text: string;
+  children: ListBlock[];
+}
 
-// ponytail: `lang` removed — unused until syntax highlighting is spec'd (YAGNI).
-type Block =
-  | { type: "code"; content: string }
-  | { type: "ul"; items: string[] }
-  | { type: "ol"; items: string[] }
-  | { type: "para"; lines: string[] };
+interface ListBlock {
+  type: ListType;
+  items: ListItemBlock[];
+}
 
-// ── Block sub-parsers (each CC <= 4) ─────────────────────────────────────────
+type Block = { type: "code"; content: string } | ListBlock | { type: "para"; lines: string[] };
 
 function parseCodeFence(lines: string[], i: number): [Block, number] {
   const codeLines: string[] = [];
-  i++; // skip opening fence (which may carry a lang tag — ignored)
-  while (i < lines.length && !isCodeFence(lines[i])) {
-    codeLines.push(lines[i]);
-    i++;
-  }
-  if (i < lines.length) i++; // skip closing fence
-  return [{ type: "code", content: codeLines.join("\n") }, i];
+  i++;
+  while (i < lines.length && !isCodeFence(lines[i])) codeLines.push(lines[i++]);
+  if (i < lines.length) i++;
+  return [{ type: "code", content: unescapeRichText(codeLines.join("\n")) }, i];
 }
 
-function parseUlBlock(lines: string[], i: number): [Block, number] {
-  const items: string[] = [];
-  while (i < lines.length && isUlLine(lines[i])) {
-    items.push(lines[i].slice(2));
-    i++;
-  }
-  return [{ type: "ul", items }, i];
-}
+function parseListBlock(
+  lines: string[],
+  i: number,
+  depth: number,
+  type: ListType,
+): [ListBlock, number] {
+  const items: ListItemBlock[] = [];
 
-function parseOlBlock(lines: string[], i: number): [Block, number] {
-  const items: string[] = [];
-  while (i < lines.length && isOlLine(lines[i])) {
-    items.push(lines[i].replace(/^\d+\. /, ""));
+  while (i < lines.length) {
+    const line = parseListLine(lines[i]);
+    if (!line || line.depth < depth) break;
+    if (line.depth > depth) {
+      if (!items.length) break;
+      const [child, next] = parseListBlock(lines, i, line.depth, line.type);
+      items[items.length - 1].children.push(child);
+      i = next;
+      continue;
+    }
+    if (line.type !== type) break;
+    items.push({ text: line.text, children: [] });
     i++;
   }
-  return [{ type: "ol", items }, i];
+
+  return [{ type, items }, i];
 }
 
 function parseParagraph(lines: string[], i: number): [{ type: "para"; lines: string[] }, number] {
   const paraLines: string[] = [];
-  while (i < lines.length && !isCodeFence(lines[i]) && !isUlLine(lines[i]) && !isOlLine(lines[i])) {
-    paraLines.push(lines[i]);
-    i++;
+  while (i < lines.length && !isCodeFence(lines[i]) && !parseListLine(lines[i])) {
+    paraLines.push(lines[i++]);
   }
   return [{ type: "para", lines: paraLines }, i];
 }
-
-// ── Block dispatcher (CC = 5) ─────────────────────────────────────────────────
 
 function parseBlocks(text: string): Block[] {
   const lines = text.split("\n");
   const blocks: Block[] = [];
   let i = 0;
+
   while (i < lines.length) {
-    const line = lines[i];
-    if (isCodeFence(line)) {
+    if (isCodeFence(lines[i])) {
       const [block, next] = parseCodeFence(lines, i);
       blocks.push(block);
       i = next;
-    } else if (isUlLine(line)) {
-      const [block, next] = parseUlBlock(lines, i);
-      blocks.push(block);
-      i = next;
-    } else if (isOlLine(line)) {
-      const [block, next] = parseOlBlock(lines, i);
-      blocks.push(block);
-      i = next;
-    } else {
-      const [para, next] = parseParagraph(lines, i);
-      if (para.lines.some((l) => l.length > 0)) blocks.push(para);
-      i = next;
+      continue;
     }
+
+    const listLine = parseListLine(lines[i]);
+    if (listLine) {
+      const [block, next] = parseListBlock(lines, i, listLine.depth, listLine.type);
+      blocks.push(block);
+      i = next;
+      continue;
+    }
+
+    const [paragraph, next] = parseParagraph(lines, i);
+    if (paragraph.lines.some((line) => line.length > 0)) blocks.push(paragraph);
+    i = next;
   }
+
   return blocks;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+function renderListItems(items: ListItemBlock[], keyPrefix: string): ReactNode[] {
+  return items.map((item, index) => (
+    <li key={index}>
+      {renderTokens(tokenizeInline(item.text), `${keyPrefix}-${index}`)}
+      {item.children.map((child, childIndex) =>
+        renderList(child, `${keyPrefix}-${index}-${childIndex}`),
+      )}
+    </li>
+  ));
+}
 
-interface RichTextRendererProps {
+function renderList(block: ListBlock, key: string): ReactNode {
+  const items = renderListItems(block.items, key);
+  return block.type === "ul" ? (
+    <ul key={key} className="rtr-list">
+      {items}
+    </ul>
+  ) : (
+    <ol key={key} className="rtr-list">
+      {items}
+    </ol>
+  );
+}
+
+export interface RichTextRendererProps {
   text: string;
 }
 
@@ -142,41 +193,23 @@ export default function RichTextRenderer({ text }: RichTextRendererProps) {
 
   return (
     <>
-      {parseBlocks(text).map((block, bi) => {
+      {parseBlocks(text).map((block, blockIndex) => {
         if (block.type === "code") {
           return (
-            <pre key={bi} className="rtr-code-block">
+            <pre key={blockIndex} className="rtr-code-block">
               <code>{block.content}</code>
             </pre>
           );
         }
-
-        if (block.type === "ul") {
-          return (
-            <ul key={bi} className="rtr-list">
-              {block.items.map((item, ii) => (
-                <li key={ii}>{renderTokens(tokenizeInline(item), `${bi}-${ii}`)}</li>
-              ))}
-            </ul>
-          );
+        if (block.type === "ul" || block.type === "ol") {
+          return renderList(block, String(blockIndex));
         }
-
-        if (block.type === "ol") {
-          return (
-            <ol key={bi} className="rtr-list">
-              {block.items.map((item, ii) => (
-                <li key={ii}>{renderTokens(tokenizeInline(item), `${bi}-${ii}`)}</li>
-              ))}
-            </ol>
-          );
-        }
-
         return (
-          <Fragment key={bi}>
-            {block.lines.map((line, li, arr) => (
-              <Fragment key={li}>
-                {renderTokens(tokenizeInline(line), `${bi}-${li}`)}
-                {li < arr.length - 1 && <br />}
+          <Fragment key={blockIndex}>
+            {block.lines.map((line, lineIndex, lines) => (
+              <Fragment key={lineIndex}>
+                {renderTokens(tokenizeInline(line), `${blockIndex}-${lineIndex}`)}
+                {lineIndex < lines.length - 1 && <br />}
               </Fragment>
             ))}
           </Fragment>

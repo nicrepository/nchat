@@ -93,6 +93,18 @@ describe("tiptapDocToMarkdown — inline marks", () => {
     expect(tiptapDocToMarkdown(doc(para(text("npm i", "code"))))).toBe("`npm i`");
   });
 
+  it.each([
+    ["*nao_italico*", String.raw`\*nao\_italico\*`],
+    ["**nao_bold**", String.raw`\*\*nao\_bold\*\*`],
+    ["`nao_codigo`", String.raw`\`nao\_codigo\``],
+    ["```", String.raw`\`\`\``],
+    ["- nao_lista", String.raw`\- nao\_lista`],
+    ["1. nao_ordenada", String.raw`1\. nao\_ordenada`],
+    [String.raw`barra\literal`, String.raw`barra\\literal`],
+  ])("escapes literal marker text %s", (literal, escaped) => {
+    expect(tiptapDocToMarkdown(doc(para(text(literal))))).toBe(escaped);
+  });
+
   it("code takes priority over bold when both marks present", () => {
     const result = tiptapDocToMarkdown(doc(para(text("hi", "bold", "code"))));
     expect(result).toBe("`hi`");
@@ -196,15 +208,14 @@ describe("applyMarks — combined and priority", () => {
     expect(applyMarks("hi", [{ type: "bold" }, { type: "code" }])).toBe("`hi`");
   });
 
-  it("bold+italic: bold wins (***text*** is not renderer-parseable)", () => {
-    // INLINE_RE does not match ***text*** — bold wins to preserve round-trip correctness.
+  it("bold+italic uses the canonical combined marker", () => {
     const result = applyMarks("hi", [{ type: "bold" }, { type: "italic" }]);
-    expect(result).toBe("**hi**");
+    expect(result).toBe("***hi***");
   });
 
-  it("bold+italic round-trips through tiptapDocToMarkdown as bold", () => {
+  it("bold+italic survives tiptapDocToMarkdown", () => {
     const result = tiptapDocToMarkdown(doc(para(text("hi", "bold", "italic"))));
-    expect(result).toBe("**hi**");
+    expect(result).toBe("***hi***");
   });
 
   it("no marks returns plain text", () => {
@@ -283,5 +294,40 @@ describe("tiptapDocToMarkdown — list item multi-paragraph (Bug 2)", () => {
       ],
     });
     expect(result).toBe("1. a b\n2. c");
+  });
+});
+
+describe("tiptapDocToMarkdown — nested lists", () => {
+  it("preserves every nested item with canonical two-space indentation", () => {
+    const result = tiptapDocToMarkdown(
+      doc({
+        type: "bulletList",
+        content: [
+          {
+            type: "listItem",
+            content: [
+              para(text("parent")),
+              {
+                type: "orderedList",
+                content: [
+                  {
+                    type: "listItem",
+                    content: [
+                      para(text("child")),
+                      {
+                        type: "bulletList",
+                        content: [{ type: "listItem", content: [para(text("grandchild"))] }],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(result).toBe("- parent\n  1. child\n    - grandchild");
   });
 });

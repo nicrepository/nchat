@@ -25,6 +25,26 @@ describe("RichTextRenderer", () => {
     expect(em?.textContent).toBe("world");
   });
 
+  it("renders canonical bold+italic with both marks", () => {
+    const { container } = render(<RichTextRenderer text="***world***" />);
+    expect(container.querySelector("strong > em")?.textContent).toBe("world");
+  });
+
+  it.each([
+    [String.raw`\*nao italico\*`, "*nao italico*"],
+    [String.raw`\*\*nao bold\*\*`, "**nao bold**"],
+    [String.raw`\`nao codigo\``, "`nao codigo`"],
+    [String.raw`\`\`\``, "```"],
+    [String.raw`\- nao lista`, "- nao lista"],
+    [String.raw`1\. nao ordenada`, "1. nao ordenada"],
+    [String.raw`barra\\literal`, String.raw`barra\literal`],
+    [String.raw`\_literal\_`, "_literal_"],
+  ])("renders escaped marker text literally: %s", (stored, visible) => {
+    const { container } = render(<RichTextRenderer text={stored} />);
+    expect(container.textContent).toBe(visible);
+    expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
+  });
+
   it("renders inline code correctly", () => {
     const { container } = render(<RichTextRenderer text="Run `npm install` now" />);
     const code = container.querySelector("code");

@@ -111,16 +111,39 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
   });
 
-  it("bold+italic: bold wins; renders as <strong> not literal ***", () => {
-    // Bug 1 regression: bold+italic must NOT produce ***text*** which
-    // the renderer cannot parse. Bold wins per the codec contract.
+  it("bold+italic survives storage and renders both marks", () => {
     const editor = createEditor("<p><strong><em>hello</em></strong></p>");
     const md = tiptapDocToMarkdown(editor.getJSON());
-    expect(md).toBe("**hello**"); // not ***hello***
+    expect(md).toBe("***hello***");
     const { container } = render(<RichTextRenderer text={md} />);
-    // Must render as bold, not as a literal *** string.
-    expect(container.querySelector("strong")?.textContent).toBe("hello");
-    expect(container.textContent).not.toContain("***");
+    expect(container.querySelector("strong > em")?.textContent).toBe("hello");
+  });
+
+  it.each([
+    "*nao_italico*",
+    "**nao_bold**",
+    "`nao_codigo`",
+    "```",
+    "- nao_lista",
+    "1. nao_ordenada",
+  ])("literal marker round-trips unchanged: %s", (literal) => {
+    const editor = createEditor(`<p>${literal}</p>`);
+    const md = tiptapDocToMarkdown(editor.getJSON());
+    const { container } = render(<RichTextRenderer text={md} />);
+
+    expect(container.textContent).toBe(literal);
+    expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
+  });
+
+  it("nested pasted-list structure and content survive the round-trip", () => {
+    const editor = createEditor(
+      "<ul><li><p>parent</p><ol><li><p>child</p><ul><li><p>grandchild</p></li></ul></li></ol></li></ul>",
+    );
+    const md = tiptapDocToMarkdown(editor.getJSON());
+    const { container } = render(<RichTextRenderer text={md} />);
+
+    expect(md).toBe("- parent\n  1. child\n    - grandchild");
+    expect(container.querySelector("ul > li > ol > li > ul > li")?.textContent).toBe("grandchild");
   });
 });
 

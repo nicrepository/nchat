@@ -5,13 +5,20 @@
  * This is the only serialization path. The backend contract (option A) is
  * Markdown strings; no HTML ever reaches the server.
  *
- * CODEC CONTRACT — must stay in sync with RichTextRenderer.tsx:
- * The grammar is declared in richTextMarkers.ts (INLINE_RE).
- * Marks are EXCLUSIVE: code > bold > italic (no combined marks).
- * bold+italic → bold wins; ***text*** is never generated (renderer can't parse it).
+ * richTextMarkers.ts owns the grammar and symmetric escaping used here and by
+ * RichTextRenderer.tsx.
  */
 
-import { BOLD_MARKER, CODE_MARKER, ITALIC_MARKER } from "./richTextMarkers";
+import {
+  BOLD_ITALIC_MARKER,
+  BOLD_MARKER,
+  CODE_BLOCK_MARKER,
+  CODE_MARKER,
+  ITALIC_MARKER,
+  escapeRichText,
+  formatListLine,
+} from "./richTextMarkers";
+import type { ListType } from "./richTextMarkers";
 
 // ── ProseMirror node shape ────────────────────────────────────────────────────
 
@@ -28,16 +35,17 @@ export interface TTNode {
 /**
  * Applies inline marks to a text string.
  *
- * Priority: code > bold > italic — EXCLUSIVE, matching INLINE_RE in richTextMarkers.ts.
- * Combined marks (e.g. bold+italic) are unsupported by the renderer regex, so bold wins.
- * ponytail: combined bold+italic produces bold; extend when renderer supports ***text***.
+ * Code is exclusive in the configured TipTap schema. Bold and italic combine.
  */
 export function applyMarks(text: string, marks: Array<{ type: string }>): string {
   const types = new Set(marks.map((m) => m.type));
-  if (types.has("code")) return CODE_MARKER + text + CODE_MARKER;
-  if (types.has("bold")) return BOLD_MARKER + text + BOLD_MARKER;
-  if (types.has("italic")) return ITALIC_MARKER + text + ITALIC_MARKER;
-  return text;
+  const escaped = escapeRichText(text);
+  if (types.has("code")) return CODE_MARKER + escaped + CODE_MARKER;
+  if (types.has("bold") && types.has("italic"))
+    return BOLD_ITALIC_MARKER + escaped + BOLD_ITALIC_MARKER;
+  if (types.has("bold")) return BOLD_MARKER + escaped + BOLD_MARKER;
+  if (types.has("italic")) return ITALIC_MARKER + escaped + ITALIC_MARKER;
+  return escaped;
 }
 
 // ── Inline serializer ─────────────────────────────────────────────────────────
@@ -58,18 +66,37 @@ export function serializeInline(nodes: TTNode[]): string {
  * Serializes all content blocks within a list item.
  * A listItem may contain multiple paragraphs (e.g. from paste). They are joined
  * with a space since RichTextRenderer expects single-line list items.
- * Nested lists and code blocks are flattened to their inline text — chat does
- * not support nested list structure in stored Markdown.
+ * Direct content blocks are joined with a space. Child lists are serialized
+ * recursively with two-space indentation, so no pasted list content is lost.
  */
 function serializeListItemContent(item: TTNode): string {
   return (item.content ?? [])
+    .filter((block) => block.type !== "bulletList" && block.type !== "orderedList")
     .map((block) => {
-      if (block.type === "codeBlock") return "`" + (block.content?.[0]?.text ?? "") + "`";
-      // paragraph and anything else: extract inline content
+      if (block.type === "codeBlock")
+        return CODE_MARKER + escapeRichText(textContent(block)) + CODE_MARKER;
       return serializeInline(block.content ?? []);
     })
     .filter(Boolean)
     .join(" ");
+}
+
+function textContent(node: TTNode): string {
+  if (node.type === "text") return node.text ?? "";
+  return (node.content ?? []).map(textContent).join("");
+}
+
+function serializeList(node: TTNode, depth: number): string {
+  const type: ListType = node.type === "orderedList" ? "ol" : "ul";
+  return (node.content ?? [])
+    .map((item, index) => {
+      const line = formatListLine(type, depth, index, serializeListItemContent(item));
+      const children = (item.content ?? [])
+        .filter((block) => block.type === "bulletList" || block.type === "orderedList")
+        .map((child) => serializeList(child, depth + 1));
+      return [line, ...children].join("\n");
+    })
+    .join("\n");
 }
 
 // ── Block serializer ──────────────────────────────────────────────────────────
@@ -77,13 +104,12 @@ function serializeListItemContent(item: TTNode): string {
 function serializeBlock(node: TTNode): string {
   switch (node.type) {
     case "codeBlock":
-      return "```\n" + (node.content?.[0]?.text ?? "") + "\n```";
+      return (
+        CODE_BLOCK_MARKER + "\n" + escapeRichText(textContent(node)) + "\n" + CODE_BLOCK_MARKER
+      );
     case "bulletList":
-      return (node.content ?? []).map((item) => "- " + serializeListItemContent(item)).join("\n");
     case "orderedList":
-      return (node.content ?? [])
-        .map((item, i) => `${i + 1}. ` + serializeListItemContent(item))
-        .join("\n");
+      return serializeList(node, 0);
     default:
       // paragraph and any other block
       return serializeInline(node.content ?? []);
