@@ -83,3 +83,48 @@ describe("ChatComposer clipboard round-trip", () => {
     expect(container.textContent).toBe("safe");
   });
 });
+
+describe("ChatComposer list UX", () => {
+  it("provides the geometry APIs TipTap paste needs in JSDOM", () => {
+    const range = document.createRange();
+
+    expect(range.getClientRects()).toHaveLength(0);
+    expect(range.getBoundingClientRect().width).toBe(0);
+    expect(document.body.getBoundingClientRect().width).toBe(0);
+  });
+
+  it("hides the placeholder when an empty list is created", async () => {
+    setup();
+
+    expect(screen.getByText("Mensagem...")).toBeInTheDocument();
+    await userEvent.click(await screen.findByTestId("fmt-ul"));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Mensagem...")).not.toBeInTheDocument();
+      expect(screen.getByTestId("chat-composer-input").querySelector("ul")).not.toBeNull();
+    });
+  });
+
+  it("Enter inside a list creates another item without sending", async () => {
+    const onSend = setup();
+    await userEvent.click(await screen.findByTestId("fmt-ul"));
+    const input = await paste("", "first");
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(input.querySelectorAll("li")).toHaveLength(2));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("Shift+Enter inside a list creates a hard break in the current item", async () => {
+    const onSend = setup();
+    await userEvent.click(await screen.findByTestId("fmt-ul"));
+    const input = await paste("", "first");
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter", shiftKey: true });
+
+    await waitFor(() => expect(input.querySelector("li br")).not.toBeNull());
+    expect(input.querySelectorAll("li")).toHaveLength(1);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+});

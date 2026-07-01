@@ -5,8 +5,7 @@
  * Emoji picker inserts content via editor.chain().insertContent().
  * ponytail: emoji picker has no search (add when requested); GIF/upload are RF-12+.
  *
- * RF-11: bold/italic/ul exposed as direct buttons (Material Symbols icons).
- *        code/codeblock/ol remain in the "more formats" dropdown.
+ * RF-11: all formatting commands are direct Material Symbols buttons.
  *        link/attach/mic: removed — add back when the backing RF lands.
  */
 
@@ -16,51 +15,55 @@ import type { Editor } from "@tiptap/core";
 // ── Toolbar item descriptors ──────────────────────────────────────────────────
 
 interface ToolbarItem {
+  name: string;
   run: (editor: Editor) => void;
   label: string;
   testId: string;
-}
-
-interface DirectItem extends ToolbarItem {
   icon: string; // Material Symbols ligature name
 }
 
-const DIRECT_ITEMS: DirectItem[] = [
+const FORMAT_ITEMS: ToolbarItem[] = [
   {
+    name: "bold",
     run: (e) => e.chain().focus().toggleBold().run(),
     label: "Negrito",
     testId: "fmt-bold",
     icon: "format_bold",
   },
   {
+    name: "italic",
     run: (e) => e.chain().focus().toggleItalic().run(),
     label: "Itálico",
     testId: "fmt-italic",
     icon: "format_italic",
   },
   {
-    run: (e) => e.chain().focus().toggleBulletList().run(),
-    label: "Lista",
-    testId: "fmt-ul",
-    icon: "format_list_bulleted",
-  },
-];
-
-const DROPDOWN_ITEMS: ToolbarItem[] = [
-  {
+    name: "code",
     run: (e) => e.chain().focus().toggleCode().run(),
     label: "Código",
     testId: "fmt-code",
+    icon: "code",
   },
   {
+    name: "codeBlock",
     run: (e) => e.chain().focus().toggleCodeBlock().run(),
     label: "Bloco de código",
     testId: "fmt-codeblock",
+    icon: "code_blocks",
   },
   {
+    name: "bulletList",
+    run: (e) => e.chain().focus().toggleBulletList().run(),
+    label: "Lista não ordenada",
+    testId: "fmt-ul",
+    icon: "format_list_bulleted",
+  },
+  {
+    name: "orderedList",
     run: (e) => e.chain().focus().toggleOrderedList().run(),
     label: "Lista ordenada",
     testId: "fmt-ol",
+    icon: "format_list_numbered",
   },
 ];
 
@@ -92,11 +95,6 @@ const EMOJIS = [
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
-const IconMoreFormat = () => (
-  <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
-    text_format
-  </span>
-);
 const IconEmoji = () => (
   <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 20 }}>
     mood
@@ -111,19 +109,15 @@ export interface ComposerToolbarProps {
 }
 
 export default function ComposerToolbar({ editor, disabled = false }: ComposerToolbarProps) {
-  const [formatOpen, setFormatOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  const formatBtnRef = useRef<HTMLButtonElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
-  const firstFmtRef = useRef<HTMLButtonElement>(null);
   const firstEmojiRef = useRef<HTMLButtonElement>(null);
 
   // Close panels on outside click.
   useEffect(() => {
     const onDown = (ev: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(ev.target as Node)) {
-        setFormatOpen(false);
         setEmojiOpen(false);
       }
     };
@@ -132,20 +126,12 @@ export default function ComposerToolbar({ editor, disabled = false }: ComposerTo
   }, []);
 
   useLayoutEffect(() => {
-    if (formatOpen) firstFmtRef.current?.focus();
-  }, [formatOpen]);
-  useLayoutEffect(() => {
     if (emojiOpen) firstEmojiRef.current?.focus();
   }, [emojiOpen]);
 
-  function closeAll() {
-    setFormatOpen(false);
-    setEmojiOpen(false);
-  }
-
   function handleFormat(item: ToolbarItem) {
     if (editor) item.run(editor);
-    closeAll();
+    setEmojiOpen(false);
   }
 
   function handleEmoji(emoji: string) {
@@ -153,10 +139,6 @@ export default function ComposerToolbar({ editor, disabled = false }: ComposerTo
     setEmojiOpen(false);
   }
 
-  const closeFormat = () => {
-    setFormatOpen(false);
-    formatBtnRef.current?.focus();
-  };
   const closeEmoji = () => {
     setEmojiOpen(false);
     emojiBtnRef.current?.focus();
@@ -164,67 +146,25 @@ export default function ComposerToolbar({ editor, disabled = false }: ComposerTo
 
   return (
     <div className="composer-toolbar" ref={containerRef}>
-      {/* ── "More formats" dropdown: code, codeblock, ordered list ── */}
-      <div className="composer-toolbar__wrap">
-        <button
-          ref={formatBtnRef}
-          type="button"
-          className="composer-toolbar__btn"
-          aria-label="Mais formatações"
-          aria-haspopup="menu"
-          aria-expanded={formatOpen}
-          disabled={disabled}
-          data-testid="toolbar-format-btn"
-          onClick={() => {
-            setFormatOpen((o) => !o);
-            setEmojiOpen(false);
-          }}
-        >
-          <IconMoreFormat />
-        </button>
-
-        {formatOpen && (
-          <div
-            role="menu"
-            className="composer-toolbar__dropdown"
-            data-testid="toolbar-format-menu"
-            onKeyDown={(ev) => {
-              if (ev.key === "Escape") closeFormat();
-            }}
+      {FORMAT_ITEMS.map((item) => {
+        const active = editor?.isActive(item.name) ?? false;
+        return (
+          <button
+            key={item.testId}
+            type="button"
+            className={`composer-toolbar__btn${active ? " composer-toolbar__btn--active" : ""}`}
+            aria-label={item.label}
+            aria-pressed={active}
+            disabled={disabled}
+            data-testid={item.testId}
+            onClick={() => handleFormat(item)}
           >
-            {DROPDOWN_ITEMS.map((item, i) => (
-              <button
-                key={item.testId}
-                ref={i === 0 ? firstFmtRef : undefined}
-                type="button"
-                role="menuitem"
-                className="composer-toolbar__format-item"
-                onClick={() => handleFormat(item)}
-                data-testid={item.testId}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* ── Direct RF-11 buttons: bold, italic, list ── */}
-      {DIRECT_ITEMS.map((item) => (
-        <button
-          key={item.testId}
-          type="button"
-          className="composer-toolbar__btn"
-          aria-label={item.label}
-          disabled={disabled}
-          data-testid={item.testId}
-          onClick={() => handleFormat(item)}
-        >
-          <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
-            {item.icon}
-          </span>
-        </button>
-      ))}
+            <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+              {item.icon}
+            </span>
+          </button>
+        );
+      })}
 
       {/* ── Emoji button + picker ── */}
       <div className="composer-toolbar__wrap">
@@ -239,7 +179,6 @@ export default function ComposerToolbar({ editor, disabled = false }: ComposerTo
           data-testid="toolbar-emoji-btn"
           onClick={() => {
             setEmojiOpen((o) => !o);
-            setFormatOpen(false);
           }}
         >
           <IconEmoji />

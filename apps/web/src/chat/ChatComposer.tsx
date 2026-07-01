@@ -58,7 +58,7 @@ export default function ChatComposer({ placeholder, disabled = false, onSend }: 
         className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}`}
       >
         <div className="chat-msg-area__composer-editor-wrap">
-          {editor?.isEmpty && (
+          {editor?.isEmpty && !editor.isActive("listItem") && (
             <div className="chat-msg-area__composer-placeholder" aria-hidden="true">
               {placeholder}
             </div>

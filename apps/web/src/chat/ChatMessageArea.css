@@ -381,7 +381,7 @@
   background: var(--color-surface, #fff);
   border: 1px solid var(--color-border, #e8e3f0);
   border-radius: 14px;
-  overflow: hidden;
+  overflow: visible;
   transition:
     border-color 0.12s,
     box-shadow 0.12s;
@@ -555,44 +555,15 @@
   color: var(--color-ink-2, #3d3550);
 }
 
+.composer-toolbar__btn--active,
+.composer-toolbar__btn--active:hover:not(:disabled) {
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary, #0e7490);
+}
+
 .composer-toolbar__btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
-}
-
-/* Format dropdown */
-.composer-toolbar__dropdown {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 0;
-  background: var(--color-surface, #fff);
-  border: 1px solid var(--color-border, #e8e3f0);
-  border-radius: var(--radius-lg, 14px);
-  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
-  padding: 6px;
-  min-width: 180px;
-  z-index: 200;
-}
-
-.composer-toolbar__format-item {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  border: none;
-  border-radius: var(--radius-md, 10px);
-  padding: 8px 12px;
-  font-size: 13px;
-  font-family: inherit;
-  color: var(--color-ink, #16121f);
-  cursor: pointer;
-  transition: background 0.12s;
-}
-
-.composer-toolbar__format-item:hover,
-.composer-toolbar__format-item:focus {
-  background: var(--color-surface-2, #faf8fd);
-  outline: none;
 }
 
 /* Emoji picker */

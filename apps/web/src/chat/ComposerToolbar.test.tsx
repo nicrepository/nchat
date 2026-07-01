@@ -1,17 +1,18 @@
 /**
  * ComposerToolbar tests — RF-11 TipTap toolbar
  *
- * Uses a mock Editor object to test that toolbar buttons call the correct
- * TipTap chain commands. Real editor not needed — behavior is: "button X
- * calls editor.chain().focus().commandY().run()".
+ * Mock editors verify command routing; real editor tests verify the complete
+ * toolbar → TipTap JSON → storage codec → rendered message flow.
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Editor } from "@tiptap/core";
 import type { Editor as EditorType } from "@tiptap/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ComposerToolbar from "./ComposerToolbar";
+import RichTextRenderer from "./RichTextRenderer";
+import { tiptapDocToMarkdown } from "./tiptapSerializer";
 import { createChatEditorExtensions } from "./useChatEditor";
 
 // ── Mock editor factory ───────────────────────────────────────────────────────
@@ -49,12 +50,12 @@ function createMockChain(): MockChain {
   return chain;
 }
 
-function createMockEditor(): { editor: EditorType; chain: MockChain } {
+function createMockEditor(activeFormat?: string): { editor: EditorType; chain: MockChain } {
   const chain = createMockChain();
   const editor = {
     chain: vi.fn().mockReturnValue(chain),
     isEmpty: false,
-    isActive: vi.fn().mockReturnValue(false),
+    isActive: vi.fn((name: string) => name === activeFormat),
   } as unknown as EditorType;
   return { editor, chain };
 }
@@ -66,6 +67,24 @@ function renderToolbar(editor: EditorType | null, disabled = false) {
 // ── Direct format buttons ─────────────────────────────────────────────────────
 
 describe("ComposerToolbar — direct format buttons", () => {
+  it("renders every format action directly without a format dropdown", () => {
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+
+    for (const testId of [
+      "fmt-bold",
+      "fmt-italic",
+      "fmt-code",
+      "fmt-codeblock",
+      "fmt-ul",
+      "fmt-ol",
+    ]) {
+      expect(screen.getByTestId(testId)).toBeVisible();
+    }
+    expect(screen.queryByTestId("toolbar-format-btn")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("toolbar-format-menu")).not.toBeInTheDocument();
+  });
+
   it("bold button calls toggleBold chain", async () => {
     const user = userEvent.setup();
     const { editor, chain } = createMockEditor();
@@ -101,89 +120,44 @@ describe("ComposerToolbar — direct format buttons", () => {
   });
 });
 
-// ── Dropdown format buttons ───────────────────────────────────────────────────
-
-describe("ComposerToolbar — dropdown format buttons", () => {
-  it("code button (via dropdown) calls toggleCode chain", async () => {
+describe("ComposerToolbar — remaining direct format buttons", () => {
+  it("code button calls toggleCode chain", async () => {
     const user = userEvent.setup();
     const { editor, chain } = createMockEditor();
     renderToolbar(editor);
 
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-code"));
 
     expect(chain.toggleCode).toHaveBeenCalled();
     expect(chain.run).toHaveBeenCalled();
   });
 
-  it("codeblock button (via dropdown) calls toggleCodeBlock chain", async () => {
+  it("codeblock button calls toggleCodeBlock chain", async () => {
     const user = userEvent.setup();
     const { editor, chain } = createMockEditor();
     renderToolbar(editor);
 
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-codeblock"));
 
     expect(chain.toggleCodeBlock).toHaveBeenCalled();
     expect(chain.run).toHaveBeenCalled();
   });
 
-  it("ol button (via dropdown) calls toggleOrderedList chain", async () => {
+  it("ol button calls toggleOrderedList chain", async () => {
     const user = userEvent.setup();
     const { editor, chain } = createMockEditor();
     renderToolbar(editor);
 
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-ol"));
 
     expect(chain.toggleOrderedList).toHaveBeenCalled();
     expect(chain.run).toHaveBeenCalled();
-  });
-
-  it("closes format menu after inserting via dropdown", async () => {
-    const user = userEvent.setup();
-    const { editor } = createMockEditor();
-    renderToolbar(editor);
-
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-
-    await user.click(screen.getByTestId("fmt-code"));
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-  });
-
-  it("direct bold closes format dropdown if it is open", async () => {
-    const user = userEvent.setup();
-    const { editor } = createMockEditor();
-    renderToolbar(editor);
-
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-
-    await user.click(screen.getByTestId("fmt-bold"));
-
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 });
 
 // ── Keyboard accessibility ────────────────────────────────────────────────────
 
 describe("ComposerToolbar — keyboard accessibility", () => {
-  it("Escape closes format menu and returns focus to format button", async () => {
-    const user = userEvent.setup();
-    const { editor } = createMockEditor();
-    renderToolbar(editor);
-    const btn = screen.getByTestId("toolbar-format-btn");
-
-    await user.click(btn);
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-
-    await user.keyboard("{Escape}");
-
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-    expect(document.activeElement).toBe(btn);
-  });
-
   it("Escape closes emoji picker and returns focus to emoji button", async () => {
     const user = userEvent.setup();
     const { editor } = createMockEditor();
@@ -212,26 +186,17 @@ describe("ComposerToolbar — keyboard accessibility", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("handleFormat via dropdown item closes emoji picker AND applies formatting (closeAll path)", async () => {
+  it("direct code closes the emoji picker and applies formatting", async () => {
     const user = userEvent.setup();
     const { editor, chain } = createMockEditor();
     renderToolbar(editor);
 
-    // Open emoji picker first.
     await user.click(screen.getByTestId("toolbar-emoji-btn"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
 
-    // Open format dropdown while emoji picker is still open.
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-
-    // Click a dropdown format item — calls handleFormat → closeAll().
     await user.click(screen.getByTestId("fmt-code"));
 
-    // closeAll() must have closed BOTH panels.
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-    // Formatting was applied.
     expect(chain.toggleCode).toHaveBeenCalled();
     expect(chain.run).toHaveBeenCalled();
   });
@@ -268,15 +233,21 @@ describe("ComposerToolbar — emoji insertion", () => {
 // ── Disabled state ────────────────────────────────────────────────────────────
 
 describe("ComposerToolbar — disabled state", () => {
-  it("disables format, emoji and direct-format buttons when disabled=true", () => {
+  it("disables emoji and every format button when disabled=true", () => {
     const { editor } = createMockEditor();
     renderToolbar(editor, true);
 
-    expect(screen.getByTestId("toolbar-format-btn")).toBeDisabled();
     expect(screen.getByTestId("toolbar-emoji-btn")).toBeDisabled();
-    expect(screen.getByTestId("fmt-bold")).toBeDisabled();
-    expect(screen.getByTestId("fmt-italic")).toBeDisabled();
-    expect(screen.getByTestId("fmt-ul")).toBeDisabled();
+    for (const testId of [
+      "fmt-bold",
+      "fmt-italic",
+      "fmt-code",
+      "fmt-codeblock",
+      "fmt-ul",
+      "fmt-ol",
+    ]) {
+      expect(screen.getByTestId(testId)).toBeDisabled();
+    }
   });
 });
 
@@ -299,11 +270,10 @@ describe("ComposerToolbar — null editor", () => {
     await expect(user.click(screen.getByText("😀"))).resolves.toBeUndefined();
   });
 
-  it("does not throw when editor is null and dropdown item is clicked", async () => {
+  it("does not throw when editor is null and code is clicked", async () => {
     const user = userEvent.setup();
     renderToolbar(null);
 
-    await user.click(screen.getByTestId("toolbar-format-btn"));
     await expect(user.click(screen.getByTestId("fmt-code"))).resolves.toBeUndefined();
   });
 });
@@ -311,44 +281,30 @@ describe("ComposerToolbar — null editor", () => {
 // ── Aria attributes ───────────────────────────────────────────────────────────
 
 describe("ComposerToolbar — aria attributes", () => {
-  it("format button has aria-label", () => {
-    const { editor } = createMockEditor();
-    renderToolbar(editor);
-    expect(screen.getByTestId("toolbar-format-btn")).toHaveAttribute(
-      "aria-label",
-      "Mais formatações",
-    );
-  });
-
-  it("format button aria-expanded reflects dropdown state", async () => {
-    const user = userEvent.setup();
-    const { editor } = createMockEditor();
-    renderToolbar(editor);
-    const btn = screen.getByTestId("toolbar-format-btn");
-
-    expect(btn).toHaveAttribute("aria-expanded", "false");
-    await user.click(btn);
-    expect(btn).toHaveAttribute("aria-expanded", "true");
-  });
-
   it("direct buttons have accessible aria-labels", () => {
     const { editor } = createMockEditor();
     renderToolbar(editor);
     expect(screen.getByTestId("fmt-bold")).toHaveAttribute("aria-label", "Negrito");
     expect(screen.getByTestId("fmt-italic")).toHaveAttribute("aria-label", "Itálico");
-    expect(screen.getByTestId("fmt-ul")).toHaveAttribute("aria-label", "Lista");
+    expect(screen.getByTestId("fmt-code")).toHaveAttribute("aria-label", "Código");
+    expect(screen.getByTestId("fmt-codeblock")).toHaveAttribute("aria-label", "Bloco de código");
+    expect(screen.getByTestId("fmt-ul")).toHaveAttribute("aria-label", "Lista não ordenada");
+    expect(screen.getByTestId("fmt-ol")).toHaveAttribute("aria-label", "Lista ordenada");
   });
 
-  it("first focus moves to first dropdown item after opening", async () => {
-    const user = userEvent.setup();
-    const { editor } = createMockEditor();
+  it.each([
+    ["fmt-bold", "bold"],
+    ["fmt-italic", "italic"],
+    ["fmt-code", "code"],
+    ["fmt-codeblock", "codeBlock"],
+    ["fmt-ul", "bulletList"],
+    ["fmt-ol", "orderedList"],
+  ])("%s reflects the active %s format", (testId, formatName) => {
+    const { editor } = createMockEditor(formatName);
     renderToolbar(editor);
 
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-
-    await waitFor(() => {
-      expect(document.activeElement).toBe(screen.getByTestId("fmt-code"));
-    });
+    expect(screen.getByTestId(testId)).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId(testId)).toHaveClass("composer-toolbar__btn--active");
   });
 });
 
@@ -389,6 +345,15 @@ describe("ComposerToolbar — real editor integration", () => {
     expect(editor.isActive("bold")).toBe(true);
   });
 
+  it("reports a formatted selection as pressed", () => {
+    const editor = createRealEditor("<p><strong>hello</strong></p>");
+    editor.commands.selectAll();
+
+    render(<ComposerToolbar editor={editor} />);
+
+    expect(screen.getByTestId("fmt-bold")).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("italic button applies italic mark to selected text in real editor", async () => {
     const user = userEvent.setup();
     const editor = createRealEditor();
@@ -398,5 +363,24 @@ describe("ComposerToolbar — real editor integration", () => {
     await user.click(screen.getByTestId("fmt-italic"));
 
     expect(editor.isActive("italic")).toBe(true);
+    const stored = tiptapDocToMarkdown(editor.getJSON());
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
+    expect(stored).toBe("*hello*");
+    expect(container.querySelector("em")?.textContent).toBe("hello");
+  });
+
+  it("bold and italic buttons survive storage and render both marks", async () => {
+    const user = userEvent.setup();
+    const editor = createRealEditor();
+    editor.commands.selectAll();
+
+    render(<ComposerToolbar editor={editor} />);
+    await user.click(screen.getByTestId("fmt-bold"));
+    await user.click(screen.getByTestId("fmt-italic"));
+
+    const stored = tiptapDocToMarkdown(editor.getJSON());
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
+    expect(stored).toBe("***hello***");
+    expect(container.querySelector("strong > em")?.textContent).toBe("hello");
   });
 });
