@@ -9,7 +9,6 @@
  * no HTML ever reaches the server or RichTextRenderer.
  */
 
-import { useCallback } from "react";
 import { EditorContent } from "@tiptap/react";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
@@ -53,24 +52,12 @@ export default function ChatComposer({ placeholder, disabled = false, onSend }: 
     onSend,
   });
 
-  // Test-only: expose the TipTap editor on its DOM element so JSDOM tests can
-  // insert content programmatically. Tree-shaken in production builds
-  // (import.meta.env.PROD is a build-time constant in Vite).
-  const editorWrapRef = useCallback(
-    (el: HTMLDivElement | null) => {
-      if (import.meta.env.PROD || !el || !editor) return;
-      const pm = el.querySelector('[data-testid="chat-composer-input"]');
-      if (pm) (pm as unknown as Record<string, unknown>).__tiptapEditor = editor;
-    },
-    [editor],
-  );
-
   return (
     <div className="chat-msg-area__composer">
       <div
         className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}`}
       >
-        <div className="chat-msg-area__composer-editor-wrap" ref={editorWrapRef}>
+        <div className="chat-msg-area__composer-editor-wrap">
           {editor?.isEmpty && (
             <div className="chat-msg-area__composer-placeholder" aria-hidden="true">
               {placeholder}

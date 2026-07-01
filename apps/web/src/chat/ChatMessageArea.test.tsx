@@ -19,31 +19,17 @@ import type { WSMessageCreatedEvent } from "./useChatWebSocket";
 import { useChatWebSocket } from "./useChatWebSocket";
 import * as chatApi from "./chatApi";
 
-// ── TipTap test helper ────────────────────────────────────────────────────────
-//
-// user.type() doesn't insert text into TipTap's contenteditable in JSDOM.
-// Instead, poll for the editor instance exposed via __tiptapEditor (non-prod builds)
-// and insert content at the ProseMirror model level.
-
-/** Typed DOM element that carries the TipTap editor reference in non-prod builds. */
-interface TipTapTestElement extends HTMLElement {
-  __tiptapEditor?: import("@tiptap/core").Editor;
-}
+// ── TipTap public-event helper ────────────────────────────────────────────────
 
 async function fillEditor(element: HTMLElement, text: string) {
-  // Poll until __tiptapEditor is available (useEditor is async in React).
-  await waitFor(
-    () => {
-      if (!(element as TipTapTestElement).__tiptapEditor) {
-        throw new Error("Waiting for __tiptapEditor to be set on the editor DOM element");
-      }
+  fireEvent.paste(element, {
+    clipboardData: {
+      getData: (type: string) => (type === "text/plain" ? text : ""),
+      types: ["text/plain"],
+      files: [],
     },
-    { timeout: 3000, interval: 50 },
-  );
-  const editor = (element as TipTapTestElement).__tiptapEditor!;
-  await act(async () => {
-    editor.commands.insertContent(text);
   });
+  await waitFor(() => expect(element).toHaveTextContent(text));
 }
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
@@ -582,10 +568,7 @@ describe("ChatMessageArea — send message", () => {
     const input = await screen.findByTestId("chat-composer-input");
     await fillEditor(input, "Enter send");
 
-    // Use TipTap's own keyboard shortcut API — exercises the real submitOnEnter extension.
-    await act(async () =>
-      (input as TipTapTestElement).__tiptapEditor!.commands.keyboardShortcut("Enter"),
-    );
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
 
     await waitFor(() => {
       expect(mockPostChannelMessage).toHaveBeenCalledTimes(1);
@@ -599,15 +582,11 @@ describe("ChatMessageArea — send message", () => {
     const input = await screen.findByTestId("chat-composer-input");
     await fillEditor(input, "line one");
 
-    // Shift+Enter must NOT send — it should invoke HardBreak from StarterKit.
-    await act(() =>
-      (input as TipTapTestElement).__tiptapEditor!.commands.keyboardShortcut("Shift-Enter"),
-    );
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter", shiftKey: true });
 
     // Nothing sent.
     expect(mockPostChannelMessage).not.toHaveBeenCalled();
-    // Editor still has content (hard break was inserted, not cleared).
-    expect((input as TipTapTestElement).__tiptapEditor!.isEmpty).toBe(false);
+    expect(input).toHaveTextContent("line one");
   });
 
   it("failed send shows error banner and keeps draft", async () => {
