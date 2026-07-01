@@ -9,32 +9,6 @@ export default defineConfig({
     strictPort: true,
     allowedHosts: ["nchat.local"],
   },
-  build: {
-    rollupOptions: {
-      output: {
-        // ponytail: TipTap individual extensions; re-add manualChunks when
-        // bundle measurement justifies splitting.
-        manualChunks: {
-          "tiptap-vendor": [
-            "@tiptap/core",
-            "@tiptap/react",
-            "@tiptap/extension-bold",
-            "@tiptap/extension-italic",
-            "@tiptap/extension-code",
-            "@tiptap/extension-code-block",
-            "@tiptap/extension-bullet-list",
-            "@tiptap/extension-ordered-list",
-            "@tiptap/extension-list-item",
-            "@tiptap/extension-hard-break",
-            "@tiptap/extension-history",
-            "@tiptap/extension-document",
-            "@tiptap/extension-paragraph",
-            "@tiptap/extension-text",
-          ],
-        },
-      },
-    },
-  },
   test: {
     environment: "jsdom",
     setupFiles: "./src/setupTests.ts",
