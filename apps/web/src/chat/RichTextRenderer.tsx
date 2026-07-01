@@ -201,7 +201,7 @@ export default function RichTextRenderer({ text }: RichTextRendererProps) {
             </pre>
           );
         }
-        if (block.type === "ul" || block.type === "ol") {
+        if (block.type !== "para") {
           return renderList(block, String(blockIndex));
         }
         return (
