@@ -15,7 +15,7 @@
  * upgrade cannot set custom headers; token-in-URL is rejected server-side).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
@@ -23,7 +23,7 @@ import type { ChatOutletContext } from "./ChatShell";
 import type { Message } from "./chatTypes";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import RichTextRenderer from "./RichTextRenderer";
-import ComposerToolbar from "./ComposerToolbar";
+import ChatComposer from "./ChatComposer";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -93,25 +93,6 @@ function IconHash({ className }: { className?: string }) {
       <line x1="16" y1="4" x2="14" y2="20" />
       <line x1="4" y1="9" x2="20" y2="9" />
       <line x1="3" y1="15" x2="19" y2="15" />
-    </svg>
-  );
-}
-
-function IconSend() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      width="16"
-      height="16"
-    >
-      <line x1="22" y1="2" x2="11" y2="13" />
-      <polygon points="22 2 15 22 11 13 2 9 22 2" />
     </svg>
   );
 }
@@ -293,7 +274,11 @@ function MessageBubble({ message, isMine = false, isGrouped = false }: MessageBu
         <div
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
-          {message.isRemoved ? "Mensagem removida." : <RichTextRenderer text={message.bodyText} />}
+          {message.isRemoved ? (
+            "Mensagem removida."
+          ) : (
+            <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
+          )}
         </div>
       </div>
     </div>
@@ -473,84 +458,6 @@ function MessageList({
   );
 }
 
-// ── Composer ──────────────────────────────────────────────────────────────────
-
-interface ComposerProps {
-  placeholder: string;
-  disabled?: boolean;
-  onSend: (body: string) => Promise<SendResult>;
-}
-
-function Composer({ placeholder, disabled = false, onSend }: ComposerProps) {
-  const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  const canSend = draft.trim().length > 0 && !sending && !disabled;
-
-  async function handleSend() {
-    if (!canSend) return;
-    const body = draft.trim();
-    setSending(true);
-    try {
-      const result = await onSend(body);
-      if (result.status === "sent") {
-        setDraft(""); // clear only on confirmed success for the current target
-      }
-      // result.status === "stale": target changed — draft preserved, no error shown
-    } catch {
-      // current-target failure — draft preserved for retry, error shown by parent
-    } finally {
-      setSending(false);
-    }
-  }
-
-  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void handleSend();
-    }
-  }
-
-  return (
-    <div className="chat-msg-area__composer">
-      <div
-        className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}`}
-      >
-        <textarea
-          ref={textareaRef}
-          className="chat-msg-area__composer-input"
-          placeholder={placeholder}
-          value={draft}
-          rows={1}
-          disabled={disabled || sending}
-          aria-label={placeholder}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={handleKeyDown}
-          data-testid="chat-composer-input"
-        />
-        <div className="chat-msg-area__composer-bar">
-          <ComposerToolbar
-            textareaRef={textareaRef}
-            setDraft={setDraft}
-            disabled={disabled || sending}
-          />
-          <button
-            type="button"
-            className="chat-msg-area__send-btn"
-            disabled={!canSend}
-            aria-label="Enviar mensagem"
-            onClick={() => void handleSend()}
-            data-testid="chat-send-btn"
-          >
-            <IconSend />
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ── Main component ────────────────────────────────────────────────────────────
 
 interface ChatMessageAreaProps {
@@ -621,7 +528,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         </div>
       )}
 
-      <Composer
+      <ChatComposer
         placeholder={
           kind === "channel" ? `Mensagem para #${resolvedName}…` : `Mensagem para ${resolvedName}…`
         }

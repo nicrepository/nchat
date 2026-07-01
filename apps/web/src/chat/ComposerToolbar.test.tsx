@@ -1,178 +1,168 @@
 /**
- * ComposerToolbar tests — RF-11 toolbar
+ * ComposerToolbar tests — RF-11 TipTap toolbar
  *
- * Uses userEvent for realistic interaction simulation (focus, keyboard, pointer).
- * TestWrapper provides a controlled textarea + setDraft to test insertion logic.
+ * Uses a mock Editor object to test that toolbar buttons call the correct
+ * TipTap chain commands. Real editor not needed — behavior is: "button X
+ * calls editor.chain().focus().commandY().run()".
  */
 
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { type RefObject, useRef, useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { Editor } from "@tiptap/core";
+import type { Editor as EditorType } from "@tiptap/core";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import ComposerToolbar from "./ComposerToolbar";
+import { createChatEditorExtensions } from "./useChatEditor";
 
-// ── Test wrapper ──────────────────────────────────────────────────────────────
+// ── Mock editor factory ───────────────────────────────────────────────────────
 
-function TestWrapper({ initialDraft = "" }: { initialDraft?: string }) {
-  const [draft, setDraft] = useState(initialDraft);
-  const ref = useRef<HTMLTextAreaElement>(null) as RefObject<HTMLTextAreaElement | null>;
-  return (
-    <div>
-      <textarea
-        ref={ref}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        data-testid="ta"
-      />
-      <ComposerToolbar textareaRef={ref} setDraft={setDraft} />
-    </div>
-  );
+type MockChain = {
+  focus: ReturnType<typeof vi.fn>;
+  toggleBold: ReturnType<typeof vi.fn>;
+  toggleItalic: ReturnType<typeof vi.fn>;
+  toggleCode: ReturnType<typeof vi.fn>;
+  toggleCodeBlock: ReturnType<typeof vi.fn>;
+  toggleBulletList: ReturnType<typeof vi.fn>;
+  toggleOrderedList: ReturnType<typeof vi.fn>;
+  insertContent: ReturnType<typeof vi.fn>;
+  run: ReturnType<typeof vi.fn>;
+};
+
+function createMockChain(): MockChain {
+  const chain: MockChain = {
+    focus: vi.fn(),
+    toggleBold: vi.fn(),
+    toggleItalic: vi.fn(),
+    toggleCode: vi.fn(),
+    toggleCodeBlock: vi.fn(),
+    toggleBulletList: vi.fn(),
+    toggleOrderedList: vi.fn(),
+    insertContent: vi.fn(),
+    run: vi.fn().mockReturnValue(true),
+  };
+  // Each method returns the chain for chaining.
+  for (const key of Object.keys(chain) as (keyof MockChain)[]) {
+    if (key !== "run") {
+      chain[key].mockReturnValue(chain);
+    }
+  }
+  return chain;
 }
 
-// ── Format insertion (inline markers) ────────────────────────────────────────
+function createMockEditor(): { editor: EditorType; chain: MockChain } {
+  const chain = createMockChain();
+  const editor = {
+    chain: vi.fn().mockReturnValue(chain),
+    isEmpty: false,
+    isActive: vi.fn().mockReturnValue(false),
+  } as unknown as EditorType;
+  return { editor, chain };
+}
 
-describe("ComposerToolbar — inline format insertion", () => {
-  it("wraps selection with ** for Negrito", async () => {
+function renderToolbar(editor: EditorType | null, disabled = false) {
+  render(<ComposerToolbar editor={editor} disabled={disabled} />);
+}
+
+// ── Direct format buttons ─────────────────────────────────────────────────────
+
+describe("ComposerToolbar — direct format buttons", () => {
+  it("bold button calls toggleBold chain", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="texto" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(0, 5);
     await user.click(screen.getByTestId("fmt-bold"));
 
-    expect(ta).toHaveValue("**texto**");
+    expect(chain.focus).toHaveBeenCalled();
+    expect(chain.toggleBold).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
   });
 
-  it("wraps selection with * for Itálico", async () => {
+  it("italic button calls toggleItalic chain", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="texto" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(0, 5);
     await user.click(screen.getByTestId("fmt-italic"));
 
-    expect(ta).toHaveValue("*texto*");
+    expect(chain.toggleItalic).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
   });
 
-  it("wraps selection with backtick for Código", async () => {
+  it("ul button calls toggleBulletList chain", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="hello" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(0, 5);
+    await user.click(screen.getByTestId("fmt-ul"));
+
+    expect(chain.toggleBulletList).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
+  });
+});
+
+// ── Dropdown format buttons ───────────────────────────────────────────────────
+
+describe("ComposerToolbar — dropdown format buttons", () => {
+  it("code button (via dropdown) calls toggleCode chain", async () => {
+    const user = userEvent.setup();
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
+
     await user.click(screen.getByTestId("toolbar-format-btn"));
     await user.click(screen.getByTestId("fmt-code"));
 
-    expect(ta).toHaveValue("`hello`");
+    expect(chain.toggleCode).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
   });
 
-  it("cursor vazio — coloca cursor entre marcadores ao inserir negrito sem seleção", async () => {
+  it("codeblock button (via dropdown) calls toggleCodeBlock chain", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="texto" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(2, 2); // cursor at pos 2, no selection
-    await user.click(screen.getByTestId("fmt-bold"));
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+    await user.click(screen.getByTestId("fmt-codeblock"));
 
-    expect(ta).toHaveValue("te****xto"); // ** + empty + ** inserted at pos 2
-    // Cursor must be collapsed between the markers (pos 4), not selecting them.
-    await waitFor(() => {
-      expect(ta.selectionStart).toBe(4);
-      expect(ta.selectionEnd).toBe(4);
-    });
+    expect(chain.toggleCodeBlock).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
   });
 
-  it("cursor posicionado sobre texto envolvido após negrito com seleção", async () => {
+  it("ol button (via dropdown) calls toggleOrderedList chain", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="texto" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(0, 5);
-    await user.click(screen.getByTestId("fmt-bold"));
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+    await user.click(screen.getByTestId("fmt-ol"));
 
-    // selectionStart/End should be on the wrapped content, not the ** markers.
-    await waitFor(() => {
-      expect(ta.selectionStart).toBe(2); // after opening **
-      expect(ta.selectionEnd).toBe(7); // before closing **
-    });
+    expect(chain.toggleOrderedList).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
   });
 
   it("closes format menu after inserting via dropdown", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper />);
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+
     await user.click(screen.getByTestId("toolbar-format-btn"));
     expect(screen.getByRole("menu")).toBeInTheDocument();
 
     await user.click(screen.getByTestId("fmt-code"));
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
-});
 
-// ── Block format insertion ────────────────────────────────────────────────────
-
-describe("ComposerToolbar — block format insertion", () => {
-  it("wraps multiline selection in code fence", async () => {
+  it("direct bold closes format dropdown if it is open", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft={"line1\nline2\nline3"} />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(0, 17); // select all
     await user.click(screen.getByTestId("toolbar-format-btn"));
-    await user.click(screen.getByTestId("fmt-codeblock"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
 
-    expect(ta).toHaveValue("```\nline1\nline2\nline3\n```");
-  });
+    await user.click(screen.getByTestId("fmt-bold"));
 
-  it("cursor posicionado dentro do bloco de código (após a cerca de abertura)", async () => {
-    const user = userEvent.setup();
-    render(<TestWrapper initialDraft="hello" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
-
-    ta.setSelectionRange(0, 5);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    await user.click(screen.getByTestId("fmt-codeblock"));
-
-    expect(ta).toHaveValue("```\nhello\n```");
-    // Cursor must be inside the fence (after "```\n"), not selecting the markers.
-    await waitFor(() => {
-      expect(ta.selectionStart).toBe(4);
-      expect(ta.selectionEnd).toBe(4);
-    });
-  });
-
-  it("expande até limites de linha — inserção no meio da linha (ul)", async () => {
-    const user = userEvent.setup();
-    render(<TestWrapper initialDraft="prefix hello suffix" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
-
-    ta.setSelectionRange(7, 12); // select "hello" — mid-line
-    await user.click(screen.getByTestId("fmt-ul"));
-
-    // Entire line must be prefixed, not just "hello".
-    expect(ta).toHaveValue("- prefix hello suffix");
-  });
-
-  it("prefixes each selected line with '- ' for ul", async () => {
-    const user = userEvent.setup();
-    render(<TestWrapper initialDraft={"item1\nitem2\nitem3"} />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
-
-    ta.setSelectionRange(0, 17);
-    await user.click(screen.getByTestId("fmt-ul"));
-
-    expect(ta).toHaveValue("- item1\n- item2\n- item3");
-  });
-
-  it("prefixes each selected line with numbered prefix for ol", async () => {
-    const user = userEvent.setup();
-    render(<TestWrapper initialDraft={"alpha\nbeta"} />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
-
-    ta.setSelectionRange(0, 10);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    await user.click(screen.getByTestId("fmt-ol"));
-
-    expect(ta).toHaveValue("1. alpha\n2. beta");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 });
 
@@ -181,7 +171,8 @@ describe("ComposerToolbar — block format insertion", () => {
 describe("ComposerToolbar — keyboard accessibility", () => {
   it("Escape closes format menu and returns focus to format button", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper />);
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
     const btn = screen.getByTestId("toolbar-format-btn");
 
     await user.click(btn);
@@ -195,7 +186,8 @@ describe("ComposerToolbar — keyboard accessibility", () => {
 
   it("Escape closes emoji picker and returns focus to emoji button", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper />);
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
     const btn = screen.getByTestId("toolbar-emoji-btn");
 
     await user.click(btn);
@@ -207,80 +199,64 @@ describe("ComposerToolbar — keyboard accessibility", () => {
     expect(document.activeElement).toBe(btn);
   });
 
-  it("seleção obsoleta — reabrir menu usa posição atual do cursor, não posição antiga", async () => {
-    const user = userEvent.setup();
-    render(<TestWrapper initialDraft="abcde" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
-
-    // Open format dropdown with "abc" selected (tests savedSel for dropdown).
-    ta.setSelectionRange(0, 3);
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-
-    // Close via Escape (clears savedSel).
-    await user.keyboard("{Escape}");
-
-    // Move cursor to "de" and click direct bold button.
-    // onPointerDown on fmt-bold snapshots fresh selection {s:3,e:5}.
-    ta.setSelectionRange(3, 5);
-    await user.click(screen.getByTestId("fmt-bold"));
-
-    // Must have wrapped "de", not "abc".
-    expect(ta).toHaveValue("abc**de**");
-  });
-
-  it("direct bold closes format dropdown if it is open", async () => {
-    const user = userEvent.setup();
-    render(<TestWrapper initialDraft="texto" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
-
-    // Open the format dropdown.
-    await user.click(screen.getByTestId("toolbar-format-btn"));
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-
-    // Click the direct bold button — must close the dropdown AND apply bold.
-    ta.setSelectionRange(0, 5);
-    await user.click(screen.getByTestId("fmt-bold"));
-
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-    expect(ta).toHaveValue("**texto**");
-  });
-
   it("direct bold closes emoji picker if it is open", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="texto" />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
 
-    // Open the emoji picker.
     await user.click(screen.getByTestId("toolbar-emoji-btn"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
 
-    // Click the direct bold button — must close the picker AND apply bold.
-    ta.setSelectionRange(0, 5);
     await user.click(screen.getByTestId("fmt-bold"));
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(ta).toHaveValue("**texto**");
+  });
+
+  it("handleFormat via dropdown item closes emoji picker AND applies formatting (closeAll path)", async () => {
+    const user = userEvent.setup();
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
+
+    // Open emoji picker first.
+    await user.click(screen.getByTestId("toolbar-emoji-btn"));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    // Open format dropdown while emoji picker is still open.
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    // Click a dropdown format item — calls handleFormat → closeAll().
+    await user.click(screen.getByTestId("fmt-code"));
+
+    // closeAll() must have closed BOTH panels.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    // Formatting was applied.
+    expect(chain.toggleCode).toHaveBeenCalled();
+    expect(chain.run).toHaveBeenCalled();
   });
 });
 
 // ── Emoji insertion ───────────────────────────────────────────────────────────
 
 describe("ComposerToolbar — emoji insertion", () => {
-  it("inserts emoji at cursor position", async () => {
+  it("inserts emoji via editor.chain().insertContent()", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper initialDraft="Olá " />);
-    const ta = screen.getByTestId("ta") as HTMLTextAreaElement;
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
 
-    ta.setSelectionRange(4, 4);
     await user.click(screen.getByTestId("toolbar-emoji-btn"));
     await user.click(screen.getByText("😀"));
 
-    expect(ta).toHaveValue("Olá 😀");
+    expect(chain.insertContent).toHaveBeenCalledWith("😀");
+    expect(chain.run).toHaveBeenCalled();
   });
 
   it("closes emoji picker after inserting", async () => {
     const user = userEvent.setup();
-    render(<TestWrapper />);
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+
     await user.click(screen.getByTestId("toolbar-emoji-btn"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
 
@@ -293,68 +269,134 @@ describe("ComposerToolbar — emoji insertion", () => {
 
 describe("ComposerToolbar — disabled state", () => {
   it("disables format, emoji and direct-format buttons when disabled=true", () => {
-    render(
-      <div>
-        <textarea ref={() => {}} data-testid="ta" />
-        <ComposerToolbar
-          textareaRef={{ current: null } as unknown as RefObject<HTMLTextAreaElement | null>}
-          setDraft={() => {}}
-          disabled
-        />
-      </div>,
-    );
+    const { editor } = createMockEditor();
+    renderToolbar(editor, true);
 
     expect(screen.getByTestId("toolbar-format-btn")).toBeDisabled();
     expect(screen.getByTestId("toolbar-emoji-btn")).toBeDisabled();
     expect(screen.getByTestId("fmt-bold")).toBeDisabled();
     expect(screen.getByTestId("fmt-italic")).toBeDisabled();
     expect(screen.getByTestId("fmt-ul")).toBeDisabled();
-    // ponytail: link/attach/mic removed — add back when the backing RF lands.
   });
 });
 
-// ── Null textareaRef defensive paths ─────────────────────────────────────────
+// ── Null editor defensive paths ───────────────────────────────────────────────
 
-describe("ComposerToolbar — null textareaRef", () => {
-  // Covers: `if (ta)` false branch in snapSel, `if (!ta) return` true in insert.
-  it("does not throw and does not call setDraft when textareaRef is null on format", async () => {
+describe("ComposerToolbar — null editor", () => {
+  it("does not throw when editor is null and bold button is clicked", async () => {
     const user = userEvent.setup();
-    const mockSetDraft = vi.fn();
-    render(
-      <div>
-        <ComposerToolbar
-          textareaRef={{ current: null } as RefObject<HTMLTextAreaElement | null>}
-          setDraft={mockSetDraft}
-          disabled={false}
-        />
-      </div>,
-    );
+    renderToolbar(null);
 
-    // Direct bold button — no dropdown needed.
-    await user.click(screen.getByTestId("fmt-bold"));
-    // insert() returns early — setDraft never called.
-    expect(mockSetDraft).not.toHaveBeenCalled();
+    // Should not throw — editor?.chain() safely short-circuits
+    await expect(user.click(screen.getByTestId("fmt-bold"))).resolves.toBeUndefined();
   });
 
-  // Covers: `if (!ta) return` true branch in handleEmoji.
-  it("does not throw and does not call setDraft when textareaRef is null on emoji", async () => {
+  it("does not throw when editor is null and emoji is inserted", async () => {
     const user = userEvent.setup();
-    const mockSetDraft = vi.fn();
-    render(
-      <div>
-        <ComposerToolbar
-          textareaRef={{ current: null } as RefObject<HTMLTextAreaElement | null>}
-          setDraft={mockSetDraft}
-          disabled={false}
-        />
-      </div>,
-    );
+    renderToolbar(null);
 
     await user.click(screen.getByTestId("toolbar-emoji-btn"));
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await expect(user.click(screen.getByText("😀"))).resolves.toBeUndefined();
+  });
 
-    await user.click(screen.getByText("😀"));
-    // handleEmoji returns early — setDraft never called.
-    expect(mockSetDraft).not.toHaveBeenCalled();
+  it("does not throw when editor is null and dropdown item is clicked", async () => {
+    const user = userEvent.setup();
+    renderToolbar(null);
+
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+    await expect(user.click(screen.getByTestId("fmt-code"))).resolves.toBeUndefined();
+  });
+});
+
+// ── Aria attributes ───────────────────────────────────────────────────────────
+
+describe("ComposerToolbar — aria attributes", () => {
+  it("format button has aria-label", () => {
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+    expect(screen.getByTestId("toolbar-format-btn")).toHaveAttribute(
+      "aria-label",
+      "Mais formatações",
+    );
+  });
+
+  it("format button aria-expanded reflects dropdown state", async () => {
+    const user = userEvent.setup();
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+    const btn = screen.getByTestId("toolbar-format-btn");
+
+    expect(btn).toHaveAttribute("aria-expanded", "false");
+    await user.click(btn);
+    expect(btn).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("direct buttons have accessible aria-labels", () => {
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+    expect(screen.getByTestId("fmt-bold")).toHaveAttribute("aria-label", "Negrito");
+    expect(screen.getByTestId("fmt-italic")).toHaveAttribute("aria-label", "Itálico");
+    expect(screen.getByTestId("fmt-ul")).toHaveAttribute("aria-label", "Lista");
+  });
+
+  it("first focus moves to first dropdown item after opening", async () => {
+    const user = userEvent.setup();
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+
+    await user.click(screen.getByTestId("toolbar-format-btn"));
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByTestId("fmt-code"));
+    });
+  });
+});
+
+// ── Real editor integration ───────────────────────────────────────────────────
+//
+// These tests use an actual TipTap Editor instance in JSDOM to verify that
+// toolbar buttons genuinely apply marks/nodes to the document — not just that
+// they call the right chain methods.
+
+describe("ComposerToolbar — real editor integration", () => {
+  let realEditor: InstanceType<typeof Editor>;
+  let mountDiv: HTMLDivElement;
+
+  afterEach(() => {
+    realEditor?.destroy();
+    mountDiv?.remove();
+  });
+
+  function createRealEditor(content = "<p>hello</p>") {
+    mountDiv = document.createElement("div");
+    document.body.appendChild(mountDiv);
+    realEditor = new Editor({
+      element: mountDiv,
+      extensions: createChatEditorExtensions(), // production config
+      content,
+    });
+    return realEditor;
+  }
+
+  it("bold button applies bold mark to selected text in real editor", async () => {
+    const user = userEvent.setup();
+    const editor = createRealEditor();
+    editor.commands.selectAll();
+
+    render(<ComposerToolbar editor={editor} />);
+    await user.click(screen.getByTestId("fmt-bold"));
+
+    expect(editor.isActive("bold")).toBe(true);
+  });
+
+  it("italic button applies italic mark to selected text in real editor", async () => {
+    const user = userEvent.setup();
+    const editor = createRealEditor();
+    editor.commands.selectAll();
+
+    render(<ComposerToolbar editor={editor} />);
+    await user.click(screen.getByTestId("fmt-italic"));
+
+    expect(editor.isActive("italic")).toBe(true);
   });
 });

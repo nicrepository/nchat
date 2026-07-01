@@ -48,6 +48,7 @@ export type ActiveItem = { kind: "channel"; id: string } | { kind: "dm"; id: str
 
 export type MessageKind = "user" | "system";
 export type MessageStatus = "active" | "deleted";
+export type MessageBodyFormat = "v1" | "v2";
 
 export interface Message {
   id: string;
@@ -57,6 +58,7 @@ export interface Message {
   kind: MessageKind;
   /** Only present when status is "active". Empty for removed messages. */
   bodyText: string;
+  bodyFormat: MessageBodyFormat;
   isRemoved: boolean;
   status: MessageStatus;
   createdAt: string; // ISO 8601

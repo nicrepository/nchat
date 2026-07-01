@@ -49,6 +49,7 @@ type MessagePayload struct {
 	SenderDisplayName string     `json:"sender_display_name"`
 	Kind              string     `json:"kind"`
 	BodyText          string     `json:"body_text"`
+	BodyFormat        string     `json:"body_format"`
 	Status            string     `json:"status"`
 	IsRemoved         bool       `json:"is_removed"`
 	CreatedAt         time.Time  `json:"created_at"`

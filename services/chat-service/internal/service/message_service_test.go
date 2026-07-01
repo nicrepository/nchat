@@ -107,6 +107,7 @@ func TestMessageService_CreateChannelMessage_PublicChannelActiveWorkspaceMemberS
 	got, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
 		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
 			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "hello",
+			BodyFormat: domain.MessageBodyFormatV2,
 		})
 	if err != nil {
 		t.Fatalf("CreateChannelMessage: %v", err)
@@ -119,6 +120,35 @@ func TestMessageService_CreateChannelMessage_PublicChannelActiveWorkspaceMemberS
 	}
 	if channels.getVisibleByIDCalls != 1 {
 		t.Fatalf("expected one visibility check, got %d", channels.getVisibleByIDCalls)
+	}
+	if msgs.lastCreateInput.BodyFormat != domain.MessageBodyFormatV2 {
+		t.Fatalf("expected v2 forwarded to storage, got %q", msgs.lastCreateInput.BodyFormat)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_RejectsUnknownBodyFormat(t *testing.T) {
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{})
+	_, err := svc.CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "hello",
+		BodyFormat: "v3",
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_DefaultsMissingBodyFormatToV1(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-legacy"}}
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "legacy",
+		})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
+	}
+	if msgs.lastCreateInput.BodyFormat != domain.MessageBodyFormatV1 {
+		t.Fatalf("expected missing format to default to v1, got %q", msgs.lastCreateInput.BodyFormat)
 	}
 }
 

@@ -106,6 +106,7 @@ func testMessage() domain.Message {
 		SenderID:    msgTestUserID,
 		Kind:        domain.MessageKindUser,
 		BodyText:    "hello",
+		BodyFormat:  domain.MessageBodyFormatV1,
 		Status:      domain.MessageStatusActive,
 		CreatedAt:   testNow(),
 		UpdatedAt:   testNow(),
@@ -200,6 +201,9 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	if len(msgsArr) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgsArr))
 	}
+	if got := msgsArr[0].(map[string]any)["body_format"]; got != "v1" {
+		t.Fatalf("expected legacy body_format v1, got %v", got)
+	}
 }
 
 func TestMessageHandler_ListChannelMessages_EmptyListReturnsEmptyArray(t *testing.T) {
@@ -275,6 +279,37 @@ func TestMessageHandler_CreateChannelMessage_Success(t *testing.T) {
 	h.CreateChannelMessage(rec, r)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMessageHandler_CreateChannelMessage_AcceptsV2Format(t *testing.T) {
+	msg := testMessage()
+	msg.BodyFormat = domain.MessageBodyFormatV2
+	msgs := &fakeMessageProvider{createdMsg: msg}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"hello","body_format":"v2"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for v2, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	if msgs.lastCreateChannelInput.BodyFormat != domain.MessageBodyFormatV2 {
+		t.Fatalf("expected v2 forwarded to service, got %q", msgs.lastCreateChannelInput.BodyFormat)
+	}
+}
+
+func TestMessageHandler_CreateChannelMessage_RejectsUnknownFormat(t *testing.T) {
+	msgs := &fakeMessageProvider{createChErr: domain.ErrInvalidInput}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"hello","body_format":"v3"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown body format, got %d", rec.Code)
 	}
 }
 

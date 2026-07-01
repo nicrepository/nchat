@@ -81,6 +81,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   senderEmail: "alice@example.com",
   kind: "user",
   bodyText: "Hello from WS",
+  bodyFormat: "v1",
   isRemoved: false,
   status: "active",
   createdAt: new Date().toISOString(),
@@ -96,6 +97,7 @@ const makePayload = (overrides: Partial<WSMessagePayload> = {}): WSMessagePayloa
   sender_email: "alice@example.com",
   kind: "user",
   body_text: "Hello from WS",
+  body_format: "v2",
   is_removed: false,
   status: "active",
   created_at: new Date().toISOString(),
@@ -170,6 +172,7 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0].id).toBe("msg-payload-ch");
     expect(result.current.state.messages[0].senderDisplayName).toBe("Alice");
     expect(result.current.state.messages[0].bodyText).toBe("Hello from WS");
+    expect(result.current.state.messages[0].bodyFormat).toBe("v2");
     // Payload path must NOT call fetchChannelMessage.
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
     expect(result.current.state.lastMutation).toBe("ws_append");

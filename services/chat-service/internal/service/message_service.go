@@ -42,6 +42,7 @@ type CreateChannelMessageInput struct {
 	ChannelID              string
 	SenderID               string
 	BodyText               string
+	BodyFormat             domain.MessageBodyFormat
 	ParentMessageID        string
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
@@ -54,6 +55,7 @@ type CreateDMMessageInput struct {
 	ConversationID         string
 	SenderID               string
 	BodyText               string
+	BodyFormat             domain.MessageBodyFormat
 	ParentMessageID        string
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
@@ -167,6 +169,10 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	if err := validateMessageBody(body); err != nil {
 		return domain.Message{}, err
 	}
+	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
+	if err != nil {
+		return domain.Message{}, err
+	}
 
 	// SQL-enforce channel visibility: workspace active + workspace member active +
 	// channel active + private-channel membership. Returns ErrNotFound for all
@@ -194,6 +200,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		SenderID:               senderID,
 		Kind:                   domain.MessageKindUser,
 		BodyText:               body,
+		BodyFormat:             bodyFormat,
 		ParentMessageID:        parentID,
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
@@ -219,6 +226,10 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		return domain.Message{}, fmt.Errorf("%w: workspace_id, conversation_id, and sender_id are required", domain.ErrInvalidInput)
 	}
 	if err := validateMessageBody(body); err != nil {
+		return domain.Message{}, err
+	}
+	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
+	if err != nil {
 		return domain.Message{}, err
 	}
 
@@ -248,6 +259,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		SenderID:               senderID,
 		Kind:                   domain.MessageKindUser,
 		BodyText:               body,
+		BodyFormat:             bodyFormat,
 		ParentMessageID:        parentID,
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
@@ -392,6 +404,16 @@ func validateMessageBody(body string) error {
 		return fmt.Errorf("%w: body_text exceeds maximum length of %d characters", domain.ErrInvalidInput, maxMessageBodyRunes)
 	}
 	return nil
+}
+
+func normalizeBodyFormat(format domain.MessageBodyFormat) (domain.MessageBodyFormat, error) {
+	if format == "" {
+		return domain.MessageBodyFormatV1, nil
+	}
+	if format != domain.MessageBodyFormatV1 && format != domain.MessageBodyFormatV2 {
+		return "", fmt.Errorf("%w: unsupported body_format", domain.ErrInvalidInput)
+	}
+	return format, nil
 }
 
 // GetChannelMessage returns a single channel message visible to the caller.

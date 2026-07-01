@@ -22,6 +22,14 @@ const (
 	MessageStatusDeleted MessageStatus = "deleted"
 )
 
+// MessageBodyFormat selects the grammar used to render BodyText.
+type MessageBodyFormat string
+
+const (
+	MessageBodyFormatV1 MessageBodyFormat = "v1"
+	MessageBodyFormatV2 MessageBodyFormat = "v2"
+)
+
 // Message is a single message posted to a channel or a DM conversation.
 //
 // Exactly one of ChannelID and DMConversationID is non-empty; the other is
@@ -38,6 +46,7 @@ type Message struct {
 	SenderID               string
 	Kind                   MessageKind
 	BodyText               string
+	BodyFormat             MessageBodyFormat
 	Status                 MessageStatus
 	ParentMessageID        string
 	ForwardedFromMessageID string

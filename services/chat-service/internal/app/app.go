@@ -181,6 +181,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		SenderDisplayName: msg.SenderDisplayName,
 		Kind:              string(msg.Kind),
 		BodyText:          msg.BodyText,
+		BodyFormat:        string(msg.BodyFormat),
 		Status:            string(msg.Status),
 		IsRemoved:         deletedAt != nil,
 		CreatedAt:         msg.CreatedAt,

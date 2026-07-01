@@ -25,6 +25,58 @@ describe("RichTextRenderer", () => {
     expect(em?.textContent).toBe("world");
   });
 
+  it("renders canonical bold+italic with both marks", () => {
+    const { container } = render(<RichTextRenderer text="***world***" bodyFormat="v2" />);
+    expect(container.querySelector("strong > em")?.textContent).toBe("world");
+  });
+
+  it.each([
+    [String.raw`\*nao italico\*`, "*nao italico*"],
+    [String.raw`\*\*nao bold\*\*`, "**nao bold**"],
+    [String.raw`\`nao codigo\``, "`nao codigo`"],
+    [String.raw`\`\`\``, "```"],
+    [String.raw`\- nao lista`, "- nao lista"],
+    [String.raw`1\. nao ordenada`, "1. nao ordenada"],
+    [String.raw`barra\\literal`, String.raw`barra\literal`],
+    [String.raw`\_literal\_`, "_literal_"],
+  ])("renders escaped marker text literally: %s", (stored, visible) => {
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
+    expect(container.textContent).toBe(visible);
+    expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
+  });
+
+  it.each([
+    [String.raw`regex /\*/`, String.raw`regex /\*/`],
+    [String.raw`literal \_ underscore`, String.raw`literal \_ underscore`],
+    [String.raw`version 1\.2`, String.raw`version 1\.2`],
+    [String.raw`double \\ slash`, String.raw`double \\ slash`],
+  ])("preserves legacy v1 backslashes exactly: %s", (stored, visible) => {
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v1" />);
+    expect(container.textContent).toBe(visible);
+  });
+
+  it("preserves regex source inside a legacy fenced code block", () => {
+    const text = "```\n" + String.raw`const stars = /\*/g;` + "\n```";
+    const { container } = render(<RichTextRenderer text={text} bodyFormat="v1" />);
+    expect(container.querySelector("pre")?.textContent).toBe(String.raw`const stars = /\*/g;`);
+  });
+
+  it("keeps v1 backslashes while applying the legacy marker grammar", () => {
+    const { container } = render(
+      <RichTextRenderer text={String.raw`\*legacy\*`} bodyFormat="v1" />,
+    );
+    expect(container.querySelector("em")?.textContent).toBe("legacy\\");
+    expect(container.textContent).toBe("\\legacy\\");
+  });
+
+  it("keeps legacy indented lines as text instead of nested lists", () => {
+    const { container } = render(
+      <RichTextRenderer text={"before\n  - indented legacy text"} bodyFormat="v1" />,
+    );
+    expect(container.querySelector("ul, ol")).toBeNull();
+    expect(container.textContent).toContain("  - indented legacy text");
+  });
+
   it("renders inline code correctly", () => {
     const { container } = render(<RichTextRenderer text="Run `npm install` now" />);
     const code = container.querySelector("code");
