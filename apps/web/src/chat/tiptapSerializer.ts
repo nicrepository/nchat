@@ -27,6 +27,7 @@ export interface TTNode {
   type?: string;
   text?: string;
   marks?: Array<{ type: string }>;
+  attrs?: Record<string, unknown>;
   content?: TTNode[];
 }
 
@@ -74,7 +75,7 @@ function serializeListItemContent(item: TTNode): string {
     .filter((block) => block.type !== "bulletList" && block.type !== "orderedList")
     .map((block) => {
       if (block.type === "codeBlock")
-        return CODE_MARKER + escapeRichText(textContent(block)) + CODE_MARKER;
+        throw new Error("codeBlock inside listItem is not supported by the chat schema");
       return serializeInline(block.content ?? []);
     })
     .filter(Boolean)
@@ -88,9 +89,11 @@ function textContent(node: TTNode): string {
 
 function serializeList(node: TTNode, depth: number): string {
   const type: ListType = node.type === "orderedList" ? "ol" : "ul";
+  const requestedStart = Number(node.attrs?.start ?? 1);
+  const start = Number.isInteger(requestedStart) && requestedStart > 0 ? requestedStart : 1;
   return (node.content ?? [])
     .map((item, index) => {
-      const line = formatListLine(type, depth, index, serializeListItemContent(item));
+      const line = formatListLine(type, depth, index, serializeListItemContent(item), start);
       const children = (item.content ?? [])
         .filter((block) => block.type === "bulletList" || block.type === "orderedList")
         .map((child) => serializeList(child, depth + 1));

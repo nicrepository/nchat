@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import "./App.css";
@@ -8,9 +9,10 @@ import LoginPage from "./auth/LoginPage";
 import OIDCCallbackPage from "./auth/OIDCCallbackPage";
 import RequireAuth from "./auth/RequireAuth";
 import ResetPasswordPage from "./auth/ResetPasswordPage";
-import ChatMessageArea from "./chat/ChatMessageArea";
 import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
+
+const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 
 export default function App() {
   return (
@@ -32,8 +34,22 @@ export default function App() {
           }
         >
           <Route index element={<ChatPlaceholder />} />
-          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
-          <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          <Route
+            path="channel/:id"
+            element={
+              <Suspense fallback={null}>
+                <ChatMessageArea kind="channel" />
+              </Suspense>
+            }
+          />
+          <Route
+            path="dm/:id"
+            element={
+              <Suspense fallback={null}>
+                <ChatMessageArea kind="dm" />
+              </Suspense>
+            }
+          />
         </Route>
 
         {/* ── Admin ─────────────────────────────────────────────────── */}

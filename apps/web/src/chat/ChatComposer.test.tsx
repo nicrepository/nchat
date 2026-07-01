@@ -51,7 +51,7 @@ describe("ChatComposer clipboard round-trip", () => {
     await paste("<p><strong><em>both</em></strong></p>", "both");
 
     const stored = await send(onSend);
-    const { container } = render(<RichTextRenderer text={stored} />);
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
 
     expect(stored).toBe("***both***");
     expect(container.querySelector("strong > em")?.textContent).toBe("both");
@@ -65,7 +65,7 @@ describe("ChatComposer clipboard round-trip", () => {
     );
 
     const stored = await send(onSend);
-    const { container } = render(<RichTextRenderer text={stored} />);
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
 
     expect(stored).toBe("- parent\n  1. child\n    - grandchild");
     expect(container.querySelector("ul > li > ol > li > ul > li")?.textContent).toBe("grandchild");
@@ -76,7 +76,7 @@ describe("ChatComposer clipboard round-trip", () => {
     await paste("<p>safe<script>alert(1)</script></p>", "safe");
 
     const stored = await send(onSend);
-    const { container } = render(<RichTextRenderer text={stored} />);
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
 
     expect(stored).toBe("safe");
     expect(container.querySelector("script")).toBeNull();

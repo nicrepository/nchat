@@ -55,7 +55,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<p><strong>hello</strong></p>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("**hello**");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.querySelector("strong")?.textContent).toBe("hello");
   });
 
@@ -63,7 +63,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<p><em>world</em></p>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("*world*");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.querySelector("em")?.textContent).toBe("world");
   });
 
@@ -71,7 +71,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<p><code>npm i</code></p>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("`npm i`");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.querySelector("code")?.textContent).toBe("npm i");
   });
 
@@ -79,7 +79,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<pre><code>const x = 1;</code></pre>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("```\nconst x = 1;\n```");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.querySelector("pre")?.textContent).toContain("const x = 1;");
   });
 
@@ -87,7 +87,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<ul><li><p>alpha</p></li><li><p>beta</p></li></ul>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("- alpha\n- beta");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     const items = container.querySelectorAll("li");
     expect(items.length).toBe(2);
     expect(items[0].textContent).toBe("alpha");
@@ -98,7 +98,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<ol><li><p>first</p></li><li><p>second</p></li></ol>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("1. first\n2. second");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.querySelector("ol")).not.toBeNull();
     expect(container.querySelectorAll("li").length).toBe(2);
   });
@@ -106,7 +106,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
   it("plain text passes through unchanged", () => {
     const editor = createEditor("<p>just text</p>");
     const md = tiptapDocToMarkdown(editor.getJSON());
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.textContent).toContain("just text");
     expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
   });
@@ -115,7 +115,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
     const editor = createEditor("<p><strong><em>hello</em></strong></p>");
     const md = tiptapDocToMarkdown(editor.getJSON());
     expect(md).toBe("***hello***");
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
     expect(container.querySelector("strong > em")?.textContent).toBe("hello");
   });
 
@@ -129,7 +129,7 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
   ])("literal marker round-trips unchanged: %s", (literal) => {
     const editor = createEditor(`<p>${literal}</p>`);
     const md = tiptapDocToMarkdown(editor.getJSON());
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
 
     expect(container.textContent).toBe(literal);
     expect(container.querySelector("strong, em, code, pre, ul, ol")).toBeNull();
@@ -140,10 +140,28 @@ describe("full codec round-trip: editor → Markdown → RichTextRenderer", () =
       "<ul><li><p>parent</p><ol><li><p>child</p><ul><li><p>grandchild</p></li></ul></li></ol></li></ul>",
     );
     const md = tiptapDocToMarkdown(editor.getJSON());
-    const { container } = render(<RichTextRenderer text={md} />);
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
 
     expect(md).toBe("- parent\n  1. child\n    - grandchild");
     expect(container.querySelector("ul > li > ol > li > ul > li")?.textContent).toBe("grandchild");
+  });
+
+  it("preserves an ordered list starting at 3 through storage and rendering", () => {
+    const editor = createEditor('<ol start="3"><li><p>third</p></li><li><p>fourth</p></li></ol>');
+    const md = tiptapDocToMarkdown(editor.getJSON());
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v2" />);
+
+    expect(md).toBe("3. third\n4. fourth");
+    expect(container.querySelector("ol")).toHaveAttribute("start", "3");
+  });
+
+  it("normalizes pasted code blocks out of list items without losing their text", () => {
+    const editor = createEditor("<ul><li><p>item</p><pre><code>a\nb</code></pre></li></ul>");
+    const json = editor.getJSON();
+    const listItem = json.content?.[0]?.content?.[0];
+
+    expect(listItem?.content?.some((node) => node.type === "codeBlock")).toBe(false);
+    expect(editor.getText()).toContain("a\nb");
   });
 });
 

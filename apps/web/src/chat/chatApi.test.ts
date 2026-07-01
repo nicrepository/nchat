@@ -329,11 +329,18 @@ describe("fetchChannelMessages", () => {
       senderId: "user-abc",
       kind: "user",
       bodyText: "Olá",
+      bodyFormat: "v1",
       isRemoved: false,
       status: "active",
       createdAt: "2024-01-15T10:00:00Z",
       updatedAt: "2024-01-15T10:00:00Z",
     });
+  });
+
+  it("maps an explicit v2 body format", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v2" })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].bodyFormat).toBe("v2");
   });
 
   it("returns nextCursor from response", async () => {
@@ -456,12 +463,12 @@ describe("postChannelMessage", () => {
     );
   });
 
-  it("sends body_text in JSON payload", async () => {
+  it("sends body_text as format v2 in JSON payload", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     await postChannelMessage("geral", "Hello world");
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(options.body as string) as Record<string, unknown>;
-    expect(body).toEqual({ body_text: "Hello world" });
+    expect(body).toEqual({ body_text: "Hello world", body_format: "v2" });
   });
 
   it("does not include author_id in payload", async () => {
@@ -507,12 +514,12 @@ describe("postDMMessage", () => {
     expect(url).toContain("/dm/dm%20user%2F1/messages");
   });
 
-  it("sends body_text in JSON payload", async () => {
+  it("sends body_text as format v2 in JSON payload", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     await postDMMessage("dm-juliane", "Mensagem direta");
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(options.body as string) as Record<string, unknown>;
-    expect(body).toEqual({ body_text: "Mensagem direta" });
+    expect(body).toEqual({ body_text: "Mensagem direta", body_format: "v2" });
   });
 
   it("does not include author_id in payload", async () => {

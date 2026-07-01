@@ -144,6 +144,20 @@ describe("tiptapDocToMarkdown — block nodes", () => {
     );
   });
 
+  it("preserves an ordered list start attribute", () => {
+    const list = orderedList("third", "fourth");
+    list.attrs = { start: 3 };
+    expect(tiptapDocToMarkdown(doc(list))).toBe("3. third\n4. fourth");
+  });
+
+  it("rejects a code block inside a list item instead of flattening it", () => {
+    const list: TTNode = {
+      type: "bulletList",
+      content: [{ type: "listItem", content: [para(text("item")), codeBlock("a\nb")] }],
+    };
+    expect(() => tiptapDocToMarkdown(doc(list))).toThrow(/codeBlock.*listItem/);
+  });
+
   it("paragraph followed by bullet list", () => {
     const result = tiptapDocToMarkdown(doc(para(text("intro")), bulletList("a", "b")));
     expect(result).toBe("intro\n- a\n- b");

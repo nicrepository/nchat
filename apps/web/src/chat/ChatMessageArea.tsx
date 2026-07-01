@@ -274,7 +274,11 @@ function MessageBubble({ message, isMine = false, isGrouped = false }: MessageBu
         <div
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
-          {message.isRemoved ? "Mensagem removida." : <RichTextRenderer text={message.bodyText} />}
+          {message.isRemoved ? (
+            "Mensagem removida."
+          ) : (
+            <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
+          )}
         </div>
       </div>
     </div>

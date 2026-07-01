@@ -200,3 +200,20 @@ func TestChatMigration_MessagesDownDoesNotDropSchemaCascade(t *testing.T) {
 		}
 	}
 }
+
+func TestChatMigration_AddsVersionedMessageBodyFormat(t *testing.T) {
+	migration := readChatMigration(t, "000005_chat_message_body_format.up.sql")
+	for _, expected := range []string{
+		"ADD COLUMN body_format",
+		"NOT NULL DEFAULT 'v1'",
+		"CHECK (body_format IN ('v1', 'v2'))",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("body format migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000005_chat_message_body_format.down.sql")
+	if !strings.Contains(down, "DROP COLUMN IF EXISTS body_format") {
+		t.Fatal("body format down migration must remove body_format")
+	}
+}

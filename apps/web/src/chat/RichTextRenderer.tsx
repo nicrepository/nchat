@@ -6,17 +6,36 @@
 import { Fragment } from "react";
 import type { ReactNode } from "react";
 import {
+  BOLD_MARKER,
+  CODE_MARKER,
   INLINE_MARKERS,
+  ITALIC_MARKER,
+  LEGACY_INLINE_RE,
   findUnescapedMarker,
   isCodeFence,
+  parseLegacyListLine,
   parseListLine,
   unescapeRichText,
 } from "./richTextMarkers";
 import type { InlineMarkerType, ListType } from "./richTextMarkers";
+import type { MessageBodyFormat } from "./chatTypes";
 
 type InlineToken = string | { type: InlineMarkerType; text: string };
 
-function tokenizeInline(text: string): InlineToken[] {
+function tokenizeV1Inline(text: string): InlineToken[] {
+  return text.split(LEGACY_INLINE_RE).flatMap((chunk): InlineToken[] => {
+    if (!chunk) return [];
+    if (chunk.startsWith(BOLD_MARKER) && chunk.endsWith(BOLD_MARKER))
+      return [{ type: "bold", text: chunk.slice(BOLD_MARKER.length, -BOLD_MARKER.length) }];
+    if (chunk.startsWith(CODE_MARKER) && chunk.endsWith(CODE_MARKER))
+      return [{ type: "code", text: chunk.slice(CODE_MARKER.length, -CODE_MARKER.length) }];
+    if (chunk.startsWith(ITALIC_MARKER) && chunk.endsWith(ITALIC_MARKER))
+      return [{ type: "italic", text: chunk.slice(ITALIC_MARKER.length, -ITALIC_MARKER.length) }];
+    return [chunk];
+  });
+}
+
+function tokenizeV2Inline(text: string): InlineToken[] {
   const tokens: InlineToken[] = [];
   let plain = "";
   let i = 0;
@@ -56,6 +75,9 @@ function tokenizeInline(text: string): InlineToken[] {
   return tokens;
 }
 
+const tokenizeInline = (text: string, format: MessageBodyFormat): InlineToken[] =>
+  format === "v2" ? tokenizeV2Inline(text) : tokenizeV1Inline(text);
+
 function renderTokens(tokens: InlineToken[], keyPrefix: string): ReactNode[] {
   return tokens.map((token, index): ReactNode => {
     if (typeof token === "string") return token;
@@ -84,17 +106,19 @@ interface ListItemBlock {
 
 interface ListBlock {
   type: ListType;
+  start: number;
   items: ListItemBlock[];
 }
 
 type Block = { type: "code"; content: string } | ListBlock | { type: "para"; lines: string[] };
 
-function parseCodeFence(lines: string[], i: number): [Block, number] {
+function parseCodeFence(lines: string[], i: number, format: MessageBodyFormat): [Block, number] {
   const codeLines: string[] = [];
   i++;
   while (i < lines.length && !isCodeFence(lines[i])) codeLines.push(lines[i++]);
   if (i < lines.length) i++;
-  return [{ type: "code", content: unescapeRichText(codeLines.join("\n")) }, i];
+  const content = codeLines.join("\n");
+  return [{ type: "code", content: format === "v2" ? unescapeRichText(content) : content }, i];
 }
 
 function parseListBlock(
@@ -102,15 +126,18 @@ function parseListBlock(
   i: number,
   depth: number,
   type: ListType,
+  format: MessageBodyFormat,
 ): [ListBlock, number] {
   const items: ListItemBlock[] = [];
+  const parseLine = format === "v2" ? parseListLine : parseLegacyListLine;
+  const start = parseLine(lines[i])?.index ?? 1;
 
   while (i < lines.length) {
-    const line = parseListLine(lines[i]);
+    const line = parseLine(lines[i]);
     if (!line || line.depth < depth) break;
     if (line.depth > depth) {
       if (!items.length) break;
-      const [child, next] = parseListBlock(lines, i, line.depth, line.type);
+      const [child, next] = parseListBlock(lines, i, line.depth, line.type, format);
       items[items.length - 1].children.push(child);
       i = next;
       continue;
@@ -120,39 +147,44 @@ function parseListBlock(
     i++;
   }
 
-  return [{ type, items }, i];
+  return [{ type, start: format === "v2" ? start : 1, items }, i];
 }
 
-function parseParagraph(lines: string[], i: number): [{ type: "para"; lines: string[] }, number] {
+function parseParagraph(
+  lines: string[],
+  i: number,
+  format: MessageBodyFormat,
+): [{ type: "para"; lines: string[] }, number] {
   const paraLines: string[] = [];
-  while (i < lines.length && !isCodeFence(lines[i]) && !parseListLine(lines[i])) {
+  const parseLine = format === "v2" ? parseListLine : parseLegacyListLine;
+  while (i < lines.length && !isCodeFence(lines[i]) && !parseLine(lines[i])) {
     paraLines.push(lines[i++]);
   }
   return [{ type: "para", lines: paraLines }, i];
 }
 
-function parseBlocks(text: string): Block[] {
+function parseBlocks(text: string, format: MessageBodyFormat): Block[] {
   const lines = text.split("\n");
   const blocks: Block[] = [];
   let i = 0;
 
   while (i < lines.length) {
     if (isCodeFence(lines[i])) {
-      const [block, next] = parseCodeFence(lines, i);
+      const [block, next] = parseCodeFence(lines, i, format);
       blocks.push(block);
       i = next;
       continue;
     }
 
-    const listLine = parseListLine(lines[i]);
+    const listLine = (format === "v2" ? parseListLine : parseLegacyListLine)(lines[i]);
     if (listLine) {
-      const [block, next] = parseListBlock(lines, i, listLine.depth, listLine.type);
+      const [block, next] = parseListBlock(lines, i, listLine.depth, listLine.type, format);
       blocks.push(block);
       i = next;
       continue;
     }
 
-    const [paragraph, next] = parseParagraph(lines, i);
+    const [paragraph, next] = parseParagraph(lines, i, format);
     if (paragraph.lines.some((line) => line.length > 0)) blocks.push(paragraph);
     i = next;
   }
@@ -160,25 +192,29 @@ function parseBlocks(text: string): Block[] {
   return blocks;
 }
 
-function renderListItems(items: ListItemBlock[], keyPrefix: string): ReactNode[] {
+function renderListItems(
+  items: ListItemBlock[],
+  keyPrefix: string,
+  format: MessageBodyFormat,
+): ReactNode[] {
   return items.map((item, index) => (
     <li key={index}>
-      {renderTokens(tokenizeInline(item.text), `${keyPrefix}-${index}`)}
+      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`)}
       {item.children.map((child, childIndex) =>
-        renderList(child, `${keyPrefix}-${index}-${childIndex}`),
+        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format),
       )}
     </li>
   ));
 }
 
-function renderList(block: ListBlock, key: string): ReactNode {
-  const items = renderListItems(block.items, key);
+function renderList(block: ListBlock, key: string, format: MessageBodyFormat): ReactNode {
+  const items = renderListItems(block.items, key, format);
   return block.type === "ul" ? (
     <ul key={key} className="rtr-list">
       {items}
     </ul>
   ) : (
-    <ol key={key} className="rtr-list">
+    <ol key={key} className="rtr-list" start={block.start}>
       {items}
     </ol>
   );
@@ -186,14 +222,15 @@ function renderList(block: ListBlock, key: string): ReactNode {
 
 export interface RichTextRendererProps {
   text: string;
+  bodyFormat?: MessageBodyFormat;
 }
 
-export default function RichTextRenderer({ text }: RichTextRendererProps) {
+export default function RichTextRenderer({ text, bodyFormat = "v1" }: RichTextRendererProps) {
   if (!text) return null;
 
   return (
     <>
-      {parseBlocks(text).map((block, blockIndex) => {
+      {parseBlocks(text, bodyFormat).map((block, blockIndex) => {
         if (block.type === "code") {
           return (
             <pre key={blockIndex} className="rtr-code-block">
@@ -202,13 +239,13 @@ export default function RichTextRenderer({ text }: RichTextRendererProps) {
           );
         }
         if (block.type !== "para") {
-          return renderList(block, String(blockIndex));
+          return renderList(block, String(blockIndex), bodyFormat);
         }
         return (
           <Fragment key={blockIndex}>
             {block.lines.map((line, lineIndex, lines) => (
               <Fragment key={lineIndex}>
-                {renderTokens(tokenizeInline(line), `${blockIndex}-${lineIndex}`)}
+                {renderTokens(tokenizeInline(line, bodyFormat), `${blockIndex}-${lineIndex}`)}
                 {lineIndex < lines.length - 1 && <br />}
               </Fragment>
             ))}

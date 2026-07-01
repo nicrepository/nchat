@@ -75,6 +75,7 @@ type CreateMessageInput struct {
 	SenderID               string
 	Kind                   domain.MessageKind
 	BodyText               string
+	BodyFormat             domain.MessageBodyFormat
 	ParentMessageID        string
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
@@ -164,7 +165,7 @@ func messageColumns(alias string) string {
 	COALESCE(` + p + `channel_id::text, ''),
 	COALESCE(` + p + `dm_conversation_id::text, ''),
 	` + p + `sender_id::text,
-	` + p + `kind, ` + p + `body_text, ` + p + `status,
+	` + p + `kind, ` + p + `body_text, ` + p + `body_format, ` + p + `status,
 	COALESCE(` + p + `parent_message_id::text, ''),
 	COALESCE(` + p + `forwarded_from_message_id::text, ''),
 	COALESCE(` + p + `referenced_message_id::text, ''),
@@ -189,7 +190,7 @@ func scanMessageWithSender(row pgx.Row) (domain.Message, error) {
 		&msg.ID, &msg.WorkspaceID,
 		&msg.ChannelID, &msg.DMConversationID,
 		&msg.SenderID,
-		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.Status),
+		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
 		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 		&editedAt, &deletedAt,
 		&msg.CreatedAt, &msg.UpdatedAt,
@@ -219,6 +220,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	kind := input.Kind
 	if kind == "" {
 		kind = domain.MessageKindUser
+	}
+	bodyFormat := input.BodyFormat
+	if bodyFormat == "" {
+		bodyFormat = domain.MessageBodyFormatV1
 	}
 	// Authorization and reference integrity are enforced atomically in one INSERT.
 	//
@@ -250,14 +255,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		WITH invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
 			WHERE
-				($7::uuid IS NOT NULL AND NOT EXISTS (
-					SELECT 1 FROM chat.messages
-					WHERE id = $7::uuid
-					  AND workspace_id = $1::uuid
-					  AND channel_id IS NOT DISTINCT FROM $2::uuid
-					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
-				))
-				OR ($8::uuid IS NOT NULL AND NOT EXISTS (
+				($8::uuid IS NOT NULL AND NOT EXISTS (
 					SELECT 1 FROM chat.messages
 					WHERE id = $8::uuid
 					  AND workspace_id = $1::uuid
@@ -271,14 +269,21 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 					  AND channel_id IS NOT DISTINCT FROM $2::uuid
 					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
+				OR ($10::uuid IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM chat.messages
+					WHERE id = $10::uuid
+					  AND workspace_id = $1::uuid
+					  AND channel_id IS NOT DISTINCT FROM $2::uuid
+					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
+				))
 		),
 		inserted AS (
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, dm_conversation_id, sender_id,
-				 kind, body_text, status,
+				 kind, body_text, body_format, status,
 				 parent_message_id, forwarded_from_message_id, referenced_message_id)
-			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, 'active',
-			       $7::uuid, $8::uuid, $9::uuid
+			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, 'active',
+			       $8::uuid, $9::uuid, $10::uuid
 			FROM (
 				-- Channel message authorization branch.
 				SELECT 1
@@ -307,7 +312,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			) auth
 			WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
-			          kind, body_text, status,
+				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, deleted_at, created_at, updated_at
 		)
@@ -320,6 +325,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.SenderID,
 		string(kind),
 		input.BodyText,
+		string(bodyFormat),
 		nullableUUID(input.ParentMessageID),
 		nullableUUID(input.ForwardedFromMessageID),
 		nullableUUID(input.ReferencedMessageID),
@@ -555,7 +561,7 @@ func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Mess
 			&msg.ID, &msg.WorkspaceID,
 			&msg.ChannelID, &msg.DMConversationID,
 			&msg.SenderID,
-			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.Status),
+			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
 			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 			&editedAt, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,

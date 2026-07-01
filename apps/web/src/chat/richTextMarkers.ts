@@ -14,6 +14,9 @@ export const INLINE_MARKERS = [
   { type: "code", marker: CODE_MARKER },
 ] as const;
 
+// Exact v1 tokenizer used before symmetric escaping was introduced.
+export const LEGACY_INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/;
+
 export type InlineMarkerType = (typeof INLINE_MARKERS)[number]["type"];
 export type ListType = "ul" | "ol";
 
@@ -60,14 +63,21 @@ export function findUnescapedMarker(text: string, marker: string, from: number):
   return -1;
 }
 
-export function formatListLine(type: ListType, depth: number, index: number, text: string): string {
-  const marker = type === "ul" ? "- " : `${index + 1}. `;
+export function formatListLine(
+  type: ListType,
+  depth: number,
+  index: number,
+  text: string,
+  start = 1,
+): string {
+  const marker = type === "ul" ? "- " : `${start + index}. `;
   return LIST_INDENT.repeat(depth) + marker + text;
 }
 
 export interface ParsedListLine {
   depth: number;
   type: ListType;
+  index: number;
   text: string;
 }
 
@@ -77,8 +87,14 @@ export function parseListLine(line: string): ParsedListLine | null {
   return {
     depth: match[1].length / LIST_INDENT.length,
     type: match[2] ? "ul" : "ol",
+    index: match[3] ? Number(match[3]) : 1,
     text: match[4],
   };
+}
+
+export function parseLegacyListLine(line: string): ParsedListLine | null {
+  const parsed = parseListLine(line);
+  return parsed?.depth === 0 ? parsed : null;
 }
 
 export const isCodeFence = (line: string): boolean => line.startsWith(CODE_BLOCK_MARKER);

@@ -60,6 +60,7 @@ type messageJSON struct {
 	SenderEmail       string    `json:"sender_email,omitempty"`
 	Kind              string    `json:"kind"`
 	BodyText          string    `json:"body_text,omitempty"`
+	BodyFormat        string    `json:"body_format"`
 	IsRemoved         bool      `json:"is_removed,omitempty"`
 	Status            string    `json:"status"`
 	CreatedAt         time.Time `json:"created_at"`
@@ -75,9 +76,10 @@ type listMessagesResponseData struct {
 // ── Request shapes ────────────────────────────────────────────────────────────
 
 // createMessageRequest is the inbound body for POST message endpoints.
-// Only body_text is accepted. Any unrecognised field causes a 400.
+// Only body_text and body_format are accepted. Any unrecognised field causes a 400.
 type createMessageRequest struct {
-	BodyText string `json:"body_text"`
+	BodyText   string `json:"body_text"`
+	BodyFormat string `json:"body_format"`
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -138,6 +140,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		SenderDisplayName: m.SenderDisplayName,
 		SenderEmail:       m.SenderEmail,
 		Kind:              string(m.Kind),
+		BodyFormat:        string(m.BodyFormat),
 		Status:            string(m.Status),
 		CreatedAt:         m.CreatedAt,
 		UpdatedAt:         m.UpdatedAt,
@@ -255,6 +258,7 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 		ChannelID:   channelID,
 		SenderID:    userID, // always from auth context — never from body
 		BodyText:    req.BodyText,
+		BodyFormat:  domain.MessageBodyFormat(req.BodyFormat),
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -350,6 +354,7 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 		ConversationID: convID,
 		SenderID:       userID,
 		BodyText:       req.BodyText,
+		BodyFormat:     domain.MessageBodyFormat(req.BodyFormat),
 	})
 	if err != nil {
 		mapServiceError(w, err)

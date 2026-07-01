@@ -106,6 +106,7 @@ interface MessageResponse {
   sender_email?: string;
   kind: string;
   body_text?: string;
+  body_format?: string;
   is_removed?: boolean;
   status: string;
   created_at: string;
@@ -135,6 +136,7 @@ function mapMessage(r: MessageResponse): Message {
     senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
     bodyText: r.body_text ?? "",
+    bodyFormat: r.body_format === "v2" ? "v2" : "v1",
     isRemoved: r.is_removed ?? false,
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
@@ -176,7 +178,7 @@ export async function postChannelMessage(
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body_text: bodyText }),
+    body: JSON.stringify({ body_text: bodyText, body_format: "v2" }),
     signal,
   });
   return mapMessage(res.data);
@@ -203,7 +205,7 @@ export async function postDMMessage(
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body_text: bodyText }),
+    body: JSON.stringify({ body_text: bodyText, body_format: "v2" }),
     signal,
   });
   return mapMessage(res.data);

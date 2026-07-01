@@ -96,6 +96,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   senderEmail: "",
   kind: "user",
   bodyText: "Olá, mundo!",
+  bodyFormat: "v1",
   isRemoved: false,
   status: "active",
   createdAt: new Date().toISOString(),
@@ -577,6 +578,7 @@ describe("ChatMessageArea — send message", () => {
 
   it("Shift+Enter creates a hard break instead of sending", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockPostChannelMessage.mockResolvedValue(makeMessage({ bodyText: "line one\nline two" }));
     renderChannelArea();
 
     const input = await screen.findByTestId("chat-composer-input");
@@ -584,9 +586,14 @@ describe("ChatMessageArea — send message", () => {
 
     fireEvent.keyDown(input, { key: "Enter", code: "Enter", shiftKey: true });
 
-    // Nothing sent.
-    expect(mockPostChannelMessage).not.toHaveBeenCalled();
-    expect(input).toHaveTextContent("line one");
+    await waitFor(() => expect(input.querySelector("br")).not.toBeNull());
+    await fillEditor(input, "line two");
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(mockPostChannelMessage).toHaveBeenCalledTimes(1);
+      expect(mockPostChannelMessage.mock.calls[0]?.[1]).toBe("line one\nline two");
+    });
   });
 
   it("failed send shows error banner and keeps draft", async () => {

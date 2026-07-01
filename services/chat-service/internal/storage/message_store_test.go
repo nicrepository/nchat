@@ -36,7 +36,7 @@ func messageCols() []string {
 		"id", "workspace_id",
 		"channel_id", "dm_conversation_id",
 		"sender_id",
-		"kind", "body_text", "status",
+		"kind", "body_text", "body_format", "status",
 		"parent_message_id", "forwarded_from_message_id", "referenced_message_id",
 		"edited_at", "deleted_at",
 		"created_at", "updated_at",
@@ -48,7 +48,7 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		id, workspaceID,
 		channelID, dmID,
 		"user-1",
-		"user", "hello", "active",
+		"user", "hello", "v1", "active",
 		"", "", "",
 		(*time.Time)(nil), (*time.Time)(nil),
 		now, now,
@@ -86,6 +86,7 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // sender_id
 			pgxmock.AnyArg(), // kind
 			pgxmock.AnyArg(), // body_text
+			pgxmock.AnyArg(), // body_format
 			pgxmock.AnyArg(), // parent_message_id
 			pgxmock.AnyArg(), // forwarded_from_message_id
 			pgxmock.AnyArg(), // referenced_message_id
@@ -208,7 +209,7 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 			mock.ExpectQuery(tc.regex).
 				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg()).
 				WillReturnRows(pgxmock.NewRows(listMessageCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -248,7 +249,7 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 	deletedAt := now.Add(-30 * time.Second)
 	row := []any{
 		"msg-e", "ws-1", "ch-1", "", "user-1",
-		"user", "edited", "active",
+		"user", "edited", "v1", "active",
 		"", "", "",
 		&editedAt, &deletedAt,
 		now, now,
@@ -397,7 +398,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 	deletedAt := now.Add(-30 * time.Second)
 	row := []any{
 		"msg-e2", "ws-1", "ch-1", "", "user-1",
-		"user", "edited body", "active",
+		"user", "edited body", "v1", "active",
 		"", "", "",
 		&editedAt, &deletedAt,
 		now, now,

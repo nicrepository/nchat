@@ -30,6 +30,10 @@ import Text from "@tiptap/extension-text";
 import { tiptapDocToMarkdown } from "./tiptapSerializer";
 import type { SendResult } from "./useMessages";
 
+const ChatListItem = ListItem.extend({
+  content: "paragraph (paragraph|bulletList|orderedList)*",
+});
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface UseChatEditorOptions {
@@ -58,7 +62,7 @@ export function createChatEditorExtensions() {
     CodeBlock,
     BulletList,
     OrderedList,
-    ListItem,
+    ChatListItem,
     HardBreak,
   ];
 }
