@@ -253,9 +253,7 @@ describe("applyMarks — combined and priority", () => {
   });
 });
 
-// ── Bug 2 regression: list item multi-paragraph ───────────────────────────────
-
-describe("tiptapDocToMarkdown — list item multi-paragraph (Bug 2)", () => {
+describe("tiptapDocToMarkdown — list item multi-paragraph", () => {
   it("bulletList item with two paragraphs joins them with space", () => {
     const result = tiptapDocToMarkdown({
       type: "doc",

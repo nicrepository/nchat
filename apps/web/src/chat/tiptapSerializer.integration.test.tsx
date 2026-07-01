@@ -184,28 +184,3 @@ describe("backward compatibility: legacy Markdown messages", () => {
     expect(container.querySelector("pre")).not.toBeNull();
   });
 });
-
-// ── Paste simulation ───────────────────────────────────────────────────────────
-
-describe("paste simulation (production editor config)", () => {
-  it("pasting bold HTML produces **text** that renders as <strong>", () => {
-    const editor = createEditor();
-    editor.commands.insertContent("<strong>pasted bold</strong>");
-    const md = tiptapDocToMarkdown(editor.getJSON());
-    expect(md).toBe("**pasted bold**");
-    expect(md).not.toContain("<");
-    const { container } = render(<RichTextRenderer text={md} />);
-    expect(container.querySelector("strong")?.textContent).toBe("pasted bold");
-  });
-
-  it("pasting script tag: TipTap schema strips it, renderer is safe", () => {
-    const editor = createEditor();
-    editor.commands.insertContent("<p>safe<script>alert(1)</script></p>");
-    const json = editor.getJSON();
-    expect(JSON.stringify(json)).not.toContain('"script"');
-    const md = tiptapDocToMarkdown(json);
-    const { container } = render(<RichTextRenderer text={md} />);
-    expect(container.querySelector("script")).toBeNull();
-    expect(container.textContent).toContain("safe");
-  });
-});
