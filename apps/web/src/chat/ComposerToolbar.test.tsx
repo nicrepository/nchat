@@ -363,7 +363,7 @@ describe("ComposerToolbar — real editor integration", () => {
     await user.click(screen.getByTestId("fmt-italic"));
 
     expect(editor.isActive("italic")).toBe(true);
-    const stored = tiptapDocToMarkdown(editor.getJSON());
+    const stored = tiptapDocToMarkdown(editor.getJSON(), "v2");
     const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
     expect(stored).toBe("*hello*");
     expect(container.querySelector("em")?.textContent).toBe("hello");
@@ -378,7 +378,7 @@ describe("ComposerToolbar — real editor integration", () => {
     await user.click(screen.getByTestId("fmt-bold"));
     await user.click(screen.getByTestId("fmt-italic"));
 
-    const stored = tiptapDocToMarkdown(editor.getJSON());
+    const stored = tiptapDocToMarkdown(editor.getJSON(), "v2");
     const { container } = render(<RichTextRenderer text={stored} bodyFormat="v2" />);
     expect(stored).toBe("***hello***");
     expect(container.querySelector("strong > em")?.textContent).toBe("hello");

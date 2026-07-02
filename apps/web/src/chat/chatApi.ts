@@ -12,6 +12,7 @@
 
 import { authenticatedFetch } from "../lib/authClient";
 import type { Channel, DMConversation, Message, MessagePage } from "./chatTypes";
+import type { MentionCandidate } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
 
@@ -126,6 +127,42 @@ interface MessageEnvelope {
   data: MessageResponse;
 }
 
+interface MentionCandidateResponse {
+  type: "user" | "channel";
+  id: string;
+  label: string;
+}
+
+interface MentionEnvelope {
+  data: { users: MentionCandidateResponse[]; channels: MentionCandidateResponse[] };
+}
+
+// Fail-safe shape guards for the mentions response: the backend contract can
+// drift or return partial data, and a malformed candidate must not crash the
+// composer — callers fall back to an empty list instead of throwing.
+function isMentionCandidateResponse(value: unknown): value is MentionCandidateResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.type === "user" || candidate.type === "channel") &&
+    typeof candidate.id === "string" &&
+    typeof candidate.label === "string"
+  );
+}
+
+function isMentionEnvelope(value: unknown): value is MentionEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const data = (value as { data?: unknown }).data;
+  if (typeof data !== "object" || data === null) return false;
+  const { users, channels } = data as Record<string, unknown>;
+  return (
+    Array.isArray(users) &&
+    Array.isArray(channels) &&
+    users.every(isMentionCandidateResponse) &&
+    channels.every(isMentionCandidateResponse)
+  );
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 function mapMessage(r: MessageResponse): Message {
@@ -136,7 +173,7 @@ function mapMessage(r: MessageResponse): Message {
     senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
     bodyText: r.body_text ?? "",
-    bodyFormat: r.body_format === "v2" ? "v2" : "v1",
+    bodyFormat: r.body_format === "v3" ? "v3" : r.body_format === "v2" ? "v2" : "v1",
     isRemoved: r.is_removed ?? false,
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
@@ -178,7 +215,7 @@ export async function postChannelMessage(
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body_text: bodyText, body_format: "v2" }),
+    body: JSON.stringify({ body_text: bodyText, body_format: "v3" }),
     signal,
   });
   return mapMessage(res.data);
@@ -195,6 +232,21 @@ export async function fetchDMMessages(
     messages: (res.data.messages ?? []).map(mapMessage),
     nextCursor: res.data.next_cursor ?? "",
   };
+}
+
+export async function fetchMentionCandidates(
+  channelId: string,
+  query: string,
+  signal?: AbortSignal,
+): Promise<MentionCandidate[]> {
+  const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/mentions?q=${encodeURIComponent(query)}`;
+  const res = await authenticatedFetch<MentionEnvelope>(url, { method: "GET", signal });
+  if (!isMentionEnvelope(res)) return [];
+  return [...res.data.users, ...res.data.channels].map((candidate) => ({
+    mentionType: candidate.type,
+    id: candidate.id,
+    label: candidate.label,
+  }));
 }
 
 export async function postDMMessage(

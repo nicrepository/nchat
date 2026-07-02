@@ -1,11 +1,18 @@
 package app
 
 import (
+	"bufio"
 	"context"
+	"io"
+	"log/slog"
+	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
+	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
@@ -122,5 +129,145 @@ func TestApp_Shutdown_PresenceStops(t *testing.T) {
 	case <-done:
 	case <-time.After(shutdownTestTimeout):
 		t.Fatalf("Shutdown did not complete within %s; possible goroutine leak", shutdownTestTimeout)
+	}
+}
+
+// startFakeValkeyServer starts a minimal in-process RESP server that answers
+// just enough of the handshake (HELLO / CLIENT) for a real valkey-go client
+// to connect successfully. It returns a "valkey://host:port" URL. No data
+// commands are needed since these tests only exercise cache wiring, not
+// Get/Set behavior (covered separately in storage/mention_label_cache_test.go).
+func startFakeValkeyServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveFakeValkeyConn(conn)
+		}
+	}()
+	// protocol=2 and client_cache=0 select the RESP2, no-client-side-caching
+	// mode our minimal fake server implements (RESP3 push invalidation is
+	// out of scope for this handshake-only test).
+	return "valkey://" + ln.Addr().String() + "?protocol=2&client_cache=0"
+}
+
+func serveFakeValkeyConn(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	for {
+		command, err := readRESPCommand(reader)
+		if err != nil {
+			return
+		}
+		switch strings.ToUpper(command[0]) {
+		case "HELLO":
+			_, _ = io.WriteString(conn, "*2\r\n+proto\r\n:2\r\n")
+		default:
+			_, _ = io.WriteString(conn, "+OK\r\n")
+		}
+	}
+}
+
+func readRESPCommand(reader *bufio.Reader) ([]string, error) {
+	header, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(header, "*")))
+	if err != nil {
+		return nil, err
+	}
+	command := make([]string, count)
+	for i := range count {
+		lengthLine, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		length, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(lengthLine, "$")))
+		if err != nil {
+			return nil, err
+		}
+		value := make([]byte, length+2)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return nil, err
+		}
+		command[i] = string(value[:length])
+	}
+	return command, nil
+}
+
+// TestWireMentionLabelCache_Disabled verifies that an empty Valkey URL leaves
+// the cache disabled without contacting anything.
+func TestWireMentionLabelCache_Disabled(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	messageSvc := service.NewMessageService(nil, nil, nil)
+
+	cache := wireMentionLabelCache("", 45, messageSvc, logger)
+	if cache != nil {
+		t.Fatalf("expected nil cache for empty Valkey URL, got %+v", cache)
+	}
+}
+
+// TestWireMentionLabelCache_InvalidURL_Disables covers the cacheErr != nil
+// branch: an unparsable Valkey URL disables the cache and does not panic or
+// interrupt the service, matching the documented graceful-degradation
+// behavior.
+func TestWireMentionLabelCache_InvalidURL_Disables(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	messageSvc := service.NewMessageService(nil, nil, nil)
+
+	cache := wireMentionLabelCache("not-a-valid-url", 45, messageSvc, logger)
+	if cache != nil {
+		t.Fatalf("expected nil cache for invalid Valkey URL, got %+v", cache)
+	}
+}
+
+// TestWireMentionLabelCache_Success covers the cacheErr == nil branch: a
+// reachable Valkey server results in a non-nil cache wired onto messageSvc.
+func TestWireMentionLabelCache_Success(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	messageSvc := service.NewMessageService(nil, nil, nil)
+	valkeyURL := startFakeValkeyServer(t)
+
+	cache := wireMentionLabelCache(valkeyURL, 45, messageSvc, logger)
+	if cache == nil {
+		t.Fatal("expected non-nil cache for reachable Valkey server")
+	}
+	t.Cleanup(cache.Close)
+}
+
+// TestApp_Shutdown_ClosesMentionCache verifies that Shutdown closes a
+// non-nil mention label cache exactly once, even across repeated calls.
+func TestApp_Shutdown_ClosesMentionCache(t *testing.T) {
+	cfg := config.Config{ServiceName: "chat-service", Env: "test", Port: 8082, ReadHeaderTimeoutSeconds: 5}
+	a := newTestApp(t, cfg)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	messageSvc := service.NewMessageService(nil, nil, nil)
+	valkeyURL := startFakeValkeyServer(t)
+	a.mentionCache = wireMentionLabelCache(valkeyURL, 45, messageSvc, logger)
+	if a.mentionCache == nil {
+		t.Fatal("expected non-nil mention cache before Shutdown")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = a.Shutdown(context.Background())
+		_ = a.Shutdown(context.Background()) // idempotent
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("Shutdown with mention cache deadlocked or did not complete in time")
 	}
 }

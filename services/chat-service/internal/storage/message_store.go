@@ -79,6 +79,8 @@ type CreateMessageInput struct {
 	ParentMessageID        string
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
+	MentionedUserIDs       []string
+	MentionedChannelIDs    []string
 }
 
 // ListChannelMessagesInput identifies the paged message list for a channel.
@@ -128,6 +130,15 @@ type MessageStore interface {
 	// Returns ErrInvalidMessageReference for any invalid case — non-enumerating:
 	// missing, cross-workspace, cross-channel, and cross-DM all return the same error.
 	ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error
+
+	// ResolveMentionLabels returns current display labels keyed by "user:<uuid>"
+	// or "channel:<uuid>", scoped to workspaceID.
+	ResolveMentionLabels(ctx context.Context, workspaceID string, userIDs, channelIDs []string) (map[string]string, error)
+
+	// ResolveAuthorizedMentionLabels returns labels only for references that are
+	// valid in sourceChannelID for requesterID. CreateMessage repeats this check
+	// atomically as the final authorization backstop.
+	ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, requesterID string, userIDs, channelIDs []string) (map[string]string, error)
 
 	// ListChannelMessages returns a paginated set of messages for a channel.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
@@ -252,7 +263,15 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	// return sender display info (sender_display_name, sender_email) in the same
 	// round-trip. This avoids a separate GET after insert for the broadcast payload.
 	row := s.pool.QueryRow(ctx, `
-		WITH invalid_refs AS (
+		WITH user_mentions AS (
+			SELECT DISTINCT id::uuid AS user_id
+			FROM unnest($11::text[]) AS ids(id)
+		),
+		channel_mentions AS (
+			SELECT DISTINCT id::uuid AS channel_id
+			FROM unnest($12::text[]) AS ids(id)
+		),
+		invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
 			WHERE
 				($8::uuid IS NOT NULL AND NOT EXISTS (
@@ -276,6 +295,44 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 					  AND channel_id IS NOT DISTINCT FROM $2::uuid
 					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
+		),
+		invalid_mentions AS (
+			SELECT 1
+			FROM user_mentions um
+			WHERE $2::uuid IS NULL OR NOT EXISTS (
+				SELECT 1
+				FROM chat.channels source_channel
+				JOIN chat.channel_members cm
+				  ON cm.channel_id = source_channel.id AND cm.user_id = um.user_id
+				JOIN chat.workspace_members mentioned_member
+				  ON mentioned_member.workspace_id = source_channel.workspace_id
+				 AND mentioned_member.user_id = um.user_id
+				 AND mentioned_member.status = 'active'
+				JOIN auth.users mentioned_user
+				  ON mentioned_user.id = um.user_id
+				 AND mentioned_user.status = 'active'
+				 AND mentioned_user.deleted_at IS NULL
+				WHERE source_channel.id = $2::uuid
+				  AND source_channel.workspace_id = $1::uuid
+				  AND source_channel.status = 'active'
+			)
+			UNION ALL
+			SELECT 1
+			FROM channel_mentions mentioned
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM chat.channels c
+				JOIN chat.workspaces w
+				  ON w.id = c.workspace_id AND w.status = 'active'
+				JOIN chat.workspace_members requester
+				  ON requester.workspace_id = c.workspace_id
+				 AND requester.user_id = $4::uuid
+				 AND requester.status = 'active'
+				WHERE c.id = mentioned.channel_id
+				  AND c.workspace_id = $1::uuid
+				  AND c.status = 'active'
+				  AND chat.channel_visible_to_user(c.id, $4::uuid)
+			)
 		),
 		inserted AS (
 			INSERT INTO chat.messages
@@ -311,10 +368,20 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				  AND w.id = $1::uuid AND w.status = 'active'
 			) auth
 			WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
+			  AND NOT EXISTS (SELECT 1 FROM invalid_mentions)
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, deleted_at, created_at, updated_at
+		),
+		mention_outbox AS (
+			INSERT INTO chat.notification_outbox
+				(workspace_id, message_id, recipient_user_id, kind, status)
+			SELECT inserted.workspace_id, inserted.id, user_mentions.user_id, 'mention', 'pending'
+			FROM inserted
+			CROSS JOIN user_mentions
+			ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
+			RETURNING id
 		)
 		SELECT `+listMessageColumns("m")+`
 		FROM inserted m
@@ -329,6 +396,8 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		nullableUUID(input.ParentMessageID),
 		nullableUUID(input.ForwardedFromMessageID),
 		nullableUUID(input.ReferencedMessageID),
+		input.MentionedUserIDs,
+		input.MentionedChannelIDs,
 	)
 	msg, err := scanMessageWithSender(row)
 	if err != nil {
@@ -341,6 +410,89 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
 	}
 	return msg, nil
+}
+
+func (s *PGXMessageStore) ResolveMentionLabels(ctx context.Context, workspaceID string, userIDs, channelIDs []string) (map[string]string, error) {
+	labels := make(map[string]string, len(userIDs)+len(channelIDs))
+	if len(userIDs)+len(channelIDs) == 0 {
+		return labels, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT 'user', u.id::text, u.display_name
+		FROM unnest($2::text[]) AS ids(id)
+		JOIN auth.users u
+		  ON u.id = ids.id::uuid AND u.status = 'active' AND u.deleted_at IS NULL
+		JOIN chat.workspace_members wm
+		  ON wm.user_id = u.id AND wm.workspace_id = $1::uuid AND wm.status = 'active'
+		UNION ALL
+		SELECT 'channel', c.id::text, c.display_name
+		FROM unnest($3::text[]) AS ids(id)
+		JOIN chat.channels c
+		  ON c.id = ids.id::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'`,
+		workspaceID, userIDs, channelIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve mention labels: %w", err)
+	}
+	defer rows.Close()
+	return scanMentionLabels(rows, labels)
+}
+
+func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, requesterID string, userIDs, channelIDs []string) (map[string]string, error) {
+	labels := make(map[string]string, len(userIDs)+len(channelIDs))
+	if len(userIDs)+len(channelIDs) == 0 {
+		return labels, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT 'user', u.id::text, u.display_name
+		FROM unnest($4::text[]) AS ids(id)
+		JOIN chat.channels source_channel
+		  ON source_channel.id = $2::uuid
+		 AND source_channel.workspace_id = $1::uuid
+		 AND source_channel.status = 'active'
+		JOIN chat.channel_members cm
+		  ON cm.channel_id = source_channel.id AND cm.user_id = ids.id::uuid
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = source_channel.workspace_id
+		 AND wm.user_id = cm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		UNION ALL
+		SELECT 'channel', c.id::text, c.display_name
+		FROM unnest($5::text[]) AS ids(id)
+		JOIN chat.channels c
+		  ON c.id = ids.id::uuid
+		 AND c.workspace_id = $1::uuid
+		 AND c.status = 'active'
+		JOIN chat.workspaces w
+		  ON w.id = c.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members requester
+		  ON requester.workspace_id = c.workspace_id
+		 AND requester.user_id = $3::uuid
+		 AND requester.status = 'active'
+		WHERE chat.channel_visible_to_user(c.id, $3::uuid)`,
+		workspaceID, sourceChannelID, requesterID, userIDs, channelIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve authorized mention labels: %w", err)
+	}
+	defer rows.Close()
+	return scanMentionLabels(rows, labels)
+}
+
+func scanMentionLabels(rows pgx.Rows, labels map[string]string) (map[string]string, error) {
+	for rows.Next() {
+		var kind, id, label string
+		if err := rows.Scan(&kind, &id, &label); err != nil {
+			return nil, fmt.Errorf("scan mention label: %w", err)
+		}
+		labels[kind+":"+id] = label
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate mention labels: %w", err)
+	}
+	return labels, nil
 }
 
 func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error {

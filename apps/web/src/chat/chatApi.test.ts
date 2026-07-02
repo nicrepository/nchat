@@ -15,6 +15,7 @@ import {
   fetchChannels,
   fetchDMMessages,
   fetchDMs,
+  fetchMentionCandidates,
   fetchSidebarData,
   messagesPath,
   postChannelMessage,
@@ -343,6 +344,12 @@ describe("fetchChannelMessages", () => {
     expect(page.messages[0].bodyFormat).toBe("v2");
   });
 
+  it("maps an explicit v3 body format", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v3" })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].bodyFormat).toBe("v3");
+  });
+
   it("returns nextCursor from response", async () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()], "next-page-cursor"));
     const page = await fetchChannelMessages("geral");
@@ -463,12 +470,12 @@ describe("postChannelMessage", () => {
     );
   });
 
-  it("sends body_text as format v2 in JSON payload", async () => {
+  it("sends body_text as format v3 in JSON payload", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     await postChannelMessage("geral", "Hello world");
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(options.body as string) as Record<string, unknown>;
-    expect(body).toEqual({ body_text: "Hello world", body_format: "v2" });
+    expect(body).toEqual({ body_text: "Hello world", body_format: "v3" });
   });
 
   it("does not include author_id in payload", async () => {
@@ -494,6 +501,54 @@ describe("postChannelMessage", () => {
     const msg = await postChannelMessage("geral", "Hello");
     expect(msg.bodyText).toBe("Hello");
     expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+describe("fetchMentionCandidates", () => {
+  it("scopes the query to the current channel and maps both candidate types", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        users: [{ type: "user", id: "user-1", label: "Ana" }],
+        channels: [{ type: "channel", id: "channel-2", label: "anuncios" }],
+      },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/channels/channel-1/mentions?q=an"),
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(candidates).toEqual([
+      { mentionType: "user", id: "user-1", label: "Ana" },
+      { mentionType: "channel", id: "channel-2", label: "anuncios" },
+    ]);
+  });
+
+  it("fails safe to an empty list when the response shape is malformed", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { users: [{ id: "user-1" }], channels: null } });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(candidates).toEqual([]);
+  });
+
+  it("fails safe to an empty list when a candidate has an out-of-enum type", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { users: [{ type: "admin", id: "user-1", label: "Ana" }], channels: [] },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(candidates).toEqual([]);
+  });
+
+  it("fails safe to an empty list when data is missing entirely", async () => {
+    mockAuthFetch.mockResolvedValue({});
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(candidates).toEqual([]);
   });
 });
 

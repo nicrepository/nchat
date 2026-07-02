@@ -93,6 +93,10 @@
   --shadow-md: 0 6px 18px rgba(16, 42, 51, 0.08);
   --shadow-lg: 0 18px 48px rgba(16, 42, 51, 0.12);
 
+  /* Overlay stacking order (chat composer popovers) */
+  --z-overlay-emoji: 200;
+  --z-overlay-mention: 300;
+
   /* Typography */
   --font-sans:
     "Inter", "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;

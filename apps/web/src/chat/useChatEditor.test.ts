@@ -20,6 +20,7 @@ const mockOnSend = vi.fn() as ReturnType<typeof vi.fn> & OnSend;
 const defaults = {
   placeholder: "Mensagem...",
   disabled: false,
+  bodyFormat: "v2" as const,
   onSend: mockOnSend,
 };
 

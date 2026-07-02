@@ -217,3 +217,23 @@ func TestChatMigration_AddsVersionedMessageBodyFormat(t *testing.T) {
 		t.Fatal("body format down migration must remove body_format")
 	}
 }
+
+func TestChatMigration_AddsV3MentionsAndDirectedOutbox(t *testing.T) {
+	migration := readChatMigration(t, "000006_chat_mentions.up.sql")
+	for _, expected := range []string{
+		"CHECK (body_format IN ('v1', 'v2', 'v3'))",
+		"CREATE TABLE chat.notification_outbox",
+		"recipient_user_id UUID",
+		"UNIQUE (message_id, recipient_user_id, kind)",
+		"WHERE status = 'pending'",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("mentions migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000006_chat_mentions.down.sql")
+	if !strings.Contains(down, "DROP TABLE IF EXISTS chat.notification_outbox") ||
+		!strings.Contains(down, "CHECK (body_format IN ('v1', 'v2'))") {
+		t.Fatal("mentions down migration must drop outbox and restore v2 constraint")
+	}
+}

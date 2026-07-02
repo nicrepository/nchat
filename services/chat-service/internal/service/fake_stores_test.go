@@ -185,15 +185,21 @@ func (f *fakeChannelStore) ArchiveChannel(_ context.Context, workspaceID, channe
 
 // fakeMemberStore implements storage.MemberStore.
 type fakeMemberStore struct {
-	workspaceMembers map[string]domain.WorkspaceMember
-	channelMembers   map[string]domain.ChannelMember
-	workspaceStatus  map[string]domain.WorkspaceStatus
-	generalChannels  map[string]string
-	addWMErr         error
-	addCMErr         error
-	removeCMErr      error
-	getWMErr         error
-	getCMErr         error
+	workspaceMembers  map[string]domain.WorkspaceMember
+	channelMembers    map[string]domain.ChannelMember
+	workspaceStatus   map[string]domain.WorkspaceStatus
+	generalChannels   map[string]string
+	addWMErr          error
+	addCMErr          error
+	removeCMErr       error
+	getWMErr          error
+	getCMErr          error
+	mentionCandidates []domain.MentionCandidate
+	mentionErr        error
+}
+
+func (f *fakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
+	return f.mentionCandidates, f.mentionErr
 }
 
 func newFakeMemberStore() *fakeMemberStore {

@@ -19,14 +19,19 @@ export const LEGACY_INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/;
 
 export type InlineMarkerType = (typeof INLINE_MARKERS)[number]["type"];
 export type ListType = "ul" | "ol";
+export type MentionType = "user" | "channel";
+
+export const MENTION_TOKEN_RE =
+  /^@\[((?:\\.|[^\]])+)]\(mention:(user|channel):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)/i;
 
 const ESCAPABLE = new Set(["\\", "*", "_", "`", "-"]);
+const V3_ESCAPABLE = new Set([...ESCAPABLE, "@", "[", "]", "(", ")"]);
 
-export function escapeRichText(text: string): string {
+function escapeWith(text: string, escapable: Set<string>): string {
   let escaped = "";
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
-    if (ESCAPABLE.has(char) || (char === "." && /\d/.test(text[i - 1] ?? ""))) {
+    if (escapable.has(char) || (char === "." && /\d/.test(text[i - 1] ?? ""))) {
       escaped += "\\";
     }
     escaped += char;
@@ -34,13 +39,23 @@ export function escapeRichText(text: string): string {
   return escaped;
 }
 
-export function unescapeRichText(text: string): string {
+export function escapeRichText(text: string): string {
+  return escapeWith(text, ESCAPABLE);
+}
+
+export const escapeRichTextV3 = (text: string) => escapeWith(text, V3_ESCAPABLE);
+
+export function buildMentionToken(type: MentionType, id: string, label: string): string {
+  return `@[${escapeRichTextV3(label)}](mention:${type}:${id})`;
+}
+
+function unescapeWith(text: string, escapable: Set<string>): string {
   let unescaped = "";
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     const next = text[i + 1];
     const escapedDot = next === "." && /\d/.test(unescaped[unescaped.length - 1] ?? "");
-    if (char === "\\" && next && (ESCAPABLE.has(next) || escapedDot)) {
+    if (char === "\\" && next && (escapable.has(next) || escapedDot)) {
       unescaped += next;
       i++;
     } else {
@@ -49,6 +64,9 @@ export function unescapeRichText(text: string): string {
   }
   return unescaped;
 }
+
+export const unescapeRichText = (text: string) => unescapeWith(text, ESCAPABLE);
+export const unescapeRichTextV3 = (text: string) => unescapeWith(text, V3_ESCAPABLE);
 
 function isEscaped(text: string, index: number): boolean {
   let slashes = 0;

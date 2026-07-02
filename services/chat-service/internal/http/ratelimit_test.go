@@ -428,7 +428,7 @@ func TestUserRateLimiter_Middleware_DoesNotBreakAuthorization(t *testing.T) {
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
-		NewMessageHandler(nil, nil),
+		NewMessageHandler(nil, nil, nil),
 		nil,
 	)
 

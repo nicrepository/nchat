@@ -27,11 +27,34 @@ import ListItem from "@tiptap/extension-list-item";
 import OrderedList from "@tiptap/extension-ordered-list";
 import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
+import { createMentionExtension } from "./mentionExtension";
 import { tiptapDocToMarkdown } from "./tiptapSerializer";
+import type { CodecFormat } from "./tiptapSerializer";
 import type { SendResult } from "./useMessages";
+
+declare module "@tiptap/core" {
+  interface Commands<ReturnType> {
+    mentionChannelContext: {
+      setMentionChannel: (channelId?: string) => ReturnType;
+    };
+  }
+}
 
 const ChatListItem = ListItem.extend({
   content: "paragraph (paragraph|bulletList|orderedList)*",
+});
+
+const MentionChannelContext = Extension.create({
+  name: "mentionChannelContext",
+  addStorage: () => ({ channelId: undefined as string | undefined }),
+  addCommands() {
+    return {
+      setMentionChannel: (channelId) => () => {
+        this.storage.channelId = channelId;
+        return true;
+      },
+    };
+  },
 });
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -39,6 +62,8 @@ const ChatListItem = ListItem.extend({
 export interface UseChatEditorOptions {
   placeholder: string;
   disabled: boolean;
+  channelId?: string;
+  bodyFormat: CodecFormat;
   onSend: (body: string) => Promise<SendResult>;
 }
 
@@ -51,8 +76,8 @@ export interface UseChatEditorOptions {
  * RF-11: bold, italic, inline code, code block, bullet list, ordered list.
  * HardBreak: Shift+Enter inserts a line break within a message.
  */
-export function createChatEditorExtensions() {
-  return [
+export function createChatEditorExtensions(enableMentions = true) {
+  const extensions = [
     Document,
     Paragraph,
     Text,
@@ -65,11 +90,20 @@ export function createChatEditorExtensions() {
     ChatListItem,
     HardBreak,
   ];
+  return enableMentions
+    ? [...extensions, MentionChannelContext, createMentionExtension()]
+    : extensions;
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
-export function useChatEditor({ placeholder, disabled, onSend }: UseChatEditorOptions) {
+export function useChatEditor({
+  placeholder,
+  disabled,
+  channelId,
+  bodyFormat,
+  onSend,
+}: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
 
@@ -80,7 +114,7 @@ export function useChatEditor({ placeholder, disabled, onSend }: UseChatEditorOp
   // ponytail: extensions created once; captures ref by reference, not value.
   const extensions = useMemo(
     () => [
-      ...createChatEditorExtensions(),
+      ...createChatEditorExtensions(bodyFormat === "v3"),
       Extension.create({
         name: "submitOnEnter",
         addKeyboardShortcuts() {
@@ -96,24 +130,31 @@ export function useChatEditor({ placeholder, disabled, onSend }: UseChatEditorOp
         },
       }),
     ],
-    [],
+    [bodyFormat],
   );
 
-  const editor = useEditor({
-    extensions,
-    editorProps: {
-      attributes: {
-        class: "chat-msg-area__composer-input",
-        "aria-label": placeholder,
-        "aria-multiline": "true",
-        role: "textbox",
-        "data-testid": "chat-composer-input",
+  const editor = useEditor(
+    {
+      extensions,
+      editorProps: {
+        attributes: {
+          class: "chat-msg-area__composer-input",
+          "aria-label": placeholder,
+          "aria-multiline": "true",
+          role: "textbox",
+          "data-testid": "chat-composer-input",
+        },
+      },
+      onUpdate: ({ editor: e }) => {
+        setHasContent(!e.isEmpty);
       },
     },
-    onUpdate: ({ editor: e }) => {
-      setHasContent(!e.isEmpty);
-    },
-  });
+    [bodyFormat],
+  );
+
+  useEffect(() => {
+    if (bodyFormat === "v3") editor?.commands.setMentionChannel(channelId);
+  }, [editor, channelId, bodyFormat]);
 
   // Sync editable state and aria attributes when props change.
   useEffect(() => {
@@ -129,7 +170,7 @@ export function useChatEditor({ placeholder, disabled, onSend }: UseChatEditorOp
 
   async function handleSend() {
     if (!canSend || !editor) return;
-    const body = tiptapDocToMarkdown(editor.getJSON()).trim();
+    const body = tiptapDocToMarkdown(editor.getJSON(), bodyFormat).trim();
     if (!body) return;
     setSending(true);
     try {

@@ -387,7 +387,7 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
           senderEmail: p.sender_email ?? "",
           kind: p.kind as Message["kind"],
           bodyText: p.body_text,
-          bodyFormat: p.body_format === "v2" ? "v2" : "v1",
+          bodyFormat: p.body_format === "v3" ? "v3" : p.body_format === "v2" ? "v2" : "v1",
           isRemoved: p.is_removed,
           status: p.status as Message["status"],
           createdAt: p.created_at,

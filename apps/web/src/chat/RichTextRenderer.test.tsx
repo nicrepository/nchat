@@ -30,6 +30,28 @@ describe("RichTextRenderer", () => {
     expect(container.querySelector("strong > em")?.textContent).toBe("world");
   });
 
+  it("renders a v3 mention as highlighted text without creating a link", () => {
+    const { container } = render(
+      <RichTextRenderer
+        text="Oi @[Ana](mention:user:11111111-1111-1111-1111-111111111111)"
+        bodyFormat="v3"
+      />,
+    );
+    const mention = container.querySelector(".rtr-mention");
+    expect(mention).toHaveTextContent("@Ana");
+    expect(mention).toHaveAttribute("data-mention-type", "user");
+    expect(mention).toHaveAttribute("data-mention-id", "11111111-1111-1111-1111-111111111111");
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  it("keeps escaped literal mention syntax as text in v3", () => {
+    const { container } = render(
+      <RichTextRenderer text={String.raw`\@\[Ana\]\(mention:user:fake\)`} bodyFormat="v3" />,
+    );
+    expect(container.textContent).toBe("@[Ana](mention:user:fake)");
+    expect(container.querySelector(".rtr-mention")).toBeNull();
+  });
+
   it.each([
     [String.raw`\*nao italico\*`, "*nao italico*"],
     [String.raw`\*\*nao bold\*\*`, "**nao bold**"],

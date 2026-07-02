@@ -37,16 +37,21 @@ type messageProvider interface {
 	GetDMMessage(ctx context.Context, in service.GetDMMessageInput) (domain.Message, error)
 }
 
+type mentionProvider interface {
+	SearchMentions(ctx context.Context, in service.SearchMentionsInput) (service.SearchMentionsOutput, error)
+}
+
 // MessageHandler handles message list and create endpoints for channels and DMs.
 type MessageHandler struct {
 	workspaces workspaceResolver
 	messages   messageProvider
+	mentions   mentionProvider
 }
 
-// NewMessageHandler returns a MessageHandler. When either dependency is nil,
-// all requests return 503.
-func NewMessageHandler(workspaces workspaceResolver, messages messageProvider) *MessageHandler {
-	return &MessageHandler{workspaces: workspaces, messages: messages}
+// NewMessageHandler returns a MessageHandler. Missing dependencies produce 503
+// only on the endpoints that use them.
+func NewMessageHandler(workspaces workspaceResolver, messages messageProvider, mentions mentionProvider) *MessageHandler {
+	return &MessageHandler{workspaces: workspaces, messages: messages, mentions: mentions}
 }
 
 // ── JSON response shapes ──────────────────────────────────────────────────────
@@ -73,6 +78,17 @@ type listMessagesResponseData struct {
 	NextCursor string        `json:"next_cursor,omitempty"`
 }
 
+type mentionJSON struct {
+	Type  string `json:"type"`
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+type searchMentionsResponseData struct {
+	Users    []mentionJSON `json:"users"`
+	Channels []mentionJSON `json:"channels"`
+}
+
 // ── Request shapes ────────────────────────────────────────────────────────────
 
 // createMessageRequest is the inbound body for POST message endpoints.
@@ -88,6 +104,14 @@ type createMessageRequest struct {
 func (h *MessageHandler) checkDeps(w http.ResponseWriter) bool {
 	if h.workspaces == nil || h.messages == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "messages not available")
+		return false
+	}
+	return true
+}
+
+func (h *MessageHandler) checkMentionDeps(w http.ResponseWriter) bool {
+	if h.workspaces == nil || h.mentions == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "mentions not available")
 		return false
 	}
 	return true
@@ -168,6 +192,46 @@ func decodeCreateRequest(w http.ResponseWriter, r *http.Request) (createMessageR
 }
 
 // ── Channel endpoints ─────────────────────────────────────────────────────────
+
+// SearchMentions handles GET /api/chat/channels/{channelID}/mentions?q=prefix.
+func (h *MessageHandler) SearchMentions(w http.ResponseWriter, r *http.Request) {
+	if !h.checkMentionDeps(w) {
+		return
+	}
+
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+
+	wsID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	out, err := h.mentions.SearchMentions(r.Context(), service.SearchMentionsInput{
+		WorkspaceID: wsID,
+		ChannelID:   channelID,
+		CallerID:    userID,
+		Query:       r.URL.Query().Get("q"),
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+
+	resp := searchMentionsResponseData{
+		Users:    mapMentions(out.Users),
+		Channels: mapMentions(out.Channels),
+	}
+	httputil.WriteJSON(w, http.StatusOK, resp)
+}
 
 // ListChannelMessages handles GET /api/chat/channels/{channelID}/messages.
 // Auth: BearerAuth + RequireActiveSession (applied in router).
@@ -454,6 +518,18 @@ func mapMessages(msgs []domain.Message) []messageJSON {
 	out := make([]messageJSON, 0, len(msgs))
 	for _, m := range msgs {
 		out = append(out, mapToMessageJSON(m))
+	}
+	return out
+}
+
+func mapMentions(candidates []domain.MentionCandidate) []mentionJSON {
+	out := make([]mentionJSON, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, mentionJSON{
+			Type:  string(candidate.Type),
+			ID:    candidate.ID,
+			Label: candidate.Label,
+		})
 	}
 	return out
 }

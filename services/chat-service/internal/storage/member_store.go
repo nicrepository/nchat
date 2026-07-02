@@ -22,6 +22,7 @@ type MemberStore interface {
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
+	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
 	// RemoveChannelMember deletes the channel membership for userID in channelID, scoped to
 	// workspaceID. Returns ErrCannotLeaveGeneralChannel if the channel has is_general=true.
 	// Returns nil when the membership does not exist (idempotent).
@@ -349,6 +350,42 @@ func (s *PGXMemberStore) GetChannelMember(ctx context.Context, channelID, userID
 		return domain.ChannelMember{}, fmt.Errorf("get channel member: %w", err)
 	}
 	return m, nil
+}
+
+func (s *PGXMemberStore) SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.display_name
+		FROM chat.channel_members cm
+		JOIN chat.channels c
+		  ON c.id = cm.channel_id
+		 AND c.workspace_id = $1::uuid
+		 AND c.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = c.workspace_id
+		 AND wm.user_id = cm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE cm.channel_id = $2::uuid
+		  AND left(lower(u.display_name), length($3)) = lower($3)
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $4`, workspaceID, channelID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search channel members: %w", err)
+	}
+	defer rows.Close()
+	results := make([]domain.MentionCandidate, 0, limit)
+	for rows.Next() {
+		var candidate domain.MentionCandidate
+		candidate.Type = domain.MentionTypeUser
+		if err := rows.Scan(&candidate.ID, &candidate.Label); err != nil {
+			return nil, fmt.Errorf("scan channel member mention: %w", err)
+		}
+		results = append(results, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate channel member mentions: %w", err)
+	}
+	return results, nil
 }
 
 // RemoveChannelMember deletes a channel membership, scoped to workspaceID.

@@ -50,6 +50,17 @@ type fakeMessageProvider struct {
 	lastGetDMInput         service.GetDMMessageInput
 }
 
+type fakeMentionProvider struct {
+	out       service.SearchMentionsOutput
+	err       error
+	lastInput service.SearchMentionsInput
+}
+
+func (f *fakeMentionProvider) SearchMentions(_ context.Context, in service.SearchMentionsInput) (service.SearchMentionsOutput, error) {
+	f.lastInput = in
+	return f.out, f.err
+}
+
 func (f *fakeMessageProvider) ListChannelMessages(_ context.Context, in service.ListChannelMessagesInput) (service.ListChannelMessagesOutput, error) {
 	f.lastListChannelInput = in
 	return f.channelOut, f.channelOutErr
@@ -115,7 +126,7 @@ func testMessage() domain.Message {
 
 // makeHandlerWithUser builds a MessageHandler and wraps it so it has msgTestUserID in context.
 func makeHandlerWithUser(ws *fakeWorkspaceResolver, msgs *fakeMessageProvider) *httpapi.MessageHandler {
-	return httpapi.NewMessageHandler(ws, msgs)
+	return httpapi.NewMessageHandler(ws, msgs, nil)
 }
 
 // requestWithUser adds the user ID to the request context as BearerAuth would.
@@ -137,7 +148,7 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 // ── ListChannelMessages ──────────────────────────────────────────────────────
 
 func TestMessageHandler_ListChannelMessages_UnauthenticatedReturns401(t *testing.T) {
-	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, nil)
 	rec := httptest.NewRecorder()
 	// No user in context (no BearerAuth applied)
 	r := httptest.NewRequest(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
@@ -255,10 +266,90 @@ func TestMessageHandler_ListChannelMessages_InaccessibleChannelReturnsNotFound(t
 	}
 }
 
+// ── SearchMentions ───────────────────────────────────────────────────────────
+
+func TestMessageHandler_SearchMentions_RejectsInvalidOrUnauthenticatedRequests(t *testing.T) {
+	t.Run("invalid channel ID", func(t *testing.T) {
+		h := httpapi.NewMessageHandler(
+			&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, &fakeMentionProvider{},
+		)
+		rec := httptest.NewRecorder()
+		r := requestWithUser(http.MethodGet, "/api/chat/channels/not-a-uuid/mentions", nil)
+		r.SetPathValue("channelID", "not-a-uuid")
+		h.SearchMentions(rec, r)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("missing authentication", func(t *testing.T) {
+		h := httpapi.NewMessageHandler(
+			&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, &fakeMentionProvider{},
+		)
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/api/chat/channels/"+testChannelID+"/mentions", nil)
+		r.SetPathValue("channelID", testChannelID)
+		h.SearchMentions(rec, r)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+	})
+
+	t.Run("missing mention service", func(t *testing.T) {
+		h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, nil)
+		rec := httptest.NewRecorder()
+		h.SearchMentions(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", rec.Code)
+		}
+	})
+}
+
+func TestMessageHandler_SearchMentions_ReturnsAuthorizedCandidates(t *testing.T) {
+	mentions := &fakeMentionProvider{out: service.SearchMentionsOutput{
+		Users:    []domain.MentionCandidate{{Type: domain.MentionTypeUser, ID: msgTestUserID, Label: "Alice"}},
+		Channels: []domain.MentionCandidate{{Type: domain.MentionTypeChannel, ID: testChannelID, Label: "geral"}},
+	}}
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, mentions)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/mentions?q=al", nil)
+	r.SetPathValue("channelID", testChannelID)
+
+	h.SearchMentions(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if mentions.lastInput.WorkspaceID != testWorkspaceID || mentions.lastInput.ChannelID != testChannelID || mentions.lastInput.CallerID != msgTestUserID || mentions.lastInput.Query != "al" {
+		t.Fatalf("unexpected service input: %+v", mentions.lastInput)
+	}
+	body := decodeBody(t, rec)["data"].(map[string]any)
+	if len(body["users"].([]any)) != 1 || len(body["channels"].([]any)) != 1 {
+		t.Fatalf("unexpected candidates: %v", body)
+	}
+}
+
+func TestMessageHandler_SearchMentions_PrivateChannelOutsiderGets404(t *testing.T) {
+	h := httpapi.NewMessageHandler(
+		&fakeWorkspaceResolver{workspace: activeWorkspace()},
+		&fakeMessageProvider{},
+		&fakeMentionProvider{err: domain.ErrNotFound},
+	)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/mentions?q=a", nil)
+	r.SetPathValue("channelID", testChannelID)
+
+	h.SearchMentions(rec, r)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
 // ── CreateChannelMessage ─────────────────────────────────────────────────────
 
 func TestMessageHandler_CreateChannelMessage_UnauthenticatedReturns401(t *testing.T) {
-	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, nil)
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
 		strings.NewReader(`{"body_text":"hello"}`))
@@ -574,7 +665,7 @@ func TestMessageHandler_ListChannelMessages_NextCursorPresentWhenMorePages(t *te
 // ── Nil deps ─────────────────────────────────────────────────────────────────
 
 func TestMessageHandler_NilDeps_Returns503(t *testing.T) {
-	h := httpapi.NewMessageHandler(nil, nil)
+	h := httpapi.NewMessageHandler(nil, nil, nil)
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
 	r.SetPathValue("channelID", testChannelID)
@@ -587,7 +678,7 @@ func TestMessageHandler_NilDeps_Returns503(t *testing.T) {
 // ── ListDMMessages: missing coverage tests ───────────────────────────────────
 
 func TestMessageHandler_ListDMMessages_UnauthenticatedReturns401(t *testing.T) {
-	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, nil)
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
 	r.SetPathValue("conversationID", testConversationID)
@@ -720,7 +811,7 @@ func TestMessageHandler_ListDMMessages_CursorForwardedToService(t *testing.T) {
 // ── CreateDMMessage: missing coverage tests ──────────────────────────────────
 
 func TestMessageHandler_CreateDMMessage_UnauthenticatedReturns401(t *testing.T) {
-	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, nil)
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
 		strings.NewReader(`{"body_text":"hello"}`))

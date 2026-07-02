@@ -178,6 +178,18 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.lastMutation).toBe("ws_append");
   });
 
+  it("preserves v3 mention format from a realtime payload", async () => {
+    const payload = makePayload({ id: "msg-v3", body_format: "v3" });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsEventWithPayload("channel", "ch-1", payload));
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].bodyFormat).toBe("v3");
+  });
+
   it("renders realtime payload without sender email", async () => {
     const payload = {
       ...makePayload({ id: "msg-no-email", sender_display_name: "Display Name" }),

@@ -529,6 +529,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       )}
 
       <ChatComposer
+        channelId={kind === "channel" ? targetId : undefined}
+        bodyFormat={kind === "channel" ? "v3" : "v2"}
         placeholder={
           kind === "channel" ? `Mensagem para #${resolvedName}…` : `Mensagem para ${resolvedName}…`
         }

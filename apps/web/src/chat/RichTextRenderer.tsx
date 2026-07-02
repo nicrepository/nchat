@@ -11,16 +11,21 @@ import {
   INLINE_MARKERS,
   ITALIC_MARKER,
   LEGACY_INLINE_RE,
+  MENTION_TOKEN_RE,
   findUnescapedMarker,
   isCodeFence,
   parseLegacyListLine,
   parseListLine,
   unescapeRichText,
+  unescapeRichTextV3,
 } from "./richTextMarkers";
 import type { InlineMarkerType, ListType } from "./richTextMarkers";
 import type { MessageBodyFormat } from "./chatTypes";
 
-type InlineToken = string | { type: InlineMarkerType; text: string };
+type InlineToken =
+  | string
+  | { type: InlineMarkerType; text: string }
+  | { type: "mention"; text: string; mentionType: "user" | "channel"; id: string };
 
 function tokenizeV1Inline(text: string): InlineToken[] {
   return text.split(LEGACY_INLINE_RE).flatMap((chunk): InlineToken[] => {
@@ -75,13 +80,80 @@ function tokenizeV2Inline(text: string): InlineToken[] {
   return tokens;
 }
 
+function tokenizeV3Inline(text: string): InlineToken[] {
+  const tokens: InlineToken[] = [];
+  let plain = "";
+  let i = 0;
+
+  const flushPlain = () => {
+    if (plain) tokens.push(unescapeRichTextV3(plain));
+    plain = "";
+  };
+
+  while (i < text.length) {
+    if (text[i] === "\\" && i + 1 < text.length) {
+      plain += text.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+
+    const mention = MENTION_TOKEN_RE.exec(text.slice(i));
+    if (mention) {
+      flushPlain();
+      tokens.push({
+        type: "mention",
+        text: unescapeRichTextV3(mention[1]),
+        mentionType: mention[2] as "user" | "channel",
+        id: mention[3].toLowerCase(),
+      });
+      i += mention[0].length;
+      continue;
+    }
+
+    const opening = INLINE_MARKERS.find(({ marker }) => text.startsWith(marker, i));
+    if (opening) {
+      const contentStart = i + opening.marker.length;
+      const closing = findUnescapedMarker(text, opening.marker, contentStart);
+      if (closing > contentStart) {
+        flushPlain();
+        tokens.push({
+          type: opening.type,
+          text: unescapeRichTextV3(text.slice(contentStart, closing)),
+        });
+        i = closing + opening.marker.length;
+        continue;
+      }
+    }
+
+    plain += text[i++];
+  }
+
+  flushPlain();
+  return tokens;
+}
+
 const tokenizeInline = (text: string, format: MessageBodyFormat): InlineToken[] =>
-  format === "v2" ? tokenizeV2Inline(text) : tokenizeV1Inline(text);
+  format === "v3"
+    ? tokenizeV3Inline(text)
+    : format === "v2"
+      ? tokenizeV2Inline(text)
+      : tokenizeV1Inline(text);
 
 function renderTokens(tokens: InlineToken[], keyPrefix: string): ReactNode[] {
   return tokens.map((token, index): ReactNode => {
     if (typeof token === "string") return token;
     const key = `${keyPrefix}-${index}`;
+    if (token.type === "mention")
+      return (
+        <span
+          key={key}
+          className="rtr-mention"
+          data-mention-type={token.mentionType}
+          data-mention-id={token.id}
+        >
+          @{token.text}
+        </span>
+      );
     if (token.type === "bold") return <strong key={key}>{token.text}</strong>;
     if (token.type === "boldItalic")
       return (
@@ -118,7 +190,18 @@ function parseCodeFence(lines: string[], i: number, format: MessageBodyFormat): 
   while (i < lines.length && !isCodeFence(lines[i])) codeLines.push(lines[i++]);
   if (i < lines.length) i++;
   const content = codeLines.join("\n");
-  return [{ type: "code", content: format === "v2" ? unescapeRichText(content) : content }, i];
+  return [
+    {
+      type: "code",
+      content:
+        format === "v3"
+          ? unescapeRichTextV3(content)
+          : format === "v2"
+            ? unescapeRichText(content)
+            : content,
+    },
+    i,
+  ];
 }
 
 function parseListBlock(
@@ -129,7 +212,7 @@ function parseListBlock(
   format: MessageBodyFormat,
 ): [ListBlock, number] {
   const items: ListItemBlock[] = [];
-  const parseLine = format === "v2" ? parseListLine : parseLegacyListLine;
+  const parseLine = format === "v1" ? parseLegacyListLine : parseListLine;
   const start = parseLine(lines[i])?.index ?? 1;
 
   while (i < lines.length) {
@@ -147,7 +230,7 @@ function parseListBlock(
     i++;
   }
 
-  return [{ type, start: format === "v2" ? start : 1, items }, i];
+  return [{ type, start: format === "v1" ? 1 : start, items }, i];
 }
 
 function parseParagraph(
@@ -156,7 +239,7 @@ function parseParagraph(
   format: MessageBodyFormat,
 ): [{ type: "para"; lines: string[] }, number] {
   const paraLines: string[] = [];
-  const parseLine = format === "v2" ? parseListLine : parseLegacyListLine;
+  const parseLine = format === "v1" ? parseLegacyListLine : parseListLine;
   while (i < lines.length && !isCodeFence(lines[i]) && !parseLine(lines[i])) {
     paraLines.push(lines[i++]);
   }
@@ -176,7 +259,7 @@ function parseBlocks(text: string, format: MessageBodyFormat): Block[] {
       continue;
     }
 
-    const listLine = (format === "v2" ? parseListLine : parseLegacyListLine)(lines[i]);
+    const listLine = (format === "v1" ? parseLegacyListLine : parseListLine)(lines[i]);
     if (listLine) {
       const [block, next] = parseListBlock(lines, i, listLine.depth, listLine.type, format);
       blocks.push(block);

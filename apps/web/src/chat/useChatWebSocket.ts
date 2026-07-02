@@ -38,7 +38,7 @@ export interface WSMessagePayload {
   kind: string;
   body_text: string;
   /** Missing means legacy v1 during rolling deploys. */
-  body_format?: "v1" | "v2";
+  body_format?: "v1" | "v2" | "v3";
   status: string;
   is_removed: boolean;
   created_at: string;

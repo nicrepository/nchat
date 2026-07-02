@@ -24,6 +24,9 @@ const msgGetSingleRateLimit = 120
 // user may make per minute across all channels and DMs.
 const msgPostRateLimit = 60
 
+// mentionSearchRateLimit limits autocomplete enumeration independently from messages.
+const mentionSearchRateLimit = 30
+
 const RouteMetrics = "/metrics"
 
 func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler) http.Handler {
@@ -59,6 +62,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	msgListLimiter := NewUserRateLimiter(msgListRateLimit, time.Minute)
 	msgGetSingleLimiter := NewUserRateLimiter(msgGetSingleRateLimit, time.Minute)
 	msgPostLimiter := NewUserRateLimiter(msgPostRateLimit, time.Minute)
+	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
 
 	// Channel message endpoints: GET list, POST create, GET single.
 	mux.Handle("GET "+RouteChannelMessages, authMiddleware(
@@ -69,6 +73,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	))
 	mux.Handle("GET "+RouteChannelMessage, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetChannelMessage)),
+	))
+	mux.Handle("GET "+RouteChannelMentions, authMiddleware(
+		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchMentions)),
 	))
 
 	// DM message endpoints: GET list, POST create, GET single.

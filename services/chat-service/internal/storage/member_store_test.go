@@ -13,6 +13,30 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
+func TestPGXMemberStore_SearchChannelMembers_ScopesWorkspaceChannelAndActiveMembership(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)FROM chat\.channel_members.*c\.workspace_id = \$1::uuid.*wm\.status = 'active'.*u\.status = 'active'.*cm\.channel_id = \$2::uuid`).
+		WithArgs("ws-1", "ch-1", "an", 10).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).AddRow("user-in-channel", "Ana"))
+
+	got, err := storage.NewPGXMemberStore(mock).SearchChannelMembers(
+		context.Background(), "ws-1", "ch-1", "an", 10,
+	)
+	if err != nil {
+		t.Fatalf("SearchChannelMembers: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "user-in-channel" {
+		t.Fatalf("out-of-scope users must not appear: %#v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestPGXMemberStore_AddWorkspaceMember_Success(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

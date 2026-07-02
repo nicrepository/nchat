@@ -13,6 +13,7 @@ import { EditorContent } from "@tiptap/react";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
+import type { CodecFormat } from "./tiptapSerializer";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -39,16 +40,26 @@ function IconSend() {
 
 export interface ChatComposerProps {
   placeholder: string;
+  channelId?: string;
+  bodyFormat: CodecFormat;
   disabled?: boolean;
   onSend: (body: string) => Promise<SendResult>;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function ChatComposer({ placeholder, disabled = false, onSend }: ChatComposerProps) {
+export default function ChatComposer({
+  placeholder,
+  channelId,
+  bodyFormat,
+  disabled = false,
+  onSend,
+}: ChatComposerProps) {
   const { editor, canSend, sending, handleSend } = useChatEditor({
     placeholder,
     disabled,
+    channelId,
+    bodyFormat,
     onSend,
   });
 
