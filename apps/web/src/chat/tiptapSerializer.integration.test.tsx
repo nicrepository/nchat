@@ -16,12 +16,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { Editor } from "@tiptap/core";
 import { createChatEditorExtensions } from "./useChatEditor";
-import { tiptapDocToMarkdown } from "./tiptapSerializer";
+import { tiptapDocToMarkdown as serializeDoc } from "./tiptapSerializer";
+import type { CodecFormat, TTNode } from "./tiptapSerializer";
 import RichTextRenderer from "./RichTextRenderer";
 
 // ── Editor lifecycle ──────────────────────────────────────────────────────────
 
 let realEditor: Editor | null = null;
+
+const tiptapDocToMarkdown = (value: TTNode, format: CodecFormat = "v2") =>
+  serializeDoc(value, format);
 
 /** Creates an Editor with the SAME extensions used in production. */
 function createEditor(content = "<p></p>") {
@@ -51,6 +55,37 @@ afterEach(() => {
 // if the renderer can't actually parse what the serializer wrote.
 
 describe("full codec round-trip: editor → Markdown → RichTextRenderer", () => {
+  it("does not register Mention in the DM editor", () => {
+    expect(createChatEditorExtensions(false).map((extension) => extension.name)).not.toContain(
+      "mention",
+    );
+    expect(createChatEditorExtensions(true).map((extension) => extension.name)).toContain(
+      "mention",
+    );
+  });
+
+  it("mention: real editor → v3 token → highlighted rendered node", () => {
+    const editor = createEditor();
+    editor.commands.insertContent([
+      { type: "text", text: "Oi " },
+      {
+        type: "mention",
+        attrs: {
+          mentionType: "user",
+          id: "11111111-1111-1111-1111-111111111111",
+          label: "Ana",
+        },
+      },
+    ]);
+
+    const md = tiptapDocToMarkdown(editor.getJSON(), "v3");
+    const { container } = render(<RichTextRenderer text={md} bodyFormat="v3" />);
+
+    expect(md).toBe("Oi @[Ana](mention:user:11111111-1111-1111-1111-111111111111)");
+    expect(container.querySelector(".rtr-mention")).toHaveTextContent("@Ana");
+    expect(container.querySelector("a, script")).toBeNull();
+  });
+
   it("bold: editor → **text** → <strong>", () => {
     const editor = createEditor("<p><strong>hello</strong></p>");
     const md = tiptapDocToMarkdown(editor.getJSON());

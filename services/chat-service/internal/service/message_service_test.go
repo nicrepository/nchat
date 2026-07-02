@@ -37,23 +37,29 @@ func activeDMConversation(workspaceID, convID string) domain.DMConversation {
 // ---- fakeMessageStore ------------------------------------------------------
 
 type fakeMessageStore struct {
-	createdMessage        domain.Message
-	createErr             error
-	afterCreate           func()
-	channelMessages       []domain.Message
-	listChannelErr        error
-	listChannelNextCursor *storage.MessageCursor
-	dmMessages            []domain.Message
-	listDMErr             error
-	listDMNextCursor      *storage.MessageCursor
-	messagesByKey         map[string]domain.Message // key: workspaceID+":"+messageID
-	getByIDErr            error
-	validateRefTargetErr  error
+	createdMessage          domain.Message
+	createErr               error
+	afterCreate             func()
+	channelMessages         []domain.Message
+	listChannelErr          error
+	listChannelNextCursor   *storage.MessageCursor
+	dmMessages              []domain.Message
+	listDMErr               error
+	listDMNextCursor        *storage.MessageCursor
+	messagesByKey           map[string]domain.Message // key: workspaceID+":"+messageID
+	getByIDErr              error
+	validateRefTargetErr    error
+	mentionLabels           map[string]string
+	resolveMentionErr       error
+	authorizedMentionLabels map[string]string
+	resolveAuthorizedErr    error
 
-	lastCreateInput  storage.CreateMessageInput
-	createCalls      int
-	listChannelCalls int
-	listDMCalls      int
+	lastCreateInput        storage.CreateMessageInput
+	createCalls            int
+	listChannelCalls       int
+	listDMCalls            int
+	resolveMentionCalls    int
+	resolveAuthorizedCalls int
 }
 
 func (f *fakeMessageStore) CreateMessage(_ context.Context, input storage.CreateMessageInput) (domain.Message, error) {
@@ -81,6 +87,19 @@ func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspac
 
 func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _ string) error {
 	return f.validateRefTargetErr
+}
+
+func (f *fakeMessageStore) ResolveMentionLabels(_ context.Context, _ string, _, _ []string) (map[string]string, error) {
+	f.resolveMentionCalls++
+	return f.mentionLabels, f.resolveMentionErr
+}
+
+func (f *fakeMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, _, _ string, _, _ []string) (map[string]string, error) {
+	f.resolveAuthorizedCalls++
+	if f.authorizedMentionLabels == nil {
+		return f.mentionLabels, f.resolveAuthorizedErr
+	}
+	return f.authorizedMentionLabels, f.resolveAuthorizedErr
 }
 
 func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {
@@ -130,10 +149,119 @@ func TestMessageService_CreateChannelMessage_RejectsUnknownBodyFormat(t *testing
 	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{})
 	_, err := svc.CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
 		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "hello",
-		BodyFormat: "v3",
+		BodyFormat: "v4",
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_AcceptsV3BodyFormat(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-v3"}}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "hello",
+			BodyFormat: "v3",
+		})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage v3: %v", err)
+	}
+	if msgs.lastCreateInput.BodyFormat != "v3" {
+		t.Fatalf("expected v3 forwarded to storage, got %q", msgs.lastCreateInput.BodyFormat)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_ExtractsAndCanonicalizesMentions(t *testing.T) {
+	const userID = "11111111-1111-1111-1111-111111111111"
+	const channelID = "22222222-2222-2222-2222-222222222222"
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{
+		createdMessage: domain.Message{ID: "msg-v3"},
+		mentionLabels: map[string]string{
+			"user:" + userID:       "Alice",
+			"channel:" + channelID: "geral",
+		},
+	}
+	body := `@[Spoofed](mention:user:` + userID + `) @[old](mention:channel:` + channelID + `)`
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: body, BodyFormat: "v3",
+		})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
+	}
+	if got := msgs.lastCreateInput.MentionedUserIDs; len(got) != 1 || got[0] != userID {
+		t.Fatalf("unexpected mentioned users: %#v", got)
+	}
+	if got := msgs.lastCreateInput.MentionedChannelIDs; len(got) != 1 || got[0] != channelID {
+		t.Fatalf("unexpected mentioned channels: %#v", got)
+	}
+	wantBody := `@[Alice](mention:user:` + userID + `) @[geral](mention:channel:` + channelID + `)`
+	if msgs.lastCreateInput.BodyText != wantBody {
+		t.Fatalf("body = %q, want %q", msgs.lastCreateInput.BodyText, wantBody)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_RejectsUnauthorizedMentionBeforeInsert(t *testing.T) {
+	const userID = "99999999-9999-9999-9999-999999999999"
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{authorizedMentionLabels: map[string]string{}}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: `@[Outsider](mention:user:` + userID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		})
+
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected non-enumerating invalid input, got %v", err)
+	}
+	if msgs.createCalls != 0 {
+		t.Fatalf("unauthorized mention must fail before insert, got %d CreateMessage calls", msgs.createCalls)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_MentionRemovedAfterPreflightIsRejected(t *testing.T) {
+	const userID = "11111111-1111-1111-1111-111111111111"
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{
+		authorizedMentionLabels: map[string]string{"user:" + userID: "Alice"},
+		createErr:               domain.ErrNotFound,
+	}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: `@[Alice](mention:user:` + userID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		})
+
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("atomic storage backstop must reject a membership race, got %v", err)
+	}
+	if msgs.resolveAuthorizedCalls != 1 || msgs.createCalls != 1 {
+		t.Fatalf("expected preflight then atomic insert, resolve=%d create=%d", msgs.resolveAuthorizedCalls, msgs.createCalls)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_DoesNotInterpretMentionSyntaxBeforeV3(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-v2"}}
+	body := `@[literal](mention:user:11111111-1111-1111-1111-111111111111)`
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: body, BodyFormat: domain.MessageBodyFormatV2,
+		})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
+	}
+	if len(msgs.lastCreateInput.MentionedUserIDs) != 0 {
+		t.Fatalf("v2 text must not create mentions: %#v", msgs.lastCreateInput.MentionedUserIDs)
 	}
 }
 
@@ -571,6 +699,145 @@ func TestMessageService_ListChannelMessages_VisibleChannelDelegatesToStorage(t *
 	}
 	if channels.getVisibleByIDCalls != 1 {
 		t.Fatalf("expected one channel visibility check, got %d", channels.getVisibleByIDCalls)
+	}
+}
+
+func TestMessageService_ListChannelMessages_RefreshesMentionLabels(t *testing.T) {
+	const userID = "11111111-1111-1111-1111-111111111111"
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{
+		channelMessages: []domain.Message{{
+			ID: "m1", WorkspaceID: "ws-1", ChannelID: "ch-1",
+			BodyText: `@[Old](mention:user:` + userID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		}},
+		mentionLabels: map[string]string{"user:" + userID: "New Name"},
+	}
+
+	got, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", CallerID: user1,
+		})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	want := `@[New Name](mention:user:` + userID + `)`
+	if got.Messages[0].BodyText != want {
+		t.Fatalf("body = %q, want %q", got.Messages[0].BodyText, want)
+	}
+}
+
+type cachedMentionLabel struct {
+	label     string
+	expiresAt time.Time
+}
+
+type fakeMentionLabelCache struct {
+	now      time.Time
+	entries  map[string]cachedMentionLabel
+	lastTTL  time.Duration
+	setCalls int
+	getErr   error
+	setErr   error
+}
+
+func (f *fakeMentionLabelCache) Get(_ context.Context, workspaceID string, refs []string) (map[string]string, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	labels := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		entry, ok := f.entries[workspaceID+":"+ref]
+		if ok && f.now.Before(entry.expiresAt) {
+			labels[ref] = entry.label
+		}
+	}
+	return labels, nil
+}
+
+func (f *fakeMentionLabelCache) Set(_ context.Context, workspaceID string, labels map[string]string, ttl time.Duration) error {
+	f.setCalls++
+	f.lastTTL = ttl
+	if f.setErr != nil {
+		return f.setErr
+	}
+	for ref, label := range labels {
+		f.entries[workspaceID+":"+ref] = cachedMentionLabel{label: label, expiresAt: f.now.Add(ttl)}
+	}
+	return nil
+}
+
+func TestMessageService_ListChannelMessages_MentionLabelCacheFailureFallsBack(t *testing.T) {
+	const userID = "11111111-1111-1111-1111-111111111111"
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{
+		channelMessages: []domain.Message{{
+			ID: "m1", WorkspaceID: "ws-1", ChannelID: "ch-1",
+			BodyText: `@[Old](mention:user:` + userID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		}},
+		mentionLabels: map[string]string{"user:" + userID: "Database Name"},
+	}
+	cache := &fakeMentionLabelCache{
+		entries: map[string]cachedMentionLabel{}, getErr: errors.New("valkey unavailable"), setErr: errors.New("valkey unavailable"),
+	}
+	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs)
+	svc.SetMentionLabelCache(cache)
+
+	got, err := svc.ListChannelMessages(context.Background(), service.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", CallerID: user1,
+	})
+	if err != nil {
+		t.Fatalf("cache failure must not fail message reads: %v", err)
+	}
+	if msgs.resolveMentionCalls != 1 || cache.setCalls != 1 {
+		t.Fatalf("expected database fallback and best-effort cache set, resolves=%d sets=%d", msgs.resolveMentionCalls, cache.setCalls)
+	}
+	want := `@[Database Name](mention:user:` + userID + `)`
+	if got.Messages[0].BodyText != want {
+		t.Fatalf("body = %q, want %q", got.Messages[0].BodyText, want)
+	}
+}
+
+func TestMessageService_ListChannelMessages_MentionLabelCacheHitAndExpiry(t *testing.T) {
+	const userID = "11111111-1111-1111-1111-111111111111"
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{
+		channelMessages: []domain.Message{{
+			ID: "m1", WorkspaceID: "ws-1", ChannelID: "ch-1",
+			BodyText: `@[Old](mention:user:` + userID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		}},
+		mentionLabels: map[string]string{"user:" + userID: "Cached Name"},
+	}
+	cache := &fakeMentionLabelCache{now: time.Unix(1_700_000_000, 0), entries: map[string]cachedMentionLabel{}}
+	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs)
+	svc.SetMentionLabelCache(cache)
+	input := service.ListChannelMessagesInput{WorkspaceID: "ws-1", ChannelID: "ch-1", CallerID: user1}
+
+	if _, err := svc.ListChannelMessages(context.Background(), input); err != nil {
+		t.Fatalf("first ListChannelMessages: %v", err)
+	}
+	if msgs.resolveMentionCalls != 1 || cache.setCalls != 1 || cache.lastTTL != 45*time.Second {
+		t.Fatalf("cache miss must query and cache for 45s: resolves=%d sets=%d ttl=%s", msgs.resolveMentionCalls, cache.setCalls, cache.lastTTL)
+	}
+
+	if _, err := svc.ListChannelMessages(context.Background(), input); err != nil {
+		t.Fatalf("cached ListChannelMessages: %v", err)
+	}
+	if msgs.resolveMentionCalls != 1 {
+		t.Fatalf("cache hit must avoid a second batched query, got %d", msgs.resolveMentionCalls)
+	}
+
+	cache.now = cache.now.Add(46 * time.Second)
+	msgs.mentionLabels = map[string]string{"user:" + userID: "Fresh Name"}
+	got, err := svc.ListChannelMessages(context.Background(), input)
+	if err != nil {
+		t.Fatalf("expired ListChannelMessages: %v", err)
+	}
+	if msgs.resolveMentionCalls != 2 {
+		t.Fatalf("expired cache must query again, got %d", msgs.resolveMentionCalls)
+	}
+	want := `@[Fresh Name](mention:user:` + userID + `)`
+	if got.Messages[0].BodyText != want {
+		t.Fatalf("body = %q, want %q", got.Messages[0].BodyText, want)
 	}
 }
 

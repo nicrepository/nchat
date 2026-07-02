@@ -20,7 +20,18 @@ const (
 	// DefaultPublishQueueCapacity bounds concurrent detached broadcasts so
 	// bursts cannot accumulate unobserved goroutines behind broker backpressure.
 	DefaultPublishQueueCapacity = 64
+	// defaultMentionLabelCacheTTL is used when SetMentionLabelCacheTTL is never
+	// called (e.g. in tests). Production wiring overrides it from
+	// config.Config.MentionLabelCacheTTLSeconds.
+	defaultMentionLabelCacheTTL = 45 * time.Second
 )
+
+// MentionLabelCache caches current mention labels for message read paths.
+// Implementations must scope entries by workspaceID.
+type MentionLabelCache interface {
+	Get(ctx context.Context, workspaceID string, refs []string) (map[string]string, error)
+	Set(ctx context.Context, workspaceID string, labels map[string]string, ttl time.Duration) error
+}
 
 // MessageEventPublisher publishes message lifecycle events.
 // It is satisfied by *ws.Hub (via an adapter in app/) to avoid a circular import.
@@ -111,23 +122,42 @@ type GetDMMessageInput struct {
 
 // MessageService handles message creation and listing for channels and DM conversations.
 type MessageService struct {
-	channels    storage.ChannelStore
-	dms         storage.DMStore
-	messages    storage.MessageStore
-	publisherMu sync.RWMutex
-	publisher   MessageEventPublisher // optional; nil means no broadcast
+	channels         storage.ChannelStore
+	dms              storage.DMStore
+	messages         storage.MessageStore
+	mentionLabels    MentionLabelCache
+	mentionLabelsTTL time.Duration
+	publisherMu      sync.RWMutex
+	publisher        MessageEventPublisher // optional; nil means no broadcast
 
 	publishSlots      chan struct{}
 	droppedPublishCnt atomic.Int64
 }
 
+// SetMentionLabelCache enables the optional read-through cache. Configure it
+// during application startup, before serving requests.
+func (s *MessageService) SetMentionLabelCache(cache MentionLabelCache) {
+	s.mentionLabels = cache
+}
+
+// SetMentionLabelCacheTTL overrides the cache entry lifetime (default 45s).
+// Lower values propagate display-name changes and account deactivation
+// ("right to be forgotten") faster, at the cost of more load on Valkey.
+func (s *MessageService) SetMentionLabelCacheTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	s.mentionLabelsTTL = ttl
+}
+
 // NewMessageService creates a MessageService backed by the provided stores.
 func NewMessageService(channels storage.ChannelStore, dms storage.DMStore, messages storage.MessageStore) *MessageService {
 	return &MessageService{
-		channels:     channels,
-		dms:          dms,
-		messages:     messages,
-		publishSlots: make(chan struct{}, DefaultPublishQueueCapacity),
+		channels:         channels,
+		dms:              dms,
+		messages:         messages,
+		mentionLabelsTTL: defaultMentionLabelCacheTTL,
+		publishSlots:     make(chan struct{}, DefaultPublishQueueCapacity),
 	}
 }
 
@@ -181,6 +211,23 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		return domain.Message{}, err
 	}
 
+	var mentionedUserIDs, mentionedChannelIDs []string
+	if bodyFormat == domain.MessageBodyFormatV3 {
+		mentionedUserIDs, mentionedChannelIDs = extractMentionIDs(body)
+	}
+	if len(mentionedUserIDs)+len(mentionedChannelIDs) > 0 {
+		labels, err := s.messages.ResolveAuthorizedMentionLabels(
+			ctx, workspaceID, channelID, senderID, mentionedUserIDs, mentionedChannelIDs,
+		)
+		if err != nil {
+			return domain.Message{}, fmt.Errorf("resolve authorized mention labels: %w", err)
+		}
+		if err := validateMentionRefs(mentionedUserIDs, mentionedChannelIDs, labels); err != nil {
+			return domain.Message{}, err
+		}
+		body = rewriteMentionLabels(body, labels)
+	}
+
 	parentID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", strings.TrimSpace(input.ParentMessageID))
 	if err != nil {
 		return domain.Message{}, err
@@ -204,6 +251,8 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		ParentMessageID:        parentID,
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
+		MentionedUserIDs:       mentionedUserIDs,
+		MentionedChannelIDs:    mentionedChannelIDs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create channel message: %w", err)
@@ -328,6 +377,9 @@ func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChan
 	if err != nil {
 		return ListChannelMessagesOutput{}, fmt.Errorf("list channel messages: %w", err)
 	}
+	if err := s.refreshMentionLabels(ctx, workspaceID, result.Messages); err != nil {
+		return ListChannelMessagesOutput{}, err
+	}
 
 	var nextCursor string
 	if result.NextCursor != nil {
@@ -406,11 +458,25 @@ func validateMessageBody(body string) error {
 	return nil
 }
 
+func validateMentionRefs(userIDs, channelIDs []string, labels map[string]string) error {
+	for _, id := range userIDs {
+		if _, ok := labels["user:"+id]; !ok {
+			return fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+		}
+	}
+	for _, id := range channelIDs {
+		if _, ok := labels["channel:"+id]; !ok {
+			return fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+		}
+	}
+	return nil
+}
+
 func normalizeBodyFormat(format domain.MessageBodyFormat) (domain.MessageBodyFormat, error) {
 	if format == "" {
 		return domain.MessageBodyFormatV1, nil
 	}
-	if format != domain.MessageBodyFormatV1 && format != domain.MessageBodyFormatV2 {
+	if format != domain.MessageBodyFormatV1 && format != domain.MessageBodyFormatV2 && format != domain.MessageBodyFormatV3 {
 		return "", fmt.Errorf("%w: unsupported body_format", domain.ErrInvalidInput)
 	}
 	return format, nil
@@ -440,7 +506,88 @@ func (s *MessageService) GetChannelMessage(ctx context.Context, input GetChannel
 	if msg.ChannelID != channelID {
 		return domain.Message{}, domain.ErrNotFound
 	}
-	return msg, nil
+	messages := []domain.Message{msg}
+	if err := s.refreshMentionLabels(ctx, workspaceID, messages); err != nil {
+		return domain.Message{}, err
+	}
+	return messages[0], nil
+}
+
+func (s *MessageService) refreshMentionLabels(ctx context.Context, workspaceID string, messages []domain.Message) error {
+	userIDs, channelIDs := []string{}, []string{}
+	for _, msg := range messages {
+		if msg.BodyFormat != domain.MessageBodyFormatV3 {
+			continue
+		}
+		users, channels := extractMentionIDs(msg.BodyText)
+		userIDs = append(userIDs, users...)
+		channelIDs = append(channelIDs, channels...)
+	}
+	if len(userIDs)+len(channelIDs) == 0 {
+		return nil
+	}
+	userIDs = uniqueStrings(userIDs)
+	channelIDs = uniqueStrings(channelIDs)
+	refs := make([]string, 0, len(userIDs)+len(channelIDs))
+	for _, id := range userIDs {
+		refs = append(refs, "user:"+id)
+	}
+	for _, id := range channelIDs {
+		refs = append(refs, "channel:"+id)
+	}
+
+	labels := make(map[string]string, len(refs))
+	if s.mentionLabels != nil {
+		cached, err := s.mentionLabels.Get(ctx, workspaceID, refs)
+		if err == nil {
+			for ref, label := range cached {
+				labels[ref] = label
+			}
+		}
+	}
+
+	missingUsers, missingChannels := []string{}, []string{}
+	for _, id := range userIDs {
+		if _, ok := labels["user:"+id]; !ok {
+			missingUsers = append(missingUsers, id)
+		}
+	}
+	for _, id := range channelIDs {
+		if _, ok := labels["channel:"+id]; !ok {
+			missingChannels = append(missingChannels, id)
+		}
+	}
+	if len(missingUsers)+len(missingChannels) > 0 {
+		resolved, err := s.messages.ResolveMentionLabels(ctx, workspaceID, missingUsers, missingChannels)
+		if err != nil {
+			return fmt.Errorf("resolve mention labels: %w", err)
+		}
+		for ref, label := range resolved {
+			labels[ref] = label
+		}
+		if s.mentionLabels != nil && len(resolved) > 0 {
+			_ = s.mentionLabels.Set(ctx, workspaceID, resolved, s.mentionLabelsTTL)
+		}
+	}
+	for i := range messages {
+		if messages[i].BodyFormat == domain.MessageBodyFormatV3 {
+			messages[i].BodyText = rewriteMentionLabels(messages[i].BodyText, labels)
+		}
+	}
+	return nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
 }
 
 // GetDMMessage returns a single DM message visible to the caller.

@@ -1,6 +1,15 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+
+const { mockFetchMentionCandidates } = vi.hoisted(() => ({
+  mockFetchMentionCandidates: vi.fn(),
+}));
+
+vi.mock("./chatApi", () => ({
+  fetchMentionCandidates: (...args: unknown[]) => mockFetchMentionCandidates(...args),
+}));
+
 import ChatComposer from "./ChatComposer";
 import RichTextRenderer from "./RichTextRenderer";
 import type { SendResult } from "./useMessages";
@@ -35,7 +44,7 @@ async function paste(html: string, plain: string): Promise<HTMLElement> {
 function setup() {
   const onSend = vi.fn<(body: string) => Promise<SendResult>>();
   onSend.mockResolvedValue({ status: "sent" });
-  render(<ChatComposer placeholder="Mensagem..." onSend={onSend} />);
+  render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
   return onSend;
 }
 
@@ -126,5 +135,66 @@ describe("ChatComposer list UX", () => {
     await waitFor(() => expect(input.querySelector("li br")).not.toBeNull());
     expect(input.querySelectorAll("li")).toHaveLength(1);
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatComposer mentions", () => {
+  it("autocompletes a channel-scoped user and sends a renderable v3 token", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      {
+        mentionType: "user",
+        id: "11111111-1111-1111-1111-111111111111",
+        label: "Ana",
+      },
+    ]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    render(
+      <ChatComposer
+        channelId="22222222-2222-2222-2222-222222222222"
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+    const input = await screen.findByTestId("chat-composer-input");
+
+    input.focus();
+    await userEvent.type(input, "@an", { skipClick: true });
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /Ana/ }));
+
+    expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
+      "22222222-2222-2222-2222-222222222222",
+      "an",
+      expect.any(AbortSignal),
+    );
+    expect(input.querySelector(".chat-mention")).toHaveTextContent("@Ana");
+
+    const stored = await send(onSend);
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v3" />);
+    expect(container.querySelector(".rtr-mention")).toHaveTextContent("@Ana");
+  });
+
+  it("closes autocomplete with Escape", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "channel", id: "channel-1", label: "anuncios" },
+    ]);
+    render(
+      <ChatComposer
+        channelId="22222222-2222-2222-2222-222222222222"
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={vi.fn().mockResolvedValue({ status: "sent" })}
+      />,
+    );
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@a", { skipClick: true });
+    expect(await screen.findByRole("option", { name: /anuncios/ })).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Escape", code: "Escape" });
+
+    await waitFor(() => expect(screen.queryByRole("option", { name: /anuncios/ })).toBeNull());
   });
 });

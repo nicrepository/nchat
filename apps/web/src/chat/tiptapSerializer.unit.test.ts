@@ -9,14 +9,17 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { tiptapDocToMarkdown, applyMarks } from "./tiptapSerializer";
-import type { TTNode } from "./tiptapSerializer";
+import { tiptapDocToMarkdown as serializeDoc, applyMarks } from "./tiptapSerializer";
+import type { CodecFormat, TTNode } from "./tiptapSerializer";
+import { buildMentionToken, MENTION_TOKEN_RE } from "./richTextMarkers";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function doc(...content: TTNode[]): TTNode {
   return { type: "doc", content };
 }
+const tiptapDocToMarkdown = (value: TTNode, format: CodecFormat = "v2") =>
+  serializeDoc(value, format);
 function para(...content: TTNode[]): TTNode {
   return { type: "paragraph", content };
 }
@@ -29,6 +32,9 @@ function text(t: string, ...marks: string[]): TTNode {
 }
 function hardBreak(): TTNode {
   return { type: "hardBreak" };
+}
+function mention(type: "user" | "channel", id: string, label: string): TTNode {
+  return { type: "mention", attrs: { mentionType: type, id, label } };
 }
 function codeBlock(code: string): TTNode {
   return { type: "codeBlock", content: [{ type: "text", text: code }] };
@@ -81,6 +87,36 @@ describe("tiptapDocToMarkdown — empty / plain", () => {
 // ── Inline marks ──────────────────────────────────────────────────────────────
 
 describe("tiptapDocToMarkdown — inline marks", () => {
+  it("uses the shared mention grammar for building and parsing tokens", () => {
+    const token = buildMentionToken("user", "11111111-1111-1111-1111-111111111111", "Ana [Dev]");
+    const parsed = MENTION_TOKEN_RE.exec(token);
+
+    expect(token).toBe(
+      String.raw`@[Ana \[Dev\]](mention:user:11111111-1111-1111-1111-111111111111)`,
+    );
+    expect(parsed?.slice(1)).toEqual([
+      String.raw`Ana \[Dev\]`,
+      "user",
+      "11111111-1111-1111-1111-111111111111",
+    ]);
+  });
+
+  it("serializes a v3 mention with its stable identity and escaped label", () => {
+    expect(
+      tiptapDocToMarkdown(
+        doc(
+          para(text("Oi "), mention("user", "11111111-1111-1111-1111-111111111111", "Ana [Dev]")),
+        ),
+        "v3",
+      ),
+    ).toBe(String.raw`Oi @[Ana \[Dev\]](mention:user:11111111-1111-1111-1111-111111111111)`);
+  });
+
+  it("escapes literal mention delimiters in v3 plain text", () => {
+    expect(tiptapDocToMarkdown(doc(para(text("@[not a mention](literal)"))), "v3")).toBe(
+      String.raw`\@\[not a mention\]\(literal\)`,
+    );
+  });
   it("bold text wrapped with **", () => {
     expect(tiptapDocToMarkdown(doc(para(text("hello", "bold"))))).toBe("**hello**");
   });
@@ -167,8 +203,23 @@ describe("tiptapDocToMarkdown — block nodes", () => {
 // ── Edge cases ────────────────────────────────────────────────────────────────
 
 describe("tiptapDocToMarkdown — edge cases", () => {
+  it("rejects a mention node in v2 instead of silently dropping it", () => {
+    expect(() =>
+      tiptapDocToMarkdown(
+        doc(para(mention("user", "11111111-1111-1111-1111-111111111111", "Ana"))),
+        "v2",
+      ),
+    ).toThrow(/mention.*v3/i);
+  });
+
+  it("rejects a malformed mention node in v3 instead of silently dropping it", () => {
+    expect(() => tiptapDocToMarkdown(doc(para({ type: "mention", attrs: {} })), "v3")).toThrow(
+      /invalid mention/i,
+    );
+  });
+
   it("unknown inline node type returns empty string (no crash)", () => {
-    const result = tiptapDocToMarkdown(doc(para({ type: "mention", content: [] })));
+    const result = tiptapDocToMarkdown(doc(para({ type: "unknown", content: [] })));
     expect(result).toBe("");
   });
 

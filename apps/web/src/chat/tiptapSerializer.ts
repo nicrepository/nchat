@@ -15,7 +15,9 @@ import {
   CODE_BLOCK_MARKER,
   CODE_MARKER,
   ITALIC_MARKER,
+  buildMentionToken,
   escapeRichText,
+  escapeRichTextV3,
   formatListLine,
 } from "./richTextMarkers";
 import type { ListType } from "./richTextMarkers";
@@ -31,6 +33,8 @@ export interface TTNode {
   content?: TTNode[];
 }
 
+export type CodecFormat = "v2" | "v3";
+
 // ── Inline mark application ───────────────────────────────────────────────────
 
 /**
@@ -38,9 +42,13 @@ export interface TTNode {
  *
  * Code is exclusive in the configured TipTap schema. Bold and italic combine.
  */
-export function applyMarks(text: string, marks: Array<{ type: string }>): string {
+export function applyMarks(
+  text: string,
+  marks: Array<{ type: string }>,
+  format: CodecFormat = "v2",
+): string {
   const types = new Set(marks.map((m) => m.type));
-  const escaped = escapeRichText(text);
+  const escaped = format === "v3" ? escapeRichTextV3(text) : escapeRichText(text);
   if (types.has("code")) return CODE_MARKER + escaped + CODE_MARKER;
   if (types.has("bold") && types.has("italic"))
     return BOLD_ITALIC_MARKER + escaped + BOLD_ITALIC_MARKER;
@@ -51,11 +59,25 @@ export function applyMarks(text: string, marks: Array<{ type: string }>): string
 
 // ── Inline serializer ─────────────────────────────────────────────────────────
 
-export function serializeInline(nodes: TTNode[]): string {
+function serializeMention(node: TTNode): string {
+  const mentionType = node.attrs?.mentionType;
+  const id = node.attrs?.id;
+  const label = node.attrs?.label;
+  if ((mentionType !== "user" && mentionType !== "channel") || !id || !label) {
+    throw new Error("invalid mention node: mentionType, id, and label are required");
+  }
+  return buildMentionToken(mentionType, String(id), String(label));
+}
+
+export function serializeInline(nodes: TTNode[], format: CodecFormat): string {
   return nodes
     .map((n) => {
       if (n.type === "hardBreak") return "\n";
-      if (n.type === "text") return applyMarks(n.text ?? "", n.marks ?? []);
+      if (n.type === "mention") {
+        if (format !== "v3") throw new Error("mention nodes require body format v3");
+        return serializeMention(n);
+      }
+      if (n.type === "text") return applyMarks(n.text ?? "", n.marks ?? [], format);
       return "";
     })
     .join("");
@@ -70,13 +92,13 @@ export function serializeInline(nodes: TTNode[]): string {
  * Direct content blocks are joined with a space. Child lists are serialized
  * recursively with two-space indentation, so no pasted list content is lost.
  */
-function serializeListItemContent(item: TTNode): string {
+function serializeListItemContent(item: TTNode, format: CodecFormat): string {
   return (item.content ?? [])
     .filter((block) => block.type !== "bulletList" && block.type !== "orderedList")
     .map((block) => {
       if (block.type === "codeBlock")
         throw new Error("codeBlock inside listItem is not supported by the chat schema");
-      return serializeInline(block.content ?? []);
+      return serializeInline(block.content ?? [], format);
     })
     .filter(Boolean)
     .join(" ");
@@ -87,16 +109,22 @@ function textContent(node: TTNode): string {
   return (node.content ?? []).map(textContent).join("");
 }
 
-function serializeList(node: TTNode, depth: number): string {
+function serializeList(node: TTNode, depth: number, format: CodecFormat): string {
   const type: ListType = node.type === "orderedList" ? "ol" : "ul";
   const requestedStart = Number(node.attrs?.start ?? 1);
   const start = Number.isInteger(requestedStart) && requestedStart > 0 ? requestedStart : 1;
   return (node.content ?? [])
     .map((item, index) => {
-      const line = formatListLine(type, depth, index, serializeListItemContent(item), start);
+      const line = formatListLine(
+        type,
+        depth,
+        index,
+        serializeListItemContent(item, format),
+        start,
+      );
       const children = (item.content ?? [])
         .filter((block) => block.type === "bulletList" || block.type === "orderedList")
-        .map((child) => serializeList(child, depth + 1));
+        .map((child) => serializeList(child, depth + 1, format));
       return [line, ...children].join("\n");
     })
     .join("\n");
@@ -104,18 +132,24 @@ function serializeList(node: TTNode, depth: number): string {
 
 // ── Block serializer ──────────────────────────────────────────────────────────
 
-function serializeBlock(node: TTNode): string {
+function serializeBlock(node: TTNode, format: CodecFormat): string {
   switch (node.type) {
     case "codeBlock":
       return (
-        CODE_BLOCK_MARKER + "\n" + escapeRichText(textContent(node)) + "\n" + CODE_BLOCK_MARKER
+        CODE_BLOCK_MARKER +
+        "\n" +
+        (format === "v3"
+          ? escapeRichTextV3(textContent(node))
+          : escapeRichText(textContent(node))) +
+        "\n" +
+        CODE_BLOCK_MARKER
       );
     case "bulletList":
     case "orderedList":
-      return serializeList(node, 0);
+      return serializeList(node, 0, format);
     default:
       // paragraph and any other block
-      return serializeInline(node.content ?? []);
+      return serializeInline(node.content ?? [], format);
   }
 }
 
@@ -125,6 +159,6 @@ function serializeBlock(node: TTNode): string {
  * Serializes a TipTap/ProseMirror JSON document to the Markdown string
  * stored in body_text.
  */
-export function tiptapDocToMarkdown(doc: TTNode): string {
-  return (doc.content ?? []).map(serializeBlock).join("\n");
+export function tiptapDocToMarkdown(doc: TTNode, format: CodecFormat): string {
+  return (doc.content ?? []).map((node) => serializeBlock(node, format)).join("\n");
 }

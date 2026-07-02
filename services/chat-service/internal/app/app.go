@@ -37,6 +37,7 @@ type App struct {
 
 	hub          *ws.Hub
 	presence     *ws.PresenceTracker
+	mentionCache *storage.ValkeyMentionLabelCache
 	shutdownOnce sync.Once
 }
 
@@ -52,6 +53,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.shutdownOnce.Do(func() {
 		a.hub.Shutdown()
 		a.presence.Stop()
+		if a.mentionCache != nil {
+			a.mentionCache.Close()
+		}
 		err = a.TracingShutdown(ctx)
 	})
 	return err
@@ -70,11 +74,13 @@ func New(cfg config.Config) *App {
 
 	var sidebarSvc *service.SidebarService
 	var messageSvc *service.MessageService
+	var mentionSvc *service.MentionService
 	var workspaceStore *storage.PGXWorkspaceStore
 	var sessionValidator storage.SessionValidator
 	var channelStore *storage.PGXChannelStore
 	var memberStore *storage.PGXMemberStore
 	var dmStore *storage.PGXDMStore
+	var mentionCache *storage.ValkeyMentionLabelCache
 
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -91,11 +97,19 @@ func New(cfg config.Config) *App {
 			messages := storage.NewPGXMessageStore(pool)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
+			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
+			mentionSvc = service.NewMentionService(
+				service.NewMemberService(memberStore, channelStore, workspaceStore),
+				service.NewPermissionService(memberStore, channelStore),
+			)
 		}
 	}
 
 	sidebar := httpapi.NewSidebarHandler(sidebarSvc)
-	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc)
+	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc, nil)
+	if mentionSvc != nil {
+		messageHandler = httpapi.NewMessageHandler(workspaceStore, messageSvc, mentionSvc)
+	}
 
 	// Hub and presence are always created so their lifecycle is always managed
 	// by Shutdown. When DB is unavailable, NopAuthorizer denies all subscriptions
@@ -124,7 +138,28 @@ func New(cfg config.Config) *App {
 		TracingShutdown: shutdown,
 		hub:             hub,
 		presence:        presence,
+		mentionCache:    mentionCache,
 	}
+}
+
+// wireMentionLabelCache creates the Valkey-backed mention label cache and
+// attaches it to messageSvc, using the configured TTL. Returns the cache
+// (nil when disabled or the connection failed) so the caller can track it
+// for Shutdown. A connection failure is logged and non-fatal: the mention
+// label cache is simply skipped and messageSvc falls back to resolving
+// labels directly from storage on every read.
+func wireMentionLabelCache(valkeyURL string, ttlSeconds int, messageSvc *service.MessageService, logger *slog.Logger) *storage.ValkeyMentionLabelCache {
+	if valkeyURL == "" {
+		return nil
+	}
+	cache, err := storage.NewValkeyMentionLabelCache(valkeyURL)
+	if err != nil {
+		logger.Warn("mention label cache disabled", "reason", "invalid_valkey_config")
+		return nil
+	}
+	messageSvc.SetMentionLabelCache(cache)
+	messageSvc.SetMentionLabelCacheTTL(time.Duration(ttlSeconds) * time.Second)
+	return cache
 }
 
 func wsHandlerConfig(cfg config.Config) ws.HandlerConfig {

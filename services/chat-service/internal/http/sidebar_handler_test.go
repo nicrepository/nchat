@@ -37,7 +37,7 @@ func (s *stubSidebarProvider) GetSidebar(_ context.Context, _ string) (service.S
 // sidebarRouter builds a test router wired with the given validator and stub.
 // allowAllSessionValidator accepts all sessions so tests focus on sidebar logic.
 func sidebarRouter(v *httpapi.TokenValidator, svc *stubSidebarProvider) http.Handler {
-	return httpapi.NewRouter(sidebarTestConfig(), nil, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil), nil)
+	return httpapi.NewRouter(sidebarTestConfig(), nil, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil)
 }
 
 // authGet returns an authenticated GET request to RouteSidebar.
@@ -53,7 +53,7 @@ func authGet(t *testing.T) *http.Request {
 
 func TestSidebarHandler_NilService_Returns503(t *testing.T) {
 	v := makeTestValidator(t)
-	router := httpapi.NewRouter(sidebarTestConfig(), nil, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil), nil)
+	router := httpapi.NewRouter(sidebarTestConfig(), nil, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil)
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, authGet(t))
 	if rr.Code != http.StatusServiceUnavailable {

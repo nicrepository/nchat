@@ -20,6 +20,12 @@ func NewMemberService(members storage.MemberStore, channels storage.ChannelStore
 	return &MemberService{members: members, channels: channels, workspaces: workspaces}
 }
 
+// SearchChannelMembers returns active members of one channel by display-name prefix.
+// The caller's channel access must be checked by MentionService before this method.
+func (s *MemberService) SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	return s.members.SearchChannelMembers(ctx, workspaceID, channelID, prefix, limit)
+}
+
 // JoinWorkspace adds userID to workspaceID with the given role. If the user is
 // already a member, the existing membership record is returned without error.
 func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {

@@ -48,7 +48,13 @@ export type ActiveItem = { kind: "channel"; id: string } | { kind: "dm"; id: str
 
 export type MessageKind = "user" | "system";
 export type MessageStatus = "active" | "deleted";
-export type MessageBodyFormat = "v1" | "v2";
+export type MessageBodyFormat = "v1" | "v2" | "v3";
+
+export interface MentionCandidate {
+  mentionType: "user" | "channel";
+  id: string;
+  label: string;
+}
 
 export interface Message {
   id: string;

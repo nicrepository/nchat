@@ -88,6 +88,14 @@ type integMessageStore struct {
 	created []domain.Message
 }
 
+func (s *integMessageStore) ResolveMentionLabels(_ context.Context, _ string, _, _ []string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
+func (s *integMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, _, _ string, _, _ []string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
 // CreateMessage records the input and returns a domain.Message derived from seed + input.
 func (s *integMessageStore) CreateMessage(_ context.Context, in storage.CreateMessageInput) (domain.Message, error) {
 	now := time.Now().UTC()

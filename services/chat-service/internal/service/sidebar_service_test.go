@@ -47,6 +47,9 @@ func (f *sidebarFakeMemberStore) AddChannelMember(_ context.Context, _, _ string
 func (f *sidebarFakeMemberStore) GetChannelMember(_ context.Context, _, _ string) (domain.ChannelMember, error) {
 	return domain.ChannelMember{}, nil
 }
+func (f *sidebarFakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
+	return nil, nil
+}
 func (f *sidebarFakeMemberStore) RemoveChannelMember(_ context.Context, _, _, _ string) error {
 	return nil
 }

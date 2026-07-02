@@ -31,7 +31,7 @@ func (allowRouterSessionValidator) ValidateActiveSession(_ context.Context, _, _
 }
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -60,7 +60,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -88,7 +88,7 @@ func TestReadyzContract(t *testing.T) {
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -106,7 +106,7 @@ func TestVersionRouteStillWorks(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 
 	tests := []struct {
 		name   string
@@ -125,6 +125,38 @@ func TestMethodAndNotFoundBehavior(t *testing.T) {
 			router.ServeHTTP(response, httptest.NewRequest(tt.method, tt.path, nil))
 			assertJSONResponse(t, response, tt.want)
 		})
+	}
+}
+
+func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
+	if mentionSearchRateLimit != 30 {
+		t.Fatalf("mention autocomplete budget = %d, want 30", mentionSearchRateLimit)
+	}
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	router := NewRouter(
+		testConfig(), platformlog.New("chat-service", "test"), validator,
+		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
+	)
+	path := "/api/chat/channels/22222222-2222-2222-2222-222222222222/mentions?q=a"
+
+	for range mentionSearchRateLimit {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		if response.Code == http.StatusTooManyRequests {
+			t.Fatal("autocomplete was rate-limited before its budget was exhausted")
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after autocomplete budget, got %d", response.Code)
 	}
 }
 
@@ -200,7 +232,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -225,7 +257,7 @@ func TestNewRouter_NilWSHandlerReturns503AfterAuth(t *testing.T) {
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
-		NewMessageHandler(nil, nil),
+		NewMessageHandler(nil, nil, nil),
 		nil,
 	)
 
@@ -267,7 +299,7 @@ func makeRouterTestToken(t *testing.T) string {
 // before the message handler is invoked, ensuring no DB write and no broadcast
 // occur when the per-user budget is exhausted.
 //
-// Approach: pass a NewMessageHandler(nil, nil) so that any handler invocation
+// Approach: pass a NewMessageHandler(nil, nil, nil) so that any handler invocation
 // would panic (nil service). Exhaust the budget by sending msgPostRateLimit
 // requests through the full router stack, then verify the next request returns
 // 429 without panicking.
@@ -288,7 +320,7 @@ func newRouterForRateLimit(t *testing.T) http.Handler {
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
-		NewMessageHandler(nil, nil),
+		NewMessageHandler(nil, nil, nil),
 		nil,
 	)
 }
@@ -313,7 +345,7 @@ func routerGETRequest(t *testing.T, url string) *http.Request {
 // POST /api/chat/channels/{channelID}/messages returns 429 when the per-user
 // msgPostRateLimit budget is exceeded, and does NOT invoke the handler.
 //
-// The inner handler is NewMessageHandler(nil, nil) — if any handler method is
+// The inner handler is NewMessageHandler(nil, nil, nil) — if any handler method is
 // called it will panic because the services are nil. A panic here means the
 // test fails with a clear signal that the rate limiter is not working.
 func TestNewRouter_PostChannelMessage_Returns429AfterBudgetExhausted(t *testing.T) {
@@ -449,7 +481,7 @@ func newRouterWithWS(t *testing.T, wsHandler http.Handler) http.Handler {
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
-		NewMessageHandler(nil, nil),
+		NewMessageHandler(nil, nil, nil),
 		wsHandler,
 	)
 }

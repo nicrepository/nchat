@@ -28,6 +28,7 @@ type MessageBodyFormat string
 const (
 	MessageBodyFormatV1 MessageBodyFormat = "v1"
 	MessageBodyFormatV2 MessageBodyFormat = "v2"
+	MessageBodyFormatV3 MessageBodyFormat = "v3"
 )
 
 // Message is a single message posted to a channel or a DM conversation.

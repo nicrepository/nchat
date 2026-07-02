@@ -14,6 +14,9 @@ const (
 	defaultJWTIssuer   = "nchat-auth"
 	defaultJWTAudience = "nchat-api"
 
+	// defaultMentionLabelCacheTTLSeconds matches service.defaultMentionLabelCacheTTL.
+	defaultMentionLabelCacheTTLSeconds = 45
+
 	// wsInstanceIDMaxLen matches sourceInstanceIDMaxLen in the ws package.
 	// Kept in sync manually; both must allow the same set of valid identifiers.
 	wsInstanceIDMaxLen = 64
@@ -44,7 +47,14 @@ type Config struct {
 
 	// ValkeyURL is the connection string for the Valkey instance.
 	// Example: "valkey://localhost:6379". Empty disables Valkey features.
+	// Must be provided via Sealed Secrets/vault in staging and production —
+	// see docs/security/secrets-owners.md for the owner of this secret.
 	ValkeyURL string
+	// MentionLabelCacheTTLSeconds controls how long resolved mention labels
+	// (display names) stay cached in Valkey. Defaults to 45s. Lower values
+	// propagate display-name changes and account deactivation/deletion
+	// ("right to be forgotten") faster, at the cost of more Valkey load.
+	MentionLabelCacheTTLSeconds int
 	// ValkeyWSBroadcastEnabled enables distributed WebSocket broadcast via
 	// Valkey Pub/Sub. When false, broadcast is in-process only (NopBus).
 	// Defaults to false; safe for local development and test environments.
@@ -69,22 +79,23 @@ type Config struct {
 func Load() Config {
 	wsDefaults := ws.DefaultHandlerConfig()
 	return Config{
-		ServiceName:                serviceName,
-		Env:                        platformconfig.GetString("APP_ENV", "development"),
-		Port:                       platformconfig.GetInt("PORT", defaultPort),
-		ReadHeaderTimeoutSeconds:   platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
-		DatabaseURL:                platformconfig.GetString("DATABASE_URL", ""),
-		DBConnectTimeoutSeconds:    platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
-		AuthJWTHMACSecret:          platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
-		AuthJWTIssuer:              platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
-		AuthJWTAudience:            platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
-		ValkeyURL:                  platformconfig.GetString("VALKEY_URL", ""),
-		ValkeyWSBroadcastEnabled:   platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
-		WSInstanceID:               sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
-		WSMaxConnectionsPerUser:    getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
-		WSInboundMessagesPerMinute: getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
-		WSInboundBurst:             getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
-		WSMaxInvalidMessages:       getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
+		ServiceName:                 serviceName,
+		Env:                         platformconfig.GetString("APP_ENV", "development"),
+		Port:                        platformconfig.GetInt("PORT", defaultPort),
+		ReadHeaderTimeoutSeconds:    platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
+		DatabaseURL:                 platformconfig.GetString("DATABASE_URL", ""),
+		DBConnectTimeoutSeconds:     platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
+		AuthJWTHMACSecret:           platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthJWTIssuer:               platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
+		AuthJWTAudience:             platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
+		ValkeyURL:                   platformconfig.GetString("VALKEY_URL", ""),
+		MentionLabelCacheTTLSeconds: getPositiveInt("MENTION_LABEL_CACHE_TTL_SECONDS", defaultMentionLabelCacheTTLSeconds),
+		ValkeyWSBroadcastEnabled:    platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
+		WSInstanceID:                sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		WSMaxConnectionsPerUser:     getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
+		WSInboundMessagesPerMinute:  getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
+		WSInboundBurst:              getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
+		WSMaxInvalidMessages:        getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
 	}
 }
 
