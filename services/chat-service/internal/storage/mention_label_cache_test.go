@@ -52,7 +52,7 @@ func newValkeyTestCache(t *testing.T) (*valkeyTestServer, *ValkeyMentionLabelCac
 }
 
 func (s *valkeyTestServer) serveConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	reader := bufio.NewReader(conn)
 	for {
 		command, err := readRESPCommand(reader)

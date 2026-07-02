@@ -160,7 +160,7 @@ func startFakeValkeyServer(t *testing.T) string {
 }
 
 func serveFakeValkeyConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	reader := bufio.NewReader(conn)
 	for {
 		command, err := readRESPCommand(reader)
