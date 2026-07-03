@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const testReactionMessageID = "11111111-1111-1111-1111-111111111111"
+
 type fakeReactionHandler struct {
 	workspaceID string
 	userID      string
@@ -31,7 +33,7 @@ func (f fakeReactionLimiter) Allow(context.Context, string) (bool, error) { retu
 
 func TestHub_ReactionToggleUsesServerIdentityAndBroadcastsAggregate(t *testing.T) {
 	handler := &fakeReactionHandler{result: ReactionUpdate{
-		MessageID: "msg-1", TargetType: TargetTypeChannel, TargetID: "ch-1",
+		MessageID: testReactionMessageID, TargetType: TargetTypeChannel, TargetID: "ch-1",
 		Reactions: []ReactionPayload{{Emoji: "👍", Count: 2}},
 	}}
 	authorizer := &fakeAuthorizer{}
@@ -48,7 +50,7 @@ func TestHub_ReactionToggleUsesServerIdentityAndBroadcastsAggregate(t *testing.T
 	}
 
 	if err := hub.handleClientMessage(context.Background(), c, ClientMessage{
-		Type: ClientMessageTypeReactionToggle, MessageID: "msg-1", Emoji: "👍",
+		Type: ClientMessageTypeReactionToggle, MessageID: testReactionMessageID, Emoji: "👍",
 	}); err != nil {
 		t.Fatalf("reaction toggle: %v", err)
 	}
@@ -61,7 +63,7 @@ func TestHub_ReactionToggleUsesServerIdentityAndBroadcastsAggregate(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		if evt.Type != EventTypeReactionUpdated || evt.Reaction == nil || evt.Reaction.MessageID != "msg-1" {
+		if evt.Type != EventTypeReactionUpdated || evt.Reaction == nil || evt.Reaction.MessageID != testReactionMessageID {
 			t.Fatalf("unexpected event: %+v", evt)
 		}
 	case <-time.After(time.Second):
@@ -77,13 +79,44 @@ func TestHub_ReactionToggleStopsWhenRateLimited(t *testing.T) {
 	c := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
 
 	err := hub.handleClientMessage(context.Background(), c, ClientMessage{
-		Type: ClientMessageTypeReactionToggle, MessageID: "msg-1", Emoji: "👍",
+		Type: ClientMessageTypeReactionToggle, MessageID: testReactionMessageID, Emoji: "👍",
 	})
 	if !errors.Is(err, ErrReactionRateLimited) {
 		t.Fatalf("expected ErrReactionRateLimited, got %v", err)
 	}
 	if handler.messageID != "" {
 		t.Fatal("rate-limited toggle reached storage")
+	}
+}
+
+func TestHub_ReactionToggleFeatureDisabledPrecedesPayloadValidation(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-reaction-disabled")
+	t.Cleanup(hub.Shutdown)
+	c := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), c, ClientMessage{
+		Type: ClientMessageTypeReactionToggle, MessageID: "not-a-uuid",
+	})
+	if !errors.Is(err, ErrReactionFeatureDisabled) {
+		t.Fatalf("expected ErrReactionFeatureDisabled, got %v", err)
+	}
+}
+
+func TestHub_ReactionToggleRejectsInvalidMessageUUIDBeforeHandler(t *testing.T) {
+	handler := &fakeReactionHandler{}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-reaction-invalid-uuid",
+		WithReactionHandler(handler), WithReactionLimiter(fakeReactionLimiter{allowed: true}))
+	t.Cleanup(hub.Shutdown)
+	c := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), c, ClientMessage{
+		Type: ClientMessageTypeReactionToggle, MessageID: "not-a-uuid", Emoji: "👍",
+	})
+	if err == nil {
+		t.Fatal("expected invalid message_id format error")
+	}
+	if handler.messageID != "" {
+		t.Fatal("invalid UUID reached reaction handler")
 	}
 }
 

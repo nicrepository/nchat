@@ -247,6 +247,7 @@ func TestChatMigration_AddsMessageReactionsWithRollback(t *testing.T) {
 		"FOREIGN KEY (user_id)",
 		"REFERENCES auth.users (id) ON DELETE CASCADE",
 		"PRIMARY KEY (message_id, user_id, emoji)",
+		"CREATE INDEX message_reactions_message_id_idx ON chat.message_reactions (message_id, created_at)",
 	} {
 		if !strings.Contains(migration, expected) {
 			t.Fatalf("reaction migration missing %q", expected)

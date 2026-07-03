@@ -146,6 +146,20 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	return m
 }
 
+func TestMessageHandler_ListAllowedReactionEmojis(t *testing.T) {
+	h := httpapi.NewMessageHandler(nil, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ListAllowedReactionEmojis(rec, httptest.NewRequest(http.MethodGet, httpapi.RouteAllowedReactionEmojis, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	emojis, ok := body["data"].(map[string]any)["emojis"].([]any)
+	if !ok || len(emojis) < 16 || len(emojis) > 20 {
+		t.Fatalf("unexpected allowlist response: %#v", body)
+	}
+}
+
 // ── ListChannelMessages ──────────────────────────────────────────────────────
 
 func TestMessageHandler_ListChannelMessages_UnauthenticatedReturns401(t *testing.T) {

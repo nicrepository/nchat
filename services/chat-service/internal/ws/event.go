@@ -66,7 +66,9 @@ type ReactionPayload struct {
 }
 
 type ReactionEventPayload struct {
-	MessageID   string            `json:"message_id"`
+	MessageID string `json:"message_id"`
+	// ActorUserID is intentionally exposed, equivalent to sender_id on
+	// message.created, so clients can reconcile the authenticated user's state.
 	ActorUserID string            `json:"actor_user_id"`
 	Emoji       string            `json:"emoji"`
 	Added       bool              `json:"added"`

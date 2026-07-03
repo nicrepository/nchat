@@ -9,8 +9,23 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-var allowedReactionEmojis = map[string]struct{}{
-	"👍": {}, "❤️": {}, "😂": {}, "🎉": {}, "😮": {}, "😢": {}, "👎": {}, "🔥": {},
+var allowedReactionEmojiList = []string{
+	"👍", "❤️", "😂", "🎉", "😮", "😢", "👎", "🔥", "🙌", "👏",
+	"✅", "👀", "🚀", "💯", "😍", "🤔", "🙏", "💪", "🤝", "😄",
+}
+
+var allowedReactionEmojis = func() map[string]struct{} {
+	allowed := make(map[string]struct{}, len(allowedReactionEmojiList))
+	for _, emoji := range allowedReactionEmojiList {
+		allowed[emoji] = struct{}{}
+	}
+	return allowed
+}()
+
+// AllowedReactionEmojis returns a copy so callers cannot mutate validation
+// policy shared by the WebSocket handler and the frontend configuration route.
+func AllowedReactionEmojis() []string {
+	return append([]string(nil), allowedReactionEmojiList...)
 }
 
 type ToggleReactionInput struct {

@@ -39,6 +39,26 @@ func (s *PGXReactionStore) ToggleReaction(ctx context.Context, input ToggleReact
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	result.ChannelID, result.DMID, err = authorizeMessageAccess(ctx, tx, input)
+	if err != nil {
+		return ToggleReactionResult{}, err
+	}
+	result.Added, err = upsertReactionToggle(ctx, tx, input)
+	if err != nil {
+		return result, err
+	}
+	result.Reactions, err = aggregateReactions(ctx, tx, input)
+	if err != nil {
+		return result, err
+	}
+	result.MessageID = input.MessageID
+	if err := tx.Commit(ctx); err != nil {
+		return result, fmt.Errorf("commit reaction toggle: %w", err)
+	}
+	return result, nil
+}
+
+func authorizeMessageAccess(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) (channelID, dmID string, err error) {
 	// ponytail: lock the message, not each reaction tuple; move to advisory tuple
 	// locks only if reaction throughput on a single message becomes measurable.
 	err = tx.QueryRow(ctx, `
@@ -58,50 +78,60 @@ func (s *PGXReactionStore) ToggleReaction(ctx context.Context, input ToggleReact
 		  AND ((m.channel_id IS NOT NULL AND c.id IS NOT NULL AND (c.type = 'public' OR cm.user_id IS NOT NULL))
 		    OR (m.dm_conversation_id IS NOT NULL AND dc.id IS NOT NULL AND dm.user_id IS NOT NULL))
 		FOR UPDATE OF m`, input.WorkspaceID, input.UserID, input.MessageID).
-		Scan(&result.ChannelID, &result.DMID)
+		Scan(&channelID, &dmID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ToggleReactionResult{}, domain.ErrNotFound
+		return "", "", domain.ErrNotFound
 	}
 	if err != nil {
-		return result, fmt.Errorf("authorize reaction target: %w", err)
+		return "", "", fmt.Errorf("authorize reaction target: %w", err)
 	}
+	return channelID, dmID, nil
+}
 
+func upsertReactionToggle(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) (bool, error) {
 	tag, err := tx.Exec(ctx, `DELETE FROM chat.message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
 		input.MessageID, input.UserID, input.Emoji)
 	if err != nil {
-		return result, fmt.Errorf("remove reaction: %w", err)
+		return false, fmt.Errorf("remove reaction: %w", err)
 	}
-	result.Added = tag.RowsAffected() == 0
-	if result.Added {
+	added := tag.RowsAffected() == 0
+	if added {
 		if _, err = tx.Exec(ctx, `INSERT INTO chat.message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)`,
 			input.MessageID, input.UserID, input.Emoji); err != nil {
-			return result, fmt.Errorf("add reaction: %w", err)
+			return false, fmt.Errorf("add reaction: %w", err)
 		}
 	}
+	return added, nil
+}
 
+func aggregateReactions(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) ([]domain.MessageReaction, error) {
+	// Transaction invariant: authorizeMessageAccess holds FOR UPDATE OF m until
+	// commit, serializing toggles for this message. EXISTS is defense in depth
+	// against aggregating a message from another workspace if this helper changes.
 	rows, err := tx.Query(ctx, `
 		SELECT emoji, count(*)::int, bool_or(user_id = $2)
 		FROM chat.message_reactions
 		WHERE message_id = $1
+		  AND EXISTS (
+		      SELECT 1 FROM chat.messages
+		      WHERE id = $1 AND workspace_id = $3
+		  )
 		GROUP BY emoji
-		ORDER BY min(created_at), emoji`, input.MessageID, input.UserID)
+		ORDER BY min(created_at), emoji`, input.MessageID, input.UserID, input.WorkspaceID)
 	if err != nil {
-		return result, fmt.Errorf("list reaction aggregate: %w", err)
+		return nil, fmt.Errorf("list reaction aggregate: %w", err)
 	}
 	defer rows.Close()
+	reactions := make([]domain.MessageReaction, 0)
 	for rows.Next() {
 		var reaction domain.MessageReaction
 		if err := rows.Scan(&reaction.Emoji, &reaction.Count, &reaction.ReactedByMe); err != nil {
-			return result, fmt.Errorf("scan reaction aggregate: %w", err)
+			return nil, fmt.Errorf("scan reaction aggregate: %w", err)
 		}
-		result.Reactions = append(result.Reactions, reaction)
+		reactions = append(reactions, reaction)
 	}
 	if err := rows.Err(); err != nil {
-		return result, fmt.Errorf("iterate reaction aggregate: %w", err)
+		return nil, fmt.Errorf("iterate reaction aggregate: %w", err)
 	}
-	result.MessageID = input.MessageID
-	if err := tx.Commit(ctx); err != nil {
-		return result, fmt.Errorf("commit reaction toggle: %w", err)
-	}
-	return result, nil
+	return reactions, nil
 }

@@ -105,6 +105,22 @@ func TestVersionRouteStillWorks(t *testing.T) {
 	}
 }
 
+func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator, allowRouterSessionValidator{},
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteAllowedReactionEmojis, nil))
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
+	}
+}
+
 func TestMethodAndNotFoundBehavior(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 

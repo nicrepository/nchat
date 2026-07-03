@@ -12,7 +12,10 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-const authorizedReactionSQL = `(?s)FROM chat\.messages m.*chat\.workspace_members wm.*wm\.status = 'active'.*chat\.channels c.*chat\.channel_members cm.*chat\.dm_conversations dc.*chat\.dm_members dm.*m\.status = 'active'.*FOR UPDATE OF m`
+const (
+	authorizedReactionSQL = `(?s)FROM chat\.messages m.*chat\.workspace_members wm.*wm\.status = 'active'.*chat\.channels c.*chat\.channel_members cm.*chat\.dm_conversations dc.*chat\.dm_members dm.*m\.status = 'active'.*FOR UPDATE OF m`
+	aggregateReactionSQL  = `(?s)FROM chat\.message_reactions.*AND EXISTS.*chat\.messages.*workspace_id = \$3.*GROUP BY emoji`
+)
 
 func reactionInput() storage.ToggleReactionInput {
 	return storage.ToggleReactionInput{WorkspaceID: "ws-1", UserID: "user-1", MessageID: "msg-1", Emoji: "👍"}
@@ -27,7 +30,7 @@ func TestPGXReactionStore_ToggleAddsReactionAndReturnsAggregate(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec(`INSERT INTO chat\.message_reactions`).WithArgs("msg-1", "user-1", "👍").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectQuery(`(?s)FROM chat\.message_reactions.*GROUP BY emoji`).WithArgs("msg-1", "user-1").
+	mock.ExpectQuery(aggregateReactionSQL).WithArgs("msg-1", "user-1", "ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"emoji", "count", "reacted_by_me"}).AddRow("👍", 2, true))
 	mock.ExpectCommit()
 
@@ -48,7 +51,7 @@ func TestPGXReactionStore_ToggleRemovesExistingReaction(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"channel_id", "dm_id"}).AddRow("", "dm-1"))
 	mock.ExpectExec(`DELETE FROM chat\.message_reactions`).WithArgs("msg-1", "user-1", "👍").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
-	mock.ExpectQuery(`(?s)FROM chat\.message_reactions.*GROUP BY emoji`).WithArgs("msg-1", "user-1").
+	mock.ExpectQuery(aggregateReactionSQL).WithArgs("msg-1", "user-1", "ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"emoji", "count", "reacted_by_me"}))
 	mock.ExpectCommit()
 

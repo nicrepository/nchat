@@ -298,6 +298,9 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 		}
 
 		if msgErr := hub.handleClientMessage(ctx, c, msg); msgErr != nil {
+			if handleReactionClientError(c, msgErr) {
+				continue
+			}
 			if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: handleClientMessage error") {
 				return
 			}
@@ -312,10 +315,37 @@ func decodeClientMessage(data []byte) (ClientMessage, error) {
 	if err := dec.Decode(&msg); err != nil {
 		return ClientMessage{}, err
 	}
+	// second Decode detects concatenated JSON frames.
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return ClientMessage{}, errors.New("ws: trailing JSON data")
 	}
 	return msg, nil
+}
+
+type clientErrorResponse struct {
+	Type       string `json:"type"`
+	Code       string `json:"code"`
+	RetryAfter int    `json:"retry_after,omitempty"`
+}
+
+// handleReactionClientError classifies expected reaction outcomes so they do
+// not consume the malformed-message budget or produce noisy client-error logs.
+func handleReactionClientError(c *Client, err error) bool {
+	response := clientErrorResponse{Type: "error"}
+	switch {
+	case errors.Is(err, ErrReactionRateLimited):
+		response.Code = "rate_limited"
+		response.RetryAfter = 60
+	case errors.Is(err, ErrReactionFeatureDisabled):
+		response.Code = "temporarily_unavailable"
+	default:
+		return false
+	}
+	data, marshalErr := json.Marshal(response)
+	if marshalErr == nil {
+		c.enqueue(data)
+	}
+	return true
 }
 
 type inboundTokenBucket struct {

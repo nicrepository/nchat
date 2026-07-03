@@ -3,7 +3,6 @@ package service_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -17,14 +16,9 @@ type fakeReactionStore struct {
 	err    error
 }
 
-type concurrentReactionStore struct {
-	mu     sync.Mutex
-	active bool
-}
+type sequentialReactionStore struct{ active bool }
 
-func (s *concurrentReactionStore) ToggleReaction(_ context.Context, input storage.ToggleReactionInput) (storage.ToggleReactionResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *sequentialReactionStore) ToggleReaction(_ context.Context, input storage.ToggleReactionInput) (storage.ToggleReactionResult, error) {
 	s.active = !s.active
 	return storage.ToggleReactionResult{MessageID: input.MessageID, Added: s.active}, nil
 }
@@ -78,22 +72,30 @@ func TestReactionService_RejectsMissingIdentityOrMessage(t *testing.T) {
 	}
 }
 
-func TestReactionService_ConcurrentDoubleToggleLeavesReactionRemoved(t *testing.T) {
-	store := &concurrentReactionStore{}
+func TestReactionService_SequentialDoubleToggleLeavesReactionRemoved(t *testing.T) {
+	// True concurrent correctness depends on the store's FOR UPDATE OF m lock and
+	// belongs in a PostgreSQL integration test rather than this service unit test.
+	store := &sequentialReactionStore{}
 	svc := service.NewReactionService(store)
 	input := service.ToggleReactionInput{WorkspaceID: "ws-1", UserID: "user-1", MessageID: "msg-1", Emoji: "👍"}
-	var wg sync.WaitGroup
-	wg.Add(2)
 	for range 2 {
-		go func() {
-			defer wg.Done()
-			if _, err := svc.ToggleReaction(context.Background(), input); err != nil {
-				t.Errorf("ToggleReaction: %v", err)
-			}
-		}()
+		if _, err := svc.ToggleReaction(context.Background(), input); err != nil {
+			t.Fatalf("ToggleReaction: %v", err)
+		}
 	}
-	wg.Wait()
 	if store.active {
 		t.Fatal("two serialized toggles must leave the reaction removed")
+	}
+}
+
+func TestAllowedReactionEmojis_IsCuratedAndFitsDatabaseConstraint(t *testing.T) {
+	emojis := service.AllowedReactionEmojis()
+	if len(emojis) < 16 || len(emojis) > 20 {
+		t.Fatalf("expected 16-20 emojis, got %d", len(emojis))
+	}
+	for _, emoji := range emojis {
+		if n := len([]rune(emoji)); n < 1 || n > 8 {
+			t.Fatalf("emoji %q has %d code points; database permits 1-8", emoji, n)
+		}
 	}
 }
