@@ -100,6 +100,7 @@ type Action =
   | { type: "reaction_updated"; event: WSReactionUpdatedEvent; actorIsMe: boolean }
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
+  | { type: "reaction_error_clear" }
   | { type: "reaction_sending" }
   | { type: "ws_fetch_error"; error: string };
 
@@ -218,6 +219,8 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       return { ...state, realtimeError: action.error, lastMutation: "none" };
     case "reaction_error":
       return { ...state, reactionError: action.error };
+    case "reaction_error_clear":
+      return { ...state, reactionError: null };
     case "reaction_sending":
       return { ...state, reactionError: null };
     case "reaction_updated": {
@@ -282,6 +285,12 @@ export function useMessages({
   currentUserId,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
+
+  useEffect(() => {
+    if (!state.reactionError) return;
+    const timer = window.setTimeout(() => dispatch({ type: "reaction_error_clear" }), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [state.reactionError]);
 
   // stateRef holds values that stable callbacks (loadMore, sendMessage, load) read
   // after async gaps, so they always see the current target and pagination state.

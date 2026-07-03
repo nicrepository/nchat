@@ -235,10 +235,8 @@
 }
 
 .chat-msg-area__reaction-grid {
-  position: absolute;
-  z-index: 4;
-  bottom: calc(100% + 7px);
-  right: 0;
+  position: fixed;
+  z-index: var(--z-overlay-emoji);
   display: grid;
   grid-template-columns: repeat(5, 32px);
   gap: 3px;

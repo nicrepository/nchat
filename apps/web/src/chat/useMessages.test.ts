@@ -167,6 +167,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clearTokens();
 });
 
@@ -239,6 +240,22 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
     expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+  });
+
+  it("clears a temporary reaction error instead of leaving a stale banner", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
+    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(result.current.state.reactionError).toBeNull();
+    vi.useRealTimers();
   });
 
   it("reloads an authorized message for route-only remote reaction events", async () => {

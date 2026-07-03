@@ -383,6 +383,75 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["middle", 400, 426, 243],
+    ["viewport footer", 730, 756, 573],
+  ])(
+    "portals and positions the picker above a message near the %s",
+    async (_name, top, bottom, expectedTop) => {
+      mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+      const rectSpy = vi
+        .spyOn(Element.prototype, "getBoundingClientRect")
+        .mockImplementation(function (this: Element) {
+          if (this.classList.contains("chat-msg-area__reaction-picker-anchor")) {
+            return {
+              x: 450,
+              y: top,
+              left: 450,
+              right: 480,
+              top,
+              bottom,
+              width: 30,
+              height: bottom - top,
+              toJSON: () => ({}),
+            };
+          }
+          if (this.classList.contains("chat-msg-area__reaction-grid")) {
+            return {
+              x: 0,
+              y: 0,
+              left: 0,
+              right: 188,
+              top: 0,
+              bottom: 150,
+              width: 188,
+              height: 150,
+              toJSON: () => ({}),
+            };
+          }
+          return {
+            x: 0,
+            y: 0,
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 0,
+            width: 0,
+            height: 0,
+            toJSON: () => ({}),
+          };
+        });
+      renderChannelArea();
+
+      await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação" }));
+
+      const dialog = screen.getByRole("dialog", { name: "Escolher reação" });
+      expect(dialog.parentElement).toBe(document.body);
+      expect(dialog).toHaveStyle({ left: "292px", top: `${expectedTop}px`, visibility: "visible" });
+      rectSpy.mockRestore();
+    },
+  );
+
+  it("closes the portaled reaction picker when the message list scrolls", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação" }));
+    fireEvent.scroll(screen.getByRole("log", { name: "Mensagens" }));
+
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+  });
+
   it("keeps only one message reaction picker open", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([makeMessage({ id: "m1" }), makeMessage({ id: "m2" })]),
@@ -462,6 +531,28 @@ describe("ChatMessageArea — message list", () => {
     expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
     expect(screen.getByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("4");
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+  });
+
+  it("throttles repeated clicks on the same reaction for 300ms", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "👍", count: 1, reactedByMe: false }],
+        }),
+      ]),
+    );
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    renderChannelArea();
+    const reaction = await screen.findByRole("button", { name: "Adicionar reação 👍" });
+
+    await userEvent.click(reaction);
+    await userEvent.click(reaction);
+    now.mockReturnValue(1_301);
+    await userEvent.click(reaction);
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledTimes(2);
+    now.mockRestore();
   });
 
   it("shows visible feedback when the reaction socket is unavailable", async () => {

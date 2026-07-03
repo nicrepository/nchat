@@ -16,6 +16,7 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
@@ -262,23 +263,48 @@ function MessageReactions({
   MessageBubbleProps,
   "message" | "onToggleReaction" | "allowedReactionEmojis" | "pickerOpen" | "onPickerOpenChange"
 >) {
+  const anchorRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (!pickerOpen || !anchorRef.current || !pickerRef.current) return;
+    const anchor = anchorRef.current.getBoundingClientRect();
+    const picker = pickerRef.current.getBoundingClientRect();
+    const gap = 7;
+    const viewportPadding = 8;
+    const left = Math.min(
+      Math.max(viewportPadding, anchor.right - picker.width),
+      window.innerWidth - picker.width - viewportPadding,
+    );
+    const above = anchor.top - picker.height - gap;
+    const top =
+      above >= viewportPadding
+        ? above
+        : Math.min(anchor.bottom + gap, window.innerHeight - picker.height - viewportPadding);
+    pickerRef.current.style.left = `${left}px`;
+    pickerRef.current.style.top = `${top}px`;
+    pickerRef.current.style.visibility = "visible";
+  }, [pickerOpen]);
 
   useEffect(() => {
     if (!pickerOpen) return;
     const closeOnOutsideClick = (event: MouseEvent) => {
-      if (!pickerRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (!anchorRef.current?.contains(target) && !pickerRef.current?.contains(target)) {
         onPickerOpenChange(message.id, false);
       }
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onPickerOpenChange(message.id, false);
     };
+    const closeOnScroll = () => onPickerOpenChange(message.id, false);
     document.addEventListener("mousedown", closeOnOutsideClick);
     document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("scroll", closeOnScroll, true);
     return () => {
       document.removeEventListener("mousedown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("scroll", closeOnScroll, true);
     };
   }, [message.id, onPickerOpenChange, pickerOpen]);
 
@@ -302,7 +328,7 @@ function MessageReactions({
           <span aria-hidden="true">{reaction.emoji}</span> {reaction.count}
         </button>
       ))}
-      <div ref={pickerRef} className="chat-msg-area__reaction-picker-anchor">
+      <div ref={anchorRef} className="chat-msg-area__reaction-picker-anchor">
         <button
           type="button"
           className="chat-msg-area__reaction chat-msg-area__reaction--add"
@@ -316,20 +342,28 @@ function MessageReactions({
             add_reaction
           </span>
         </button>
-        {pickerOpen && (
-          <div className="chat-msg-area__reaction-grid" role="dialog" aria-label="Escolher reação">
-            {allowedReactionEmojis.map((emoji) => (
-              <button
-                key={emoji}
-                type="button"
-                aria-label={`Reagir com ${emoji}`}
-                onClick={() => selectReaction(emoji)}
-              >
-                {emoji}
-              </button>
-            ))}
-          </div>
-        )}
+        {pickerOpen &&
+          createPortal(
+            <div
+              ref={pickerRef}
+              className="chat-msg-area__reaction-grid"
+              role="dialog"
+              aria-label="Escolher reação"
+              style={{ visibility: "hidden" }}
+            >
+              {allowedReactionEmojis.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  aria-label={`Reagir com ${emoji}`}
+                  onClick={() => selectReaction(emoji)}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>,
+            document.body,
+          )}
       </div>
     </div>
   );
@@ -605,6 +639,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   });
   const [allowedReactionEmojiState, setAllowedReactionEmojis] = useState<string[]>([]);
   const [reactionInputError, setReactionInputError] = useState<string | null>(null);
+  const lastReactionToggleRef = useRef({ key: "", at: 0 });
   const allowedReactionEmojis = useMemo(
     () => allowedReactionEmojiState,
     [allowedReactionEmojiState],
@@ -636,6 +671,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         setReactionInputError("Emoji não permitido para reações.");
         return;
       }
+      const key = `${messageId}\u0000${emoji}`;
+      const now = Date.now();
+      if (
+        lastReactionToggleRef.current.key === key &&
+        now - lastReactionToggleRef.current.at < 300
+      ) {
+        return;
+      }
+      lastReactionToggleRef.current = { key, at: now };
       setReactionInputError(null);
       toggleReaction(messageId, emoji);
     },

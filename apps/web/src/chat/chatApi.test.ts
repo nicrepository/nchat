@@ -76,6 +76,12 @@ describe("fetchAllowedReactionEmojis", () => {
     expect(mockAuthFetch).toHaveBeenCalledTimes(2);
   });
 
+  it("drops non-string values from a malformed allowlist response", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: ["👍", 42, null, "🚀"] } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["👍", "🚀"]);
+  });
+
   it("does not let a stale request failure clear the new session cache", async () => {
     let rejectStale!: (error: Error) => void;
     mockAuthFetch.mockImplementationOnce(
