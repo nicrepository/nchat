@@ -575,6 +575,9 @@ func canonicalizeReactionEvent(evt Event) (Event, bool) {
 	// Aggregates are not trusted from the cross-instance bus. Remote clients
 	// fetch the authoritative message snapshot, trading one read for a smaller
 	// trusted bus surface and consistent reacted_by_me calculation.
+	// TODO: this fetch-on-remote-event can cause a thundering herd in large
+	// channels. Propagate aggregates and actor_user_id through the bus before
+	// computing reacted_by_me optimistically without a REST round-trip.
 	evt.Reaction = nil
 	return evt, true
 }

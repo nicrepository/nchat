@@ -598,6 +598,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 	if err != nil {
 		return ListMessagesResult{}, fmt.Errorf("list channel messages: %w", err)
 	}
+	defer rows.Close()
 	result, err := collectListMessagesResult(rows, limit)
 	rows.Close()
 	if err != nil {
@@ -665,6 +666,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 	if err != nil {
 		return ListMessagesResult{}, fmt.Errorf("list dm messages: %w", err)
 	}
+	defer rows.Close()
 	result, err := collectListMessagesResult(rows, limit)
 	rows.Close()
 	if err != nil {
