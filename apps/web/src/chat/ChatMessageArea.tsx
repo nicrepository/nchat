@@ -16,7 +16,15 @@
  * upgrade cannot set custom headers; token-in-URL is rejected server-side).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import { createPortal } from "react-dom";
 import { useOutletContext, useParams } from "react-router-dom";
 
@@ -287,6 +295,8 @@ interface MessageBubbleProps {
 
 function MessageReactions({
   message,
+  isMine = false,
+  bubbleRef,
   onToggleReaction,
   allowedReactionEmojis,
   recentReactionEmojis,
@@ -296,16 +306,47 @@ function MessageReactions({
 }: Pick<
   MessageBubbleProps,
   | "message"
+  | "isMine"
   | "onToggleReaction"
   | "allowedReactionEmojis"
   | "recentReactionEmojis"
   | "reactionMenuVisible"
   | "pickerOpen"
   | "onPickerOpenChange"
->) {
+> & { bubbleRef: RefObject<HTMLDivElement | null> }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
+
+  const positionMenu = useCallback(() => {
+    if (!reactionMenuVisible || !bubbleRef.current || !menuRef.current) return;
+    const bubble = bubbleRef.current.getBoundingClientRect();
+    if (bubble.bottom < 0 || bubble.top > window.innerHeight) return;
+    const menu = menuRef.current.getBoundingClientRect();
+    const gap = 6;
+    const viewportPadding = 8;
+    const midX = bubble.left + bubble.width / 2;
+    const left = Math.min(
+      Math.max(viewportPadding, isMine ? midX - menu.width : midX),
+      window.innerWidth - menu.width - viewportPadding,
+    );
+    const above = bubble.top - menu.height - gap;
+    const top =
+      above >= viewportPadding
+        ? above
+        : Math.min(bubble.bottom + gap, window.innerHeight - menu.height - viewportPadding);
+    menuRef.current.style.left = `${left}px`;
+    menuRef.current.style.top = `${top}px`;
+    menuRef.current.style.visibility = "visible";
+  }, [bubbleRef, isMine, reactionMenuVisible]);
+
+  useLayoutEffect(positionMenu, [positionMenu]);
+
+  useEffect(() => {
+    if (!reactionMenuVisible) return;
+    document.addEventListener("scroll", positionMenu, true);
+    return () => document.removeEventListener("scroll", positionMenu, true);
+  }, [positionMenu, reactionMenuVisible]);
 
   const positionPicker = useCallback(() => {
     if (!pickerOpen || !anchorRef.current || !pickerRef.current) return;
@@ -378,13 +419,15 @@ function MessageReactions({
           ))}
         </div>
       )}
-      {reactionMenuVisible && (
-        <div
-          ref={menuRef}
-          className="chat-msg-area__reaction-menu"
-          role="toolbar"
-          aria-label="Reagir à mensagem"
-        >
+      {reactionMenuVisible &&
+        createPortal(
+          <div
+            ref={menuRef}
+            className="chat-msg-area__reaction-menu"
+            role="toolbar"
+            aria-label="Reagir à mensagem"
+            style={{ visibility: "hidden" }}
+          >
           {recentReactionEmojis.map((emoji) => (
             <button
               key={emoji}
@@ -430,8 +473,9 @@ function MessageReactions({
               </div>,
               document.body,
             )}
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </>
   );
 }
@@ -466,6 +510,7 @@ function MessageBubble({
   pickerOpen,
   onPickerOpenChange,
 }: MessageBubbleProps) {
+  const bubbleRef = useRef<HTMLDivElement>(null);
   return (
     <div
       className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}${isGrouped ? " chat-msg-area__msg--grouped" : ""}`}
@@ -489,6 +534,7 @@ function MessageBubble({
       <div className="chat-msg-area__msg-body">
         <MessageMeta message={message} isMine={isMine} isGrouped={isGrouped} />
         <div
+          ref={bubbleRef}
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
           {message.isRemoved ? (
@@ -499,6 +545,8 @@ function MessageBubble({
         </div>
         <MessageReactions
           message={message}
+          isMine={isMine}
+          bubbleRef={bubbleRef}
           onToggleReaction={onToggleReaction}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}

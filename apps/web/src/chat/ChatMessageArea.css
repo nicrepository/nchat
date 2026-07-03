@@ -218,10 +218,8 @@
 }
 
 .chat-msg-area__reaction-menu {
-  position: absolute;
+  position: fixed;
   z-index: var(--z-overlay-emoji);
-  top: -15px;
-  right: 8px;
   display: flex;
   gap: 2px;
   padding: 3px;
