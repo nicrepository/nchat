@@ -68,6 +68,8 @@ export interface MessagesState {
   realtimeError: string | null;
   /** Feedback for reaction commands rejected or not sent. */
   reactionError: string | null;
+  /** Reactions snapshot to restore per messageId if the in-flight optimistic toggle is rejected or times out. */
+  pendingReactions: Map<string, Message["reactions"]>;
 }
 
 // ── Send result ───────────────────────────────────────────────────────────────
@@ -101,8 +103,32 @@ type Action =
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
   | { type: "reaction_error_clear" }
-  | { type: "reaction_sending" }
+  | { type: "reaction_optimistic"; messageId: string; emoji: string }
+  | { type: "reaction_revert"; messageId: string; error: string }
   | { type: "ws_fetch_error"; error: string };
+
+/** Applies a local toggle to a message's reaction list, mirroring server semantics for count/reactedByMe. */
+function toggleOptimisticReaction(
+  reactions: Message["reactions"],
+  emoji: string,
+): Message["reactions"] {
+  const index = reactions.findIndex((item) => item.emoji === emoji);
+  if (index < 0) {
+    return [...reactions, { emoji, count: 1, reactedByMe: true }];
+  }
+  const current = reactions[index];
+  if (!current.reactedByMe) {
+    return reactions.map((item, i) =>
+      i === index ? { ...item, count: item.count + 1, reactedByMe: true } : item,
+    );
+  }
+  if (current.count <= 1) {
+    return reactions.filter((_, i) => i !== index);
+  }
+  return reactions.map((item, i) =>
+    i === index ? { ...item, count: item.count - 1, reactedByMe: false } : item,
+  );
+}
 
 const initialState: MessagesState = {
   status: "idle",
@@ -114,9 +140,11 @@ const initialState: MessagesState = {
   lastMutation: "none",
   realtimeError: null,
   reactionError: null,
+  pendingReactions: new Map(),
 };
 
 const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
+const reactionConfirmTimeoutMs = 8_000;
 
 function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
@@ -132,6 +160,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         lastMutation: "none",
         realtimeError: null,
         reactionError: null,
+        pendingReactions: new Map(),
       };
     case "loaded":
       return {
@@ -144,6 +173,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         lastMutation: "initial",
         realtimeError: null,
         reactionError: null,
+        pendingReactions: new Map(),
       };
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
@@ -217,19 +247,60 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
-    case "reaction_error":
-      return { ...state, reactionError: action.error };
+    case "reaction_error": {
+      // Server-level errors (rate limit, feature unavailable) aren't scoped to a
+      // single message, so every optimistic toggle still in flight is reverted.
+      if (state.pendingReactions.size === 0) {
+        return { ...state, reactionError: action.error };
+      }
+      const messages = state.messages.map((message) => {
+        const snapshot = state.pendingReactions.get(message.id);
+        return snapshot ? { ...message, reactions: snapshot } : message;
+      });
+      return { ...state, messages, reactionError: action.error, pendingReactions: new Map() };
+    }
     case "reaction_error_clear":
       return { ...state, reactionError: null };
-    case "reaction_sending":
-      return { ...state, reactionError: null };
+    case "reaction_optimistic": {
+      const index = state.messages.findIndex((message) => message.id === action.messageId);
+      if (index < 0) return state;
+      const message = state.messages[index];
+      const pendingReactions = new Map(state.pendingReactions);
+      if (!pendingReactions.has(action.messageId)) {
+        pendingReactions.set(action.messageId, message.reactions);
+      }
+      const messages = [...state.messages];
+      messages[index] = {
+        ...message,
+        reactions: toggleOptimisticReaction(message.reactions, action.emoji),
+      };
+      return { ...state, messages, pendingReactions, reactionError: null };
+    }
+    case "reaction_revert": {
+      const snapshot = state.pendingReactions.get(action.messageId);
+      if (!snapshot) return { ...state, reactionError: action.error };
+      const index = state.messages.findIndex((message) => message.id === action.messageId);
+      const messages =
+        index < 0
+          ? state.messages
+          : state.messages.map((message, i) =>
+              i === index ? { ...message, reactions: snapshot } : message,
+            );
+      const pendingReactions = new Map(state.pendingReactions);
+      pendingReactions.delete(action.messageId);
+      return { ...state, messages, pendingReactions, reactionError: action.error };
+    }
     case "reaction_updated": {
       const { reaction } = action.event;
       if (!reaction) return state;
       const index = state.messages.findIndex((message) => message.id === reaction.message_id);
       if (index < 0) return state;
       const message = state.messages[index];
-      const previous = new Map(message.reactions.map((item) => [item.emoji, item.reactedByMe]));
+      // Reconcile against the pre-optimistic baseline (not the current, possibly
+      // still-unconfirmed optimistic guess) so an update from another actor doesn't
+      // inherit our own not-yet-confirmed toggle as ground truth.
+      const baseline = state.pendingReactions.get(reaction.message_id) ?? message.reactions;
+      const previous = new Map(baseline.map((item) => [item.emoji, item.reactedByMe]));
       const reactions = reaction.reactions.map((item) => ({
         ...item,
         reactedByMe:
@@ -239,9 +310,12 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       }));
       const messages = [...state.messages];
       messages[index] = { ...message, reactions };
+      const pendingReactions = new Map(state.pendingReactions);
+      pendingReactions.delete(reaction.message_id);
       return {
         ...state,
         messages,
+        pendingReactions,
         lastMutation: "none",
         realtimeError: null,
         reactionError: null,
@@ -252,9 +326,12 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       if (index < 0) return state;
       const messages = [...state.messages];
       messages[index] = { ...messages[index], reactions: action.reactions };
+      const pendingReactions = new Map(state.pendingReactions);
+      pendingReactions.delete(action.messageId);
       return {
         ...state,
         messages,
+        pendingReactions,
         lastMutation: "none",
         realtimeError: null,
         reactionError: null,
@@ -314,6 +391,14 @@ export function useMessages({
   const abortRef = useRef<AbortController | null>(null);
   const loadMoreAbortRef = useRef<AbortController | null>(null);
   const wsFallbackAbortRef = useRef<AbortController | null>(null);
+  const pendingReactionTimersRef = useRef<Map<string, number>>(new Map());
+  const clearReactionTimer = useCallback((messageId: string) => {
+    const timer = pendingReactionTimersRef.current.get(messageId);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      pendingReactionTimersRef.current.delete(messageId);
+    }
+  }, []);
 
   const isCurrentTarget = useCallback((loadKey: string) => {
     return stateRef.current.target === loadKey;
@@ -355,6 +440,8 @@ export function useMessages({
         ctrl.abort();
         loadMoreAbortRef.current?.abort();
         wsFallbackAbortRef.current?.abort();
+        for (const timer of pendingReactionTimersRef.current.values()) window.clearTimeout(timer);
+        pendingReactionTimersRef.current.clear();
       };
     },
     [isCurrentTarget],
@@ -514,6 +601,7 @@ export function useMessages({
       fetchFn().then(
         (message) => {
           if (!isCurrentTarget(loadKey)) return;
+          clearReactionTimer(message.id);
           dispatch({
             type: "reaction_snapshot",
             messageId: message.id,
@@ -528,7 +616,7 @@ export function useMessages({
         },
       );
     },
-    [isCurrentTarget, kind, targetId],
+    [clearReactionTimer, isCurrentTarget, kind, targetId],
   );
 
   const handleReactionUpdated = useCallback(
@@ -540,13 +628,21 @@ export function useMessages({
       }
       const actorIsMe = event.reaction.actor_user_id === currentUserId;
       if (actorIsMe) onOwnReactionConfirmed?.(event.reaction.emoji);
+      clearReactionTimer(event.message_id);
       dispatch({
         type: "reaction_updated",
         event,
         actorIsMe,
       });
     },
-    [currentUserId, fetchReactionSnapshot, isMessageRendered, onOwnReactionConfirmed, targetId],
+    [
+      clearReactionTimer,
+      currentUserId,
+      fetchReactionSnapshot,
+      isMessageRendered,
+      onOwnReactionConfirmed,
+      targetId,
+    ],
   );
 
   const handleReactionError = useCallback((event: WSClientErrorEvent) => {
@@ -554,6 +650,8 @@ export function useMessages({
       rate_limited: "Muitas reações em sequência. Aguarde um minuto e tente novamente.",
       temporarily_unavailable: "Reações temporariamente indisponíveis.",
     };
+    for (const timer of pendingReactionTimersRef.current.values()) window.clearTimeout(timer);
+    pendingReactionTimersRef.current.clear();
     dispatch({
       type: "reaction_error",
       error: messages[event.code] ?? "Não foi possível atualizar a reação.",
@@ -570,15 +668,27 @@ export function useMessages({
 
   const toggleReaction = useCallback(
     (messageId: string, emoji: string) => {
-      dispatch({ type: "reaction_sending" });
+      dispatch({ type: "reaction_optimistic", messageId, emoji });
       if (!sendReactionToggle(messageId, emoji)) {
         dispatch({
-          type: "reaction_error",
+          type: "reaction_revert",
+          messageId,
           error: "Conexão em tempo real indisponível. Tente novamente.",
         });
+        return;
       }
+      clearReactionTimer(messageId);
+      const timer = window.setTimeout(() => {
+        pendingReactionTimersRef.current.delete(messageId);
+        dispatch({
+          type: "reaction_revert",
+          messageId,
+          error: "Não foi possível confirmar a reação. Tente novamente.",
+        });
+      }, reactionConfirmTimeoutMs);
+      pendingReactionTimersRef.current.set(messageId, timer);
     },
-    [sendReactionToggle],
+    [clearReactionTimer, sendReactionToggle],
   );
 
   return { state, sendMessage, retry, loadMore, toggleReaction };
