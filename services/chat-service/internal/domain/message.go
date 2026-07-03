@@ -65,7 +65,7 @@ type Message struct {
 
 // MessageReaction is an aggregate safe to expose to a message viewer.
 type MessageReaction struct {
-	Emoji       string `json:"emoji"`
-	Count       int    `json:"count"`
-	ReactedByMe bool   `json:"reacted_by_me"`
+	Emoji       string
+	Count       int
+	ReactedByMe bool
 }

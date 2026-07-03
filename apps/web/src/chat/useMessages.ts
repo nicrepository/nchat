@@ -241,7 +241,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
 interface UseMessagesOptions {
   kind: "channel" | "dm";
   targetId: string;
-  currentUserId?: string;
+  currentUserId: string;
 }
 
 export interface UseMessagesResult {
@@ -255,7 +255,7 @@ export interface UseMessagesResult {
 export function useMessages({
   kind,
   targetId,
-  currentUserId = "",
+  currentUserId,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 

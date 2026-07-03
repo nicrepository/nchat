@@ -239,7 +239,9 @@ describe("useMessages — WS message.created integration", () => {
       messages: [makeMessage({ id: "msg-visible" })],
       nextCursor: "",
     });
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     act(() =>
@@ -265,7 +267,7 @@ describe("useMessages — WS message.created integration", () => {
       return new Promise<Message>(() => undefined);
     });
     const { result, unmount } = renderHook(() =>
-      useMessages({ kind: "channel", targetId: "ch-1" }),
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
     );
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -287,7 +289,9 @@ describe("useMessages — WS message.created integration", () => {
     const payload = makePayload({ id: "msg-payload-ch" });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     expect(result.current.state.messages).toHaveLength(0);
@@ -309,7 +313,9 @@ describe("useMessages — WS message.created integration", () => {
   it("preserves v3 mention format from a realtime payload", async () => {
     const payload = makePayload({ id: "msg-v3", body_format: "v3" });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     act(() => fireWsEventWithPayload("channel", "ch-1", payload));
@@ -325,7 +331,9 @@ describe("useMessages — WS message.created integration", () => {
     } as unknown as WSMessagePayload;
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-no-email" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-no-email", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -347,7 +355,9 @@ describe("useMessages — WS message.created integration", () => {
     const payload = makePayload({ id: "msg-payload-dm", dm_conversation_id: "conv-1" });
     mockFetchDMMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "dm", targetId: "conv-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-1", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -365,7 +375,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     mockFetchChannelMessage.mockResolvedValue(msg);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-fb" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-fb", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -389,7 +401,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     mockFetchDMMessage.mockResolvedValue(msg);
 
-    const { result } = renderHook(() => useMessages({ kind: "dm", targetId: "conv-fb" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-fb", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -412,7 +426,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     mockFetchChannelMessage.mockRejectedValue(new Error("rate limited"));
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-fb-error" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-fb-error", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -442,7 +458,9 @@ describe("useMessages — WS message.created integration", () => {
     const initialPage: MessagePage = { messages: [existingMsg], nextCursor: "" };
     mockFetchChannelMessages.mockResolvedValue(initialPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-dup" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-dup", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
 
@@ -464,7 +482,9 @@ describe("useMessages — WS message.created integration", () => {
   it("ignores event for a different channel (cross-target filter)", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-active" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-active", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -482,7 +502,9 @@ describe("useMessages — WS message.created integration", () => {
   it("ignores event for a different DM conversation (cross-target filter)", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "dm", targetId: "conv-active" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-active", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -503,7 +525,9 @@ describe("useMessages — WS message.created integration", () => {
     ];
     mockFetchChannelMessages.mockResolvedValue({ messages: initial, nextCursor: "" });
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-order" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-order", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(2));
 
@@ -532,7 +556,9 @@ describe("useMessages — WS message.created integration", () => {
     ];
     mockFetchChannelMessages.mockResolvedValue({ messages: initial, nextCursor: "" });
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-tiebreak" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-tiebreak", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(2));
 
@@ -555,7 +581,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const payload = makePayload({ id: "msg-newest" });
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-latest" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-latest", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -580,7 +608,8 @@ describe("useMessages — WS message.created integration", () => {
     });
 
     const { result, rerender } = renderHook(
-      ({ targetId }: { targetId: string }) => useMessages({ kind: "channel", targetId }),
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
       { initialProps: { targetId: "ch-original" } },
     );
 

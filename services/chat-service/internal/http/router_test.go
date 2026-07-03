@@ -436,6 +436,22 @@ func TestNewRouter_GetSingleMessage_Returns429AfterSingleBudgetExhausted(t *test
 	}
 }
 
+func TestNewRouter_AllowedReactionEmojisUsesListRateLimit(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	for i := range msgListRateLimit {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, routerGETRequest(t, RouteAllowedReactionEmojis))
+		if w.Code != http.StatusOK {
+			t.Fatalf("allowed emojis request %d: expected 200, got %d", i+1, w.Code)
+		}
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerGETRequest(t, RouteAllowedReactionEmojis))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after list budget exhausted, got %d", w.Code)
+	}
+}
+
 func TestNewRouter_GetSingleBudgetDoesNotConsumeListBudget(t *testing.T) {
 	router := newRouterForRateLimit(t)
 	singleURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/22222222-2222-2222-2222-222222222222"
