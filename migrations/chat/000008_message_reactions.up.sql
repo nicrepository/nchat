@@ -12,6 +12,4 @@ CREATE TABLE chat.message_reactions (
     PRIMARY KEY (message_id, user_id, emoji)
 );
 
-CREATE INDEX message_reactions_message_id_idx ON chat.message_reactions (message_id, created_at);
-
 COMMIT;

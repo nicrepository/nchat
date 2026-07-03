@@ -22,6 +22,27 @@ func readChatMigration(t *testing.T, name string) string {
 	return string(contents)
 }
 
+func readAllChatUpMigrations(t *testing.T) string {
+	t.Helper()
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve migration test path")
+	}
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(currentFile), "..", "..", "..", "..", "migrations", "chat", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("list chat migrations: %v", err)
+	}
+	var migrations strings.Builder
+	for _, path := range paths {
+		contents, err := os.ReadFile(path) //nolint:gosec // Glob is restricted to the repository migration directory.
+		if err != nil {
+			t.Fatalf("read %s: %v", filepath.Base(path), err)
+		}
+		migrations.Write(contents)
+	}
+	return migrations.String()
+}
+
 func TestChatMigration_SeedCreatesOneIdempotentActivePublicGeneralChannel(t *testing.T) {
 	migration := readChatMigration(t, "000001_chat_domain_schema.up.sql")
 	if strings.Count(migration, "INSERT INTO chat.channels") != 1 {
@@ -247,7 +268,6 @@ func TestChatMigration_AddsMessageReactionsWithRollback(t *testing.T) {
 		"FOREIGN KEY (user_id)",
 		"REFERENCES auth.users (id) ON DELETE CASCADE",
 		"PRIMARY KEY (message_id, user_id, emoji)",
-		"CREATE INDEX message_reactions_message_id_idx ON chat.message_reactions (message_id, created_at)",
 	} {
 		if !strings.Contains(migration, expected) {
 			t.Fatalf("reaction migration missing %q", expected)
@@ -256,5 +276,17 @@ func TestChatMigration_AddsMessageReactionsWithRollback(t *testing.T) {
 	down := readChatMigration(t, "000008_message_reactions.down.sql")
 	if !strings.Contains(down, "DROP TABLE IF EXISTS chat.message_reactions") || strings.Contains(strings.ToUpper(down), "DROP SCHEMA") {
 		t.Fatal("reaction rollback must only drop message_reactions")
+	}
+}
+
+func TestChatMigration_AddsMessageReactionLookupIndex(t *testing.T) {
+	migrations := readAllChatUpMigrations(t)
+	if !strings.Contains(migrations, "CREATE INDEX IF NOT EXISTS message_reactions_message_id_idx") ||
+		!strings.Contains(migrations, "ON chat.message_reactions (message_id, created_at)") {
+		t.Fatal("chat migrations must add the message reaction lookup index")
+	}
+	down := readChatMigration(t, "000009_message_reactions_message_id_index.down.sql")
+	if !strings.Contains(down, "DROP INDEX IF EXISTS chat.message_reactions_message_id_idx") {
+		t.Fatal("reaction lookup index migration must have a schema-qualified rollback")
 	}
 }
