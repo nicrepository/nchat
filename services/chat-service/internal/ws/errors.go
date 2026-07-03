@@ -12,3 +12,5 @@ var ErrHubShutdown = errors.New("hub is shutting down")
 
 // ErrBusClosed is returned by BroadcastBus.Subscribe when the bus is already closed.
 var ErrBusClosed = errors.New("bus is closed")
+
+var ErrReactionRateLimited = errors.New("reaction rate limited")

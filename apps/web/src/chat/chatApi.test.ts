@@ -338,6 +338,14 @@ describe("fetchChannelMessages", () => {
     });
   });
 
+  it("maps reaction aggregates", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ reactions: [{ emoji: "👍", count: 2, reacted_by_me: true }] })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reactions).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
+  });
+
   it("maps an explicit v2 body format", async () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v2" })]));
     const page = await fetchChannelMessages("geral");

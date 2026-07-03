@@ -59,17 +59,24 @@ func NewMessageHandler(workspaces workspaceResolver, messages messageProvider, m
 // messageJSON is the outbound representation of a single message.
 // body_text is suppressed for deleted messages; is_removed is set instead.
 type messageJSON struct {
-	ID                string    `json:"id"`
-	SenderID          string    `json:"sender_id"`
-	SenderDisplayName string    `json:"sender_display_name,omitempty"`
-	SenderEmail       string    `json:"sender_email,omitempty"`
-	Kind              string    `json:"kind"`
-	BodyText          string    `json:"body_text,omitempty"`
-	BodyFormat        string    `json:"body_format"`
-	IsRemoved         bool      `json:"is_removed,omitempty"`
-	Status            string    `json:"status"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                string         `json:"id"`
+	SenderID          string         `json:"sender_id"`
+	SenderDisplayName string         `json:"sender_display_name,omitempty"`
+	SenderEmail       string         `json:"sender_email,omitempty"`
+	Kind              string         `json:"kind"`
+	BodyText          string         `json:"body_text,omitempty"`
+	BodyFormat        string         `json:"body_format"`
+	IsRemoved         bool           `json:"is_removed,omitempty"`
+	Status            string         `json:"status"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+	Reactions         []reactionJSON `json:"reactions"`
+}
+
+type reactionJSON struct {
+	Emoji       string `json:"emoji"`
+	Count       int    `json:"count"`
+	ReactedByMe bool   `json:"reacted_by_me"`
 }
 
 // listMessagesResponseData is the data envelope for list endpoints.
@@ -168,6 +175,10 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		Status:            string(m.Status),
 		CreatedAt:         m.CreatedAt,
 		UpdatedAt:         m.UpdatedAt,
+		Reactions:         make([]reactionJSON, len(m.Reactions)),
+	}
+	for i, reaction := range m.Reactions {
+		j.Reactions[i] = reactionJSON{Emoji: reaction.Emoji, Count: reaction.Count, ReactedByMe: reaction.ReactedByMe}
 	}
 	if m.Status == domain.MessageStatusDeleted {
 		j.IsRemoved = true

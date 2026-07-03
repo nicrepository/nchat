@@ -67,6 +67,30 @@ type broadcastReq struct {
 // HubOption is a functional option for NewHub.
 type HubOption func(*Hub)
 
+type ReactionUpdate struct {
+	MessageID  string
+	TargetType TargetType
+	TargetID   string
+	Added      bool
+	Reactions  []ReactionPayload
+}
+
+type ReactionHandler interface {
+	ToggleReaction(ctx context.Context, workspaceID, userID, messageID, emoji string) (ReactionUpdate, error)
+}
+
+type ReactionLimiter interface {
+	Allow(ctx context.Context, userID string) (bool, error)
+}
+
+func WithReactionHandler(handler ReactionHandler) HubOption {
+	return func(h *Hub) { h.reactionHandler = handler }
+}
+
+func WithReactionLimiter(limiter ReactionLimiter) HubOption {
+	return func(h *Hub) { h.reactionLimiter = limiter }
+}
+
 // WithPresence attaches a PresenceTracker to the Hub. When set, the Hub
 // calls Connect on register and Disconnect on unregister so that presence
 // state stays in sync with WebSocket lifecycle events.
@@ -92,7 +116,9 @@ type Hub struct {
 	logger     *slog.Logger
 	busCancel  context.CancelFunc
 
-	presence *PresenceTracker // optional; nil-safe throughout
+	presence        *PresenceTracker // optional; nil-safe throughout
+	reactionHandler ReactionHandler
+	reactionLimiter ReactionLimiter
 
 	register    chan registerReq
 	unregister  chan *Client
@@ -290,6 +316,34 @@ func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, tar
 	}
 }
 
+func (h *Hub) PublishReactionUpdated(ctx context.Context, workspaceID, actorUserID, emoji string, update ReactionUpdate) {
+	payload := &ReactionEventPayload{
+		MessageID: update.MessageID, ActorUserID: actorUserID, Emoji: emoji,
+		Added: update.Added, Reactions: update.Reactions,
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeReactionUpdated,
+		WorkspaceID: workspaceID, TargetType: update.TargetType, TargetID: update.TargetID,
+		MessageID: update.MessageID, Reaction: payload, EventID: uuid.New().String(),
+		SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal reaction.updated event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: reaction bus publish failed", "target_type", string(update.TargetType), "error", err)
+	}
+}
+
 // Shutdown stops the hub goroutine, cancels bus subscriptions, closes all
 // client connections, and closes the BroadcastBus. Blocks until the run
 // goroutine exits.
@@ -421,7 +475,7 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageCreated:
+	case EventTypeMessageCreated, EventTypeReactionUpdated:
 		// OK
 	default:
 		return Event{}, false
@@ -469,17 +523,33 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 	evt.TargetID = tid.String()
 
 	// message_id: required for message.created; must be a valid UUID.
-	if evt.Type == EventTypeMessageCreated {
+	if evt.Type == EventTypeMessageCreated || evt.Type == EventTypeReactionUpdated {
 		mid, err := uuid.Parse(evt.MessageID)
 		if err != nil {
 			return Event{}, false
 		}
 		evt.MessageID = mid.String()
 	}
+	if evt.Type == EventTypeReactionUpdated {
+		if evt.Reaction == nil || evt.Reaction.MessageID != evt.MessageID || evt.Reaction.Emoji == "" || len(evt.Reaction.Reactions) > 64 {
+			return Event{}, false
+		}
+		actorID, err := uuid.Parse(evt.Reaction.ActorUserID)
+		if err != nil {
+			return Event{}, false
+		}
+		evt.Reaction.ActorUserID = actorID.String()
+		for _, reaction := range evt.Reaction.Reactions {
+			if reaction.Emoji == "" || reaction.Count <= 0 {
+				return Event{}, false
+			}
+		}
+	}
 
 	// Remote bus payloads may contain body_text or legacy sender_email. Strip
 	// them so remote nodes route by IDs only; clients fetch by ID if needed.
 	evt.Payload = nil
+	evt.Reaction = nil
 
 	return evt, true
 }
@@ -692,6 +762,22 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 		h.revokeSubscription(c.id, key)
 	case ClientMessageTypePing:
 		// Activity already recorded above; nothing else to do.
+	case ClientMessageTypeReactionToggle:
+		if msg.MessageID == "" || msg.Emoji == "" || msg.TargetType != "" || msg.TargetID != "" || h.reactionHandler == nil || h.reactionLimiter == nil {
+			return fmt.Errorf("ws: invalid reaction toggle")
+		}
+		allowed, err := h.reactionLimiter.Allow(ctx, c.userID)
+		if err != nil {
+			return fmt.Errorf("ws: reaction rate limit: %w", err)
+		}
+		if !allowed {
+			return ErrReactionRateLimited
+		}
+		update, err := h.reactionHandler.ToggleReaction(ctx, c.workspaceID, c.userID, msg.MessageID, msg.Emoji)
+		if err != nil {
+			return fmt.Errorf("ws: toggle reaction: %w", err)
+		}
+		h.PublishReactionUpdated(ctx, c.workspaceID, c.userID, msg.Emoji, update)
 	default:
 		return fmt.Errorf("ws: unknown client message type %q", msg.Type)
 	}

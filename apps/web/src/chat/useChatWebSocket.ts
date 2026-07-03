@@ -16,7 +16,7 @@
  * - Connection is cleaned up on unmount or target change.
  */
 
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import { getAccessToken } from "../lib/authSession";
 
@@ -61,22 +61,51 @@ export interface WSMessageCreatedEvent {
   payload?: WSMessagePayload;
 }
 
+export interface WSReactionUpdatedEvent {
+  type: "reaction.updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+  reaction?: {
+    message_id: string;
+    actor_user_id: string;
+    emoji: string;
+    added: boolean;
+    reactions: Array<{ emoji: string; count: number }>;
+  };
+}
+
 interface UseChatWebSocketOptions {
   kind: "channel" | "dm";
   targetId: string;
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
+  onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+}
+
+export interface ChatWebSocketActions {
+  toggleReaction: (messageId: string, emoji: string) => void;
 }
 
 export function useChatWebSocket({
   kind,
   targetId,
   onMessageCreated,
-}: UseChatWebSocketOptions): void {
+  onReactionUpdated,
+}: UseChatWebSocketOptions): ChatWebSocketActions {
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
+  const onReactionRef = useRef(onReactionUpdated);
+  const socketRef = useRef<WebSocket | null>(null);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
+    onReactionRef.current = onReactionUpdated;
   });
+
+  const toggleReaction = useCallback((messageId: string, emoji: string) => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "reaction.toggle", message_id: messageId, emoji }));
+  }, []);
 
   useEffect(() => {
     if (!targetId) return;
@@ -124,6 +153,7 @@ export function useChatWebSocket({
       }
 
       ws = socket;
+      socketRef.current = socket;
 
       socket.onopen = () => {
         if (closed || ws !== socket) return;
@@ -143,10 +173,13 @@ export function useChatWebSocket({
         }
         if (!data || typeof data !== "object") return;
         const d = data as Record<string, unknown>;
-        if (d["type"] !== "message.created") return;
         // Filter: only process events for the active target.
         if (d["target_type"] !== targetType || d["target_id"] !== targetId) return;
-        onMessageRef.current(d as unknown as WSMessageCreatedEvent);
+        if (d["type"] === "message.created") {
+          onMessageRef.current(d as unknown as WSMessageCreatedEvent);
+        } else if (d["type"] === "reaction.updated") {
+          onReactionRef.current?.(d as unknown as WSReactionUpdatedEvent);
+        }
       };
 
       socket.onerror = () => {
@@ -168,6 +201,7 @@ export function useChatWebSocket({
       if (ws) {
         const socket = ws;
         ws = null;
+        socketRef.current = null;
         if (socket.readyState === WebSocket.OPEN) {
           try {
             socket.send(
@@ -189,4 +223,6 @@ export function useChatWebSocket({
       }
     };
   }, [kind, targetId]);
+
+  return { toggleReaction };
 }

@@ -58,6 +58,7 @@ const {
     vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
+    toggleReaction: vi.fn(),
   },
 }));
 
@@ -83,6 +84,7 @@ vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
     ({ onMessageCreated }: { onMessageCreated: (event: WSMessageCreatedEvent) => void }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
+      return { toggleReaction: wsMockState.toggleReaction };
     },
   ),
 }));
@@ -101,6 +103,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   status: "active",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
+  reactions: [],
   ...overrides,
 });
 
@@ -312,6 +315,20 @@ describe("ChatMessageArea — empty state", () => {
 // ── Message list ──────────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — message list", () => {
+  it("renders reaction counts and sends picker toggles", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", reactions: [{ emoji: "🎉", count: 3, reactedByMe: true }] }),
+      ]),
+    );
+    renderChannelArea();
+
+    expect(await screen.findByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("3");
+    await userEvent.click(screen.getByRole("button", { name: "Adicionar reação" }));
+    await userEvent.click(screen.getByRole("button", { name: "Reagir com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+  });
+
   it("renders messages from API response", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([makeMessage({ bodyText: "Olá, mundo!" })]),
@@ -1538,13 +1555,16 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
         onMessageCreated: (evt: WSMessageCreatedEvent) => void;
       }) => {
         capturedOnMessageCreated = onMessageCreated;
+        return { toggleReaction: wsMockState.toggleReaction };
       },
     );
   });
 
   afterEach(() => {
     // Restore to the default no-op so other test suites are not affected.
-    vi.mocked(useChatWebSocket).mockImplementation(vi.fn());
+    vi.mocked(useChatWebSocket).mockImplementation(() => ({
+      toggleReaction: wsMockState.toggleReaction,
+    }));
   });
 
   it("does NOT call scrollIntoView when user is reading history (not near bottom)", async () => {

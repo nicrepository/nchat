@@ -179,6 +179,22 @@ func TestCanonicalizeRemoteEvent_StripsSensitivePayload(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeRemoteReaction_StripsUntrustedAggregate(t *testing.T) {
+	evt := remoteEvt(testEventID2)
+	evt.Type = EventTypeReactionUpdated
+	evt.Reaction = &ReactionEventPayload{
+		MessageID: testMessageID, ActorUserID: testEventIDEcho, Emoji: "👍", Added: true,
+		Reactions: []ReactionPayload{{Emoji: "👍", Count: 99}},
+	}
+	canonical, ok := canonicalizeRemoteEvent(evt)
+	if !ok {
+		t.Fatal("expected valid remote reaction route")
+	}
+	if canonical.Reaction != nil {
+		t.Fatalf("remote reaction aggregate must be stripped, got %+v", canonical.Reaction)
+	}
+}
+
 // waitForOutbox polls until n events arrive in c.outbox or 500ms passes.
 func waitForOutbox(c *Client, n int) bool {
 	deadline := time.Now().Add(500 * time.Millisecond)

@@ -15,7 +15,8 @@ type EventType string
 
 const (
 	// EventTypeMessageCreated is emitted after a message has been persisted.
-	EventTypeMessageCreated EventType = "message.created"
+	EventTypeMessageCreated  EventType = "message.created"
+	EventTypeReactionUpdated EventType = "reaction.updated"
 )
 
 // CurrentEventSchemaVersion is the version of the outbound WebSocket event
@@ -27,9 +28,10 @@ const CurrentEventSchemaVersion = 1
 type ClientMessageType string
 
 const (
-	ClientMessageTypeSubscribe   ClientMessageType = "subscribe"
-	ClientMessageTypeUnsubscribe ClientMessageType = "unsubscribe"
-	ClientMessageTypePing        ClientMessageType = "ping"
+	ClientMessageTypeSubscribe      ClientMessageType = "subscribe"
+	ClientMessageTypeUnsubscribe    ClientMessageType = "unsubscribe"
+	ClientMessageTypePing           ClientMessageType = "ping"
+	ClientMessageTypeReactionToggle ClientMessageType = "reaction.toggle"
 )
 
 // MessagePayload carries the full message DTO for message.created events.
@@ -58,6 +60,19 @@ type MessagePayload struct {
 	DeletedAt         *time.Time `json:"deleted_at,omitempty"`
 }
 
+type ReactionPayload struct {
+	Emoji string `json:"emoji"`
+	Count int    `json:"count"`
+}
+
+type ReactionEventPayload struct {
+	MessageID   string            `json:"message_id"`
+	ActorUserID string            `json:"actor_user_id"`
+	Emoji       string            `json:"emoji"`
+	Added       bool              `json:"added"`
+	Reactions   []ReactionPayload `json:"reactions"`
+}
+
 // Event is the outbound event envelope sent to WebSocket clients and exchanged
 // over the distributed BroadcastBus.
 //
@@ -77,7 +92,8 @@ type Event struct {
 	MessageID string `json:"message_id,omitempty"`
 	// Payload carries the full message DTO for direct browser insertion.
 	// Omitted on canonicalized remote events (body_text is not re-trusted from bus).
-	Payload *MessagePayload `json:"payload,omitempty"`
+	Payload  *MessagePayload       `json:"payload,omitempty"`
+	Reaction *ReactionEventPayload `json:"reaction,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`
@@ -96,4 +112,6 @@ type ClientMessage struct {
 	Type       ClientMessageType `json:"type"`
 	TargetType TargetType        `json:"target_type,omitempty"`
 	TargetID   string            `json:"target_id,omitempty"`
+	MessageID  string            `json:"message_id,omitempty"`
+	Emoji      string            `json:"emoji,omitempty"`
 }

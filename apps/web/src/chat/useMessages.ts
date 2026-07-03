@@ -32,7 +32,11 @@ import {
   postDMMessage,
 } from "./chatApi";
 import type { Message, MessagePage } from "./chatTypes";
-import { useChatWebSocket, type WSMessageCreatedEvent } from "./useChatWebSocket";
+import {
+  useChatWebSocket,
+  type WSMessageCreatedEvent,
+  type WSReactionUpdatedEvent,
+} from "./useChatWebSocket";
 
 // ── State shape ───────────────────────────────────────────────────────────────
 
@@ -90,6 +94,8 @@ type Action =
   | { type: "prepended"; page: MessagePage }
   | { type: "prepend_error" }
   | { type: "ws_received"; message: Message }
+  | { type: "reaction_updated"; event: WSReactionUpdatedEvent; actorIsMe: boolean }
+  | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "ws_fetch_error"; error: string };
 
 const initialState: MessagesState = {
@@ -202,6 +208,31 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
+    case "reaction_updated": {
+      const { reaction } = action.event;
+      if (!reaction) return state;
+      const index = state.messages.findIndex((message) => message.id === reaction.message_id);
+      if (index < 0) return state;
+      const message = state.messages[index];
+      const previous = new Map(message.reactions.map((item) => [item.emoji, item.reactedByMe]));
+      const reactions = reaction.reactions.map((item) => ({
+        ...item,
+        reactedByMe:
+          action.actorIsMe && item.emoji === reaction.emoji
+            ? reaction.added
+            : (previous.get(item.emoji) ?? false),
+      }));
+      const messages = [...state.messages];
+      messages[index] = { ...message, reactions };
+      return { ...state, messages, lastMutation: "none", realtimeError: null };
+    }
+    case "reaction_snapshot": {
+      const index = state.messages.findIndex((message) => message.id === action.messageId);
+      if (index < 0) return state;
+      const messages = [...state.messages];
+      messages[index] = { ...messages[index], reactions: action.reactions };
+      return { ...state, messages, lastMutation: "none", realtimeError: null };
+    }
   }
 }
 
@@ -210,6 +241,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
 interface UseMessagesOptions {
   kind: "channel" | "dm";
   targetId: string;
+  currentUserId?: string;
 }
 
 export interface UseMessagesResult {
@@ -217,9 +249,14 @@ export interface UseMessagesResult {
   sendMessage: (body: string) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;
+  toggleReaction: (messageId: string, emoji: string) => void;
 }
 
-export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessagesResult {
+export function useMessages({
+  kind,
+  targetId,
+  currentUserId = "",
+}: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 
   // stateRef holds values that stable callbacks (loadMore, sendMessage, load) read
@@ -392,6 +429,7 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
           status: p.status as Message["status"],
           createdAt: p.created_at,
           updatedAt: p.updated_at,
+          reactions: [],
         };
         if (!isCurrentTarget(loadKey)) return;
         dispatch({ type: "ws_received", message: msg });
@@ -422,7 +460,50 @@ export function useMessages({ kind, targetId }: UseMessagesOptions): UseMessages
     [kind, targetId, isCurrentTarget],
   );
 
-  useChatWebSocket({ kind, targetId, onMessageCreated: handleWsMessageCreated });
+  const handleReactionUpdated = useCallback(
+    (event: WSReactionUpdatedEvent) => {
+      if (event.target_id !== targetId) return;
+      if (!event.reaction) {
+        wsFallbackAbortRef.current?.abort();
+        const ctrl = new AbortController();
+        wsFallbackAbortRef.current = ctrl;
+        const fetchFn =
+          kind === "channel"
+            ? () => fetchChannelMessage(targetId, event.message_id, ctrl.signal)
+            : () => fetchDMMessage(targetId, event.message_id, ctrl.signal);
+        fetchFn().then(
+          (message) => {
+            if (!isCurrentTarget(`${kind}:${targetId}`)) return;
+            dispatch({
+              type: "reaction_snapshot",
+              messageId: message.id,
+              reactions: message.reactions,
+            });
+          },
+          (err: unknown) => {
+            if (err instanceof Error && err.name === "AbortError") return;
+            if (isCurrentTarget(`${kind}:${targetId}`)) {
+              dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
+            }
+          },
+        );
+        return;
+      }
+      dispatch({
+        type: "reaction_updated",
+        event,
+        actorIsMe: event.reaction.actor_user_id === currentUserId,
+      });
+    },
+    [currentUserId, isCurrentTarget, kind, targetId],
+  );
 
-  return { state, sendMessage, retry, loadMore };
+  const { toggleReaction } = useChatWebSocket({
+    kind,
+    targetId,
+    onMessageCreated: handleWsMessageCreated,
+    onReactionUpdated: handleReactionUpdated,
+  });
+
+  return { state, sendMessage, retry, loadMore, toggleReaction };
 }

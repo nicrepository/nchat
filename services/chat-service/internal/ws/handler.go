@@ -1,9 +1,11 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -287,8 +289,8 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			return
 		}
 
-		var msg ClientMessage
-		if jsonErr := json.Unmarshal(data, &msg); jsonErr != nil {
+		msg, jsonErr := decodeClientMessage(data)
+		if jsonErr != nil {
 			if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: invalid client message") {
 				return
 			}
@@ -301,6 +303,19 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			}
 		}
 	}
+}
+
+func decodeClientMessage(data []byte) (ClientMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var msg ClientMessage
+	if err := dec.Decode(&msg); err != nil {
+		return ClientMessage{}, err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return ClientMessage{}, errors.New("ws: trailing JSON data")
+	}
+	return msg, nil
 }
 
 type inboundTokenBucket struct {

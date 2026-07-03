@@ -177,6 +177,73 @@
   font-size: 13px;
 }
 
+.chat-msg-area__reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.chat-msg-area__reaction,
+.chat-msg-area__reaction-picker summary,
+.chat-msg-area__reaction-options button {
+  border: 1px solid var(--color-border, #e8e3f0);
+  background: var(--color-surface, #fff);
+  border-radius: 999px;
+  min-height: 26px;
+  padding: 2px 8px;
+  cursor: pointer;
+  color: var(--color-muted, #675f75);
+}
+
+.chat-msg-area__reaction--mine {
+  border-color: var(--color-primary, #7b43e8);
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-ink, #16121f);
+}
+
+.chat-msg-area__reaction-picker {
+  position: relative;
+}
+
+.chat-msg-area__reaction-picker summary {
+  display: grid;
+  place-items: center;
+  min-width: 26px;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-msg-area__reaction-picker summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-msg-area__reaction-options {
+  position: absolute;
+  z-index: 3;
+  bottom: 32px;
+  left: 0;
+  display: flex;
+  gap: 3px;
+  padding: 6px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 8px 24px rgb(36 24 55 / 14%);
+}
+
+.chat-msg-area__msg--mine .chat-msg-area__reaction-options {
+  right: 0;
+  left: auto;
+}
+
+.chat-msg-area__reaction-options button {
+  border: 0;
+  min-width: 30px;
+  padding: 2px;
+  font-size: 17px;
+}
+
 /* ── Message grouping (same sender, same minute) ─────────────────────────────── */
 
 /* ponytail: opacity-0 ghost keeps column alignment for grouped avatar slots */

@@ -126,7 +126,7 @@ func (s *integMessageStore) listCreated() []domain.Message {
 	return out
 }
 
-func (s *integMessageStore) GetMessageByIDInWorkspace(_ context.Context, _, _ string) (domain.Message, error) {
+func (s *integMessageStore) GetMessageByIDInWorkspace(_ context.Context, _, _, _ string) (domain.Message, error) {
 	return s.seed, nil
 }
 func (s *integMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _ string) error {

@@ -123,7 +123,7 @@ type MessageStore interface {
 	// GetMessageByIDInWorkspace returns the message only if it belongs to workspaceID.
 	// Returns ErrNotFound when the message does not exist or belongs to a different
 	// workspace, preventing cross-workspace enumeration via message IDs.
-	GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID string) (domain.Message, error)
+	GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID, userID string) (domain.Message, error)
 
 	// ValidateRefMessageInTarget checks that messageID belongs to the given workspace
 	// and target (channelID or dmConversationID). Returns nil when valid.
@@ -514,7 +514,7 @@ func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, worksp
 	return nil
 }
 
-func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID string) (domain.Message, error) {
+func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID, userID string) (domain.Message, error) {
 	// Use listMessageColumns so the result includes sender_display_name and
 	// sender_email — the same contract as the list endpoints.
 	row := s.pool.QueryRow(ctx, `
@@ -531,7 +531,11 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 		}
 		return domain.Message{}, fmt.Errorf("get message by id in workspace: %w", err)
 	}
-	return msg, nil
+	messages := []domain.Message{msg}
+	if err := s.loadReactionBatch(ctx, messages, userID); err != nil {
+		return domain.Message{}, err
+	}
+	return messages[0], nil
 }
 
 func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) (ListMessagesResult, error) {
@@ -594,8 +598,15 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 	if err != nil {
 		return ListMessagesResult{}, fmt.Errorf("list channel messages: %w", err)
 	}
-	defer rows.Close()
-	return collectListMessagesResult(rows, limit)
+	result, err := collectListMessagesResult(rows, limit)
+	rows.Close()
+	if err != nil {
+		return ListMessagesResult{}, err
+	}
+	if err := s.loadReactionBatch(ctx, result.Messages, input.UserID); err != nil {
+		return ListMessagesResult{}, err
+	}
+	return result, nil
 }
 
 func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessagesInput) (ListMessagesResult, error) {
@@ -654,8 +665,52 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 	if err != nil {
 		return ListMessagesResult{}, fmt.Errorf("list dm messages: %w", err)
 	}
+	result, err := collectListMessagesResult(rows, limit)
+	rows.Close()
+	if err != nil {
+		return ListMessagesResult{}, err
+	}
+	if err := s.loadReactionBatch(ctx, result.Messages, input.UserID); err != nil {
+		return ListMessagesResult{}, err
+	}
+	return result, nil
+}
+
+func (s *PGXMessageStore) loadReactionBatch(ctx context.Context, messages []domain.Message, userID string) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	ids := make([]string, len(messages))
+	byID := make(map[string]int, len(messages))
+	for i := range messages {
+		ids[i] = messages[i].ID
+		byID[messages[i].ID] = i
+		messages[i].Reactions = []domain.MessageReaction{}
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT message_id::text, emoji, count(*)::int, bool_or(user_id = $2)
+		FROM chat.message_reactions
+		WHERE message_id = ANY($1::uuid[])
+		GROUP BY message_id, emoji
+		ORDER BY message_id, min(created_at), emoji`, ids, userID)
+	if err != nil {
+		return fmt.Errorf("load message reactions: %w", err)
+	}
 	defer rows.Close()
-	return collectListMessagesResult(rows, limit)
+	for rows.Next() {
+		var messageID string
+		var reaction domain.MessageReaction
+		if err := rows.Scan(&messageID, &reaction.Emoji, &reaction.Count, &reaction.ReactedByMe); err != nil {
+			return fmt.Errorf("scan message reaction: %w", err)
+		}
+		if i, ok := byID[messageID]; ok {
+			messages[i].Reactions = append(messages[i].Reactions, reaction)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate message reactions: %w", err)
+	}
+	return nil
 }
 
 // resolveLimit returns a valid limit value: defaults to defaultMessageLimit when

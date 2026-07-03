@@ -71,7 +71,7 @@ func (f *fakeMessageStore) CreateMessage(_ context.Context, input storage.Create
 	return f.createdMessage, f.createErr
 }
 
-func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspaceID, messageID string) (domain.Message, error) {
+func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspaceID, messageID, _ string) (domain.Message, error) {
 	if f.getByIDErr != nil {
 		return domain.Message{}, f.getByIDErr
 	}

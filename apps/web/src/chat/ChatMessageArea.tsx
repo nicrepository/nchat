@@ -245,9 +245,17 @@ interface MessageBubbleProps {
   isMine?: boolean;
   /** True when consecutive messages from the same sender within the same minute. */
   isGrouped?: boolean;
+  onToggleReaction: (messageId: string, emoji: string) => void;
 }
 
-function MessageBubble({ message, isMine = false, isGrouped = false }: MessageBubbleProps) {
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "🎉", "😮", "😢", "👎", "🔥"] as const;
+
+function MessageBubble({
+  message,
+  isMine = false,
+  isGrouped = false,
+  onToggleReaction,
+}: MessageBubbleProps) {
   const time = formatTime(message.createdAt);
 
   return (
@@ -280,6 +288,43 @@ function MessageBubble({ message, isMine = false, isGrouped = false }: MessageBu
             <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
           )}
         </div>
+        {!message.isRemoved && (
+          <div className="chat-msg-area__reactions">
+            {message.reactions.map((reaction) => (
+              <button
+                key={reaction.emoji}
+                type="button"
+                className={`chat-msg-area__reaction${reaction.reactedByMe ? " chat-msg-area__reaction--mine" : ""}`}
+                aria-label={`${reaction.reactedByMe ? "Remover" : "Adicionar"} reação ${reaction.emoji}`}
+                aria-pressed={reaction.reactedByMe}
+                onClick={() => onToggleReaction(message.id, reaction.emoji)}
+              >
+                <span aria-hidden="true">{reaction.emoji}</span> {reaction.count}
+              </button>
+            ))}
+            <details className="chat-msg-area__reaction-picker">
+              <summary role="button" aria-label="Adicionar reação">
+                ＋
+              </summary>
+              <div
+                className="chat-msg-area__reaction-options"
+                role="group"
+                aria-label="Emojis de reação"
+              >
+                {REACTION_EMOJIS.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    aria-label={`Reagir com ${emoji}`}
+                    onClick={() => onToggleReaction(message.id, emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            </details>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -292,6 +337,7 @@ interface MessageListProps {
   loadingMore: boolean;
   lastMutation: LastMutation;
   onLoadMore: () => void;
+  onToggleReaction: (messageId: string, emoji: string) => void;
 }
 
 function MessageList({
@@ -301,6 +347,7 @@ function MessageList({
   loadingMore,
   lastMutation,
   onLoadMore,
+  onToggleReaction,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -450,6 +497,7 @@ function MessageList({
             message={item.message}
             isMine={!!currentUserId && item.message.senderId === currentUserId}
             isGrouped={item.isGrouped}
+            onToggleReaction={onToggleReaction}
           />
         ),
       )}
@@ -476,7 +524,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       ? (ctx.channels.find((ch) => ch.id === targetId)?.name ?? targetId)
       : (ctx.dms.find((dm) => dm.id === targetId)?.name ?? targetId);
 
-  const { state, sendMessage, retry, loadMore } = useMessages({ kind, targetId });
+  const { state, sendMessage, retry, loadMore, toggleReaction } = useMessages({
+    kind,
+    targetId,
+    currentUserId: ctx.currentUserId,
+  });
 
   const handleSend = useCallback(
     (body: string): Promise<SendResult> => sendMessage(body),
@@ -507,6 +559,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           loadingMore={state.loadingMore}
           lastMutation={state.lastMutation}
           onLoadMore={loadMore}
+          onToggleReaction={toggleReaction}
         />
       )}
 

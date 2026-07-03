@@ -103,6 +103,16 @@ func checkExpectations(t *testing.T, mock pgxmock.PgxPoolIface) {
 	}
 }
 
+func expectReactionBatch(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
+	mock.ExpectQuery(`(?s)FROM chat\.message_reactions.*message_id = ANY`).
+		WithArgs(pgxmock.AnyArg(), "user-1").
+		WillReturnRows(rows)
+}
+
+func emptyReactionRows() *pgxmock.Rows {
+	return pgxmock.NewRows([]string{"message_id", "emoji", "count", "reacted_by_me"})
+}
+
 // ---- CreateMessage: success paths -------------------------------------------
 
 func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
@@ -502,9 +512,10 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 		WithArgs("msg-1", "ws-1").
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 1, true))
 
 	store := storage.NewPGXMessageStore(mock)
-	msg, err := store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-1")
+	msg, err := store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-1", "user-1")
 	if err != nil {
 		t.Fatalf("GetMessageByIDInWorkspace: %v", err)
 	}
@@ -517,6 +528,9 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	if msg.SenderEmail != "test@example.com" {
 		t.Fatalf("expected sender_email 'test@example.com', got %q", msg.SenderEmail)
 	}
+	if len(msg.Reactions) != 1 || !msg.Reactions[0].ReactedByMe {
+		t.Fatalf("expected personalized reactions, got %+v", msg.Reactions)
+	}
 	checkExpectations(t, mock)
 }
 
@@ -527,7 +541,7 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_NotFoundReturnsErrNotFound(t 
 		WillReturnError(pgx.ErrNoRows)
 
 	store := storage.NewPGXMessageStore(mock)
-	_, err := store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-missing")
+	_, err := store.GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-missing", "user-1")
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -545,6 +559,7 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...).
 			AddRow(listMessageRow("msg-2", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 2, true))
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -558,6 +573,9 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	}
 	if result.Messages[0].SenderDisplayName != "Test User" {
 		t.Fatalf("expected SenderDisplayName 'Test User', got %q", result.Messages[0].SenderDisplayName)
+	}
+	if len(result.Messages[1].Reactions) != 1 || result.Messages[1].Reactions[0].Emoji != "👍" {
+		t.Fatalf("expected batched reaction aggregate, got %+v", result.Messages[1].Reactions)
 	}
 	checkExpectations(t, mock)
 }
@@ -599,6 +617,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).AddRow(row...))
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -622,6 +641,7 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 		WithArgs("ws-1", "dm-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("msg-3", "ws-1", "", "dm-1", now)...))
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
@@ -710,6 +730,7 @@ func TestPGXMessageStore_ListChannelMessages_DefaultLimit(t *testing.T) {
 		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -772,6 +793,7 @@ func TestPGXMessageStore_ListChannelMessages_HasNextPage_SetsNextCursor(t *testi
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
 		WillReturnRows(rows)
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -800,6 +822,7 @@ func TestPGXMessageStore_ListDMMessages_HasNextPage_SetsNextCursor(t *testing.T)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1", 51).
 		WillReturnRows(rows)
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
@@ -830,6 +853,7 @@ func TestPGXMessageStore_ListChannelMessages_WithBeforeCursor(t *testing.T) {
 		WithArgs("ws-1", "ch-1", "user-1", pgxmock.AnyArg(), cursorID, 51).
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("msg-older", "ws-1", "ch-1", "", now.Add(-time.Minute))...))
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -855,6 +879,7 @@ func TestPGXMessageStore_ListDMMessages_WithBeforeCursor(t *testing.T) {
 		WithArgs("ws-1", "dm-1", "user-1", pgxmock.AnyArg(), cursorID, 51).
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("dm-older", "ws-1", "", "dm-1", now.Add(-time.Minute))...))
+	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{

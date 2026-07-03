@@ -60,4 +60,12 @@ type Message struct {
 	// Populated by list queries that JOIN auth.users; empty for create results.
 	SenderDisplayName string
 	SenderEmail       string
+	Reactions         []MessageReaction
+}
+
+// MessageReaction is an aggregate safe to expose to a message viewer.
+type MessageReaction struct {
+	Emoji       string
+	Count       int
+	ReactedByMe bool
 }

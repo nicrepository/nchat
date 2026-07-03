@@ -113,6 +113,50 @@ describe("useChatWebSocket", () => {
     });
   });
 
+  it("sends a strict reaction.toggle command on the active socket", () => {
+    const { result } = renderHook(() =>
+      useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
+    );
+    act(() => {
+      result.current.toggleReaction("msg-1", "👍");
+    });
+    expect(JSON.parse(FakeWebSocket.instances[0].sentMessages.at(-1)!)).toEqual({
+      type: "reaction.toggle",
+      message_id: "msg-1",
+      emoji: "👍",
+    });
+  });
+
+  it("routes matching reaction.updated events", () => {
+    const onReactionUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onReactionUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-1",
+        reaction: {
+          message_id: "msg-1",
+          actor_user_id: "user-1",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 2 }],
+        },
+      }),
+    );
+    expect(onReactionUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ message_id: "msg-1" }),
+    );
+  });
+
   it("calls onMessageCreated for matching message.created event", () => {
     const onMessageCreated = vi.fn();
     renderHook(() => useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated }));

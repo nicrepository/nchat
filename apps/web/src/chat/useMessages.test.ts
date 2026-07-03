@@ -18,7 +18,11 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
-import type { WSMessageCreatedEvent, WSMessagePayload } from "./useChatWebSocket";
+import type {
+  WSMessageCreatedEvent,
+  WSMessagePayload,
+  WSReactionUpdatedEvent,
+} from "./useChatWebSocket";
 import { useMessages } from "./useMessages";
 import type { Message, MessagePage } from "./chatTypes";
 
@@ -26,16 +30,22 @@ import type { Message, MessagePage } from "./chatTypes";
 
 // Captures the latest onMessageCreated callback so tests can fire WS events.
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
+let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
+const mockToggleReaction = vi.fn();
 
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
+    onReactionUpdated,
   }: {
     kind: string;
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
+    onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
+    capturedOnReactionUpdated = onReactionUpdated ?? null;
+    return { toggleReaction: mockToggleReaction };
   },
 }));
 
@@ -86,6 +96,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   status: "active",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
+  reactions: [],
   ...overrides,
 });
 
@@ -145,6 +156,7 @@ function fireWsEventNoPayload(
 beforeEach(() => {
   setTokens("test-access-token");
   capturedOnMessageCreated = null;
+  capturedOnReactionUpdated = null;
   vi.clearAllMocks();
 });
 
@@ -155,6 +167,73 @@ afterEach(() => {
 // ── WS integration tests ──────────────────────────────────────────────────────
 
 describe("useMessages — WS message.created integration", () => {
+  it("replaces reaction counts from WS and marks the authenticated actor", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", reactions: [] })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-1",
+        reaction: {
+          message_id: "msg-1",
+          actor_user_id: "user-me",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 2 }],
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 2, reactedByMe: true },
+    ]);
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+    expect(mockToggleReaction).toHaveBeenCalledWith("msg-1", "👍");
+  });
+
+  it("reloads an authorized message for route-only remote reaction events", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-remote", reactions: [] })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: "msg-remote", reactions: [{ emoji: "🔥", count: 4, reactedByMe: true }] }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-remote",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages[0].reactions).toHaveLength(1));
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      "ch-1",
+      "msg-remote",
+      expect.any(AbortSignal),
+    );
+  });
+
   it("inserts channel message directly from payload without fetch", async () => {
     const payload = makePayload({ id: "msg-payload-ch" });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);

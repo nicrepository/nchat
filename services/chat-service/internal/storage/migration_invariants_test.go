@@ -237,3 +237,23 @@ func TestChatMigration_AddsV3MentionsAndDirectedOutbox(t *testing.T) {
 		t.Fatal("mentions down migration must drop outbox and restore v2 constraint")
 	}
 }
+
+func TestChatMigration_AddsMessageReactionsWithRollback(t *testing.T) {
+	migration := readChatMigration(t, "000008_message_reactions.up.sql")
+	for _, expected := range []string{
+		"CREATE TABLE chat.message_reactions",
+		"FOREIGN KEY (message_id)",
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+		"FOREIGN KEY (user_id)",
+		"REFERENCES auth.users (id) ON DELETE CASCADE",
+		"PRIMARY KEY (message_id, user_id, emoji)",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("reaction migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000008_message_reactions.down.sql")
+	if !strings.Contains(down, "DROP TABLE IF EXISTS chat.message_reactions") || strings.Contains(strings.ToUpper(down), "DROP SCHEMA") {
+		t.Fatal("reaction rollback must only drop message_reactions")
+	}
+}

@@ -121,6 +121,7 @@ func testMessage() domain.Message {
 		Status:      domain.MessageStatusActive,
 		CreatedAt:   testNow(),
 		UpdatedAt:   testNow(),
+		Reactions:   []domain.MessageReaction{{Emoji: "👍", Count: 2, ReactedByMe: true}},
 	}
 }
 
@@ -214,6 +215,10 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	}
 	if got := msgsArr[0].(map[string]any)["body_format"]; got != "v1" {
 		t.Fatalf("expected legacy body_format v1, got %v", got)
+	}
+	reactions, ok := msgsArr[0].(map[string]any)["reactions"].([]any)
+	if !ok || len(reactions) != 1 || reactions[0].(map[string]any)["reacted_by_me"] != true {
+		t.Fatalf("expected reaction aggregate, got %#v", msgsArr[0].(map[string]any)["reactions"])
 	}
 }
 

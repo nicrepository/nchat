@@ -112,6 +112,7 @@ interface MessageResponse {
   status: string;
   created_at: string;
   updated_at: string;
+  reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
 }
 
 interface MessageListData {
@@ -178,6 +179,11 @@ function mapMessage(r: MessageResponse): Message {
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    reactions: (r.reactions ?? []).map((reaction) => ({
+      emoji: reaction.emoji,
+      count: reaction.count,
+      reactedByMe: reaction.reacted_by_me,
+    })),
   };
 }
 
