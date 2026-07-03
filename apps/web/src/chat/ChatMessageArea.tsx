@@ -428,51 +428,51 @@ function MessageReactions({
             aria-label="Reagir à mensagem"
             style={{ visibility: "hidden" }}
           >
-          {recentReactionEmojis.map((emoji) => (
-            <button
-              key={emoji}
-              type="button"
-              aria-label={`Reagir rapidamente com ${emoji}`}
-              onClick={() => onToggleReaction(message.id, emoji)}
-            >
-              {emoji}
-            </button>
-          ))}
-          <button
-            ref={anchorRef}
-            type="button"
-            aria-label="Mais reações"
-            aria-expanded={pickerOpen}
-            aria-haspopup="dialog"
-            disabled={allowedReactionEmojis.length === 0}
-            onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
-          >
-            <span className="material-symbols-outlined" aria-hidden="true">
-              add_reaction
-            </span>
-          </button>
-          {pickerOpen &&
-            createPortal(
-              <div
-                ref={pickerRef}
-                className="chat-msg-area__reaction-grid"
-                role="dialog"
-                aria-label="Escolher reação"
-                style={{ visibility: "hidden" }}
+            {recentReactionEmojis.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                aria-label={`Reagir rapidamente com ${emoji}`}
+                onClick={() => onToggleReaction(message.id, emoji)}
               >
-                {allowedReactionEmojis.map((emoji) => (
-                  <button
-                    key={emoji}
-                    type="button"
-                    aria-label={`Reagir com ${emoji}`}
-                    onClick={() => selectReaction(emoji)}
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </div>,
-              document.body,
-            )}
+                {emoji}
+              </button>
+            ))}
+            <button
+              ref={anchorRef}
+              type="button"
+              aria-label="Mais reações"
+              aria-expanded={pickerOpen}
+              aria-haspopup="dialog"
+              disabled={allowedReactionEmojis.length === 0}
+              onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                add_reaction
+              </span>
+            </button>
+            {pickerOpen &&
+              createPortal(
+                <div
+                  ref={pickerRef}
+                  className="chat-msg-area__reaction-grid"
+                  role="dialog"
+                  aria-label="Escolher reação"
+                  style={{ visibility: "hidden" }}
+                >
+                  {allowedReactionEmojis.map((emoji) => (
+                    <button
+                      key={emoji}
+                      type="button"
+                      aria-label={`Reagir com ${emoji}`}
+                      onClick={() => selectReaction(emoji)}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>,
+                document.body,
+              )}
           </div>,
           document.body,
         )}

@@ -288,6 +288,101 @@ describe("useMessages — WS message.created integration", () => {
     );
   });
 
+  it("reports a failed remote reaction snapshot without exposing details", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-remote-error", reactions: [] })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockRejectedValue(new Error("sensitive backend failure"));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-remote-error",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.realtimeError).toMatch(/tempo real/i));
+    expect(result.current.state.realtimeError).not.toContain("sensitive backend failure");
+  });
+
+  it("reloads a DM message for route-only remote reaction events", async () => {
+    mockFetchDMMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-dm-remote", reactions: [] })],
+      nextCursor: "",
+    });
+    mockFetchDMMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-dm-remote",
+        reactions: [{ emoji: "🔥", count: 2, reactedByMe: false }],
+      }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "dm",
+        target_id: "dm-1",
+        message_id: "msg-dm-remote",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages[0].reactions).toHaveLength(1));
+    expect(mockFetchDMMessage).toHaveBeenCalledWith(
+      "dm-1",
+      "msg-dm-remote",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("does not mark another user's reaction as mine", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-other", reactions: [] })],
+      nextCursor: "",
+    });
+    const onOwnReactionConfirmed = vi.fn();
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onOwnReactionConfirmed,
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-other",
+        reaction: {
+          message_id: "msg-other",
+          actor_user_id: "user-other",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 1 }],
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 1, reactedByMe: false },
+    ]);
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+
   it("does not fetch a remote reaction for a message outside the rendered page", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "msg-visible" })],

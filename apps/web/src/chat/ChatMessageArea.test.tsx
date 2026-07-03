@@ -220,6 +220,32 @@ describe("ChatMessageArea — channel header", () => {
     expect(header).toHaveTextContent("dm-juliane");
   });
 
+  it("resolves the DM name from outlet context", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "dm-1", type: "1:1", name: "Juliane", participants: [] }],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("chat-msg-header")).toHaveTextContent("Juliane");
+  });
+
   it("renders the chat message area container", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     renderChannelArea();
@@ -581,6 +607,46 @@ describe("ChatMessageArea — message list", () => {
       rectSpy.mockRestore();
     },
   );
+
+  it("closes the reaction picker when its anchor leaves the viewport", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.getAttribute("aria-label") === "Mais reações") {
+          return {
+            x: 0,
+            y: 900,
+            left: 0,
+            right: 30,
+            top: 900,
+            bottom: 930,
+            width: 30,
+            height: 30,
+            toJSON: () => ({}),
+          };
+        }
+        return {
+          x: 0,
+          y: 0,
+          left: 0,
+          right: 0,
+          top: 0,
+          bottom: 0,
+          width: 0,
+          height: 0,
+          toJSON: () => ({}),
+        };
+      });
+    renderChannelArea();
+
+    await openFullReactionPicker();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument(),
+    );
+    rectSpy.mockRestore();
+  });
 
   it("keeps the portaled reaction picker anchored when the message list scrolls", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
