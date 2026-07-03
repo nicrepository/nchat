@@ -90,6 +90,7 @@
 /* ── Message row ─────────────────────────────────────────────────────────────── */
 
 .chat-msg-area__msg {
+  position: relative;
   display: flex;
   gap: 10px;
   padding: 2px 0;
@@ -211,27 +212,46 @@
   color: var(--color-primary-strong);
 }
 
-.chat-msg-area__reaction--add {
-  border-color: var(--color-border-strong);
-  border-style: dashed;
-  background: transparent;
-  color: var(--color-muted-2);
-  padding-inline: 6px;
-}
-
-.chat-msg-area__reaction--add .material-symbols-outlined {
-  font-size: 16px;
-  line-height: 1;
-}
-
 .chat-msg-area__reaction:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
-.chat-msg-area__reaction-picker-anchor {
-  position: relative;
+.chat-msg-area__reaction-menu {
+  position: absolute;
+  z-index: var(--z-overlay-emoji);
+  top: -15px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+}
+
+.chat-msg-area__reaction-menu button {
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.chat-msg-area__reaction-menu button:hover,
+.chat-msg-area__reaction-menu button:focus-visible {
+  background: var(--color-primary-tint);
+}
+
+.chat-msg-area__reaction-menu .material-symbols-outlined {
+  font-size: 17px;
 }
 
 .chat-msg-area__reaction-grid {

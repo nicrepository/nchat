@@ -269,6 +269,7 @@ interface UseMessagesOptions {
   kind: "channel" | "dm";
   targetId: string;
   currentUserId: string;
+  onOwnReactionConfirmed?: (emoji: string) => void;
 }
 
 export interface UseMessagesResult {
@@ -283,6 +284,7 @@ export function useMessages({
   kind,
   targetId,
   currentUserId,
+  onOwnReactionConfirmed,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 
@@ -536,13 +538,15 @@ export function useMessages({
         fetchReactionSnapshot(event.message_id);
         return;
       }
+      const actorIsMe = event.reaction.actor_user_id === currentUserId;
+      if (actorIsMe) onOwnReactionConfirmed?.(event.reaction.emoji);
       dispatch({
         type: "reaction_updated",
         event,
-        actorIsMe: event.reaction.actor_user_id === currentUserId,
+        actorIsMe,
       });
     },
-    [currentUserId, fetchReactionSnapshot, isMessageRendered, targetId],
+    [currentUserId, fetchReactionSnapshot, isMessageRendered, onOwnReactionConfirmed, targetId],
   );
 
   const handleReactionError = useCallback((event: WSClientErrorEvent) => {
