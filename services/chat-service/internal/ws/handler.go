@@ -222,8 +222,8 @@ func resolveWorkspace(w http.ResponseWriter, r *http.Request, workspaces Workspa
 // in the hub, starts the I/O pumps, and runs the read loop until the connection
 // closes. Cleanup is idempotent via stop/done and sync.Once in wsSender.
 //
-// If the request carries a Sec-WebSocket-Protocol header the token is validated
-// but never echoed back; the JWT must not appear in the response headers.
+// The credential protocol is validated but never echoed. The fixed public
+// protocol is selected so standards-compliant browsers accept the handshake.
 func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID string, cfg HandlerConfig) {
 	logger = normalizeLogger(logger)
 
@@ -233,10 +233,10 @@ func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slo
 			return
 		}
 		// Token already extracted and validated by WSTokenMiddleware + BearerAuth.
-		// Do NOT echo the JWT as a negotiated subprotocol — that would leak it in
-		// the response Sec-WebSocket-Protocol header visible to proxies and DevTools.
 	}
-	conn, err := websocket.Accept(w, r, nil)
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{wsutil.NegotiatedSubprotocol},
+	})
 	if err != nil {
 		// websocket.Accept writes the error response itself.
 		logger.WarnContext(r.Context(), "ws: upgrade failed")

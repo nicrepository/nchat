@@ -327,7 +327,7 @@ func TestServeWS_AuthenticatedConnection_RegistersClientInHub(t *testing.T) {
 	_ = conn.CloseNow()
 }
 
-func TestServeWS_JWTSubprotocolHandshake_DoesNotEchoToken(t *testing.T) {
+func TestServeWS_JWTSubprotocolHandshake_SelectsOnlySafeProtocol(t *testing.T) {
 	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-jwt-subprotocol")
 	defer hub.Shutdown()
 
@@ -338,7 +338,7 @@ func TestServeWS_JWTSubprotocolHandshake_DoesNotEchoToken(t *testing.T) {
 	url := "ws" + srv.URL[len("http"):]
 
 	conn, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-		Subprotocols: []string{token},
+		Subprotocols: []string{token, "nchat.v1"},
 	})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
@@ -348,9 +348,8 @@ func TestServeWS_JWTSubprotocolHandshake_DoesNotEchoToken(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = conn.CloseNow() })
 
-	// The server must NOT echo the JWT back as a negotiated subprotocol.
-	if got := conn.Subprotocol(); got != "" {
-		t.Fatalf("server must not echo JWT as subprotocol, got %q", got)
+	if got := conn.Subprotocol(); got != "nchat.v1" {
+		t.Fatalf("server must select only the safe protocol, got %q", got)
 	}
 
 	eventually(t, func() bool {

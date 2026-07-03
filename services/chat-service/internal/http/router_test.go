@@ -87,6 +87,22 @@ func TestReadyzContract(t *testing.T) {
 	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
 }
 
+func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.T) {
+	cfg := testConfig()
+	cfg.DatabaseURL = "postgres://configured"
+	response := httptest.NewRecorder()
+
+	Readyz(cfg).ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d", response.Code)
+	}
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Status != health.StatusUnready {
+		t.Fatalf("expected unready status, got %q", body.Data.Status)
+	}
+}
+
 func TestVersionRouteStillWorks(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 	response := httptest.NewRecorder()

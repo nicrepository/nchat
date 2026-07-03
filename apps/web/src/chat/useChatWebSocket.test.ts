@@ -85,14 +85,14 @@ afterEach(() => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("useChatWebSocket", () => {
-  it("connects with the access token as Sec-WebSocket-Protocol", () => {
+  it("connects with the access token and a safe negotiated subprotocol", () => {
     renderHook(() =>
       useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
     );
 
     expect(FakeWebSocket.instances).toHaveLength(1);
     const ws = FakeWebSocket.instances[0];
-    expect(ws.protocols).toEqual(["test-token"]);
+    expect(ws.protocols).toEqual(["test-token", "nchat.v1"]);
   });
 
   it("sends subscribe on open", () => {
@@ -306,7 +306,7 @@ describe("useChatWebSocket", () => {
     });
 
     expect(FakeWebSocket.instances).toHaveLength(2);
-    expect(FakeWebSocket.instances[1].protocols).toEqual(["test-token"]);
+    expect(FakeWebSocket.instances[1].protocols).toEqual(["test-token", "nchat.v1"]);
     expect(FakeWebSocket.instances[0].url).not.toContain("test-token");
     expect(FakeWebSocket.instances[1].url).not.toContain("test-token");
   });

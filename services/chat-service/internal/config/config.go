@@ -46,7 +46,9 @@ type Config struct {
 	AuthJWTAudience string
 
 	// ValkeyURL is the connection string for the Valkey instance.
-	// Example: "valkey://localhost:6379". Empty disables Valkey features.
+	// Example: "valkey://localhost:6379". Empty disables Valkey features and
+	// makes a database-backed instance unready because reactions require the
+	// shared Valkey anti-abuse limiter.
 	// Must be provided via Sealed Secrets/vault in staging and production —
 	// see docs/security/secrets-owners.md for the owner of this secret.
 	ValkeyURL string

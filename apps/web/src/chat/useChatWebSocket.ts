@@ -1,7 +1,8 @@
 /**
  * useChatWebSocket — minimal WebSocket hook for realtime message delivery.
  *
- * Auth: passes the Bearer access token as the WebSocket subprotocol so that
+ * Auth: passes the Bearer access token as a credential subprotocol plus a
+ * fixed public protocol selected by the server so that
  * browser clients (which cannot set arbitrary HTTP headers on the upgrade
  * request) can authenticate without putting the token in the URL query string.
  * The server validates the token but does not echo it back in the response.
@@ -26,6 +27,7 @@ const CHAT_WS_URL =
 
 const RECONNECT_BASE_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 2_000;
+const CHAT_WS_SUBPROTOCOL = "nchat.v1";
 
 export interface WSMessagePayload {
   id: string;
@@ -154,9 +156,9 @@ export function useChatWebSocket({
 
       let socket: WebSocket;
       try {
-        // Pass the access token as the WebSocket subprotocol.
-        // WSTokenMiddleware extracts it as a Bearer token; the server does not echo it back.
-        socket = new WebSocket(CHAT_WS_URL, [token]);
+        // WSTokenMiddleware extracts the credential protocol as a Bearer token;
+        // the server selects only CHAT_WS_SUBPROTOCOL and never echoes the token.
+        socket = new WebSocket(CHAT_WS_URL, [token, CHAT_WS_SUBPROTOCOL]);
       } catch {
         // WebSocket constructor may throw on invalid URL.
         scheduleReconnect();

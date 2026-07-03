@@ -45,6 +45,16 @@ func TestSubprotocolHeader(t *testing.T) {
 		}
 	})
 
+	t.Run("credential_plus_safe_protocol", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Sec-Websocket-Protocol", realisticJWTSubprotocol+", nchat.v1")
+
+		got, ok := SubprotocolHeader(h)
+		if !ok || got != realisticJWTSubprotocol {
+			t.Fatalf("SubprotocolHeader pair = %q, %v; want JWT, true", got, ok)
+		}
+	})
+
 	t.Run("single_header", func(t *testing.T) {
 		h := http.Header{}
 		h.Set("Sec-Websocket-Protocol", realisticJWTSubprotocol)
