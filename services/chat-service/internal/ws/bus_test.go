@@ -291,6 +291,55 @@ func TestHub_Bus_PublishCallsBusOnce(t *testing.T) {
 	}
 }
 
+func TestHubPublishReactionUpdatedStopsWhenCanceledOrShutdown(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		context func() context.Context
+		stopHub bool
+	}{
+		{name: "canceled context", context: func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}},
+		{name: "shutdown hub", context: context.Background, stopHub: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bus := &fakeBus{}
+			hub := &Hub{
+				bus: bus, logger: newTestLogger(), instanceID: "instance-A",
+				bcast: nil, quit: make(chan struct{}),
+			}
+			if tt.stopHub {
+				close(hub.quit)
+			}
+
+			hub.PublishReactionUpdated(tt.context(), testWorkspaceID, testEventIDEcho, "👍", ReactionUpdate{
+				MessageID: testMessageID, TargetType: TargetTypeChannel, TargetID: testChannelID,
+			})
+			if bus.publishCount() != 0 {
+				t.Fatal("reaction must not reach the bus after cancellation or shutdown")
+			}
+		})
+	}
+}
+
+func TestNopWebsocketDependenciesFailClosed(t *testing.T) {
+	bus := NopBus{}
+	if err := bus.Publish(t.Context(), Event{}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := bus.Subscribe(t.Context(), func(Event) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	bus.Close()
+
+	allowed, err := (NopAuthorizer{}).CanAccess(t.Context(), "user", "workspace", TargetTypeChannel, "channel")
+	if err != nil || allowed {
+		t.Fatalf("NopAuthorizer must fail closed: allowed=%v err=%v", allowed, err)
+	}
+}
+
 func TestHub_Bus_PublishedEvent_StripsPayloadFromBusButKeepsLocalPayload(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", testWorkspaceID, TargetTypeChannel, testChannelID, true)

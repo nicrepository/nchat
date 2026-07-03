@@ -333,6 +333,16 @@ func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 	}
 }
 
+func TestHubBroadcasterPublishesCreatedMessage(t *testing.T) {
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), ws.NopBus{}, "test-broadcaster")
+	t.Cleanup(hub.Shutdown)
+	broadcaster := hubBroadcaster{hub: hub}
+
+	broadcaster.PublishMessageCreated(t.Context(), "workspace-1", string(ws.TargetTypeChannel), "channel-1", domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1", SenderID: "user-1",
+	})
+}
+
 type reactionStoreStub struct {
 	result storage.ToggleReactionResult
 	err    error
