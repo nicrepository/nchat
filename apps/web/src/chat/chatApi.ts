@@ -115,20 +115,19 @@ export async function fetchSidebarData(): Promise<{
 
 export function fetchAllowedReactionEmojis(): Promise<string[]> {
   if (!allowedReactionEmojisRequest) {
-    allowedReactionEmojisRequest = authenticatedFetch<AllowedReactionEmojisEnvelope>(
+    const request = authenticatedFetch<AllowedReactionEmojisEnvelope>(
       `${CHAT_BASE}/reactions/allowed-emojis`,
       { method: "GET" },
-    )
-      .then((response) => {
-        const emojis = response.data.emojis;
-        return Array.isArray(emojis)
-          ? emojis.filter((emoji): emoji is string => typeof emoji === "string")
-          : [];
-      })
-      .catch((error: unknown) => {
-        allowedReactionEmojisRequest = null;
-        throw error;
-      });
+    ).then((response) => {
+      const emojis = response.data.emojis;
+      return Array.isArray(emojis)
+        ? emojis.filter((emoji): emoji is string => typeof emoji === "string")
+        : [];
+    });
+    allowedReactionEmojisRequest = request;
+    void request.catch(() => {
+      if (allowedReactionEmojisRequest === request) allowedReactionEmojisRequest = null;
+    });
   }
   return allowedReactionEmojisRequest;
 }

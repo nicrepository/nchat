@@ -398,7 +398,7 @@ describe("ChatMessageArea — message list", () => {
     await userEvent.click(buttons[0]);
     expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
 
-    await userEvent.click(buttons[1]);
+    fireEvent.click(buttons[1]);
     expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
   });
 

@@ -75,6 +75,24 @@ describe("fetchAllowedReactionEmojis", () => {
     await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
     expect(mockAuthFetch).toHaveBeenCalledTimes(2);
   });
+
+  it("does not let a stale request failure clear the new session cache", async () => {
+    let rejectStale!: (error: Error) => void;
+    mockAuthFetch.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectStale = reject)),
+    );
+    const staleRequest = fetchAllowedReactionEmojis();
+
+    resetAllowedReactionEmojisCache();
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["🚀"] } });
+    const currentRequest = fetchAllowedReactionEmojis();
+    await expect(currentRequest).resolves.toEqual(["🚀"]);
+
+    rejectStale(new Error("stale session"));
+    await expect(staleRequest).rejects.toThrow("stale session");
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 // ── fetchChannels ─────────────────────────────────────────────────────────────
