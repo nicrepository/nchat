@@ -106,6 +106,32 @@ func TestHub_ReactionToggleStopsWhenRateLimited(t *testing.T) {
 	}
 }
 
+func TestHub_ReactionTogglePropagatesDependencyErrors(t *testing.T) {
+	want := errors.New("dependency failed")
+	for _, tt := range []struct {
+		name    string
+		limiter fakeReactionLimiter
+		handler *fakeReactionHandler
+	}{
+		{name: "limiter", limiter: fakeReactionLimiter{err: want}, handler: &fakeReactionHandler{}},
+		{name: "handler", limiter: fakeReactionLimiter{allowed: true}, handler: &fakeReactionHandler{err: want}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-reaction-error",
+				WithReactionHandler(tt.handler), WithReactionLimiter(tt.limiter))
+			t.Cleanup(hub.Shutdown)
+			client := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
+
+			err := hub.handleClientMessage(t.Context(), client, ClientMessage{
+				Type: ClientMessageTypeReactionToggle, MessageID: testReactionMessageID, Emoji: "👍",
+			})
+			if !errors.Is(err, want) {
+				t.Fatalf("expected %v, got %v", want, err)
+			}
+		})
+	}
+}
+
 func TestHub_ReactionToggleFeatureDisabledPrecedesPayloadValidation(t *testing.T) {
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-reaction-disabled")
 	t.Cleanup(hub.Shutdown)

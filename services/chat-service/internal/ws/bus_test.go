@@ -195,6 +195,38 @@ func TestCanonicalizeRemoteReaction_StripsUntrustedAggregate(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeRemoteReactionRejectsInvalidPayload(t *testing.T) {
+	valid := ReactionEventPayload{
+		MessageID: testMessageID, ActorUserID: testEventIDEcho, Emoji: "👍", Added: true,
+		Reactions: []ReactionPayload{{Emoji: "👍", Count: 1}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Event)
+	}{
+		{name: "missing payload", mutate: func(evt *Event) { evt.Reaction = nil }},
+		{name: "message mismatch", mutate: func(evt *Event) { evt.Reaction.MessageID = testEventID }},
+		{name: "empty emoji", mutate: func(evt *Event) { evt.Reaction.Emoji = "" }},
+		{name: "invalid actor", mutate: func(evt *Event) { evt.Reaction.ActorUserID = "invalid" }},
+		{name: "empty aggregate emoji", mutate: func(evt *Event) { evt.Reaction.Reactions[0].Emoji = "" }},
+		{name: "non-positive count", mutate: func(evt *Event) { evt.Reaction.Reactions[0].Count = 0 }},
+		{name: "oversized aggregate", mutate: func(evt *Event) { evt.Reaction.Reactions = make([]ReactionPayload, 65) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evt := remoteEvt(testEventID2)
+			evt.Type = EventTypeReactionUpdated
+			payload := valid
+			payload.Reactions = append([]ReactionPayload(nil), valid.Reactions...)
+			evt.Reaction = &payload
+			tt.mutate(&evt)
+			if _, ok := canonicalizeRemoteEvent(evt); ok {
+				t.Fatal("expected invalid remote reaction to be rejected")
+			}
+		})
+	}
+}
+
 // waitForOutbox polls until n events arrive in c.outbox or 500ms passes.
 func waitForOutbox(c *Client, n int) bool {
 	deadline := time.Now().Add(500 * time.Millisecond)

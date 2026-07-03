@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
@@ -269,5 +272,116 @@ func TestApp_Shutdown_ClosesMentionCache(t *testing.T) {
 	case <-done:
 	case <-time.After(shutdownTestTimeout):
 		t.Fatal("Shutdown with mention cache deadlocked or did not complete in time")
+	}
+}
+
+func TestNewInvalidValkeyBroadcastConfigGracefullyDegrades(t *testing.T) {
+	a := newTestApp(t, config.Config{
+		ServiceName: "chat-service", Env: "test", Port: 8082, ReadHeaderTimeoutSeconds: 5,
+		ValkeyURL: "invalid", ValkeyWSBroadcastEnabled: true,
+	})
+	if a.hub == nil {
+		t.Fatal("expected in-process hub when Valkey broadcast config is invalid")
+	}
+}
+
+func TestAppShutdownClosesReactionLimiter(t *testing.T) {
+	a := newTestApp(t, config.Config{ServiceName: "chat-service", Env: "test", Port: 8082, ReadHeaderTimeoutSeconds: 5})
+	limiter, err := ws.NewValkeyReactionLimiter(startFakeValkeyServer(t))
+	if err != nil {
+		t.Fatalf("new reaction limiter: %v", err)
+	}
+	a.reactionLimiter = limiter
+	if err := a.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+type workspaceResolverStore struct {
+	workspace domain.Workspace
+	err       error
+}
+
+func (s workspaceResolverStore) GetDefaultWorkspace(context.Context) (domain.Workspace, error) {
+	return s.workspace, s.err
+}
+
+func TestAppWSWorkspaceResolver(t *testing.T) {
+	resolver := appWSWorkspaceResolver{store: workspaceResolverStore{workspace: domain.Workspace{ID: "workspace-1"}}}
+	if id, err := resolver.GetDefaultWorkspaceID(t.Context()); err != nil || id != "workspace-1" {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+
+	want := errors.New("lookup failed")
+	resolver.store = workspaceResolverStore{err: want}
+	if _, err := resolver.GetDefaultWorkspaceID(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("expected %v, got %v", want, err)
+	}
+}
+
+func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
+	now := time.Now().UTC()
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1", SenderID: "user-1",
+		BodyText: "hello", EditedAt: now, DeletedAt: now,
+	})
+	if got.ID != "message-1" || got.WorkspaceID != "workspace-1" || got.ChannelID != "channel-1" || got.SenderID != "user-1" || got.BodyText != "hello" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+	if !got.IsRemoved || got.EditedAt == nil || got.DeletedAt == nil {
+		t.Fatalf("removal timestamps not mapped: %+v", got)
+	}
+}
+
+type reactionStoreStub struct {
+	result storage.ToggleReactionResult
+	err    error
+	input  storage.ToggleReactionInput
+}
+
+func (s *reactionStoreStub) ToggleReaction(_ context.Context, input storage.ToggleReactionInput) (storage.ToggleReactionResult, error) {
+	s.input = input
+	return s.result, s.err
+}
+
+func TestReactionHandlerAdapterMapsChannelAndDMUpdates(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		result     storage.ToggleReactionResult
+		targetType ws.TargetType
+		targetID   string
+	}{
+		{name: "channel", result: storage.ToggleReactionResult{MessageID: "message-1", ChannelID: "channel-1", Added: true}, targetType: ws.TargetTypeChannel, targetID: "channel-1"},
+		{name: "dm", result: storage.ToggleReactionResult{MessageID: "message-1", DMID: "dm-1", Added: false}, targetType: ws.TargetTypeDM, targetID: "dm-1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &reactionStoreStub{result: tt.result}
+			store.result.Reactions = []domain.MessageReaction{{Emoji: "👍", Count: 2}}
+			adapter := reactionHandlerAdapter{service: service.NewReactionService(store)}
+
+			got, err := adapter.ToggleReaction(t.Context(), "workspace-1", "user-1", "message-1", "👍")
+			if err != nil {
+				t.Fatalf("ToggleReaction: %v", err)
+			}
+			if got.MessageID != "message-1" || got.TargetType != tt.targetType || got.TargetID != tt.targetID || got.Added != tt.result.Added {
+				t.Fatalf("unexpected update: %+v", got)
+			}
+			if len(got.Reactions) != 1 || got.Reactions[0].Emoji != "👍" || got.Reactions[0].Count != 2 {
+				t.Fatalf("unexpected reactions: %+v", got.Reactions)
+			}
+			if store.input.WorkspaceID != "workspace-1" || store.input.UserID != "user-1" {
+				t.Fatalf("server identity not forwarded: %+v", store.input)
+			}
+		})
+	}
+}
+
+func TestReactionHandlerAdapterPropagatesServiceError(t *testing.T) {
+	want := errors.New("store failed")
+	adapter := reactionHandlerAdapter{service: service.NewReactionService(&reactionStoreStub{err: want})}
+
+	_, err := adapter.ToggleReaction(t.Context(), "workspace-1", "user-1", "message-1", "👍")
+	if !errors.Is(err, want) {
+		t.Fatalf("expected %v, got %v", want, err)
 	}
 }
