@@ -60,7 +60,8 @@ const {
   mockFetchAllowedReactionEmojis: vi.fn<() => Promise<string[]>>(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
-    toggleReaction: vi.fn(),
+    capturedReactionUpdated: null as ((event: unknown) => void) | null,
+    toggleReaction: vi.fn(() => true),
   },
 }));
 
@@ -85,8 +86,15 @@ vi.mock("./chatApi", () => ({
 // useChatWebSocket.test.ts.
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
-    ({ onMessageCreated }: { onMessageCreated: (event: WSMessageCreatedEvent) => void }) => {
+    ({
+      onMessageCreated,
+      onReactionUpdated,
+    }: {
+      onMessageCreated: (event: WSMessageCreatedEvent) => void;
+      onReactionUpdated?: (event: unknown) => void;
+    }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
+      wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
       return { toggleReaction: wsMockState.toggleReaction };
     },
   ),
@@ -141,6 +149,7 @@ function renderDMArea(dmId = "dm-juliane") {
 beforeEach(() => {
   setTokens("test-at");
   wsMockState.capturedWSMessageCreated = null;
+  wsMockState.capturedReactionUpdated = null;
   vi.clearAllMocks();
   mockFetchAllowedReactionEmojis.mockResolvedValue([
     "👍",
@@ -345,45 +354,31 @@ describe("ChatMessageArea — message list", () => {
     renderChannelArea();
 
     expect(await screen.findByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("3");
-    await userEvent.click(screen.getByRole("button", { name: "Mais reações" }));
+    await userEvent.click(screen.getByRole("button", { name: "Adicionar reação" }));
     await userEvent.click(screen.getByRole("button", { name: "Reagir com 👍" }));
     expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
     expect(mockFetchAllowedReactionEmojis).toHaveBeenCalledTimes(1);
   });
 
-  it("reveals reaction actions on hover, keyboard focus and touch", async () => {
+  it("always renders the add-reaction button when the message has zero reactions", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelArea();
 
-    const bubble = await screen.findByTestId("chat-msg-bubble");
-    const toolbar = await screen.findByRole("toolbar", { name: "Ações de reação" });
-    expect(toolbar).toHaveAttribute("data-visible", "false");
-
-    fireEvent.mouseEnter(bubble);
-    expect(toolbar).toHaveAttribute("data-visible", "true");
-    fireEvent.mouseLeave(bubble);
-    expect(toolbar).toHaveAttribute("data-visible", "false");
-
-    fireEvent.focus(bubble);
-    expect(toolbar).toHaveAttribute("data-visible", "true");
-    fireEvent.blur(bubble, { relatedTarget: document.body });
-    expect(toolbar).toHaveAttribute("data-visible", "false");
-
-    fireEvent.touchStart(bubble);
-    expect(toolbar).toHaveAttribute("data-visible", "true");
+    expect(await screen.findByRole("button", { name: "Adicionar reação" })).toBeVisible();
+    expect(screen.queryByRole("toolbar", { name: "Ações de reação" })).not.toBeInTheDocument();
   });
 
   it("closes the controlled reaction picker on Escape and outside click", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelArea();
 
-    await userEvent.click(await screen.findByRole("button", { name: "Mais reações" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação" }));
     expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Mais reações" }));
+    await userEvent.click(screen.getByRole("button", { name: "Adicionar reação" }));
     fireEvent.mouseDown(document.body);
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
   });
@@ -394,12 +389,96 @@ describe("ChatMessageArea — message list", () => {
     );
     renderChannelArea();
 
-    const buttons = await screen.findAllByRole("button", { name: "Mais reações" });
+    const buttons = await screen.findAllByRole("button", { name: "Adicionar reação" });
     await userEvent.click(buttons[0]);
     expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
 
     fireEvent.click(buttons[1]);
     expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
+  });
+
+  it("renders the reaction pill after the authoritative WS update", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação" }));
+    await userEvent.click(screen.getByRole("button", { name: "Reagir com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "other-user",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 1 }],
+        },
+      }),
+    );
+
+    expect(await screen.findByRole("button", { name: "Adicionar reação 👍" })).toHaveTextContent(
+      "1",
+    );
+  });
+
+  it("rejects a reaction whose bytes do not match the server allowlist", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "❤", count: 1, reactedByMe: false }],
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação ❤" }));
+
+    expect(wsMockState.toggleReaction).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(/emoji não permitido/i);
+  });
+
+  it("renders N reactions and toggles an existing pill without opening the grid", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [
+            { emoji: "👍", count: 2, reactedByMe: false },
+            { emoji: "🎉", count: 4, reactedByMe: true },
+          ],
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação 👍" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.getByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("4");
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+  });
+
+  it("shows visible feedback when the reaction socket is unavailable", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "👍", count: 1, reactedByMe: false }],
+        }),
+      ]),
+    );
+    wsMockState.toggleReaction.mockReturnValueOnce(false);
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação 👍" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/tempo real indisponível/i);
   });
 
   it("renders messages from API response", async () => {

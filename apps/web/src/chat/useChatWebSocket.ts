@@ -75,15 +75,22 @@ export interface WSReactionUpdatedEvent {
   };
 }
 
+export interface WSClientErrorEvent {
+  type: "error";
+  code: string;
+  retry_after?: number;
+}
+
 interface UseChatWebSocketOptions {
   kind: "channel" | "dm";
   targetId: string;
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+  onReactionError?: (event: WSClientErrorEvent) => void;
 }
 
 export interface ChatWebSocketActions {
-  toggleReaction: (messageId: string, emoji: string) => void;
+  toggleReaction: (messageId: string, emoji: string) => boolean;
 }
 
 export function useChatWebSocket({
@@ -91,20 +98,24 @@ export function useChatWebSocket({
   targetId,
   onMessageCreated,
   onReactionUpdated,
+  onReactionError,
 }: UseChatWebSocketOptions): ChatWebSocketActions {
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
   const onReactionRef = useRef(onReactionUpdated);
+  const onReactionErrorRef = useRef(onReactionError);
   const socketRef = useRef<WebSocket | null>(null);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
     onReactionRef.current = onReactionUpdated;
+    onReactionErrorRef.current = onReactionError;
   });
 
   const toggleReaction = useCallback((messageId: string, emoji: string) => {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
     socket.send(JSON.stringify({ type: "reaction.toggle", message_id: messageId, emoji }));
+    return true;
   }, []);
 
   useEffect(() => {
@@ -173,6 +184,10 @@ export function useChatWebSocket({
         }
         if (!data || typeof data !== "object") return;
         const d = data as Record<string, unknown>;
+        if (d["type"] === "error" && typeof d["code"] === "string") {
+          onReactionErrorRef.current?.(d as unknown as WSClientErrorEvent);
+          return;
+        }
         // Filter: only process events for the active target.
         if (d["target_type"] !== targetType || d["target_id"] !== targetId) return;
         if (d["type"] === "message.created") {

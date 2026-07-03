@@ -252,33 +252,27 @@ interface MessageBubbleProps {
   onPickerOpenChange: (messageId: string, open: boolean) => void;
 }
 
-interface ReactionToolbarProps {
-  messageId: string;
-  emojis: string[];
-  visible: boolean;
-  open: boolean;
-  onOpenChange: (messageId: string, open: boolean) => void;
-  onToggleReaction: (messageId: string, emoji: string) => void;
-}
-
-function ReactionToolbar({
-  messageId,
-  emojis,
-  visible,
-  open,
-  onOpenChange,
+function MessageReactions({
+  message,
   onToggleReaction,
-}: ReactionToolbarProps) {
+  allowedReactionEmojis,
+  pickerOpen,
+  onPickerOpenChange,
+}: Pick<
+  MessageBubbleProps,
+  "message" | "onToggleReaction" | "allowedReactionEmojis" | "pickerOpen" | "onPickerOpenChange"
+>) {
   const pickerRef = useRef<HTMLDivElement>(null);
-  const quickEmojis = emojis.slice(0, 5);
 
   useEffect(() => {
-    if (!open) return;
+    if (!pickerOpen) return;
     const closeOnOutsideClick = (event: MouseEvent) => {
-      if (!pickerRef.current?.contains(event.target as Node)) onOpenChange(messageId, false);
+      if (!pickerRef.current?.contains(event.target as Node)) {
+        onPickerOpenChange(message.id, false);
+      }
     };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onOpenChange(messageId, false);
+      if (event.key === "Escape") onPickerOpenChange(message.id, false);
     };
     document.addEventListener("mousedown", closeOnOutsideClick);
     document.addEventListener("keydown", closeOnEscape);
@@ -286,67 +280,16 @@ function ReactionToolbar({
       document.removeEventListener("mousedown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [messageId, onOpenChange, open]);
+  }, [message.id, onPickerOpenChange, pickerOpen]);
 
   const selectReaction = (emoji: string) => {
-    onToggleReaction(messageId, emoji);
-    onOpenChange(messageId, false);
+    onToggleReaction(message.id, emoji);
+    onPickerOpenChange(message.id, false);
   };
 
+  if (message.isRemoved) return null;
   return (
-    <div
-      ref={pickerRef}
-      className="chat-msg-area__reaction-toolbar"
-      role="toolbar"
-      aria-label="Ações de reação"
-      data-visible={visible || open}
-    >
-      {quickEmojis.map((emoji) => (
-        <button
-          key={emoji}
-          type="button"
-          className="chat-msg-area__quick-reaction"
-          aria-label={`Reagir rapidamente com ${emoji}`}
-          onClick={() => selectReaction(emoji)}
-        >
-          {emoji}
-        </button>
-      ))}
-      <button
-        type="button"
-        className="chat-msg-area__more-reactions"
-        aria-label="Mais reações"
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => onOpenChange(messageId, !open)}
-      >
-        <span aria-hidden="true">☺</span>
-      </button>
-      {open && (
-        <div className="chat-msg-area__reaction-grid" role="dialog" aria-label="Escolher reação">
-          {emojis.map((emoji) => (
-            <button
-              key={emoji}
-              type="button"
-              aria-label={`Reagir com ${emoji}`}
-              onClick={() => selectReaction(emoji)}
-            >
-              {emoji}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function MessageReactions({
-  message,
-  onToggleReaction,
-}: Pick<MessageBubbleProps, "message" | "onToggleReaction">) {
-  if (message.isRemoved || message.reactions.length === 0) return null;
-  return (
-    <div className="chat-msg-area__reactions">
+    <div className="chat-msg-area__reactions" aria-label="Reações da mensagem">
       {message.reactions.map((reaction) => (
         <button
           key={reaction.emoji}
@@ -359,6 +302,35 @@ function MessageReactions({
           <span aria-hidden="true">{reaction.emoji}</span> {reaction.count}
         </button>
       ))}
+      <div ref={pickerRef} className="chat-msg-area__reaction-picker-anchor">
+        <button
+          type="button"
+          className="chat-msg-area__reaction chat-msg-area__reaction--add"
+          aria-label="Adicionar reação"
+          aria-expanded={pickerOpen}
+          aria-haspopup="dialog"
+          disabled={allowedReactionEmojis.length === 0}
+          onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">
+            add_reaction
+          </span>
+        </button>
+        {pickerOpen && (
+          <div className="chat-msg-area__reaction-grid" role="dialog" aria-label="Escolher reação">
+            {allowedReactionEmojis.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                aria-label={`Reagir com ${emoji}`}
+                onClick={() => selectReaction(emoji)}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -390,22 +362,10 @@ function MessageBubble({
   pickerOpen,
   onPickerOpenChange,
 }: MessageBubbleProps) {
-  const [toolbarVisible, setToolbarVisible] = useState(false);
-
-  const hideToolbarAfterBlur = (event: React.FocusEvent<HTMLDivElement>) => {
-    if (!event.currentTarget.contains(event.relatedTarget)) setToolbarVisible(false);
-  };
-
   return (
     <div
       className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}${isGrouped ? " chat-msg-area__msg--grouped" : ""}`}
       data-testid="chat-msg-bubble"
-      tabIndex={0}
-      onMouseEnter={() => setToolbarVisible(true)}
-      onMouseLeave={() => setToolbarVisible(false)}
-      onFocus={() => setToolbarVisible(true)}
-      onBlur={hideToolbarAfterBlur}
-      onTouchStart={() => setToolbarVisible(true)}
     >
       {!isMine && (
         <div className="chat-msg-area__msg-avatar" aria-hidden="true">
@@ -414,28 +374,22 @@ function MessageBubble({
       )}
       <div className="chat-msg-area__msg-body">
         <MessageMeta message={message} isMine={isMine} isGrouped={isGrouped} />
-        <div className="chat-msg-area__bubble-wrap">
-          <div
-            className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
-          >
-            {message.isRemoved ? (
-              "Mensagem removida."
-            ) : (
-              <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
-            )}
-          </div>
-          {!message.isRemoved && allowedReactionEmojis.length > 0 && (
-            <ReactionToolbar
-              messageId={message.id}
-              emojis={allowedReactionEmojis}
-              visible={toolbarVisible}
-              open={pickerOpen}
-              onOpenChange={onPickerOpenChange}
-              onToggleReaction={onToggleReaction}
-            />
+        <div
+          className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
+        >
+          {message.isRemoved ? (
+            "Mensagem removida."
+          ) : (
+            <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
           )}
         </div>
-        <MessageReactions message={message} onToggleReaction={onToggleReaction} />
+        <MessageReactions
+          message={message}
+          onToggleReaction={onToggleReaction}
+          allowedReactionEmojis={allowedReactionEmojis}
+          pickerOpen={pickerOpen}
+          onPickerOpenChange={onPickerOpenChange}
+        />
       </div>
     </div>
   );
@@ -650,6 +604,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     currentUserId: ctx.currentUserId,
   });
   const [allowedReactionEmojiState, setAllowedReactionEmojis] = useState<string[]>([]);
+  const [reactionInputError, setReactionInputError] = useState<string | null>(null);
   const allowedReactionEmojis = useMemo(
     () => allowedReactionEmojiState,
     [allowedReactionEmojiState],
@@ -673,6 +628,18 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const handleSend = useCallback(
     (body: string): Promise<SendResult> => sendMessage(body),
     [sendMessage],
+  );
+
+  const handleToggleReaction = useCallback(
+    (messageId: string, emoji: string) => {
+      if (!allowedReactionEmojis.includes(emoji)) {
+        setReactionInputError("Emoji não permitido para reações.");
+        return;
+      }
+      setReactionInputError(null);
+      toggleReaction(messageId, emoji);
+    },
+    [allowedReactionEmojis, toggleReaction],
   );
 
   return (
@@ -699,7 +666,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           loadingMore={state.loadingMore}
           lastMutation={state.lastMutation}
           onLoadMore={loadMore}
-          onToggleReaction={toggleReaction}
+          onToggleReaction={handleToggleReaction}
           allowedReactionEmojis={allowedReactionEmojis}
         />
       )}
@@ -719,6 +686,13 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         >
           <IconWarning />
           Conexão em tempo real instável. Tentando reconectar...
+        </div>
+      )}
+
+      {(reactionInputError || state.reactionError) && (
+        <div className="chat-msg-area__reaction-error" role="alert">
+          <IconWarning />
+          {reactionInputError || state.reactionError}
         </div>
       )}
 

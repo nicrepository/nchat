@@ -38,6 +38,7 @@ func TestHub_ReactionToggleUsesServerIdentityAndBroadcastsAggregate(t *testing.T
 	}}
 	authorizer := &fakeAuthorizer{}
 	authorizer.setAccess("user-auth", "ws-auth", TargetTypeChannel, "ch-1", true)
+	authorizer.setAccess("user-other", "ws-auth", TargetTypeChannel, "ch-1", true)
 	hub := NewHub(authorizer, newTestLogger(), NopBus{}, "test-reaction",
 		WithReactionHandler(handler), WithReactionLimiter(fakeReactionLimiter{allowed: true}))
 	t.Cleanup(hub.Shutdown)
@@ -46,6 +47,13 @@ func TestHub_ReactionToggleUsesServerIdentityAndBroadcastsAggregate(t *testing.T
 		t.Fatal("register")
 	}
 	if err := hub.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1"); err != nil {
+		t.Fatal(err)
+	}
+	other := newClient("client-2", "user-other", "ws-auth", &fakeSender{})
+	if !hub.Register(other) {
+		t.Fatal("register second client")
+	}
+	if err := hub.Subscribe(context.Background(), other, TargetTypeChannel, "ch-1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,6 +76,15 @@ func TestHub_ReactionToggleUsesServerIdentityAndBroadcastsAggregate(t *testing.T
 		}
 	case <-time.After(time.Second):
 		t.Fatal("reaction event not broadcast")
+	}
+	select {
+	case raw := <-other.outbox:
+		evt, err := decodeEvent(raw)
+		if err != nil || evt.Reaction == nil || evt.Reaction.MessageID != testReactionMessageID {
+			t.Fatalf("unexpected remote event: event=%+v err=%v", evt, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reaction event not broadcast to second user")
 	}
 }
 

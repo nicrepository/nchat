@@ -35,6 +35,7 @@ import type { Message, MessagePage } from "./chatTypes";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
+  type WSClientErrorEvent,
   type WSReactionUpdatedEvent,
 } from "./useChatWebSocket";
 
@@ -65,6 +66,8 @@ export interface MessagesState {
   lastMutation: LastMutation;
   /** Recoverable realtime fallback error; initial loads and manual retries remain authoritative. */
   realtimeError: string | null;
+  /** Feedback for reaction commands rejected or not sent. */
+  reactionError: string | null;
 }
 
 // ── Send result ───────────────────────────────────────────────────────────────
@@ -96,6 +99,8 @@ type Action =
   | { type: "ws_received"; message: Message }
   | { type: "reaction_updated"; event: WSReactionUpdatedEvent; actorIsMe: boolean }
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
+  | { type: "reaction_error"; error: string }
+  | { type: "reaction_sending" }
   | { type: "ws_fetch_error"; error: string };
 
 const initialState: MessagesState = {
@@ -107,6 +112,7 @@ const initialState: MessagesState = {
   loadingMore: false,
   lastMutation: "none",
   realtimeError: null,
+  reactionError: null,
 };
 
 const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
@@ -124,6 +130,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         nextCursor: "",
         lastMutation: "none",
         realtimeError: null,
+        reactionError: null,
       };
     case "loaded":
       return {
@@ -135,6 +142,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         loadingMore: false,
         lastMutation: "initial",
         realtimeError: null,
+        reactionError: null,
       };
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
@@ -208,6 +216,10 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
+    case "reaction_error":
+      return { ...state, reactionError: action.error };
+    case "reaction_sending":
+      return { ...state, reactionError: null };
     case "reaction_updated": {
       const { reaction } = action.event;
       if (!reaction) return state;
@@ -224,14 +236,26 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       }));
       const messages = [...state.messages];
       messages[index] = { ...message, reactions };
-      return { ...state, messages, lastMutation: "none", realtimeError: null };
+      return {
+        ...state,
+        messages,
+        lastMutation: "none",
+        realtimeError: null,
+        reactionError: null,
+      };
     }
     case "reaction_snapshot": {
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       if (index < 0) return state;
       const messages = [...state.messages];
       messages[index] = { ...messages[index], reactions: action.reactions };
-      return { ...state, messages, lastMutation: "none", realtimeError: null };
+      return {
+        ...state,
+        messages,
+        lastMutation: "none",
+        realtimeError: null,
+        reactionError: null,
+      };
     }
   }
 }
@@ -512,12 +536,37 @@ export function useMessages({
     [currentUserId, fetchReactionSnapshot, isMessageRendered, targetId],
   );
 
-  const { toggleReaction } = useChatWebSocket({
+  const handleReactionError = useCallback((event: WSClientErrorEvent) => {
+    const messages: Record<string, string> = {
+      rate_limited: "Muitas reações em sequência. Aguarde um minuto e tente novamente.",
+      temporarily_unavailable: "Reações temporariamente indisponíveis.",
+    };
+    dispatch({
+      type: "reaction_error",
+      error: messages[event.code] ?? "Não foi possível atualizar a reação.",
+    });
+  }, []);
+
+  const { toggleReaction: sendReactionToggle } = useChatWebSocket({
     kind,
     targetId,
     onMessageCreated: handleWsMessageCreated,
     onReactionUpdated: handleReactionUpdated,
+    onReactionError: handleReactionError,
   });
+
+  const toggleReaction = useCallback(
+    (messageId: string, emoji: string) => {
+      dispatch({ type: "reaction_sending" });
+      if (!sendReactionToggle(messageId, emoji)) {
+        dispatch({
+          type: "reaction_error",
+          error: "Conexão em tempo real indisponível. Tente novamente.",
+        });
+      }
+    },
+    [sendReactionToggle],
+  );
 
   return { state, sendMessage, retry, loadMore, toggleReaction };
 }

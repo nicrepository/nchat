@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import type {
+  WSClientErrorEvent,
   WSMessageCreatedEvent,
   WSMessagePayload,
   WSReactionUpdatedEvent,
@@ -31,20 +32,24 @@ import type { Message, MessagePage } from "./chatTypes";
 // Captures the latest onMessageCreated callback so tests can fire WS events.
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
 let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
-const mockToggleReaction = vi.fn();
+let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
+const mockToggleReaction = vi.fn(() => true);
 
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
     onReactionUpdated,
+    onReactionError,
   }: {
     kind: string;
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
+    onReactionError?: (evt: WSClientErrorEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
+    capturedOnReactionError = onReactionError ?? null;
     return { toggleReaction: mockToggleReaction };
   },
 }));
@@ -157,6 +162,7 @@ beforeEach(() => {
   setTokens("test-access-token");
   capturedOnMessageCreated = null;
   capturedOnReactionUpdated = null;
+  capturedOnReactionError = null;
   vi.clearAllMocks();
 });
 
@@ -202,6 +208,37 @@ describe("useMessages — WS message.created integration", () => {
     ]);
     act(() => result.current.toggleReaction("msg-1", "👍"));
     expect(mockToggleReaction).toHaveBeenCalledWith("msg-1", "👍");
+  });
+
+  it("shows an error when the reaction socket is unavailable", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1" })],
+      nextCursor: "",
+    });
+    mockToggleReaction.mockReturnValueOnce(false);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+
+    expect(result.current.state.reactionError).toMatch(/tempo real/i);
+  });
+
+  it("maps structured reaction errors to visible state", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "rate_limited", retry_after: 60 }));
+
+    expect(result.current.state.reactionError).toMatch(/muitas reações/i);
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
+    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
   });
 
   it("reloads an authorized message for route-only remote reaction events", async () => {
