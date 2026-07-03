@@ -13,6 +13,9 @@ import (
 
 const reactionActionsPerMinute = 60
 
+// ponytail: INCR+conditional EXPIRE has no atomic native equivalent in
+// valkey-go (or Redis) short of Lua — two round trips would race between the
+// INCR and the EXPIRE. Reviewed for v2; kept as is, no simpler swap available.
 var reactionRateScript = valkey.NewLuaScript(`
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
