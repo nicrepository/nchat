@@ -234,6 +234,55 @@ describe("useMessages — WS message.created integration", () => {
     );
   });
 
+  it("does not fetch a remote reaction for a message outside the rendered page", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-visible" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-not-rendered",
+      }),
+    );
+
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("aborts the remote reaction fallback when the main effect cleans up", async () => {
+    let fallbackSignal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-remote" })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockImplementation((_targetId, _messageId, signal) => {
+      fallbackSignal = signal;
+      return new Promise<Message>(() => undefined);
+    });
+    const { result, unmount } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-remote",
+      }),
+    );
+    await waitFor(() => expect(fallbackSignal).toBeDefined());
+
+    unmount();
+    expect(fallbackSignal?.aborted).toBe(true);
+  });
+
   it("inserts channel message directly from payload without fetch", async () => {
     const payload = makePayload({ id: "msg-payload-ch" });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);

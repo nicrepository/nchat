@@ -6,8 +6,8 @@
  * session/cookie mechanism in authenticatedFetch.
  *
  * chatFixtures.ts is TEST-ONLY and must never be imported here.
- * There is intentionally no module-level request cache: each call is independent
- * so that a session change cannot cause one user to receive another user's data.
+ * User-scoped data is never cached across calls. The immutable, non-sensitive
+ * reaction allowlist is the sole exception and is deduplicated for the app lifetime.
  */
 
 import { authenticatedFetch } from "../lib/authClient";
@@ -42,6 +42,12 @@ interface SidebarResponse {
 interface SidebarEnvelope {
   data: SidebarResponse;
 }
+
+interface AllowedReactionEmojisEnvelope {
+  data: { emojis: unknown };
+}
+
+let allowedReactionEmojisRequest: Promise<string[]> | null = null;
 
 // ── Internal fetch (no cross-request caching) ─────────────────────────────────
 
@@ -96,6 +102,26 @@ export async function fetchSidebarData(): Promise<{
     participants: [],
   }));
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
+}
+
+export function fetchAllowedReactionEmojis(): Promise<string[]> {
+  if (!allowedReactionEmojisRequest) {
+    allowedReactionEmojisRequest = authenticatedFetch<AllowedReactionEmojisEnvelope>(
+      `${CHAT_BASE}/reactions/allowed-emojis`,
+      { method: "GET" },
+    )
+      .then((response) => {
+        const emojis = response.data.emojis;
+        return Array.isArray(emojis)
+          ? emojis.filter((emoji): emoji is string => typeof emoji === "string")
+          : [];
+      })
+      .catch((error: unknown) => {
+        allowedReactionEmojisRequest = null;
+        throw error;
+      });
+  }
+  return allowedReactionEmojisRequest;
 }
 
 // ── Message API response shapes ───────────────────────────────────────────────

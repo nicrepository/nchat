@@ -123,6 +123,10 @@
   min-width: 0;
 }
 
+.chat-msg-area__bubble-wrap {
+  position: relative;
+}
+
 .chat-msg-area__msg--mine .chat-msg-area__msg-body {
   align-items: flex-end;
 }
@@ -185,8 +189,8 @@
 }
 
 .chat-msg-area__reaction,
-.chat-msg-area__reaction-picker summary,
-.chat-msg-area__reaction-options button {
+.chat-msg-area__reaction-toolbar button,
+.chat-msg-area__reaction-grid button {
   border: 1px solid var(--color-border, #e8e3f0);
   background: var(--color-surface, #fff);
   border-radius: 999px;
@@ -202,46 +206,85 @@
   color: var(--color-ink, #16121f);
 }
 
-.chat-msg-area__reaction-picker {
-  position: relative;
-}
-
-.chat-msg-area__reaction-picker summary {
-  display: grid;
-  place-items: center;
-  min-width: 26px;
-  padding: 0;
-  list-style: none;
-}
-
-.chat-msg-area__reaction-picker summary::-webkit-details-marker {
-  display: none;
-}
-
-.chat-msg-area__reaction-options {
+.chat-msg-area__reaction-toolbar {
   position: absolute;
-  z-index: 3;
-  bottom: 32px;
-  left: 0;
+  z-index: 4;
+  top: -16px;
+  right: 8px;
   display: flex;
-  gap: 3px;
-  padding: 6px;
+  gap: 2px;
+  padding: 3px;
   border: 1px solid var(--color-border, #e8e3f0);
-  border-radius: 10px;
-  background: var(--color-surface, #fff);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-surface, #fff) 94%, transparent);
   box-shadow: 0 8px 24px rgb(36 24 55 / 14%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(3px) scale(0.98);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease,
+    visibility 120ms;
 }
 
-.chat-msg-area__msg--mine .chat-msg-area__reaction-options {
-  right: 0;
-  left: auto;
+.chat-msg-area__reaction-toolbar[data-visible="true"],
+.chat-msg-area__msg:hover .chat-msg-area__reaction-toolbar,
+.chat-msg-area__msg:focus-within .chat-msg-area__reaction-toolbar {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
 }
 
-.chat-msg-area__reaction-options button {
+.chat-msg-area__reaction-toolbar button,
+.chat-msg-area__reaction-grid button {
   border: 0;
-  min-width: 30px;
-  padding: 2px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 1px;
   font-size: 17px;
+  line-height: 1;
+}
+
+.chat-msg-area__reaction-toolbar button:hover,
+.chat-msg-area__reaction-toolbar button:focus-visible,
+.chat-msg-area__reaction-grid button:hover,
+.chat-msg-area__reaction-grid button:focus-visible {
+  background: var(--color-primary-tint, #f3ebfb);
+  outline: none;
+}
+
+.chat-msg-area__more-reactions {
+  font-family: Georgia, serif;
+  font-size: 18px !important;
+}
+
+.chat-msg-area__reaction-grid {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 7px);
+  display: grid;
+  grid-template-columns: repeat(5, 32px);
+  gap: 3px;
+  padding: 7px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 12px;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 12px 30px rgb(36 24 55 / 18%);
+}
+
+@media (pointer: coarse) {
+  .chat-msg-area__reaction-toolbar {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: none;
+  }
+
+  .chat-msg-area__quick-reaction {
+    display: none;
+  }
 }
 
 /* ── Message grouping (same sender, same minute) ─────────────────────────────── */

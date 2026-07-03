@@ -12,6 +12,7 @@ vi.mock("../lib/authClient", () => ({
 
 import {
   fetchChannelMessages,
+  fetchAllowedReactionEmojis,
   fetchChannels,
   fetchDMMessages,
   fetchDMs,
@@ -41,6 +42,25 @@ function sidebarResponse(
 
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => vi.clearAllMocks());
+
+describe("fetchAllowedReactionEmojis", () => {
+  it("fetches the authenticated allowlist once and reuses the in-memory result", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: ["👍", "❤️", "🚀"] } });
+
+    const [first, second] = await Promise.all([
+      fetchAllowedReactionEmojis(),
+      fetchAllowedReactionEmojis(),
+    ]);
+
+    expect(first).toEqual(["👍", "❤️", "🚀"]);
+    expect(second).toEqual(first);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/reactions/allowed-emojis"),
+      { method: "GET" },
+    );
+  });
+});
 
 // ── fetchChannels ─────────────────────────────────────────────────────────────
 

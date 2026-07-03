@@ -15,7 +15,7 @@
  * upgrade cannot set custom headers; token-in-URL is rejected server-side).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
@@ -24,6 +24,7 @@ import type { Message } from "./chatTypes";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import RichTextRenderer from "./RichTextRenderer";
 import ChatComposer from "./ChatComposer";
+import { fetchAllowedReactionEmojis } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -246,22 +247,57 @@ interface MessageBubbleProps {
   /** True when consecutive messages from the same sender within the same minute. */
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  allowedReactionEmojis: string[];
 }
-
-const REACTION_EMOJIS = ["👍", "❤️", "😂", "🎉", "😮", "😢", "👎", "🔥"] as const;
 
 function MessageBubble({
   message,
   isMine = false,
   isGrouped = false,
   onToggleReaction,
+  allowedReactionEmojis,
 }: MessageBubbleProps) {
   const time = formatTime(message.createdAt);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [toolbarVisible, setToolbarVisible] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const quickEmojis = allowedReactionEmojis.slice(0, 5);
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setPickerOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPickerOpen(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [pickerOpen]);
+
+  const selectReaction = (emoji: string) => {
+    onToggleReaction(message.id, emoji);
+    setPickerOpen(false);
+  };
+
+  const hideToolbarAfterBlur = (event: React.FocusEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget)) setToolbarVisible(false);
+  };
 
   return (
     <div
       className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}${isGrouped ? " chat-msg-area__msg--grouped" : ""}`}
       data-testid="chat-msg-bubble"
+      tabIndex={0}
+      onMouseEnter={() => setToolbarVisible(true)}
+      onMouseLeave={() => setToolbarVisible(false)}
+      onFocus={() => setToolbarVisible(true)}
+      onBlur={hideToolbarAfterBlur}
+      onTouchStart={() => setToolbarVisible(true)}
     >
       {!isMine && (
         <div className="chat-msg-area__msg-avatar" aria-hidden="true">
@@ -279,16 +315,67 @@ function MessageBubble({
             <span className="chat-msg-area__msg-time">{time}</span>
           </div>
         )}
-        <div
-          className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
-        >
-          {message.isRemoved ? (
-            "Mensagem removida."
-          ) : (
-            <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
+        <div className="chat-msg-area__bubble-wrap">
+          <div
+            className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
+          >
+            {message.isRemoved ? (
+              "Mensagem removida."
+            ) : (
+              <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
+            )}
+          </div>
+          {!message.isRemoved && allowedReactionEmojis.length > 0 && (
+            <div
+              ref={pickerRef}
+              className="chat-msg-area__reaction-toolbar"
+              role="toolbar"
+              aria-label="Ações de reação"
+              data-visible={toolbarVisible || pickerOpen}
+            >
+              {quickEmojis.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  className="chat-msg-area__quick-reaction"
+                  aria-label={`Reagir rapidamente com ${emoji}`}
+                  onClick={() => selectReaction(emoji)}
+                >
+                  {emoji}
+                </button>
+              ))}
+              <button
+                type="button"
+                className="chat-msg-area__more-reactions"
+                aria-label="Mais reações"
+                aria-expanded={pickerOpen}
+                aria-haspopup="dialog"
+                onClick={() => setPickerOpen((open) => !open)}
+              >
+                <span aria-hidden="true">☺</span>
+              </button>
+              {pickerOpen && (
+                <div
+                  className="chat-msg-area__reaction-grid"
+                  role="dialog"
+                  aria-label="Escolher reação"
+                >
+                  {allowedReactionEmojis.map((emoji) => (
+                    <button
+                      key={emoji}
+                      type="button"
+                      aria-label={`Reagir com ${emoji}`}
+                      onClick={() => selectReaction(emoji)}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
-        {!message.isRemoved && (
+        {!message.isRemoved && message.reactions.length > 0 && (
           <div className="chat-msg-area__reactions">
             {message.reactions.map((reaction) => (
               <button
@@ -302,27 +389,6 @@ function MessageBubble({
                 <span aria-hidden="true">{reaction.emoji}</span> {reaction.count}
               </button>
             ))}
-            <details className="chat-msg-area__reaction-picker">
-              <summary role="button" aria-label="Adicionar reação">
-                ＋
-              </summary>
-              <div
-                className="chat-msg-area__reaction-options"
-                role="group"
-                aria-label="Emojis de reação"
-              >
-                {REACTION_EMOJIS.map((emoji) => (
-                  <button
-                    key={emoji}
-                    type="button"
-                    aria-label={`Reagir com ${emoji}`}
-                    onClick={() => onToggleReaction(message.id, emoji)}
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </div>
-            </details>
           </div>
         )}
       </div>
@@ -338,6 +404,7 @@ interface MessageListProps {
   lastMutation: LastMutation;
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  allowedReactionEmojis: string[];
 }
 
 function MessageList({
@@ -348,6 +415,7 @@ function MessageList({
   lastMutation,
   onLoadMore,
   onToggleReaction,
+  allowedReactionEmojis,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -498,6 +566,7 @@ function MessageList({
             isMine={!!currentUserId && item.message.senderId === currentUserId}
             isGrouped={item.isGrouped}
             onToggleReaction={onToggleReaction}
+            allowedReactionEmojis={allowedReactionEmojis}
           />
         ),
       )}
@@ -529,6 +598,22 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     targetId,
     currentUserId: ctx.currentUserId,
   });
+  const [allowedReactionEmojis, setAllowedReactionEmojis] = useState<string[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    fetchAllowedReactionEmojis().then(
+      (emojis) => {
+        if (active) setAllowedReactionEmojis(emojis);
+      },
+      () => {
+        // Message rendering remains available if optional reaction config fails.
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleSend = useCallback(
     (body: string): Promise<SendResult> => sendMessage(body),
@@ -560,6 +645,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           lastMutation={state.lastMutation}
           onLoadMore={loadMore}
           onToggleReaction={toggleReaction}
+          allowedReactionEmojis={allowedReactionEmojis}
         />
       )}
 

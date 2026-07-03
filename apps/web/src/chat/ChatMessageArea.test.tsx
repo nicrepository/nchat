@@ -40,6 +40,7 @@ const {
   mockPostChannelMessage,
   mockFetchDMMessages,
   mockPostDMMessage,
+  mockFetchAllowedReactionEmojis,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -56,6 +57,7 @@ const {
     >(),
   mockPostDMMessage:
     vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchAllowedReactionEmojis: vi.fn<() => Promise<string[]>>(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     toggleReaction: vi.fn(),
@@ -76,6 +78,7 @@ vi.mock("./chatApi", () => ({
   postDMMessage: (conversationId: string, bodyText: string, signal?: AbortSignal) =>
     mockPostDMMessage(conversationId, bodyText, signal),
   fetchDMMessage: vi.fn(),
+  fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
@@ -139,6 +142,24 @@ beforeEach(() => {
   setTokens("test-at");
   wsMockState.capturedWSMessageCreated = null;
   vi.clearAllMocks();
+  mockFetchAllowedReactionEmojis.mockResolvedValue([
+    "👍",
+    "❤️",
+    "😂",
+    "🎉",
+    "😮",
+    "😢",
+    "👎",
+    "🔥",
+    "🙌",
+    "👏",
+    "✅",
+    "👀",
+    "🚀",
+    "💯",
+    "😍",
+    "🤔",
+  ]);
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
 });
@@ -315,7 +336,7 @@ describe("ChatMessageArea — empty state", () => {
 // ── Message list ──────────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — message list", () => {
-  it("renders reaction counts and sends picker toggles", async () => {
+  it("renders reaction counts, uses the server allowlist and closes after selection", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
         makeMessage({ id: "m1", reactions: [{ emoji: "🎉", count: 3, reactedByMe: true }] }),
@@ -324,9 +345,47 @@ describe("ChatMessageArea — message list", () => {
     renderChannelArea();
 
     expect(await screen.findByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("3");
-    await userEvent.click(screen.getByRole("button", { name: "Adicionar reação" }));
+    await userEvent.click(screen.getByRole("button", { name: "Mais reações" }));
     await userEvent.click(screen.getByRole("button", { name: "Reagir com 👍" }));
     expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+    expect(mockFetchAllowedReactionEmojis).toHaveBeenCalledTimes(1);
+  });
+
+  it("reveals reaction actions on hover, keyboard focus and touch", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    const toolbar = await screen.findByRole("toolbar", { name: "Ações de reação" });
+    expect(toolbar).toHaveAttribute("data-visible", "false");
+
+    fireEvent.mouseEnter(bubble);
+    expect(toolbar).toHaveAttribute("data-visible", "true");
+    fireEvent.mouseLeave(bubble);
+    expect(toolbar).toHaveAttribute("data-visible", "false");
+
+    fireEvent.focus(bubble);
+    expect(toolbar).toHaveAttribute("data-visible", "true");
+    fireEvent.blur(bubble, { relatedTarget: document.body });
+    expect(toolbar).toHaveAttribute("data-visible", "false");
+
+    fireEvent.touchStart(bubble);
+    expect(toolbar).toHaveAttribute("data-visible", "true");
+  });
+
+  it("closes the controlled reaction picker on Escape and outside click", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Mais reações" }));
+    expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Mais reações" }));
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
   });
 
   it("renders messages from API response", async () => {

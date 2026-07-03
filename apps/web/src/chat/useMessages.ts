@@ -267,11 +267,13 @@ export function useMessages({
     target: `${kind}:${targetId}`,
     nextCursor: state.nextCursor,
     loadingMore: state.loadingMore,
+    messages: state.messages,
   });
   useLayoutEffect(() => {
     stateRef.current.target = `${kind}:${targetId}`;
     stateRef.current.nextCursor = state.nextCursor;
     stateRef.current.loadingMore = state.loadingMore;
+    stateRef.current.messages = state.messages;
   });
 
   const abortRef = useRef<AbortController | null>(null);
@@ -280,6 +282,10 @@ export function useMessages({
 
   const isCurrentTarget = useCallback((loadKey: string) => {
     return stateRef.current.target === loadKey;
+  }, []);
+
+  const isMessageRendered = useCallback((messageId: string) => {
+    return stateRef.current.messages.some((message) => message.id === messageId);
   }, []);
 
   const load = useCallback(
@@ -460,33 +466,41 @@ export function useMessages({
     [kind, targetId, isCurrentTarget],
   );
 
+  const fetchReactionSnapshot = useCallback(
+    (messageId: string) => {
+      wsFallbackAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      wsFallbackAbortRef.current = ctrl;
+      const loadKey = `${kind}:${targetId}`;
+      const fetchFn =
+        kind === "channel"
+          ? () => fetchChannelMessage(targetId, messageId, ctrl.signal)
+          : () => fetchDMMessage(targetId, messageId, ctrl.signal);
+      fetchFn().then(
+        (message) => {
+          if (!isCurrentTarget(loadKey)) return;
+          dispatch({
+            type: "reaction_snapshot",
+            messageId: message.id,
+            reactions: message.reactions,
+          });
+        },
+        (err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") return;
+          if (isCurrentTarget(loadKey)) {
+            dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
+          }
+        },
+      );
+    },
+    [isCurrentTarget, kind, targetId],
+  );
+
   const handleReactionUpdated = useCallback(
     (event: WSReactionUpdatedEvent) => {
-      if (event.target_id !== targetId) return;
+      if (event.target_id !== targetId || !isMessageRendered(event.message_id)) return;
       if (!event.reaction) {
-        wsFallbackAbortRef.current?.abort();
-        const ctrl = new AbortController();
-        wsFallbackAbortRef.current = ctrl;
-        const fetchFn =
-          kind === "channel"
-            ? () => fetchChannelMessage(targetId, event.message_id, ctrl.signal)
-            : () => fetchDMMessage(targetId, event.message_id, ctrl.signal);
-        fetchFn().then(
-          (message) => {
-            if (!isCurrentTarget(`${kind}:${targetId}`)) return;
-            dispatch({
-              type: "reaction_snapshot",
-              messageId: message.id,
-              reactions: message.reactions,
-            });
-          },
-          (err: unknown) => {
-            if (err instanceof Error && err.name === "AbortError") return;
-            if (isCurrentTarget(`${kind}:${targetId}`)) {
-              dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
-            }
-          },
-        );
+        fetchReactionSnapshot(event.message_id);
         return;
       }
       dispatch({
@@ -495,7 +509,7 @@ export function useMessages({
         actorIsMe: event.reaction.actor_user_id === currentUserId,
       });
     },
-    [currentUserId, isCurrentTarget, kind, targetId],
+    [currentUserId, fetchReactionSnapshot, isMessageRendered, targetId],
   );
 
   const { toggleReaction } = useChatWebSocket({
