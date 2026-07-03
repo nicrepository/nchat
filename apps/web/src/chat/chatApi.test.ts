@@ -21,6 +21,7 @@ import {
   messagesPath,
   postChannelMessage,
   postDMMessage,
+  resetAllowedReactionEmojisCache,
 } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -40,7 +41,10 @@ function sidebarResponse(
   };
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  resetAllowedReactionEmojisCache();
+});
 afterEach(() => vi.clearAllMocks());
 
 describe("fetchAllowedReactionEmojis", () => {
@@ -59,6 +63,17 @@ describe("fetchAllowedReactionEmojis", () => {
       expect.stringContaining("/reactions/allowed-emojis"),
       { method: "GET" },
     );
+  });
+
+  it("fetches again after the cache is reset", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["👍"] } });
+    await fetchAllowedReactionEmojis();
+
+    resetAllowedReactionEmojisCache();
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["🚀"] } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
   });
 });
 

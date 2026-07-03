@@ -120,6 +120,27 @@ func TestHub_ReactionToggleRejectsInvalidMessageUUIDBeforeHandler(t *testing.T) 
 	}
 }
 
+func TestValidateReactionToggle_ReportsInvalidField(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  ClientMessage
+		want string
+	}{
+		{name: "message id required", msg: ClientMessage{Emoji: "👍"}, want: "ws: reaction toggle: message_id required"},
+		{name: "emoji required", msg: ClientMessage{MessageID: testReactionMessageID}, want: "ws: reaction toggle: emoji required"},
+		{name: "unexpected target type", msg: ClientMessage{MessageID: testReactionMessageID, Emoji: "👍", TargetType: TargetTypeChannel}, want: "ws: reaction toggle: unexpected target fields"},
+		{name: "unexpected target id", msg: ClientMessage{MessageID: testReactionMessageID, Emoji: "👍", TargetID: "channel-id"}, want: "ws: reaction toggle: unexpected target fields"},
+		{name: "invalid message id", msg: ClientMessage{MessageID: "not-a-uuid", Emoji: "👍"}, want: "ws: reaction toggle: invalid message_id format"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateReactionToggle(tt.msg); err == nil || err.Error() != tt.want {
+				t.Fatalf("expected %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
 func decodeEvent(raw []byte) (Event, error) {
 	var evt Event
 	err := json.Unmarshal(raw, &evt)

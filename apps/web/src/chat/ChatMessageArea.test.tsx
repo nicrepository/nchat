@@ -388,6 +388,20 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
   });
 
+  it("keeps only one message reaction picker open", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1" }), makeMessage({ id: "m2" })]),
+    );
+    renderChannelArea();
+
+    const buttons = await screen.findAllByRole("button", { name: "Mais reações" });
+    await userEvent.click(buttons[0]);
+    expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
+
+    await userEvent.click(buttons[1]);
+    expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
+  });
+
   it("renders messages from API response", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([makeMessage({ bodyText: "Olá, mundo!" })]),

@@ -821,8 +821,14 @@ func (h *Hub) handleReactionToggle(ctx context.Context, c *Client, msg ClientMes
 }
 
 func validateReactionToggle(msg ClientMessage) error {
-	if msg.MessageID == "" || msg.Emoji == "" || msg.TargetType != "" || msg.TargetID != "" {
-		return fmt.Errorf("ws: invalid reaction toggle")
+	if msg.MessageID == "" {
+		return fmt.Errorf("ws: reaction toggle: message_id required")
+	}
+	if msg.Emoji == "" {
+		return fmt.Errorf("ws: reaction toggle: emoji required")
+	}
+	if msg.TargetType != "" || msg.TargetID != "" {
+		return fmt.Errorf("ws: reaction toggle: unexpected target fields")
 	}
 	if _, err := uuid.Parse(msg.MessageID); err != nil {
 		return fmt.Errorf("ws: reaction toggle: invalid message_id format")

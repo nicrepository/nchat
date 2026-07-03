@@ -11,6 +11,7 @@
  */
 
 import { authenticatedFetch } from "../lib/authClient";
+import { onAuthChange } from "../lib/authSession";
 import type { Channel, DMConversation, Message, MessagePage } from "./chatTypes";
 import type { MentionCandidate } from "./chatTypes";
 
@@ -48,6 +49,14 @@ interface AllowedReactionEmojisEnvelope {
 }
 
 let allowedReactionEmojisRequest: Promise<string[]> | null = null;
+
+export function resetAllowedReactionEmojisCache(): void {
+  allowedReactionEmojisRequest = null;
+}
+
+// ponytail: authSession already owns session-change notifications; reuse it
+// instead of adding chat-specific logout plumbing.
+onAuthChange(resetAllowedReactionEmojisCache);
 
 // ── Internal fetch (no cross-request caching) ─────────────────────────────────
 
