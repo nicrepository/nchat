@@ -2,8 +2,8 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"hash/fnv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -39,17 +39,15 @@ func (s *PGXReactionStore) ToggleReaction(ctx context.Context, input ToggleReact
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	result.ChannelID, result.DMID, err = authorizeMessageAccess(ctx, tx, input)
+	// Acquire before the next statement takes its READ COMMITTED snapshot. A
+	// lock inside the toggle statement would wait correctly but retain a stale
+	// pre-wait snapshot, allowing duplicate inserts on consecutive toggles.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, reactionAdvisoryKey(input)); err != nil {
+		return result, fmt.Errorf("acquire reaction tuple lock: %w", err)
+	}
+	result, err = toggleAuthorizedReaction(ctx, tx, input)
 	if err != nil {
 		return ToggleReactionResult{}, err
-	}
-	result.Added, err = upsertReactionToggle(ctx, tx, input)
-	if err != nil {
-		return result, err
-	}
-	result.Reactions, err = aggregateReactions(ctx, tx, input)
-	if err != nil {
-		return result, err
 	}
 	result.MessageID = input.MessageID
 	if err := tx.Commit(ctx); err != nil {
@@ -58,80 +56,106 @@ func (s *PGXReactionStore) ToggleReaction(ctx context.Context, input ToggleReact
 	return result, nil
 }
 
-func authorizeMessageAccess(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) (channelID, dmID string, err error) {
-	// ponytail: lock the message, not each reaction tuple; move to advisory tuple
-	// locks only if reaction throughput on a single message becomes measurable.
-	err = tx.QueryRow(ctx, `
-		SELECT COALESCE(m.channel_id::text, ''), COALESCE(m.dm_conversation_id::text, '')
-		FROM chat.messages m
-		JOIN chat.workspace_members wm
-		  ON wm.workspace_id = m.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
-		LEFT JOIN chat.channels c
-		  ON c.id = m.channel_id AND c.status = 'active'
-		LEFT JOIN chat.channel_members cm
-		  ON cm.channel_id = m.channel_id AND cm.user_id = $2
-		LEFT JOIN chat.dm_conversations dc
-		  ON dc.id = m.dm_conversation_id AND dc.status = 'active'
-		LEFT JOIN chat.dm_members dm
-		  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $2 AND dm.status = 'active'
-		WHERE m.workspace_id = $1 AND m.id = $3 AND m.status = 'active'
-		  AND ((m.channel_id IS NOT NULL AND c.id IS NOT NULL AND (c.type = 'public' OR cm.user_id IS NOT NULL))
-		    OR (m.dm_conversation_id IS NOT NULL AND dc.id IS NOT NULL AND dm.user_id IS NOT NULL))
-		FOR UPDATE OF m`, input.WorkspaceID, input.UserID, input.MessageID).
-		Scan(&channelID, &dmID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", "", domain.ErrNotFound
-	}
-	if err != nil {
-		return "", "", fmt.Errorf("authorize reaction target: %w", err)
-	}
-	return channelID, dmID, nil
-}
-
-func upsertReactionToggle(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) (bool, error) {
-	tag, err := tx.Exec(ctx, `DELETE FROM chat.message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-		input.MessageID, input.UserID, input.Emoji)
-	if err != nil {
-		return false, fmt.Errorf("remove reaction: %w", err)
-	}
-	added := tag.RowsAffected() == 0
-	if added {
-		if _, err = tx.Exec(ctx, `INSERT INTO chat.message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)`,
-			input.MessageID, input.UserID, input.Emoji); err != nil {
-			return false, fmt.Errorf("add reaction: %w", err)
-		}
-	}
-	return added, nil
-}
-
-func aggregateReactions(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) ([]domain.MessageReaction, error) {
-	// Transaction invariant: authorizeMessageAccess holds FOR UPDATE OF m until
-	// commit, serializing toggles for this message. EXISTS is defense in depth
-	// against aggregating a message from another workspace if this helper changes.
+func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReactionInput) (result ToggleReactionResult, err error) {
 	rows, err := tx.Query(ctx, `
-		SELECT emoji, count(*)::int, bool_or(user_id = $2)
-		FROM chat.message_reactions
-		WHERE message_id = $1
-		  AND EXISTS (
-		      SELECT 1 FROM chat.messages
-		      WHERE id = $1 AND workspace_id = $3
-		  )
-		GROUP BY emoji
-		ORDER BY min(created_at), emoji`, input.MessageID, input.UserID, input.WorkspaceID)
+		WITH base AS MATERIALIZED (
+			SELECT m.channel_id, m.dm_conversation_id
+			FROM chat.messages m
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
+			WHERE m.workspace_id = $1 AND m.id = $3 AND m.status = 'active'
+			FOR SHARE OF m, wm
+		),
+		public_channel AS MATERIALIZED (
+			SELECT b.channel_id::text AS channel_id, ''::text AS dm_id
+			FROM base b
+			JOIN chat.channels c ON c.id = b.channel_id AND c.status = 'active' AND c.type = 'public'
+			FOR SHARE OF c
+		),
+		private_channel AS MATERIALIZED (
+			SELECT b.channel_id::text AS channel_id, ''::text AS dm_id
+			FROM base b
+			JOIN chat.channels c ON c.id = b.channel_id AND c.status = 'active' AND c.type = 'private'
+			JOIN chat.channel_members cm ON cm.channel_id = c.id AND cm.user_id = $2
+			FOR SHARE OF c, cm
+		),
+		direct_message AS MATERIALIZED (
+			SELECT ''::text AS channel_id, b.dm_conversation_id::text AS dm_id
+			FROM base b
+			JOIN chat.dm_conversations dc ON dc.id = b.dm_conversation_id AND dc.status = 'active'
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = dc.id AND dm.user_id = $2 AND dm.status = 'active'
+			FOR SHARE OF dc, dm
+		),
+		authorized AS MATERIALIZED (
+			SELECT * FROM public_channel
+			UNION ALL SELECT * FROM private_channel
+			UNION ALL SELECT * FROM direct_message
+		),
+		deleted AS (
+			DELETE FROM chat.message_reactions r
+			USING authorized a
+			WHERE r.message_id = $3 AND r.user_id = $2 AND r.emoji = $4
+			RETURNING r.message_id
+		),
+		inserted AS (
+			INSERT INTO chat.message_reactions (message_id, user_id, emoji)
+			SELECT $3, $2, $4 FROM authorized
+			WHERE NOT EXISTS (SELECT 1 FROM deleted)
+			RETURNING emoji, user_id, created_at
+		),
+		final_reactions AS MATERIALIZED (
+			SELECT r.emoji, r.user_id, r.created_at
+			FROM chat.message_reactions r
+			JOIN authorized a ON true
+			WHERE r.message_id = $3 AND (r.user_id <> $2 OR r.emoji <> $4)
+			UNION ALL
+			SELECT emoji, user_id, created_at FROM inserted
+		),
+		aggregated AS (
+			SELECT emoji, count(*)::int AS count, bool_or(user_id = $2) AS reacted_by_me,
+			       min(created_at) AS first_created_at
+			FROM final_reactions
+			GROUP BY emoji
+		)
+		SELECT a.channel_id, a.dm_id, EXISTS (SELECT 1 FROM inserted),
+		       COALESCE(g.emoji, ''), COALESCE(g.count, 0), COALESCE(g.reacted_by_me, false)
+		FROM authorized a
+		LEFT JOIN aggregated g ON true
+		ORDER BY g.first_created_at NULLS LAST, g.emoji`,
+		input.WorkspaceID, input.UserID, input.MessageID, input.Emoji)
 	if err != nil {
-		return nil, fmt.Errorf("list reaction aggregate: %w", err)
+		return result, fmt.Errorf("toggle authorized reaction: %w", err)
 	}
 	defer rows.Close()
-	reactions := make([]domain.MessageReaction, 0)
+	found := false
 	for rows.Next() {
+		found = true
 		var reaction domain.MessageReaction
-		if err := rows.Scan(&reaction.Emoji, &reaction.Count, &reaction.ReactedByMe); err != nil {
-			return nil, fmt.Errorf("scan reaction aggregate: %w", err)
+		if err := rows.Scan(
+			&result.ChannelID, &result.DMID, &result.Added,
+			&reaction.Emoji, &reaction.Count, &reaction.ReactedByMe,
+		); err != nil {
+			return ToggleReactionResult{}, fmt.Errorf("scan reaction toggle: %w", err)
 		}
-		reactions = append(reactions, reaction)
+		if reaction.Emoji != "" {
+			result.Reactions = append(result.Reactions, reaction)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate reaction aggregate: %w", err)
+		return ToggleReactionResult{}, fmt.Errorf("iterate reaction toggle: %w", err)
 	}
-	return reactions, nil
+	if !found {
+		return ToggleReactionResult{}, domain.ErrNotFound
+	}
+	return result, nil
+}
+
+// reactionAdvisoryKey scopes serialization to exactly one toggle tuple. Hash
+// collisions can only add contention; the reaction primary key still enforces
+// correctness. NUL separators are unambiguous for UUIDs and allowed emoji.
+func reactionAdvisoryKey(input ToggleReactionInput) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(input.MessageID + "\x00" + input.UserID + "\x00" + input.Emoji))
+	return int64(h.Sum64()) //nolint:gosec // Intentional uint64→int64 reinterpretation for PostgreSQL advisory locks.
 }
