@@ -11,6 +11,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ServiceName != "chat-service" || cfg.Env != "development" || cfg.Port != 8082 || cfg.ReadHeaderTimeoutSeconds != 5 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
+	if cfg.ReactionRateLimitMaxActions != 60 || cfg.ReactionRateLimitWindowSeconds != 60 {
+		t.Fatalf("unexpected reaction rate-limit defaults: %+v", cfg)
+	}
 	wsDefaults := ws.DefaultHandlerConfig()
 	if cfg.WSMaxConnectionsPerUser != wsDefaults.MaxConnectionsPerUser ||
 		cfg.WSInboundMessagesPerMinute != wsDefaults.InboundMessagesPerMinute ||
@@ -27,6 +30,8 @@ func TestLoadUsesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("WS_INBOUND_MESSAGES_PER_MINUTE", "120")
 	t.Setenv("WS_INBOUND_BURST", "20")
 	t.Setenv("WS_MAX_INVALID_MESSAGES", "3")
+	t.Setenv("REACTION_RATE_LIMIT_MAX_ACTIONS", "7")
+	t.Setenv("REACTION_RATE_LIMIT_WINDOW_SECONDS", "12")
 	cfg := Load()
 	if cfg.Env != "test" || cfg.Port != 18082 {
 		t.Fatalf("expected env/port overrides, got %+v", cfg)
@@ -36,6 +41,18 @@ func TestLoadUsesEnvironmentOverrides(t *testing.T) {
 		cfg.WSInboundBurst != 20 ||
 		cfg.WSMaxInvalidMessages != 3 {
 		t.Fatalf("expected websocket resource env overrides, got %+v", cfg)
+	}
+	if cfg.ReactionRateLimitMaxActions != 7 || cfg.ReactionRateLimitWindowSeconds != 12 {
+		t.Fatalf("expected reaction rate-limit env overrides, got %+v", cfg)
+	}
+}
+
+func TestLoadInvalidReactionRateLimitFallsBackToDefaults(t *testing.T) {
+	t.Setenv("REACTION_RATE_LIMIT_MAX_ACTIONS", "0")
+	t.Setenv("REACTION_RATE_LIMIT_WINDOW_SECONDS", "invalid")
+	cfg := Load()
+	if cfg.ReactionRateLimitMaxActions != 60 || cfg.ReactionRateLimitWindowSeconds != 60 {
+		t.Fatalf("expected invalid reaction rate limit to use defaults, got %+v", cfg)
 	}
 }
 

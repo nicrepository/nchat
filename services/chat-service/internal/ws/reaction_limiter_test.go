@@ -12,13 +12,14 @@ import (
 )
 
 type reactionLimiterValkey struct {
-	mu    sync.Mutex
-	count int
-	fail  bool
-	key   string
+	mu     sync.Mutex
+	count  int
+	fail   bool
+	key    string
+	window string
 }
 
-func newTestReactionLimiter(t *testing.T, server *reactionLimiterValkey) *ValkeyReactionLimiter {
+func newTestReactionLimiter(t *testing.T, server *reactionLimiterValkey, maxActions, windowSeconds int) *ValkeyReactionLimiter {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -34,7 +35,7 @@ func newTestReactionLimiter(t *testing.T, server *reactionLimiterValkey) *Valkey
 			go server.serve(conn)
 		}
 	}()
-	limiter, err := NewValkeyReactionLimiter("valkey://" + listener.Addr().String() + "?protocol=2&client_cache=0")
+	limiter, err := NewValkeyReactionLimiter("valkey://"+listener.Addr().String()+"?protocol=2&client_cache=0", maxActions, windowSeconds)
 	if err != nil {
 		t.Fatalf("new reaction limiter: %v", err)
 	}
@@ -64,6 +65,7 @@ func (s *reactionLimiterValkey) serve(conn net.Conn) {
 			}
 			s.count++
 			s.key = command[3]
+			s.window = command[4]
 			count := s.count
 			s.mu.Unlock()
 			_, _ = fmt.Fprintf(conn, ":%d\r\n", count)
@@ -102,19 +104,27 @@ func readReactionLimiterCommand(reader *bufio.Reader) ([]string, error) {
 }
 
 func TestNewValkeyReactionLimiterValidatesConfiguration(t *testing.T) {
-	for _, url := range []string{"", "://invalid"} {
-		if limiter, err := NewValkeyReactionLimiter(url); err == nil || limiter != nil {
-			t.Fatalf("expected %q to be rejected, limiter=%v err=%v", url, limiter, err)
+	for _, tt := range []struct {
+		url                string
+		maxActions, window int
+	}{
+		{url: "", maxActions: 60, window: 60},
+		{url: "://invalid", maxActions: 60, window: 60},
+		{url: "valkey://localhost:6379", maxActions: 0, window: 60},
+		{url: "valkey://localhost:6379", maxActions: 60, window: 0},
+	} {
+		if limiter, err := NewValkeyReactionLimiter(tt.url, tt.maxActions, tt.window); err == nil || limiter != nil {
+			t.Fatalf("expected invalid config to be rejected, limiter=%v err=%v", limiter, err)
 		}
 	}
 
-	_ = newTestReactionLimiter(t, &reactionLimiterValkey{})
+	_ = newTestReactionLimiter(t, &reactionLimiterValkey{}, 60, 60)
 }
 
-func TestValkeyReactionLimiterAllowsSixtyActionsWithoutExposingUserID(t *testing.T) {
+func TestValkeyReactionLimiterUsesConfiguredLimitAndWindowWithoutExposingUserID(t *testing.T) {
 	server := &reactionLimiterValkey{}
-	limiter := newTestReactionLimiter(t, server)
-	for i := 0; i < reactionActionsPerMinute; i++ {
+	limiter := newTestReactionLimiter(t, server, 2, 7)
+	for i := 0; i < 2; i++ {
 		allowed, err := limiter.Allow(t.Context(), "sensitive-user-id")
 		if err != nil || !allowed {
 			t.Fatalf("action %d: allowed=%v err=%v", i+1, allowed, err)
@@ -122,15 +132,18 @@ func TestValkeyReactionLimiterAllowsSixtyActionsWithoutExposingUserID(t *testing
 	}
 	allowed, err := limiter.Allow(t.Context(), "sensitive-user-id")
 	if err != nil || allowed {
-		t.Fatalf("action 61: allowed=%v err=%v", allowed, err)
+		t.Fatalf("action 3: allowed=%v err=%v", allowed, err)
 	}
 	if strings.Contains(server.key, "sensitive-user-id") {
 		t.Fatalf("rate-limit key leaks user ID: %q", server.key)
 	}
+	if server.window != "7" {
+		t.Fatalf("rate-limit window = %q, want 7", server.window)
+	}
 }
 
 func TestValkeyReactionLimiterPropagatesValkeyFailure(t *testing.T) {
-	limiter := newTestReactionLimiter(t, &reactionLimiterValkey{fail: true})
+	limiter := newTestReactionLimiter(t, &reactionLimiterValkey{fail: true}, 60, 60)
 	if allowed, err := limiter.Allow(t.Context(), "user-1"); err == nil || allowed {
 		t.Fatalf("expected Valkey error, allowed=%v err=%v", allowed, err)
 	}

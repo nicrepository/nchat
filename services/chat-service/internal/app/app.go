@@ -139,7 +139,9 @@ func New(cfg config.Config) *App {
 	options := []ws.HubOption{ws.WithPresence(presence)}
 	var reactionLimiter *ws.ValkeyReactionLimiter
 	if reactionSvc != nil {
-		if limiter, limiterErr := ws.NewValkeyReactionLimiter(cfg.ValkeyURL); limiterErr != nil {
+		if limiter, limiterErr := ws.NewValkeyReactionLimiter(
+			cfg.ValkeyURL, cfg.ReactionRateLimitMaxActions, cfg.ReactionRateLimitWindowSeconds,
+		); limiterErr != nil {
 			logger.Warn("message reactions disabled", "reason", "invalid_valkey_config")
 		} else {
 			reactionLimiter = limiter

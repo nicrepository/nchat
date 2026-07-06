@@ -287,7 +287,7 @@ func TestNewInvalidValkeyBroadcastConfigGracefullyDegrades(t *testing.T) {
 
 func TestAppShutdownClosesReactionLimiter(t *testing.T) {
 	a := newTestApp(t, config.Config{ServiceName: "chat-service", Env: "test", Port: 8082, ReadHeaderTimeoutSeconds: 5})
-	limiter, err := ws.NewValkeyReactionLimiter(startFakeValkeyServer(t))
+	limiter, err := ws.NewValkeyReactionLimiter(startFakeValkeyServer(t), 60, 60)
 	if err != nil {
 		t.Fatalf("new reaction limiter: %v", err)
 	}

@@ -16,6 +16,8 @@ const (
 
 	// defaultMentionLabelCacheTTLSeconds matches service.defaultMentionLabelCacheTTL.
 	defaultMentionLabelCacheTTLSeconds = 45
+	defaultReactionRateLimitMaxActions = 60
+	defaultReactionRateLimitWindowSecs = 60
 
 	// wsInstanceIDMaxLen matches sourceInstanceIDMaxLen in the ws package.
 	// Kept in sync manually; both must allow the same set of valid identifiers.
@@ -57,6 +59,10 @@ type Config struct {
 	// propagate display-name changes and account deactivation/deletion
 	// ("right to be forgotten") faster, at the cost of more Valkey load.
 	MentionLabelCacheTTLSeconds int
+	// ReactionRateLimitMaxActions and ReactionRateLimitWindowSeconds control
+	// the shared per-user reaction limiter in Valkey.
+	ReactionRateLimitMaxActions    int
+	ReactionRateLimitWindowSeconds int
 	// ValkeyWSBroadcastEnabled enables distributed WebSocket broadcast via
 	// Valkey Pub/Sub. When false, broadcast is in-process only (NopBus).
 	// Defaults to false; safe for local development and test environments.
@@ -92,12 +98,16 @@ func Load() Config {
 		AuthJWTAudience:             platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
 		ValkeyURL:                   platformconfig.GetString("VALKEY_URL", ""),
 		MentionLabelCacheTTLSeconds: getPositiveInt("MENTION_LABEL_CACHE_TTL_SECONDS", defaultMentionLabelCacheTTLSeconds),
-		ValkeyWSBroadcastEnabled:    platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
-		WSInstanceID:                sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
-		WSMaxConnectionsPerUser:     getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
-		WSInboundMessagesPerMinute:  getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
-		WSInboundBurst:              getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
-		WSMaxInvalidMessages:        getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
+		ReactionRateLimitMaxActions: getPositiveInt("REACTION_RATE_LIMIT_MAX_ACTIONS", defaultReactionRateLimitMaxActions),
+		ReactionRateLimitWindowSeconds: getPositiveInt(
+			"REACTION_RATE_LIMIT_WINDOW_SECONDS", defaultReactionRateLimitWindowSecs,
+		),
+		ValkeyWSBroadcastEnabled:   platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
+		WSInstanceID:               sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		WSMaxConnectionsPerUser:    getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
+		WSInboundMessagesPerMinute: getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
+		WSInboundBurst:             getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
+		WSMaxInvalidMessages:       getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
 	}
 }
 
