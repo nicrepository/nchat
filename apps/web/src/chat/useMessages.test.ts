@@ -18,7 +18,12 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
-import type { WSMessageCreatedEvent, WSMessagePayload } from "./useChatWebSocket";
+import type {
+  WSClientErrorEvent,
+  WSMessageCreatedEvent,
+  WSMessagePayload,
+  WSReactionUpdatedEvent,
+} from "./useChatWebSocket";
 import { useMessages } from "./useMessages";
 import type { Message, MessagePage } from "./chatTypes";
 
@@ -26,16 +31,26 @@ import type { Message, MessagePage } from "./chatTypes";
 
 // Captures the latest onMessageCreated callback so tests can fire WS events.
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
+let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
+let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
+const mockToggleReaction = vi.fn(() => true);
 
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
+    onReactionUpdated,
+    onReactionError,
   }: {
     kind: string;
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
+    onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
+    onReactionError?: (evt: WSClientErrorEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
+    capturedOnReactionUpdated = onReactionUpdated ?? null;
+    capturedOnReactionError = onReactionError ?? null;
+    return { toggleReaction: mockToggleReaction };
   },
 }));
 
@@ -86,6 +101,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   status: "active",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
+  reactions: [],
   ...overrides,
 });
 
@@ -145,21 +161,286 @@ function fireWsEventNoPayload(
 beforeEach(() => {
   setTokens("test-access-token");
   capturedOnMessageCreated = null;
+  capturedOnReactionUpdated = null;
+  capturedOnReactionError = null;
   vi.clearAllMocks();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clearTokens();
 });
 
 // ── WS integration tests ──────────────────────────────────────────────────────
 
 describe("useMessages — WS message.created integration", () => {
+  it("replaces reaction counts from WS and marks the authenticated actor", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", reactions: [] })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-1",
+        reaction: {
+          message_id: "msg-1",
+          actor_user_id: "user-me",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 2 }],
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 2, reactedByMe: true },
+    ]);
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+    expect(mockToggleReaction).toHaveBeenCalledWith("msg-1", "👍");
+  });
+
+  it("shows an error when the reaction socket is unavailable", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1" })],
+      nextCursor: "",
+    });
+    mockToggleReaction.mockReturnValueOnce(false);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+
+    expect(result.current.state.reactionError).toMatch(/tempo real/i);
+  });
+
+  it("maps structured reaction errors to visible state", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "rate_limited", retry_after: 60 }));
+
+    expect(result.current.state.reactionError).toMatch(/muitas reações/i);
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
+    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+  });
+
+  it("clears a temporary reaction error instead of leaving a stale banner", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
+    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(result.current.state.reactionError).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("reloads an authorized message for route-only remote reaction events", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-remote", reactions: [] })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: "msg-remote", reactions: [{ emoji: "🔥", count: 4, reactedByMe: true }] }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-remote",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages[0].reactions).toHaveLength(1));
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      "ch-1",
+      "msg-remote",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("reports a failed remote reaction snapshot without exposing details", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-remote-error", reactions: [] })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockRejectedValue(new Error("sensitive backend failure"));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-remote-error",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.realtimeError).toMatch(/tempo real/i));
+    expect(result.current.state.realtimeError).not.toContain("sensitive backend failure");
+  });
+
+  it("reloads a DM message for route-only remote reaction events", async () => {
+    mockFetchDMMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-dm-remote", reactions: [] })],
+      nextCursor: "",
+    });
+    mockFetchDMMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-dm-remote",
+        reactions: [{ emoji: "🔥", count: 2, reactedByMe: false }],
+      }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "dm",
+        target_id: "dm-1",
+        message_id: "msg-dm-remote",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages[0].reactions).toHaveLength(1));
+    expect(mockFetchDMMessage).toHaveBeenCalledWith(
+      "dm-1",
+      "msg-dm-remote",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("does not mark another user's reaction as mine", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-other", reactions: [] })],
+      nextCursor: "",
+    });
+    const onOwnReactionConfirmed = vi.fn();
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onOwnReactionConfirmed,
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-other",
+        reaction: {
+          message_id: "msg-other",
+          actor_user_id: "user-other",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 1 }],
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 1, reactedByMe: false },
+    ]);
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch a remote reaction for a message outside the rendered page", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-visible" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-not-rendered",
+      }),
+    );
+
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("aborts the remote reaction fallback when the main effect cleans up", async () => {
+    let fallbackSignal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-remote" })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockImplementation((_targetId, _messageId, signal) => {
+      fallbackSignal = signal;
+      return new Promise<Message>(() => undefined);
+    });
+    const { result, unmount } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-remote",
+      }),
+    );
+    await waitFor(() => expect(fallbackSignal).toBeDefined());
+
+    unmount();
+    expect(fallbackSignal?.aborted).toBe(true);
+  });
+
   it("inserts channel message directly from payload without fetch", async () => {
     const payload = makePayload({ id: "msg-payload-ch" });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     expect(result.current.state.messages).toHaveLength(0);
@@ -181,7 +462,9 @@ describe("useMessages — WS message.created integration", () => {
   it("preserves v3 mention format from a realtime payload", async () => {
     const payload = makePayload({ id: "msg-v3", body_format: "v3" });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     act(() => fireWsEventWithPayload("channel", "ch-1", payload));
@@ -197,7 +480,9 @@ describe("useMessages — WS message.created integration", () => {
     } as unknown as WSMessagePayload;
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-no-email" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-no-email", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -219,7 +504,9 @@ describe("useMessages — WS message.created integration", () => {
     const payload = makePayload({ id: "msg-payload-dm", dm_conversation_id: "conv-1" });
     mockFetchDMMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "dm", targetId: "conv-1" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-1", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -237,7 +524,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     mockFetchChannelMessage.mockResolvedValue(msg);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-fb" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-fb", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -261,7 +550,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     mockFetchDMMessage.mockResolvedValue(msg);
 
-    const { result } = renderHook(() => useMessages({ kind: "dm", targetId: "conv-fb" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-fb", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -284,7 +575,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     mockFetchChannelMessage.mockRejectedValue(new Error("rate limited"));
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-fb-error" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-fb-error", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -314,7 +607,9 @@ describe("useMessages — WS message.created integration", () => {
     const initialPage: MessagePage = { messages: [existingMsg], nextCursor: "" };
     mockFetchChannelMessages.mockResolvedValue(initialPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-dup" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-dup", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
 
@@ -336,7 +631,9 @@ describe("useMessages — WS message.created integration", () => {
   it("ignores event for a different channel (cross-target filter)", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-active" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-active", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -354,7 +651,9 @@ describe("useMessages — WS message.created integration", () => {
   it("ignores event for a different DM conversation (cross-target filter)", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
 
-    const { result } = renderHook(() => useMessages({ kind: "dm", targetId: "conv-active" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-active", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -375,7 +674,9 @@ describe("useMessages — WS message.created integration", () => {
     ];
     mockFetchChannelMessages.mockResolvedValue({ messages: initial, nextCursor: "" });
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-order" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-order", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(2));
 
@@ -404,7 +705,9 @@ describe("useMessages — WS message.created integration", () => {
     ];
     mockFetchChannelMessages.mockResolvedValue({ messages: initial, nextCursor: "" });
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-tiebreak" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-tiebreak", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(2));
 
@@ -427,7 +730,9 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const payload = makePayload({ id: "msg-newest" });
 
-    const { result } = renderHook(() => useMessages({ kind: "channel", targetId: "ch-latest" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-latest", currentUserId: "user-me" }),
+    );
 
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
@@ -452,7 +757,8 @@ describe("useMessages — WS message.created integration", () => {
     });
 
     const { result, rerender } = renderHook(
-      ({ targetId }: { targetId: string }) => useMessages({ kind: "channel", targetId }),
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
       { initialProps: { targetId: "ch-original" } },
     );
 

@@ -179,6 +179,54 @@ func TestCanonicalizeRemoteEvent_StripsSensitivePayload(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeRemoteReaction_StripsUntrustedAggregate(t *testing.T) {
+	evt := remoteEvt(testEventID2)
+	evt.Type = EventTypeReactionUpdated
+	evt.Reaction = &ReactionEventPayload{
+		MessageID: testMessageID, ActorUserID: testEventIDEcho, Emoji: "👍", Added: true,
+		Reactions: []ReactionPayload{{Emoji: "👍", Count: 99}},
+	}
+	canonical, ok := canonicalizeRemoteEvent(evt)
+	if !ok {
+		t.Fatal("expected valid remote reaction route")
+	}
+	if canonical.Reaction != nil {
+		t.Fatalf("remote reaction aggregate must be stripped, got %+v", canonical.Reaction)
+	}
+}
+
+func TestCanonicalizeRemoteReactionRejectsInvalidPayload(t *testing.T) {
+	valid := ReactionEventPayload{
+		MessageID: testMessageID, ActorUserID: testEventIDEcho, Emoji: "👍", Added: true,
+		Reactions: []ReactionPayload{{Emoji: "👍", Count: 1}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Event)
+	}{
+		{name: "missing payload", mutate: func(evt *Event) { evt.Reaction = nil }},
+		{name: "message mismatch", mutate: func(evt *Event) { evt.Reaction.MessageID = testEventID }},
+		{name: "empty emoji", mutate: func(evt *Event) { evt.Reaction.Emoji = "" }},
+		{name: "invalid actor", mutate: func(evt *Event) { evt.Reaction.ActorUserID = "invalid" }},
+		{name: "empty aggregate emoji", mutate: func(evt *Event) { evt.Reaction.Reactions[0].Emoji = "" }},
+		{name: "non-positive count", mutate: func(evt *Event) { evt.Reaction.Reactions[0].Count = 0 }},
+		{name: "oversized aggregate", mutate: func(evt *Event) { evt.Reaction.Reactions = make([]ReactionPayload, 65) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evt := remoteEvt(testEventID2)
+			evt.Type = EventTypeReactionUpdated
+			payload := valid
+			payload.Reactions = append([]ReactionPayload(nil), valid.Reactions...)
+			evt.Reaction = &payload
+			tt.mutate(&evt)
+			if _, ok := canonicalizeRemoteEvent(evt); ok {
+				t.Fatal("expected invalid remote reaction to be rejected")
+			}
+		})
+	}
+}
+
 // waitForOutbox polls until n events arrive in c.outbox or 500ms passes.
 func waitForOutbox(c *Client, n int) bool {
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -240,6 +288,55 @@ func TestHub_Bus_PublishCallsBusOnce(t *testing.T) {
 	}
 	if n := bus.publishCount(); n != 1 {
 		t.Fatalf("expected bus.Publish called once, got %d", n)
+	}
+}
+
+func TestHubPublishReactionUpdatedStopsWhenCanceledOrShutdown(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		context func() context.Context
+		stopHub bool
+	}{
+		{name: "canceled context", context: func() context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}},
+		{name: "shutdown hub", context: context.Background, stopHub: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bus := &fakeBus{}
+			hub := &Hub{
+				bus: bus, logger: newTestLogger(), instanceID: "instance-A",
+				bcast: nil, quit: make(chan struct{}),
+			}
+			if tt.stopHub {
+				close(hub.quit)
+			}
+
+			hub.PublishReactionUpdated(tt.context(), testWorkspaceID, testEventIDEcho, "👍", ReactionUpdate{
+				MessageID: testMessageID, TargetType: TargetTypeChannel, TargetID: testChannelID,
+			})
+			if bus.publishCount() != 0 {
+				t.Fatal("reaction must not reach the bus after cancellation or shutdown")
+			}
+		})
+	}
+}
+
+func TestNopWebsocketDependenciesFailClosed(t *testing.T) {
+	bus := NopBus{}
+	if err := bus.Publish(t.Context(), Event{}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := bus.Subscribe(t.Context(), func(Event) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	bus.Close()
+
+	allowed, err := (NopAuthorizer{}).CanAccess(t.Context(), "user", "workspace", TargetTypeChannel, "channel")
+	if err != nil || allowed {
+		t.Fatalf("NopAuthorizer must fail closed: allowed=%v err=%v", allowed, err)
 	}
 }
 

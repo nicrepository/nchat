@@ -64,6 +64,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	msgPostLimiter := NewUserRateLimiter(msgPostRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
 
+	// Static, non-sensitive configuration; authentication still prevents adding
+	// a new public API surface.
+	mux.Handle("GET "+RouteAllowedReactionEmojis, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListAllowedReactionEmojis)),
+	))
+
 	// Channel message endpoints: GET list, POST create, GET single.
 	mux.Handle("GET "+RouteChannelMessages, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListChannelMessages)),

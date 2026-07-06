@@ -121,6 +121,7 @@ func testMessage() domain.Message {
 		Status:      domain.MessageStatusActive,
 		CreatedAt:   testNow(),
 		UpdatedAt:   testNow(),
+		Reactions:   []domain.MessageReaction{{Emoji: "👍", Count: 2, ReactedByMe: true}},
 	}
 }
 
@@ -143,6 +144,20 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 		t.Fatalf("decode response body: %v", err)
 	}
 	return m
+}
+
+func TestMessageHandler_ListAllowedReactionEmojis(t *testing.T) {
+	h := httpapi.NewMessageHandler(nil, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ListAllowedReactionEmojis(rec, httptest.NewRequest(http.MethodGet, httpapi.RouteAllowedReactionEmojis, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	emojis, ok := body["data"].(map[string]any)["emojis"].([]any)
+	if !ok || len(emojis) < 16 || len(emojis) > 20 {
+		t.Fatalf("unexpected allowlist response: %#v", body)
+	}
 }
 
 // ── ListChannelMessages ──────────────────────────────────────────────────────
@@ -214,6 +229,10 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	}
 	if got := msgsArr[0].(map[string]any)["body_format"]; got != "v1" {
 		t.Fatalf("expected legacy body_format v1, got %v", got)
+	}
+	reactions, ok := msgsArr[0].(map[string]any)["reactions"].([]any)
+	if !ok || len(reactions) != 1 || reactions[0].(map[string]any)["reacted_by_me"] != true {
+		t.Fatalf("expected reaction aggregate, got %#v", msgsArr[0].(map[string]any)["reactions"])
 	}
 }
 

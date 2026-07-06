@@ -1,9 +1,11 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -220,8 +222,8 @@ func resolveWorkspace(w http.ResponseWriter, r *http.Request, workspaces Workspa
 // in the hub, starts the I/O pumps, and runs the read loop until the connection
 // closes. Cleanup is idempotent via stop/done and sync.Once in wsSender.
 //
-// If the request carries a Sec-WebSocket-Protocol header the token is validated
-// but never echoed back; the JWT must not appear in the response headers.
+// The credential protocol is validated but never echoed. The fixed public
+// protocol is selected so standards-compliant browsers accept the handshake.
 func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID string, cfg HandlerConfig) {
 	logger = normalizeLogger(logger)
 
@@ -231,10 +233,10 @@ func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slo
 			return
 		}
 		// Token already extracted and validated by WSTokenMiddleware + BearerAuth.
-		// Do NOT echo the JWT as a negotiated subprotocol — that would leak it in
-		// the response Sec-WebSocket-Protocol header visible to proxies and DevTools.
 	}
-	conn, err := websocket.Accept(w, r, nil)
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{wsutil.NegotiatedSubprotocol},
+	})
 	if err != nil {
 		// websocket.Accept writes the error response itself.
 		logger.WarnContext(r.Context(), "ws: upgrade failed")
@@ -287,8 +289,8 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			return
 		}
 
-		var msg ClientMessage
-		if jsonErr := json.Unmarshal(data, &msg); jsonErr != nil {
+		msg, jsonErr := decodeClientMessage(data)
+		if jsonErr != nil {
 			if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: invalid client message") {
 				return
 			}
@@ -296,11 +298,54 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 		}
 
 		if msgErr := hub.handleClientMessage(ctx, c, msg); msgErr != nil {
+			if handleReactionClientError(c, msgErr) {
+				continue
+			}
 			if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: handleClientMessage error") {
 				return
 			}
 		}
 	}
+}
+
+func decodeClientMessage(data []byte) (ClientMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var msg ClientMessage
+	if err := dec.Decode(&msg); err != nil {
+		return ClientMessage{}, err
+	}
+	// second Decode detects concatenated JSON frames.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return ClientMessage{}, errors.New("ws: trailing JSON data")
+	}
+	return msg, nil
+}
+
+type clientErrorResponse struct {
+	Type       string `json:"type"`
+	Code       string `json:"code"`
+	RetryAfter int    `json:"retry_after,omitempty"`
+}
+
+// handleReactionClientError classifies expected reaction outcomes so they do
+// not consume the malformed-message budget or produce noisy client-error logs.
+func handleReactionClientError(c *Client, err error) bool {
+	response := clientErrorResponse{Type: "error"}
+	switch {
+	case errors.Is(err, ErrReactionRateLimited):
+		response.Code = "rate_limited"
+		response.RetryAfter = 60
+	case errors.Is(err, ErrReactionFeatureDisabled):
+		response.Code = "temporarily_unavailable"
+	default:
+		return false
+	}
+	data, marshalErr := json.Marshal(response)
+	if marshalErr == nil {
+		c.enqueue(data)
+	}
+	return true
 }
 
 type inboundTokenBucket struct {

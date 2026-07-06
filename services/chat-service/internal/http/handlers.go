@@ -19,7 +19,7 @@ func Healthz(cfg config.Config) http.Handler {
 
 func Readyz(cfg config.Config) http.Handler {
 	info := buildinfo.Current()
-	return health.ReadinessHandler(cfg.ServiceName, info.Version, info.Commit, readinessChecks(), readinessTimeout)
+	return health.ReadinessHandler(cfg.ServiceName, info.Version, info.Commit, readinessChecks(cfg), readinessTimeout)
 }
 
 func Version(cfg config.Config) http.Handler {
@@ -33,9 +33,14 @@ func Version(cfg config.Config) http.Handler {
 	})
 }
 
-func readinessChecks() []health.Checker {
+func readinessChecks(cfg config.Config) []health.Checker {
+	reactionLimiterStatus := health.CheckPass
+	if cfg.DatabaseURL != "" && cfg.ValkeyURL == "" {
+		reactionLimiterStatus = health.CheckFail
+	}
 	return []health.Checker{
 		health.NewStaticChecker("service-bootstrap", true, health.CheckPass, ""),
 		health.NewStaticChecker("config-loaded", true, health.CheckPass, ""),
+		health.NewStaticChecker("reaction-rate-limiter-configured", true, reactionLimiterStatus, ""),
 	}
 }

@@ -85,14 +85,14 @@ afterEach(() => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("useChatWebSocket", () => {
-  it("connects with the access token as Sec-WebSocket-Protocol", () => {
+  it("connects with the access token and a safe negotiated subprotocol", () => {
     renderHook(() =>
       useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
     );
 
     expect(FakeWebSocket.instances).toHaveLength(1);
     const ws = FakeWebSocket.instances[0];
-    expect(ws.protocols).toEqual(["test-token"]);
+    expect(ws.protocols).toEqual(["test-token", "nchat.v1"]);
   });
 
   it("sends subscribe on open", () => {
@@ -111,6 +111,85 @@ describe("useChatWebSocket", () => {
       target_type: "channel",
       target_id: "ch-1",
     });
+  });
+
+  it("sends a strict reaction.toggle command on the active socket", () => {
+    const { result } = renderHook(() =>
+      useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
+    );
+    let sent = false;
+    act(() => {
+      sent = result.current.toggleReaction("msg-1", "👍");
+    });
+    expect(sent).toBe(true);
+    expect(JSON.parse(FakeWebSocket.instances[0].sentMessages.at(-1)!)).toEqual({
+      type: "reaction.toggle",
+      message_id: "msg-1",
+      emoji: "👍",
+    });
+  });
+
+  it("reports when a reaction cannot be sent on a closed socket", () => {
+    const { result } = renderHook(() =>
+      useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
+    );
+    FakeWebSocket.instances[0].readyState = FakeWebSocket.CLOSED;
+
+    expect(result.current.toggleReaction("msg-1", "👍")).toBe(false);
+  });
+
+  it("routes structured reaction errors before target filtering", () => {
+    const onReactionError = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onReactionError,
+      }),
+    );
+
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "error",
+        code: "rate_limited",
+        retry_after: 60,
+      }),
+    );
+
+    expect(onReactionError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "rate_limited", retry_after: 60 }),
+    );
+  });
+
+  it("routes matching reaction.updated events", () => {
+    const onReactionUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onReactionUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-1",
+        reaction: {
+          message_id: "msg-1",
+          actor_user_id: "user-1",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 2 }],
+        },
+      }),
+    );
+    expect(onReactionUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ message_id: "msg-1" }),
+    );
   });
 
   it("calls onMessageCreated for matching message.created event", () => {
@@ -227,7 +306,7 @@ describe("useChatWebSocket", () => {
     });
 
     expect(FakeWebSocket.instances).toHaveLength(2);
-    expect(FakeWebSocket.instances[1].protocols).toEqual(["test-token"]);
+    expect(FakeWebSocket.instances[1].protocols).toEqual(["test-token", "nchat.v1"]);
     expect(FakeWebSocket.instances[0].url).not.toContain("test-token");
     expect(FakeWebSocket.instances[1].url).not.toContain("test-token");
   });

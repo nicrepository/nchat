@@ -498,7 +498,7 @@ func (s *MessageService) GetChannelMessage(ctx context.Context, input GetChannel
 		return domain.Message{}, err
 	}
 
-	msg, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID)
+	msg, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID, callerID)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -606,7 +606,7 @@ func (s *MessageService) GetDMMessage(ctx context.Context, input GetDMMessageInp
 		return domain.Message{}, err
 	}
 
-	msg, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID)
+	msg, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID, callerID)
 	if err != nil {
 		return domain.Message{}, err
 	}

@@ -44,6 +44,23 @@ func TestWSTokenMiddleware_InjectsAuthHeaderFromSubprotocol(t *testing.T) {
 	}
 }
 
+func TestWSTokenMiddleware_InjectsCredentialFromNegotiatedProtocolPair(t *testing.T) {
+	proto := testSubprotocol()
+	var capturedAuth string
+	handler := httpapi.WSTokenMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/chat/ws", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-Websocket-Protocol", proto+", nchat.v1")
+
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if capturedAuth != "Bearer "+proto {
+		t.Fatalf("expected credential protocol to become bearer auth, got %q", capturedAuth)
+	}
+}
+
 func TestWSTokenMiddleware_DoesNotOverrideExistingAuthorization(t *testing.T) {
 	const existing = "Bearer existing-token"
 	proto := testSubprotocol()

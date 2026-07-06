@@ -87,6 +87,22 @@ func TestReadyzContract(t *testing.T) {
 	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
 }
 
+func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.T) {
+	cfg := testConfig()
+	cfg.DatabaseURL = "postgres://configured"
+	response := httptest.NewRecorder()
+
+	Readyz(cfg).ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d", response.Code)
+	}
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Status != health.StatusUnready {
+		t.Fatalf("expected unready status, got %q", body.Data.Status)
+	}
+}
+
 func TestVersionRouteStillWorks(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
 	response := httptest.NewRecorder()
@@ -102,6 +118,22 @@ func TestVersionRouteStillWorks(t *testing.T) {
 	}
 	if body.Data["service"] != "chat-service" || body.Data["version"] != "0.0.0" || body.Data["commit"] != "dev" {
 		t.Fatalf("unexpected version response: %+v", body.Data)
+	}
+}
+
+func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator, allowRouterSessionValidator{},
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteAllowedReactionEmojis, nil))
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
 	}
 }
 
@@ -417,6 +449,22 @@ func TestNewRouter_GetSingleMessage_Returns429AfterSingleBudgetExhausted(t *test
 	router.ServeHTTP(w, routerGETRequest(t, url))
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 after GET single budget exhausted; got %d", w.Code)
+	}
+}
+
+func TestNewRouter_AllowedReactionEmojisUsesListRateLimit(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	for i := range msgListRateLimit {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, routerGETRequest(t, RouteAllowedReactionEmojis))
+		if w.Code != http.StatusOK {
+			t.Fatalf("allowed emojis request %d: expected 200, got %d", i+1, w.Code)
+		}
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerGETRequest(t, RouteAllowedReactionEmojis))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after list budget exhausted, got %d", w.Code)
 	}
 }
 

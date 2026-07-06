@@ -67,6 +67,30 @@ type broadcastReq struct {
 // HubOption is a functional option for NewHub.
 type HubOption func(*Hub)
 
+type ReactionUpdate struct {
+	MessageID  string
+	TargetType TargetType
+	TargetID   string
+	Added      bool
+	Reactions  []ReactionPayload
+}
+
+type ReactionHandler interface {
+	ToggleReaction(ctx context.Context, workspaceID, userID, messageID, emoji string) (ReactionUpdate, error)
+}
+
+type ReactionLimiter interface {
+	Allow(ctx context.Context, userID string) (bool, error)
+}
+
+func WithReactionHandler(handler ReactionHandler) HubOption {
+	return func(h *Hub) { h.reactionHandler = handler }
+}
+
+func WithReactionLimiter(limiter ReactionLimiter) HubOption {
+	return func(h *Hub) { h.reactionLimiter = limiter }
+}
+
 // WithPresence attaches a PresenceTracker to the Hub. When set, the Hub
 // calls Connect on register and Disconnect on unregister so that presence
 // state stays in sync with WebSocket lifecycle events.
@@ -92,7 +116,9 @@ type Hub struct {
 	logger     *slog.Logger
 	busCancel  context.CancelFunc
 
-	presence *PresenceTracker // optional; nil-safe throughout
+	presence        *PresenceTracker // optional; nil-safe throughout
+	reactionHandler ReactionHandler
+	reactionLimiter ReactionLimiter
 
 	register    chan registerReq
 	unregister  chan *Client
@@ -290,6 +316,34 @@ func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, tar
 	}
 }
 
+func (h *Hub) PublishReactionUpdated(ctx context.Context, workspaceID, actorUserID, emoji string, update ReactionUpdate) {
+	payload := &ReactionEventPayload{
+		MessageID: update.MessageID, ActorUserID: actorUserID, Emoji: emoji,
+		Added: update.Added, Reactions: update.Reactions,
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeReactionUpdated,
+		WorkspaceID: workspaceID, TargetType: update.TargetType, TargetID: update.TargetID,
+		MessageID: update.MessageID, Reaction: payload, EventID: uuid.New().String(),
+		SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal reaction.updated event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: reaction bus publish failed", "target_type", string(update.TargetType), "error", err)
+	}
+}
+
 // Shutdown stops the hub goroutine, cancels bus subscriptions, closes all
 // client connections, and closes the BroadcastBus. Blocks until the run
 // goroutine exits.
@@ -408,6 +462,30 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 // but not sufficient for untrusted Pub/Sub payloads. Canonicalization here
 // prevents spoofed workspace_id / target_id values from reaching the hub.
 func canonicalizeRemoteEvent(evt Event) (Event, bool) {
+	var ok bool
+	evt, ok = canonicalizeRemoteEnvelope(evt)
+	if !ok {
+		return Event{}, false
+	}
+	evt, ok = canonicalizeEventIDs(evt)
+	if !ok {
+		return Event{}, false
+	}
+	if evt.Type == EventTypeReactionUpdated {
+		evt, ok = canonicalizeReactionEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
+
+	// Remote bus payloads may contain body_text or legacy sender_email. Strip
+	// them so remote nodes route by IDs only; clients fetch by ID if needed.
+	evt.Payload = nil
+
+	return evt, true
+}
+
+func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	switch evt.SchemaVersion {
 	case 0:
 		// Older chat-service instances did not emit schema_version. Treat absence
@@ -421,7 +499,7 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageCreated:
+	case EventTypeMessageCreated, EventTypeReactionUpdated:
 		// OK
 	default:
 		return Event{}, false
@@ -446,7 +524,10 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 	if !sourceInstanceIDRe.MatchString(evt.SourceInstanceID) {
 		return Event{}, false
 	}
+	return evt, true
+}
 
+func canonicalizeEventIDs(evt Event) (Event, bool) {
 	// event_id: required, must be a valid UUID; canonicalize to lowercase.
 	eid, err := uuid.Parse(evt.EventID)
 	if err != nil {
@@ -468,19 +549,36 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 	}
 	evt.TargetID = tid.String()
 
-	// message_id: required for message.created; must be a valid UUID.
-	if evt.Type == EventTypeMessageCreated {
-		mid, err := uuid.Parse(evt.MessageID)
-		if err != nil {
+	// All currently supported event types are message-scoped.
+	mid, err := uuid.Parse(evt.MessageID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.MessageID = mid.String()
+	return evt, true
+}
+
+func canonicalizeReactionEvent(evt Event) (Event, bool) {
+	if evt.Reaction == nil || evt.Reaction.MessageID != evt.MessageID || evt.Reaction.Emoji == "" || len(evt.Reaction.Reactions) > 64 {
+		return Event{}, false
+	}
+	actorID, err := uuid.Parse(evt.Reaction.ActorUserID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.Reaction.ActorUserID = actorID.String()
+	for _, reaction := range evt.Reaction.Reactions {
+		if reaction.Emoji == "" || reaction.Count <= 0 {
 			return Event{}, false
 		}
-		evt.MessageID = mid.String()
 	}
-
-	// Remote bus payloads may contain body_text or legacy sender_email. Strip
-	// them so remote nodes route by IDs only; clients fetch by ID if needed.
-	evt.Payload = nil
-
+	// Aggregates are not trusted from the cross-instance bus. Remote clients
+	// fetch the authoritative message snapshot, trading one read for a smaller
+	// trusted bus surface and consistent reacted_by_me calculation.
+	// TODO: this fetch-on-remote-event can cause a thundering herd in large
+	// channels. Propagate aggregates and actor_user_id through the bus before
+	// computing reacted_by_me optimistically without a REST round-trip.
+	evt.Reaction = nil
 	return evt, true
 }
 
@@ -692,8 +790,51 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 		h.revokeSubscription(c.id, key)
 	case ClientMessageTypePing:
 		// Activity already recorded above; nothing else to do.
+	case ClientMessageTypeReactionToggle:
+		if err := h.handleReactionToggle(ctx, c, msg); err != nil {
+			return err
+		}
+		return nil
 	default:
 		return fmt.Errorf("ws: unknown client message type %q", msg.Type)
+	}
+	return nil
+}
+
+func (h *Hub) handleReactionToggle(ctx context.Context, c *Client, msg ClientMessage) error {
+	if h.reactionHandler == nil || h.reactionLimiter == nil {
+		return ErrReactionFeatureDisabled
+	}
+	if err := validateReactionToggle(msg); err != nil {
+		return err
+	}
+	allowed, err := h.reactionLimiter.Allow(ctx, c.userID)
+	if err != nil {
+		return fmt.Errorf("ws: reaction rate limit: %w", err)
+	}
+	if !allowed {
+		return ErrReactionRateLimited
+	}
+	update, err := h.reactionHandler.ToggleReaction(ctx, c.workspaceID, c.userID, msg.MessageID, msg.Emoji)
+	if err != nil {
+		return fmt.Errorf("ws: toggle reaction: %w", err)
+	}
+	h.PublishReactionUpdated(ctx, c.workspaceID, c.userID, msg.Emoji, update)
+	return nil
+}
+
+func validateReactionToggle(msg ClientMessage) error {
+	if msg.MessageID == "" {
+		return fmt.Errorf("ws: reaction toggle: message_id required")
+	}
+	if msg.Emoji == "" {
+		return fmt.Errorf("ws: reaction toggle: emoji required")
+	}
+	if msg.TargetType != "" || msg.TargetID != "" {
+		return fmt.Errorf("ws: reaction toggle: unexpected target fields")
+	}
+	if _, err := uuid.Parse(msg.MessageID); err != nil {
+		return fmt.Errorf("ws: reaction toggle: invalid message_id format")
 	}
 	return nil
 }

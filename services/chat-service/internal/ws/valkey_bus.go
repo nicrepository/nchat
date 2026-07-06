@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -100,13 +99,11 @@ func NewValkeyBus(valkeyURL, instanceID string, logger *slog.Logger) (*ValkeyBus
 	if valkeyURL == "" {
 		return nil, errors.New("ws: valkeyURL must not be empty")
 	}
-	// Strip scheme if present (valkey-go expects host:port).
-	addr := strings.TrimPrefix(valkeyURL, "valkey://")
-	addr = strings.TrimPrefix(addr, "redis://")
-
-	client, err := valkey.NewClient(valkey.ClientOption{
-		InitAddress: []string{addr},
-	})
+	option, err := valkey.ParseURL(valkeyURL)
+	if err != nil {
+		return nil, fmt.Errorf("ws: parse valkey URL: %w", err)
+	}
+	client, err := valkey.NewClient(option)
 	if err != nil {
 		return nil, fmt.Errorf("ws: create valkey client: %w", err)
 	}

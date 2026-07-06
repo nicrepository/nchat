@@ -40,6 +40,7 @@ const {
   mockPostChannelMessage,
   mockFetchDMMessages,
   mockPostDMMessage,
+  mockFetchAllowedReactionEmojis,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -56,8 +57,11 @@ const {
     >(),
   mockPostDMMessage:
     vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchAllowedReactionEmojis: vi.fn<() => Promise<string[]>>(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
+    capturedReactionUpdated: null as ((event: unknown) => void) | null,
+    toggleReaction: vi.fn(() => true),
   },
 }));
 
@@ -75,14 +79,23 @@ vi.mock("./chatApi", () => ({
   postDMMessage: (conversationId: string, bodyText: string, signal?: AbortSignal) =>
     mockPostDMMessage(conversationId, bodyText, signal),
   fetchDMMessage: vi.fn(),
+  fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
 // useChatWebSocket.test.ts.
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
-    ({ onMessageCreated }: { onMessageCreated: (event: WSMessageCreatedEvent) => void }) => {
+    ({
+      onMessageCreated,
+      onReactionUpdated,
+    }: {
+      onMessageCreated: (event: WSMessageCreatedEvent) => void;
+      onReactionUpdated?: (event: unknown) => void;
+    }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
+      wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      return { toggleReaction: wsMockState.toggleReaction };
     },
   ),
 }));
@@ -101,6 +114,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   status: "active",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
+  reactions: [],
   ...overrides,
 });
 
@@ -130,12 +144,53 @@ function renderDMArea(dmId = "dm-juliane") {
   );
 }
 
+function renderChannelAreaForUser(currentUserId = "me-123") {
+  return render(
+    <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+      <Routes>
+        <Route
+          path="/chat"
+          element={<ParentWithContext ctx={{ currentUserId, channels: [], dms: [] }} />}
+        >
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+async function openFullReactionPicker(messageIndex = 0) {
+  const bubbles = await screen.findAllByTestId("chat-msg-bubble");
+  fireEvent.mouseEnter(bubbles[messageIndex]);
+  await userEvent.click(screen.getByRole("button", { name: "Mais reações" }));
+}
+
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 beforeEach(() => {
   setTokens("test-at");
+  localStorage.clear();
   wsMockState.capturedWSMessageCreated = null;
+  wsMockState.capturedReactionUpdated = null;
   vi.clearAllMocks();
+  mockFetchAllowedReactionEmojis.mockResolvedValue([
+    "👍",
+    "❤️",
+    "😂",
+    "🎉",
+    "😮",
+    "😢",
+    "👎",
+    "🔥",
+    "🙌",
+    "👏",
+    "✅",
+    "👀",
+    "🚀",
+    "💯",
+    "😍",
+    "🤔",
+  ]);
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
 });
@@ -163,6 +218,32 @@ describe("ChatMessageArea — channel header", () => {
     const header = await screen.findByTestId("chat-msg-header");
     expect(header).toBeInTheDocument();
     expect(header).toHaveTextContent("dm-juliane");
+  });
+
+  it("resolves the DM name from outlet context", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "dm-1", type: "1:1", name: "Juliane", participants: [] }],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("chat-msg-header")).toHaveTextContent("Juliane");
   });
 
   it("renders the chat message area container", async () => {
@@ -312,6 +393,392 @@ describe("ChatMessageArea — empty state", () => {
 // ── Message list ──────────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — message list", () => {
+  it("shows one hover menu with three recent emojis and no persistent add button", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1" }), makeMessage({ id: "m2" })]),
+    );
+    renderChannelAreaForUser();
+    const bubbles = await screen.findAllByTestId("chat-msg-bubble");
+
+    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Adicionar reação" })).not.toBeInTheDocument();
+    fireEvent.mouseEnter(bubbles[0]);
+
+    expect(screen.getAllByRole("button", { name: /Reagir rapidamente com/ })).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+    fireEvent.mouseEnter(bubbles[1]);
+    expect(screen.getAllByRole("button", { name: "Mais reações" })).toHaveLength(1);
+    fireEvent.mouseLeave(bubbles[1]);
+    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+  });
+
+  it("reveals the reaction menu by keyboard focus and touch", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+
+    fireEvent.focus(bubble);
+    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+    fireEvent.blur(bubble, { relatedTarget: document.body });
+    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+    fireEvent.touchStart(bubble);
+    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+  });
+
+  it("filters stored recent emojis against the server allowlist", async () => {
+    localStorage.setItem("nchat_recent_reactions:me-123", JSON.stringify(["🛑", "🚀", "👍"]));
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+
+    fireEvent.mouseEnter(bubble);
+
+    expect(screen.queryByRole("button", { name: "Reagir rapidamente com 🛑" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Reagir rapidamente com 🚀" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reagir rapidamente com 👍" })).toBeVisible();
+  });
+
+  it("toggles a quick reaction directly and opens the full grid only from more", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Mais reações" }));
+    expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeVisible();
+    fireEvent.mouseLeave(bubble);
+    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+  });
+
+  it("stores a confirmed own reaction as the most recent allowed emoji", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "me-123",
+          emoji: "🚀",
+          added: true,
+          reactions: [{ emoji: "🚀", count: 1 }],
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("nchat_recent_reactions:me-123") ?? "[]")[0]).toBe(
+        "🚀",
+      ),
+    );
+  });
+
+  it("renders a confirmed reaction when local preference storage is unavailable", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota", "QuotaExceededError");
+    });
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "me-123",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 1 }],
+        },
+      }),
+    );
+
+    expect(await screen.findByRole("button", { name: "Remover reação 👍" })).toBeVisible();
+    setItem.mockRestore();
+  });
+
+  it("renders reaction counts, uses the server allowlist and closes after selection", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", reactions: [{ emoji: "🎉", count: 3, reactedByMe: true }] }),
+      ]),
+    );
+    renderChannelArea();
+
+    expect(await screen.findByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("3");
+    await openFullReactionPicker();
+    await userEvent.click(screen.getByRole("button", { name: "Reagir com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+    expect(mockFetchAllowedReactionEmojis).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not render a persistent add-reaction button when the message has zero reactions", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.queryByRole("button", { name: "Adicionar reação" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+  });
+
+  it("closes the controlled reaction picker on Escape and outside click", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+
+    await openFullReactionPicker();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["middle", 400, 426, 243],
+    ["viewport footer", 730, 756, 573],
+  ])(
+    "portals and positions the picker above a message near the %s",
+    async (_name, top, bottom, expectedTop) => {
+      mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+      const rectSpy = vi
+        .spyOn(Element.prototype, "getBoundingClientRect")
+        .mockImplementation(function (this: Element) {
+          if (this.getAttribute("aria-label") === "Mais reações") {
+            return {
+              x: 450,
+              y: top,
+              left: 450,
+              right: 480,
+              top,
+              bottom,
+              width: 30,
+              height: bottom - top,
+              toJSON: () => ({}),
+            };
+          }
+          if (this.classList.contains("chat-msg-area__reaction-grid")) {
+            return {
+              x: 0,
+              y: 0,
+              left: 0,
+              right: 188,
+              top: 0,
+              bottom: 150,
+              width: 188,
+              height: 150,
+              toJSON: () => ({}),
+            };
+          }
+          return {
+            x: 0,
+            y: 0,
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 0,
+            width: 0,
+            height: 0,
+            toJSON: () => ({}),
+          };
+        });
+      renderChannelArea();
+
+      await openFullReactionPicker();
+
+      const dialog = screen.getByRole("dialog", { name: "Escolher reação" });
+      expect(dialog.parentElement).toBe(document.body);
+      expect(dialog).toHaveStyle({ left: "292px", top: `${expectedTop}px`, visibility: "visible" });
+      rectSpy.mockRestore();
+    },
+  );
+
+  it("closes the reaction picker when its anchor leaves the viewport", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.getAttribute("aria-label") === "Mais reações") {
+          return {
+            x: 0,
+            y: 900,
+            left: 0,
+            right: 30,
+            top: 900,
+            bottom: 930,
+            width: 30,
+            height: 30,
+            toJSON: () => ({}),
+          };
+        }
+        return {
+          x: 0,
+          y: 0,
+          left: 0,
+          right: 0,
+          top: 0,
+          bottom: 0,
+          width: 0,
+          height: 0,
+          toJSON: () => ({}),
+        };
+      });
+    renderChannelArea();
+
+    await openFullReactionPicker();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument(),
+    );
+    rectSpy.mockRestore();
+  });
+
+  it("keeps the portaled reaction picker anchored when the message list scrolls", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    fireEvent.scroll(screen.getByRole("log", { name: "Mensagens" }));
+
+    expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
+  });
+
+  it("keeps only one message reaction picker open", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1" }), makeMessage({ id: "m2" })]),
+    );
+    renderChannelArea();
+
+    await openFullReactionPicker(0);
+    expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await openFullReactionPicker(1);
+    expect(screen.getAllByRole("dialog", { name: "Escolher reação" })).toHaveLength(1);
+  });
+
+  it("renders the reaction pill after the authoritative WS update", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelArea();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "other-user",
+          emoji: "👍",
+          added: true,
+          reactions: [{ emoji: "👍", count: 1 }],
+        },
+      }),
+    );
+
+    expect(await screen.findByRole("button", { name: "Adicionar reação 👍" })).toHaveTextContent(
+      "1",
+    );
+  });
+
+  it("rejects a reaction whose bytes do not match the server allowlist", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "❤", count: 1, reactedByMe: false }],
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação ❤" }));
+
+    expect(wsMockState.toggleReaction).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(/emoji não permitido/i);
+  });
+
+  it("renders N reactions and toggles an existing pill without opening the grid", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [
+            { emoji: "👍", count: 2, reactedByMe: false },
+            { emoji: "🎉", count: 4, reactedByMe: true },
+          ],
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação 👍" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.getByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("4");
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+  });
+
+  it("throttles repeated clicks on the same reaction for 300ms", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "👍", count: 1, reactedByMe: false }],
+        }),
+      ]),
+    );
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    renderChannelArea();
+    const reaction = await screen.findByRole("button", { name: "Adicionar reação 👍" });
+
+    await userEvent.click(reaction);
+    await userEvent.click(reaction);
+    now.mockReturnValue(1_301);
+    await userEvent.click(reaction);
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledTimes(2);
+    now.mockRestore();
+  });
+
+  it("shows visible feedback when the reaction socket is unavailable", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "👍", count: 1, reactedByMe: false }],
+        }),
+      ]),
+    );
+    wsMockState.toggleReaction.mockReturnValueOnce(false);
+    renderChannelArea();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação 👍" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/tempo real indisponível/i);
+  });
+
   it("renders messages from API response", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([makeMessage({ bodyText: "Olá, mundo!" })]),
@@ -1538,13 +2005,16 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
         onMessageCreated: (evt: WSMessageCreatedEvent) => void;
       }) => {
         capturedOnMessageCreated = onMessageCreated;
+        return { toggleReaction: wsMockState.toggleReaction };
       },
     );
   });
 
   afterEach(() => {
     // Restore to the default no-op so other test suites are not affected.
-    vi.mocked(useChatWebSocket).mockImplementation(vi.fn());
+    vi.mocked(useChatWebSocket).mockImplementation(() => ({
+      toggleReaction: wsMockState.toggleReaction,
+    }));
   });
 
   it("does NOT call scrollIntoView when user is reading history (not near bottom)", async () => {

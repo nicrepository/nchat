@@ -6,11 +6,12 @@
  * session/cookie mechanism in authenticatedFetch.
  *
  * chatFixtures.ts is TEST-ONLY and must never be imported here.
- * There is intentionally no module-level request cache: each call is independent
- * so that a session change cannot cause one user to receive another user's data.
+ * User-scoped data is never cached across calls. The immutable, non-sensitive
+ * reaction allowlist is the sole exception and is deduplicated for the app lifetime.
  */
 
 import { authenticatedFetch } from "../lib/authClient";
+import { onAuthChange } from "../lib/authSession";
 import type { Channel, DMConversation, Message, MessagePage } from "./chatTypes";
 import type { MentionCandidate } from "./chatTypes";
 
@@ -42,6 +43,20 @@ interface SidebarResponse {
 interface SidebarEnvelope {
   data: SidebarResponse;
 }
+
+interface AllowedReactionEmojisEnvelope {
+  data: { emojis: unknown };
+}
+
+let allowedReactionEmojisRequest: Promise<string[]> | null = null;
+
+export function resetAllowedReactionEmojisCache(): void {
+  allowedReactionEmojisRequest = null;
+}
+
+// ponytail: authSession already owns session-change notifications; reuse it
+// instead of adding chat-specific logout plumbing.
+onAuthChange(resetAllowedReactionEmojisCache);
 
 // ── Internal fetch (no cross-request caching) ─────────────────────────────────
 
@@ -98,6 +113,25 @@ export async function fetchSidebarData(): Promise<{
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
 }
 
+export function fetchAllowedReactionEmojis(): Promise<string[]> {
+  if (!allowedReactionEmojisRequest) {
+    const request = authenticatedFetch<AllowedReactionEmojisEnvelope>(
+      `${CHAT_BASE}/reactions/allowed-emojis`,
+      { method: "GET" },
+    ).then((response) => {
+      const emojis = response.data.emojis;
+      return Array.isArray(emojis)
+        ? emojis.filter((emoji): emoji is string => typeof emoji === "string")
+        : [];
+    });
+    allowedReactionEmojisRequest = request;
+    void request.catch(() => {
+      if (allowedReactionEmojisRequest === request) allowedReactionEmojisRequest = null;
+    });
+  }
+  return allowedReactionEmojisRequest;
+}
+
 // ── Message API response shapes ───────────────────────────────────────────────
 
 interface MessageResponse {
@@ -112,6 +146,7 @@ interface MessageResponse {
   status: string;
   created_at: string;
   updated_at: string;
+  reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
 }
 
 interface MessageListData {
@@ -178,6 +213,11 @@ function mapMessage(r: MessageResponse): Message {
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    reactions: (r.reactions ?? []).map((reaction) => ({
+      emoji: reaction.emoji,
+      count: reaction.count,
+      reactedByMe: reaction.reacted_by_me,
+    })),
   };
 }
 

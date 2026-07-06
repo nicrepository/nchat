@@ -1,7 +1,8 @@
 /**
  * useChatWebSocket — minimal WebSocket hook for realtime message delivery.
  *
- * Auth: passes the Bearer access token as the WebSocket subprotocol so that
+ * Auth: passes the Bearer access token as a credential subprotocol plus a
+ * fixed public protocol selected by the server so that
  * browser clients (which cannot set arbitrary HTTP headers on the upgrade
  * request) can authenticate without putting the token in the URL query string.
  * The server validates the token but does not echo it back in the response.
@@ -16,7 +17,7 @@
  * - Connection is cleaned up on unmount or target change.
  */
 
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import { getAccessToken } from "../lib/authSession";
 
@@ -26,6 +27,7 @@ const CHAT_WS_URL =
 
 const RECONNECT_BASE_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 2_000;
+const CHAT_WS_SUBPROTOCOL = "nchat.v1";
 
 export interface WSMessagePayload {
   id: string;
@@ -61,22 +63,62 @@ export interface WSMessageCreatedEvent {
   payload?: WSMessagePayload;
 }
 
+export interface WSReactionUpdatedEvent {
+  type: "reaction.updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+  reaction?: {
+    message_id: string;
+    actor_user_id: string;
+    emoji: string;
+    added: boolean;
+    reactions: Array<{ emoji: string; count: number }>;
+  };
+}
+
+export interface WSClientErrorEvent {
+  type: "error";
+  code: string;
+  retry_after?: number;
+}
+
 interface UseChatWebSocketOptions {
   kind: "channel" | "dm";
   targetId: string;
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
+  onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+  onReactionError?: (event: WSClientErrorEvent) => void;
+}
+
+export interface ChatWebSocketActions {
+  toggleReaction: (messageId: string, emoji: string) => boolean;
 }
 
 export function useChatWebSocket({
   kind,
   targetId,
   onMessageCreated,
-}: UseChatWebSocketOptions): void {
+  onReactionUpdated,
+  onReactionError,
+}: UseChatWebSocketOptions): ChatWebSocketActions {
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
+  const onReactionRef = useRef(onReactionUpdated);
+  const onReactionErrorRef = useRef(onReactionError);
+  const socketRef = useRef<WebSocket | null>(null);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
+    onReactionRef.current = onReactionUpdated;
+    onReactionErrorRef.current = onReactionError;
   });
+
+  const toggleReaction = useCallback((messageId: string, emoji: string) => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type: "reaction.toggle", message_id: messageId, emoji }));
+    return true;
+  }, []);
 
   useEffect(() => {
     if (!targetId) return;
@@ -114,9 +156,9 @@ export function useChatWebSocket({
 
       let socket: WebSocket;
       try {
-        // Pass the access token as the WebSocket subprotocol.
-        // WSTokenMiddleware extracts it as a Bearer token; the server does not echo it back.
-        socket = new WebSocket(CHAT_WS_URL, [token]);
+        // WSTokenMiddleware extracts the credential protocol as a Bearer token;
+        // the server selects only CHAT_WS_SUBPROTOCOL and never echoes the token.
+        socket = new WebSocket(CHAT_WS_URL, [token, CHAT_WS_SUBPROTOCOL]);
       } catch {
         // WebSocket constructor may throw on invalid URL.
         scheduleReconnect();
@@ -124,6 +166,7 @@ export function useChatWebSocket({
       }
 
       ws = socket;
+      socketRef.current = socket;
 
       socket.onopen = () => {
         if (closed || ws !== socket) return;
@@ -143,10 +186,17 @@ export function useChatWebSocket({
         }
         if (!data || typeof data !== "object") return;
         const d = data as Record<string, unknown>;
-        if (d["type"] !== "message.created") return;
+        if (d["type"] === "error" && typeof d["code"] === "string") {
+          onReactionErrorRef.current?.(d as unknown as WSClientErrorEvent);
+          return;
+        }
         // Filter: only process events for the active target.
         if (d["target_type"] !== targetType || d["target_id"] !== targetId) return;
-        onMessageRef.current(d as unknown as WSMessageCreatedEvent);
+        if (d["type"] === "message.created") {
+          onMessageRef.current(d as unknown as WSMessageCreatedEvent);
+        } else if (d["type"] === "reaction.updated") {
+          onReactionRef.current?.(d as unknown as WSReactionUpdatedEvent);
+        }
       };
 
       socket.onerror = () => {
@@ -168,6 +218,7 @@ export function useChatWebSocket({
       if (ws) {
         const socket = ws;
         ws = null;
+        socketRef.current = null;
         if (socket.readyState === WebSocket.OPEN) {
           try {
             socket.send(
@@ -189,4 +240,6 @@ export function useChatWebSocket({
       }
     };
   }, [kind, targetId]);
+
+  return { toggleReaction };
 }

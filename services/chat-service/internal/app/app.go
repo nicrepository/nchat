@@ -35,10 +35,11 @@ type App struct {
 	Handler         http.Handler
 	TracingShutdown observability.ShutdownFunc
 
-	hub          *ws.Hub
-	presence     *ws.PresenceTracker
-	mentionCache *storage.ValkeyMentionLabelCache
-	shutdownOnce sync.Once
+	hub             *ws.Hub
+	presence        *ws.PresenceTracker
+	mentionCache    *storage.ValkeyMentionLabelCache
+	reactionLimiter *ws.ValkeyReactionLimiter
+	shutdownOnce    sync.Once
 }
 
 // Shutdown stops the WebSocket hub, presence tracker, and tracing exporter in
@@ -55,6 +56,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 		a.presence.Stop()
 		if a.mentionCache != nil {
 			a.mentionCache.Close()
+		}
+		if a.reactionLimiter != nil {
+			a.reactionLimiter.Close()
 		}
 		err = a.TracingShutdown(ctx)
 	})
@@ -81,6 +85,7 @@ func New(cfg config.Config) *App {
 	var memberStore *storage.PGXMemberStore
 	var dmStore *storage.PGXDMStore
 	var mentionCache *storage.ValkeyMentionLabelCache
+	var reactionSvc *service.ReactionService
 
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -95,6 +100,7 @@ func New(cfg config.Config) *App {
 			memberStore = storage.NewPGXMemberStore(pool)
 			dmStore = storage.NewPGXDMStore(pool)
 			messages := storage.NewPGXMessageStore(pool)
+			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
@@ -122,7 +128,27 @@ func New(cfg config.Config) *App {
 		authorizer = ws.NewServiceAuthorizer(permSvc, dmStore)
 		wsWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 	}
-	hub := ws.NewHub(authorizer, logger, ws.NopBus{}, cfg.WSInstanceID, ws.WithPresence(presence))
+	var bus ws.BroadcastBus = ws.NopBus{}
+	if cfg.ValkeyWSBroadcastEnabled {
+		if valkeyBus, busErr := ws.NewValkeyBus(cfg.ValkeyURL, cfg.WSInstanceID, logger); busErr != nil {
+			logger.Warn("distributed ws broadcast disabled", "reason", "invalid_valkey_config")
+		} else {
+			bus = valkeyBus
+		}
+	}
+	options := []ws.HubOption{ws.WithPresence(presence)}
+	var reactionLimiter *ws.ValkeyReactionLimiter
+	if reactionSvc != nil {
+		if limiter, limiterErr := ws.NewValkeyReactionLimiter(
+			cfg.ValkeyURL, cfg.ReactionRateLimitMaxActions, cfg.ReactionRateLimitWindowSeconds,
+		); limiterErr != nil {
+			logger.Warn("message reactions disabled", "reason", "invalid_valkey_config")
+		} else {
+			reactionLimiter = limiter
+			options = append(options, ws.WithReactionHandler(&reactionHandlerAdapter{service: reactionSvc}), ws.WithReactionLimiter(limiter))
+		}
+	}
+	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
 
 	// Wire the hub as the broadcast publisher for message creation events.
@@ -139,6 +165,7 @@ func New(cfg config.Config) *App {
 		hub:             hub,
 		presence:        presence,
 		mentionCache:    mentionCache,
+		reactionLimiter: reactionLimiter,
 	}
 }
 
@@ -191,6 +218,29 @@ func (r *appWSWorkspaceResolver) GetDefaultWorkspaceID(ctx context.Context) (str
 // It converts the string targetType to ws.TargetType and domain.Message to
 // ws.MessagePayload, keeping the service package free of a direct ws import.
 type hubBroadcaster struct{ hub *ws.Hub }
+
+type reactionHandlerAdapter struct{ service *service.ReactionService }
+
+func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID, userID, messageID, emoji string) (ws.ReactionUpdate, error) {
+	result, err := a.service.ToggleReaction(ctx, service.ToggleReactionInput{
+		WorkspaceID: workspaceID, UserID: userID, MessageID: messageID, Emoji: emoji,
+	})
+	if err != nil {
+		return ws.ReactionUpdate{}, err
+	}
+	targetType, targetID := ws.TargetTypeChannel, result.ChannelID
+	if result.DMID != "" {
+		targetType, targetID = ws.TargetTypeDM, result.DMID
+	}
+	reactions := make([]ws.ReactionPayload, len(result.Reactions))
+	for i, reaction := range result.Reactions {
+		reactions[i] = ws.ReactionPayload{Emoji: reaction.Emoji, Count: reaction.Count}
+	}
+	return ws.ReactionUpdate{
+		MessageID: result.MessageID, TargetType: targetType, TargetID: targetID,
+		Added: result.Added, Reactions: reactions,
+	}, nil
+}
 
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
 	payload := domainMessageToWSPayload(msg)

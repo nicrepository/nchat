@@ -12,6 +12,7 @@ vi.mock("../lib/authClient", () => ({
 
 import {
   fetchChannelMessages,
+  fetchAllowedReactionEmojis,
   fetchChannels,
   fetchDMMessages,
   fetchDMs,
@@ -20,6 +21,7 @@ import {
   messagesPath,
   postChannelMessage,
   postDMMessage,
+  resetAllowedReactionEmojisCache,
 } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -39,8 +41,65 @@ function sidebarResponse(
   };
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  resetAllowedReactionEmojisCache();
+});
 afterEach(() => vi.clearAllMocks());
+
+describe("fetchAllowedReactionEmojis", () => {
+  it("fetches the authenticated allowlist once and reuses the in-memory result", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: ["👍", "❤️", "🚀"] } });
+
+    const [first, second] = await Promise.all([
+      fetchAllowedReactionEmojis(),
+      fetchAllowedReactionEmojis(),
+    ]);
+
+    expect(first).toEqual(["👍", "❤️", "🚀"]);
+    expect(second).toEqual(first);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/reactions/allowed-emojis"),
+      { method: "GET" },
+    );
+  });
+
+  it("fetches again after the cache is reset", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["👍"] } });
+    await fetchAllowedReactionEmojis();
+
+    resetAllowedReactionEmojisCache();
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["🚀"] } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops non-string values from a malformed allowlist response", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: ["👍", 42, null, "🚀"] } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["👍", "🚀"]);
+  });
+
+  it("does not let a stale request failure clear the new session cache", async () => {
+    let rejectStale!: (error: Error) => void;
+    mockAuthFetch.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectStale = reject)),
+    );
+    const staleRequest = fetchAllowedReactionEmojis();
+
+    resetAllowedReactionEmojisCache();
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["🚀"] } });
+    const currentRequest = fetchAllowedReactionEmojis();
+    await expect(currentRequest).resolves.toEqual(["🚀"]);
+
+    rejectStale(new Error("stale session"));
+    await expect(staleRequest).rejects.toThrow("stale session");
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+});
 
 // ── fetchChannels ─────────────────────────────────────────────────────────────
 
@@ -336,6 +395,14 @@ describe("fetchChannelMessages", () => {
       createdAt: "2024-01-15T10:00:00Z",
       updatedAt: "2024-01-15T10:00:00Z",
     });
+  });
+
+  it("maps reaction aggregates", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ reactions: [{ emoji: "👍", count: 2, reacted_by_me: true }] })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reactions).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
   });
 
   it("maps an explicit v2 body format", async () => {

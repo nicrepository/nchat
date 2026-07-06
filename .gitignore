@@ -121,3 +121,5 @@ apps/web/test-results/
 # Security scan artifacts
 results.sarif
 *.sarif
+*.patch
+*_results.txt

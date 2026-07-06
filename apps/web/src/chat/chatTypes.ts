@@ -69,6 +69,13 @@ export interface Message {
   status: MessageStatus;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
+  reactions: MessageReaction[];
+}
+
+export interface MessageReaction {
+  emoji: string;
+  count: number;
+  reactedByMe: boolean;
 }
 
 export interface MessagePage {

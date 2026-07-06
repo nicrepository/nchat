@@ -10,13 +10,14 @@ import (
 
 // WSTokenMiddleware extracts a Bearer token from the Sec-WebSocket-Protocol
 // header for WebSocket upgrade requests and injects it as an Authorization
-// header before the downstream BearerAuth middleware runs.
+// header before the downstream BearerAuth middleware runs. The client also
+// offers the fixed nchat.v1 protocol, which is the only value echoed.
 //
 // Browser WebSocket clients cannot set custom HTTP headers on the initial
 // upgrade request. The accepted convention is to pass the access token as the
 // WebSocket subprotocol:
 //
-//	new WebSocket(url, [accessToken])
+//	new WebSocket(url, [accessToken, "nchat.v1"])
 //
 // The server validates the token server-side but does NOT echo it back in the
 // response Sec-WebSocket-Protocol header, preventing JWT exposure in responses.

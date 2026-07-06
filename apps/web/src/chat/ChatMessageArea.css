@@ -90,6 +90,7 @@
 /* ── Message row ─────────────────────────────────────────────────────────────── */
 
 .chat-msg-area__msg {
+  position: relative;
   display: flex;
   gap: 10px;
   padding: 2px 0;
@@ -175,6 +176,107 @@
   color: var(--color-muted, #7c7390);
   font-style: italic;
   font-size: 13px;
+}
+
+.chat-msg-area__reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+
+.chat-msg-area__reaction,
+.chat-msg-area__reaction-grid button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--color-ink-2);
+}
+
+.chat-msg-area__reaction:hover,
+.chat-msg-area__reaction:focus-visible {
+  border-color: var(--color-primary-tint-strong);
+  background: var(--color-primary-tint);
+}
+
+.chat-msg-area__reaction--mine {
+  border-color: var(--color-primary-tint-strong);
+  background: var(--color-primary-tint);
+  color: var(--color-primary-strong);
+}
+
+.chat-msg-area__reaction:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.chat-msg-area__reaction-menu {
+  position: fixed;
+  z-index: var(--z-overlay-emoji);
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+}
+
+.chat-msg-area__reaction-menu button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.chat-msg-area__reaction-menu button:hover,
+.chat-msg-area__reaction-menu button:focus-visible {
+  background: var(--color-primary-tint);
+}
+
+.chat-msg-area__reaction-menu .material-symbols-outlined {
+  font-size: 17px;
+}
+
+.chat-msg-area__reaction-grid {
+  position: fixed;
+  z-index: var(--z-overlay-emoji);
+  display: grid;
+  grid-template-columns: repeat(5, 32px);
+  gap: 3px;
+  padding: 7px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+}
+
+.chat-msg-area__reaction-grid button {
+  justify-content: center;
+  border: 0;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 2px;
+  font-size: 17px;
+}
+
+.chat-msg-area__reaction-grid button:hover,
+.chat-msg-area__reaction-grid button:focus-visible {
+  background: var(--color-primary-tint);
 }
 
 /* ── Message grouping (same sender, same minute) ─────────────────────────────── */
@@ -321,7 +423,8 @@
 
 /* ── Send error banner ───────────────────────────────────────────────────────── */
 
-.chat-msg-area__send-error {
+.chat-msg-area__send-error,
+.chat-msg-area__reaction-error {
   margin: 0 24px 8px;
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);
