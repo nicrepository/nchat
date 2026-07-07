@@ -157,12 +157,18 @@ func TestMessageHandler_ListFavorites_UnauthenticatedReturns401(t *testing.T) {
 	}
 }
 
-func TestMessageHandler_ListFavorites_InvalidCursorReturns400(t *testing.T) {
-	h := favoriteHandler(&fakeFavoriteProvider{})
+func TestMessageHandler_ListFavorites_ForwardsCursorToService(t *testing.T) {
+	// Cursor validation lives in FavoriteService; the handler forwards the raw
+	// value and maps domain.ErrInvalidCursor to 400 (covered below).
+	fav := &fakeFavoriteProvider{}
+	h := favoriteHandler(fav)
 	rec := httptest.NewRecorder()
-	h.ListFavorites(rec, requestWithUser(http.MethodGet, "/api/chat/favorites?before=!!!invalid!!!", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", rec.Code)
+	h.ListFavorites(rec, requestWithUser(http.MethodGet, "/api/chat/favorites?before=opaque-cursor", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if fav.lastListInput.BeforeCursor != "opaque-cursor" {
+		t.Fatalf("expected cursor forwarded to service, got %+v", fav.lastListInput)
 	}
 }
 

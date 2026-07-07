@@ -7,7 +7,6 @@ import (
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
-	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 // favoriteProvider is the FavoriteService interface used by MessageHandler.
@@ -119,18 +118,12 @@ func (h *MessageHandler) ListFavorites(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	beforeCursor := r.URL.Query().Get("before")
-	if beforeCursor != "" {
-		if _, err := storage.DecodeCursor(beforeCursor); err != nil {
-			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid cursor")
-			return
-		}
-	}
-
+	// Cursor validation is the FavoriteService's responsibility; malformed
+	// cursors surface as domain.ErrInvalidCursor → 400 via mapServiceError.
 	out, err := h.favorites.ListFavorites(r.Context(), service.ListFavoritesInput{
 		WorkspaceID:  wsID,
 		UserID:       userID,
-		BeforeCursor: beforeCursor,
+		BeforeCursor: r.URL.Query().Get("before"),
 		Limit:        parseLimitParam(r),
 	})
 	if err != nil {

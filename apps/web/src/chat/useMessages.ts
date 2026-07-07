@@ -68,8 +68,8 @@ export interface MessagesState {
   lastMutation: LastMutation;
   /** Recoverable realtime fallback error; initial loads and manual retries remain authoritative. */
   realtimeError: string | null;
-  /** Feedback for reaction commands rejected or not sent. */
-  reactionError: string | null;
+  /** Feedback for rejected/unsent message actions (reactions, favorites). */
+  actionError: string | null;
   /** Reactions snapshot to restore per messageId if the in-flight optimistic toggle is rejected or times out. */
   pendingReactions: Map<string, Message["reactions"]>;
 }
@@ -143,7 +143,7 @@ const initialState: MessagesState = {
   loadingMore: false,
   lastMutation: "none",
   realtimeError: null,
-  reactionError: null,
+  actionError: null,
   pendingReactions: new Map(),
 };
 
@@ -163,7 +163,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         nextCursor: "",
         lastMutation: "none",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
         pendingReactions: new Map(),
       };
     case "loaded":
@@ -176,7 +176,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         loadingMore: false,
         lastMutation: "initial",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
         pendingReactions: new Map(),
       };
     case "error":
@@ -255,16 +255,16 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       // Server-level errors (rate limit, feature unavailable) aren't scoped to a
       // single message, so every optimistic toggle still in flight is reverted.
       if (state.pendingReactions.size === 0) {
-        return { ...state, reactionError: action.error };
+        return { ...state, actionError: action.error };
       }
       const messages = state.messages.map((message) => {
         const snapshot = state.pendingReactions.get(message.id);
         return snapshot ? { ...message, reactions: snapshot } : message;
       });
-      return { ...state, messages, reactionError: action.error, pendingReactions: new Map() };
+      return { ...state, messages, actionError: action.error, pendingReactions: new Map() };
     }
     case "reaction_error_clear":
-      return { ...state, reactionError: null };
+      return { ...state, actionError: null };
     case "favorite_set": {
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       if (index < 0) return state;
@@ -274,7 +274,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "favorite_error":
       // Reuses the transient banner without touching reaction snapshots.
-      return { ...state, reactionError: action.error };
+      return { ...state, actionError: action.error };
     case "reaction_optimistic": {
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       if (index < 0) return state;
@@ -288,11 +288,11 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         ...message,
         reactions: toggleOptimisticReaction(message.reactions, action.emoji),
       };
-      return { ...state, messages, pendingReactions, reactionError: null };
+      return { ...state, messages, pendingReactions, actionError: null };
     }
     case "reaction_revert": {
       const snapshot = state.pendingReactions.get(action.messageId);
-      if (!snapshot) return { ...state, reactionError: action.error };
+      if (!snapshot) return { ...state, actionError: action.error };
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       const messages =
         index < 0
@@ -302,7 +302,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
             );
       const pendingReactions = new Map(state.pendingReactions);
       pendingReactions.delete(action.messageId);
-      return { ...state, messages, pendingReactions, reactionError: action.error };
+      return { ...state, messages, pendingReactions, actionError: action.error };
     }
     case "reaction_updated": {
       const { reaction } = action.event;
@@ -332,7 +332,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         pendingReactions,
         lastMutation: "none",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
       };
     }
     case "reaction_snapshot": {
@@ -348,7 +348,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         pendingReactions,
         lastMutation: "none",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
       };
     }
   }
@@ -381,10 +381,10 @@ export function useMessages({
   const [state, dispatch] = useReducer(reducer, initialState);
 
   useEffect(() => {
-    if (!state.reactionError) return;
+    if (!state.actionError) return;
     const timer = window.setTimeout(() => dispatch({ type: "reaction_error_clear" }), 5_000);
     return () => window.clearTimeout(timer);
-  }, [state.reactionError]);
+  }, [state.actionError]);
 
   // stateRef holds values that stable callbacks (loadMore, sendMessage, load) read
   // after async gaps, so they always see the current target and pagination state.

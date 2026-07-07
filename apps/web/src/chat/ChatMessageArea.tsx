@@ -932,10 +932,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         </div>
       )}
 
-      {(reactionInputError || state.reactionError) && (
+      {(reactionInputError || state.actionError) && (
         <div className="chat-msg-area__reaction-error" role="alert">
           <IconWarning />
-          {reactionInputError || state.reactionError}
+          {reactionInputError || state.actionError}
         </div>
       )}
 

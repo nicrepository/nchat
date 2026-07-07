@@ -231,7 +231,7 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => result.current.toggleReaction("msg-1", "👍"));
 
-    expect(result.current.state.reactionError).toMatch(/tempo real/i);
+    expect(result.current.state.actionError).toMatch(/tempo real/i);
   });
 
   it("maps structured reaction errors to visible state", async () => {
@@ -243,10 +243,10 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => capturedOnReactionError?.({ type: "error", code: "rate_limited", retry_after: 60 }));
 
-    expect(result.current.state.reactionError).toMatch(/muitas reações/i);
+    expect(result.current.state.actionError).toMatch(/muitas reações/i);
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
-    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+    expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
   });
 
   it("clears a temporary reaction error instead of leaving a stale banner", async () => {
@@ -258,10 +258,10 @@ describe("useMessages — WS message.created integration", () => {
     vi.useFakeTimers();
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
-    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+    expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
     act(() => vi.advanceTimersByTime(5_000));
 
-    expect(result.current.state.reactionError).toBeNull();
+    expect(result.current.state.actionError).toBeNull();
     vi.useRealTimers();
   });
 
@@ -845,7 +845,7 @@ describe("useMessages — toggleFavorite", () => {
 
     act(() => result.current.toggleFavorite("msg-1", true));
 
-    await waitFor(() => expect(result.current.state.reactionError).toMatch(/favorito/i));
+    await waitFor(() => expect(result.current.state.actionError).toMatch(/favorito/i));
     expect(result.current.state.messages[0].isFavorited).toBe(false);
   });
 });
