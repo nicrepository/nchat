@@ -87,6 +87,7 @@ func New(cfg config.Config) *App {
 	var mentionCache *storage.ValkeyMentionLabelCache
 	var reactionSvc *service.ReactionService
 	var favoriteSvc *service.FavoriteService
+	var pinSvc *service.PinService
 
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -103,6 +104,10 @@ func New(cfg config.Config) *App {
 			messages := storage.NewPGXMessageStore(pool)
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
+			pinSvc = service.NewPinService(
+				storage.NewPGXPinStore(pool),
+				service.NewPermissionService(memberStore, channelStore),
+			)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
@@ -160,6 +165,11 @@ func New(cfg config.Config) *App {
 	// SetPublisher is called after both messageSvc and hub are ready.
 	if messageSvc != nil {
 		messageSvc.SetPublisher(&hubBroadcaster{hub: hub})
+	}
+
+	// Pins broadcast over the same hub; wired after the hub exists (RF-05).
+	if pinSvc != nil {
+		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
 	}
 
 	return &App{
@@ -250,6 +260,11 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
 	payload := domainMessageToWSPayload(msg)
 	b.hub.PublishMessageCreated(ctx, workspaceID, ws.TargetType(targetType), targetID, payload)
+}
+
+// PublishPinUpdated adapts the hub for the RF-05 pin broadcaster interface.
+func (b *hubBroadcaster) PublishPinUpdated(ctx context.Context, workspaceID, channelID, messageID, actorUserID string, pinned bool) {
+	b.hub.PublishPinUpdated(ctx, workspaceID, channelID, messageID, actorUserID, pinned)
 }
 
 func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {

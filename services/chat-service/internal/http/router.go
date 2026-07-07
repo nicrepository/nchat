@@ -108,6 +108,20 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListFavorites)),
 	))
 
+	// Pin endpoints (RF-05): channel-wide pinned messages. Writes require an
+	// elevated role (enforced in the service) and share msgPostLimiter so
+	// pin/unpin cannot exceed the general write quota (abuse ceiling). The list
+	// is visible to any member who can read the channel.
+	mux.Handle("POST "+RouteChannelMessagePin, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.PinMessage)),
+	))
+	mux.Handle("DELETE "+RouteChannelMessagePin, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.UnpinMessage)),
+	))
+	mux.Handle("GET "+RouteChannelPins, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListPins)),
+	))
+
 	// WebSocket endpoint: WSTokenMiddleware extracts a Bearer token from
 	// Sec-WebSocket-Protocol for browser clients that cannot set Authorization
 	// headers on WebSocket upgrades. auth middleware runs before upgrade so

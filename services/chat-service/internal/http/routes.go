@@ -13,5 +13,7 @@ const (
 	RouteAllowedReactionEmojis = "/api/chat/reactions/allowed-emojis"
 	RouteMessageFavorite       = "/api/chat/messages/{messageID}/favorite"
 	RouteFavorites             = "/api/chat/favorites"
+	RouteChannelMessagePin     = "/api/chat/channels/{channelID}/messages/{messageID}/pin"
+	RouteChannelPins           = "/api/chat/channels/{channelID}/pins"
 	RouteWS                    = "/api/chat/ws"
 )
