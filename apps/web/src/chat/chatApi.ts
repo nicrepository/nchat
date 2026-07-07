@@ -12,7 +12,14 @@
 
 import { authenticatedFetch } from "../lib/authClient";
 import { onAuthChange } from "../lib/authSession";
-import type { Channel, DMConversation, Message, MessagePage } from "./chatTypes";
+import type {
+  Channel,
+  DMConversation,
+  FavoriteItem,
+  FavoritesPage,
+  Message,
+  MessagePage,
+} from "./chatTypes";
 import type { MentionCandidate } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
@@ -147,6 +154,18 @@ interface MessageResponse {
   created_at: string;
   updated_at: string;
   reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
+  is_favorited?: boolean;
+}
+
+interface FavoriteResponse {
+  message: MessageResponse;
+  channel_id?: string;
+  dm_conversation_id?: string;
+  favorited_at: string;
+}
+
+interface FavoritesEnvelope {
+  data: { favorites: FavoriteResponse[]; next_cursor?: string };
 }
 
 interface MessageListData {
@@ -218,6 +237,7 @@ function mapMessage(r: MessageResponse): Message {
       count: reaction.count,
       reactedByMe: reaction.reacted_by_me,
     })),
+    isFavorited: r.is_favorited ?? false,
   };
 }
 
@@ -311,6 +331,45 @@ export async function fetchChannelMessage(
   const url = `${messagesPath("channel", channelId)}/${encodeURIComponent(messageId)}`;
   const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
   return mapMessage(res.data);
+}
+
+// ── Favorites API (RF-06) ─────────────────────────────────────────────────────
+
+function favoritePath(messageId: string): string {
+  return `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}/favorite`;
+}
+
+/** Favorites a message for the authenticated user. Idempotent (204). */
+export async function favoriteMessage(messageId: string, signal?: AbortSignal): Promise<void> {
+  await authenticatedFetch<void>(favoritePath(messageId), { method: "POST", signal });
+}
+
+/** Removes the authenticated user's favorite. Idempotent (204). */
+export async function unfavoriteMessage(messageId: string, signal?: AbortSignal): Promise<void> {
+  await authenticatedFetch<void>(favoritePath(messageId), { method: "DELETE", signal });
+}
+
+function mapFavorite(r: FavoriteResponse): FavoriteItem {
+  return {
+    message: mapMessage(r.message),
+    channelId: r.channel_id ?? "",
+    dmConversationId: r.dm_conversation_id ?? "",
+    favoritedAt: r.favorited_at,
+  };
+}
+
+/** Fetches one page of the authenticated user's own favorites, newest first. */
+export async function fetchFavorites(
+  beforeCursor?: string,
+  signal?: AbortSignal,
+): Promise<FavoritesPage> {
+  const base = `${CHAT_BASE}/favorites`;
+  const url = beforeCursor ? `${base}?before=${encodeURIComponent(beforeCursor)}` : base;
+  const res = await authenticatedFetch<FavoritesEnvelope>(url, { method: "GET", signal });
+  return {
+    favorites: (res.data.favorites ?? []).map(mapFavorite),
+    nextCursor: res.data.next_cursor ?? "",
+  };
 }
 
 export async function fetchDMMessage(

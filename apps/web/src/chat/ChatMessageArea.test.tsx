@@ -41,6 +41,8 @@ const {
   mockFetchDMMessages,
   mockPostDMMessage,
   mockFetchAllowedReactionEmojis,
+  mockFavoriteMessage,
+  mockUnfavoriteMessage,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -58,6 +60,8 @@ const {
   mockPostDMMessage:
     vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
   mockFetchAllowedReactionEmojis: vi.fn<() => Promise<string[]>>(),
+  mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
+  mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: unknown) => void) | null,
@@ -80,6 +84,8 @@ vi.mock("./chatApi", () => ({
     mockPostDMMessage(conversationId, bodyText, signal),
   fetchDMMessage: vi.fn(),
   fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
+  favoriteMessage: (id: string) => mockFavoriteMessage(id),
+  unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
@@ -115,6 +121,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   reactions: [],
+  isFavorited: false,
   ...overrides,
 });
 
@@ -2102,5 +2109,72 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
 
     // scrollIntoView SHOULD be called — user is near the bottom.
     await waitFor(() => expect(scrollMock).toHaveBeenCalledTimes(1));
+  });
+});
+
+// ── Favoritos (RF-06) ─────────────────────────────────────────────────────────
+
+describe("ChatMessageArea — favoritar mensagem", () => {
+  it("shows the favorite action in the hover menu and confirms via REST", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", isFavorited: false })]),
+    );
+    mockFavoriteMessage.mockResolvedValue(undefined);
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    const star = screen.getByRole("button", { name: "Favoritar mensagem" });
+    expect(star).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(star);
+
+    expect(mockFavoriteMessage).toHaveBeenCalledWith("m1");
+    fireEvent.mouseEnter(bubble);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Remover dos favoritos" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+  });
+
+  it("unfavorites an already-favorited message", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", isFavorited: true })]),
+    );
+    mockUnfavoriteMessage.mockResolvedValue(undefined);
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    await userEvent.click(screen.getByRole("button", { name: "Remover dos favoritos" }));
+
+    expect(mockUnfavoriteMessage).toHaveBeenCalledWith("m1");
+    fireEvent.mouseEnter(bubble);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Favoritar mensagem" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      ),
+    );
+  });
+
+  it("shows an error banner and keeps state when the favorite call fails", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", isFavorited: false })]),
+    );
+    mockFavoriteMessage.mockRejectedValue(new Error("boom"));
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    await userEvent.click(screen.getByRole("button", { name: "Favoritar mensagem" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/favorito/i);
+    fireEvent.mouseEnter(bubble);
+    expect(screen.getByRole("button", { name: "Favoritar mensagem" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
   });
 });

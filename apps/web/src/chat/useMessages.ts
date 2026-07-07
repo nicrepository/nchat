@@ -24,12 +24,14 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
+  favoriteMessage,
   fetchChannelMessage,
   fetchChannelMessages,
   fetchDMMessage,
   fetchDMMessages,
   postChannelMessage,
   postDMMessage,
+  unfavoriteMessage,
 } from "./chatApi";
 import type { Message, MessagePage } from "./chatTypes";
 import {
@@ -103,6 +105,8 @@ type Action =
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
   | { type: "reaction_error_clear" }
+  | { type: "favorite_set"; messageId: string; isFavorited: boolean }
+  | { type: "favorite_error"; error: string }
   | { type: "reaction_optimistic"; messageId: string; emoji: string }
   | { type: "reaction_revert"; messageId: string; error: string }
   | { type: "ws_fetch_error"; error: string };
@@ -261,6 +265,16 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "reaction_error_clear":
       return { ...state, reactionError: null };
+    case "favorite_set": {
+      const index = state.messages.findIndex((message) => message.id === action.messageId);
+      if (index < 0) return state;
+      const messages = [...state.messages];
+      messages[index] = { ...messages[index], isFavorited: action.isFavorited };
+      return { ...state, messages };
+    }
+    case "favorite_error":
+      // Reuses the transient banner without touching reaction snapshots.
+      return { ...state, reactionError: action.error };
     case "reaction_optimistic": {
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       if (index < 0) return state;
@@ -355,6 +369,7 @@ export interface UseMessagesResult {
   retry: () => void;
   loadMore: () => void;
   toggleReaction: (messageId: string, emoji: string) => void;
+  toggleFavorite: (messageId: string, isFavorited: boolean) => void;
 }
 
 export function useMessages({
@@ -558,6 +573,9 @@ export function useMessages({
           createdAt: p.created_at,
           updatedAt: p.updated_at,
           reactions: [],
+          // WS create events never carry the caller's favorite state; a message
+          // just created cannot be favorited yet.
+          isFavorited: false,
         };
         if (!isCurrentTarget(loadKey)) return;
         dispatch({ type: "ws_received", message: msg });
@@ -691,5 +709,27 @@ export function useMessages({
     [clearReactionTimer, sendReactionToggle],
   );
 
-  return { state, sendMessage, retry, loadMore, toggleReaction };
+  // RF-06: REST round-trip confirms before the flag flips — no optimistic
+  // update; a failure reuses the transient reaction error banner.
+  // ponytail: no in-flight dedupe; a double click just repeats an idempotent call.
+  const toggleFavorite = useCallback(
+    (messageId: string, isFavorited: boolean) => {
+      const apply = isFavorited ? favoriteMessage : unfavoriteMessage;
+      void apply(messageId)
+        .then(() => {
+          if (isMessageRendered(messageId)) {
+            dispatch({ type: "favorite_set", messageId, isFavorited });
+          }
+        })
+        .catch(() => {
+          dispatch({
+            type: "favorite_error",
+            error: "Não foi possível atualizar o favorito. Tente novamente.",
+          });
+        });
+    },
+    [isMessageRendered],
+  );
+
+  return { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite };
 }
