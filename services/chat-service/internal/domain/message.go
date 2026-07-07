@@ -61,6 +61,16 @@ type Message struct {
 	SenderDisplayName string
 	SenderEmail       string
 	Reactions         []MessageReaction
+
+	// IsFavorited reports whether the requesting user favorited this message.
+	// Always scoped to the caller — never exposes other users' favorites.
+	IsFavorited bool
+}
+
+// FavoriteMessage is one entry in a user's private favorites list.
+type FavoriteMessage struct {
+	Message     Message
+	FavoritedAt time.Time
 }
 
 // MessageReaction is an aggregate safe to expose to a message viewer.
