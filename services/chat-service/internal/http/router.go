@@ -27,6 +27,11 @@ const msgPostRateLimit = 60
 // mentionSearchRateLimit limits autocomplete enumeration independently from messages.
 const mentionSearchRateLimit = 30
 
+// favoriteWriteRateLimit is the maximum number of favorite/unfavorite actions an
+// authenticated user may make per minute, budgeted separately so bookmarking
+// does not consume the message-send quota.
+const favoriteWriteRateLimit = 60
+
 const RouteMetrics = "/metrics"
 
 func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler) http.Handler {
@@ -63,6 +68,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	msgGetSingleLimiter := NewUserRateLimiter(msgGetSingleRateLimit, time.Minute)
 	msgPostLimiter := NewUserRateLimiter(msgPostRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
+	favoriteWriteLimiter := NewUserRateLimiter(favoriteWriteRateLimit, time.Minute)
 
 	// Static, non-sensitive configuration; authentication still prevents adding
 	// a new public API surface.
@@ -93,6 +99,18 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	))
 	mux.Handle("GET "+RouteDMMessage, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
+	))
+
+	// Favorite endpoints (RF-06): per-user private bookmarks. The list endpoint
+	// only ever returns the authenticated caller's own favorites.
+	mux.Handle("POST "+RouteMessageFavorite, authMiddleware(
+		favoriteWriteLimiter.Middleware(http.HandlerFunc(messages.FavoriteMessage)),
+	))
+	mux.Handle("DELETE "+RouteMessageFavorite, authMiddleware(
+		favoriteWriteLimiter.Middleware(http.HandlerFunc(messages.UnfavoriteMessage)),
+	))
+	mux.Handle("GET "+RouteFavorites, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListFavorites)),
 	))
 
 	// WebSocket endpoint: WSTokenMiddleware extracts a Bearer token from

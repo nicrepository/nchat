@@ -46,6 +46,14 @@ type MessageHandler struct {
 	workspaces workspaceResolver
 	messages   messageProvider
 	mentions   mentionProvider
+	favorites  favoriteProvider
+}
+
+// WithFavorites enables the RF-06 favorite endpoints. Returns the handler for
+// chaining; when never called, favorite routes answer 503.
+func (h *MessageHandler) WithFavorites(favorites favoriteProvider) *MessageHandler {
+	h.favorites = favorites
+	return h
 }
 
 // NewMessageHandler returns a MessageHandler. Missing dependencies produce 503
@@ -71,6 +79,7 @@ type messageJSON struct {
 	CreatedAt         time.Time      `json:"created_at"`
 	UpdatedAt         time.Time      `json:"updated_at"`
 	Reactions         []reactionJSON `json:"reactions"`
+	IsFavorited       bool           `json:"is_favorited,omitempty"`
 }
 
 type reactionJSON struct {
@@ -176,6 +185,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		CreatedAt:         m.CreatedAt,
 		UpdatedAt:         m.UpdatedAt,
 		Reactions:         make([]reactionJSON, len(m.Reactions)),
+		IsFavorited:       m.IsFavorited,
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{

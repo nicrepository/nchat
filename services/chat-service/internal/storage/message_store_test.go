@@ -58,11 +58,11 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 // listMessageCols returns columns matching listMessageColumns("") scan order
 // (base message columns + sender display info from auth.users).
 func listMessageCols() []string {
-	return append(messageCols(), "sender_display_name", "sender_email")
+	return append(messageCols(), "sender_display_name", "sender_email", "is_favorited")
 }
 
 func listMessageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
-	return append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com")
+	return append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", false)
 }
 
 // newMock creates and defers close of a pgxmock pool.
@@ -455,7 +455,7 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"", "", "",
 		&editedAt, &deletedAt,
 		now, now,
-		"Test User", "test@example.com",
+		"Test User", "test@example.com", false,
 	}
 	expectCreate(mock, pgxmock.NewRows(listMessageCols()).AddRow(row...))
 
@@ -509,7 +509,7 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	// GetMessageByIDInWorkspace now uses listMessageColumns + auth.users JOIN,
 	// matching the list endpoint contract (includes sender_display_name, sender_email).
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("msg-1", "ws-1").
+		WithArgs("msg-1", "ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(listMessageCols()).
 			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
 	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 1, true))
@@ -537,7 +537,7 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 func TestPGXMessageStore_GetMessageByIDInWorkspace_NotFoundReturnsErrNotFound(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
-		WithArgs("msg-missing", "ws-1").
+		WithArgs("msg-missing", "ws-1", "user-1").
 		WillReturnError(pgx.ErrNoRows)
 
 	store := storage.NewPGXMessageStore(mock)
@@ -612,7 +612,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		"", "", "",
 		&editedAt, &deletedAt,
 		now, now,
-		"Test User", "test@example.com",
+		"Test User", "test@example.com", false,
 	}
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
