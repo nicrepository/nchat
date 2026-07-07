@@ -184,12 +184,20 @@ func messageColumns(alias string) string {
 	` + p + `created_at, ` + p + `updated_at`
 }
 
-// listMessageColumns returns messageColumns plus sender display info from auth.users.
-// Requires a LEFT JOIN auth.users aliased as "u" in the query.
-func listMessageColumns(alias string) string {
+// listMessageColumns returns messageColumns plus sender display info from
+// auth.users and the caller-scoped is_favorited flag. Requires a LEFT JOIN
+// auth.users aliased as "u" in the query. userParam is the positional
+// placeholder (e.g. "$3") holding the requesting user's ID — a code literal,
+// never user input. Computing the flag inline keeps favorite marking a single
+// index-backed query instead of a per-message lookup (RF-06 anti-N+1).
+func listMessageColumns(alias, userParam string) string {
 	return messageColumns(alias) + `,
 	COALESCE(u.display_name, ''),
-	COALESCE(u.email::text, '')`
+	COALESCE(u.email::text, ''),
+	EXISTS (
+		SELECT 1 FROM chat.message_favorites mf
+		WHERE mf.message_id = ` + alias + `.id AND mf.user_id = ` + userParam + `::uuid
+	)`
 }
 
 // scanMessageWithSender reads a single message row including sender display info.
@@ -206,6 +214,7 @@ func scanMessageWithSender(row pgx.Row) (domain.Message, error) {
 		&editedAt, &deletedAt,
 		&msg.CreatedAt, &msg.UpdatedAt,
 		&msg.SenderDisplayName, &msg.SenderEmail,
+		&msg.IsFavorited,
 	)
 	if err != nil {
 		return domain.Message{}, err
@@ -383,7 +392,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
 			RETURNING id
 		)
-		SELECT `+listMessageColumns("m")+`
+		SELECT `+listMessageColumns("m", "$4")+`
 		FROM inserted m
 		LEFT JOIN auth.users u ON u.id = m.sender_id`,
 		input.WorkspaceID,
@@ -518,11 +527,11 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 	// Use listMessageColumns so the result includes sender_display_name and
 	// sender_email — the same contract as the list endpoints.
 	row := s.pool.QueryRow(ctx, `
-		SELECT `+listMessageColumns("m")+`
+		SELECT `+listMessageColumns("m", "$3")+`
 		FROM chat.messages m
 		LEFT JOIN auth.users u ON u.id = m.sender_id
 		WHERE m.id = $1 AND m.workspace_id = $2`,
-		messageID, workspaceID,
+		messageID, workspaceID, userID,
 	)
 	msg, err := scanMessageWithSender(row)
 	if err != nil {
@@ -548,7 +557,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		// Keyset pagination: fetch messages older than the cursor.
 		// Fetch limit+1 to detect whether a next page exists.
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m")+`
+			SELECT `+listMessageColumns("m", "$3")+`
 			FROM chat.messages m
 			JOIN chat.channels c
 			  ON c.id = m.channel_id
@@ -573,7 +582,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m")+`
+			SELECT `+listMessageColumns("m", "$3")+`
 			FROM chat.messages m
 			JOIN chat.channels c
 			  ON c.id = m.channel_id
@@ -618,7 +627,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 
 	if input.BeforeCursor != nil {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m")+`
+			SELECT `+listMessageColumns("m", "$3")+`
 			FROM chat.messages m
 			JOIN chat.dm_conversations dc
 			  ON dc.id = m.dm_conversation_id
@@ -642,7 +651,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m")+`
+			SELECT `+listMessageColumns("m", "$3")+`
 			FROM chat.messages m
 			JOIN chat.dm_conversations dc
 			  ON dc.id = m.dm_conversation_id
@@ -776,7 +785,7 @@ func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Mess
 			&msg.CreatedAt, &msg.UpdatedAt,
 		}
 		if withSender {
-			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail)
+			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.IsFavorited)
 		}
 		err := rows.Scan(dest...)
 		if err != nil {

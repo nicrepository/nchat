@@ -61,7 +61,11 @@ const {
   mockFetchChannelMessage,
   mockFetchDMMessages,
   mockFetchDMMessage,
+  mockFavoriteMessage,
+  mockUnfavoriteMessage,
 } = vi.hoisted(() => ({
+  mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
+  mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockFetchChannelMessages:
     vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
   mockFetchChannelMessage:
@@ -83,6 +87,8 @@ vi.mock("./chatApi", () => ({
     mockFetchDMMessage(id, msgId, signal),
   postChannelMessage: vi.fn(),
   postDMMessage: vi.fn(),
+  favoriteMessage: (id: string) => mockFavoriteMessage(id),
+  unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -102,6 +108,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   reactions: [],
+  isFavorited: false,
   ...overrides,
 });
 
@@ -224,7 +231,7 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => result.current.toggleReaction("msg-1", "👍"));
 
-    expect(result.current.state.reactionError).toMatch(/tempo real/i);
+    expect(result.current.state.actionError).toMatch(/tempo real/i);
   });
 
   it("maps structured reaction errors to visible state", async () => {
@@ -236,10 +243,10 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => capturedOnReactionError?.({ type: "error", code: "rate_limited", retry_after: 60 }));
 
-    expect(result.current.state.reactionError).toMatch(/muitas reações/i);
+    expect(result.current.state.actionError).toMatch(/muitas reações/i);
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
-    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+    expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
   });
 
   it("clears a temporary reaction error instead of leaving a stale banner", async () => {
@@ -251,10 +258,10 @@ describe("useMessages — WS message.created integration", () => {
     vi.useFakeTimers();
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
-    expect(result.current.state.reactionError).toMatch(/temporariamente indisponíveis/i);
+    expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
     act(() => vi.advanceTimersByTime(5_000));
 
-    expect(result.current.state.reactionError).toBeNull();
+    expect(result.current.state.actionError).toBeNull();
     vi.useRealTimers();
   });
 
@@ -784,5 +791,61 @@ describe("useMessages — WS message.created integration", () => {
     // Message must NOT be inserted — staleRef guard fired.
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     expect(result.current.state.messages).toHaveLength(0);
+  });
+});
+
+// ── Favorites (RF-06) ─────────────────────────────────────────────────────────
+
+describe("useMessages — toggleFavorite", () => {
+  it("marks the message favorited after the REST call confirms", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", isFavorited: false })],
+      nextCursor: "",
+    });
+    mockFavoriteMessage.mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleFavorite("msg-1", true));
+
+    await waitFor(() => expect(result.current.state.messages[0].isFavorited).toBe(true));
+    expect(mockFavoriteMessage).toHaveBeenCalledWith("msg-1");
+    expect(mockUnfavoriteMessage).not.toHaveBeenCalled();
+  });
+
+  it("clears the flag after unfavoriting", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", isFavorited: true })],
+      nextCursor: "",
+    });
+    mockUnfavoriteMessage.mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleFavorite("msg-1", false));
+
+    await waitFor(() => expect(result.current.state.messages[0].isFavorited).toBe(false));
+    expect(mockUnfavoriteMessage).toHaveBeenCalledWith("msg-1");
+  });
+
+  it("keeps state and surfaces an error when the call fails", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", isFavorited: false })],
+      nextCursor: "",
+    });
+    mockFavoriteMessage.mockRejectedValue(new Error("boom"));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleFavorite("msg-1", true));
+
+    await waitFor(() => expect(result.current.state.actionError).toMatch(/favorito/i));
+    expect(result.current.state.messages[0].isFavorited).toBe(false);
   });
 });

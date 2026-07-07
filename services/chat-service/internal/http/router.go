@@ -95,6 +95,19 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
 	))
 
+	// Favorite endpoints (RF-06): per-user private bookmarks. The list endpoint
+	// only ever returns the authenticated caller's own favorites. Writes share
+	// msgPostLimiter so favoriting cannot exceed the general write quota.
+	mux.Handle("POST "+RouteMessageFavorite, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.FavoriteMessage)),
+	))
+	mux.Handle("DELETE "+RouteMessageFavorite, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.UnfavoriteMessage)),
+	))
+	mux.Handle("GET "+RouteFavorites, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListFavorites)),
+	))
+
 	// WebSocket endpoint: WSTokenMiddleware extracts a Bearer token from
 	// Sec-WebSocket-Protocol for browser clients that cannot set Authorization
 	// headers on WebSocket upgrades. auth middleware runs before upgrade so

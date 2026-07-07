@@ -90,6 +90,23 @@ function IconSettings() {
   );
 }
 
+function IconStar() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__icon"
+      aria-hidden="true"
+    >
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+    </svg>
+  );
+}
+
 // ── Avatar helpers ────────────────────────────────────────────────────────────
 
 interface AvatarProps {
@@ -415,6 +432,14 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
       {/* ── Footer ── */}
       <div className="chat-sidebar__footer">
+        <Link
+          to="/chat/favorites"
+          className="chat-sidebar__footer-item"
+          aria-label="Meus favoritos"
+        >
+          <IconStar />
+          <span>Favoritos</span>
+        </Link>
         <Link to="/admin/users" className="chat-sidebar__footer-item" aria-label="Configurações">
           <IconSettings />
           <span>Configurações</span>

@@ -13,6 +13,7 @@ import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
 
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
+const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
 
 export default function App() {
   return (
@@ -47,6 +48,14 @@ export default function App() {
             element={
               <Suspense fallback={null}>
                 <ChatMessageArea kind="dm" />
+              </Suspense>
+            }
+          />
+          <Route
+            path="favorites"
+            element={
+              <Suspense fallback={null}>
+                <FavoritesPage />
               </Suspense>
             }
           />

@@ -24,12 +24,14 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
+  favoriteMessage,
   fetchChannelMessage,
   fetchChannelMessages,
   fetchDMMessage,
   fetchDMMessages,
   postChannelMessage,
   postDMMessage,
+  unfavoriteMessage,
 } from "./chatApi";
 import type { Message, MessagePage } from "./chatTypes";
 import {
@@ -66,8 +68,8 @@ export interface MessagesState {
   lastMutation: LastMutation;
   /** Recoverable realtime fallback error; initial loads and manual retries remain authoritative. */
   realtimeError: string | null;
-  /** Feedback for reaction commands rejected or not sent. */
-  reactionError: string | null;
+  /** Feedback for rejected/unsent message actions (reactions, favorites). */
+  actionError: string | null;
   /** Reactions snapshot to restore per messageId if the in-flight optimistic toggle is rejected or times out. */
   pendingReactions: Map<string, Message["reactions"]>;
 }
@@ -103,6 +105,8 @@ type Action =
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
   | { type: "reaction_error_clear" }
+  | { type: "favorite_set"; messageId: string; isFavorited: boolean }
+  | { type: "favorite_error"; error: string }
   | { type: "reaction_optimistic"; messageId: string; emoji: string }
   | { type: "reaction_revert"; messageId: string; error: string }
   | { type: "ws_fetch_error"; error: string };
@@ -139,7 +143,7 @@ const initialState: MessagesState = {
   loadingMore: false,
   lastMutation: "none",
   realtimeError: null,
-  reactionError: null,
+  actionError: null,
   pendingReactions: new Map(),
 };
 
@@ -159,7 +163,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         nextCursor: "",
         lastMutation: "none",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
         pendingReactions: new Map(),
       };
     case "loaded":
@@ -172,7 +176,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         loadingMore: false,
         lastMutation: "initial",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
         pendingReactions: new Map(),
       };
     case "error":
@@ -251,16 +255,26 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       // Server-level errors (rate limit, feature unavailable) aren't scoped to a
       // single message, so every optimistic toggle still in flight is reverted.
       if (state.pendingReactions.size === 0) {
-        return { ...state, reactionError: action.error };
+        return { ...state, actionError: action.error };
       }
       const messages = state.messages.map((message) => {
         const snapshot = state.pendingReactions.get(message.id);
         return snapshot ? { ...message, reactions: snapshot } : message;
       });
-      return { ...state, messages, reactionError: action.error, pendingReactions: new Map() };
+      return { ...state, messages, actionError: action.error, pendingReactions: new Map() };
     }
     case "reaction_error_clear":
-      return { ...state, reactionError: null };
+      return { ...state, actionError: null };
+    case "favorite_set": {
+      const index = state.messages.findIndex((message) => message.id === action.messageId);
+      if (index < 0) return state;
+      const messages = [...state.messages];
+      messages[index] = { ...messages[index], isFavorited: action.isFavorited };
+      return { ...state, messages };
+    }
+    case "favorite_error":
+      // Reuses the transient banner without touching reaction snapshots.
+      return { ...state, actionError: action.error };
     case "reaction_optimistic": {
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       if (index < 0) return state;
@@ -274,11 +288,11 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         ...message,
         reactions: toggleOptimisticReaction(message.reactions, action.emoji),
       };
-      return { ...state, messages, pendingReactions, reactionError: null };
+      return { ...state, messages, pendingReactions, actionError: null };
     }
     case "reaction_revert": {
       const snapshot = state.pendingReactions.get(action.messageId);
-      if (!snapshot) return { ...state, reactionError: action.error };
+      if (!snapshot) return { ...state, actionError: action.error };
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       const messages =
         index < 0
@@ -288,7 +302,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
             );
       const pendingReactions = new Map(state.pendingReactions);
       pendingReactions.delete(action.messageId);
-      return { ...state, messages, pendingReactions, reactionError: action.error };
+      return { ...state, messages, pendingReactions, actionError: action.error };
     }
     case "reaction_updated": {
       const { reaction } = action.event;
@@ -318,7 +332,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         pendingReactions,
         lastMutation: "none",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
       };
     }
     case "reaction_snapshot": {
@@ -334,7 +348,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         pendingReactions,
         lastMutation: "none",
         realtimeError: null,
-        reactionError: null,
+        actionError: null,
       };
     }
   }
@@ -355,6 +369,7 @@ export interface UseMessagesResult {
   retry: () => void;
   loadMore: () => void;
   toggleReaction: (messageId: string, emoji: string) => void;
+  toggleFavorite: (messageId: string, isFavorited: boolean) => void;
 }
 
 export function useMessages({
@@ -366,10 +381,10 @@ export function useMessages({
   const [state, dispatch] = useReducer(reducer, initialState);
 
   useEffect(() => {
-    if (!state.reactionError) return;
+    if (!state.actionError) return;
     const timer = window.setTimeout(() => dispatch({ type: "reaction_error_clear" }), 5_000);
     return () => window.clearTimeout(timer);
-  }, [state.reactionError]);
+  }, [state.actionError]);
 
   // stateRef holds values that stable callbacks (loadMore, sendMessage, load) read
   // after async gaps, so they always see the current target and pagination state.
@@ -558,6 +573,9 @@ export function useMessages({
           createdAt: p.created_at,
           updatedAt: p.updated_at,
           reactions: [],
+          // WS create events never carry the caller's favorite state; a message
+          // just created cannot be favorited yet.
+          isFavorited: false,
         };
         if (!isCurrentTarget(loadKey)) return;
         dispatch({ type: "ws_received", message: msg });
@@ -691,5 +709,27 @@ export function useMessages({
     [clearReactionTimer, sendReactionToggle],
   );
 
-  return { state, sendMessage, retry, loadMore, toggleReaction };
+  // RF-06: REST round-trip confirms before the flag flips — no optimistic
+  // update; a failure reuses the transient reaction error banner.
+  // ponytail: no in-flight dedupe; a double click just repeats an idempotent call.
+  const toggleFavorite = useCallback(
+    (messageId: string, isFavorited: boolean) => {
+      const apply = isFavorited ? favoriteMessage : unfavoriteMessage;
+      void apply(messageId)
+        .then(() => {
+          if (isMessageRendered(messageId)) {
+            dispatch({ type: "favorite_set", messageId, isFavorited });
+          }
+        })
+        .catch(() => {
+          dispatch({
+            type: "favorite_error",
+            error: "Não foi possível atualizar o favorito. Tente novamente.",
+          });
+        });
+    },
+    [isMessageRendered],
+  );
+
+  return { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite };
 }

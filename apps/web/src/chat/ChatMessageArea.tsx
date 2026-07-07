@@ -285,6 +285,7 @@ interface MessageBubbleProps {
   /** True when consecutive messages from the same sender within the same minute. */
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
   reactionMenuVisible: boolean;
@@ -298,6 +299,7 @@ function MessageReactions({
   isMine = false,
   bubbleRef,
   onToggleReaction,
+  onToggleFavorite,
   allowedReactionEmojis,
   recentReactionEmojis,
   reactionMenuVisible,
@@ -308,6 +310,7 @@ function MessageReactions({
   | "message"
   | "isMine"
   | "onToggleReaction"
+  | "onToggleFavorite"
   | "allowedReactionEmojis"
   | "recentReactionEmojis"
   | "reactionMenuVisible"
@@ -439,6 +442,17 @@ function MessageReactions({
               </button>
             ))}
             <button
+              type="button"
+              className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
+              aria-label={message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
+              aria-pressed={message.isFavorited}
+              onClick={() => onToggleFavorite(message.id, !message.isFavorited)}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                star
+              </span>
+            </button>
+            <button
               ref={anchorRef}
               type="button"
               aria-label="Mais reações"
@@ -503,6 +517,7 @@ function MessageBubble({
   isMine = false,
   isGrouped = false,
   onToggleReaction,
+  onToggleFavorite,
   allowedReactionEmojis,
   recentReactionEmojis,
   reactionMenuVisible,
@@ -548,6 +563,7 @@ function MessageBubble({
           isMine={isMine}
           bubbleRef={bubbleRef}
           onToggleReaction={onToggleReaction}
+          onToggleFavorite={onToggleFavorite}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
           reactionMenuVisible={reactionMenuVisible || pickerOpen}
@@ -567,6 +583,7 @@ interface MessageListProps {
   lastMutation: LastMutation;
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
 }
@@ -579,6 +596,7 @@ function MessageList({
   lastMutation,
   onLoadMore,
   onToggleReaction,
+  onToggleFavorite,
   allowedReactionEmojis,
   recentReactionEmojis,
 }: MessageListProps) {
@@ -743,6 +761,7 @@ function MessageList({
             isMine={!!currentUserId && item.message.senderId === currentUserId}
             isGrouped={item.isGrouped}
             onToggleReaction={onToggleReaction}
+            onToggleFavorite={onToggleFavorite}
             allowedReactionEmojis={allowedReactionEmojis}
             recentReactionEmojis={recentReactionEmojis}
             reactionMenuVisible={hoveredMessageId === item.message.id}
@@ -816,7 +835,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [allowedReactionEmojis, ctx.currentUserId],
   );
 
-  const { state, sendMessage, retry, loadMore, toggleReaction } = useMessages({
+  const { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite } = useMessages({
     kind,
     targetId,
     currentUserId: ctx.currentUserId,
@@ -889,6 +908,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           lastMutation={state.lastMutation}
           onLoadMore={loadMore}
           onToggleReaction={handleToggleReaction}
+          onToggleFavorite={toggleFavorite}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
         />
@@ -912,10 +932,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         </div>
       )}
 
-      {(reactionInputError || state.reactionError) && (
+      {(reactionInputError || state.actionError) && (
         <div className="chat-msg-area__reaction-error" role="alert">
           <IconWarning />
-          {reactionInputError || state.reactionError}
+          {reactionInputError || state.actionError}
         </div>
       )}
 

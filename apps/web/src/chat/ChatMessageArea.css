@@ -252,6 +252,102 @@
   font-size: 17px;
 }
 
+.chat-msg-area__favorite--active .material-symbols-outlined {
+  color: var(--color-warning, #f5a623);
+  font-variation-settings: "FILL" 1;
+}
+
+/* ── Meus favoritos (RF-06) ─────────────────────────────────────────────── */
+
+.chat-favorites {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+
+.chat-favorites__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.chat-favorites__sub {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.chat-favorites__list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-favorites__item {
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+.chat-favorites__item-meta {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.chat-favorites__sender {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.chat-favorites__time {
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.chat-favorites__actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.chat-favorites__link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 12px;
+  color: var(--color-primary, #2563eb);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.chat-favorites__link-btn:hover {
+  text-decoration: underline;
+}
+
+.chat-favorites__status {
+  font-size: 13px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.chat-favorites__load-more {
+  align-self: center;
+  padding: 6px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  font-size: 13px;
+  cursor: pointer;
+}
+
 .chat-msg-area__reaction-grid {
   position: fixed;
   z-index: var(--z-overlay-emoji);

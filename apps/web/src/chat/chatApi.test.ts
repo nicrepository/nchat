@@ -11,7 +11,9 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import {
+  favoriteMessage,
   fetchChannelMessages,
+  fetchFavorites,
   fetchAllowedReactionEmojis,
   fetchChannels,
   fetchDMMessages,
@@ -22,6 +24,7 @@ import {
   postChannelMessage,
   postDMMessage,
   resetAllowedReactionEmojisCache,
+  unfavoriteMessage,
 } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -695,5 +698,106 @@ describe("messagesPath", () => {
     expect(ch).not.toBe(dm);
     expect(ch).toContain("/channels/");
     expect(dm).toContain("/dm/");
+  });
+});
+
+// ── Favorites (RF-06) ─────────────────────────────────────────────────────────
+
+describe("favoriteMessage / unfavoriteMessage", () => {
+  it("POSTs to the favorite path with the encoded message ID", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await favoriteMessage("msg/1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg%2F1/favorite", {
+      method: "POST",
+      signal: undefined,
+    });
+  });
+
+  it("DELETEs the favorite path", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await unfavoriteMessage("msg-1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg-1/favorite", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(favoriteMessage("msg-1")).rejects.toThrow("boom");
+    await expect(unfavoriteMessage("msg-1")).rejects.toThrow("boom");
+  });
+});
+
+describe("fetchFavorites", () => {
+  const favoriteResponse = {
+    data: {
+      favorites: [
+        {
+          message: {
+            id: "msg-1",
+            sender_id: "user-1",
+            sender_display_name: "Ana",
+            kind: "user",
+            body_text: "olá",
+            body_format: "v2",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            updated_at: "2025-01-15T10:00:00Z",
+            is_favorited: true,
+          },
+          channel_id: "ch-1",
+          favorited_at: "2025-02-01T12:00:00Z",
+        },
+        {
+          message: {
+            id: "msg-2",
+            sender_id: "user-2",
+            kind: "user",
+            is_removed: true,
+            status: "deleted",
+            created_at: "2025-01-10T10:00:00Z",
+            updated_at: "2025-01-10T10:00:00Z",
+          },
+          dm_conversation_id: "dm-1",
+          favorited_at: "2025-01-20T12:00:00Z",
+        },
+      ],
+      next_cursor: "cursor-abc",
+    },
+  };
+
+  it("maps favorites, source IDs, and next cursor", async () => {
+    mockAuthFetch.mockResolvedValue(favoriteResponse);
+    const page = await fetchFavorites();
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/favorites", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(page.nextCursor).toBe("cursor-abc");
+    expect(page.favorites).toHaveLength(2);
+    expect(page.favorites[0]).toMatchObject({
+      channelId: "ch-1",
+      dmConversationId: "",
+      favoritedAt: "2025-02-01T12:00:00Z",
+    });
+    expect(page.favorites[0].message).toMatchObject({ id: "msg-1", isFavorited: true });
+    expect(page.favorites[1]).toMatchObject({ channelId: "", dmConversationId: "dm-1" });
+    expect(page.favorites[1].message).toMatchObject({ isRemoved: true, status: "deleted" });
+  });
+
+  it("appends the before cursor as a query param", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { favorites: [] } });
+    const page = await fetchFavorites("cur|sor");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/favorites?before=cur%7Csor", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(page).toEqual({ favorites: [], nextCursor: "" });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(fetchFavorites()).rejects.toThrow("boom");
   });
 });

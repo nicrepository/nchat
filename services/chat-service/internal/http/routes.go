@@ -11,5 +11,7 @@ const (
 	RouteDMMessages            = "/api/chat/dm/{conversationID}/messages"
 	RouteDMMessage             = "/api/chat/dm/{conversationID}/messages/{messageID}"
 	RouteAllowedReactionEmojis = "/api/chat/reactions/allowed-emojis"
+	RouteMessageFavorite       = "/api/chat/messages/{messageID}/favorite"
+	RouteFavorites             = "/api/chat/favorites"
 	RouteWS                    = "/api/chat/ws"
 )

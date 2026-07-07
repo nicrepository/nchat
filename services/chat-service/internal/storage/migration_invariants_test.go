@@ -290,3 +290,26 @@ func TestChatMigration_AddsMessageReactionLookupIndex(t *testing.T) {
 		t.Fatal("reaction lookup index migration must have a schema-qualified rollback")
 	}
 }
+
+func TestChatMigration_AddsMessageFavoritesWithRollback(t *testing.T) {
+	migration := readChatMigration(t, "000010_message_favorites.up.sql")
+	for _, expected := range []string{
+		"CREATE TABLE chat.message_favorites",
+		"FOREIGN KEY (user_id)",
+		"REFERENCES auth.users (id) ON DELETE CASCADE",
+		"FOREIGN KEY (message_id)",
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+		"PRIMARY KEY (user_id, message_id)",
+		"CREATE INDEX message_favorites_user_created_idx",
+		"ON chat.message_favorites (user_id, created_at DESC, message_id DESC)",
+		"CREATE INDEX message_favorites_message_id_idx",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("favorites migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000010_message_favorites.down.sql")
+	if !strings.Contains(down, "DROP TABLE IF EXISTS chat.message_favorites") || strings.Contains(strings.ToUpper(down), "DROP SCHEMA") {
+		t.Fatal("favorites rollback must only drop message_favorites")
+	}
+}

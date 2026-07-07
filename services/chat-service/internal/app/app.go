@@ -86,6 +86,7 @@ func New(cfg config.Config) *App {
 	var dmStore *storage.PGXDMStore
 	var mentionCache *storage.ValkeyMentionLabelCache
 	var reactionSvc *service.ReactionService
+	var favoriteSvc *service.FavoriteService
 
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -101,6 +102,7 @@ func New(cfg config.Config) *App {
 			dmStore = storage.NewPGXDMStore(pool)
 			messages := storage.NewPGXMessageStore(pool)
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
+			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
@@ -115,6 +117,9 @@ func New(cfg config.Config) *App {
 	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc, nil)
 	if mentionSvc != nil {
 		messageHandler = httpapi.NewMessageHandler(workspaceStore, messageSvc, mentionSvc)
+	}
+	if favoriteSvc != nil {
+		messageHandler = messageHandler.WithFavorites(favoriteSvc)
 	}
 
 	// Hub and presence are always created so their lifecycle is always managed

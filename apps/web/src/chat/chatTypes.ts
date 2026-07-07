@@ -70,6 +70,8 @@ export interface Message {
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
   reactions: MessageReaction[];
+  /** True when the current user favorited this message (RF-06, private per user). */
+  isFavorited: boolean;
 }
 
 export interface MessageReaction {
@@ -80,6 +82,23 @@ export interface MessageReaction {
 
 export interface MessagePage {
   messages: Message[];
+  /** Opaque cursor; non-empty when an older page is available. */
+  nextCursor: string;
+}
+
+// ── Favorites (RF-06) ────────────────────────────────────────────────────────
+
+export interface FavoriteItem {
+  message: Message;
+  /** Non-empty when the message belongs to a channel. */
+  channelId: string;
+  /** Non-empty when the message belongs to a DM conversation. */
+  dmConversationId: string;
+  favoritedAt: string; // ISO 8601
+}
+
+export interface FavoritesPage {
+  favorites: FavoriteItem[];
   /** Opaque cursor; non-empty when an older page is available. */
   nextCursor: string;
 }
