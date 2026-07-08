@@ -257,6 +257,84 @@
   font-variation-settings: "FILL" 1;
 }
 
+.chat-msg-area__pin--active .material-symbols-outlined {
+  color: var(--color-accent, #4a7dff);
+  font-variation-settings: "FILL" 1;
+}
+
+/* ── Mensagens fixadas / pins (RF-05) ───────────────────────────────────── */
+
+.chat-msg-area__pins {
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  background: var(--color-surface-muted, #f7f8fa);
+}
+
+.chat-msg-area__pins-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary, #4b5563);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-msg-area__pins-toggle .material-symbols-outlined {
+  font-size: 18px;
+  color: var(--color-accent, #4a7dff);
+}
+
+.chat-msg-area__pins-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.chat-msg-area__pins-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.chat-msg-area__pins-item:hover {
+  background: var(--color-surface, #fff);
+}
+
+.chat-msg-area__pins-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--color-text, #111827);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-msg-area__pins-sender {
+  font-weight: 600;
+}
+
+.chat-msg-area__pins-item button {
+  flex: none;
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary, #6b7280);
+  cursor: pointer;
+}
+
+.chat-msg-area__pins-item button .material-symbols-outlined {
+  font-size: 18px;
+}
+
 /* ── Meus favoritos (RF-06) ─────────────────────────────────────────────── */
 
 .chat-favorites {

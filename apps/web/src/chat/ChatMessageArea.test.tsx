@@ -43,6 +43,9 @@ const {
   mockFetchAllowedReactionEmojis,
   mockFavoriteMessage,
   mockUnfavoriteMessage,
+  mockFetchChannelPins,
+  mockPinMessage,
+  mockUnpinMessage,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -62,6 +65,9 @@ const {
   mockFetchAllowedReactionEmojis: vi.fn<() => Promise<string[]>>(),
   mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
+  mockFetchChannelPins: vi.fn<(channelId: string, signal?: AbortSignal) => Promise<unknown[]>>(),
+  mockPinMessage: vi.fn<(channelId: string, messageId: string) => Promise<void>>(),
+  mockUnpinMessage: vi.fn<(channelId: string, messageId: string) => Promise<void>>(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: unknown) => void) | null,
@@ -86,6 +92,10 @@ vi.mock("./chatApi", () => ({
   fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
   unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
+  fetchChannelPins: (channelId: string, signal?: AbortSignal) =>
+    mockFetchChannelPins(channelId, signal),
+  pinMessage: (channelId: string, messageId: string) => mockPinMessage(channelId, messageId),
+  unpinMessage: (channelId: string, messageId: string) => mockUnpinMessage(channelId, messageId),
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
@@ -198,6 +208,9 @@ beforeEach(() => {
     "😍",
     "🤔",
   ]);
+  mockFetchChannelPins.mockResolvedValue([]);
+  mockPinMessage.mockResolvedValue(undefined);
+  mockUnpinMessage.mockResolvedValue(undefined);
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
 });
@@ -2176,5 +2189,52 @@ describe("ChatMessageArea — favoritar mensagem", () => {
       "aria-pressed",
       "false",
     );
+  });
+});
+
+describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
+  it("pins a channel message via REST and reloads pins", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchChannelPins
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        {
+          message: makeMessage({ id: "m1", bodyText: "fixe-me" }),
+          pinnedByUserId: "mod-1",
+          pinnedAt: new Date().toISOString(),
+        },
+      ]);
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    const pinBtn = screen.getByRole("button", { name: "Fixar mensagem no canal" });
+    await userEvent.click(pinBtn);
+
+    expect(mockPinMessage).toHaveBeenCalledWith("geral", "m1");
+    // The pins bar appears once the reload resolves with the new pin.
+    expect(await screen.findByTestId("chat-pins")).toHaveTextContent("1 mensagem fixada");
+  });
+
+  it("shows a permission error when a non-moderator pin is rejected", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockPinMessage.mockRejectedValue(new Error("forbidden"));
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    await userEvent.click(screen.getByRole("button", { name: "Fixar mensagem no canal" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/moderador/i);
+  });
+
+  it("does not render the pin action in DMs", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMArea();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+
+    expect(screen.queryByRole("button", { name: "Fixar mensagem no canal" })).toBeNull();
+    expect(mockFetchChannelPins).not.toHaveBeenCalled();
   });
 });

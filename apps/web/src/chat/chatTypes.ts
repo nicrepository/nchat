@@ -102,3 +102,12 @@ export interface FavoritesPage {
   /** Opaque cursor; non-empty when an older page is available. */
   nextCursor: string;
 }
+
+// ── Pins (RF-05) ─────────────────────────────────────────────────────────────
+
+export interface PinnedItem {
+  message: Message;
+  /** User who pinned the message. */
+  pinnedByUserId: string;
+  pinnedAt: string; // ISO 8601
+}

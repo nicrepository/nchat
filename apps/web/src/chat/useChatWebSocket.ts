@@ -77,6 +77,18 @@ export interface WSReactionUpdatedEvent {
   };
 }
 
+export interface WSPinUpdatedEvent {
+  type: "pin.updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+  pin?: {
+    message_id: string;
+    actor_user_id: string;
+    pinned: boolean;
+  };
+}
+
 export interface WSClientErrorEvent {
   type: "error";
   code: string;
@@ -88,6 +100,7 @@ interface UseChatWebSocketOptions {
   targetId: string;
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+  onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
 }
 
@@ -100,16 +113,19 @@ export function useChatWebSocket({
   targetId,
   onMessageCreated,
   onReactionUpdated,
+  onPinUpdated,
   onReactionError,
 }: UseChatWebSocketOptions): ChatWebSocketActions {
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
   const onReactionRef = useRef(onReactionUpdated);
+  const onPinRef = useRef(onPinUpdated);
   const onReactionErrorRef = useRef(onReactionError);
   const socketRef = useRef<WebSocket | null>(null);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
     onReactionRef.current = onReactionUpdated;
+    onPinRef.current = onPinUpdated;
     onReactionErrorRef.current = onReactionError;
   });
 
@@ -196,6 +212,8 @@ export function useChatWebSocket({
           onMessageRef.current(d as unknown as WSMessageCreatedEvent);
         } else if (d["type"] === "reaction.updated") {
           onReactionRef.current?.(d as unknown as WSReactionUpdatedEvent);
+        } else if (d["type"] === "pin.updated") {
+          onPinRef.current?.(d as unknown as WSPinUpdatedEvent);
         }
       };
 

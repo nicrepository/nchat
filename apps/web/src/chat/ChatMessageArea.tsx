@@ -30,8 +30,9 @@ import { useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
 import type { ChatOutletContext } from "./ChatShell";
-import type { Message } from "./chatTypes";
+import type { Message, PinnedItem } from "./chatTypes";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
+import { usePins } from "./usePins";
 import RichTextRenderer from "./RichTextRenderer";
 import ChatComposer from "./ChatComposer";
 import { fetchAllowedReactionEmojis } from "./chatApi";
@@ -286,6 +287,10 @@ interface MessageBubbleProps {
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  /** RF-05: pin/unpin action. Only provided for channels; absent for DMs. */
+  onTogglePin?: (messageId: string, pin: boolean) => void;
+  /** RF-05: whether this message is currently pinned in the channel. */
+  isPinned?: boolean;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
   reactionMenuVisible: boolean;
@@ -300,6 +305,8 @@ function MessageReactions({
   bubbleRef,
   onToggleReaction,
   onToggleFavorite,
+  onTogglePin,
+  isPinned = false,
   allowedReactionEmojis,
   recentReactionEmojis,
   reactionMenuVisible,
@@ -311,6 +318,8 @@ function MessageReactions({
   | "isMine"
   | "onToggleReaction"
   | "onToggleFavorite"
+  | "onTogglePin"
+  | "isPinned"
   | "allowedReactionEmojis"
   | "recentReactionEmojis"
   | "reactionMenuVisible"
@@ -452,6 +461,19 @@ function MessageReactions({
                 star
               </span>
             </button>
+            {onTogglePin && (
+              <button
+                type="button"
+                className={isPinned ? "chat-msg-area__pin--active" : undefined}
+                aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem no canal"}
+                aria-pressed={isPinned}
+                onClick={() => onTogglePin(message.id, !isPinned)}
+              >
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  keep
+                </span>
+              </button>
+            )}
             <button
               ref={anchorRef}
               type="button"
@@ -518,6 +540,8 @@ function MessageBubble({
   isGrouped = false,
   onToggleReaction,
   onToggleFavorite,
+  onTogglePin,
+  isPinned = false,
   allowedReactionEmojis,
   recentReactionEmojis,
   reactionMenuVisible,
@@ -564,6 +588,8 @@ function MessageBubble({
           bubbleRef={bubbleRef}
           onToggleReaction={onToggleReaction}
           onToggleFavorite={onToggleFavorite}
+          onTogglePin={onTogglePin}
+          isPinned={isPinned}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
           reactionMenuVisible={reactionMenuVisible || pickerOpen}
@@ -584,6 +610,10 @@ interface MessageListProps {
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  /** RF-05: pin/unpin action. Only provided for channels; absent for DMs. */
+  onTogglePin?: (messageId: string, pin: boolean) => void;
+  /** RF-05: set of currently-pinned message IDs in this channel. */
+  pinnedIds?: Set<string>;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
 }
@@ -597,6 +627,8 @@ function MessageList({
   onLoadMore,
   onToggleReaction,
   onToggleFavorite,
+  onTogglePin,
+  pinnedIds,
   allowedReactionEmojis,
   recentReactionEmojis,
 }: MessageListProps) {
@@ -762,6 +794,8 @@ function MessageList({
             isGrouped={item.isGrouped}
             onToggleReaction={onToggleReaction}
             onToggleFavorite={onToggleFavorite}
+            onTogglePin={onTogglePin}
+            isPinned={pinnedIds?.has(item.message.id) ?? false}
             allowedReactionEmojis={allowedReactionEmojis}
             recentReactionEmojis={recentReactionEmojis}
             reactionMenuVisible={hoveredMessageId === item.message.id}
@@ -773,6 +807,54 @@ function MessageList({
       )}
       <div ref={bottomRef} />
     </div>
+  );
+}
+
+// ── Pinned messages bar (RF-05) ──────────────────────────────────────────────
+
+interface PinnedBarProps {
+  pins: PinnedItem[];
+  onUnpin: (messageId: string, pin: boolean) => void;
+}
+
+function PinnedBar({ pins, onUnpin }: PinnedBarProps) {
+  const [expanded, setExpanded] = useState(false);
+  if (pins.length === 0) return null;
+  return (
+    <section className="chat-msg-area__pins" aria-label="Mensagens fixadas" data-testid="chat-pins">
+      <button
+        type="button"
+        className="chat-msg-area__pins-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          keep
+        </span>
+        {pins.length === 1 ? "1 mensagem fixada" : `${pins.length} mensagens fixadas`}
+      </button>
+      {expanded && (
+        <ul className="chat-msg-area__pins-list">
+          {pins.map((pin) => (
+            <li key={pin.message.id} className="chat-msg-area__pins-item">
+              <span className="chat-msg-area__pins-text">
+                <span className="chat-msg-area__pins-sender">{senderLabel(pin.message)}: </span>
+                {pin.message.isRemoved ? "Mensagem removida." : pin.message.bodyText}
+              </span>
+              <button
+                type="button"
+                aria-label="Desafixar mensagem"
+                onClick={() => onUnpin(pin.message.id, false)}
+              >
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  close
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -835,11 +917,16 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [allowedReactionEmojis, ctx.currentUserId],
   );
 
+  // RF-05: pins are per-channel; DMs pass an empty id and usePins stays idle.
+  const pinChannelId = kind === "channel" ? targetId : "";
+  const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinChannelId);
+
   const { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite } = useMessages({
     kind,
     targetId,
     currentUserId: ctx.currentUserId,
     onOwnReactionConfirmed: rememberReaction,
+    onPinUpdated: reloadPins,
   });
 
   useEffect(() => {
@@ -891,6 +978,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         <HeaderDM name={resolvedName} />
       )}
 
+      {kind === "channel" && <PinnedBar pins={pins} onUnpin={togglePin} />}
+
       {state.status === "loading" && <LoadingSkeleton />}
 
       {state.status === "error" && <ErrorState onRetry={retry} />}
@@ -909,6 +998,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onLoadMore={loadMore}
           onToggleReaction={handleToggleReaction}
           onToggleFavorite={toggleFavorite}
+          onTogglePin={kind === "channel" ? togglePin : undefined}
+          pinnedIds={pinnedIds}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
         />
@@ -932,10 +1023,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         </div>
       )}
 
-      {(reactionInputError || state.actionError) && (
+      {(reactionInputError || state.actionError || pinError) && (
         <div className="chat-msg-area__reaction-error" role="alert">
           <IconWarning />
-          {reactionInputError || state.actionError}
+          {reactionInputError || state.actionError || pinError}
         </div>
       )}
 

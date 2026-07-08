@@ -19,6 +19,7 @@ import type {
   FavoritesPage,
   Message,
   MessagePage,
+  PinnedItem,
 } from "./chatTypes";
 import type { MentionCandidate } from "./chatTypes";
 
@@ -166,6 +167,16 @@ interface FavoriteResponse {
 
 interface FavoritesEnvelope {
   data: { favorites: FavoriteResponse[]; next_cursor?: string };
+}
+
+interface PinResponse {
+  message: MessageResponse;
+  pinned_by_user_id: string;
+  pinned_at: string;
+}
+
+interface PinsEnvelope {
+  data: { pins: PinResponse[] };
 }
 
 interface MessageListData {
@@ -380,4 +391,46 @@ export async function fetchDMMessage(
   const url = `${messagesPath("dm", conversationId)}/${encodeURIComponent(messageId)}`;
   const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
   return mapMessage(res.data);
+}
+
+// ── Pins API (RF-05) ──────────────────────────────────────────────────────────
+
+function pinPath(channelId: string, messageId: string): string {
+  return `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}/pin`;
+}
+
+/** Pins a message for the whole channel. Requires an elevated role (server 403). Idempotent (204). */
+export async function pinMessage(
+  channelId: string,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch<void>(pinPath(channelId, messageId), { method: "POST", signal });
+}
+
+/** Unpins a channel message. Requires an elevated role (server 403). Idempotent (204). */
+export async function unpinMessage(
+  channelId: string,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch<void>(pinPath(channelId, messageId), { method: "DELETE", signal });
+}
+
+function mapPin(r: PinResponse): PinnedItem {
+  return {
+    message: mapMessage(r.message),
+    pinnedByUserId: r.pinned_by_user_id,
+    pinnedAt: r.pinned_at,
+  };
+}
+
+/** Fetches a channel's pinned messages, newest pin first. */
+export async function fetchChannelPins(
+  channelId: string,
+  signal?: AbortSignal,
+): Promise<PinnedItem[]> {
+  const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/pins`;
+  const res = await authenticatedFetch<PinsEnvelope>(url, { method: "GET", signal });
+  return (res.data.pins ?? []).map(mapPin);
 }
