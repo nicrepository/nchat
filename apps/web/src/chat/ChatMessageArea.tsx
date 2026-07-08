@@ -287,9 +287,9 @@ interface MessageBubbleProps {
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
-  /** RF-05: pin/unpin action. Only provided for channels; absent for DMs. */
+  /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
-  /** RF-05: whether this message is currently pinned in the channel. */
+  /** RF-05: whether this message is currently pinned in the active target. */
   isPinned?: boolean;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
@@ -465,7 +465,7 @@ function MessageReactions({
               <button
                 type="button"
                 className={isPinned ? "chat-msg-area__pin--active" : undefined}
-                aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem no canal"}
+                aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
                 aria-pressed={isPinned}
                 onClick={() => onTogglePin(message.id, !isPinned)}
               >
@@ -610,9 +610,9 @@ interface MessageListProps {
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
-  /** RF-05: pin/unpin action. Only provided for channels; absent for DMs. */
+  /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
-  /** RF-05: set of currently-pinned message IDs in this channel. */
+  /** RF-05: set of currently-pinned message IDs in this target. */
   pinnedIds?: Set<string>;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
@@ -917,9 +917,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [allowedReactionEmojis, ctx.currentUserId],
   );
 
-  // RF-05: pins are per-channel; DMs pass an empty id and usePins stays idle.
-  const pinChannelId = kind === "channel" ? targetId : "";
-  const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinChannelId);
+  const pinTarget = useMemo(() => (targetId ? { kind, id: targetId } : null), [kind, targetId]);
+  const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinTarget);
 
   const { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite } = useMessages({
     kind,
@@ -978,7 +977,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         <HeaderDM name={resolvedName} />
       )}
 
-      {kind === "channel" && <PinnedBar pins={pins} onUnpin={togglePin} />}
+      <PinnedBar pins={pins} onUnpin={togglePin} />
 
       {state.status === "loading" && <LoadingSkeleton />}
 
@@ -998,7 +997,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onLoadMore={loadMore}
           onToggleReaction={handleToggleReaction}
           onToggleFavorite={toggleFavorite}
-          onTogglePin={kind === "channel" ? togglePin : undefined}
+          onTogglePin={togglePin}
           pinnedIds={pinnedIds}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}

@@ -1,15 +1,14 @@
 /**
- * usePins — RF-05 channel pinned-messages state.
+ * usePins — RF-05 pinned-messages state.
  *
- * Owns the pin list for the active channel: initial fetch, a pinnedIds set for
+ * Owns the pin list for the active target: initial fetch, a pinnedIds set for
  * O(1) per-message lookup, a togglePin action (REST round-trip, then reload),
  * and a reload() the caller wires to the pin.updated WebSocket event so pins
- * stay live for every channel member. DMs have no pins — pass an empty channelId
- * and the hook stays idle.
+ * stay live for every readable channel/DM member. Pass null and the hook stays idle.
  *
  * Security: no tokens handled here (authenticatedFetch owns auth); the server
- * enforces role (403) and channel read access (404). A rejected toggle surfaces
- * a transient error and leaves the list untouched.
+ * enforces target read access. A rejected toggle surfaces a transient defensive
+ * error and leaves the list untouched.
  *
  * State lives in a reducer (not useState) so the load effect can dispatch
  * synchronously without the cascading-render lint rule, mirroring useChatSidebar.
@@ -17,7 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 
-import { fetchChannelPins, pinMessage, unpinMessage } from "./chatApi";
+import { fetchPins, pinMessage, unpinMessage, type PinTarget } from "./chatApi";
 import type { PinnedItem } from "./chatTypes";
 
 interface PinsState {
@@ -49,29 +48,35 @@ function reducer(state: PinsState, action: Action): PinsState {
 export interface UsePinsResult {
   pins: PinnedItem[];
   pinnedIds: Set<string>;
-  /** Transient error for a rejected pin/unpin (e.g. 403 for non-moderators). */
+  /** Transient defensive error for a rejected pin/unpin. */
   error: string | null;
   togglePin: (messageId: string, pin: boolean) => void;
   reload: () => void;
 }
 
-export function usePins(channelId: string): UsePinsResult {
+export function usePins(target: PinTarget | null): UsePinsResult {
   const [state, dispatch] = useReducer(reducer, initialState);
   const abortRef = useRef<AbortController | null>(null);
+  const targetKind = target?.kind ?? "";
+  const targetId = target?.id ?? "";
+  const resolvedTarget = useMemo<PinTarget | null>(() => {
+    if (!targetId || (targetKind !== "channel" && targetKind !== "dm")) return null;
+    return { kind: targetKind, id: targetId };
+  }, [targetKind, targetId]);
 
-  // fetch loads the channel's pins. resetFirst clears stale pins when switching
-  // channels; a toggle/WS reload keeps the current list visible until the new
+  // fetch loads the target's pins. resetFirst clears stale pins when switching
+  // targets; a toggle/WS reload keeps the current list visible until the new
   // one arrives (no blink).
-  const fetch = useCallback((id: string, resetFirst: boolean) => {
+  const fetch = useCallback((nextTarget: PinTarget | null, resetFirst: boolean) => {
     abortRef.current?.abort();
-    if (!id) {
+    if (!nextTarget?.id) {
       dispatch({ type: "reset" });
       return;
     }
     if (resetFirst) dispatch({ type: "reset" });
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    fetchChannelPins(id, ctrl.signal).then(
+    fetchPins(nextTarget, ctrl.signal).then(
       (pins) => dispatch({ type: "loaded", pins }),
       (err: unknown) => {
         if (err instanceof Error && err.name === "AbortError") return;
@@ -82,9 +87,9 @@ export function usePins(channelId: string): UsePinsResult {
   }, []);
 
   useEffect(() => {
-    fetch(channelId, true);
+    fetch(resolvedTarget, true);
     return () => abortRef.current?.abort();
-  }, [channelId, fetch]);
+  }, [resolvedTarget, fetch]);
 
   useEffect(() => {
     if (!state.error) return;
@@ -92,26 +97,27 @@ export function usePins(channelId: string): UsePinsResult {
     return () => window.clearTimeout(timer);
   }, [state.error]);
 
-  const reload = useCallback(() => fetch(channelId, false), [channelId, fetch]);
+  const reload = useCallback(() => fetch(resolvedTarget, false), [resolvedTarget, fetch]);
 
   // ponytail: no optimistic update; the REST call is cheap and reload() reflects
   // the authoritative order/cap. A double click just repeats an idempotent call.
   const togglePin = useCallback(
     (messageId: string, pin: boolean) => {
-      if (!channelId) return;
+      if (!resolvedTarget) return;
+      const currentTarget = resolvedTarget;
       const apply = pin ? pinMessage : unpinMessage;
-      void apply(channelId, messageId)
-        .then(() => fetch(channelId, false))
+      void apply(currentTarget, messageId)
+        .then(() => fetch(currentTarget, false))
         .catch(() => {
           dispatch({
             type: "error",
             error: pin
-              ? "Não foi possível fixar a mensagem. Você precisa de permissão de moderador."
+              ? "Não foi possível fixar a mensagem."
               : "Não foi possível desafixar a mensagem.",
           });
         });
     },
-    [channelId, fetch],
+    [resolvedTarget, fetch],
   );
 
   const pinnedIds = useMemo(() => new Set(state.pins.map((p) => p.message.id)), [state.pins]);

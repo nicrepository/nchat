@@ -176,8 +176,10 @@ interface PinResponse {
 }
 
 interface PinsEnvelope {
-  data: { pins: PinResponse[] };
+  data: { pins: PinResponse[]; total_count?: number };
 }
+
+export type PinTarget = { kind: "channel" | "dm"; id: string };
 
 interface MessageListData {
   messages: MessageResponse[];
@@ -395,26 +397,31 @@ export async function fetchDMMessage(
 
 // ── Pins API (RF-05) ──────────────────────────────────────────────────────────
 
-function pinPath(channelId: string, messageId: string): string {
-  return `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}/pin`;
+function targetBasePath(target: PinTarget): string {
+  const segment = target.kind === "channel" ? "channels" : "dm";
+  return `${CHAT_BASE}/${segment}/${encodeURIComponent(target.id)}`;
 }
 
-/** Pins a message for the whole channel. Requires an elevated role (server 403). Idempotent (204). */
+function pinPath(target: PinTarget, messageId: string): string {
+  return `${targetBasePath(target)}/messages/${encodeURIComponent(messageId)}/pin`;
+}
+
+/** Pins a message for the whole channel/DM. Idempotent (204). */
 export async function pinMessage(
-  channelId: string,
+  target: PinTarget,
   messageId: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  await authenticatedFetch<void>(pinPath(channelId, messageId), { method: "POST", signal });
+  await authenticatedFetch<void>(pinPath(target, messageId), { method: "POST", signal });
 }
 
-/** Unpins a channel message. Requires an elevated role (server 403). Idempotent (204). */
+/** Unpins a channel/DM message. Idempotent (204). */
 export async function unpinMessage(
-  channelId: string,
+  target: PinTarget,
   messageId: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  await authenticatedFetch<void>(pinPath(channelId, messageId), { method: "DELETE", signal });
+  await authenticatedFetch<void>(pinPath(target, messageId), { method: "DELETE", signal });
 }
 
 function mapPin(r: PinResponse): PinnedItem {
@@ -425,12 +432,9 @@ function mapPin(r: PinResponse): PinnedItem {
   };
 }
 
-/** Fetches a channel's pinned messages, newest pin first. */
-export async function fetchChannelPins(
-  channelId: string,
-  signal?: AbortSignal,
-): Promise<PinnedItem[]> {
-  const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/pins`;
+/** Fetches a target's pinned messages, newest pin first. */
+export async function fetchPins(target: PinTarget, signal?: AbortSignal): Promise<PinnedItem[]> {
+  const url = `${targetBasePath(target)}/pins`;
   const res = await authenticatedFetch<PinsEnvelope>(url, { method: "GET", signal });
   return (res.data.pins ?? []).map(mapPin);
 }

@@ -362,7 +362,7 @@ interface UseMessagesOptions {
   targetId: string;
   currentUserId: string;
   onOwnReactionConfirmed?: (emoji: string) => void;
-  /** RF-05: called on a pin.updated event for the active channel (refetch pins). */
+  /** RF-05: called on a pin.updated event for the active target (refetch pins). */
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
 }
 
@@ -687,10 +687,10 @@ export function useMessages({
   });
   const handlePinUpdated = useCallback(
     (event: WSPinUpdatedEvent) => {
-      if (event.target_id !== targetId) return;
+      if (event.target_type !== kind || event.target_id !== targetId) return;
       onPinUpdatedRef.current?.(event);
     },
-    [targetId],
+    [kind, targetId],
   );
 
   const { toggleReaction: sendReactionToggle } = useChatWebSocket({
