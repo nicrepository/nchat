@@ -345,14 +345,14 @@ func (h *Hub) PublishReactionUpdated(ctx context.Context, workspaceID, actorUser
 }
 
 // PublishPinUpdated broadcasts a pin.updated event (RF-05) to all clients
-// subscribed to the channel. Like message.created, local delivery is attempted
+// subscribed to the target. Like message.created, local delivery is attempted
 // first and re-checks authorization per subscriber; distributed publish via the
 // bus is best-effort. The event is route-plus-flag only — it carries no message
 // body, so clients refetch the pin list on receipt.
-func (h *Hub) PublishPinUpdated(ctx context.Context, workspaceID, channelID, messageID, actorUserID string, pinned bool) {
+func (h *Hub) PublishPinUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID, actorUserID string, pinned bool) {
 	evt := Event{
 		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypePinUpdated,
-		WorkspaceID: workspaceID, TargetType: TargetTypeChannel, TargetID: channelID,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
 		MessageID:        messageID,
 		Pin:              &PinEventPayload{MessageID: messageID, ActorUserID: actorUserID, Pinned: pinned},
 		EventID:          uuid.New().String(),
@@ -371,7 +371,7 @@ func (h *Hub) PublishPinUpdated(ctx context.Context, workspaceID, channelID, mes
 		return
 	}
 	if err := h.bus.Publish(ctx, evt); err != nil {
-		h.logger.WarnContext(ctx, "ws: pin bus publish failed", "target_type", string(TargetTypeChannel), "error", err)
+		h.logger.WarnContext(ctx, "ws: pin bus publish failed", "target_type", string(targetType), "error", err)
 	}
 }
 
@@ -619,11 +619,13 @@ func canonicalizeReactionEvent(evt Event) (Event, bool) {
 	return evt, true
 }
 
-// canonicalizePinEvent validates a remote pin.updated event. Pins are
-// channel-scoped only; the actor is canonicalized to lowercase UUID. The tiny
-// route-plus-flag payload is retained (no aggregate to recompute).
+// canonicalizePinEvent validates a remote pin.updated event. The actor is
+// canonicalized to lowercase UUID. The tiny route-plus-flag payload is retained.
 func canonicalizePinEvent(evt Event) (Event, bool) {
-	if evt.TargetType != TargetTypeChannel || evt.Pin == nil || evt.Pin.MessageID != evt.MessageID {
+	if evt.Pin == nil || evt.Pin.MessageID != evt.MessageID {
+		return Event{}, false
+	}
+	if evt.TargetType != TargetTypeChannel && evt.TargetType != TargetTypeDM {
 		return Event{}, false
 	}
 	actorID, err := uuid.Parse(evt.Pin.ActorUserID)

@@ -24,6 +24,9 @@ const msgGetSingleRateLimit = 120
 // user may make per minute across all channels and DMs.
 const msgPostRateLimit = 60
 
+// pinActionRateLimit is the maximum number of pin/unpin writes per user/minute.
+const pinActionRateLimit = 10
+
 // mentionSearchRateLimit limits autocomplete enumeration independently from messages.
 const mentionSearchRateLimit = 30
 
@@ -57,11 +60,13 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	// msgListLimiter: guards paginated GET list endpoints.
 	// msgGetSingleLimiter: guards GET single-message fallback used by realtime WS.
 	// msgPostLimiter: guards POST send-message (write endpoint).
+	// pinActionLimiter: guards pin/unpin separately from normal message writes.
 	// GC goroutines run for the process lifetime; tests that build a limiter
 	// explicitly use t.Cleanup(limiter.Stop).
 	msgListLimiter := NewUserRateLimiter(msgListRateLimit, time.Minute)
 	msgGetSingleLimiter := NewUserRateLimiter(msgGetSingleRateLimit, time.Minute)
 	msgPostLimiter := NewUserRateLimiter(msgPostRateLimit, time.Minute)
+	pinActionLimiter := NewUserRateLimiter(pinActionRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
 
 	// Static, non-sensitive configuration; authentication still prevents adding
@@ -108,18 +113,25 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListFavorites)),
 	))
 
-	// Pin endpoints (RF-05): channel-wide pinned messages. Writes require an
-	// elevated role (enforced in the service) and share msgPostLimiter so
-	// pin/unpin cannot exceed the general write quota (abuse ceiling). The list
-	// is visible to any member who can read the channel.
+	// Pin endpoints (RF-05): channel/DM pinned messages. Writes use current read
+	// access and a dedicated pin-action budget; lists use the read budget.
 	mux.Handle("POST "+RouteChannelMessagePin, authMiddleware(
-		msgPostLimiter.Middleware(http.HandlerFunc(messages.PinMessage)),
+		pinActionLimiter.Middleware(http.HandlerFunc(messages.PinMessage)),
 	))
 	mux.Handle("DELETE "+RouteChannelMessagePin, authMiddleware(
-		msgPostLimiter.Middleware(http.HandlerFunc(messages.UnpinMessage)),
+		pinActionLimiter.Middleware(http.HandlerFunc(messages.UnpinMessage)),
 	))
 	mux.Handle("GET "+RouteChannelPins, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListPins)),
+	))
+	mux.Handle("POST "+RouteDMMessagePin, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(messages.PinDMMessage)),
+	))
+	mux.Handle("DELETE "+RouteDMMessagePin, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(messages.UnpinDMMessage)),
+	))
+	mux.Handle("GET "+RouteDMPins, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ListDMPins)),
 	))
 
 	// WebSocket endpoint: WSTokenMiddleware extracts a Bearer token from

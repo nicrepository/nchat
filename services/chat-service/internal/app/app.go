@@ -104,10 +104,7 @@ func New(cfg config.Config) *App {
 			messages := storage.NewPGXMessageStore(pool)
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
-			pinSvc = service.NewPinService(
-				storage.NewPGXPinStore(pool),
-				service.NewPermissionService(memberStore, channelStore),
-			)
+			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
@@ -263,8 +260,8 @@ func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID,
 }
 
 // PublishPinUpdated adapts the hub for the RF-05 pin broadcaster interface.
-func (b *hubBroadcaster) PublishPinUpdated(ctx context.Context, workspaceID, channelID, messageID, actorUserID string, pinned bool) {
-	b.hub.PublishPinUpdated(ctx, workspaceID, channelID, messageID, actorUserID, pinned)
+func (b *hubBroadcaster) PublishPinUpdated(ctx context.Context, workspaceID, targetType, targetID, messageID, actorUserID string, pinned bool) {
+	b.hub.PublishPinUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, actorUserID, pinned)
 }
 
 func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {

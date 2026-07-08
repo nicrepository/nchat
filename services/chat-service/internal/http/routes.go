@@ -15,5 +15,7 @@ const (
 	RouteFavorites             = "/api/chat/favorites"
 	RouteChannelMessagePin     = "/api/chat/channels/{channelID}/messages/{messageID}/pin"
 	RouteChannelPins           = "/api/chat/channels/{channelID}/pins"
+	RouteDMMessagePin          = "/api/chat/dm/{conversationID}/messages/{messageID}/pin"
+	RouteDMPins                = "/api/chat/dm/{conversationID}/pins"
 	RouteWS                    = "/api/chat/ws"
 )

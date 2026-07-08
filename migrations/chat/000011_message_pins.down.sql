@@ -1,5 +1,5 @@
 BEGIN;
 
-DROP TABLE IF EXISTS chat.message_pins;
+DROP TABLE IF EXISTS chat.message_pins CASCADE;
 
 COMMIT;

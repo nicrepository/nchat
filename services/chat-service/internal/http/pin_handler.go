@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
-	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 )
 
@@ -14,14 +13,13 @@ import (
 type pinProvider interface {
 	Pin(ctx context.Context, in service.PinActionInput) error
 	Unpin(ctx context.Context, in service.PinActionInput) error
-	ListPins(ctx context.Context, in service.ListPinsInput) ([]domain.PinnedMessage, error)
+	ListPins(ctx context.Context, in service.ListPinsInput) (service.ListPinsOutput, error)
 }
 
-// pinBroadcaster fans a pin change out to a channel's WebSocket subscribers.
-// The hub re-checks per-subscriber channel authorization before delivery, so
-// only members who can read the channel receive the event.
+// pinBroadcaster fans a pin change out to a target's WebSocket subscribers.
+// The hub re-checks per-subscriber authorization before delivery.
 type pinBroadcaster interface {
-	PublishPinUpdated(ctx context.Context, workspaceID, channelID, messageID, actorUserID string, pinned bool)
+	PublishPinUpdated(ctx context.Context, workspaceID, targetType, targetID, messageID, actorUserID string, pinned bool)
 }
 
 // ── JSON response shapes ──────────────────────────────────────────────────────
@@ -33,7 +31,8 @@ type pinJSON struct {
 }
 
 type listPinsResponseData struct {
-	Pins []pinJSON `json:"pins"`
+	Pins       []pinJSON `json:"pins"`
+	TotalCount int       `json:"total_count"`
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -46,11 +45,10 @@ func (h *MessageHandler) checkPinDeps(w http.ResponseWriter) bool {
 	return true
 }
 
-// pinRequestContext validates the channel + message path params and resolves
+// pinRequestContext validates the target + message path params and resolves
 // the caller and workspace. Returns ok=false after writing the error response.
-func (h *MessageHandler) pinRequestContext(w http.ResponseWriter, r *http.Request) (in service.PinActionInput, ok bool) {
-	channelID := r.PathValue("channelID")
-	if !validateTargetID(w, channelID, "channel_id") {
+func (h *MessageHandler) pinRequestContext(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string) (in service.PinActionInput, ok bool) {
+	if !validateTargetID(w, targetID, targetParam) {
 		return in, false
 	}
 	messageID := r.PathValue("messageID")
@@ -68,20 +66,37 @@ func (h *MessageHandler) pinRequestContext(w http.ResponseWriter, r *http.Reques
 	}
 	// ActorUserID always from auth context — never from the payload (no body).
 	return service.PinActionInput{
-		WorkspaceID: wsID, ChannelID: channelID, MessageID: messageID, ActorUserID: userID,
+		WorkspaceID: wsID, TargetType: targetType, TargetID: targetID, MessageID: messageID, ActorUserID: userID,
 	}, true
 }
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 
 // PinMessage handles POST /api/chat/channels/{channelID}/messages/{messageID}/pin.
-// Idempotent; responds 204. Callers without an elevated role get 403; a message
-// that is not visible / not in the channel gets 404; a full channel gets 409.
+// Idempotent; responds 204. A message that is not visible / not in the channel
+// gets 404; a full channel gets 409.
 func (h *MessageHandler) PinMessage(w http.ResponseWriter, r *http.Request) {
 	if !h.checkPinDeps(w) {
 		return
 	}
-	in, ok := h.pinRequestContext(w, r)
+	in, ok := h.pinRequestContext(w, r, service.PinTargetChannel, r.PathValue("channelID"), "channel_id")
+	if !ok {
+		return
+	}
+	if err := h.pins.Pin(r.Context(), in); err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	h.broadcastPin(r.Context(), in, true)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// PinDMMessage handles POST /api/chat/dm/{conversationID}/messages/{messageID}/pin.
+func (h *MessageHandler) PinDMMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkPinDeps(w) {
+		return
+	}
+	in, ok := h.pinRequestContext(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id")
 	if !ok {
 		return
 	}
@@ -99,7 +114,7 @@ func (h *MessageHandler) UnpinMessage(w http.ResponseWriter, r *http.Request) {
 	if !h.checkPinDeps(w) {
 		return
 	}
-	in, ok := h.pinRequestContext(w, r)
+	in, ok := h.pinRequestContext(w, r, service.PinTargetChannel, r.PathValue("channelID"), "channel_id")
 	if !ok {
 		return
 	}
@@ -111,13 +126,30 @@ func (h *MessageHandler) UnpinMessage(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// broadcastPin publishes the pin change to channel subscribers. Best-effort:
+// UnpinDMMessage handles DELETE /api/chat/dm/{conversationID}/messages/{messageID}/pin.
+func (h *MessageHandler) UnpinDMMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkPinDeps(w) {
+		return
+	}
+	in, ok := h.pinRequestContext(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id")
+	if !ok {
+		return
+	}
+	if err := h.pins.Unpin(r.Context(), in); err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	h.broadcastPin(r.Context(), in, false)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// broadcastPin publishes the pin change to target subscribers. Best-effort:
 // the write already succeeded, so a nil broadcaster or bus failure is ignored.
 func (h *MessageHandler) broadcastPin(ctx context.Context, in service.PinActionInput, pinned bool) {
 	if h.pinBroadcaster == nil {
 		return
 	}
-	h.pinBroadcaster.PublishPinUpdated(ctx, in.WorkspaceID, in.ChannelID, in.MessageID, in.ActorUserID, pinned)
+	h.pinBroadcaster.PublishPinUpdated(ctx, in.WorkspaceID, in.TargetType, in.TargetID, in.MessageID, in.ActorUserID, pinned)
 }
 
 // ListPins handles GET /api/chat/channels/{channelID}/pins.
@@ -127,8 +159,20 @@ func (h *MessageHandler) ListPins(w http.ResponseWriter, r *http.Request) {
 	if !h.checkPinDeps(w) {
 		return
 	}
-	channelID := r.PathValue("channelID")
-	if !validateTargetID(w, channelID, "channel_id") {
+	h.listPins(w, r, service.PinTargetChannel, r.PathValue("channelID"), "channel_id")
+}
+
+// ListDMPins handles GET /api/chat/dm/{conversationID}/pins.
+// Requires the same read access as reading the DM messages.
+func (h *MessageHandler) ListDMPins(w http.ResponseWriter, r *http.Request) {
+	h.listPins(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id")
+}
+
+func (h *MessageHandler) listPins(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string) {
+	if !h.checkPinDeps(w) {
+		return
+	}
+	if !validateTargetID(w, targetID, targetParam) {
 		return
 	}
 	userID := GetContextUserID(r)
@@ -141,16 +185,16 @@ func (h *MessageHandler) ListPins(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pins, err := h.pins.ListPins(r.Context(), service.ListPinsInput{
-		WorkspaceID: wsID, ChannelID: channelID, ViewerID: userID,
+	out, err := h.pins.ListPins(r.Context(), service.ListPinsInput{
+		WorkspaceID: wsID, TargetType: targetType, TargetID: targetID, ViewerID: userID,
 	})
 	if err != nil {
 		mapServiceError(w, err)
 		return
 	}
 
-	resp := listPinsResponseData{Pins: make([]pinJSON, 0, len(pins))}
-	for _, pin := range pins {
+	resp := listPinsResponseData{Pins: make([]pinJSON, 0, len(out.Pins)), TotalCount: out.TotalCount}
+	for _, pin := range out.Pins {
 		resp.Pins = append(resp.Pins, pinJSON{
 			Message:        mapToMessageJSON(pin.Message),
 			PinnedByUserID: pin.PinnedByUserID,

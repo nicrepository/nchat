@@ -3,111 +3,106 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
+const (
+	PinTargetChannel = "channel"
+	PinTargetDM      = "dm"
+)
+
 // PinActionInput identifies a pin/unpin action. ActorUserID always comes from
 // the authenticated context — never from the request payload.
 type PinActionInput struct {
 	WorkspaceID string
-	ChannelID   string
+	TargetType  string
+	TargetID    string
 	MessageID   string
 	ActorUserID string
 }
 
-// ListPinsInput identifies the channel whose pins the caller wants to read.
+// ListPinsInput identifies the container whose pins the caller wants to read.
 type ListPinsInput struct {
 	WorkspaceID string
-	ChannelID   string
+	TargetType  string
+	TargetID    string
 	ViewerID    string
 }
 
-// PinService implements RF-05: channel-wide pinned messages, gated to elevated
-// roles for writes and to channel read access for listing.
+type ListPinsOutput = storage.ListPinsResult
+
+// PinService implements RF-05: channel/DM pinned messages, gated to current
+// read access by the store's shared message visibility SQL.
 type PinService struct {
-	pins        storage.PinStore
-	permissions *PermissionService
+	pins storage.PinStore
 }
 
-// NewPinService returns a PinService backed by the given store and permissions.
-func NewPinService(pins storage.PinStore, permissions *PermissionService) *PinService {
-	return &PinService{pins: pins, permissions: permissions}
+// NewPinService returns a PinService backed by the given store.
+func NewPinService(pins storage.PinStore) *PinService {
+	return &PinService{pins: pins}
 }
 
 func validatePinAction(input PinActionInput) (PinActionInput, error) {
 	input.WorkspaceID = strings.TrimSpace(input.WorkspaceID)
-	input.ChannelID = strings.TrimSpace(input.ChannelID)
+	input.TargetType = strings.TrimSpace(input.TargetType)
+	input.TargetID = strings.TrimSpace(input.TargetID)
 	input.MessageID = strings.TrimSpace(input.MessageID)
 	input.ActorUserID = strings.TrimSpace(input.ActorUserID)
-	if input.WorkspaceID == "" || input.ChannelID == "" || input.MessageID == "" || input.ActorUserID == "" {
-		return input, fmt.Errorf("%w: workspace, channel, message and actor are required", domain.ErrInvalidInput)
+	if input.WorkspaceID == "" || input.TargetType == "" || input.TargetID == "" || input.MessageID == "" || input.ActorUserID == "" {
+		return input, fmt.Errorf("%w: workspace, target, message and actor are required", domain.ErrInvalidInput)
+	}
+	if input.TargetType != PinTargetChannel && input.TargetType != PinTargetDM {
+		return input, fmt.Errorf("%w: target_type must be channel or dm", domain.ErrInvalidInput)
 	}
 	return input, nil
 }
 
-// authorizeModerate enforces read access (→ ErrNotFound) and elevated role
-// (→ ErrForbidden) before a pin/unpin write.
-func (s *PinService) authorizeModerate(ctx context.Context, workspaceID, channelID, userID string) error {
-	readable, moderate, err := s.permissions.CanModerateChannel(ctx, workspaceID, channelID, userID)
-	if err != nil {
-		return err
-	}
-	if !readable {
-		// Non-enumerating: a channel the caller cannot see is "not found".
-		return domain.ErrNotFound
-	}
-	if !moderate {
-		return domain.ErrForbidden
-	}
-	return nil
-}
-
-// Pin pins a message for the whole channel. Idempotent. Returns ErrNotFound
-// (message missing/deleted/not in channel), ErrForbidden (role too low), or
-// ErrPinLimitReached (channel at capacity).
+// Pin pins a message for the whole container. Idempotent. Returns ErrNotFound
+// (message missing/deleted/unreadable/not in target) or ErrPinLimitReached.
 func (s *PinService) Pin(ctx context.Context, input PinActionInput) error {
 	input, err := validatePinAction(input)
 	if err != nil {
 		return err
 	}
-	if err := s.authorizeModerate(ctx, input.WorkspaceID, input.ChannelID, input.ActorUserID); err != nil {
-		return err
-	}
-	return s.pins.AddPin(ctx, input.ChannelID, input.MessageID, input.ActorUserID)
+	slog.InfoContext(ctx, "chat pin message",
+		"actor_user_id", input.ActorUserID,
+		"target_type", input.TargetType,
+		"target_id", input.TargetID,
+		"message_id", input.MessageID,
+	)
+	return s.pins.AddPin(ctx, input.WorkspaceID, input.TargetType, input.TargetID, input.MessageID, input.ActorUserID)
 }
 
-// Unpin removes a channel pin. Idempotent. Same authorization as Pin.
+// Unpin removes a pin. Idempotent. Same authorization as Pin.
 func (s *PinService) Unpin(ctx context.Context, input PinActionInput) error {
 	input, err := validatePinAction(input)
 	if err != nil {
 		return err
 	}
-	if err := s.authorizeModerate(ctx, input.WorkspaceID, input.ChannelID, input.ActorUserID); err != nil {
-		return err
-	}
-	return s.pins.RemovePin(ctx, input.ChannelID, input.MessageID)
+	slog.InfoContext(ctx, "chat unpin message",
+		"actor_user_id", input.ActorUserID,
+		"target_type", input.TargetType,
+		"target_id", input.TargetID,
+		"message_id", input.MessageID,
+	)
+	return s.pins.RemovePin(ctx, input.WorkspaceID, input.TargetType, input.TargetID, input.MessageID, input.ActorUserID)
 }
 
-// ListPins returns the channel's pins, newest first. Requires channel read
-// access — any member who can read the channel can see its pins (RF-05
-// visibility mirrors reading messages). Returns ErrNotFound when the caller
-// cannot read the channel.
-func (s *PinService) ListPins(ctx context.Context, input ListPinsInput) ([]domain.PinnedMessage, error) {
+// ListPins returns the target's pins, newest first. Requires current read access.
+func (s *PinService) ListPins(ctx context.Context, input ListPinsInput) (ListPinsOutput, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	channelID := strings.TrimSpace(input.ChannelID)
+	targetType := strings.TrimSpace(input.TargetType)
+	targetID := strings.TrimSpace(input.TargetID)
 	viewerID := strings.TrimSpace(input.ViewerID)
-	if workspaceID == "" || channelID == "" || viewerID == "" {
-		return nil, fmt.Errorf("%w: workspace, channel and viewer are required", domain.ErrInvalidInput)
+	if workspaceID == "" || targetType == "" || targetID == "" || viewerID == "" {
+		return ListPinsOutput{}, fmt.Errorf("%w: workspace, target and viewer are required", domain.ErrInvalidInput)
 	}
-	allowed, err := s.permissions.CanRead(ctx, workspaceID, channelID, viewerID)
-	if err != nil {
-		return nil, err
+	if targetType != PinTargetChannel && targetType != PinTargetDM {
+		return ListPinsOutput{}, fmt.Errorf("%w: target_type must be channel or dm", domain.ErrInvalidInput)
 	}
-	if !allowed {
-		return nil, domain.ErrNotFound
-	}
-	return s.pins.ListPins(ctx, channelID, viewerID)
+	return s.pins.ListPins(ctx, workspaceID, targetType, targetID, viewerID)
 }

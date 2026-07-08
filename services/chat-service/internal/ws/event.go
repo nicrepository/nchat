@@ -18,7 +18,7 @@ const (
 	EventTypeMessageCreated  EventType = "message.created"
 	EventTypeReactionUpdated EventType = "reaction.updated"
 	// EventTypePinUpdated is emitted after a message is pinned or unpinned in a
-	// channel (RF-05). Delivered to channel subscribers only.
+	// channel or DM (RF-05). Delivered to readable target subscribers only.
 	EventTypePinUpdated EventType = "pin.updated"
 )
 
@@ -68,7 +68,7 @@ type ReactionPayload struct {
 	Count int    `json:"count"`
 }
 
-// PinEventPayload carries a channel pin change (RF-05). It is route-plus-flag
+// PinEventPayload carries a pin change (RF-05). It is route-plus-flag
 // only: clients refetch the authoritative pin list on receipt. No message body
 // travels on this event.
 type PinEventPayload struct {

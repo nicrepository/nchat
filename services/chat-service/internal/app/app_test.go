@@ -343,6 +343,14 @@ func TestHubBroadcasterPublishesCreatedMessage(t *testing.T) {
 	})
 }
 
+func TestHubBroadcasterPublishesPinUpdated(t *testing.T) {
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), ws.NopBus{}, "test-pin-broadcaster")
+	t.Cleanup(hub.Shutdown)
+	broadcaster := hubBroadcaster{hub: hub}
+
+	broadcaster.PublishPinUpdated(t.Context(), "workspace-1", string(ws.TargetTypeDM), "dm-1", "message-1", "user-1", true)
+}
+
 type reactionStoreStub struct {
 	result storage.ToggleReactionResult
 	err    error

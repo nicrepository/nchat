@@ -58,8 +58,8 @@ func (h *MessageHandler) WithFavorites(favorites favoriteProvider) *MessageHandl
 	return h
 }
 
-// WithPins enables the RF-05 channel pin endpoints. broadcaster fans pin
-// changes out to channel subscribers over WebSocket. Returns the handler for
+// WithPins enables the RF-05 pin endpoints. broadcaster fans pin changes out
+// to target subscribers over WebSocket. Returns the handler for
 // chaining; when never called, pin routes answer 503.
 func (h *MessageHandler) WithPins(pins pinProvider, broadcaster pinBroadcaster) *MessageHandler {
 	h.pins = pins
@@ -594,7 +594,7 @@ func mapServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
 	case errors.Is(err, domain.ErrPinLimitReached):
-		httputil.WriteError(w, http.StatusConflict, "conflict", "pin limit reached")
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "pin limit reached")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
