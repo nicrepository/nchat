@@ -344,6 +344,37 @@ func (h *Hub) PublishReactionUpdated(ctx context.Context, workspaceID, actorUser
 	}
 }
 
+// PublishPinUpdated broadcasts a pin.updated event (RF-05) to all clients
+// subscribed to the target. Like message.created, local delivery is attempted
+// first and re-checks authorization per subscriber; distributed publish via the
+// bus is best-effort. The event is route-plus-flag only — it carries no message
+// body, so clients refetch the pin list on receipt.
+func (h *Hub) PublishPinUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID, actorUserID string, pinned bool) {
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypePinUpdated,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID:        messageID,
+		Pin:              &PinEventPayload{MessageID: messageID, ActorUserID: actorUserID, Pinned: pinned},
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal pin.updated event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: pin bus publish failed", "target_type", string(targetType), "error", err)
+	}
+}
+
 // Shutdown stops the hub goroutine, cancels bus subscriptions, closes all
 // client connections, and closes the BroadcastBus. Blocks until the run
 // goroutine exits.
@@ -477,6 +508,12 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if evt.Type == EventTypePinUpdated {
+		evt, ok = canonicalizePinEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 
 	// Remote bus payloads may contain body_text or legacy sender_email. Strip
 	// them so remote nodes route by IDs only; clients fetch by ID if needed.
@@ -499,7 +536,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageCreated, EventTypeReactionUpdated:
+	case EventTypeMessageCreated, EventTypeReactionUpdated, EventTypePinUpdated:
 		// OK
 	default:
 		return Event{}, false
@@ -579,6 +616,23 @@ func canonicalizeReactionEvent(evt Event) (Event, bool) {
 	// channels. Propagate aggregates and actor_user_id through the bus before
 	// computing reacted_by_me optimistically without a REST round-trip.
 	evt.Reaction = nil
+	return evt, true
+}
+
+// canonicalizePinEvent validates a remote pin.updated event. The actor is
+// canonicalized to lowercase UUID. The tiny route-plus-flag payload is retained.
+func canonicalizePinEvent(evt Event) (Event, bool) {
+	if evt.Pin == nil || evt.Pin.MessageID != evt.MessageID {
+		return Event{}, false
+	}
+	if evt.TargetType != TargetTypeChannel && evt.TargetType != TargetTypeDM {
+		return Event{}, false
+	}
+	actorID, err := uuid.Parse(evt.Pin.ActorUserID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.Pin.ActorUserID = actorID.String()
 	return evt, true
 }
 

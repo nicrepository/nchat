@@ -22,6 +22,7 @@ import type {
   WSClientErrorEvent,
   WSMessageCreatedEvent,
   WSMessagePayload,
+  WSPinUpdatedEvent,
   WSReactionUpdatedEvent,
 } from "./useChatWebSocket";
 import { useMessages } from "./useMessages";
@@ -33,22 +34,26 @@ import type { Message, MessagePage } from "./chatTypes";
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
 let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
 let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
+let capturedOnPinUpdated: ((evt: WSPinUpdatedEvent) => void) | null = null;
 const mockToggleReaction = vi.fn(() => true);
 
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
     onReactionUpdated,
+    onPinUpdated,
     onReactionError,
   }: {
     kind: string;
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
+    onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
     onReactionError?: (evt: WSClientErrorEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
+    capturedOnPinUpdated = onPinUpdated ?? null;
     capturedOnReactionError = onReactionError ?? null;
     return { toggleReaction: mockToggleReaction };
   },
@@ -170,6 +175,7 @@ beforeEach(() => {
   capturedOnMessageCreated = null;
   capturedOnReactionUpdated = null;
   capturedOnReactionError = null;
+  capturedOnPinUpdated = null;
   vi.clearAllMocks();
 });
 
@@ -232,6 +238,40 @@ describe("useMessages — WS message.created integration", () => {
     act(() => result.current.toggleReaction("msg-1", "👍"));
 
     expect(result.current.state.actionError).toMatch(/tempo real/i);
+  });
+
+  it("forwards pin.updated only for the active target type and id", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const onPinUpdated = vi.fn();
+    renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "same-id",
+        currentUserId: "user-me",
+        onPinUpdated,
+      }),
+    );
+    await waitFor(() => expect(capturedOnPinUpdated).not.toBeNull());
+
+    act(() =>
+      capturedOnPinUpdated?.({
+        type: "pin.updated",
+        target_type: "dm",
+        target_id: "same-id",
+        message_id: "msg-1",
+      }),
+    );
+    expect(onPinUpdated).not.toHaveBeenCalled();
+
+    act(() =>
+      capturedOnPinUpdated?.({
+        type: "pin.updated",
+        target_type: "channel",
+        target_id: "same-id",
+        message_id: "msg-1",
+      }),
+    );
+    expect(onPinUpdated).toHaveBeenCalledTimes(1);
   });
 
   it("maps structured reaction errors to visible state", async () => {

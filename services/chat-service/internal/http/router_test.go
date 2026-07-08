@@ -433,6 +433,38 @@ func TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted(t *testing.T) {
 	}
 }
 
+func TestNewRouter_PinActionsUseDedicatedRateLimit(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	channelPinURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/22222222-2222-2222-2222-222222222222/pin"
+	dmPinURL := "/api/chat/dm/33333333-3333-3333-3333-333333333333/messages/22222222-2222-2222-2222-222222222222/pin"
+
+	if pinActionRateLimit != 10 {
+		t.Fatalf("pinActionRateLimit = %d, want 10", pinActionRateLimit)
+	}
+	for i := range pinActionRateLimit {
+		w := httptest.NewRecorder()
+		func() {
+			defer func() { recover() }() //nolint:errcheck
+			router.ServeHTTP(w, routerPOSTRequest(t, channelPinURL))
+		}()
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("pin request %d should not be 429 within pin budget", i+1)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, routerPOSTRequest(t, dmPinURL))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected shared pin budget 429 across channel/DM pins, got %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, routerPOSTRequest(t, "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"))
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatal("exhausting pin budget must not consume message post budget")
+	}
+}
+
 func TestNewRouter_GetSingleMessage_Returns429AfterSingleBudgetExhausted(t *testing.T) {
 	router := newRouterForRateLimit(t)
 	url := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/22222222-2222-2222-2222-222222222222"

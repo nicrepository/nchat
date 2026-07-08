@@ -8,4 +8,5 @@ const (
 	ErrCodeUnauthorized = "unauthorized"
 	ErrCodeForbidden    = "forbidden"
 	ErrCodeRateLimited  = "rate_limited"
+	ErrCodeConflict     = "conflict"
 )

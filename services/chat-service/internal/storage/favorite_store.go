@@ -8,28 +8,30 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
-// favoriteAccessJoins and favoriteAccessPredicate express "the user can read
+// messageAccessJoins and messageAccessPredicate express "the user can read
 // this message right now": active workspace + active workspace membership, and
 // either an active public channel, an active private channel the user belongs
 // to, or an active DM conversation the user is an active member of. They mirror
 // the visibility rules used by the message list queries and the reaction store.
 // Both AddFavorite and ListFavorites re-evaluate access server-side on every
 // request — favorites made before an access revocation are filtered out.
-const favoriteAccessJoins = `
+func messageAccessJoins(userArg string) string {
+	return `
 	JOIN chat.workspaces w
 	  ON w.id = m.workspace_id AND w.status = 'active'
 	JOIN chat.workspace_members wm
-	  ON wm.workspace_id = m.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
+	  ON wm.workspace_id = m.workspace_id AND wm.user_id = ` + userArg + ` AND wm.status = 'active'
 	LEFT JOIN chat.channels c
 	  ON c.id = m.channel_id AND c.status = 'active'
 	LEFT JOIN chat.channel_members cm
-	  ON cm.channel_id = m.channel_id AND cm.user_id = $2
+	  ON cm.channel_id = m.channel_id AND cm.user_id = ` + userArg + `
 	LEFT JOIN chat.dm_conversations dc
 	  ON dc.id = m.dm_conversation_id AND dc.status = 'active'
 	LEFT JOIN chat.dm_members dm
-	  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $2 AND dm.status = 'active'`
+	  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = ` + userArg + ` AND dm.status = 'active'`
+}
 
-const favoriteAccessPredicate = `(
+const messageAccessPredicate = `(
 		(m.channel_id IS NOT NULL AND c.id IS NOT NULL AND (c.type = 'public' OR cm.user_id IS NOT NULL))
 		OR (m.dm_conversation_id IS NOT NULL AND dc.id IS NOT NULL AND dm.user_id IS NOT NULL)
 	)`
@@ -94,9 +96,9 @@ func (s *PGXFavoriteStore) AddFavorite(ctx context.Context, input AddFavoriteInp
 	err := s.pool.QueryRow(ctx, `
 		WITH authorized AS (
 			SELECT m.id
-			FROM chat.messages m`+favoriteAccessJoins+`
+			FROM chat.messages m`+messageAccessJoins("$2")+`
 			WHERE m.workspace_id = $1 AND m.id = $3 AND m.status = 'active'
-			  AND `+favoriteAccessPredicate+`
+			  AND `+messageAccessPredicate+`
 		),
 		ins AS (
 			INSERT INTO chat.message_favorites (user_id, message_id)
@@ -138,11 +140,11 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 		SELECT ` + listMessageColumns("m", "$2") + `, f.created_at
 		FROM chat.message_favorites f
 		JOIN chat.messages m
-		  ON m.id = f.message_id AND m.workspace_id = $1` + favoriteAccessJoins + `
+		  ON m.id = f.message_id AND m.workspace_id = $1` + messageAccessJoins("$2") + `
 		LEFT JOIN auth.users u
 		  ON u.id = m.sender_id
 		WHERE f.user_id = $2
-		  AND ` + favoriteAccessPredicate
+		  AND ` + messageAccessPredicate
 
 	args := []any{input.WorkspaceID, input.UserID}
 	if input.BeforeCursor != nil {

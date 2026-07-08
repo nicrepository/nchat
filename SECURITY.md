@@ -97,6 +97,15 @@ Sealed Secrets e obrigatorio para versionar secrets do MVP:
 - Definir tamanho maximo de mensagem.
 - Aplicar timeout de inatividade.
 
+## Autorizacao para pin/unpin de mensagens
+
+Fixar e desafixar mensagem (RF-05) nao exige papel de Moderador ou
+Admin. Qualquer membro do workspace com acesso de leitura ao canal ou
+a DM (incluindo Guest) pode fixar e desafixar. Mesma verificacao de
+acesso usada para leitura de mensagens (RF-04), sem RBAC adicional.
+Decisao de produto registrada em 2026-07-08 (issue #105), substituindo
+a suposicao original de acesso restrito a Moderador/Admin.
+
 ## Regras para uploads
 
 - Definir limite de tamanho.

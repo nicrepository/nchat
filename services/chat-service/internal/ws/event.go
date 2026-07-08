@@ -17,6 +17,9 @@ const (
 	// EventTypeMessageCreated is emitted after a message has been persisted.
 	EventTypeMessageCreated  EventType = "message.created"
 	EventTypeReactionUpdated EventType = "reaction.updated"
+	// EventTypePinUpdated is emitted after a message is pinned or unpinned in a
+	// channel or DM (RF-05). Delivered to readable target subscribers only.
+	EventTypePinUpdated EventType = "pin.updated"
 )
 
 // CurrentEventSchemaVersion is the version of the outbound WebSocket event
@@ -65,6 +68,18 @@ type ReactionPayload struct {
 	Count int    `json:"count"`
 }
 
+// PinEventPayload carries a pin change (RF-05). It is route-plus-flag
+// only: clients refetch the authoritative pin list on receipt. No message body
+// travels on this event.
+type PinEventPayload struct {
+	MessageID string `json:"message_id"`
+	// ActorUserID is the user who pinned/unpinned, exposed like sender_id so
+	// clients can reconcile their own optimistic state.
+	ActorUserID string `json:"actor_user_id"`
+	// Pinned is true for a pin, false for an unpin.
+	Pinned bool `json:"pinned"`
+}
+
 type ReactionEventPayload struct {
 	MessageID string `json:"message_id"`
 	// ActorUserID is intentionally exposed, equivalent to sender_id on
@@ -96,6 +111,7 @@ type Event struct {
 	// Omitted on canonicalized remote events (body_text is not re-trusted from bus).
 	Payload  *MessagePayload       `json:"payload,omitempty"`
 	Reaction *ReactionEventPayload `json:"reaction,omitempty"`
+	Pin      *PinEventPayload      `json:"pin,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`

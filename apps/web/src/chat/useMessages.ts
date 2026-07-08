@@ -38,6 +38,7 @@ import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
   type WSClientErrorEvent,
+  type WSPinUpdatedEvent,
   type WSReactionUpdatedEvent,
 } from "./useChatWebSocket";
 
@@ -361,6 +362,8 @@ interface UseMessagesOptions {
   targetId: string;
   currentUserId: string;
   onOwnReactionConfirmed?: (emoji: string) => void;
+  /** RF-05: called on a pin.updated event for the active target (refetch pins). */
+  onPinUpdated?: (event: WSPinUpdatedEvent) => void;
 }
 
 export interface UseMessagesResult {
@@ -377,6 +380,7 @@ export function useMessages({
   targetId,
   currentUserId,
   onOwnReactionConfirmed,
+  onPinUpdated,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 
@@ -676,11 +680,25 @@ export function useMessages({
     });
   }, []);
 
+  // RF-05: keep the pin callback in a ref so it never restarts the socket.
+  const onPinUpdatedRef = useRef(onPinUpdated);
+  useLayoutEffect(() => {
+    onPinUpdatedRef.current = onPinUpdated;
+  });
+  const handlePinUpdated = useCallback(
+    (event: WSPinUpdatedEvent) => {
+      if (event.target_type !== kind || event.target_id !== targetId) return;
+      onPinUpdatedRef.current?.(event);
+    },
+    [kind, targetId],
+  );
+
   const { toggleReaction: sendReactionToggle } = useChatWebSocket({
     kind,
     targetId,
     onMessageCreated: handleWsMessageCreated,
     onReactionUpdated: handleReactionUpdated,
+    onPinUpdated: handlePinUpdated,
     onReactionError: handleReactionError,
   });
 

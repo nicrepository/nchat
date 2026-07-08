@@ -13,6 +13,7 @@ vi.mock("../lib/authClient", () => ({
 import {
   favoriteMessage,
   fetchChannelMessages,
+  fetchPins,
   fetchFavorites,
   fetchAllowedReactionEmojis,
   fetchChannels,
@@ -21,10 +22,12 @@ import {
   fetchMentionCandidates,
   fetchSidebarData,
   messagesPath,
+  pinMessage,
   postChannelMessage,
   postDMMessage,
   resetAllowedReactionEmojisCache,
   unfavoriteMessage,
+  unpinMessage,
 } from "./chatApi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -799,5 +802,111 @@ describe("fetchFavorites", () => {
   it("propagates errors from authenticatedFetch", async () => {
     mockAuthFetch.mockRejectedValue(new Error("boom"));
     await expect(fetchFavorites()).rejects.toThrow("boom");
+  });
+});
+
+describe("pinMessage / unpinMessage (RF-05)", () => {
+  it("POSTs to the channel-scoped pin path with encoded IDs", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await pinMessage({ kind: "channel", id: "ch/1" }, "msg/1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%2F1/messages/msg%2F1/pin", {
+      method: "POST",
+      signal: undefined,
+    });
+  });
+
+  it("DELETEs the channel-scoped pin path", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await unpinMessage({ kind: "channel", id: "ch-1" }, "msg-1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch-1/messages/msg-1/pin", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("forbidden"));
+    await expect(pinMessage({ kind: "channel", id: "ch-1" }, "msg-1")).rejects.toThrow("forbidden");
+    await expect(unpinMessage({ kind: "channel", id: "ch-1" }, "msg-1")).rejects.toThrow(
+      "forbidden",
+    );
+  });
+
+  it("uses the DM pin path for DM targets", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await pinMessage({ kind: "dm", id: "dm-1" }, "msg-1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/messages/msg-1/pin", {
+      method: "POST",
+      signal: undefined,
+    });
+  });
+});
+
+describe("fetchPins (RF-05)", () => {
+  const pinsResponse = {
+    data: {
+      pins: [
+        {
+          message: {
+            id: "msg-1",
+            sender_id: "user-1",
+            sender_display_name: "Ana",
+            kind: "user",
+            body_text: "importante",
+            body_format: "v3",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            updated_at: "2025-01-15T10:00:00Z",
+          },
+          pinned_by_user_id: "mod-1",
+          pinned_at: "2025-02-01T12:00:00Z",
+        },
+        {
+          message: {
+            id: "msg-2",
+            sender_id: "user-2",
+            kind: "user",
+            is_removed: true,
+            status: "deleted",
+            created_at: "2025-01-10T10:00:00Z",
+            updated_at: "2025-01-10T10:00:00Z",
+          },
+          pinned_by_user_id: "mod-1",
+          pinned_at: "2025-01-20T12:00:00Z",
+        },
+      ],
+    },
+  };
+
+  it("maps pins with pinnedBy and preserves deleted-message placeholder", async () => {
+    mockAuthFetch.mockResolvedValue(pinsResponse);
+    const pins = await fetchPins({ kind: "channel", id: "ch-1" });
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch-1/pins", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(pins).toHaveLength(2);
+    expect(pins[0]).toMatchObject({ pinnedByUserId: "mod-1", pinnedAt: "2025-02-01T12:00:00Z" });
+    expect(pins[0].message).toMatchObject({ id: "msg-1", bodyText: "importante" });
+    expect(pins[1].message).toMatchObject({ isRemoved: true, status: "deleted" });
+  });
+
+  it("returns an empty list when the payload has no pins", async () => {
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    await expect(fetchPins({ kind: "channel", id: "ch-1" })).resolves.toEqual([]);
+  });
+
+  it("uses the DM pins path for DM targets", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { pins: [] } });
+    await expect(fetchPins({ kind: "dm", id: "dm-1" })).resolves.toEqual([]);
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/pins", {
+      method: "GET",
+      signal: undefined,
+    });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(fetchPins({ kind: "channel", id: "ch-1" })).rejects.toThrow("boom");
   });
 });

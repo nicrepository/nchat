@@ -19,6 +19,7 @@ import type {
   FavoritesPage,
   Message,
   MessagePage,
+  PinnedItem,
 } from "./chatTypes";
 import type { MentionCandidate } from "./chatTypes";
 
@@ -167,6 +168,18 @@ interface FavoriteResponse {
 interface FavoritesEnvelope {
   data: { favorites: FavoriteResponse[]; next_cursor?: string };
 }
+
+interface PinResponse {
+  message: MessageResponse;
+  pinned_by_user_id: string;
+  pinned_at: string;
+}
+
+interface PinsEnvelope {
+  data: { pins: PinResponse[]; total_count?: number };
+}
+
+export type PinTarget = { kind: "channel" | "dm"; id: string };
 
 interface MessageListData {
   messages: MessageResponse[];
@@ -380,4 +393,48 @@ export async function fetchDMMessage(
   const url = `${messagesPath("dm", conversationId)}/${encodeURIComponent(messageId)}`;
   const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
   return mapMessage(res.data);
+}
+
+// ── Pins API (RF-05) ──────────────────────────────────────────────────────────
+
+function targetBasePath(target: PinTarget): string {
+  const segment = target.kind === "channel" ? "channels" : "dm";
+  return `${CHAT_BASE}/${segment}/${encodeURIComponent(target.id)}`;
+}
+
+function pinPath(target: PinTarget, messageId: string): string {
+  return `${targetBasePath(target)}/messages/${encodeURIComponent(messageId)}/pin`;
+}
+
+/** Pins a message for the whole channel/DM. Idempotent (204). */
+export async function pinMessage(
+  target: PinTarget,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch<void>(pinPath(target, messageId), { method: "POST", signal });
+}
+
+/** Unpins a channel/DM message. Idempotent (204). */
+export async function unpinMessage(
+  target: PinTarget,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch<void>(pinPath(target, messageId), { method: "DELETE", signal });
+}
+
+function mapPin(r: PinResponse): PinnedItem {
+  return {
+    message: mapMessage(r.message),
+    pinnedByUserId: r.pinned_by_user_id,
+    pinnedAt: r.pinned_at,
+  };
+}
+
+/** Fetches a target's pinned messages, newest pin first. */
+export async function fetchPins(target: PinTarget, signal?: AbortSignal): Promise<PinnedItem[]> {
+  const url = `${targetBasePath(target)}/pins`;
+  const res = await authenticatedFetch<PinsEnvelope>(url, { method: "GET", signal });
+  return (res.data.pins ?? []).map(mapPin);
 }

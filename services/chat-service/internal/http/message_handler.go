@@ -43,16 +43,27 @@ type mentionProvider interface {
 
 // MessageHandler handles message list and create endpoints for channels and DMs.
 type MessageHandler struct {
-	workspaces workspaceResolver
-	messages   messageProvider
-	mentions   mentionProvider
-	favorites  favoriteProvider
+	workspaces     workspaceResolver
+	messages       messageProvider
+	mentions       mentionProvider
+	favorites      favoriteProvider
+	pins           pinProvider
+	pinBroadcaster pinBroadcaster
 }
 
 // WithFavorites enables the RF-06 favorite endpoints. Returns the handler for
 // chaining; when never called, favorite routes answer 503.
 func (h *MessageHandler) WithFavorites(favorites favoriteProvider) *MessageHandler {
 	h.favorites = favorites
+	return h
+}
+
+// WithPins enables the RF-05 pin endpoints. broadcaster fans pin changes out
+// to target subscribers over WebSocket. Returns the handler for
+// chaining; when never called, pin routes answer 503.
+func (h *MessageHandler) WithPins(pins pinProvider, broadcaster pinBroadcaster) *MessageHandler {
+	h.pins = pins
+	h.pinBroadcaster = broadcaster
 	return h
 }
 
@@ -582,6 +593,8 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrPinLimitReached):
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "pin limit reached")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
