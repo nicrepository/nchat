@@ -129,7 +129,7 @@ type MessageStore interface {
 	// and target (channelID or dmConversationID). Returns nil when valid.
 	// Returns ErrInvalidMessageReference for any invalid case — non-enumerating:
 	// missing, cross-workspace, cross-channel, and cross-DM all return the same error.
-	ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error
+	ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID, userID string) error
 
 	// ResolveMentionLabels returns current display labels keyed by "user:<uuid>"
 	// or "channel:<uuid>", scoped to workspaceID.
@@ -200,11 +200,38 @@ func listMessageColumns(alias, userParam string) string {
 	)`
 }
 
-// scanMessageWithSender reads a single message row including sender display info.
-// It must be called with exactly the columns listed in listMessageColumns.
-func scanMessageWithSender(row pgx.Row) (domain.Message, error) {
+func quotedMessageColumns(alias string) string {
+	return `
+	COALESCE(` + alias + `.id::text, ''),
+	COALESCE(` + alias + `.sender_id::text, ''),
+	COALESCE(` + alias + `.body_text, ''),
+	COALESCE(` + alias + `.body_format::text, ''),
+	COALESCE(` + alias + `.status::text, ''),
+	` + alias + `.deleted_at,
+	` + alias + `.created_at`
+}
+
+func listMessageWithQuoteColumns(alias, userParam, quoteAlias string) string {
+	return listMessageColumns(alias, userParam) + `,` + quotedMessageColumns(quoteAlias)
+}
+
+func quotedMessageJoin(alias, quoteAlias string) string {
+	return `
+		LEFT JOIN chat.messages ` + quoteAlias + `
+		  ON ` + quoteAlias + `.id = ` + alias + `.parent_message_id
+		 AND ` + quoteAlias + `.workspace_id = ` + alias + `.workspace_id
+		 AND ` + quoteAlias + `.channel_id IS NOT DISTINCT FROM ` + alias + `.channel_id
+		 AND ` + quoteAlias + `.dm_conversation_id IS NOT DISTINCT FROM ` + alias + `.dm_conversation_id`
+}
+
+// scanMessageWithSenderAndQuote reads a single message row including sender
+// display info and optional quote preview. It must be called with exactly the
+// columns listed in listMessageWithQuoteColumns.
+func scanMessageWithSenderAndQuote(row pgx.Row) (domain.Message, error) {
 	var msg domain.Message
 	var editedAt, deletedAt *time.Time
+	var quote domain.QuotedMessage
+	var quoteDeletedAt, quoteCreatedAt *time.Time
 	err := row.Scan(
 		&msg.ID, &msg.WorkspaceID,
 		&msg.ChannelID, &msg.DMConversationID,
@@ -215,6 +242,8 @@ func scanMessageWithSender(row pgx.Row) (domain.Message, error) {
 		&msg.CreatedAt, &msg.UpdatedAt,
 		&msg.SenderDisplayName, &msg.SenderEmail,
 		&msg.IsFavorited,
+		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
+		&quoteDeletedAt, &quoteCreatedAt,
 	)
 	if err != nil {
 		return domain.Message{}, err
@@ -224,6 +253,15 @@ func scanMessageWithSender(row pgx.Row) (domain.Message, error) {
 	}
 	if deletedAt != nil {
 		msg.DeletedAt = *deletedAt
+	}
+	if quote.ID != "" {
+		if quoteDeletedAt != nil {
+			quote.DeletedAt = *quoteDeletedAt
+		}
+		if quoteCreatedAt != nil {
+			quote.CreatedAt = *quoteCreatedAt
+		}
+		msg.Quoted = &quote
 	}
 	return msg, nil
 }
@@ -392,9 +430,9 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
 			RETURNING id
 		)
-		SELECT `+listMessageColumns("m", "$4")+`
+		SELECT `+listMessageWithQuoteColumns("m", "$4", "q")+`
 		FROM inserted m
-		LEFT JOIN auth.users u ON u.id = m.sender_id`,
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
 		input.WorkspaceID,
 		nullableUUID(input.ChannelID),
 		nullableUUID(input.DMConversationID),
@@ -408,7 +446,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.MentionedUserIDs,
 		input.MentionedChannelIDs,
 	)
-	msg, err := scanMessageWithSender(row)
+	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Non-enumerating TOCTOU backstop: both auth failure and reference failure
@@ -504,15 +542,18 @@ func scanMentionLabels(rows pgx.Rows, labels map[string]string) (map[string]stri
 	return labels, nil
 }
 
-func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID string) error {
+func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID, userID string) error {
 	var exists int
 	err := s.pool.QueryRow(ctx, `
-		SELECT 1 FROM chat.messages
-		WHERE id = $1
-		  AND workspace_id = $2
-		  AND channel_id IS NOT DISTINCT FROM $3
-		  AND dm_conversation_id IS NOT DISTINCT FROM $4`,
-		messageID, workspaceID, nullableUUID(channelID), nullableUUID(dmConversationID),
+		SELECT 1
+		FROM chat.messages m`+messageAccessJoins("$5")+`
+		WHERE m.id = $1
+		  AND m.workspace_id = $2
+		  AND m.status = 'active'
+		  AND m.channel_id IS NOT DISTINCT FROM $3
+		  AND m.dm_conversation_id IS NOT DISTINCT FROM $4
+		  AND `+messageAccessPredicate,
+		messageID, workspaceID, nullableUUID(channelID), nullableUUID(dmConversationID), userID,
 	).Scan(&exists)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -524,16 +565,16 @@ func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, worksp
 }
 
 func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID, userID string) (domain.Message, error) {
-	// Use listMessageColumns so the result includes sender_display_name and
-	// sender_email — the same contract as the list endpoints.
+	// Use listMessageWithQuoteColumns so the result matches the list endpoint
+	// contract: sender display info, favorite flag, and optional quote preview.
 	row := s.pool.QueryRow(ctx, `
-		SELECT `+listMessageColumns("m", "$3")+`
+		SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
 		FROM chat.messages m
-		LEFT JOIN auth.users u ON u.id = m.sender_id
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 		WHERE m.id = $1 AND m.workspace_id = $2`,
 		messageID, workspaceID, userID,
 	)
-	msg, err := scanMessageWithSender(row)
+	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Message{}, domain.ErrNotFound
@@ -557,7 +598,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		// Keyset pagination: fetch messages older than the cursor.
 		// Fetch limit+1 to detect whether a next page exists.
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m", "$3")+`
+			SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
 			FROM chat.messages m
 			JOIN chat.channels c
 			  ON c.id = m.channel_id
@@ -568,7 +609,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			LEFT JOIN chat.channel_members cm
 			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
 			LEFT JOIN auth.users u
-			  ON u.id = m.sender_id
+			  ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 			WHERE m.workspace_id = $1
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
@@ -582,7 +623,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m", "$3")+`
+			SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
 			FROM chat.messages m
 			JOIN chat.channels c
 			  ON c.id = m.channel_id
@@ -593,7 +634,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			LEFT JOIN chat.channel_members cm
 			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
 			LEFT JOIN auth.users u
-			  ON u.id = m.sender_id
+			  ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 			WHERE m.workspace_id = $1
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
@@ -627,7 +668,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 
 	if input.BeforeCursor != nil {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m", "$3")+`
+			SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
 			FROM chat.messages m
 			JOIN chat.dm_conversations dc
 			  ON dc.id = m.dm_conversation_id
@@ -638,7 +679,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			JOIN chat.dm_members dm
 			  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
 			LEFT JOIN auth.users u
-			  ON u.id = m.sender_id
+			  ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
@@ -651,7 +692,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT `+listMessageColumns("m", "$3")+`
+			SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
 			FROM chat.messages m
 			JOIN chat.dm_conversations dc
 			  ON dc.id = m.dm_conversation_id
@@ -662,7 +703,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			JOIN chat.dm_members dm
 			  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = $3 AND dm.status = 'active'
 			LEFT JOIN auth.users u
-			  ON u.id = m.sender_id
+			  ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
@@ -747,7 +788,7 @@ func collectListMessagesResult(rows messageRows, limit int) (ListMessagesResult,
 }
 
 func doCollectMessagesResult(rows messageRows, limit int, withSender bool) (ListMessagesResult, error) {
-	msgs, err := collectMessagesWithSender(rows, withSender)
+	msgs, err := collectMessagesWithSenderAndQuote(rows, withSender)
 	if err != nil {
 		return ListMessagesResult{}, err
 	}
@@ -770,11 +811,13 @@ func doCollectMessagesResult(rows messageRows, limit int, withSender bool) (List
 	return ListMessagesResult{Messages: msgs, NextCursor: nextCursor}, nil
 }
 
-func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Message, error) {
+func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]domain.Message, error) {
 	var messages []domain.Message
 	for rows.Next() {
 		var msg domain.Message
 		var editedAt, deletedAt *time.Time
+		var quote domain.QuotedMessage
+		var quoteDeletedAt, quoteCreatedAt *time.Time
 		dest := []any{
 			&msg.ID, &msg.WorkspaceID,
 			&msg.ChannelID, &msg.DMConversationID,
@@ -786,6 +829,10 @@ func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Mess
 		}
 		if withSender {
 			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.IsFavorited)
+			dest = append(dest,
+				&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
+				&quoteDeletedAt, &quoteCreatedAt,
+			)
 		}
 		err := rows.Scan(dest...)
 		if err != nil {
@@ -796,6 +843,15 @@ func collectMessagesWithSender(rows messageRows, withSender bool) ([]domain.Mess
 		}
 		if deletedAt != nil {
 			msg.DeletedAt = *deletedAt
+		}
+		if quote.ID != "" {
+			if quoteDeletedAt != nil {
+				quote.DeletedAt = *quoteDeletedAt
+			}
+			if quoteCreatedAt != nil {
+				quote.CreatedAt = *quoteCreatedAt
+			}
+			msg.Quoted = &quote
 		}
 		messages = append(messages, msg)
 	}

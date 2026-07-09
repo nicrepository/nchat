@@ -285,10 +285,34 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		BodyText:          msg.BodyText,
 		BodyFormat:        string(msg.BodyFormat),
 		Status:            string(msg.Status),
-		IsRemoved:         deletedAt != nil,
+		IsRemoved:         msg.Status == domain.MessageStatusDeleted || deletedAt != nil,
 		CreatedAt:         msg.CreatedAt,
 		UpdatedAt:         msg.UpdatedAt,
 		EditedAt:          editedAt,
 		DeletedAt:         deletedAt,
+		Quoted:            domainQuoteToWSPayload(msg.Quoted),
 	}
+}
+
+func domainQuoteToWSPayload(q *domain.QuotedMessage) *ws.QuotePayload {
+	if q == nil {
+		return nil
+	}
+	var deletedAt *time.Time
+	if !q.DeletedAt.IsZero() {
+		t := q.DeletedAt
+		deletedAt = &t
+	}
+	payload := &ws.QuotePayload{
+		ID:         q.ID,
+		AuthorID:   q.AuthorID,
+		BodyFormat: string(q.BodyFormat),
+		IsRemoved:  q.Status == domain.MessageStatusDeleted || deletedAt != nil,
+		DeletedAt:  deletedAt,
+		CreatedAt:  q.CreatedAt,
+	}
+	if !payload.IsRemoved {
+		payload.Body = q.BodyText
+	}
+	return payload
 }

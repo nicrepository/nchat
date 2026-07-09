@@ -46,21 +46,32 @@ const (
 //   - All fields are server-populated from the authoritative DB record.
 //   - No tokens, secrets, credentials, or sender email may appear in any field.
 type MessagePayload struct {
-	ID                string     `json:"id"`
-	WorkspaceID       string     `json:"workspace_id"`
-	ChannelID         string     `json:"channel_id,omitempty"`
-	DMConversationID  string     `json:"dm_conversation_id,omitempty"`
-	SenderID          string     `json:"sender_id"`
-	SenderDisplayName string     `json:"sender_display_name"`
-	Kind              string     `json:"kind"`
-	BodyText          string     `json:"body_text"`
-	BodyFormat        string     `json:"body_format"`
-	Status            string     `json:"status"`
-	IsRemoved         bool       `json:"is_removed"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	EditedAt          *time.Time `json:"edited_at,omitempty"`
-	DeletedAt         *time.Time `json:"deleted_at,omitempty"`
+	ID                string        `json:"id"`
+	WorkspaceID       string        `json:"workspace_id"`
+	ChannelID         string        `json:"channel_id,omitempty"`
+	DMConversationID  string        `json:"dm_conversation_id,omitempty"`
+	SenderID          string        `json:"sender_id"`
+	SenderDisplayName string        `json:"sender_display_name"`
+	Kind              string        `json:"kind"`
+	BodyText          string        `json:"body_text"`
+	BodyFormat        string        `json:"body_format"`
+	Status            string        `json:"status"`
+	IsRemoved         bool          `json:"is_removed"`
+	CreatedAt         time.Time     `json:"created_at"`
+	UpdatedAt         time.Time     `json:"updated_at"`
+	EditedAt          *time.Time    `json:"edited_at,omitempty"`
+	DeletedAt         *time.Time    `json:"deleted_at,omitempty"`
+	Quoted            *QuotePayload `json:"quoted,omitempty"`
+}
+
+type QuotePayload struct {
+	ID         string     `json:"id"`
+	AuthorID   string     `json:"author_id"`
+	Body       string     `json:"body,omitempty"`
+	BodyFormat string     `json:"body_format"`
+	IsRemoved  bool       `json:"is_removed,omitempty"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type ReactionPayload struct {
