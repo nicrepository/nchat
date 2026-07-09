@@ -61,8 +61,32 @@ func listMessageCols() []string {
 	return append(messageCols(), "sender_display_name", "sender_email", "is_favorited")
 }
 
+func listMessageWithQuoteCols() []string {
+	return append(listMessageCols(),
+		"quote_id", "quote_author_id", "quote_body_text", "quote_body_format",
+		"quote_status", "quote_deleted_at", "quote_created_at",
+	)
+}
+
 func listMessageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 	return append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", false)
+}
+
+func listMessageWithQuoteRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
+	return append(listMessageRow(id, workspaceID, channelID, dmID, now), emptyQuoteRow()...)
+}
+
+func emptyQuoteRow() []any {
+	return []any{"", "", "", "", "", (*time.Time)(nil), (*time.Time)(nil)}
+}
+
+func quoteRow(id, authorID, body, format, status string, deletedAt *time.Time, createdAt time.Time) []any {
+	return []any{id, authorID, body, format, status, deletedAt, &createdAt}
+}
+
+func listMessageRowWithQuote(id, workspaceID, channelID, dmID string, now time.Time, quote []any) []any {
+	row := append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", false)
+	return append(row, quote...)
 }
 
 // newMock creates and defers close of a pgxmock pool.
@@ -118,8 +142,8 @@ func emptyReactionRows() *pgxmock.Rows {
 func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	expectCreate(mock, pgxmock.NewRows(listMessageCols()).
-		AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
+	expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols()).
+		AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -138,8 +162,8 @@ func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
 func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	expectCreate(mock, pgxmock.NewRows(listMessageCols()).
-		AddRow(listMessageRow("msg-2", "ws-1", "", "dm-1", now)...))
+	expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols()).
+		AddRow(listMessageWithQuoteRow("msg-2", "ws-1", "", "dm-1", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -158,8 +182,8 @@ func TestPGXMessageStore_CreateMessage_DMSuccess(t *testing.T) {
 func TestPGXMessageStore_CreateMessage_ValidSameTargetRef_Succeeds(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	expectCreate(mock, pgxmock.NewRows(listMessageCols()).
-		AddRow(listMessageRow("msg-c", "ws-1", "ch-1", "", now)...))
+	expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols()).
+		AddRow(listMessageWithQuoteRow("msg-c", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	_, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -168,6 +192,29 @@ func TestPGXMessageStore_CreateMessage_ValidSameTargetRef_Succeeds(t *testing.T)
 	})
 	if err != nil {
 		t.Fatalf("CreateMessage with valid same-target ref: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_CreateMessage_ReturnsQuotedParent(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols()).
+		AddRow(listMessageRowWithQuote(
+			"msg-child", "ws-1", "ch-1", "", now,
+			quoteRow("msg-parent", "user-parent", "parent body", "v2", "active", nil, now),
+		)...))
+
+	store := storage.NewPGXMessageStore(mock)
+	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "reply",
+		ParentMessageID: "00000000-0000-0000-0000-000000000010",
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage with quote: %v", err)
+	}
+	if msg.Quoted == nil || msg.Quoted.ID != "msg-parent" || msg.Quoted.BodyText != "parent body" {
+		t.Fatalf("quoted parent not scanned: %+v", msg.Quoted)
 	}
 	checkExpectations(t, mock)
 }
@@ -222,7 +269,7 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
-				WillReturnRows(pgxmock.NewRows(listMessageCols()))
+				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
 			if !errors.Is(err, domain.ErrNotFound) {
@@ -244,8 +291,8 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			[]string{"11111111-1111-1111-1111-111111111111"},
 			[]string{"22222222-2222-2222-2222-222222222222"},
 		).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("msg-mention", "ws-1", "ch-1", "", now)...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -273,7 +320,7 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			[]string{"99999999-9999-9999-9999-999999999999"},
 			pgxmock.AnyArg(),
 		).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	_, err := storage.NewPGXMessageStore(mock).CreateMessage(
 		context.Background(),
@@ -429,7 +476,7 @@ func TestPGXMessageStore_CreateMessage_AuthDenied_ReturnsErrNotFound(t *testing.
 	for _, name := range []string{"channel auth denied", "DM auth denied", "cross-workspace", "invalid ref backstop"} {
 		t.Run(name, func(t *testing.T) {
 			mock := newMock(t)
-			expectCreate(mock, pgxmock.NewRows(listMessageCols())) // 0 rows
+			expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols())) // 0 rows
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
 				WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "user-1", BodyText: "x",
@@ -457,7 +504,8 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		now, now,
 		"Test User", "test@example.com", false,
 	}
-	expectCreate(mock, pgxmock.NewRows(listMessageCols()).AddRow(row...))
+	row = append(row, emptyQuoteRow()...)
+	expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
 
 	store := storage.NewPGXMessageStore(mock)
 	msg, err := store.CreateMessage(context.Background(), storage.CreateMessageInput{
@@ -476,12 +524,12 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 
 func TestPGXMessageStore_ValidateRefMessageInTarget_ValidReturnsNil(t *testing.T) {
 	mock := newMock(t)
-	mock.ExpectQuery(`SELECT 1 FROM chat\.messages`).
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+	mock.ExpectQuery(`(?s)FROM chat\.messages m.*JOIN chat\.workspace_members wm.*wm\.user_id = \$5.*m\.status = 'active'.*m\.channel_id IS NOT DISTINCT FROM \$3`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
 
 	store := storage.NewPGXMessageStore(mock)
-	if err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-1"); err != nil {
+	if err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-1", "user-1"); err != nil {
 		t.Fatalf("expected nil for valid ref, got %v", err)
 	}
 	checkExpectations(t, mock)
@@ -489,14 +537,28 @@ func TestPGXMessageStore_ValidateRefMessageInTarget_ValidReturnsNil(t *testing.T
 
 func TestPGXMessageStore_ValidateRefMessageInTarget_MissingReturnsErrInvalidRef(t *testing.T) {
 	mock := newMock(t)
-	mock.ExpectQuery(`SELECT 1 FROM chat\.messages`).
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+	mock.ExpectQuery(`FROM chat\.messages m`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 
 	store := storage.NewPGXMessageStore(mock)
-	err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-missing")
+	err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-missing", "user-1")
 	if !errors.Is(err, domain.ErrInvalidMessageReference) {
 		t.Fatalf("expected ErrInvalidMessageReference for missing ref, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ValidateRefMessageInTarget_DeletedReturnsErrInvalidRef(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(`(?s)FROM chat\.messages m.*m\.status = 'active'`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnError(pgx.ErrNoRows)
+
+	store := storage.NewPGXMessageStore(mock)
+	err := store.ValidateRefMessageInTarget(context.Background(), "ws-1", "ch-1", "", "msg-deleted", "user-1")
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for deleted ref, got %v", err)
 	}
 	checkExpectations(t, mock)
 }
@@ -510,8 +572,8 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	// matching the list endpoint contract (includes sender_display_name, sender_email).
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("msg-1", "ws-1", "user-1").
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...))
 	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 1, true))
 
 	store := storage.NewPGXMessageStore(mock)
@@ -556,9 +618,9 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	// Default limit is 50; query uses limit+1 = 51 to detect next page.
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...).
-			AddRow(listMessageRow("msg-2", "ws-1", "ch-1", "", now)...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...).
+			AddRow(listMessageWithQuoteRow("msg-2", "ws-1", "ch-1", "", now)...))
 	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 2, true))
 
 	store := storage.NewPGXMessageStore(mock)
@@ -580,11 +642,36 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	checkExpectations(t, mock)
 }
 
+func TestPGXMessageStore_ListChannelMessages_JoinsQuotedParent(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`(?s)LEFT JOIN chat\.messages q.*q\.id = m\.parent_message_id.*q\.workspace_id = m\.workspace_id.*q\.channel_id IS NOT DISTINCT FROM m\.channel_id`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageRowWithQuote(
+				"msg-child", "ws-1", "ch-1", "", now,
+				quoteRow("msg-parent", "user-parent", "parent body", "v1", "active", nil, now),
+			)...))
+	expectReactionBatch(mock, emptyReactionRows())
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	if len(result.Messages) != 1 || result.Messages[0].Quoted == nil || result.Messages[0].Quoted.ID != "msg-parent" {
+		t.Fatalf("quoted parent not loaded: %+v", result.Messages)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -614,9 +701,10 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		now, now,
 		"Test User", "test@example.com", false,
 	}
+	row = append(row, emptyQuoteRow()...)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).AddRow(row...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
 	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -639,8 +727,8 @@ func TestPGXMessageStore_ListDMMessages_ReturnsMessages(t *testing.T) {
 	now := time.Now()
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1", 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("msg-3", "ws-1", "", "dm-1", now)...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-3", "ws-1", "", "dm-1", now)...))
 	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -660,7 +748,7 @@ func TestPGXMessageStore_ListDMMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1", 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	result, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{
@@ -728,8 +816,8 @@ func TestPGXMessageStore_ListChannelMessages_DefaultLimit(t *testing.T) {
 	// Default limit is 50 → query uses limit+1 = 51.
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("msg-1", "ws-1", "ch-1", "", now)...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...))
 	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -750,7 +838,7 @@ func TestPGXMessageStore_ListChannelMessages_LimitCappedAtMax(t *testing.T) {
 	// Limit 999 → capped at 100 → query uses 101.
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 101).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	_, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -767,7 +855,7 @@ func TestPGXMessageStore_ListChannelMessages_CustomLimitWithinBounds(t *testing.
 	// Explicit limit 10 → query uses 11.
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 11).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	_, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -785,10 +873,10 @@ func TestPGXMessageStore_ListChannelMessages_HasNextPage_SetsNextCursor(t *testi
 	mock := newMock(t)
 	now := time.Now()
 	// Return limit+1 rows (default 50 → 51 rows) to trigger NextCursor.
-	rows := pgxmock.NewRows(listMessageCols())
+	rows := pgxmock.NewRows(listMessageWithQuoteCols())
 	for i := range 51 {
 		id := "msg-" + string(rune('a'+i%26))
-		rows.AddRow(listMessageRow(id, "ws-1", "ch-1", "", now)...)
+		rows.AddRow(listMessageWithQuoteRow(id, "ws-1", "ch-1", "", now)...)
 	}
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", 51).
@@ -814,10 +902,10 @@ func TestPGXMessageStore_ListChannelMessages_HasNextPage_SetsNextCursor(t *testi
 func TestPGXMessageStore_ListDMMessages_HasNextPage_SetsNextCursor(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	rows := pgxmock.NewRows(listMessageCols())
+	rows := pgxmock.NewRows(listMessageWithQuoteCols())
 	for i := range 51 {
 		id := "dm-msg-" + string(rune('a'+i%26))
-		rows.AddRow(listMessageRow(id, "ws-1", "", "dm-1", now)...)
+		rows.AddRow(listMessageWithQuoteRow(id, "ws-1", "", "dm-1", now)...)
 	}
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1", 51).
@@ -851,8 +939,8 @@ func TestPGXMessageStore_ListChannelMessages_WithBeforeCursor(t *testing.T) {
 	// When BeforeCursor is set, query has 6 args: ws, ch, user, ts, id, limit+1.
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "ch-1", "user-1", pgxmock.AnyArg(), cursorID, 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("msg-older", "ws-1", "ch-1", "", now.Add(-time.Minute))...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-older", "ws-1", "ch-1", "", now.Add(-time.Minute))...))
 	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -877,8 +965,8 @@ func TestPGXMessageStore_ListDMMessages_WithBeforeCursor(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT`).
 		WithArgs("ws-1", "dm-1", "user-1", pgxmock.AnyArg(), cursorID, 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()).
-			AddRow(listMessageRow("dm-older", "ws-1", "", "dm-1", now.Add(-time.Minute))...))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("dm-older", "ws-1", "", "dm-1", now.Add(-time.Minute))...))
 	expectReactionBatch(mock, emptyReactionRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -910,7 +998,7 @@ func TestPGXMessageStore_ListChannelMessages_KeysetSQLContainsIDTieBreaker(t *te
 	// Match the row-comparison keyset clause in the query.
 	mock.ExpectQuery(`(?s)\(m\.created_at,\s*m\.id\)\s*<\s*\(\$4,\s*\$5::uuid\)`).
 		WithArgs("ws-1", "ch-1", "user-1", pgxmock.AnyArg(), cursor.ID, 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	_, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
@@ -933,7 +1021,7 @@ func TestPGXMessageStore_ListDMMessages_KeysetSQLContainsIDTieBreaker(t *testing
 	// Match the row-comparison keyset clause in the DM query.
 	mock.ExpectQuery(`(?s)\(m\.created_at,\s*m\.id\)\s*<\s*\(\$4,\s*\$5::uuid\)`).
 		WithArgs("ws-1", "conv-1", "user-1", pgxmock.AnyArg(), cursor.ID, 51).
-		WillReturnRows(pgxmock.NewRows(listMessageCols()))
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
 	store := storage.NewPGXMessageStore(mock)
 	_, err := store.ListDMMessages(context.Background(), storage.ListDMMessagesInput{

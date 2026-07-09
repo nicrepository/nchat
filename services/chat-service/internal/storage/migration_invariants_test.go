@@ -206,6 +206,40 @@ func TestChatMigration_AddsMessagesIndexes(t *testing.T) {
 	}
 }
 
+func TestChatMigration_AddsParentReplyMigration(t *testing.T) {
+	up := readChatMigration(t, "000012_message_parent_reply.up.sql")
+	for _, expected := range []string{
+		"ADD COLUMN IF NOT EXISTS parent_message_id UUID",
+		"DROP CONSTRAINT IF EXISTS messages_parent_message_id_fkey",
+		"REFERENCES chat.messages (id) ON DELETE SET NULL",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Fatalf("parent reply up migration missing %q", expected)
+		}
+	}
+	redundantParentIndex := "idx_messages_parent" + "_message_id"
+	if strings.Contains(up, redundantParentIndex) {
+		t.Fatal("parent reply up migration must not create redundant parent_message_id index")
+	}
+
+	down := readChatMigration(t, "000012_message_parent_reply.down.sql")
+	for _, expected := range []string{
+		"DROP CONSTRAINT IF EXISTS messages_parent_message_id_fkey",
+		"ADD CONSTRAINT messages_parent_message_id_fkey",
+		"FOREIGN KEY (parent_message_id) REFERENCES chat.messages (id)",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("parent reply down migration missing %q", expected)
+		}
+	}
+	if strings.Contains(down, "DROP COLUMN") {
+		t.Fatal("parent reply down migration must not drop parent_message_id")
+	}
+	if strings.Contains(down, "CREATE INDEX") {
+		t.Fatal("parent reply down migration must not create indexes")
+	}
+}
+
 func TestChatMigration_MessagesDownDoesNotDropSchemaCascade(t *testing.T) {
 	migration := readChatMigration(t, "000004_chat_messages.down.sql")
 	if strings.Contains(strings.ToUpper(migration), "DROP SCHEMA") {

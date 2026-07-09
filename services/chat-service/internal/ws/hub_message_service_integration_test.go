@@ -129,7 +129,7 @@ func (s *integMessageStore) listCreated() []domain.Message {
 func (s *integMessageStore) GetMessageByIDInWorkspace(_ context.Context, _, _, _ string) (domain.Message, error) {
 	return s.seed, nil
 }
-func (s *integMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _ string) error {
+func (s *integMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _, _ string) error {
 	return nil
 }
 func (s *integMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {

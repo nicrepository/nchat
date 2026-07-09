@@ -91,6 +91,17 @@ type messageJSON struct {
 	UpdatedAt         time.Time      `json:"updated_at"`
 	Reactions         []reactionJSON `json:"reactions"`
 	IsFavorited       bool           `json:"is_favorited,omitempty"`
+	Quoted            *quoteJSON     `json:"quoted,omitempty"`
+}
+
+type quoteJSON struct {
+	ID         string     `json:"id"`
+	AuthorID   string     `json:"author_id"`
+	Body       string     `json:"body,omitempty"`
+	BodyFormat string     `json:"body_format"`
+	IsRemoved  bool       `json:"is_removed,omitempty"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type reactionJSON struct {
@@ -119,10 +130,14 @@ type searchMentionsResponseData struct {
 // ── Request shapes ────────────────────────────────────────────────────────────
 
 // createMessageRequest is the inbound body for POST message endpoints.
-// Only body_text and body_format are accepted. Any unrecognised field causes a 400.
+// Only body_text, body_format, and parent_message_id are accepted. Any unrecognised field causes a 400.
+// ForwardedFromMessageID and ReferencedMessageID are reserved for
+// future RF-08 (forward) and RF-09 (thread reference) and are not
+// yet exposed via the API.
 type createMessageRequest struct {
-	BodyText   string `json:"body_text"`
-	BodyFormat string `json:"body_format"`
+	BodyText        string `json:"body_text"`
+	BodyFormat      string `json:"body_format"`
+	ParentMessageID string `json:"parent_message_id"`
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -197,6 +212,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		UpdatedAt:         m.UpdatedAt,
 		Reactions:         make([]reactionJSON, len(m.Reactions)),
 		IsFavorited:       m.IsFavorited,
+		Quoted:            mapQuoteJSON(m.Quoted),
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
@@ -207,6 +223,29 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		j.IsRemoved = true
 	} else {
 		j.BodyText = m.BodyText
+	}
+	return j
+}
+
+func mapQuoteJSON(q *domain.QuotedMessage) *quoteJSON {
+	if q == nil {
+		return nil
+	}
+	var deletedAt *time.Time
+	if !q.DeletedAt.IsZero() {
+		t := q.DeletedAt
+		deletedAt = &t
+	}
+	j := &quoteJSON{
+		ID:         q.ID,
+		AuthorID:   q.AuthorID,
+		BodyFormat: string(q.BodyFormat),
+		IsRemoved:  q.Status == domain.MessageStatusDeleted || deletedAt != nil,
+		DeletedAt:  deletedAt,
+		CreatedAt:  q.CreatedAt,
+	}
+	if !j.IsRemoved {
+		j.Body = q.BodyText
 	}
 	return j
 }
@@ -364,11 +403,12 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	msg, err := h.messages.CreateChannelMessage(r.Context(), service.CreateChannelMessageInput{
-		WorkspaceID: wsID,
-		ChannelID:   channelID,
-		SenderID:    userID, // always from auth context — never from body
-		BodyText:    req.BodyText,
-		BodyFormat:  domain.MessageBodyFormat(req.BodyFormat),
+		WorkspaceID:     wsID,
+		ChannelID:       channelID,
+		SenderID:        userID, // always from auth context — never from body
+		BodyText:        req.BodyText,
+		BodyFormat:      domain.MessageBodyFormat(req.BodyFormat),
+		ParentMessageID: req.ParentMessageID,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -460,11 +500,12 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 	}
 
 	msg, err := h.messages.CreateDMMessage(r.Context(), service.CreateDMMessageInput{
-		WorkspaceID:    wsID,
-		ConversationID: convID,
-		SenderID:       userID,
-		BodyText:       req.BodyText,
-		BodyFormat:     domain.MessageBodyFormat(req.BodyFormat),
+		WorkspaceID:     wsID,
+		ConversationID:  convID,
+		SenderID:        userID,
+		BodyText:        req.BodyText,
+		BodyFormat:      domain.MessageBodyFormat(req.BodyFormat),
+		ParentMessageID: req.ParentMessageID,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -590,6 +631,9 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid cursor")
 	case errors.Is(err, domain.ErrNotFound):
 		// Non-enumerating: use the same status for unauthorized targets.
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrInvalidMessageReference):
+		// Non-enumerating: missing, deleted, and cross-target parents look identical.
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")

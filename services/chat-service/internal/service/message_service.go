@@ -49,12 +49,15 @@ const maxMessageBodyRunes = 40_000
 // CreateChannelMessageInput is the caller-provided input for posting to a channel.
 // Status, timestamps, edited_at, deleted_at, and workspace_id are not caller-settable.
 type CreateChannelMessageInput struct {
-	WorkspaceID            string
-	ChannelID              string
-	SenderID               string
-	BodyText               string
-	BodyFormat             domain.MessageBodyFormat
-	ParentMessageID        string
+	WorkspaceID     string
+	ChannelID       string
+	SenderID        string
+	BodyText        string
+	BodyFormat      domain.MessageBodyFormat
+	ParentMessageID string
+	// ForwardedFromMessageID and ReferencedMessageID are reserved for
+	// future RF-08 (forward) and RF-09 (thread reference) and are not
+	// yet exposed via the API.
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
 }
@@ -62,12 +65,15 @@ type CreateChannelMessageInput struct {
 // CreateDMMessageInput is the caller-provided input for posting to a DM conversation.
 // Status, timestamps, edited_at, deleted_at, and workspace_id are not caller-settable.
 type CreateDMMessageInput struct {
-	WorkspaceID            string
-	ConversationID         string
-	SenderID               string
-	BodyText               string
-	BodyFormat             domain.MessageBodyFormat
-	ParentMessageID        string
+	WorkspaceID     string
+	ConversationID  string
+	SenderID        string
+	BodyText        string
+	BodyFormat      domain.MessageBodyFormat
+	ParentMessageID string
+	// ForwardedFromMessageID and ReferencedMessageID are reserved for
+	// future RF-08 (forward) and RF-09 (thread reference) and are not
+	// yet exposed via the API.
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
 }
@@ -228,15 +234,15 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		body = rewriteMentionLabels(body, labels)
 	}
 
-	parentID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", strings.TrimSpace(input.ParentMessageID))
+	parentID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", senderID, strings.TrimSpace(input.ParentMessageID))
 	if err != nil {
 		return domain.Message{}, err
 	}
-	forwardedID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", strings.TrimSpace(input.ForwardedFromMessageID))
+	forwardedID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", senderID, strings.TrimSpace(input.ForwardedFromMessageID))
 	if err != nil {
 		return domain.Message{}, err
 	}
-	referencedID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", strings.TrimSpace(input.ReferencedMessageID))
+	referencedID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", senderID, strings.TrimSpace(input.ReferencedMessageID))
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -289,15 +295,15 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		return domain.Message{}, err
 	}
 
-	parentID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, strings.TrimSpace(input.ParentMessageID))
+	parentID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ParentMessageID))
 	if err != nil {
 		return domain.Message{}, err
 	}
-	forwardedID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, strings.TrimSpace(input.ForwardedFromMessageID))
+	forwardedID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ForwardedFromMessageID))
 	if err != nil {
 		return domain.Message{}, err
 	}
-	referencedID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, strings.TrimSpace(input.ReferencedMessageID))
+	referencedID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ReferencedMessageID))
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -435,14 +441,14 @@ func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessage
 // for any invalid case (invalid UUID, non-existent, cross-workspace, cross-channel,
 // channel-to-DM, DM-to-channel). The error is intentionally non-enumerating: callers
 // cannot determine whether the referenced message exists.
-func (s *MessageService) validateRefMessage(ctx context.Context, workspaceID, channelID, dmConversationID, refID string) (string, error) {
+func (s *MessageService) validateRefMessage(ctx context.Context, workspaceID, channelID, dmConversationID, senderID, refID string) (string, error) {
 	if refID == "" {
 		return "", nil
 	}
 	if _, err := uuid.Parse(refID); err != nil {
 		return "", domain.ErrInvalidMessageReference
 	}
-	if err := s.messages.ValidateRefMessageInTarget(ctx, workspaceID, channelID, dmConversationID, refID); err != nil {
+	if err := s.messages.ValidateRefMessageInTarget(ctx, workspaceID, channelID, dmConversationID, refID, senderID); err != nil {
 		return "", err
 	}
 	return refID, nil
