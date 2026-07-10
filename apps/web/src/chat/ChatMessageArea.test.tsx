@@ -245,6 +245,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clearTokens();
 });
 
@@ -1263,6 +1264,10 @@ describe("ChatMessageArea — send message", () => {
 
     expect(quote).toHaveTextContent("Mensagem original indisponível.");
     expect(quote).toHaveAttribute("aria-disabled", "true");
+    const scrollIntoViewMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoViewMock.mockClear();
+    fireEvent.keyDown(quote, { key: "Enter" });
+    expect(scrollIntoViewMock).not.toHaveBeenCalled();
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
   });
 
@@ -1301,6 +1306,48 @@ describe("ChatMessageArea — send message", () => {
       block: "center",
     });
     expect(scrollIntoViewMock.mock.contexts[0]).toBe(originalMessageElement);
+  });
+
+  it("keyboard jump highlights the original message briefly", async () => {
+    const parent = makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "original" });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        parent,
+        makeMessage({
+          id: "m2",
+          bodyText: "resposta",
+          quoted: {
+            id: "m1",
+            authorId: parent.senderId,
+            bodyText: parent.bodyText,
+            bodyFormat: parent.bodyFormat,
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: parent.createdAt,
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const quotes = await screen.findAllByTestId("chat-message-quote");
+    const originalMessageElement = document.querySelector('[data-message-id="m1"]');
+    expect(originalMessageElement).not.toBeNull();
+    const scrollIntoViewMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoViewMock.mockClear();
+    vi.useFakeTimers();
+
+    fireEvent.keyDown(quotes[0], { key: "Enter" });
+
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+    expect(originalMessageElement).toHaveClass("chat-msg-area__msg--highlight");
+
+    act(() => vi.advanceTimersByTime(1_200));
+
+    expect(originalMessageElement).not.toHaveClass("chat-msg-area__msg--highlight");
   });
 });
 

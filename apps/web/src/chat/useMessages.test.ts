@@ -289,6 +289,47 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
   });
 
+  it("reverts pending optimistic reactions when the server reports a reaction error", async () => {
+    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false }];
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", reactions: originalReactions })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 2, reactedByMe: true },
+    ]);
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
+
+    expect(result.current.state.messages[0].reactions).toEqual(originalReactions);
+    expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
+  });
+
+  it("reverts an optimistic reaction when confirmation times out", async () => {
+    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false }];
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", reactions: originalReactions })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+    act(() => vi.advanceTimersByTime(8_000));
+
+    expect(result.current.state.messages[0].reactions).toEqual(originalReactions);
+    expect(result.current.state.actionError).toMatch(/confirmar a reação/i);
+  });
+
   it("clears a temporary reaction error instead of leaving a stale banner", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const { result } = renderHook(() =>

@@ -12,11 +12,13 @@ vi.mock("../lib/authClient", () => ({
 
 import {
   favoriteMessage,
+  fetchChannelMessage,
   fetchChannelMessages,
   fetchPins,
   fetchFavorites,
   fetchAllowedReactionEmojis,
   fetchChannels,
+  fetchDMMessage,
   fetchDMMessages,
   fetchDMs,
   fetchMentionCandidates,
@@ -569,6 +571,36 @@ describe("fetchDMMessages", () => {
     const page = await fetchDMMessages("dm-juliane");
     expect(page.messages).toEqual([]);
     expect(page.nextCursor).toBe("");
+  });
+});
+
+describe("fetchChannelMessage", () => {
+  it("fetches one channel message with the encoded message id", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ id: "msg/1" })));
+    const ctrl = new AbortController();
+
+    const msg = await fetchChannelMessage("geral", "msg/1", ctrl.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/channels/geral/messages/msg%2F1"),
+      expect.objectContaining({ method: "GET", signal: ctrl.signal }),
+    );
+    expect(msg.id).toBe("msg/1");
+  });
+});
+
+describe("fetchDMMessage", () => {
+  it("fetches one DM message with the encoded message id", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ id: "msg dm" })));
+    const ctrl = new AbortController();
+
+    const msg = await fetchDMMessage("dm-juliane", "msg dm", ctrl.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/dm/dm-juliane/messages/msg%20dm"),
+      expect.objectContaining({ method: "GET", signal: ctrl.signal }),
+    );
+    expect(msg.id).toBe("msg dm");
   });
 });
 
