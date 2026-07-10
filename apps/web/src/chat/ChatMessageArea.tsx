@@ -94,7 +94,7 @@ function quoteAuthorLabel(
   messagesById: Map<string, Message>,
 ) {
   const parent = messagesById.get(quote.id);
-  return parent ? senderLabel(parent) : quote.authorId.slice(0, 8);
+  return parent ? senderLabel(parent) : "Usuário desconhecido";
 }
 
 function senderInitials(msg: Message): string {
@@ -651,7 +651,7 @@ function MessageBubble({
           {message.quoted && !message.isRemoved && (
             <QuoteBlock
               quote={message.quoted}
-              authorLabel={quoteAuthorLabel ?? message.quoted.authorId.slice(0, 8)}
+              authorLabel={quoteAuthorLabel ?? "Usuário desconhecido"}
               canJump={canJumpToQuote}
               onJump={onQuoteJump}
             />
