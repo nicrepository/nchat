@@ -647,7 +647,8 @@ function MessageBubble({
           ref={bubbleRef}
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
-          {message.quoted && (
+          {/* Quote ocultado em mensagens removidas para não misturar contexto residual com o placeholder de remoção. */}
+          {message.quoted && !message.isRemoved && (
             <QuoteBlock
               quote={message.quoted}
               authorLabel={quoteAuthorLabel ?? message.quoted.authorId.slice(0, 8)}
