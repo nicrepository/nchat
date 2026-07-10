@@ -72,12 +72,25 @@ export interface Message {
   reactions: MessageReaction[];
   /** True when the current user favorited this message (RF-06, private per user). */
   isFavorited: boolean;
+  /** Immediate parent preview for RF-07 quote-reply. One level only. */
+  quoted?: QuotedMessage;
 }
 
 export interface MessageReaction {
   emoji: string;
   count: number;
   reactedByMe: boolean;
+}
+
+export interface QuotedMessage {
+  id: string;
+  authorId: string;
+  /** Empty when the original message is removed or inaccessible. */
+  bodyText: string;
+  bodyFormat: MessageBodyFormat;
+  isRemoved: boolean;
+  deletedAt: string | null;
+  createdAt: string;
 }
 
 export interface MessagePage {

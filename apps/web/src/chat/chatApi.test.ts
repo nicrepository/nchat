@@ -411,6 +411,61 @@ describe("fetchChannelMessages", () => {
     expect(page.messages[0].reactions).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
   });
 
+  it("maps inline quoted message previews", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          quoted: {
+            id: "parent-1",
+            author_id: "user-parent",
+            body: "texto citado",
+            body_format: "v3",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0].quoted).toEqual({
+      id: "parent-1",
+      authorId: "user-parent",
+      bodyText: "texto citado",
+      bodyFormat: "v3",
+      isRemoved: false,
+      deletedAt: null,
+      createdAt: "2024-01-15T09:00:00Z",
+    });
+  });
+
+  it("maps removed quoted previews without body", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          quoted: {
+            id: "parent-1",
+            author_id: "user-parent",
+            body_format: "v2",
+            is_removed: true,
+            deleted_at: "2024-01-15T09:30:00Z",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0].quoted).toMatchObject({
+      id: "parent-1",
+      bodyText: "",
+      bodyFormat: "v2",
+      isRemoved: true,
+      deletedAt: "2024-01-15T09:30:00Z",
+    });
+  });
+
   it("maps an explicit v2 body format", async () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v2" })]));
     const page = await fetchChannelMessages("geral");
@@ -562,11 +617,23 @@ describe("postChannelMessage", () => {
   it("passes abort signal to authenticatedFetch", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postChannelMessage("geral", "Hello", ctrl.signal);
+    await postChannelMessage("geral", "Hello", undefined, ctrl.signal);
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ signal: ctrl.signal }),
     );
+  });
+
+  it("sends parent_message_id when replying in a channel", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello world", "parent-1");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({
+      body_text: "Hello world",
+      body_format: "v3",
+      parent_message_id: "parent-1",
+    });
   });
 
   it("returns mapped Message from response", async () => {
@@ -661,11 +728,23 @@ describe("postDMMessage", () => {
   it("passes abort signal to authenticatedFetch", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postDMMessage("dm-juliane", "Hi", ctrl.signal);
+    await postDMMessage("dm-juliane", "Hi", undefined, ctrl.signal);
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ signal: ctrl.signal }),
     );
+  });
+
+  it("sends parent_message_id when replying in a DM", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Mensagem direta", "parent-dm-1");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({
+      body_text: "Mensagem direta",
+      body_format: "v2",
+      parent_message_id: "parent-dm-1",
+    });
   });
 
   it("returns mapped Message from response", async () => {
