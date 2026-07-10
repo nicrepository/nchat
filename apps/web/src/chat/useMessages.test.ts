@@ -865,6 +865,67 @@ describe("useMessages — WS message.created integration", () => {
   });
 });
 
+// ── Quote reply state (RF-07) ─────────────────────────────────────────────────
+
+describe("useMessages — reply state", () => {
+  it("selectReply exposes the selected message as replyTo", async () => {
+    const msg = makeMessage({ id: "msg-reply-parent" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [msg], nextCursor: "" });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(msg));
+
+    expect(result.current.state.replyTo).toEqual(msg);
+  });
+
+  it("cancelReply clears replyTo without changing loaded messages", async () => {
+    const msg = makeMessage({ id: "msg-reply-parent" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [msg], nextCursor: "" });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(msg));
+    act(() => result.current.cancelReply());
+
+    expect(result.current.state.replyTo).toBeNull();
+    expect(result.current.state.messages).toEqual([msg]);
+  });
+
+  it("resets replyTo when switching targets", async () => {
+    const msg = makeMessage({ id: "msg-reply-parent" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [msg], nextCursor: "" });
+
+    const { result, rerender } = renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(msg));
+    expect(result.current.state.replyTo).toEqual(msg);
+
+    mockFetchChannelMessages.mockResolvedValueOnce(emptyPage);
+    rerender({ targetId: "ch-2" });
+
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "ch-2",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(result.current.state.replyTo).toBeNull());
+  });
+});
+
 // ── Favorites (RF-06) ─────────────────────────────────────────────────────────
 
 describe("useMessages — toggleFavorite", () => {

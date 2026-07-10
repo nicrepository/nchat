@@ -1289,12 +1289,18 @@ describe("ChatMessageArea — send message", () => {
     renderChannelAreaForUser();
 
     const quotes = await screen.findAllByTestId("chat-message-quote");
+    const originalMessageElement = document.querySelector('[data-message-id="m1"]');
+    expect(originalMessageElement).not.toBeNull();
+    const scrollIntoViewMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoViewMock.mockClear();
+
     await userEvent.click(quotes[0]);
 
-    expect(window.Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({
       behavior: "smooth",
       block: "center",
     });
+    expect(scrollIntoViewMock.mock.contexts[0]).toBe(originalMessageElement);
   });
 });
 
