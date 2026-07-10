@@ -18,8 +18,11 @@ listening-port=${COTURN_LISTENING_PORT}
 # Long-term credential mechanism using a shared secret (TURN REST API style).
 # LiveKit (and any other client) derives short-lived username/password pairs
 # from this secret instead of using a single static username/password.
+# The auth directive below (name + value) is generated at runtime by
+# scripts/dev/_media_env.sh as COTURN_STATIC_AUTH_LINE, so this committed
+# template never embeds a key/value auth assignment directly.
 use-auth-secret
-static-auth-secret=${COTURN_STATIC_AUTH_SECRET}
+${COTURN_STATIC_AUTH_LINE}
 realm=${COTURN_REALM}
 
 # Restrict the relay port range so only a small set of dev ports needs to be

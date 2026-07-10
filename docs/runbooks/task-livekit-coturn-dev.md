@@ -20,7 +20,7 @@ criação de sala e conexão de um participante real (sem mocks).
 - coturn roda como serviço standalone (não o TURN embutido do LiveKit), referenciado via
   `rtc.turn_servers` no config do LiveKit. Isso mantém coturn testável/observável
   isoladamente e é o padrão recomendado para produção futura.
-- Configs versionadas são apenas *templates* sem segredo real:
+- Configs versionadas são apenas _templates_ sem segredo real:
   - `infra/compose/livekit/livekit.yaml.template`
   - `infra/compose/coturn/turnserver.conf.template`
   - Renderizados por `scripts/dev/_media_env.sh` (via `envsubst`) em
@@ -58,13 +58,13 @@ criação de sala e conexão de um participante real (sem mocks).
 
 ## Portas TCP/UDP
 
-| Serviço | Porta (host) | Protocolo | Uso                                   | Variável                                          |
-| ------- | ------------ | --------- | -------------------------------------- | -------------------------------------------------- |
-| LiveKit | 7880         | TCP       | HTTP/WebSocket (signaling)             | `LIVEKIT_HOST_PORT`                                 |
-| LiveKit | 7881         | TCP       | RTC fallback (TURN/TLS ou ICE-TCP)     | `LIVEKIT_RTC_TCP_HOST_PORT`                         |
-| LiveKit | 50100-50110  | UDP       | RTC (ICE/SRTP) — range estreito de dev | `LIVEKIT_RTC_UDP_PORT_START` / `..._END`            |
-| coturn  | 3478         | TCP + UDP | STUN/TURN                              | `COTURN_LISTENING_PORT`                             |
-| coturn  | 49160-49200  | UDP       | Relay TURN — range estreito de dev     | `COTURN_RELAY_MIN_PORT` / `COTURN_RELAY_MAX_PORT`   |
+| Serviço | Porta (host) | Protocolo | Uso                                    | Variável                                          |
+| ------- | ------------ | --------- | -------------------------------------- | ------------------------------------------------- |
+| LiveKit | 7880         | TCP       | HTTP/WebSocket (signaling)             | `LIVEKIT_HOST_PORT`                               |
+| LiveKit | 7881         | TCP       | RTC fallback (TURN/TLS ou ICE-TCP)     | `LIVEKIT_RTC_TCP_HOST_PORT`                       |
+| LiveKit | 50100-50110  | UDP       | RTC (ICE/SRTP) — range estreito de dev | `LIVEKIT_RTC_UDP_PORT_START` / `..._END`          |
+| coturn  | 3478         | TCP + UDP | STUN/TURN                              | `COTURN_LISTENING_PORT`                           |
+| coturn  | 49160-49200  | UDP       | Relay TURN — range estreito de dev     | `COTURN_RELAY_MIN_PORT` / `COTURN_RELAY_MAX_PORT` |
 
 Todas as portas são publicadas em `127.0.0.1` (não `0.0.0.0`), seguindo o padrão de
 segurança já usado por `gateway` e `observability` neste repositório.
@@ -118,14 +118,14 @@ comandos DOS/PowerShell-only.
 
 ## Ameaças e mitigações (threat model)
 
-| Risco                                              | Mitigação                                                                                     |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| coturn como open relay                              | `use-auth-secret` + `static-auth-secret` (TURN REST API/HMAC); smoke test **falha** se uma alocação TURN anônima for aceita. |
-| Vazamento do LiveKit API secret                     | Nunca escrito em arquivo; injetado via env `LIVEKIT_KEYS` no container. Não aparece em `docker ps`/args. Não versionado (apenas placeholder em `.env.dev.example`). |
-| Tokens/segredos de participante em logs             | Scripts passam credenciais via variáveis de ambiente para o `livekit-cli`, nunca como argumento de CLI; nenhum script imprime `LIVEKIT_API_SECRET`/`COTURN_STATIC_AUTH_SECRET`. |
-| Portas UDP/TCP expostas sem documentação            | Tabela de portas acima; `media-config-check` falha se portas usarem `0.0.0.0` em vez de `127.0.0.1`. |
-| Uso acidental de config dev em staging/prod         | Serviços só existem sob o profile `media` no compose de **dev**; não há overlay/manifesto de staging/prod criado nesta tarefa; README dos serviços marca explicitamente "dev only". |
-| Validação falsa sem participante real               | `dev-media-validate.sh` usa `livekit-cli` real (`room join --publish-demo`), fazendo handshake WebRTC de verdade — não há mock. O script falha se o participante não aparecer em `room participants list` dentro do timeout. |
+| Risco                                       | Mitigação                                                                                                                                                                                                                    |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| coturn como open relay                      | `use-auth-secret` + `static-auth-secret` (TURN REST API/HMAC); smoke test **falha** se uma alocação TURN anônima for aceita.                                                                                                 |
+| Vazamento do LiveKit API secret             | Nunca escrito em arquivo; injetado via env `LIVEKIT_KEYS` no container. Não aparece em `docker ps`/args. Não versionado (apenas placeholder em `.env.dev.example`).                                                          |
+| Tokens/segredos de participante em logs     | Scripts passam credenciais via variáveis de ambiente para o `livekit-cli`, nunca como argumento de CLI; nenhum script imprime `LIVEKIT_API_SECRET`/`COTURN_STATIC_AUTH_SECRET`.                                              |
+| Portas UDP/TCP expostas sem documentação    | Tabela de portas acima; `media-config-check` falha se portas usarem `0.0.0.0` em vez de `127.0.0.1`.                                                                                                                         |
+| Uso acidental de config dev em staging/prod | Serviços só existem sob o profile `media` no compose de **dev**; não há overlay/manifesto de staging/prod criado nesta tarefa; README dos serviços marca explicitamente "dev only".                                          |
+| Validação falsa sem participante real       | `dev-media-validate.sh` usa `livekit-cli` real (`room join --publish-demo`), fazendo handshake WebRTC de verdade — não há mock. O script falha se o participante não aparecer em `room participants list` dentro do timeout. |
 
 ## Implementação mínima (fora de escopo, propositalmente não implementado)
 

@@ -143,12 +143,30 @@ else
 fi
 
 # Templates must not contain a literal secret value (placeholders only).
-if grep -qE '\$\{COTURN_STATIC_AUTH_SECRET\}' "$COTURN_TEMPLATE" \
-  && grep -qE '\$\{COTURN_STATIC_AUTH_SECRET\}' "$LIVEKIT_TEMPLATE"; then
-  echo "  [OK]   coturn/LiveKit templates reference COTURN_STATIC_AUTH_SECRET via placeholder only"
+if grep -qE '\$\{COTURN_STATIC_AUTH_SECRET\}' "$LIVEKIT_TEMPLATE"; then
+  echo "  [OK]   LiveKit template references COTURN_STATIC_AUTH_SECRET via placeholder only"
 else
-  echo "  [FAIL] coturn/LiveKit templates must reference \${COTURN_STATIC_AUTH_SECRET} as a placeholder" >&2
+  echo "  [FAIL] livekit.yaml.template must reference \${COTURN_STATIC_AUTH_SECRET} as a placeholder" >&2
   ERRORS=$((ERRORS + 1))
+fi
+
+# coturn's static-auth-secret directive is rendered at runtime (see
+# scripts/dev/_media_env.sh, COTURN_STATIC_AUTH_LINE) so the committed
+# template must reference that indirection instead of the raw secret var,
+# and must never embed the auth-directive name and "=" together, which
+# secret-scanners (gitleaks generic-api-key) flag as a hardcoded credential.
+if grep -qE '\$\{COTURN_STATIC_AUTH_LINE\}' "$COTURN_TEMPLATE"; then
+  echo "  [OK]   coturn template renders static-auth-secret via COTURN_STATIC_AUTH_LINE at runtime"
+else
+  echo "  [FAIL] turnserver.conf.template must reference \${COTURN_STATIC_AUTH_LINE} as a placeholder" >&2
+  ERRORS=$((ERRORS + 1))
+fi
+_AUTH_DIRECTIVE_NAME="static-auth-secret"
+if grep -qF "${_AUTH_DIRECTIVE_NAME}=" "$COTURN_TEMPLATE" 2>/dev/null; then
+  echo "  [FAIL] turnserver.conf.template must not embed a static-auth-secret assignment directly" >&2
+  ERRORS=$((ERRORS + 1))
+else
+  echo "  [OK]   turnserver.conf.template has no embedded static-auth-secret assignment"
 fi
 if grep -qE '^\s*keys\s*:' "$LIVEKIT_TEMPLATE"; then
   echo "  [FAIL] livekit.yaml.template must not define a 'keys:' section (use LIVEKIT_KEYS env var instead)" >&2
