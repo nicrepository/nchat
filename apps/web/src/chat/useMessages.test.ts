@@ -520,6 +520,37 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0].bodyFormat).toBe("v3");
   });
 
+  it("maps quoted previews from realtime payloads", async () => {
+    const payload = makePayload({
+      id: "msg-reply",
+      quoted: {
+        id: "msg-parent",
+        author_id: "user-parent",
+        body: "texto citado",
+        body_format: "v3",
+        created_at: "2024-01-15T09:00:00Z",
+      },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsEventWithPayload("channel", "ch-1", payload));
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].quoted).toEqual({
+      id: "msg-parent",
+      authorId: "user-parent",
+      bodyText: "texto citado",
+      bodyFormat: "v3",
+      isRemoved: false,
+      deletedAt: null,
+      createdAt: "2024-01-15T09:00:00Z",
+    });
+  });
+
   it("renders realtime payload without sender email", async () => {
     const payload = {
       ...makePayload({ id: "msg-no-email", sender_display_name: "Display Name" }),
