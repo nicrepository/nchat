@@ -47,6 +47,17 @@ export interface WSMessagePayload {
   updated_at: string;
   edited_at?: string | null;
   deleted_at?: string | null;
+  quoted?: WSQuotePayload;
+}
+
+export interface WSQuotePayload {
+  id: string;
+  author_id: string;
+  body?: string;
+  body_format?: "v1" | "v2" | "v3";
+  is_removed?: boolean;
+  deleted_at?: string | null;
+  created_at: string;
 }
 
 export interface WSMessageCreatedEvent {

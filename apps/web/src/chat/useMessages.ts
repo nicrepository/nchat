@@ -33,7 +33,7 @@ import {
   postDMMessage,
   unfavoriteMessage,
 } from "./chatApi";
-import type { Message, MessagePage } from "./chatTypes";
+import { normalizeBodyFormat, type Message, type MessagePage } from "./chatTypes";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -73,6 +73,8 @@ export interface MessagesState {
   actionError: string | null;
   /** Reactions snapshot to restore per messageId if the in-flight optimistic toggle is rejected or times out. */
   pendingReactions: Map<string, Message["reactions"]>;
+  /** RF-07: message currently selected as the parent quote for the composer. */
+  replyTo: Message | null;
 }
 
 // ── Send result ───────────────────────────────────────────────────────────────
@@ -106,6 +108,8 @@ type Action =
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
   | { type: "reaction_error_clear" }
+  | { type: "reply_set"; message: Message }
+  | { type: "reply_clear" }
   | { type: "favorite_set"; messageId: string; isFavorited: boolean }
   | { type: "favorite_error"; error: string }
   | { type: "reaction_optimistic"; messageId: string; emoji: string }
@@ -146,6 +150,7 @@ const initialState: MessagesState = {
   realtimeError: null,
   actionError: null,
   pendingReactions: new Map(),
+  replyTo: null,
 };
 
 const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
@@ -166,6 +171,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         realtimeError: null,
         actionError: null,
         pendingReactions: new Map(),
+        replyTo: null,
       };
     case "loaded":
       return {
@@ -179,6 +185,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         realtimeError: null,
         actionError: null,
         pendingReactions: new Map(),
+        replyTo: null,
       };
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
@@ -194,6 +201,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         sendError: null,
         lastMutation: alreadyPresent ? "none" : "append",
         realtimeError: null,
+        replyTo: null,
       };
     }
     case "send_error":
@@ -266,6 +274,10 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     }
     case "reaction_error_clear":
       return { ...state, actionError: null };
+    case "reply_set":
+      return { ...state, replyTo: action.message };
+    case "reply_clear":
+      return { ...state, replyTo: null };
     case "favorite_set": {
       const index = state.messages.findIndex((message) => message.id === action.messageId);
       if (index < 0) return state;
@@ -371,6 +383,8 @@ export interface UseMessagesResult {
   sendMessage: (body: string) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;
+  selectReply: (message: Message) => void;
+  cancelReply: () => void;
   toggleReaction: (messageId: string, emoji: string) => void;
   toggleFavorite: (messageId: string, isFavorited: boolean) => void;
 }
@@ -399,12 +413,14 @@ export function useMessages({
     nextCursor: state.nextCursor,
     loadingMore: state.loadingMore,
     messages: state.messages,
+    replyTo: state.replyTo,
   });
   useLayoutEffect(() => {
     stateRef.current.target = `${kind}:${targetId}`;
     stateRef.current.nextCursor = state.nextCursor;
     stateRef.current.loadingMore = state.loadingMore;
     stateRef.current.messages = state.messages;
+    stateRef.current.replyTo = state.replyTo;
   });
 
   const abortRef = useRef<AbortController | null>(null);
@@ -518,13 +534,14 @@ export function useMessages({
       if (!targetId || !body.trim()) return { status: "stale" };
 
       const sendKey = `${kind}:${targetId}`;
+      const parentMessageId = stateRef.current.replyTo?.id;
       dispatch({ type: "sending" });
 
       try {
         const sendFn =
           kind === "channel"
-            ? () => postChannelMessage(targetId, body)
-            : () => postDMMessage(targetId, body);
+            ? () => postChannelMessage(targetId, body, parentMessageId)
+            : () => postDMMessage(targetId, body, parentMessageId);
 
         const msg = await sendFn();
 
@@ -571,7 +588,7 @@ export function useMessages({
           senderEmail: p.sender_email ?? "",
           kind: p.kind as Message["kind"],
           bodyText: p.body_text,
-          bodyFormat: p.body_format === "v3" ? "v3" : p.body_format === "v2" ? "v2" : "v1",
+          bodyFormat: normalizeBodyFormat(p.body_format),
           isRemoved: p.is_removed,
           status: p.status as Message["status"],
           createdAt: p.created_at,
@@ -580,6 +597,17 @@ export function useMessages({
           // WS create events never carry the caller's favorite state; a message
           // just created cannot be favorited yet.
           isFavorited: false,
+          quoted: p.quoted
+            ? {
+                id: p.quoted.id,
+                authorId: p.quoted.author_id,
+                bodyText: p.quoted.body ?? "",
+                bodyFormat: normalizeBodyFormat(p.quoted.body_format),
+                isRemoved: p.quoted.is_removed ?? false,
+                deletedAt: p.quoted.deleted_at ?? null,
+                createdAt: p.quoted.created_at ?? "",
+              }
+            : undefined,
         };
         if (!isCurrentTarget(loadKey)) return;
         dispatch({ type: "ws_received", message: msg });
@@ -727,6 +755,14 @@ export function useMessages({
     [clearReactionTimer, sendReactionToggle],
   );
 
+  const selectReply = useCallback((message: Message) => {
+    dispatch({ type: "reply_set", message });
+  }, []);
+
+  const cancelReply = useCallback(() => {
+    dispatch({ type: "reply_clear" });
+  }, []);
+
   // RF-06: REST round-trip confirms before the flag flips — no optimistic
   // update; a failure reuses the transient reaction error banner.
   // ponytail: no in-flight dedupe; a double click just repeats an idempotent call.
@@ -749,5 +785,14 @@ export function useMessages({
     [isMessageRendered],
   );
 
-  return { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite };
+  return {
+    state,
+    sendMessage,
+    retry,
+    loadMore,
+    selectReply,
+    cancelReply,
+    toggleReaction,
+    toggleFavorite,
+  };
 }
