@@ -10,7 +10,7 @@
  */
 
 import { EditorContent } from "@tiptap/react";
-import { useEffect, type KeyboardEvent } from "react";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
@@ -76,9 +76,13 @@ export default function ChatComposer({
     bodyFormat,
     onSend,
   });
+  const prevReplyRef = useRef<typeof replyPreview>(null);
 
   useEffect(() => {
-    if (replyPreview && editor && !disabled) editor.commands.focus("end");
+    if (replyPreview && !prevReplyRef.current && editor && !disabled) {
+      editor.commands.focus("end");
+    }
+    prevReplyRef.current = replyPreview;
   }, [disabled, editor, replyPreview]);
 
   const handleKeyDownCapture = (event: KeyboardEvent<HTMLDivElement>) => {
