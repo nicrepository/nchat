@@ -356,18 +356,20 @@ function MessageReactions({
     const bubble = bubbleRef.current.getBoundingClientRect();
     if (bubble.bottom < 0 || bubble.top > window.innerHeight) return;
     const menu = menuRef.current.getBoundingClientRect();
-    const gap = 0;
+    // gapAbove = 0: cola a borda da toolbar exatamente no início da mensagem (feedback de UX, issue #331)
+    const gapAbove = 0;
+    const gapBelow = 6;
     const viewportPadding = 8;
     const midX = bubble.left + bubble.width / 2;
     const left = Math.min(
       Math.max(viewportPadding, isMine ? midX - menu.width : midX),
       window.innerWidth - menu.width - viewportPadding,
     );
-    const above = bubble.top - menu.height - gap;
+    const above = bubble.top - menu.height - gapAbove;
     const top =
       above >= viewportPadding
         ? above
-        : Math.min(bubble.bottom + gap, window.innerHeight - menu.height - viewportPadding);
+        : Math.min(bubble.bottom + gapBelow, window.innerHeight - menu.height - viewportPadding);
     menuRef.current.style.left = `${left}px`;
     menuRef.current.style.top = `${top}px`;
     menuRef.current.style.visibility = "visible";
