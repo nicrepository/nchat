@@ -460,7 +460,66 @@ describe("ChatMessageArea — message list", () => {
     fireEvent.mouseEnter(bubbles[1]);
     expect(screen.getAllByRole("button", { name: "Mais reações" })).toHaveLength(1);
     fireEvent.mouseLeave(bubbles[1]);
-    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the grouped message hover menu active when the pointer moves onto its toolbar", async () => {
+    const user = userEvent.setup();
+    const sameMinute = "2024-01-15T10:04";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderId: "user-alice",
+          senderDisplayName: "Alice",
+          bodyText: "Primeira",
+          createdAt: `${sameMinute}:10.000Z`,
+        }),
+        makeMessage({
+          id: "m2",
+          senderId: "user-alice",
+          senderDisplayName: "Alice",
+          bodyText: "Segunda",
+          createdAt: `${sameMinute}:20.000Z`,
+        }),
+        makeMessage({
+          id: "m3",
+          senderId: "user-alice",
+          senderDisplayName: "Alice",
+          bodyText: "Terceira",
+          createdAt: `${sameMinute}:30.000Z`,
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+    const bubbles = await screen.findAllByTestId("chat-msg-bubble");
+
+    await user.hover(bubbles[1]);
+    const toolbar = screen.getByRole("toolbar", { name: "Reagir à mensagem" });
+    await user.hover(toolbar);
+
+    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+    expect(screen.getAllByRole("toolbar", { name: "Reagir à mensagem" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m2", "👍");
+    expect(wsMockState.toggleReaction).not.toHaveBeenCalledWith("m1", expect.any(String));
+  });
+
+  it("cleans up a pending hover-menu close timer on unmount", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    const { unmount } = renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    vi.useFakeTimers();
+    const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
+
+    fireEvent.mouseEnter(bubble);
+    fireEvent.mouseLeave(bubble);
+    unmount();
+
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+    clearTimeoutSpy.mockRestore();
   });
 
   it("reveals the reaction menu by keyboard focus and touch", async () => {
@@ -472,7 +531,9 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Responder" })).toBeVisible();
     fireEvent.blur(bubble, { relatedTarget: document.body });
-    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument(),
+    );
     fireEvent.touchStart(bubble);
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
   });
