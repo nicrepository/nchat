@@ -55,7 +55,7 @@
     "security:trivy:config": "bash scripts/security/trivy-config.sh",
     "security:secrets": "bash scripts/security/secrets-scan.sh",
     "security": "pnpm security:secrets && pnpm security:govulncheck && pnpm security:trivy:fs && pnpm security:trivy:config",
-    "ci": "pnpm format:check && pnpm ci:config-check && pnpm poc:config-check && pnpm observability:config-check && pnpm grafana:dashboard-check && pnpm dev:env:config-check && pnpm gateway:config-check && pnpm tls:config-check && pnpm sealed-secrets:policy-check && pnpm k8s:ci && pnpm health:contract-check && pnpm migrations:check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build",
+    "ci": "pnpm format:check && pnpm ci:config-check && pnpm poc:config-check && pnpm observability:config-check && pnpm grafana:dashboard-check && pnpm dev:env:config-check && pnpm gateway:config-check && pnpm media:config-check && pnpm tls:config-check && pnpm sealed-secrets:policy-check && pnpm k8s:ci && pnpm health:contract-check && pnpm migrations:check && pnpm lint && pnpm typecheck:web && pnpm test && pnpm test:coverage && pnpm build",
     "tls:generate": "bash scripts/dev/dev-tls-generate.sh",
     "tls:status": "bash scripts/dev/dev-tls-status.sh",
     "tls:clean": "bash scripts/dev/dev-tls-clean.sh",
@@ -81,7 +81,13 @@
     "dev:observability:down": "bash scripts/dev/dev-observability-down.sh",
     "dev:observability:status": "bash scripts/dev/dev-observability-status.sh",
     "dev:observability:logs": "bash scripts/dev/dev-observability-logs.sh",
-    "dev:observability:validate": "bash scripts/dev/dev-observability-validate.sh"
+    "dev:observability:validate": "bash scripts/dev/dev-observability-validate.sh",
+    "dev:media:up": "bash scripts/dev/dev-media-up.sh",
+    "dev:media:down": "bash scripts/dev/dev-media-down.sh",
+    "dev:media:status": "bash scripts/dev/dev-media-status.sh",
+    "dev:media:logs": "bash scripts/dev/dev-media-logs.sh",
+    "dev:media:validate": "bash scripts/dev/dev-media-validate.sh",
+    "media:config-check": "bash scripts/ci/media-config-check.sh"
   },
   "engines": {
     "node": ">=24 <25",
