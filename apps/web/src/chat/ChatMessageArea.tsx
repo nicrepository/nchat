@@ -356,7 +356,7 @@ function MessageReactions({
     const bubble = bubbleRef.current.getBoundingClientRect();
     if (bubble.bottom < 0 || bubble.top > window.innerHeight) return;
     const menu = menuRef.current.getBoundingClientRect();
-    const gap = 6;
+    const gap = 0;
     const viewportPadding = 8;
     const midX = bubble.left + bubble.width / 2;
     const left = Math.min(
