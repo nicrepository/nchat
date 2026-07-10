@@ -42,6 +42,7 @@ import { fetchAllowedReactionEmojis } from "./chatApi";
 
 const defaultRecentReactions = ["👍", "❤️", "😂"];
 const quoteHighlightMs = 1_200;
+const reactionMenuLeaveDelayMs = 150;
 
 function recentReactionsKey(userID: string): string {
   return `nchat_recent_reactions:${userID}`;
@@ -327,6 +328,7 @@ function MessageReactions({
   allowedReactionEmojis,
   recentReactionEmojis,
   reactionMenuVisible,
+  onReactionMenuVisibleChange,
   pickerOpen,
   onPickerOpenChange,
 }: Pick<
@@ -341,6 +343,7 @@ function MessageReactions({
   | "allowedReactionEmojis"
   | "recentReactionEmojis"
   | "reactionMenuVisible"
+  | "onReactionMenuVisibleChange"
   | "pickerOpen"
   | "onPickerOpenChange"
 > & { bubbleRef: RefObject<HTMLDivElement | null> }) {
@@ -353,18 +356,20 @@ function MessageReactions({
     const bubble = bubbleRef.current.getBoundingClientRect();
     if (bubble.bottom < 0 || bubble.top > window.innerHeight) return;
     const menu = menuRef.current.getBoundingClientRect();
-    const gap = 6;
+    // gapAbove = 0: cola a borda da toolbar exatamente no início da mensagem (feedback de UX, issue #331)
+    const gapAbove = 0;
+    const gapBelow = 6;
     const viewportPadding = 8;
     const midX = bubble.left + bubble.width / 2;
     const left = Math.min(
       Math.max(viewportPadding, isMine ? midX - menu.width : midX),
       window.innerWidth - menu.width - viewportPadding,
     );
-    const above = bubble.top - menu.height - gap;
+    const above = bubble.top - menu.height - gapAbove;
     const top =
       above >= viewportPadding
         ? above
-        : Math.min(bubble.bottom + gap, window.innerHeight - menu.height - viewportPadding);
+        : Math.min(bubble.bottom + gapBelow, window.innerHeight - menu.height - viewportPadding);
     menuRef.current.style.left = `${left}px`;
     menuRef.current.style.top = `${top}px`;
     menuRef.current.style.visibility = "visible";
@@ -449,92 +454,91 @@ function MessageReactions({
           ))}
         </div>
       )}
-      {reactionMenuVisible &&
-        createPortal(
-          <div
-            ref={menuRef}
-            className="chat-msg-area__reaction-menu"
-            role="toolbar"
-            aria-label="Reagir à mensagem"
-            style={{ visibility: "hidden" }}
+      {reactionMenuVisible && (
+        <div
+          ref={menuRef}
+          className="chat-msg-area__reaction-menu"
+          role="toolbar"
+          aria-label="Reagir à mensagem"
+          onMouseEnter={() => onReactionMenuVisibleChange(message.id, true)}
+          style={{ visibility: "hidden" }}
+        >
+          {recentReactionEmojis.map((emoji) => (
+            <button
+              key={emoji}
+              type="button"
+              aria-label={`Reagir rapidamente com ${emoji}`}
+              onClick={() => onToggleReaction(message.id, emoji)}
+            >
+              {emoji}
+            </button>
+          ))}
+          <button type="button" aria-label="Responder" onClick={() => onReplyMessage(message)}>
+            <span className="material-symbols-outlined" aria-hidden="true">
+              reply
+            </span>
+          </button>
+          <button
+            type="button"
+            className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
+            aria-label={message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
+            aria-pressed={message.isFavorited}
+            onClick={() => onToggleFavorite(message.id, !message.isFavorited)}
           >
-            {recentReactionEmojis.map((emoji) => (
-              <button
-                key={emoji}
-                type="button"
-                aria-label={`Reagir rapidamente com ${emoji}`}
-                onClick={() => onToggleReaction(message.id, emoji)}
-              >
-                {emoji}
-              </button>
-            ))}
-            <button type="button" aria-label="Responder" onClick={() => onReplyMessage(message)}>
-              <span className="material-symbols-outlined" aria-hidden="true">
-                reply
-              </span>
-            </button>
+            <span className="material-symbols-outlined" aria-hidden="true">
+              star
+            </span>
+          </button>
+          {onTogglePin && (
             <button
               type="button"
-              className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
-              aria-label={message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
-              aria-pressed={message.isFavorited}
-              onClick={() => onToggleFavorite(message.id, !message.isFavorited)}
+              className={isPinned ? "chat-msg-area__pin--active" : undefined}
+              aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
+              aria-pressed={isPinned}
+              onClick={() => onTogglePin(message.id, !isPinned)}
             >
               <span className="material-symbols-outlined" aria-hidden="true">
-                star
+                keep
               </span>
             </button>
-            {onTogglePin && (
-              <button
-                type="button"
-                className={isPinned ? "chat-msg-area__pin--active" : undefined}
-                aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
-                aria-pressed={isPinned}
-                onClick={() => onTogglePin(message.id, !isPinned)}
+          )}
+          <button
+            ref={anchorRef}
+            type="button"
+            aria-label="Mais reações"
+            aria-expanded={pickerOpen}
+            aria-haspopup="dialog"
+            disabled={allowedReactionEmojis.length === 0}
+            onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              add_reaction
+            </span>
+          </button>
+          {pickerOpen &&
+            createPortal(
+              <div
+                ref={pickerRef}
+                className="chat-msg-area__reaction-grid"
+                role="dialog"
+                aria-label="Escolher reação"
+                style={{ visibility: "hidden" }}
               >
-                <span className="material-symbols-outlined" aria-hidden="true">
-                  keep
-                </span>
-              </button>
+                {allowedReactionEmojis.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    aria-label={`Reagir com ${emoji}`}
+                    onClick={() => selectReaction(emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>,
+              document.body,
             )}
-            <button
-              ref={anchorRef}
-              type="button"
-              aria-label="Mais reações"
-              aria-expanded={pickerOpen}
-              aria-haspopup="dialog"
-              disabled={allowedReactionEmojis.length === 0}
-              onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
-            >
-              <span className="material-symbols-outlined" aria-hidden="true">
-                add_reaction
-              </span>
-            </button>
-            {pickerOpen &&
-              createPortal(
-                <div
-                  ref={pickerRef}
-                  className="chat-msg-area__reaction-grid"
-                  role="dialog"
-                  aria-label="Escolher reação"
-                  style={{ visibility: "hidden" }}
-                >
-                  {allowedReactionEmojis.map((emoji) => (
-                    <button
-                      key={emoji}
-                      type="button"
-                      aria-label={`Reagir com ${emoji}`}
-                      onClick={() => selectReaction(emoji)}
-                    >
-                      {emoji}
-                    </button>
-                  ))}
-                </div>,
-                document.body,
-              )}
-          </div>,
-          document.body,
-        )}
+        </div>
+      )}
     </>
   );
 }
@@ -627,7 +631,12 @@ function MessageBubble({
       data-message-id={message.id}
       tabIndex={0}
       onMouseEnter={() => onReactionMenuVisibleChange(message.id, true)}
-      onMouseLeave={() => onReactionMenuVisibleChange(message.id, false)}
+      onMouseLeave={(event) => {
+        const nextTarget = event.relatedTarget;
+        if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+          onReactionMenuVisibleChange(message.id, false);
+        }
+      }}
       onFocus={() => onReactionMenuVisibleChange(message.id, true)}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) {
@@ -674,6 +683,7 @@ function MessageBubble({
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
           reactionMenuVisible={reactionMenuVisible || pickerOpen}
+          onReactionMenuVisibleChange={onReactionMenuVisibleChange}
           pickerOpen={pickerOpen}
           onPickerOpenChange={onPickerOpenChange}
         />
@@ -720,6 +730,7 @@ function MessageList({
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const messageRefs = useRef(new Map<string, HTMLDivElement>());
   const highlightTimerRef = useRef<number | null>(null);
+  const hoverCloseTimerRef = useRef<number | null>(null);
   const [openPickerMessageId, setOpenPickerMessageId] = useState<string | null>(null);
   const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
@@ -748,7 +759,18 @@ function MessageList({
   const handleReactionMenuVisibleChange = useCallback(
     (messageId: string, visible: boolean) => {
       if (openPickerMessageId && openPickerMessageId !== messageId) return;
-      setHoveredMessageId(visible ? messageId : null);
+      if (hoverCloseTimerRef.current !== null) {
+        window.clearTimeout(hoverCloseTimerRef.current);
+        hoverCloseTimerRef.current = null;
+      }
+      if (visible) {
+        setHoveredMessageId(messageId);
+        return;
+      }
+      hoverCloseTimerRef.current = window.setTimeout(() => {
+        setHoveredMessageId((current) => (current === messageId ? null : current));
+        hoverCloseTimerRef.current = null;
+      }, reactionMenuLeaveDelayMs);
     },
     [openPickerMessageId],
   );
@@ -786,6 +808,7 @@ function MessageList({
   useEffect(() => {
     return () => {
       if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+      if (hoverCloseTimerRef.current !== null) window.clearTimeout(hoverCloseTimerRef.current);
     };
   }, []);
 
