@@ -33,7 +33,7 @@ import {
   postDMMessage,
   unfavoriteMessage,
 } from "./chatApi";
-import type { Message, MessagePage } from "./chatTypes";
+import { normalizeBodyFormat, type Message, type MessagePage } from "./chatTypes";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -588,7 +588,7 @@ export function useMessages({
           senderEmail: p.sender_email ?? "",
           kind: p.kind as Message["kind"],
           bodyText: p.body_text,
-          bodyFormat: p.body_format === "v3" ? "v3" : p.body_format === "v2" ? "v2" : "v1",
+          bodyFormat: normalizeBodyFormat(p.body_format),
           isRemoved: p.is_removed,
           status: p.status as Message["status"],
           createdAt: p.created_at,
@@ -602,15 +602,10 @@ export function useMessages({
                 id: p.quoted.id,
                 authorId: p.quoted.author_id,
                 bodyText: p.quoted.body ?? "",
-                bodyFormat:
-                  p.quoted.body_format === "v3"
-                    ? "v3"
-                    : p.quoted.body_format === "v2"
-                      ? "v2"
-                      : "v1",
+                bodyFormat: normalizeBodyFormat(p.quoted.body_format),
                 isRemoved: p.quoted.is_removed ?? false,
                 deletedAt: p.quoted.deleted_at ?? null,
-                createdAt: p.quoted.created_at,
+                createdAt: p.quoted.created_at ?? "",
               }
             : undefined,
         };

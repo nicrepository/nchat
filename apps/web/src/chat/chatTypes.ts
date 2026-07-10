@@ -50,6 +50,10 @@ export type MessageKind = "user" | "system";
 export type MessageStatus = "active" | "deleted";
 export type MessageBodyFormat = "v1" | "v2" | "v3";
 
+export function normalizeBodyFormat(raw?: string): MessageBodyFormat {
+  return raw === "v3" ? "v3" : raw === "v2" ? "v2" : "v1";
+}
+
 export interface MentionCandidate {
   mentionType: "user" | "channel";
   id: string;

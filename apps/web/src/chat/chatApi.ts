@@ -12,16 +12,18 @@
 
 import { authenticatedFetch } from "../lib/authClient";
 import { onAuthChange } from "../lib/authSession";
-import type {
-  Channel,
-  DMConversation,
-  FavoriteItem,
-  FavoritesPage,
-  Message,
-  MessagePage,
-  PinnedItem,
+import {
+  normalizeBodyFormat,
+  type Channel,
+  type MessageBodyFormat,
+  type MentionCandidate,
+  type DMConversation,
+  type FavoriteItem,
+  type FavoritesPage,
+  type Message,
+  type MessagePage,
+  type PinnedItem,
 } from "./chatTypes";
-import type { MentionCandidate } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
 
@@ -163,9 +165,9 @@ interface QuoteResponse {
   id: string;
   author_id: string;
   body?: string;
-  body_format?: string;
+  body_format?: MessageBodyFormat;
   is_removed?: boolean;
-  deleted_at?: string | null;
+  deleted_at?: string;
   created_at: string;
 }
 
@@ -251,7 +253,7 @@ function mapMessage(r: MessageResponse): Message {
     senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
     bodyText: r.body_text ?? "",
-    bodyFormat: r.body_format === "v3" ? "v3" : r.body_format === "v2" ? "v2" : "v1",
+    bodyFormat: normalizeBodyFormat(r.body_format),
     isRemoved: r.is_removed ?? false,
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
@@ -271,10 +273,10 @@ function mapQuote(r: QuoteResponse): Message["quoted"] {
     id: r.id,
     authorId: r.author_id,
     bodyText: r.body ?? "",
-    bodyFormat: r.body_format === "v3" ? "v3" : r.body_format === "v2" ? "v2" : "v1",
+    bodyFormat: normalizeBodyFormat(r.body_format),
     isRemoved: r.is_removed ?? false,
     deletedAt: r.deleted_at ?? null,
-    createdAt: r.created_at,
+    createdAt: r.created_at ?? "",
   };
 }
 
