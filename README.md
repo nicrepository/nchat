@@ -24,6 +24,8 @@ A stack atual está registrada no ADR-0002. Destaques:
 - SeaweedFS é **decisão provisória** até Sprint 3, quando será confirmado ou substituído.
 - Valkey 8 foi **validado no Sprint 0** para Pub/Sub, Streams, locks, TTL e sliding window.
 - Chamadas de áudio/vídeo (LiveKit) estão fora do MVP conforme requisitos v5.0; integram na V1.0.
+  Preparação técnica de infraestrutura dev (LiveKit + coturn via Docker Compose, profile `media`):
+  ver [docs/runbooks/task-livekit-coturn-dev.md](docs/runbooks/task-livekit-coturn-dev.md).
 - Próximas decisões críticas serão registradas via ADR antes de serem implementadas.
 
 ## Project tracking
