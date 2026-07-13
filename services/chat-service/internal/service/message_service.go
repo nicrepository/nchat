@@ -44,7 +44,12 @@ type MessageEventPublisher interface {
 	PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message)
 }
 
+type messageUpdatedPublisher interface {
+	PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message)
+}
+
 const maxMessageBodyRunes = 40_000
+const maxEditHistoryOffset = 10_000
 
 // CreateChannelMessageInput is the caller-provided input for posting to a channel.
 // Status, timestamps, edited_at, deleted_at, and workspace_id are not caller-settable.
@@ -124,6 +129,22 @@ type GetDMMessageInput struct {
 	ConversationID string
 	CallerID       string
 	MessageID      string
+}
+
+type EditMessageInput struct {
+	WorkspaceID string
+	MessageID   string
+	EditorID    string
+	Body        string
+	BodyFormat  domain.MessageBodyFormat
+}
+
+type GetMessageEditHistoryInput struct {
+	WorkspaceID string
+	MessageID   string
+	CallerID    string
+	Limit       int
+	Offset      int
 }
 
 // MessageService handles message creation and listing for channels and DM conversations.
@@ -331,7 +352,26 @@ func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID,
 	if publisher == nil {
 		return
 	}
+	s.enqueuePublish(ctx, func(publishCtx context.Context) {
+		publisher.PublishMessageCreated(publishCtx, workspaceID, targetType, targetID, msg)
+	})
+}
 
+func (s *MessageService) publishMessageUpdated(ctx context.Context, msg domain.Message) {
+	publisher, ok := s.getPublisher().(messageUpdatedPublisher)
+	if !ok {
+		return
+	}
+	targetType, targetID := "channel", msg.ChannelID
+	if msg.DMConversationID != "" {
+		targetType, targetID = "dm", msg.DMConversationID
+	}
+	s.enqueuePublish(ctx, func(publishCtx context.Context) {
+		publisher.PublishMessageUpdated(publishCtx, msg.WorkspaceID, targetType, targetID, msg)
+	})
+}
+
+func (s *MessageService) enqueuePublish(ctx context.Context, publish func(context.Context)) {
 	select {
 	case s.publishSlots <- struct{}{}:
 	default:
@@ -345,8 +385,79 @@ func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID,
 
 		publishCtx, cancel := context.WithTimeout(baseCtx, DefaultPublishTimeout)
 		defer cancel()
-		publisher.PublishMessageCreated(publishCtx, workspaceID, targetType, targetID, msg)
+		publish(publishCtx)
 	}()
+}
+
+// EditMessage validates the body with the creation path's rules, then delegates
+// the atomic authorization, snapshot, window check, and update to storage.
+func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	messageID := strings.TrimSpace(input.MessageID)
+	editorID := strings.TrimSpace(input.EditorID)
+	body := strings.TrimSpace(input.Body)
+	if workspaceID == "" || messageID == "" || editorID == "" {
+		return domain.Message{}, fmt.Errorf("%w: workspace_id, message_id, and editor_id are required", domain.ErrInvalidInput)
+	}
+	if err := validateMessageBody(body); err != nil {
+		return domain.Message{}, err
+	}
+	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
+	if err != nil {
+		return domain.Message{}, err
+	}
+
+	current, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID, editorID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, editorID, body, bodyFormat)
+	if err != nil {
+		return domain.Message{}, err
+	}
+
+	updated, err := s.messages.EditMessage(ctx, storage.EditMessageInput{
+		WorkspaceID: workspaceID, MessageID: messageID, EditorID: editorID,
+		Body: body, BodyFormat: bodyFormat,
+	})
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("edit message: %w", err)
+	}
+	s.publishMessageUpdated(ctx, updated)
+	return updated, nil
+}
+
+func (s *MessageService) resolveAndRewriteMentions(ctx context.Context, workspaceID, channelID, requesterID, body string, bodyFormat domain.MessageBodyFormat) (string, error) {
+	if bodyFormat != domain.MessageBodyFormatV3 || channelID == "" {
+		return body, nil
+	}
+	userIDs, channelIDs := extractMentionIDs(body)
+	if len(userIDs)+len(channelIDs) == 0 {
+		return body, nil
+	}
+	labels, err := s.messages.ResolveAuthorizedMentionLabels(
+		ctx, workspaceID, channelID, requesterID, userIDs, channelIDs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("resolve authorized mention labels: %w", err)
+	}
+	if err := validateMentionRefs(userIDs, channelIDs, labels); err != nil {
+		return "", err
+	}
+	return rewriteMentionLabels(body, labels), nil
+}
+
+func (s *MessageService) GetMessageEditHistory(ctx context.Context, input GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	messageID := strings.TrimSpace(input.MessageID)
+	callerID := strings.TrimSpace(input.CallerID)
+	if workspaceID == "" || messageID == "" || callerID == "" || input.Offset < 0 || input.Offset > maxEditHistoryOffset {
+		return nil, fmt.Errorf("%w: invalid history request", domain.ErrInvalidInput)
+	}
+	return s.messages.ListMessageEditHistory(ctx, storage.ListMessageEditHistoryInput{
+		WorkspaceID: workspaceID, MessageID: messageID, UserID: callerID,
+		Limit: input.Limit, Offset: input.Offset,
+	})
 }
 
 // ListChannelMessages returns messages for a channel visible to the caller.

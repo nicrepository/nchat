@@ -69,3 +69,16 @@ func (s *PermissionService) CanRead(ctx context.Context, workspaceID, channelID,
 func (s *PermissionService) CanWrite(ctx context.Context, workspaceID, channelID, userID string) (bool, error) {
 	return s.CanRead(ctx, workspaceID, channelID, userID)
 }
+
+// CanManageWorkspace reports whether the caller is an active workspace owner/admin.
+func (s *PermissionService) CanManageWorkspace(ctx context.Context, workspaceID, userID string) (bool, error) {
+	member, err := s.members.GetWorkspaceMember(ctx, workspaceID, userID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get workspace manager: %w", err)
+	}
+	return member.Status == domain.MemberStatusActive &&
+		(member.Role == domain.WorkspaceRoleOwner || member.Role == domain.WorkspaceRoleAdmin), nil
+}

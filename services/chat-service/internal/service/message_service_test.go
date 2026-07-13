@@ -53,6 +53,10 @@ type fakeMessageStore struct {
 	resolveMentionErr       error
 	authorizedMentionLabels map[string]string
 	resolveAuthorizedErr    error
+	editedMessage           domain.Message
+	editErr                 error
+	editHistory             []domain.MessageEditHistory
+	historyErr              error
 
 	lastCreateInput        storage.CreateMessageInput
 	createCalls            int
@@ -60,6 +64,45 @@ type fakeMessageStore struct {
 	listDMCalls            int
 	resolveMentionCalls    int
 	resolveAuthorizedCalls int
+}
+
+func (f *fakeMessageStore) EditMessage(_ context.Context, input storage.EditMessageInput) (domain.Message, error) {
+	if f.editErr != nil {
+		return domain.Message{}, f.editErr
+	}
+	if f.editedMessage.ID != "" {
+		return f.editedMessage, nil
+	}
+	return domain.Message{ID: input.MessageID, WorkspaceID: input.WorkspaceID, SenderID: input.EditorID, BodyText: input.Body, BodyFormat: input.BodyFormat}, nil
+}
+
+func (f *fakeMessageStore) ListMessageEditHistory(_ context.Context, _ storage.ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	return f.editHistory, f.historyErr
+}
+
+func TestMessageService_EditMessage_PropagatesEditForbiddenFromStorage(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		message domain.Message
+	}{
+		{name: "non-author", message: domain.Message{ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: "other", Status: domain.MessageStatusActive}},
+		{name: "deleted", message: domain.Message{ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, Status: domain.MessageStatusDeleted}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeMessageStore{
+				messagesByKey: map[string]domain.Message{"ws-1:msg-1": tt.message},
+				editErr:       domain.ErrEditForbidden,
+			}
+			_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).EditMessage(
+				context.Background(), service.EditMessageInput{
+					WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+					Body: "edited", BodyFormat: domain.MessageBodyFormatV1,
+				})
+			if !errors.Is(err, domain.ErrEditForbidden) {
+				t.Fatalf("expected ErrEditForbidden, got %v", err)
+			}
+		})
+	}
 }
 
 func (f *fakeMessageStore) CreateMessage(_ context.Context, input storage.CreateMessageInput) (domain.Message, error) {
