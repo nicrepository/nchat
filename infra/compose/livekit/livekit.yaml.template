@@ -1,0 +1,43 @@
+# LiveKit dev config template (TASK: livekit-coturn-dev)
+#
+# This file is a TEMPLATE. It contains only placeholders — no real secrets.
+# scripts/dev/_media_env.sh renders it into livekit.runtime.yaml (gitignored)
+# using envsubst + values from infra/compose/.env.dev before the container starts.
+#
+# API key/secret are NOT set here. They are injected at container start via the
+# LIVEKIT_KEYS environment variable (see compose.dev.yml), which is the
+# officially supported LiveKit mechanism for keeping keys out of config files.
+#
+# Do not add "keys:" to this file and do not commit livekit.runtime.yaml.
+
+port: 7880
+
+rtc:
+  tcp_port: 7881
+  port_range_start: ${LIVEKIT_RTC_UDP_PORT_START}
+  port_range_end: ${LIVEKIT_RTC_UDP_PORT_END}
+  # Local dev only: Docker Desktop on Windows runs containers behind NAT, so
+  # STUN-based external IP discovery does not resolve to a usable address.
+  # node_ip is set explicitly instead (defaults to 127.0.0.1 for same-host use).
+  use_external_ip: false
+  node_ip: ${LIVEKIT_NODE_IP}
+  # External TURN/STUN, provided by the standalone coturn dev service.
+  # The shared secret must match COTURN_STATIC_AUTH_SECRET in .env.dev.
+  turn_servers:
+    - host: ${COTURN_HOST}
+      port: ${COTURN_LISTENING_PORT}
+      protocol: udp
+      secret: ${COTURN_STATIC_AUTH_SECRET}
+
+# Embedded TURN server is disabled; coturn is used instead as a standalone service.
+turn:
+  enabled: false
+
+logging:
+  level: info
+  json: false
+
+room:
+  auto_create: true
+  empty_timeout: 300
+  max_participants: 20

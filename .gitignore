@@ -7,6 +7,10 @@ infra/compose/.env.dev
 *.local
 *.local.*
 
+# Rendered LiveKit/coturn dev config (contains real secrets, see *.template sources)
+infra/compose/livekit/livekit.runtime.yaml
+infra/compose/coturn/turnserver.runtime.conf
+
 # Secrets, private keys, certificates, and dumps
 *.pem
 *.key

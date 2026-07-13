@@ -222,6 +222,51 @@ services:
     networks:
       - nchat-dev
 
+  # LiveKit + coturn — dev prep for media-service (V1.0 Sprints 9-10).
+  # Config files are rendered from *.template sources by scripts/dev/_media_env.sh
+  # into gitignored *.runtime.* files before these services start.
+  livekit:
+    image: ${LIVEKIT_IMAGE}
+    container_name: nchat-livekit
+    profiles:
+      - media
+    env_file:
+      - .env.dev
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
+    command:
+      - --config
+      - /etc/livekit/livekit.yaml
+    ports:
+      - "127.0.0.1:${LIVEKIT_HOST_PORT}:7880"
+      - "127.0.0.1:${LIVEKIT_RTC_TCP_HOST_PORT}:7881"
+      - "127.0.0.1:${LIVEKIT_RTC_UDP_PORT_START}-${LIVEKIT_RTC_UDP_PORT_END}:${LIVEKIT_RTC_UDP_PORT_START}-${LIVEKIT_RTC_UDP_PORT_END}/udp"
+    volumes:
+      - ./livekit/livekit.runtime.yaml:/etc/livekit/livekit.yaml:ro
+    depends_on:
+      - coturn
+    networks:
+      - nchat-dev
+
+  coturn:
+    image: ${COTURN_IMAGE}
+    container_name: nchat-coturn
+    profiles:
+      - media
+    env_file:
+      - .env.dev
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+    ports:
+      - "127.0.0.1:${COTURN_LISTENING_PORT}:3478"
+      - "127.0.0.1:${COTURN_LISTENING_PORT}:3478/udp"
+      - "127.0.0.1:${COTURN_RELAY_MIN_PORT}-${COTURN_RELAY_MAX_PORT}:${COTURN_RELAY_MIN_PORT}-${COTURN_RELAY_MAX_PORT}/udp"
+    volumes:
+      - ./coturn/turnserver.runtime.conf:/etc/coturn/turnserver.conf:ro
+    networks:
+      - nchat-dev
+
 networks:
   nchat-dev:
     name: nchat-dev
