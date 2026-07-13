@@ -21,6 +21,10 @@ var (
 	// ErrInvalidCursor is returned when a pagination cursor cannot be decoded or
 	// contains values that fail validation (malformed timestamp, invalid UUID).
 	ErrInvalidCursor = errors.New("invalid pagination cursor")
+	// ErrEditForbidden covers author-only and deleted-message edit denials.
+	ErrEditForbidden = errors.New("message edit forbidden")
+	// ErrEditWindowExpired reports an edit outside the workspace-configured window.
+	ErrEditWindowExpired = errors.New("message edit window expired")
 	// ErrPinLimitReached is returned when a channel already holds the maximum
 	// number of pinned messages (RF-05 abuse ceiling).
 	ErrPinLimitReached = errors.New("pin limit reached")

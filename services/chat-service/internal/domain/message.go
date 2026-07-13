@@ -53,6 +53,7 @@ type Message struct {
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
 	EditedAt               time.Time
+	EditCount              int
 	DeletedAt              time.Time
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
@@ -69,6 +70,28 @@ type Message struct {
 	// Quoted is the immediate parent message preview for quote-reply.
 	// It is intentionally one level only; nested parent quotes are not populated.
 	Quoted *QuotedMessage
+}
+
+// MessageEditHistory is a previous persisted version of a message body.
+type MessageEditHistory struct {
+	ID           string
+	MessageID    string
+	Body         string
+	BodyFormat   MessageBodyFormat
+	EditorUserID string
+	VersionedAt  time.Time
+}
+
+// ValidateMessageEdit enforces author, deletion, and workspace-window rules.
+// now must come from the server/database, never from the request payload.
+func ValidateMessageEdit(message Message, requesterID string, editWindowSeconds *int, now time.Time) error {
+	if message.SenderID != requesterID || message.Status == MessageStatusDeleted || !message.DeletedAt.IsZero() {
+		return ErrEditForbidden
+	}
+	if editWindowSeconds != nil && now.Sub(message.CreatedAt) > time.Duration(*editWindowSeconds)*time.Second {
+		return ErrEditWindowExpired
+	}
+	return nil
 }
 
 // QuotedMessage is the inline parent preview attached to a reply.
