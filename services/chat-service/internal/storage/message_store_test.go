@@ -38,7 +38,7 @@ func messageCols() []string {
 		"sender_id",
 		"kind", "body_text", "body_format", "status",
 		"parent_message_id", "forwarded_from_message_id", "referenced_message_id",
-		"edited_at", "deleted_at",
+		"edited_at", "edit_count", "deleted_at",
 		"created_at", "updated_at",
 	}
 }
@@ -50,7 +50,7 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		"user-1",
 		"user", "hello", "v1", "active",
 		"", "", "",
-		(*time.Time)(nil), (*time.Time)(nil),
+		(*time.Time)(nil), 0, (*time.Time)(nil),
 		now, now,
 	}
 }
@@ -500,7 +500,7 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"msg-e", "ws-1", "ch-1", "", "user-1",
 		"user", "edited", "v1", "active",
 		"", "", "",
-		&editedAt, &deletedAt,
+		&editedAt, 1, &deletedAt,
 		now, now,
 		"Test User", "test@example.com", false,
 	}
@@ -592,6 +592,82 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	}
 	if len(msg.Reactions) != 1 || !msg.Reactions[0].ReactedByMe {
 		t.Fatalf("expected personalized reactions, got %+v", msg.Reactions)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_EditMessage_SnapshotsAndUpdatesInOneTransaction(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now().UTC()
+	window := 900
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
+		WithArgs("ws-1", "msg-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
+			AddRow("user-1", "active", nil, now.Add(-time.Minute), &window, now))
+	mock.ExpectExec(`INSERT INTO chat\.message_edit_history`).
+		WithArgs("msg-1", "user-1", now).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	updatedRow := listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)
+	updatedRow[6], updatedRow[7], updatedRow[13] = "new body", "v2", 1
+	updatedRow[12], updatedRow[16] = &now, now
+	mock.ExpectQuery(`(?s)UPDATE chat\.messages.*edit_count = edit_count \+ 1`).
+		WithArgs("msg-1", "new body", "v2", "user-1", now).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(updatedRow...))
+	mock.ExpectCommit()
+
+	message, err := storage.NewPGXMessageStore(mock).EditMessage(context.Background(), storage.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: "user-1",
+		Body: "new body", BodyFormat: domain.MessageBodyFormatV2,
+	})
+	if err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if message.BodyText != "new body" || message.EditCount != 1 || message.EditedAt.IsZero() {
+		t.Fatalf("unexpected updated message: %+v", message)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_EditMessage_ExpiredRollsBackBeforeSnapshot(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now().UTC()
+	window := 900
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
+		WithArgs("ws-1", "msg-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
+			AddRow("user-1", "active", nil, now.Add(-901*time.Second), &window, now))
+	mock.ExpectRollback()
+
+	_, err := storage.NewPGXMessageStore(mock).EditMessage(context.Background(), storage.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: "user-1",
+		Body: "new body", BodyFormat: domain.MessageBodyFormatV1,
+	})
+	if !errors.Is(err, domain.ErrEditWindowExpired) {
+		t.Fatalf("expected ErrEditWindowExpired, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ListMessageEditHistory_ReturnsMultipleVersionsNewestFirst(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now().UTC()
+	older := now.Add(-time.Minute)
+	mock.ExpectQuery(`(?s)WITH authorized AS.*message_edit_history.*ORDER BY versioned_at DESC`).
+		WithArgs("ws-1", "msg-1", "user-1", 50, 0).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "message_id", "body", "body_format", "editor_user_id", "versioned_at"}).
+			AddRow("hist-2", "msg-1", "second", "v2", "user-1", &now).
+			AddRow("hist-1", "msg-1", "first", "v1", "user-1", &older))
+
+	history, err := storage.NewPGXMessageStore(mock).ListMessageEditHistory(context.Background(), storage.ListMessageEditHistoryInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListMessageEditHistory: %v", err)
+	}
+	if len(history) != 2 || history[0].Body != "second" || history[1].Body != "first" {
+		t.Fatalf("unexpected history order/content: %+v", history)
 	}
 	checkExpectations(t, mock)
 }
@@ -697,7 +773,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		"msg-e2", "ws-1", "ch-1", "", "user-1",
 		"user", "edited body", "v1", "active",
 		"", "", "",
-		&editedAt, &deletedAt,
+		&editedAt, 1, &deletedAt,
 		now, now,
 		"Test User", "test@example.com", false,
 	}
