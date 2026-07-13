@@ -23,6 +23,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
@@ -40,6 +41,8 @@ import { fetchAllowedReactionEmojis } from "./chatApi";
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const defaultRecentReactions = ["👍", "❤️", "😂"];
+const quoteHighlightMs = 1_200;
+const reactionMenuLeaveDelayMs = 150;
 
 function recentReactionsKey(userID: string): string {
   return `nchat_recent_reactions:${userID}`;
@@ -85,6 +88,14 @@ function formatTime(iso: string): string {
 
 function senderLabel(msg: Message): string {
   return msg.senderDisplayName || msg.senderEmail || msg.senderId.slice(0, 8);
+}
+
+function quoteAuthorLabel(
+  quote: NonNullable<Message["quoted"]>,
+  messagesById: Map<string, Message>,
+) {
+  const parent = messagesById.get(quote.id);
+  return parent ? senderLabel(parent) : "Usuário desconhecido";
 }
 
 function senderInitials(msg: Message): string {
@@ -286,6 +297,7 @@ interface MessageBubbleProps {
   /** True when consecutive messages from the same sender within the same minute. */
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  onReplyMessage: (message: Message) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
@@ -297,6 +309,11 @@ interface MessageBubbleProps {
   onReactionMenuVisibleChange: (messageId: string, visible: boolean) => void;
   pickerOpen: boolean;
   onPickerOpenChange: (messageId: string, open: boolean) => void;
+  quoteAuthorLabel?: string;
+  canJumpToQuote?: boolean;
+  onQuoteJump?: (messageId: string) => void;
+  isHighlighted?: boolean;
+  setMessageRef?: (messageId: string, el: HTMLDivElement | null) => void;
 }
 
 function MessageReactions({
@@ -304,12 +321,14 @@ function MessageReactions({
   isMine = false,
   bubbleRef,
   onToggleReaction,
+  onReplyMessage,
   onToggleFavorite,
   onTogglePin,
   isPinned = false,
   allowedReactionEmojis,
   recentReactionEmojis,
   reactionMenuVisible,
+  onReactionMenuVisibleChange,
   pickerOpen,
   onPickerOpenChange,
 }: Pick<
@@ -317,12 +336,14 @@ function MessageReactions({
   | "message"
   | "isMine"
   | "onToggleReaction"
+  | "onReplyMessage"
   | "onToggleFavorite"
   | "onTogglePin"
   | "isPinned"
   | "allowedReactionEmojis"
   | "recentReactionEmojis"
   | "reactionMenuVisible"
+  | "onReactionMenuVisibleChange"
   | "pickerOpen"
   | "onPickerOpenChange"
 > & { bubbleRef: RefObject<HTMLDivElement | null> }) {
@@ -335,18 +356,20 @@ function MessageReactions({
     const bubble = bubbleRef.current.getBoundingClientRect();
     if (bubble.bottom < 0 || bubble.top > window.innerHeight) return;
     const menu = menuRef.current.getBoundingClientRect();
-    const gap = 6;
+    // gapAbove = 0: cola a borda da toolbar exatamente no início da mensagem (feedback de UX, issue #331)
+    const gapAbove = 0;
+    const gapBelow = 6;
     const viewportPadding = 8;
     const midX = bubble.left + bubble.width / 2;
     const left = Math.min(
       Math.max(viewportPadding, isMine ? midX - menu.width : midX),
       window.innerWidth - menu.width - viewportPadding,
     );
-    const above = bubble.top - menu.height - gap;
+    const above = bubble.top - menu.height - gapAbove;
     const top =
       above >= viewportPadding
         ? above
-        : Math.min(bubble.bottom + gap, window.innerHeight - menu.height - viewportPadding);
+        : Math.min(bubble.bottom + gapBelow, window.innerHeight - menu.height - viewportPadding);
     menuRef.current.style.left = `${left}px`;
     menuRef.current.style.top = `${top}px`;
     menuRef.current.style.visibility = "visible";
@@ -431,87 +454,91 @@ function MessageReactions({
           ))}
         </div>
       )}
-      {reactionMenuVisible &&
-        createPortal(
-          <div
-            ref={menuRef}
-            className="chat-msg-area__reaction-menu"
-            role="toolbar"
-            aria-label="Reagir à mensagem"
-            style={{ visibility: "hidden" }}
+      {reactionMenuVisible && (
+        <div
+          ref={menuRef}
+          className="chat-msg-area__reaction-menu"
+          role="toolbar"
+          aria-label="Reagir à mensagem"
+          onMouseEnter={() => onReactionMenuVisibleChange(message.id, true)}
+          style={{ visibility: "hidden" }}
+        >
+          {recentReactionEmojis.map((emoji) => (
+            <button
+              key={emoji}
+              type="button"
+              aria-label={`Reagir rapidamente com ${emoji}`}
+              onClick={() => onToggleReaction(message.id, emoji)}
+            >
+              {emoji}
+            </button>
+          ))}
+          <button type="button" aria-label="Responder" onClick={() => onReplyMessage(message)}>
+            <span className="material-symbols-outlined" aria-hidden="true">
+              reply
+            </span>
+          </button>
+          <button
+            type="button"
+            className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
+            aria-label={message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
+            aria-pressed={message.isFavorited}
+            onClick={() => onToggleFavorite(message.id, !message.isFavorited)}
           >
-            {recentReactionEmojis.map((emoji) => (
-              <button
-                key={emoji}
-                type="button"
-                aria-label={`Reagir rapidamente com ${emoji}`}
-                onClick={() => onToggleReaction(message.id, emoji)}
-              >
-                {emoji}
-              </button>
-            ))}
+            <span className="material-symbols-outlined" aria-hidden="true">
+              star
+            </span>
+          </button>
+          {onTogglePin && (
             <button
               type="button"
-              className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
-              aria-label={message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
-              aria-pressed={message.isFavorited}
-              onClick={() => onToggleFavorite(message.id, !message.isFavorited)}
+              className={isPinned ? "chat-msg-area__pin--active" : undefined}
+              aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
+              aria-pressed={isPinned}
+              onClick={() => onTogglePin(message.id, !isPinned)}
             >
               <span className="material-symbols-outlined" aria-hidden="true">
-                star
+                keep
               </span>
             </button>
-            {onTogglePin && (
-              <button
-                type="button"
-                className={isPinned ? "chat-msg-area__pin--active" : undefined}
-                aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
-                aria-pressed={isPinned}
-                onClick={() => onTogglePin(message.id, !isPinned)}
+          )}
+          <button
+            ref={anchorRef}
+            type="button"
+            aria-label="Mais reações"
+            aria-expanded={pickerOpen}
+            aria-haspopup="dialog"
+            disabled={allowedReactionEmojis.length === 0}
+            onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              add_reaction
+            </span>
+          </button>
+          {pickerOpen &&
+            createPortal(
+              <div
+                ref={pickerRef}
+                className="chat-msg-area__reaction-grid"
+                role="dialog"
+                aria-label="Escolher reação"
+                style={{ visibility: "hidden" }}
               >
-                <span className="material-symbols-outlined" aria-hidden="true">
-                  keep
-                </span>
-              </button>
+                {allowedReactionEmojis.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    aria-label={`Reagir com ${emoji}`}
+                    onClick={() => selectReaction(emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>,
+              document.body,
             )}
-            <button
-              ref={anchorRef}
-              type="button"
-              aria-label="Mais reações"
-              aria-expanded={pickerOpen}
-              aria-haspopup="dialog"
-              disabled={allowedReactionEmojis.length === 0}
-              onClick={() => onPickerOpenChange(message.id, !pickerOpen)}
-            >
-              <span className="material-symbols-outlined" aria-hidden="true">
-                add_reaction
-              </span>
-            </button>
-            {pickerOpen &&
-              createPortal(
-                <div
-                  ref={pickerRef}
-                  className="chat-msg-area__reaction-grid"
-                  role="dialog"
-                  aria-label="Escolher reação"
-                  style={{ visibility: "hidden" }}
-                >
-                  {allowedReactionEmojis.map((emoji) => (
-                    <button
-                      key={emoji}
-                      type="button"
-                      aria-label={`Reagir com ${emoji}`}
-                      onClick={() => selectReaction(emoji)}
-                    >
-                      {emoji}
-                    </button>
-                  ))}
-                </div>,
-                document.body,
-              )}
-          </div>,
-          document.body,
-        )}
+        </div>
+      )}
     </>
   );
 }
@@ -534,11 +561,52 @@ function MessageMeta({
   );
 }
 
+interface QuoteBlockProps {
+  quote: NonNullable<Message["quoted"]>;
+  authorLabel: string;
+  canJump: boolean;
+  onJump?: (messageId: string) => void;
+}
+
+function QuoteBlock({ quote, authorLabel, canJump, onJump }: QuoteBlockProps) {
+  const jump = () => {
+    if (canJump) onJump?.(quote.id);
+  };
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!canJump || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    jump();
+  };
+
+  return (
+    <div
+      className={`chat-msg-area__quote${canJump ? " chat-msg-area__quote--clickable" : " chat-msg-area__quote--disabled"}`}
+      role={canJump ? "button" : undefined}
+      tabIndex={canJump ? 0 : undefined}
+      aria-disabled={canJump ? undefined : true}
+      aria-label={canJump ? `Ir para mensagem original de ${authorLabel}` : undefined}
+      onClick={canJump ? jump : undefined}
+      onKeyDown={handleKeyDown}
+      data-testid="chat-message-quote"
+    >
+      <div className="chat-msg-area__quote-author">{authorLabel}</div>
+      <div className="chat-msg-area__quote-excerpt">
+        {quote.isRemoved ? (
+          "Mensagem original indisponível."
+        ) : (
+          <RichTextRenderer text={quote.bodyText} bodyFormat={quote.bodyFormat} />
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MessageBubble({
   message,
   isMine = false,
   isGrouped = false,
   onToggleReaction,
+  onReplyMessage,
   onToggleFavorite,
   onTogglePin,
   isPinned = false,
@@ -548,15 +616,27 @@ function MessageBubble({
   onReactionMenuVisibleChange,
   pickerOpen,
   onPickerOpenChange,
+  quoteAuthorLabel,
+  canJumpToQuote = false,
+  onQuoteJump,
+  isHighlighted = false,
+  setMessageRef,
 }: MessageBubbleProps) {
   const bubbleRef = useRef<HTMLDivElement>(null);
   return (
     <div
-      className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}${isGrouped ? " chat-msg-area__msg--grouped" : ""}`}
+      ref={(el) => setMessageRef?.(message.id, el)}
+      className={`chat-msg-area__msg${isMine ? " chat-msg-area__msg--mine" : ""}${isGrouped ? " chat-msg-area__msg--grouped" : ""}${isHighlighted ? " chat-msg-area__msg--highlight" : ""}`}
       data-testid="chat-msg-bubble"
+      data-message-id={message.id}
       tabIndex={0}
       onMouseEnter={() => onReactionMenuVisibleChange(message.id, true)}
-      onMouseLeave={() => onReactionMenuVisibleChange(message.id, false)}
+      onMouseLeave={(event) => {
+        const nextTarget = event.relatedTarget;
+        if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+          onReactionMenuVisibleChange(message.id, false);
+        }
+      }}
       onFocus={() => onReactionMenuVisibleChange(message.id, true)}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) {
@@ -576,6 +656,15 @@ function MessageBubble({
           ref={bubbleRef}
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
+          {/* Quote ocultado em mensagens removidas para não misturar contexto residual com o placeholder de remoção. */}
+          {message.quoted && !message.isRemoved && (
+            <QuoteBlock
+              quote={message.quoted}
+              authorLabel={quoteAuthorLabel ?? "Usuário desconhecido"}
+              canJump={canJumpToQuote}
+              onJump={onQuoteJump}
+            />
+          )}
           {message.isRemoved ? (
             "Mensagem removida."
           ) : (
@@ -587,12 +676,14 @@ function MessageBubble({
           isMine={isMine}
           bubbleRef={bubbleRef}
           onToggleReaction={onToggleReaction}
+          onReplyMessage={onReplyMessage}
           onToggleFavorite={onToggleFavorite}
           onTogglePin={onTogglePin}
           isPinned={isPinned}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
           reactionMenuVisible={reactionMenuVisible || pickerOpen}
+          onReactionMenuVisibleChange={onReactionMenuVisibleChange}
           pickerOpen={pickerOpen}
           onPickerOpenChange={onPickerOpenChange}
         />
@@ -609,6 +700,7 @@ interface MessageListProps {
   lastMutation: LastMutation;
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  onReplyMessage: (message: Message) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
@@ -626,6 +718,7 @@ function MessageList({
   lastMutation,
   onLoadMore,
   onToggleReaction,
+  onReplyMessage,
   onToggleFavorite,
   onTogglePin,
   pinnedIds,
@@ -635,15 +728,49 @@ function MessageList({
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
+  const messageRefs = useRef(new Map<string, HTMLDivElement>());
+  const highlightTimerRef = useRef<number | null>(null);
+  const hoverCloseTimerRef = useRef<number | null>(null);
   const [openPickerMessageId, setOpenPickerMessageId] = useState<string | null>(null);
   const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const messagesById = useMemo(
+    () => new Map(messages.map((message) => [message.id, message])),
+    [messages],
+  );
+  const setMessageRef = useCallback((messageId: string, el: HTMLDivElement | null) => {
+    if (el) messageRefs.current.set(messageId, el);
+    else messageRefs.current.delete(messageId);
+  }, []);
+  const handleQuoteJump = useCallback((messageId: string) => {
+    const el = messageRefs.current.get(messageId);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlightedMessageId(messageId);
+    if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedMessageId(null);
+      highlightTimerRef.current = null;
+    }, quoteHighlightMs);
+  }, []);
   const handlePickerOpenChange = useCallback((messageId: string, open: boolean) => {
     setOpenPickerMessageId(open ? messageId : null);
   }, []);
   const handleReactionMenuVisibleChange = useCallback(
     (messageId: string, visible: boolean) => {
       if (openPickerMessageId && openPickerMessageId !== messageId) return;
-      setHoveredMessageId(visible ? messageId : null);
+      if (hoverCloseTimerRef.current !== null) {
+        window.clearTimeout(hoverCloseTimerRef.current);
+        hoverCloseTimerRef.current = null;
+      }
+      if (visible) {
+        setHoveredMessageId(messageId);
+        return;
+      }
+      hoverCloseTimerRef.current = window.setTimeout(() => {
+        setHoveredMessageId((current) => (current === messageId ? null : current));
+        hoverCloseTimerRef.current = null;
+      }, reactionMenuLeaveDelayMs);
     },
     [openPickerMessageId],
   );
@@ -676,6 +803,13 @@ function MessageList({
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+      if (hoverCloseTimerRef.current !== null) window.clearTimeout(hoverCloseTimerRef.current);
+    };
   }, []);
 
   // Scroll management driven by lastMutation — explicit and race-condition-free.
@@ -793,6 +927,7 @@ function MessageList({
             isMine={!!currentUserId && item.message.senderId === currentUserId}
             isGrouped={item.isGrouped}
             onToggleReaction={onToggleReaction}
+            onReplyMessage={onReplyMessage}
             onToggleFavorite={onToggleFavorite}
             onTogglePin={onTogglePin}
             isPinned={pinnedIds?.has(item.message.id) ?? false}
@@ -802,6 +937,13 @@ function MessageList({
             onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
             pickerOpen={openPickerMessageId === item.message.id}
             onPickerOpenChange={handlePickerOpenChange}
+            quoteAuthorLabel={
+              item.message.quoted ? quoteAuthorLabel(item.message.quoted, messagesById) : undefined
+            }
+            canJumpToQuote={item.message.quoted ? messagesById.has(item.message.quoted.id) : false}
+            onQuoteJump={handleQuoteJump}
+            isHighlighted={highlightedMessageId === item.message.id}
+            setMessageRef={setMessageRef}
           />
         ),
       )}
@@ -920,7 +1062,16 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const pinTarget = useMemo(() => (targetId ? { kind, id: targetId } : null), [kind, targetId]);
   const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinTarget);
 
-  const { state, sendMessage, retry, loadMore, toggleReaction, toggleFavorite } = useMessages({
+  const {
+    state,
+    sendMessage,
+    retry,
+    loadMore,
+    selectReply,
+    cancelReply,
+    toggleReaction,
+    toggleFavorite,
+  } = useMessages({
     kind,
     targetId,
     currentUserId: ctx.currentUserId,
@@ -946,6 +1097,19 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const handleSend = useCallback(
     (body: string): Promise<SendResult> => sendMessage(body),
     [sendMessage],
+  );
+
+  const replyPreview = useMemo(
+    () =>
+      state.replyTo
+        ? {
+            authorLabel: senderLabel(state.replyTo),
+            bodyText: state.replyTo.bodyText,
+            bodyFormat: state.replyTo.bodyFormat,
+            isRemoved: state.replyTo.isRemoved,
+          }
+        : null,
+    [state.replyTo],
   );
 
   const handleToggleReaction = useCallback(
@@ -996,6 +1160,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           lastMutation={state.lastMutation}
           onLoadMore={loadMore}
           onToggleReaction={handleToggleReaction}
+          onReplyMessage={selectReply}
           onToggleFavorite={toggleFavorite}
           onTogglePin={togglePin}
           pinnedIds={pinnedIds}
@@ -1036,6 +1201,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           kind === "channel" ? `Mensagem para #${resolvedName}…` : `Mensagem para ${resolvedName}…`
         }
         disabled={state.status !== "ready"}
+        replyPreview={replyPreview}
+        onCancelReply={cancelReply}
         onSend={handleSend}
       />
     </div>

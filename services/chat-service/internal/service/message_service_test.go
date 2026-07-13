@@ -85,7 +85,7 @@ func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspac
 	return domain.Message{}, domain.ErrNotFound
 }
 
-func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _ string) error {
+func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _, _ string) error {
 	return f.validateRefTargetErr
 }
 
@@ -595,6 +595,26 @@ func TestMessageService_CreateChannelMessage_RefMessageChannelToDMDenied(t *test
 		})
 	if !errors.Is(err, domain.ErrInvalidMessageReference) {
 		t.Fatalf("expected ErrInvalidMessageReference for channel-to-DM ref, got %v", err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_DeletedParentMessageDenied(t *testing.T) {
+	ch := publicActiveChannel("ws-1", "ch-1")
+	channels := &fakeChannelStore{visibleChannel: ch}
+	// Decision: replies to deleted messages are rejected, matching AddFavorite's
+	// active-message rule and keeping invalid-reference reasons non-enumerating.
+	msgs := &fakeMessageStore{validateRefTargetErr: domain.ErrInvalidMessageReference}
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID:     "ws-1",
+			ChannelID:       "ch-1",
+			SenderID:        user1,
+			BodyText:        "reply",
+			ParentMessageID: user2,
+		})
+	if !errors.Is(err, domain.ErrInvalidMessageReference) {
+		t.Fatalf("expected ErrInvalidMessageReference for deleted parent, got %v", err)
 	}
 }
 

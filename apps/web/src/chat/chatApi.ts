@@ -12,16 +12,18 @@
 
 import { authenticatedFetch } from "../lib/authClient";
 import { onAuthChange } from "../lib/authSession";
-import type {
-  Channel,
-  DMConversation,
-  FavoriteItem,
-  FavoritesPage,
-  Message,
-  MessagePage,
-  PinnedItem,
+import {
+  normalizeBodyFormat,
+  type Channel,
+  type MessageBodyFormat,
+  type MentionCandidate,
+  type DMConversation,
+  type FavoriteItem,
+  type FavoritesPage,
+  type Message,
+  type MessagePage,
+  type PinnedItem,
 } from "./chatTypes";
-import type { MentionCandidate } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
 
@@ -156,6 +158,17 @@ interface MessageResponse {
   updated_at: string;
   reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited?: boolean;
+  quoted?: QuoteResponse;
+}
+
+interface QuoteResponse {
+  id: string;
+  author_id: string;
+  body?: string;
+  body_format?: MessageBodyFormat;
+  is_removed?: boolean;
+  deleted_at?: string;
+  created_at: string;
 }
 
 interface FavoriteResponse {
@@ -240,7 +253,7 @@ function mapMessage(r: MessageResponse): Message {
     senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
     bodyText: r.body_text ?? "",
-    bodyFormat: r.body_format === "v3" ? "v3" : r.body_format === "v2" ? "v2" : "v1",
+    bodyFormat: normalizeBodyFormat(r.body_format),
     isRemoved: r.is_removed ?? false,
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
@@ -251,6 +264,19 @@ function mapMessage(r: MessageResponse): Message {
       reactedByMe: reaction.reacted_by_me,
     })),
     isFavorited: r.is_favorited ?? false,
+    quoted: r.quoted ? mapQuote(r.quoted) : undefined,
+  };
+}
+
+function mapQuote(r: QuoteResponse): Message["quoted"] {
+  return {
+    id: r.id,
+    authorId: r.author_id,
+    bodyText: r.body ?? "",
+    bodyFormat: normalizeBodyFormat(r.body_format),
+    isRemoved: r.is_removed ?? false,
+    deletedAt: r.deleted_at ?? null,
+    createdAt: r.created_at ?? "",
   };
 }
 
@@ -283,12 +309,17 @@ export async function fetchChannelMessages(
 export async function postChannelMessage(
   channelId: string,
   bodyText: string,
+  parentMessageId?: string,
   signal?: AbortSignal,
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body_text: bodyText, body_format: "v3" }),
+    body: JSON.stringify({
+      body_text: bodyText,
+      body_format: "v3",
+      ...(parentMessageId ? { parent_message_id: parentMessageId } : {}),
+    }),
     signal,
   });
   return mapMessage(res.data);
@@ -325,12 +356,17 @@ export async function fetchMentionCandidates(
 export async function postDMMessage(
   conversationId: string,
   bodyText: string,
+  parentMessageId?: string,
   signal?: AbortSignal,
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body_text: bodyText, body_format: "v2" }),
+    body: JSON.stringify({
+      body_text: bodyText,
+      body_format: "v2",
+      ...(parentMessageId ? { parent_message_id: parentMessageId } : {}),
+    }),
     signal,
   });
   return mapMessage(res.data);

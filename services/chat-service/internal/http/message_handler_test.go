@@ -273,6 +273,44 @@ func TestMessageHandler_ListChannelMessages_DeletedMessageBodyWithheld(t *testin
 	}
 }
 
+func TestMessageHandler_ListChannelMessages_QuotedDeletedParentBodyWithheld(t *testing.T) {
+	deletedAt := testNow().Add(-time.Minute)
+	msg := testMessage()
+	msg.ParentMessageID = "66666666-6666-6666-6666-666666666666"
+	msg.Quoted = &domain.QuotedMessage{
+		ID:         msg.ParentMessageID,
+		AuthorID:   msgTestUserID,
+		BodyText:   "quoted secret",
+		BodyFormat: domain.MessageBodyFormatV1,
+		Status:     domain.MessageStatusDeleted,
+		DeletedAt:  deletedAt,
+		CreatedAt:  testNow().Add(-time.Hour),
+	}
+	msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{
+		Messages: []domain.Message{msg},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "quoted secret") {
+		t.Fatal("deleted quoted parent body must not appear in response")
+	}
+	body := decodeBody(t, rec)
+	first := body["data"].(map[string]any)["messages"].([]any)[0].(map[string]any)
+	quoted := first["quoted"].(map[string]any)
+	if quoted["is_removed"] != true {
+		t.Fatalf("expected removed quoted parent, got %#v", quoted)
+	}
+	if _, ok := quoted["body"]; ok {
+		t.Fatalf("deleted quoted parent must omit body: %#v", quoted)
+	}
+}
+
 func TestMessageHandler_ListChannelMessages_InaccessibleChannelReturnsNotFound(t *testing.T) {
 	msgs := &fakeMessageProvider{channelOutErr: domain.ErrNotFound}
 	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
@@ -389,6 +427,36 @@ func TestMessageHandler_CreateChannelMessage_Success(t *testing.T) {
 	h.CreateChannelMessage(rec, r)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMessageHandler_CreateChannelMessage_AcceptsParentMessageID(t *testing.T) {
+	const parentID = "66666666-6666-6666-6666-666666666666"
+	msgs := &fakeMessageProvider{createdMsg: testMessage()}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"hello","parent_message_id":"`+parentID+`"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	if msgs.lastCreateChannelInput.ParentMessageID != parentID {
+		t.Fatalf("parent_message_id not forwarded: %+v", msgs.lastCreateChannelInput)
+	}
+}
+
+func TestMessageHandler_CreateChannelMessage_InvalidParentReferenceReturns404(t *testing.T) {
+	msgs := &fakeMessageProvider{createChErr: domain.ErrInvalidMessageReference}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"hello","parent_message_id":"66666666-6666-6666-6666-666666666666"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected generic 404 for invalid parent, got %d — body: %s", rec.Code, rec.Body.String())
 	}
 }
 

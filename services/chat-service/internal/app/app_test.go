@@ -331,6 +331,32 @@ func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 	if !got.IsRemoved || got.EditedAt == nil || got.DeletedAt == nil {
 		t.Fatalf("removal timestamps not mapped: %+v", got)
 	}
+
+	got = domainMessageToWSPayload(domain.Message{
+		ID: "message-2", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		Status: domain.MessageStatusDeleted,
+	})
+	if !got.IsRemoved || got.DeletedAt != nil {
+		t.Fatalf("deleted status without timestamp must still map as removed: %+v", got)
+	}
+}
+
+func TestDomainMessageToWSPayloadMapsDeletedQuotePlaceholder(t *testing.T) {
+	now := time.Now().UTC()
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1", SenderID: "user-1",
+		Quoted: &domain.QuotedMessage{
+			ID: "parent-1", AuthorID: "user-2", BodyText: "quoted secret",
+			BodyFormat: domain.MessageBodyFormatV1, Status: domain.MessageStatusDeleted,
+			DeletedAt: now, CreatedAt: now.Add(-time.Hour),
+		},
+	})
+	if got.Quoted == nil || got.Quoted.ID != "parent-1" || got.Quoted.AuthorID != "user-2" {
+		t.Fatalf("quoted payload not mapped: %+v", got.Quoted)
+	}
+	if !got.Quoted.IsRemoved || got.Quoted.DeletedAt == nil || got.Quoted.Body != "" {
+		t.Fatalf("deleted quoted body must be withheld: %+v", got.Quoted)
+	}
 }
 
 func TestHubBroadcasterPublishesCreatedMessage(t *testing.T) {

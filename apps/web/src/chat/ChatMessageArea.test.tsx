@@ -55,13 +55,27 @@ const {
   mockFetchChannelMessage:
     vi.fn<(channelId: string, messageId: string, signal?: AbortSignal) => Promise<Message>>(),
   mockPostChannelMessage:
-    vi.fn<(channelId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
+    vi.fn<
+      (
+        channelId: string,
+        bodyText: string,
+        parentMessageId?: string,
+        signal?: AbortSignal,
+      ) => Promise<Message>
+    >(),
   mockFetchDMMessages:
     vi.fn<
       (conversationId: string, beforeCursor?: string, signal?: AbortSignal) => Promise<MessagePage>
     >(),
   mockPostDMMessage:
-    vi.fn<(conversationId: string, bodyText: string, signal?: AbortSignal) => Promise<Message>>(),
+    vi.fn<
+      (
+        conversationId: string,
+        bodyText: string,
+        parentMessageId?: string,
+        signal?: AbortSignal,
+      ) => Promise<Message>
+    >(),
   mockFetchAllowedReactionEmojis: vi.fn<() => Promise<string[]>>(),
   mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
@@ -87,12 +101,20 @@ vi.mock("./chatApi", () => ({
   fetchChannelMessages: (channelId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchChannelMessages(channelId, beforeCursor, signal),
   fetchChannelMessage: mockFetchChannelMessage,
-  postChannelMessage: (channelId: string, bodyText: string, signal?: AbortSignal) =>
-    mockPostChannelMessage(channelId, bodyText, signal),
+  postChannelMessage: (
+    channelId: string,
+    bodyText: string,
+    parentMessageId?: string,
+    signal?: AbortSignal,
+  ) => mockPostChannelMessage(channelId, bodyText, parentMessageId, signal),
   fetchDMMessages: (conversationId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchDMMessages(conversationId, beforeCursor, signal),
-  postDMMessage: (conversationId: string, bodyText: string, signal?: AbortSignal) =>
-    mockPostDMMessage(conversationId, bodyText, signal),
+  postDMMessage: (
+    conversationId: string,
+    bodyText: string,
+    parentMessageId?: string,
+    signal?: AbortSignal,
+  ) => mockPostDMMessage(conversationId, bodyText, parentMessageId, signal),
   fetchDMMessage: vi.fn(),
   fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
@@ -223,6 +245,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clearTokens();
 });
 
@@ -432,11 +455,71 @@ describe("ChatMessageArea — message list", () => {
     fireEvent.mouseEnter(bubbles[0]);
 
     expect(screen.getAllByRole("button", { name: /Reagir rapidamente com/ })).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "Responder" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
     fireEvent.mouseEnter(bubbles[1]);
     expect(screen.getAllByRole("button", { name: "Mais reações" })).toHaveLength(1);
     fireEvent.mouseLeave(bubbles[1]);
-    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the grouped message hover menu active when the pointer moves onto its toolbar", async () => {
+    const user = userEvent.setup();
+    const sameMinute = "2024-01-15T10:04";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderId: "user-alice",
+          senderDisplayName: "Alice",
+          bodyText: "Primeira",
+          createdAt: `${sameMinute}:10.000Z`,
+        }),
+        makeMessage({
+          id: "m2",
+          senderId: "user-alice",
+          senderDisplayName: "Alice",
+          bodyText: "Segunda",
+          createdAt: `${sameMinute}:20.000Z`,
+        }),
+        makeMessage({
+          id: "m3",
+          senderId: "user-alice",
+          senderDisplayName: "Alice",
+          bodyText: "Terceira",
+          createdAt: `${sameMinute}:30.000Z`,
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+    const bubbles = await screen.findAllByTestId("chat-msg-bubble");
+
+    await user.hover(bubbles[1]);
+    const toolbar = screen.getByRole("toolbar", { name: "Reagir à mensagem" });
+    await user.hover(toolbar);
+
+    expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+    expect(screen.getAllByRole("toolbar", { name: "Reagir à mensagem" })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m2", "👍");
+    expect(wsMockState.toggleReaction).not.toHaveBeenCalledWith("m1", expect.any(String));
+  });
+
+  it("cleans up a pending hover-menu close timer on unmount", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    const { unmount } = renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    vi.useFakeTimers();
+    const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
+
+    fireEvent.mouseEnter(bubble);
+    fireEvent.mouseLeave(bubble);
+    unmount();
+
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+    clearTimeoutSpy.mockRestore();
   });
 
   it("reveals the reaction menu by keyboard focus and touch", async () => {
@@ -446,8 +529,11 @@ describe("ChatMessageArea — message list", () => {
 
     fireEvent.focus(bubble);
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Responder" })).toBeVisible();
     fireEvent.blur(bubble, { relatedTarget: document.body });
-    expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Mais reações" })).not.toBeInTheDocument(),
+    );
     fireEvent.touchStart(bubble);
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
   });
@@ -1122,6 +1208,207 @@ describe("ChatMessageArea — send message", () => {
     await waitFor(() => {
       expect(screen.getByTestId("chat-send-error")).toBeInTheDocument();
     });
+  });
+
+  it("reply action opens the composer quote and cancel keeps the draft", async () => {
+    const user = userEvent.setup();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          senderDisplayName: "Ana",
+          bodyText: "**texto citado**",
+          bodyFormat: "v2",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await user.click(screen.getByRole("button", { name: "Responder" }));
+
+    const input = screen.getByTestId("chat-composer-input");
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(screen.getByTestId("chat-composer-quote")).toHaveTextContent("Ana");
+    expect(screen.getByTestId("chat-composer-quote")).toHaveTextContent("texto citado");
+
+    await fillEditor(input, "rascunho");
+    await user.click(screen.getByRole("button", { name: "Cancelar resposta" }));
+
+    expect(screen.queryByTestId("chat-composer-quote")).not.toBeInTheDocument();
+    expect(input).toHaveTextContent("rascunho");
+  });
+
+  it("Escape closes the composer quote", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderDisplayName: "Ana" })]),
+    );
+    renderChannelAreaForUser();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Responder" }));
+
+    const input = screen.getByTestId("chat-composer-input");
+    fireEvent.keyDown(input, { key: "Escape", code: "Escape" });
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-composer-quote")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("send with active reply includes parent_message_id and renders the returned quote", async () => {
+    const user = userEvent.setup();
+    const parent = makeMessage({
+      id: "m1",
+      senderId: "user-parent",
+      senderDisplayName: "Ana",
+      bodyText: "mensagem original",
+      bodyFormat: "v2",
+    });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([parent]));
+    mockPostChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "m2",
+        senderId: "me-123",
+        bodyText: "resposta",
+        bodyFormat: "v3",
+        quoted: {
+          id: "m1",
+          authorId: "user-parent",
+          bodyText: "mensagem original",
+          bodyFormat: "v2",
+          isRemoved: false,
+          deletedAt: null,
+          createdAt: parent.createdAt,
+        },
+      }),
+    );
+    renderChannelAreaForUser();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await user.click(screen.getByRole("button", { name: "Responder" }));
+    await fillEditor(screen.getByTestId("chat-composer-input"), "resposta");
+    await user.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
+    expect(mockPostChannelMessage.mock.calls[0]?.[2]).toBe("m1");
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-composer-quote")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("chat-message-quote")).toHaveTextContent("Ana");
+    expect(screen.getByTestId("chat-message-quote")).toHaveTextContent("mensagem original");
+  });
+
+  it("renders unavailable quoted messages without fetching the original", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m2",
+          quoted: {
+            id: "missing-parent",
+            authorId: "user-parent",
+            bodyText: "",
+            bodyFormat: "v2",
+            isRemoved: true,
+            deletedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const quote = await screen.findByTestId("chat-message-quote");
+
+    expect(quote).toHaveTextContent("Mensagem original indisponível.");
+    expect(quote).toHaveAttribute("aria-disabled", "true");
+    const scrollIntoViewMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoViewMock.mockClear();
+    fireEvent.keyDown(quote, { key: "Enter" });
+    expect(scrollIntoViewMock).not.toHaveBeenCalled();
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("clicking a loaded quote scrolls to the original message", async () => {
+    const parent = makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "original" });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        parent,
+        makeMessage({
+          id: "m2",
+          bodyText: "resposta",
+          quoted: {
+            id: "m1",
+            authorId: parent.senderId,
+            bodyText: parent.bodyText,
+            bodyFormat: parent.bodyFormat,
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: parent.createdAt,
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const quotes = await screen.findAllByTestId("chat-message-quote");
+    const originalMessageElement = document.querySelector('[data-message-id="m1"]');
+    expect(originalMessageElement).not.toBeNull();
+    const scrollIntoViewMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoViewMock.mockClear();
+
+    await userEvent.click(quotes[0]);
+
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+    expect(scrollIntoViewMock.mock.contexts[0]).toBe(originalMessageElement);
+  });
+
+  it("keyboard jump highlights the original message briefly", async () => {
+    const parent = makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "original" });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        parent,
+        makeMessage({
+          id: "m2",
+          bodyText: "resposta",
+          quoted: {
+            id: "m1",
+            authorId: parent.senderId,
+            bodyText: parent.bodyText,
+            bodyFormat: parent.bodyFormat,
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: parent.createdAt,
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const quotes = await screen.findAllByTestId("chat-message-quote");
+    const originalMessageElement = document.querySelector('[data-message-id="m1"]');
+    expect(originalMessageElement).not.toBeNull();
+    const scrollIntoViewMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollIntoViewMock.mockClear();
+    vi.useFakeTimers();
+
+    fireEvent.keyDown(quotes[0], { key: "Enter" });
+
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
+    expect(originalMessageElement).toHaveClass("chat-msg-area__msg--highlight");
+
+    act(() => vi.advanceTimersByTime(1_200));
+
+    expect(originalMessageElement).not.toHaveClass("chat-msg-area__msg--highlight");
   });
 });
 

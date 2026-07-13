@@ -65,6 +65,22 @@ type Message struct {
 	// IsFavorited reports whether the requesting user favorited this message.
 	// Always scoped to the caller — never exposes other users' favorites.
 	IsFavorited bool
+
+	// Quoted is the immediate parent message preview for quote-reply.
+	// It is intentionally one level only; nested parent quotes are not populated.
+	Quoted *QuotedMessage
+}
+
+// QuotedMessage is the inline parent preview attached to a reply.
+// Status is kept for serializers to reuse the deleted-message placeholder rule.
+type QuotedMessage struct {
+	ID         string
+	AuthorID   string
+	BodyText   string
+	BodyFormat MessageBodyFormat
+	Status     MessageStatus
+	DeletedAt  time.Time
+	CreatedAt  time.Time
 }
 
 // FavoriteMessage is one entry in a user's private favorites list.

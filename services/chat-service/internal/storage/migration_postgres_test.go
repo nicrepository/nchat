@@ -60,6 +60,15 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			t.Fatalf("apply %s: %v", name, err)
 		}
 	}
+	if _, err := conn.Exec(ctx, readChatMigration(t, "000012_message_parent_reply.up.sql")); err != nil {
+		t.Fatalf("apply 000012_message_parent_reply.up.sql: %v", err)
+	}
+	if _, err := conn.Exec(ctx, readChatMigration(t, "000012_message_parent_reply.down.sql")); err != nil {
+		t.Fatalf("apply 000012_message_parent_reply.down.sql: %v", err)
+	}
+	if _, err := conn.Exec(ctx, readChatMigration(t, "000012_message_parent_reply.up.sql")); err != nil {
+		t.Fatalf("re-apply 000012_message_parent_reply.up.sql: %v", err)
+	}
 
 	t.Run("SQL visibility excludes unauthorized private and cross-workspace channels", func(t *testing.T) {
 		_, err := conn.Exec(ctx, `

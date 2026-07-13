@@ -289,6 +289,47 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
   });
 
+  it("reverts pending optimistic reactions when the server reports a reaction error", async () => {
+    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false }];
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", reactions: originalReactions })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 2, reactedByMe: true },
+    ]);
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
+
+    expect(result.current.state.messages[0].reactions).toEqual(originalReactions);
+    expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
+  });
+
+  it("reverts an optimistic reaction when confirmation times out", async () => {
+    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false }];
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", reactions: originalReactions })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+
+    act(() => result.current.toggleReaction("msg-1", "👍"));
+    act(() => vi.advanceTimersByTime(8_000));
+
+    expect(result.current.state.messages[0].reactions).toEqual(originalReactions);
+    expect(result.current.state.actionError).toMatch(/confirmar a reação/i);
+  });
+
   it("clears a temporary reaction error instead of leaving a stale banner", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const { result } = renderHook(() =>
@@ -518,6 +559,37 @@ describe("useMessages — WS message.created integration", () => {
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
     expect(result.current.state.messages[0].bodyFormat).toBe("v3");
+  });
+
+  it("maps quoted previews from realtime payloads", async () => {
+    const payload = makePayload({
+      id: "msg-reply",
+      quoted: {
+        id: "msg-parent",
+        author_id: "user-parent",
+        body: "texto citado",
+        body_format: "v3",
+        created_at: "2024-01-15T09:00:00Z",
+      },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsEventWithPayload("channel", "ch-1", payload));
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].quoted).toEqual({
+      id: "msg-parent",
+      authorId: "user-parent",
+      bodyText: "texto citado",
+      bodyFormat: "v3",
+      isRemoved: false,
+      deletedAt: null,
+      createdAt: "2024-01-15T09:00:00Z",
+    });
   });
 
   it("renders realtime payload without sender email", async () => {
@@ -831,6 +903,67 @@ describe("useMessages — WS message.created integration", () => {
     // Message must NOT be inserted — staleRef guard fired.
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     expect(result.current.state.messages).toHaveLength(0);
+  });
+});
+
+// ── Quote reply state (RF-07) ─────────────────────────────────────────────────
+
+describe("useMessages — reply state", () => {
+  it("selectReply exposes the selected message as replyTo", async () => {
+    const msg = makeMessage({ id: "msg-reply-parent" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [msg], nextCursor: "" });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(msg));
+
+    expect(result.current.state.replyTo).toEqual(msg);
+  });
+
+  it("cancelReply clears replyTo without changing loaded messages", async () => {
+    const msg = makeMessage({ id: "msg-reply-parent" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [msg], nextCursor: "" });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(msg));
+    act(() => result.current.cancelReply());
+
+    expect(result.current.state.replyTo).toBeNull();
+    expect(result.current.state.messages).toEqual([msg]);
+  });
+
+  it("resets replyTo when switching targets", async () => {
+    const msg = makeMessage({ id: "msg-reply-parent" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [msg], nextCursor: "" });
+
+    const { result, rerender } = renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.selectReply(msg));
+    expect(result.current.state.replyTo).toEqual(msg);
+
+    mockFetchChannelMessages.mockResolvedValueOnce(emptyPage);
+    rerender({ targetId: "ch-2" });
+
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "ch-2",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(result.current.state.replyTo).toBeNull());
   });
 });
 
