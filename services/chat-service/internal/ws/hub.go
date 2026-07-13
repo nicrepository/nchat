@@ -316,6 +316,33 @@ func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, tar
 	}
 }
 
+// PublishMessageUpdated broadcasts an authorized post-commit message edit.
+func (h *Hub) PublishMessageUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID string, payload MessageUpdatedPayload) {
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageUpdated,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID: payload.MessageID, MessageUpdate: &payload,
+		EventID: uuid.New().String(), SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal message.updated event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	busEvent := evt
+	busEvent.MessageUpdate = nil
+	if err := h.bus.Publish(ctx, busEvent); err != nil {
+		h.logger.WarnContext(ctx, "ws: message update bus publish failed", "target_type", string(targetType), "error", err)
+	}
+}
+
 func (h *Hub) PublishReactionUpdated(ctx context.Context, workspaceID, actorUserID, emoji string, update ReactionUpdate) {
 	payload := &ReactionEventPayload{
 		MessageID: update.MessageID, ActorUserID: actorUserID, Emoji: emoji,
@@ -518,6 +545,7 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 	// Remote bus payloads may contain body_text or legacy sender_email. Strip
 	// them so remote nodes route by IDs only; clients fetch by ID if needed.
 	evt.Payload = nil
+	evt.MessageUpdate = nil
 
 	return evt, true
 }
@@ -536,7 +564,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageCreated, EventTypeReactionUpdated, EventTypePinUpdated:
+	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated:
 		// OK
 	default:
 		return Event{}, false

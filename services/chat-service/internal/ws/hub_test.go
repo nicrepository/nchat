@@ -607,6 +607,36 @@ func TestHub_Broadcast_MultipleSubscribers_OnlyAuthorized(t *testing.T) {
 	}
 }
 
+func TestHub_MessageUpdated_DeliveredOnlyToAuthorizedChannelMembers(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("member", "ws-1", TargetTypeChannel, "ch-1", true)
+	auth.setAccess("removed", "ws-1", TargetTypeChannel, "ch-1", true)
+	hub := newTestHub(auth)
+
+	member := newClient("member-client", "member", "ws-1", &fakeSender{})
+	removed := newClient("removed-client", "removed", "ws-1", &fakeSender{})
+	registerInHub(t, hub, member)
+	registerInHub(t, hub, removed)
+	mustSubscribe(t, hub, member, TargetTypeChannel, "ch-1")
+	mustSubscribe(t, hub, removed, TargetTypeChannel, "ch-1")
+	auth.setAccess("removed", "ws-1", TargetTypeChannel, "ch-1", false)
+
+	event := Event{
+		Type: EventTypeMessageUpdated, WorkspaceID: "ws-1", TargetType: TargetTypeChannel,
+		TargetID: "ch-1", MessageID: "msg-1",
+		MessageUpdate: &MessageUpdatedPayload{MessageID: "msg-1", ChannelID: "ch-1", Body: "edited", BodyFormat: "v1", EditCount: 1, IsEdited: true},
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal message.updated: %v", err)
+	}
+	hub.handleBroadcast(broadcastReq{event: event, data: data})
+
+	if len(member.outbox) != 1 || len(removed.outbox) != 0 {
+		t.Fatalf("message.updated delivery member=%d removed=%d", len(member.outbox), len(removed.outbox))
+	}
+}
+
 func TestHub_MalformedClientMessage_NoError(t *testing.T) {
 	inputs := [][]byte{
 		[]byte(`{invalid`),

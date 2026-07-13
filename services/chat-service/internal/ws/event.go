@@ -16,6 +16,7 @@ type EventType string
 const (
 	// EventTypeMessageCreated is emitted after a message has been persisted.
 	EventTypeMessageCreated  EventType = "message.created"
+	EventTypeMessageUpdated  EventType = "message.updated"
 	EventTypeReactionUpdated EventType = "reaction.updated"
 	// EventTypePinUpdated is emitted after a message is pinned or unpinned in a
 	// channel or DM (RF-05). Delivered to readable target subscribers only.
@@ -62,6 +63,18 @@ type MessagePayload struct {
 	EditedAt          *time.Time    `json:"edited_at,omitempty"`
 	DeletedAt         *time.Time    `json:"deleted_at,omitempty"`
 	Quoted            *QuotePayload `json:"quoted,omitempty"`
+}
+
+// MessageUpdatedPayload carries the authoritative post-edit fields.
+type MessageUpdatedPayload struct {
+	MessageID  string    `json:"message_id"`
+	ChannelID  string    `json:"channel_id,omitempty"`
+	DMID       string    `json:"dm_id,omitempty"`
+	Body       string    `json:"body"`
+	BodyFormat string    `json:"body_format"`
+	EditedAt   time.Time `json:"edited_at"`
+	EditCount  int       `json:"edit_count"`
+	IsEdited   bool      `json:"is_edited"`
 }
 
 type QuotePayload struct {
@@ -120,9 +133,10 @@ type Event struct {
 	MessageID string `json:"message_id,omitempty"`
 	// Payload carries the full message DTO for direct browser insertion.
 	// Omitted on canonicalized remote events (body_text is not re-trusted from bus).
-	Payload  *MessagePayload       `json:"payload,omitempty"`
-	Reaction *ReactionEventPayload `json:"reaction,omitempty"`
-	Pin      *PinEventPayload      `json:"pin,omitempty"`
+	Payload       *MessagePayload        `json:"payload,omitempty"`
+	MessageUpdate *MessageUpdatedPayload `json:"message_update,omitempty"`
+	Reaction      *ReactionEventPayload  `json:"reaction,omitempty"`
+	Pin           *PinEventPayload       `json:"pin,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`
