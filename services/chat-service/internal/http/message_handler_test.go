@@ -41,6 +41,10 @@ type fakeMessageProvider struct {
 	createDMErr   error
 	dmMsg         domain.Message
 	dmMsgErr      error
+	editedMsg     domain.Message
+	editErr       error
+	history       []domain.MessageEditHistory
+	historyErr    error
 
 	lastCreateChannelInput service.CreateChannelMessageInput
 	lastCreateDMInput      service.CreateDMMessageInput
@@ -50,10 +54,44 @@ type fakeMessageProvider struct {
 	lastGetDMInput         service.GetDMMessageInput
 }
 
+func (f *fakeMessageProvider) EditMessage(_ context.Context, in service.EditMessageInput) (domain.Message, error) {
+	f.editedMsg.BodyText = in.Body
+	f.editedMsg.BodyFormat = in.BodyFormat
+	return f.editedMsg, f.editErr
+}
+
+func (f *fakeMessageProvider) GetMessageEditHistory(_ context.Context, _ service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	return f.history, f.historyErr
+}
+
 type fakeMentionProvider struct {
 	out       service.SearchMentionsOutput
 	err       error
 	lastInput service.SearchMentionsInput
+}
+
+type fakeEditLimiter struct {
+	allowed bool
+	err     error
+}
+
+func (f fakeEditLimiter) AllowAction(context.Context, string, string) (bool, error) {
+	return f.allowed, f.err
+}
+
+type fakeSettingsAuthorizer struct{ allowed bool }
+
+func (f fakeSettingsAuthorizer) CanManageWorkspace(context.Context, string, string) (bool, error) {
+	return f.allowed, nil
+}
+
+type fakeWorkspaceSettingsStore struct {
+	calls int
+}
+
+func (f *fakeWorkspaceSettingsStore) UpdateEditWindow(_ context.Context, workspaceID, _ string, seconds *int) (domain.Workspace, error) {
+	f.calls++
+	return domain.Workspace{ID: workspaceID, EditWindowSeconds: seconds}, nil
 }
 
 func (f *fakeMentionProvider) SearchMentions(_ context.Context, in service.SearchMentionsInput) (service.SearchMentionsOutput, error) {
@@ -144,6 +182,81 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 		t.Fatalf("decode response body: %v", err)
 	}
 	return m
+}
+
+func TestMessageHandler_EditMessage_RejectsMassAssignmentFields(t *testing.T) {
+	messages := &fakeMessageProvider{}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages).
+		WithEditing(nil, nil, fakeEditLimiter{allowed: true})
+	request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID,
+		strings.NewReader(`{"body":"edited","body_format":"v1","author_id":"spoof","created_at":"2020-01-01T00:00:00Z"}`))
+	request.SetPathValue("messageID", testMessageID)
+	recorder := httptest.NewRecorder()
+
+	handler.EditMessage(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for extra fields, got %d", recorder.Code)
+	}
+}
+
+func TestMessageHandler_EditMessage_MapsNonAuthorToForbidden(t *testing.T) {
+	messages := &fakeMessageProvider{editErr: domain.ErrEditForbidden}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages).
+		WithEditing(nil, nil, fakeEditLimiter{allowed: true})
+	request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID,
+		strings.NewReader(`{"body":"edited","body_format":"v1"}`))
+	request.SetPathValue("messageID", testMessageID)
+	recorder := httptest.NewRecorder()
+
+	handler.EditMessage(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", recorder.Code)
+	}
+}
+
+func TestMessageHandler_UpdateWorkspaceEditWindow_RequiresAdmin(t *testing.T) {
+	settings := &fakeWorkspaceSettingsStore{}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}).
+		WithEditing(settings, fakeSettingsAuthorizer{allowed: false}, fakeEditLimiter{allowed: true})
+	request := requestWithUser(http.MethodPatch, "/api/v1/workspaces/"+testWorkspaceID+"/settings",
+		strings.NewReader(`{"edit_window_seconds":900}`))
+	request.SetPathValue("workspaceID", testWorkspaceID)
+	recorder := httptest.NewRecorder()
+
+	handler.UpdateWorkspaceEditWindow(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", recorder.Code)
+	}
+	if settings.calls != 0 {
+		t.Fatalf("unauthorized settings update reached storage %d times", settings.calls)
+	}
+}
+
+func TestMessageHandler_UpdateWorkspaceEditWindow_ValidatesBoundsAndAllowsNull(t *testing.T) {
+	settings := &fakeWorkspaceSettingsStore{}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}).
+		WithEditing(settings, fakeSettingsAuthorizer{allowed: true}, fakeEditLimiter{allowed: true})
+
+	invalid := requestWithUser(http.MethodPatch, "/api/v1/workspaces/"+testWorkspaceID+"/settings",
+		strings.NewReader(`{"edit_window_seconds":29}`))
+	invalid.SetPathValue("workspaceID", testWorkspaceID)
+	invalidRecorder := httptest.NewRecorder()
+	handler.UpdateWorkspaceEditWindow(invalidRecorder, invalid)
+	if invalidRecorder.Code != http.StatusBadRequest || settings.calls != 0 {
+		t.Fatalf("invalid bound status=%d storage calls=%d", invalidRecorder.Code, settings.calls)
+	}
+
+	unlimited := requestWithUser(http.MethodPatch, "/api/v1/workspaces/"+testWorkspaceID+"/settings",
+		strings.NewReader(`{"edit_window_seconds":null}`))
+	unlimited.SetPathValue("workspaceID", testWorkspaceID)
+	unlimitedRecorder := httptest.NewRecorder()
+	handler.UpdateWorkspaceEditWindow(unlimitedRecorder, unlimited)
+	if unlimitedRecorder.Code != http.StatusOK || settings.calls != 1 {
+		t.Fatalf("null window status=%d storage calls=%d", unlimitedRecorder.Code, settings.calls)
+	}
 }
 
 func TestMessageHandler_ListAllowedReactionEmojis(t *testing.T) {

@@ -100,6 +100,16 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
 	))
 
+	// RF-13 message editing/history and workspace edit-window configuration.
+	// The edit handler applies the shared Valkey Lua limiter before touching DB.
+	mux.Handle("PATCH "+RouteMessageEdit, authMiddleware(http.HandlerFunc(messages.EditMessage)))
+	mux.Handle("GET "+RouteMessageEditHistory, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageEditHistory)),
+	))
+	mux.Handle("PATCH "+RouteWorkspaceSettings, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceEditWindow)),
+	))
+
 	// Favorite endpoints (RF-06): per-user private bookmarks. The list endpoint
 	// only ever returns the authenticated caller's own favorites. Writes share
 	// msgPostLimiter so favoriting cannot exceed the general write quota.
