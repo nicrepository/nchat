@@ -14,7 +14,7 @@ import (
 // ponytail: INCR+conditional EXPIRE has no atomic native equivalent in
 // valkey-go (or Redis) short of Lua — two round trips would race between the
 // INCR and the EXPIRE. Reviewed for v2; kept as is, no simpler swap available.
-var reactionRateScript = valkey.NewLuaScript(`
+var actionRateScript = valkey.NewLuaScript(`
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
 return count`)
@@ -44,9 +44,14 @@ func NewValkeyReactionLimiter(valkeyURL string, maxActions, windowSeconds int) (
 }
 
 func (l *ValkeyReactionLimiter) Allow(ctx context.Context, userID string) (bool, error) {
+	return l.AllowAction(ctx, userID, "reaction")
+}
+
+// AllowAction applies the shared Lua fixed-window limiter to a named user action.
+func (l *ValkeyReactionLimiter) AllowAction(ctx context.Context, userID, action string) (bool, error) {
 	sum := sha256.Sum256([]byte(userID))
-	key := "nchat:chat:action:reaction:" + hex.EncodeToString(sum[:])
-	count, err := reactionRateScript.Exec(ctx, l.client, []string{key}, []string{strconv.Itoa(l.windowSeconds)}).AsInt64()
+	key := "nchat:chat:action:" + action + ":" + hex.EncodeToString(sum[:])
+	count, err := actionRateScript.Exec(ctx, l.client, []string{key}, []string{strconv.Itoa(l.windowSeconds)}).AsInt64()
 	if err != nil {
 		return false, err
 	}

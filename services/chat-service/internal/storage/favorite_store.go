@@ -174,7 +174,7 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 			&msg.SenderID,
 			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
 			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-			&editedAt, &deletedAt,
+			&editedAt, &msg.EditCount, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
 			&msg.SenderDisplayName, &msg.SenderEmail,
 			&msg.IsFavorited,

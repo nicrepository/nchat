@@ -143,3 +143,56 @@ func TestPGXWorkspaceStore_GetWorkspaceByID_DBError(t *testing.T) {
 		t.Fatalf("expected database error, got %v", err)
 	}
 }
+
+func TestPGXWorkspaceStore_UpdateEditWindow_HasAtomicAdminBackstop(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	now := time.Now()
+	window := 900
+	mock.ExpectQuery(`(?s)UPDATE chat\.workspaces.*chat\.workspace_members.*wm\.role IN \('owner', 'admin'\)`).
+		WithArgs("ws-1", "admin-1", &window).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "slug", "name", "status", "edit_window_seconds", "created_at", "updated_at"}).
+			AddRow("ws-1", "default", "NChat", "active", &window, now, now))
+
+	workspace, err := storage.NewPGXWorkspaceStore(mock).UpdateEditWindow(context.Background(), "ws-1", "admin-1", &window)
+	if err != nil || workspace.EditWindowSeconds == nil || *workspace.EditWindowSeconds != window {
+		t.Fatalf("UpdateEditWindow() = %+v, %v", workspace, err)
+	}
+}
+
+func TestPGXWorkspaceStore_UpdateEditWindow_UnauthorizedIsForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`UPDATE chat\.workspaces`).
+		WithArgs("ws-1", "member-1", (*int)(nil)).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "slug", "name", "status", "edit_window_seconds", "created_at", "updated_at"}))
+
+	_, err = storage.NewPGXWorkspaceStore(mock).UpdateEditWindow(context.Background(), "ws-1", "member-1", nil)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func TestPGXWorkspaceStore_UpdateEditWindow_NullDisablesWindow(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	now := time.Now()
+	mock.ExpectQuery(`UPDATE chat\.workspaces`).
+		WithArgs("ws-1", "admin-1", (*int)(nil)).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "slug", "name", "status", "edit_window_seconds", "created_at", "updated_at"}).
+			AddRow("ws-1", "default", "NChat", "active", nil, now, now))
+
+	workspace, err := storage.NewPGXWorkspaceStore(mock).UpdateEditWindow(context.Background(), "ws-1", "admin-1", nil)
+	if err != nil || workspace.EditWindowSeconds != nil {
+		t.Fatalf("UpdateEditWindow(nil) = %+v, %v", workspace, err)
+	}
+}

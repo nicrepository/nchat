@@ -83,6 +83,24 @@ type CreateMessageInput struct {
 	MentionedChannelIDs    []string
 }
 
+// EditMessageInput contains only server-derived identity and validated body fields.
+type EditMessageInput struct {
+	WorkspaceID string
+	MessageID   string
+	EditorID    string
+	Body        string
+	BodyFormat  domain.MessageBodyFormat
+}
+
+// ListMessageEditHistoryInput identifies one authorized history page.
+type ListMessageEditHistoryInput struct {
+	WorkspaceID string
+	MessageID   string
+	UserID      string
+	Limit       int
+	Offset      int
+}
+
 // ListChannelMessagesInput identifies the paged message list for a channel.
 type ListChannelMessagesInput struct {
 	WorkspaceID string
@@ -119,6 +137,8 @@ type MessageStore interface {
 	// same target as the new message. This is a non-enumerating storage backstop:
 	// callers cannot determine whether the referenced message exists.
 	CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error)
+	EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error)
+	ListMessageEditHistory(ctx context.Context, input ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
 
 	// GetMessageByIDInWorkspace returns the message only if it belongs to workspaceID.
 	// Returns ErrNotFound when the message does not exist or belongs to a different
@@ -180,7 +200,7 @@ func messageColumns(alias string) string {
 	COALESCE(` + p + `parent_message_id::text, ''),
 	COALESCE(` + p + `forwarded_from_message_id::text, ''),
 	COALESCE(` + p + `referenced_message_id::text, ''),
-	` + p + `edited_at, ` + p + `deleted_at,
+	` + p + `edited_at, ` + p + `edit_count, ` + p + `deleted_at,
 	` + p + `created_at, ` + p + `updated_at`
 }
 
@@ -238,7 +258,7 @@ func scanMessageWithSenderAndQuote(row pgx.Row) (domain.Message, error) {
 		&msg.SenderID,
 		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
 		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-		&editedAt, &deletedAt,
+		&editedAt, &msg.EditCount, &deletedAt,
 		&msg.CreatedAt, &msg.UpdatedAt,
 		&msg.SenderDisplayName, &msg.SenderEmail,
 		&msg.IsFavorited,
@@ -419,7 +439,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
-			          edited_at, deleted_at, created_at, updated_at
+			          edited_at, edit_count, deleted_at, created_at, updated_at
 		),
 		mention_outbox AS (
 			INSERT INTO chat.notification_outbox
@@ -457,6 +477,131 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
 	}
 	return msg, nil
+}
+
+// EditMessage atomically snapshots the current body and replaces it after
+// server-side access, author, deletion, and edit-window validation.
+func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("begin message edit: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var current domain.Message
+	var deletedAt *time.Time
+	var editWindowSeconds *int
+	var databaseNow time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT m.sender_id::text, m.status, m.deleted_at, m.created_at,
+		       w.edit_window_seconds, clock_timestamp()
+		FROM chat.messages m`+messageAccessJoins("$3")+`
+		WHERE m.workspace_id = $1 AND m.id = $2
+		  AND `+messageAccessPredicate+`
+		FOR UPDATE OF m`,
+		input.WorkspaceID, input.MessageID, input.EditorID,
+	).Scan(&current.SenderID, (*string)(&current.Status), &deletedAt, &current.CreatedAt, &editWindowSeconds, &databaseNow)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, domain.ErrNotFound
+		}
+		return domain.Message{}, fmt.Errorf("lock editable message: %w", err)
+	}
+	if deletedAt != nil {
+		current.DeletedAt = *deletedAt
+	}
+	if err := domain.ValidateMessageEdit(current, input.EditorID, editWindowSeconds, databaseNow); err != nil {
+		return domain.Message{}, err
+	}
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO chat.message_edit_history (message_id, body, body_format, editor_user_id, versioned_at)
+		SELECT id, body_text, body_format, $2, $3
+		FROM chat.messages
+		WHERE id = $1`, input.MessageID, input.EditorID, databaseNow)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("snapshot message edit: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.Message{}, domain.ErrNotFound
+	}
+
+	row := tx.QueryRow(ctx, `
+		WITH updated AS (
+			UPDATE chat.messages
+			SET body_text = $2, body_format = $3, edited_at = $5,
+			    edit_count = edit_count + 1, updated_at = $5
+			WHERE id = $1
+			RETURNING *
+		)
+		SELECT `+listMessageWithQuoteColumns("m", "$4", "q")+`
+		FROM updated m
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
+		input.MessageID, input.Body, string(input.BodyFormat), input.EditorID, databaseNow,
+	)
+	updated, err := scanMessageWithSenderAndQuote(row)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("update message body: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Message{}, fmt.Errorf("commit message edit: %w", err)
+	}
+	return updated, nil
+}
+
+func (s *PGXMessageStore) ListMessageEditHistory(ctx context.Context, input ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	limit := resolveLimit(input.Limit)
+	offset := max(input.Offset, 0)
+	rows, err := s.pool.Query(ctx, `
+		WITH authorized AS (
+			SELECT m.id
+			FROM chat.messages m`+messageAccessJoins("$3")+`
+			WHERE m.workspace_id = $1 AND m.id = $2
+			  AND `+messageAccessPredicate+`
+		)
+		SELECT COALESCE(h.id::text, ''), COALESCE(h.message_id::text, ''),
+		       COALESCE(h.body, ''), COALESCE(h.body_format, ''),
+		       COALESCE(h.editor_user_id::text, ''), h.versioned_at
+		FROM authorized a
+		LEFT JOIN LATERAL (
+			SELECT id, message_id, body, body_format, editor_user_id, versioned_at
+			FROM chat.message_edit_history
+			WHERE message_id = a.id
+			ORDER BY versioned_at DESC, id DESC
+			LIMIT $4 OFFSET $5
+		) h ON true
+		ORDER BY h.versioned_at DESC NULLS LAST, h.id DESC`,
+		input.WorkspaceID, input.MessageID, input.UserID, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list message edit history: %w", err)
+	}
+	defer rows.Close()
+
+	found := false
+	history := make([]domain.MessageEditHistory, 0, limit)
+	for rows.Next() {
+		found = true
+		var version domain.MessageEditHistory
+		var versionedAt *time.Time
+		if err := rows.Scan(
+			&version.ID, &version.MessageID, &version.Body, (*string)(&version.BodyFormat),
+			&version.EditorUserID, &versionedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan message edit history: %w", err)
+		}
+		if version.ID != "" {
+			version.VersionedAt = *versionedAt
+			history = append(history, version)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate message edit history: %w", err)
+	}
+	if !found {
+		return nil, domain.ErrNotFound
+	}
+	return history, nil
 }
 
 func (s *PGXMessageStore) ResolveMentionLabels(ctx context.Context, workspaceID string, userIDs, channelIDs []string) (map[string]string, error) {
@@ -569,9 +714,10 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 	// contract: sender display info, favorite flag, and optional quote preview.
 	row := s.pool.QueryRow(ctx, `
 		SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
-		FROM chat.messages m
+		FROM chat.messages m`+messageAccessJoins("$3")+`
 		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
-		WHERE m.id = $1 AND m.workspace_id = $2`,
+		WHERE m.id = $1 AND m.workspace_id = $2
+		  AND `+messageAccessPredicate,
 		messageID, workspaceID, userID,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
@@ -824,7 +970,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&msg.SenderID,
 			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
 			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-			&editedAt, &deletedAt,
+			&editedAt, &msg.EditCount, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
 		}
 		if withSender {

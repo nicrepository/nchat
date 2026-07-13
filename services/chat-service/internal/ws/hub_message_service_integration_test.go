@@ -88,6 +88,14 @@ type integMessageStore struct {
 	created []domain.Message
 }
 
+func (s *integMessageStore) EditMessage(_ context.Context, in storage.EditMessageInput) (domain.Message, error) {
+	return domain.Message{ID: in.MessageID, WorkspaceID: in.WorkspaceID, SenderID: in.EditorID, BodyText: in.Body, BodyFormat: in.BodyFormat}, nil
+}
+
+func (s *integMessageStore) ListMessageEditHistory(context.Context, storage.ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	return nil, nil
+}
+
 func (s *integMessageStore) ResolveMentionLabels(_ context.Context, _ string, _, _ []string) (map[string]string, error) {
 	return map[string]string{}, nil
 }

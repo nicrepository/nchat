@@ -160,6 +160,32 @@ func TestPermissionService_CanWrite_MatchesCanRead(t *testing.T) {
 	}
 }
 
+func TestPermissionService_CanManageWorkspace_OnlyActiveOwnerOrAdmin(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		role   domain.WorkspaceRole
+		status domain.MemberStatus
+		want   bool
+	}{
+		{name: "owner", role: domain.WorkspaceRoleOwner, status: domain.MemberStatusActive, want: true},
+		{name: "admin", role: domain.WorkspaceRoleAdmin, status: domain.MemberStatusActive, want: true},
+		{name: "member", role: domain.WorkspaceRoleMember, status: domain.MemberStatusActive},
+		{name: "suspended admin", role: domain.WorkspaceRoleAdmin, status: domain.MemberStatusSuspended},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			members := newFakeMemberStore()
+			members.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "user-1", Role: tt.role, Status: tt.status,
+			}
+			got, err := service.NewPermissionService(members, &fakeChannelStore{}).
+				CanManageWorkspace(context.Background(), "ws-1", "user-1")
+			if err != nil || got != tt.want {
+				t.Fatalf("CanManageWorkspace() = %v, %v; want %v", got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestPermissionService_ListVisibleChannels_UsesSQLVisibilityFiltering(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")

@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	valkey "github.com/valkey-io/valkey-go"
 )
 
 // ── fakePubSub — in-process pub-sub for ValkeyBus unit tests ──────────────────
@@ -23,6 +26,30 @@ type fakePubSub struct {
 	handlers    []func(channel, payload string)
 	closeCalled bool
 }
+
+type fakeValkeyClient struct {
+	valkey.Client
+	doCommand      []string
+	receiveCommand []string
+	receiveMessage valkey.PubSubMessage
+	receiveErr     error
+	closeCalled    bool
+}
+
+func (*fakeValkeyClient) B() valkey.Builder { return valkey.Builder{} }
+
+func (f *fakeValkeyClient) Do(_ context.Context, command valkey.Completed) valkey.ValkeyResult {
+	f.doCommand = append([]string(nil), command.Commands()...)
+	return valkey.ValkeyResult{}
+}
+
+func (f *fakeValkeyClient) Receive(_ context.Context, command valkey.Completed, handler func(valkey.PubSubMessage)) error {
+	f.receiveCommand = append([]string(nil), command.Commands()...)
+	handler(f.receiveMessage)
+	return f.receiveErr
+}
+
+func (f *fakeValkeyClient) Close() { f.closeCalled = true }
 
 func (f *fakePubSub) Publish(_ context.Context, channel, payload string) error {
 	f.mu.Lock()
@@ -115,6 +142,41 @@ func TestValkeyBus_Publish_SerializesEventToJSON(t *testing.T) {
 	}
 	if decoded.MessageID != testMessageID {
 		t.Errorf("decoded MessageID = %q, want %q", decoded.MessageID, testMessageID)
+	}
+}
+
+func TestValkeyPubSub_DelegatesPublishSubscribeAndClose(t *testing.T) {
+	wantReceiveErr := errors.New("subscription ended")
+	client := &fakeValkeyClient{
+		receiveMessage: valkey.PubSubMessage{Channel: "events", Message: "payload"},
+		receiveErr:     wantReceiveErr,
+	}
+	adapter := &valkeyPubSub{client: client}
+
+	if err := adapter.Publish(context.Background(), "events", "payload"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if want := []string{"PUBLISH", "events", "payload"}; !slices.Equal(client.doCommand, want) {
+		t.Fatalf("publish command = %#v, want %#v", client.doCommand, want)
+	}
+
+	var channel, payload string
+	err := adapter.PSubscribe(context.Background(), "events:*", func(gotChannel, gotPayload string) {
+		channel, payload = gotChannel, gotPayload
+	})
+	if !errors.Is(err, wantReceiveErr) {
+		t.Fatalf("PSubscribe error = %v, want %v", err, wantReceiveErr)
+	}
+	if want := []string{"PSUBSCRIBE", "events:*"}; !slices.Equal(client.receiveCommand, want) {
+		t.Fatalf("psubscribe command = %#v, want %#v", client.receiveCommand, want)
+	}
+	if channel != "events" || payload != "payload" {
+		t.Fatalf("handler received channel=%q payload=%q", channel, payload)
+	}
+
+	adapter.Close()
+	if !client.closeCalled {
+		t.Fatal("Close did not close the Valkey client")
 	}
 }
 

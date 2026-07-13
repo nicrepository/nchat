@@ -88,6 +88,7 @@ func New(cfg config.Config) *App {
 	var reactionSvc *service.ReactionService
 	var favoriteSvc *service.FavoriteService
 	var pinSvc *service.PinService
+	var permissionSvc *service.PermissionService
 
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
@@ -105,12 +106,13 @@ func New(cfg config.Config) *App {
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
+			permissionSvc = service.NewPermissionService(memberStore, channelStore)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
 			mentionSvc = service.NewMentionService(
 				service.NewMemberService(memberStore, channelStore, workspaceStore),
-				service.NewPermissionService(memberStore, channelStore),
+				permissionSvc,
 			)
 		}
 	}
@@ -131,8 +133,7 @@ func New(cfg config.Config) *App {
 	var authorizer ws.SubscriptionAuthorizer = ws.NopAuthorizer{}
 	var wsWorkspaces ws.WorkspaceResolver
 	if workspaceStore != nil {
-		permSvc := service.NewPermissionService(memberStore, channelStore)
-		authorizer = ws.NewServiceAuthorizer(permSvc, dmStore)
+		authorizer = ws.NewServiceAuthorizer(permissionSvc, dmStore)
 		wsWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 	}
 	var bus ws.BroadcastBus = ws.NopBus{}
@@ -154,6 +155,9 @@ func New(cfg config.Config) *App {
 			reactionLimiter = limiter
 			options = append(options, ws.WithReactionHandler(&reactionHandlerAdapter{service: reactionSvc}), ws.WithReactionLimiter(limiter))
 		}
+	}
+	if workspaceStore != nil {
+		messageHandler = messageHandler.WithEditing(workspaceStore, permissionSvc, reactionLimiter)
 	}
 	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
@@ -257,6 +261,14 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
 	payload := domainMessageToWSPayload(msg)
 	b.hub.PublishMessageCreated(ctx, workspaceID, ws.TargetType(targetType), targetID, payload)
+}
+
+func (b *hubBroadcaster) PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
+	b.hub.PublishMessageUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, ws.MessageUpdatedPayload{
+		MessageID: msg.ID, ChannelID: msg.ChannelID, DMID: msg.DMConversationID,
+		Body: msg.BodyText, BodyFormat: string(msg.BodyFormat), EditedAt: msg.EditedAt,
+		EditCount: msg.EditCount, IsEdited: true,
+	})
 }
 
 // PublishPinUpdated adapts the hub for the RF-05 pin broadcaster interface.

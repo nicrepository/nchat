@@ -15,8 +15,21 @@ import (
 // ── fakePublisher ─────────────────────────────────────────────────────────────
 
 type fakePublisher struct {
-	mu    sync.Mutex
-	calls []publishCall
+	mu      sync.Mutex
+	calls   []publishCall
+	updates []publishCall
+}
+
+func (p *fakePublisher) PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.updates = append(p.updates, publishCall{workspaceID: workspaceID, targetType: targetType, targetID: targetID, msg: msg, ctxErrAtCall: ctx.Err()})
+}
+
+func (p *fakePublisher) updateCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.updates)
 }
 
 type publishCall struct {
@@ -65,6 +78,33 @@ func waitForPublishCalls(t *testing.T, pub *fakePublisher, want int) []publishCa
 	}
 	t.Fatalf("expected %d publish calls, got %d", want, pub.count())
 	return nil
+}
+
+func TestMessageService_EditMessage_BroadcastsUpdatedAfterPersist(t *testing.T) {
+	store := &fakeMessageStore{
+		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, Status: domain.MessageStatusActive,
+		}},
+		editedMessage: domain.Message{
+			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			Status: domain.MessageStatusActive, BodyText: "edited", BodyFormat: domain.MessageBodyFormatV1, EditCount: 1,
+		},
+	}
+	publisher := &fakePublisher{}
+	serviceUnderTest := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store)
+	serviceUnderTest.SetPublisher(publisher)
+	if _, err := serviceUnderTest.EditMessage(context.Background(), service.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1, Body: "edited", BodyFormat: domain.MessageBodyFormatV1,
+	}); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for publisher.updateCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if publisher.updateCount() != 1 {
+		t.Fatalf("expected one message.updated publish, got %d", publisher.updateCount())
+	}
 }
 
 type blockingPublisher struct {

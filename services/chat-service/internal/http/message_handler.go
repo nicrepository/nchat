@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -35,6 +36,16 @@ type messageProvider interface {
 	ListDMMessages(ctx context.Context, in service.ListDMMessagesInput) (service.ListDMMessagesOutput, error)
 	CreateDMMessage(ctx context.Context, in service.CreateDMMessageInput) (domain.Message, error)
 	GetDMMessage(ctx context.Context, in service.GetDMMessageInput) (domain.Message, error)
+	EditMessage(ctx context.Context, in service.EditMessageInput) (domain.Message, error)
+	GetMessageEditHistory(ctx context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
+}
+
+type editRateLimiter interface {
+	AllowAction(ctx context.Context, userID, action string) (bool, error)
+}
+
+type workspaceSettingsAuthorizer interface {
+	CanManageWorkspace(ctx context.Context, workspaceID, userID string) (bool, error)
 }
 
 type mentionProvider interface {
@@ -49,6 +60,15 @@ type MessageHandler struct {
 	favorites      favoriteProvider
 	pins           pinProvider
 	pinBroadcaster pinBroadcaster
+	settings       storage.WorkspaceSettingsStore
+	settingsAuth   workspaceSettingsAuthorizer
+	editLimiter    editRateLimiter
+}
+
+// WithEditing enables message editing/history and workspace edit-window settings.
+func (h *MessageHandler) WithEditing(settings storage.WorkspaceSettingsStore, auth workspaceSettingsAuthorizer, limiter editRateLimiter) *MessageHandler {
+	h.settings, h.settingsAuth, h.editLimiter = settings, auth, limiter
+	return h
 }
 
 // WithFavorites enables the RF-06 favorite endpoints. Returns the handler for
@@ -89,6 +109,9 @@ type messageJSON struct {
 	Status            string         `json:"status"`
 	CreatedAt         time.Time      `json:"created_at"`
 	UpdatedAt         time.Time      `json:"updated_at"`
+	EditedAt          *time.Time     `json:"edited_at,omitempty"`
+	EditCount         int            `json:"edit_count"`
+	IsEdited          bool           `json:"is_edited"`
 	Reactions         []reactionJSON `json:"reactions"`
 	IsFavorited       bool           `json:"is_favorited,omitempty"`
 	Quoted            *quoteJSON     `json:"quoted,omitempty"`
@@ -138,6 +161,24 @@ type createMessageRequest struct {
 	BodyText        string `json:"body_text"`
 	BodyFormat      string `json:"body_format"`
 	ParentMessageID string `json:"parent_message_id"`
+}
+
+type editMessageRequest struct {
+	Body       string `json:"body"`
+	BodyFormat string `json:"body_format"`
+}
+
+type editHistoryJSON struct {
+	ID           string    `json:"id"`
+	MessageID    string    `json:"message_id"`
+	Body         string    `json:"body"`
+	BodyFormat   string    `json:"body_format"`
+	EditorUserID string    `json:"editor_user_id"`
+	VersionedAt  time.Time `json:"versioned_at"`
+}
+
+type updateEditWindowRequest struct {
+	EditWindowSeconds json.RawMessage `json:"edit_window_seconds"`
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -200,6 +241,10 @@ func parseLimitParam(r *http.Request) int {
 // mapToMessageJSON converts a domain.Message to its JSON representation.
 // For deleted messages, body_text is withheld and is_removed is set.
 func mapToMessageJSON(m domain.Message) messageJSON {
+	var editedAt *time.Time
+	if !m.EditedAt.IsZero() {
+		editedAt = &m.EditedAt
+	}
 	j := messageJSON{
 		ID:                m.ID,
 		SenderID:          m.SenderID,
@@ -210,6 +255,9 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		Status:            string(m.Status),
 		CreatedAt:         m.CreatedAt,
 		UpdatedAt:         m.UpdatedAt,
+		EditedAt:          editedAt,
+		EditCount:         m.EditCount,
+		IsEdited:          m.EditCount > 0,
 		Reactions:         make([]reactionJSON, len(m.Reactions)),
 		IsFavorited:       m.IsFavorited,
 		Quoted:            mapQuoteJSON(m.Quoted),
@@ -265,15 +313,167 @@ func (h *MessageHandler) ListAllowedReactionEmojis(w http.ResponseWriter, _ *htt
 // decodeCreateRequest reads and decodes the request body into a createMessageRequest.
 // Rejects unknown fields. Returns false and writes 400 on any parse error.
 func decodeCreateRequest(w http.ResponseWriter, r *http.Request) (createMessageRequest, bool) {
+	var req createMessageRequest
+	return req, decodeStrictJSON(w, r, &req)
+}
+
+func decodeStrictJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	var req createMessageRequest
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(dst); err != nil {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request body")
-		return createMessageRequest{}, false
+		return false
 	}
-	return req, true
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request body")
+		return false
+	}
+	return true
+}
+
+// EditMessage handles PATCH /api/v1/messages/{messageID}.
+func (h *MessageHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	messageID := r.PathValue("messageID")
+	if !validateTargetID(w, messageID, "message_id") {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	if h.editLimiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "message editing not available")
+		return
+	}
+	allowed, err := h.editLimiter.AllowAction(r.Context(), userID, "edit_message")
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "message editing not available")
+		return
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", "60")
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return
+	}
+	var req editMessageRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	message, err := h.messages.EditMessage(r.Context(), service.EditMessageInput{
+		WorkspaceID: workspaceID, MessageID: messageID, EditorID: userID,
+		Body: req.Body, BodyFormat: domain.MessageBodyFormat(req.BodyFormat),
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, mapToMessageJSON(message))
+}
+
+// GetMessageEditHistory handles GET /api/v1/messages/{messageID}/history.
+func (h *MessageHandler) GetMessageEditHistory(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	messageID := r.PathValue("messageID")
+	if !validateTargetID(w, messageID, "message_id") {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		var err error
+		offset, err = strconv.Atoi(raw)
+		if err != nil || offset < 0 || offset > 10_000 {
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid offset")
+			return
+		}
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	history, err := h.messages.GetMessageEditHistory(r.Context(), service.GetMessageEditHistoryInput{
+		WorkspaceID: workspaceID, MessageID: messageID, CallerID: userID,
+		Limit: parseLimitParam(r), Offset: offset,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	out := make([]editHistoryJSON, len(history))
+	for i, version := range history {
+		out[i] = editHistoryJSON{
+			ID: version.ID, MessageID: version.MessageID, Body: version.Body,
+			BodyFormat: string(version.BodyFormat), EditorUserID: version.EditorUserID,
+			VersionedAt: version.VersionedAt,
+		}
+	}
+	httputil.WriteJSON(w, http.StatusOK, map[string]any{"history": out, "offset": offset})
+}
+
+// UpdateWorkspaceEditWindow handles PATCH /api/v1/workspaces/{workspaceID}/settings.
+func (h *MessageHandler) UpdateWorkspaceEditWindow(w http.ResponseWriter, r *http.Request) {
+	if h.settings == nil || h.settingsAuth == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "workspace settings not available")
+		return
+	}
+	workspaceID := r.PathValue("workspaceID")
+	if !validateTargetID(w, workspaceID, "workspace_id") {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var req updateEditWindowRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	if req.EditWindowSeconds == nil {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request body")
+		return
+	}
+	var seconds *int
+	if string(req.EditWindowSeconds) != "null" {
+		var value int
+		if err := json.Unmarshal(req.EditWindowSeconds, &value); err != nil || value < 30 || value > 86400 {
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid edit_window_seconds")
+			return
+		}
+		seconds = &value
+	}
+	allowed, err := h.settingsAuth.CanManageWorkspace(r.Context(), workspaceID, userID)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	if !allowed {
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+		return
+	}
+	workspace, err := h.settings.UpdateEditWindow(r.Context(), workspaceID, userID, seconds)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, map[string]any{
+		"workspace_id": workspace.ID, "edit_window_seconds": workspace.EditWindowSeconds,
+	})
 }
 
 // ── Channel endpoints ─────────────────────────────────────────────────────────
@@ -637,6 +837,10 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrEditForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "message edit forbidden")
+	case errors.Is(err, domain.ErrEditWindowExpired):
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "message edit window expired")
 	case errors.Is(err, domain.ErrPinLimitReached):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "pin limit reached")
 	default:

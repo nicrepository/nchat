@@ -76,12 +76,13 @@ const (
 
 // Workspace represents a single team/organisation space.
 type Workspace struct {
-	ID        string
-	Slug      string
-	Name      string
-	Status    WorkspaceStatus
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                string
+	Slug              string
+	Name              string
+	Status            WorkspaceStatus
+	EditWindowSeconds *int
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // ChannelCategory is an organisational folder for channels within a workspace.

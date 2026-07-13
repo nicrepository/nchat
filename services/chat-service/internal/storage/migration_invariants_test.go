@@ -347,3 +347,32 @@ func TestChatMigration_AddsMessageFavoritesWithRollback(t *testing.T) {
 		t.Fatal("favorites rollback must only drop message_favorites")
 	}
 }
+
+func TestChatMigration_AddsMessageEditHistoryWithRollback(t *testing.T) {
+	up := readChatMigration(t, "000013_message_edit_history.up.sql")
+	for _, expected := range []string{
+		"ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+		"ADD COLUMN edit_window_seconds INTEGER NULL DEFAULT 900",
+		"CREATE TABLE chat.message_edit_history",
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+		"REFERENCES auth.users (id)",
+		"ON chat.message_edit_history (message_id, versioned_at DESC)",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Fatalf("edit-history migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000013_message_edit_history.down.sql")
+	for _, expected := range []string{
+		"DROP TABLE IF EXISTS chat.message_edit_history",
+		"DROP COLUMN IF EXISTS edit_window_seconds",
+		"DROP COLUMN IF EXISTS edit_count",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("edit-history rollback missing %q", expected)
+		}
+	}
+	if strings.Contains(down, "DROP COLUMN IF EXISTS edited_at") {
+		t.Fatal("000013 rollback must preserve edited_at owned by 000004")
+	}
+}

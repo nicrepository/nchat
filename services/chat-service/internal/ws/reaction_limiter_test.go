@@ -148,3 +148,15 @@ func TestValkeyReactionLimiterPropagatesValkeyFailure(t *testing.T) {
 		t.Fatalf("expected Valkey error, allowed=%v err=%v", allowed, err)
 	}
 }
+
+func TestValkeyReactionLimiterScopesEditMessageActionWithoutExposingUserID(t *testing.T) {
+	server := &reactionLimiterValkey{}
+	limiter := newTestReactionLimiter(t, server, 2, 60)
+	allowed, err := limiter.AllowAction(t.Context(), "sensitive-user-id", "edit_message")
+	if err != nil || !allowed {
+		t.Fatalf("edit action: allowed=%v err=%v", allowed, err)
+	}
+	if !strings.Contains(server.key, ":edit_message:") || strings.Contains(server.key, "sensitive-user-id") {
+		t.Fatalf("unexpected edit rate-limit key: %q", server.key)
+	}
+}
