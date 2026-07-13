@@ -59,6 +59,7 @@ type fakeMessageStore struct {
 	historyErr              error
 
 	lastCreateInput        storage.CreateMessageInput
+	lastHistoryInput       storage.ListMessageEditHistoryInput
 	createCalls            int
 	listChannelCalls       int
 	listDMCalls            int
@@ -76,7 +77,8 @@ func (f *fakeMessageStore) EditMessage(_ context.Context, input storage.EditMess
 	return domain.Message{ID: input.MessageID, WorkspaceID: input.WorkspaceID, SenderID: input.EditorID, BodyText: input.Body, BodyFormat: input.BodyFormat}, nil
 }
 
-func (f *fakeMessageStore) ListMessageEditHistory(_ context.Context, _ storage.ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+func (f *fakeMessageStore) ListMessageEditHistory(_ context.Context, input storage.ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	f.lastHistoryInput = input
 	return f.editHistory, f.historyErr
 }
 
@@ -102,6 +104,135 @@ func TestMessageService_EditMessage_PropagatesEditForbiddenFromStorage(t *testin
 				t.Fatalf("expected ErrEditForbidden, got %v", err)
 			}
 		})
+	}
+}
+
+func TestMessageService_EditMessage_RewritesAddedMention(t *testing.T) {
+	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
+	store := &fakeMessageStore{
+		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		}},
+		authorizedMentionLabels: map[string]string{"user:" + mentionedUserID: "Alice"},
+	}
+
+	message, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).EditMessage(
+		context.Background(), service.EditMessageInput{
+			WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+			Body: `@[Spoofed](mention:user:` + mentionedUserID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		})
+	if err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	want := `@[Alice](mention:user:` + mentionedUserID + `)`
+	if message.BodyText != want {
+		t.Fatalf("edited body = %q, want %q", message.BodyText, want)
+	}
+}
+
+func TestMessageService_EditMessage_RemovesExistingMention(t *testing.T) {
+	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
+	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+		ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		BodyText: `@[Alice](mention:user:` + mentionedUserID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+	}}}
+
+	message, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).EditMessage(
+		context.Background(), service.EditMessageInput{
+			WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+			Body: "mention removed", BodyFormat: domain.MessageBodyFormatV3,
+		})
+	if err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if message.BodyText != "mention removed" {
+		t.Fatalf("unexpected edited message: %+v", message)
+	}
+}
+
+func TestMessageService_EditMessage_RejectsUnauthorizedMention(t *testing.T) {
+	const mentionedUserID = "99999999-9999-9999-9999-999999999999"
+	store := &fakeMessageStore{
+		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		}},
+		authorizedMentionLabels: map[string]string{},
+	}
+
+	_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).EditMessage(
+		context.Background(), service.EditMessageInput{
+			WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+			Body: `@[Outsider](mention:user:` + mentionedUserID + `)`, BodyFormat: domain.MessageBodyFormatV3,
+		})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestMessageService_EditMessage_RejectsUnknownBodyFormat(t *testing.T) {
+	_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{}).EditMessage(
+		context.Background(), service.EditMessageInput{
+			WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+			Body: "edited", BodyFormat: "v4",
+		})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestMessageService_GetMessageEditHistory_ReturnsRequestedPageNewestFirst(t *testing.T) {
+	newest := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	store := &fakeMessageStore{editHistory: []domain.MessageEditHistory{
+		{ID: "hist-3", MessageID: "msg-1", Body: "third", VersionedAt: newest},
+		{ID: "hist-2", MessageID: "msg-1", Body: "second", VersionedAt: newest.Add(-time.Minute)},
+	}}
+
+	history, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).GetMessageEditHistory(
+		context.Background(), service.GetMessageEditHistoryInput{
+			WorkspaceID: "ws-1", MessageID: "msg-1", CallerID: user1, Limit: 2, Offset: 1,
+		})
+	if err != nil {
+		t.Fatalf("GetMessageEditHistory: %v", err)
+	}
+	if len(history) != 2 || history[0].ID != "hist-3" || history[1].ID != "hist-2" {
+		t.Fatalf("unexpected history page: %+v", history)
+	}
+	if store.lastHistoryInput.Limit != 2 || store.lastHistoryInput.Offset != 1 || store.lastHistoryInput.UserID != user1 {
+		t.Fatalf("unexpected storage pagination/access input: %+v", store.lastHistoryInput)
+	}
+}
+
+func TestMessageService_GetMessageEditHistory_EmptyAndNotFound(t *testing.T) {
+	input := service.GetMessageEditHistoryInput{WorkspaceID: "ws-1", MessageID: "msg-1", CallerID: user1}
+	history, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{}).
+		GetMessageEditHistory(context.Background(), input)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("empty history = %+v, %v", history, err)
+	}
+
+	for _, name := range []string{"non-member", "missing-message"} {
+		t.Run(name, func(t *testing.T) {
+			_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{historyErr: domain.ErrNotFound}).
+				GetMessageEditHistory(context.Background(), input)
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("expected ErrNotFound, got %v", err)
+			}
+		})
+	}
+}
+
+func TestMessageService_GetMessageEditHistory_RejectsInvalidRequest(t *testing.T) {
+	for _, input := range []service.GetMessageEditHistoryInput{
+		{MessageID: "msg-1", CallerID: user1},
+		{WorkspaceID: "ws-1", CallerID: user1},
+		{WorkspaceID: "ws-1", MessageID: "msg-1", CallerID: user1, Offset: -1},
+		{WorkspaceID: "ws-1", MessageID: "msg-1", CallerID: user1, Offset: 10_001},
+	} {
+		_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{}).
+			GetMessageEditHistory(context.Background(), input)
+		if !errors.Is(err, domain.ErrInvalidInput) {
+			t.Fatalf("input %+v: expected ErrInvalidInput, got %v", input, err)
+		}
 	}
 }
 

@@ -637,6 +637,95 @@ func TestHub_MessageUpdated_DeliveredOnlyToAuthorizedChannelMembers(t *testing.T
 	}
 }
 
+func TestHub_PublishMessageUpdated_DeliversCompletePayloadOnlyToAuthorizedSubscribers(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		targetType TargetType
+		targetID   string
+		otherID    string
+	}{
+		{name: "channel", targetType: TargetTypeChannel, targetID: "ch-1", otherID: "ch-2"},
+		{name: "dm", targetType: TargetTypeDM, targetID: "dm-1", otherID: "dm-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := &fakeAuthorizer{}
+			auth.setAccess("member", "ws-1", tt.targetType, tt.targetID, true)
+			auth.setAccess("other", "ws-1", tt.targetType, tt.otherID, true)
+			hub := NewHub(auth, newTestLogger(), NopBus{}, "test-message-update-"+tt.name)
+			t.Cleanup(hub.Shutdown)
+
+			member := newClient("member-"+tt.name, "member", "ws-1", &fakeSender{})
+			other := newClient("other-"+tt.name, "other", "ws-1", &fakeSender{})
+			outsider := newClient("outsider-"+tt.name, "outsider", "ws-1", &fakeSender{})
+			registerInRunningHub(t, hub, member)
+			registerInRunningHub(t, hub, other)
+			registerInRunningHub(t, hub, outsider)
+			if err := hub.Subscribe(context.Background(), member, tt.targetType, tt.targetID); err != nil {
+				t.Fatalf("member subscribe: %v", err)
+			}
+			if err := hub.Subscribe(context.Background(), other, tt.targetType, tt.otherID); err != nil {
+				t.Fatalf("other target subscribe: %v", err)
+			}
+			if err := hub.Subscribe(context.Background(), outsider, tt.targetType, tt.targetID); !errors.Is(err, ErrSubscribeForbidden) {
+				t.Fatalf("outsider subscribe: expected forbidden, got %v", err)
+			}
+
+			editedAt := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+			payload := MessageUpdatedPayload{
+				MessageID: "msg-1", Body: "edited", BodyFormat: "v3",
+				EditedAt: editedAt, EditCount: 2, IsEdited: true,
+			}
+			if tt.targetType == TargetTypeChannel {
+				payload.ChannelID = tt.targetID
+			} else {
+				payload.DMID = tt.targetID
+			}
+			hub.PublishMessageUpdated(context.Background(), "ws-1", tt.targetType, tt.targetID, payload)
+
+			select {
+			case raw := <-member.outbox:
+				event, err := decodeEvent(raw)
+				if err != nil {
+					t.Fatalf("decode message.updated: %v", err)
+				}
+				if event.Type != EventTypeMessageUpdated || event.TargetType != tt.targetType || event.TargetID != tt.targetID || event.MessageUpdate == nil {
+					t.Fatalf("unexpected event route: %+v", event)
+				}
+				got := event.MessageUpdate
+				if got.MessageID != "msg-1" || got.ChannelID != payload.ChannelID || got.DMID != payload.DMID || got.Body != "edited" || got.BodyFormat != "v3" || !got.EditedAt.Equal(editedAt) || got.EditCount != 2 || !got.IsEdited {
+					t.Fatalf("incomplete message.updated payload: %+v", got)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("authorized subscriber did not receive message.updated")
+			}
+			if len(other.outbox) != 0 || len(outsider.outbox) != 0 {
+				t.Fatalf("unexpected delivery: other=%d outsider=%d", len(other.outbox), len(outsider.outbox))
+			}
+		})
+	}
+}
+
+func TestHub_PublishMessageUpdated_DeliversLocallyWhenBusFails(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("member", testWorkspaceID, TargetTypeChannel, testChannelID, true)
+	hub := newBusTestHub(auth, &fakeBus{publishErr: errors.New("valkey unavailable")})
+	t.Cleanup(hub.Shutdown)
+	member := newClient("message-update-member", "member", testWorkspaceID, &fakeSender{})
+	registerInRunningHub(t, hub, member)
+	if err := hub.Subscribe(context.Background(), member, TargetTypeChannel, testChannelID); err != nil {
+		t.Fatalf("member subscribe: %v", err)
+	}
+
+	hub.PublishMessageUpdated(context.Background(), testWorkspaceID, TargetTypeChannel, testChannelID, MessageUpdatedPayload{
+		MessageID: testMessageID, ChannelID: testChannelID, Body: "edited",
+		BodyFormat: "v1", EditedAt: time.Now().UTC(), EditCount: 1, IsEdited: true,
+	})
+
+	if !waitForOutbox(member, 1) {
+		t.Fatal("local subscriber did not receive message.updated after bus failure")
+	}
+}
+
 func TestHub_MalformedClientMessage_NoError(t *testing.T) {
 	inputs := [][]byte{
 		[]byte(`{invalid`),

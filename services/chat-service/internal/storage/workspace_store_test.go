@@ -178,3 +178,21 @@ func TestPGXWorkspaceStore_UpdateEditWindow_UnauthorizedIsForbidden(t *testing.T
 		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
 }
+
+func TestPGXWorkspaceStore_UpdateEditWindow_NullDisablesWindow(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	now := time.Now()
+	mock.ExpectQuery(`UPDATE chat\.workspaces`).
+		WithArgs("ws-1", "admin-1", (*int)(nil)).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "slug", "name", "status", "edit_window_seconds", "created_at", "updated_at"}).
+			AddRow("ws-1", "default", "NChat", "active", nil, now, now))
+
+	workspace, err := storage.NewPGXWorkspaceStore(mock).UpdateEditWindow(context.Background(), "ws-1", "admin-1", nil)
+	if err != nil || workspace.EditWindowSeconds != nil {
+		t.Fatalf("UpdateEditWindow(nil) = %+v, %v", workspace, err)
+	}
+}

@@ -369,6 +369,37 @@ func TestHubBroadcasterPublishesCreatedMessage(t *testing.T) {
 	})
 }
 
+type captureBroadcastBus struct{ published chan ws.Event }
+
+func (b *captureBroadcastBus) Publish(_ context.Context, event ws.Event) error {
+	b.published <- event
+	return nil
+}
+
+func (*captureBroadcastBus) Subscribe(context.Context, func(ws.Event)) error { return nil }
+func (*captureBroadcastBus) Close()                                          {}
+
+func TestHubBroadcasterPublishesUpdatedMessage(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 1)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-updated-broadcaster")
+	t.Cleanup(hub.Shutdown)
+	editedAt := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+
+	(&hubBroadcaster{hub: hub}).PublishMessageUpdated(t.Context(), "workspace-1", string(ws.TargetTypeChannel), "channel-1", domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		BodyText: "edited", BodyFormat: domain.MessageBodyFormatV3, EditedAt: editedAt, EditCount: 2,
+	})
+
+	select {
+	case event := <-bus.published:
+		if event.Type != ws.EventTypeMessageUpdated || event.WorkspaceID != "workspace-1" || event.TargetType != ws.TargetTypeChannel || event.TargetID != "channel-1" || event.MessageID != "message-1" {
+			t.Fatalf("unexpected published event route: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message.updated was not published")
+	}
+}
+
 func TestHubBroadcasterPublishesPinUpdated(t *testing.T) {
 	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), ws.NopBus{}, "test-pin-broadcaster")
 	t.Cleanup(hub.Shutdown)
