@@ -2651,9 +2651,7 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
       expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "Texto atualizado", 2),
     );
     expect(await screen.findByText("Texto atualizado")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Ver histórico de edições" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ver histórico de edições" })).toBeInTheDocument();
   });
 
   it("cancels an inline edit without calling the API or changing the message", async () => {
@@ -2729,9 +2727,7 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
 
     expect(await screen.findByText("Atualizada por WS")).toBeInTheDocument();
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
-    expect(
-      screen.getByRole("button", { name: "Ver histórico de edições" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ver histórico de edições" })).toBeInTheDocument();
   });
 
   it("loads history lazily and renders versions through the safe rich-text renderer", async () => {
@@ -2755,9 +2751,7 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
     renderChannelAreaForUser();
 
     expect(mockGetMessageHistory).not.toHaveBeenCalled();
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Ver histórico de edições" }),
-    );
+    await userEvent.click(await screen.findByRole("button", { name: "Ver histórico de edições" }));
 
     const dialog = await screen.findByRole("dialog", { name: "Histórico de edições" });
     expect(dialog).toHaveTextContent("Versão segura");

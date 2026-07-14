@@ -587,9 +587,12 @@ describe("message editing", () => {
 
     const page = await getMessageHistory("msg-1", { cursor: "2", limit: 2 });
 
-    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg-1/history?limit=2&offset=2", {
-      method: "GET",
-    });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/messages/msg-1/history?limit=2&offset=2",
+      {
+        method: "GET",
+      },
+    );
     expect(page).toEqual({
       entries: [
         { body: "mais recente", bodyFormat: 3, versionedAt: "2026-07-13T12:00:00Z" },
