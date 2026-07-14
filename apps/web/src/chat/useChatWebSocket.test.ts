@@ -238,6 +238,50 @@ describe("useChatWebSocket", () => {
     expect(onMessageUpdated).toHaveBeenCalledWith(update);
   });
 
+  it("routes sanitized deletion and route-only distributed message.updated events", () => {
+    const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageUpdated,
+      }),
+    );
+    const deletion: WSMessageUpdatedEvent = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_update: {
+        message_id: "msg-1",
+        channel_id: "ch-1",
+        body: "",
+        body_format: "v1",
+        edited_at: "",
+        edit_count: 0,
+        is_edited: false,
+        status: "deleted",
+        is_removed: true,
+        deleted_at: "2026-07-14T12:00:00Z",
+        updated_at: "2026-07-14T12:00:00Z",
+      },
+    };
+    const routeOnly: WSMessageUpdatedEvent = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateMessage(deletion);
+      FakeWebSocket.instances[0].simulateMessage(routeOnly);
+    });
+
+    expect(onMessageUpdated).toHaveBeenNthCalledWith(1, deletion);
+    expect(onMessageUpdated).toHaveBeenNthCalledWith(2, routeOnly);
+  });
+
   it("ignores malformed message.updated payloads", () => {
     const onMessageUpdated = vi.fn();
     renderHook(() =>
@@ -266,6 +310,10 @@ describe("useChatWebSocket", () => {
       { ...base, edited_at: 1 },
       { ...base, edit_count: "2" },
       { ...base, is_edited: "true" },
+      { ...base, status: "removed" },
+      { ...base, is_removed: "true" },
+      { ...base, deleted_at: 1 },
+      { ...base, updated_at: 1 },
     ];
 
     act(() => {

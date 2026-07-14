@@ -73,11 +73,16 @@ const {
   mockFetchDMMessage,
   mockFavoriteMessage,
   mockUnfavoriteMessage,
+  mockPostChannelMessage,
   mockEditMessage,
+  mockDeleteMessage,
 } = vi.hoisted(() => ({
   mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
+  mockPostChannelMessage:
+    vi.fn<(id: string, body: string, parentMessageId?: string) => Promise<Message>>(),
   mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
+  mockDeleteMessage: vi.fn<(id: string) => Promise<Message>>(),
   mockFetchChannelMessages:
     vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
   mockFetchChannelMessage:
@@ -97,12 +102,14 @@ vi.mock("./chatApi", () => ({
     mockFetchDMMessages(id, cursor, signal),
   fetchDMMessage: (id: string, msgId: string, signal?: AbortSignal) =>
     mockFetchDMMessage(id, msgId, signal),
-  postChannelMessage: vi.fn(),
+  postChannelMessage: (id: string, body: string, parentMessageId?: string) =>
+    mockPostChannelMessage(id, body, parentMessageId),
   postDMMessage: vi.fn(),
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
   unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
   editMessage: (id: string, body: string, bodyFormat: number) =>
     mockEditMessage(id, body, bodyFormat),
+  deleteMessage: (id: string) => mockDeleteMessage(id),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -176,6 +183,27 @@ function fireWsEventNoPayload(
     target_type: targetType,
     target_id: targetId,
     message_id: messageId,
+  });
+}
+
+function fireFullDelete(messageId: string, targetId = "ch-1"): void {
+  capturedOnMessageUpdated?.({
+    type: "message.updated",
+    target_type: "channel",
+    target_id: targetId,
+    message_update: {
+      message_id: messageId,
+      channel_id: targetId,
+      body: "",
+      body_format: "v1",
+      edited_at: "",
+      edit_count: 0,
+      is_edited: false,
+      status: "deleted",
+      is_removed: true,
+      deleted_at: "2026-07-14T12:00:00Z",
+      updated_at: "2026-07-14T12:00:00Z",
+    },
   });
 }
 
@@ -1318,10 +1346,784 @@ describe("useMessages — message editing", () => {
       capturedOnMessageUpdated?.({
         ...update,
         target_id: "ch-1",
-        message_update: { ...update.message_update, message_id: "missing", channel_id: "ch-1" },
+        message_update: { ...update.message_update!, message_id: "missing", channel_id: "ch-1" },
       }),
     );
 
     expect(result.current.state.messages).toEqual([original]);
+  });
+});
+
+describe("useMessages — message deletion", () => {
+  it("reconciles the DELETE response in place and sanitizes loaded replies", async () => {
+    const createdAt = "2026-07-14T10:00:00Z";
+    const deletedAt = "2026-07-14T12:00:00Z";
+    const original = makeMessage({
+      id: "msg-delete",
+      bodyText: "segredo",
+      createdAt,
+      reactions: [{ emoji: "👍", count: 1, reactedByMe: true }],
+    });
+    const reply = makeMessage({
+      id: "msg-reply",
+      bodyText: "resposta",
+      quoted: {
+        id: original.id,
+        authorId: original.senderId,
+        bodyText: original.bodyText,
+        bodyFormat: "v1",
+        isRemoved: false,
+        deletedAt: null,
+        createdAt,
+      },
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [original, reply], nextCursor: "" });
+    mockDeleteMessage.mockResolvedValue(
+      makeMessage({
+        ...original,
+        bodyText: "",
+        status: "deleted",
+        isRemoved: true,
+        deletedAt,
+        updatedAt: deletedAt,
+        reactions: [],
+      }),
+    );
+    const onMessageRemoved = vi.fn();
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onMessageRemoved,
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.selectReply(original));
+
+    await act(() => result.current.deleteMessageLocal(original.id));
+
+    expect(mockDeleteMessage).toHaveBeenCalledWith(original.id);
+    expect(result.current.state.messages.map((message) => message.id)).toEqual([
+      "msg-delete",
+      "msg-reply",
+    ]);
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "",
+      createdAt,
+      status: "deleted",
+      isRemoved: true,
+      deletedAt,
+      reactions: [],
+    });
+    expect(result.current.state.messages[1].quoted).toMatchObject({
+      bodyText: "",
+      isRemoved: true,
+      deletedAt,
+    });
+    expect(result.current.state.replyTo).toBeNull();
+    expect(onMessageRemoved).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the message and surfaces generic feedback when DELETE fails", async () => {
+    const original = makeMessage({ id: "msg-delete", bodyText: "permanece" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [original], nextCursor: "" });
+    mockDeleteMessage.mockRejectedValue(new Error("forbidden details"));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let rejected: unknown;
+    await act(async () => {
+      try {
+        await result.current.deleteMessageLocal(original.id);
+      } catch (error) {
+        rejected = error;
+      }
+    });
+
+    expect(rejected).toEqual(new Error("forbidden details"));
+    expect(result.current.state.messages).toEqual([original]);
+    await waitFor(() =>
+      expect(result.current.state.actionError).toBe(
+        "Não foi possível excluir a mensagem. Tente novamente.",
+      ),
+    );
+  });
+
+  it("applies repeated sanitized WS deletions idempotently and ignores a late edit", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-delete", bodyText: "original" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    const deletion: WSMessageUpdatedEvent = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_update: {
+        message_id: "msg-delete",
+        channel_id: "ch-1",
+        body: "",
+        body_format: "v1",
+        edited_at: "",
+        edit_count: 0,
+        is_edited: false,
+        status: "deleted",
+        is_removed: true,
+        deleted_at: "2026-07-14T12:00:00Z",
+        updated_at: "2026-07-14T12:00:00Z",
+      },
+    };
+
+    act(() => {
+      capturedOnMessageUpdated?.(deletion);
+      capturedOnMessageUpdated?.(deletion);
+      capturedOnMessageUpdated?.({
+        ...deletion,
+        message_update: {
+          ...deletion.message_update!,
+          body: "edição atrasada",
+          status: "active",
+          is_removed: false,
+          edit_count: 2,
+          is_edited: true,
+        },
+      });
+    });
+
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "",
+      status: "deleted",
+      isRemoved: true,
+      deletedAt: "2026-07-14T12:00:00Z",
+    });
+  });
+
+  it("reloads a sanitized snapshot for route-only distributed updates", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-delete", bodyText: "original" })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-delete",
+        bodyText: "",
+        isRemoved: true,
+        status: "deleted",
+        deletedAt: "2026-07-14T12:00:00Z",
+      }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-delete",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages[0].isRemoved).toBe(true));
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      "ch-1",
+      "msg-delete",
+      expect.any(AbortSignal),
+    );
+    expect(result.current.state.messages[0].bodyText).toBe("");
+  });
+
+  it("reconciles concurrent route-only updates for different messages", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({ id: "msg-first", bodyText: "first original" }),
+        makeMessage({ id: "msg-second", bodyText: "second original" }),
+      ],
+      nextCursor: "",
+    });
+    const snapshots = new Map<string, (message: Message) => void>();
+    mockFetchChannelMessage.mockImplementation(
+      (_targetId, messageId) =>
+        new Promise((resolve) => {
+          snapshots.set(messageId, resolve);
+        }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-first",
+      });
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-second",
+      });
+    });
+
+    expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2);
+    act(() => {
+      snapshots.get("msg-second")?.(makeMessage({ id: "msg-second", bodyText: "second updated" }));
+      snapshots.get("msg-first")?.(
+        makeMessage({ id: "msg-first", bodyText: "", isRemoved: true, status: "deleted" }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(result.current.state.messages).toEqual([
+        expect.objectContaining({ id: "msg-first", bodyText: "", isRemoved: true }),
+        expect.objectContaining({ id: "msg-second", bodyText: "second updated" }),
+      ]),
+    );
+  });
+
+  it("keeps a route-only delete when creation for the same message is still pending", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let resolveCreated!: (message: Message) => void;
+    let resolveDeleted!: (message: Message) => void;
+    mockFetchChannelMessage
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveCreated = resolve)))
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveDeleted = resolve)));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventNoPayload("channel", "ch-1", "msg-race");
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-race",
+      });
+    });
+    expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2);
+
+    act(() =>
+      resolveDeleted(
+        makeMessage({ id: "msg-race", bodyText: "", isRemoved: true, status: "deleted" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(result.current.state.messages).toEqual([
+        expect.objectContaining({ id: "msg-race", bodyText: "", isRemoved: true }),
+      ]),
+    );
+
+    act(() => resolveCreated(makeMessage({ id: "msg-race", bodyText: "stale original" })));
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "msg-race",
+      bodyText: "",
+      isRemoved: true,
+      status: "deleted",
+    });
+  });
+
+  it("reconciles a full delete while route-only creation for the same ID is pending", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let resolveCreated!: (message: Message) => void;
+    let resolveDeleted!: (message: Message) => void;
+    mockFetchChannelMessage
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveCreated = resolve)))
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveDeleted = resolve)));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventNoPayload("channel", "ch-1", "msg-full-race");
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-full-race",
+          channel_id: "ch-1",
+          body: "",
+          body_format: "v1",
+          edited_at: "",
+          edit_count: 0,
+          is_edited: false,
+          status: "deleted",
+          is_removed: true,
+          deleted_at: "2026-07-14T12:00:00Z",
+          updated_at: "2026-07-14T12:00:00Z",
+        },
+      });
+    });
+    expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2);
+
+    act(() => resolveCreated(makeMessage({ id: "msg-full-race", bodyText: "stale original" })));
+    await waitFor(() => expect(result.current.state.messages).toEqual([]));
+
+    act(() =>
+      resolveDeleted(
+        makeMessage({
+          id: "msg-full-race",
+          bodyText: "",
+          isRemoved: true,
+          status: "deleted",
+          deletedAt: "2026-07-14T12:00:00Z",
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(result.current.state.messages).toEqual([
+        expect.objectContaining({
+          id: "msg-full-race",
+          bodyText: "",
+          isRemoved: true,
+          status: "deleted",
+        }),
+      ]),
+    );
+  });
+
+  it("keeps a full delete terminal when a full create arrives later", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-reordered",
+          channel_id: "ch-1",
+          body: "",
+          body_format: "v1",
+          edited_at: "",
+          edit_count: 0,
+          is_edited: false,
+          status: "deleted",
+          is_removed: true,
+          deleted_at: "2026-07-14T12:00:00Z",
+          updated_at: "2026-07-14T12:00:00Z",
+        },
+      }),
+    );
+    expect(result.current.state.messages).toEqual([]);
+
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({ id: "msg-reordered", body_text: "body that must stay hidden" }),
+      ),
+    );
+
+    expect(result.current.state.messages).toEqual([
+      expect.objectContaining({
+        id: "msg-reordered",
+        bodyText: "",
+        isRemoved: true,
+        status: "deleted",
+        deletedAt: "2026-07-14T12:00:00Z",
+      }),
+    ]);
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes a stale initial page that resolves after a full delete", async () => {
+    let resolvePage!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation(
+      () => new Promise((resolve) => (resolvePage = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+
+    act(() => fireFullDelete("msg-stale-page"));
+    act(() =>
+      resolvePage({
+        messages: [
+          makeMessage({ id: "msg-stale-page", bodyText: "stale body" }),
+          makeMessage({
+            id: "msg-stale-reply",
+            quoted: {
+              id: "msg-stale-page",
+              authorId: "user-sender",
+              bodyText: "stale quote",
+              bodyFormat: "v1",
+              isRemoved: false,
+              deletedAt: null,
+              createdAt: "2026-07-14T11:00:00Z",
+            },
+          }),
+        ],
+        nextCursor: "",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "msg-stale-page",
+      bodyText: "",
+      isRemoved: true,
+      status: "deleted",
+    });
+    expect(result.current.state.messages[1].quoted).toMatchObject({
+      id: "msg-stale-page",
+      bodyText: "",
+      isRemoved: true,
+    });
+  });
+
+  it("sanitizes a stale older page that resolves after a full delete", async () => {
+    let resolveOlderPage!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({
+        messages: [makeMessage({ id: "msg-visible" })],
+        nextCursor: "older-cursor",
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveOlderPage = resolve)));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.loadMore());
+
+    act(() => fireFullDelete("msg-stale-older"));
+    act(() =>
+      resolveOlderPage({
+        messages: [makeMessage({ id: "msg-stale-older", bodyText: "stale older body" })],
+        nextCursor: "",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.loadingMore).toBe(false));
+    expect(
+      result.current.state.messages.find((message) => message.id === "msg-stale-older"),
+    ).toMatchObject({
+      bodyText: "",
+      isRemoved: true,
+      status: "deleted",
+    });
+  });
+
+  it("sanitizes a stale send response that resolves after a full delete", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let resolveSend!: (message: Message) => void;
+    mockPostChannelMessage.mockImplementation(
+      () => new Promise((resolve) => (resolveSend = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let send!: ReturnType<typeof result.current.sendMessage>;
+    act(() => {
+      send = result.current.sendMessage("stale send body");
+      fireFullDelete("msg-stale-send");
+    });
+    await act(async () => {
+      resolveSend(makeMessage({ id: "msg-stale-send", bodyText: "stale send body" }));
+      await send;
+    });
+
+    expect(result.current.state.messages).toEqual([
+      expect.objectContaining({
+        id: "msg-stale-send",
+        bodyText: "",
+        isRemoved: true,
+        status: "deleted",
+      }),
+    ]);
+  });
+
+  it("does not revert a deleted message when an earlier edit fails", async () => {
+    const original = makeMessage({ id: "msg-edit-delete", bodyText: "original" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [original], nextCursor: "" });
+    let rejectEdit!: (error: Error) => void;
+    mockEditMessage.mockImplementation(
+      () => new Promise((_resolve, reject) => (rejectEdit = reject)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let edit!: ReturnType<typeof result.current.editMessageLocal>;
+    act(() => {
+      edit = result.current.editMessageLocal(original.id, "optimistic body", "v1");
+    });
+    act(() => fireFullDelete(original.id));
+    act(() => rejectEdit(new Error("edit failed after delete")));
+    await expect(edit).rejects.toThrow("edit failed after delete");
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: original.id,
+      bodyText: "",
+      isRemoved: true,
+      status: "deleted",
+    });
+  });
+
+  it("does not insert an absent historical message from a route-only update", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-visible" })],
+      nextCursor: "older-cursor",
+    });
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: "msg-historical", bodyText: "edited outside the loaded page" }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-historical",
+      }),
+    );
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledOnce());
+    expect(result.current.state.messages).toEqual([expect.objectContaining({ id: "msg-visible" })]);
+    expect(result.current.state.nextCursor).toBe("older-cursor");
+  });
+
+  it("handles status-only deletion events using the authoritative updated timestamp", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-delete", bodyText: "original" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-delete",
+          channel_id: "ch-1",
+          body: "",
+          body_format: "v1",
+          edited_at: "",
+          edit_count: 0,
+          is_edited: false,
+          status: "deleted",
+          is_removed: false,
+          updated_at: "2026-07-14T12:00:00Z",
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "",
+      isRemoved: true,
+      deletedAt: "2026-07-14T12:00:00Z",
+      updatedAt: "2026-07-14T12:00:00Z",
+    });
+  });
+
+  it("reports route-only snapshot failures and silently ignores aborts", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-delete" })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessage
+      .mockRejectedValueOnce(new Error("backend detail"))
+      .mockRejectedValueOnce(new DOMException("aborted", "AbortError"));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    const routeOnly: WSMessageUpdatedEvent = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-delete",
+    };
+
+    act(() => capturedOnMessageUpdated?.(routeOnly));
+    await waitFor(() =>
+      expect(result.current.state.realtimeError).toBe(
+        "Não foi possível atualizar mensagens em tempo real.",
+      ),
+    );
+    act(() => capturedOnMessageUpdated?.(routeOnly));
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    expect(result.current.state.realtimeError).toBe(
+      "Não foi possível atualizar mensagens em tempo real.",
+    );
+  });
+
+  it("reloads a deleted DM snapshot from a route-only update", async () => {
+    mockFetchDMMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-delete", bodyText: "dm original" })],
+      nextCursor: "",
+    });
+    mockFetchDMMessage.mockResolvedValue(
+      makeMessage({ id: "msg-delete", bodyText: "", isRemoved: true, status: "deleted" }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "dm",
+        target_id: "dm-1",
+        message_id: "msg-delete",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages[0].isRemoved).toBe(true));
+    expect(mockFetchDMMessage).toHaveBeenCalledWith("dm-1", "msg-delete", expect.any(AbortSignal));
+  });
+
+  it("discards stale DELETE outcomes after the user changes target", async () => {
+    const original = makeMessage({ id: "msg-delete", bodyText: "original" });
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: [original], nextCursor: "" })
+      .mockResolvedValue({ messages: [], nextCursor: "" });
+    let resolveDelete!: (message: Message) => void;
+    let rejectDelete!: (error: Error) => void;
+    mockDeleteMessage
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveDelete = resolve)))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectDelete = reject)));
+    const { result, rerender } = renderHook(
+      ({ targetId }) => useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let success!: Promise<void>;
+    act(() => {
+      success = result.current.deleteMessageLocal(original.id);
+    });
+    rerender({ targetId: "ch-2" });
+    await waitFor(() => expect(result.current.state.messages).toEqual([]));
+    act(() =>
+      resolveDelete(makeMessage({ ...original, bodyText: "", isRemoved: true, status: "deleted" })),
+    );
+    await success;
+
+    let failure!: Promise<void>;
+    act(() => {
+      failure = result.current.deleteMessageLocal("missing");
+    });
+    rerender({ targetId: "ch-3" });
+    act(() => rejectDelete(new Error("stale failure")));
+    await expect(failure).rejects.toThrow("stale failure");
+    expect(result.current.state.actionError).toBeNull();
+  });
+
+  it("ignores route-only updates without an ID and stale snapshot outcomes", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-delete" })],
+      nextCursor: "",
+    });
+    let resolveSnapshot!: (message: Message) => void;
+    let rejectSnapshot!: (error: Error) => void;
+    mockFetchChannelMessage
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveSnapshot = resolve)))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectSnapshot = reject)));
+    const { result, rerender } = renderHook(
+      ({ targetId }) => useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-delete",
+      }),
+    );
+    rerender({ targetId: "ch-2" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() =>
+      resolveSnapshot(makeMessage({ id: "msg-delete", isRemoved: true, status: "deleted" })),
+    );
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-2",
+        message_id: "msg-delete",
+      }),
+    );
+    rerender({ targetId: "ch-3" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => rejectSnapshot(new Error("stale snapshot failure")));
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    expect(result.current.state.realtimeError).toBeNull();
+  });
+
+  it("does not resurrect a deleted message from an active route-only snapshot", async () => {
+    const deleted = makeMessage({
+      id: "msg-delete",
+      bodyText: "",
+      isRemoved: true,
+      status: "deleted",
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [deleted], nextCursor: "" });
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: "msg-delete", bodyText: "stale body", isRemoved: false, status: "active" }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-delete",
+      }),
+    );
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledOnce());
+    expect(result.current.state.messages[0]).toEqual(deleted);
   });
 });

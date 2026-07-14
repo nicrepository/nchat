@@ -43,6 +43,7 @@ export interface MessageBubbleProps {
     bodyFormat: Message["bodyFormat"],
   ) => Promise<Message>;
   onEditForbidden: (messageId: string) => void;
+  onDeleteMessage: (messageId: string) => Promise<void>;
   editDisabled?: boolean;
   channelId?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -80,6 +81,8 @@ type MessageReactionsProps = Pick<
 > & {
   bubbleRef: RefObject<HTMLDivElement | null>;
   onStartEdit?: () => void;
+  onDelete?: () => void;
+  deleting?: boolean;
 };
 
 function MessageReactions({
@@ -98,6 +101,8 @@ function MessageReactions({
   pickerOpen,
   onPickerOpenChange,
   onStartEdit,
+  onDelete,
+  deleting = false,
 }: MessageReactionsProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement>(null);
@@ -237,6 +242,19 @@ function MessageReactions({
               </span>
             </button>
           )}
+          {onDelete && (
+            <button
+              type="button"
+              aria-label={deleting ? "Excluindo mensagem" : "Excluir mensagem"}
+              aria-busy={deleting}
+              disabled={deleting}
+              onClick={onDelete}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                {deleting ? "progress_activity" : "delete"}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
@@ -321,7 +339,7 @@ function MessageMeta({
       {!isGrouped && (
         <span className="chat-msg-area__msg-time">{formatTime(message.createdAt)}</span>
       )}
-      {message.isEdited && (
+      {message.isEdited && !message.isRemoved && (
         <button
           type="button"
           className="chat-msg-area__edited"
@@ -385,6 +403,7 @@ export default function MessageBubble({
   onToggleFavorite,
   onEditMessage,
   onEditForbidden,
+  onDeleteMessage,
   editDisabled = false,
   channelId,
   onTogglePin,
@@ -404,6 +423,7 @@ export default function MessageBubble({
   const bubbleRef = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const saveEdit = useCallback(
     async (body: string, format: CodecFormat) => {
       const updated = await onEditMessage(message.id, body, format);
@@ -416,6 +436,15 @@ export default function MessageBubble({
     setEditing(false);
     onEditForbidden(message.id);
   }, [message.id, onEditForbidden]);
+  const handleDelete = useCallback(async () => {
+    if (deleting || !window.confirm("Excluir esta mensagem?")) return;
+    setDeleting(true);
+    try {
+      await onDeleteMessage(message.id);
+    } catch {
+      setDeleting(false);
+    }
+  }, [deleting, message.id, onDeleteMessage]);
   return (
     <div
       ref={(el) => setMessageRef?.(message.id, el)}
@@ -463,7 +492,9 @@ export default function MessageBubble({
               onJump={onQuoteJump}
             />
           )}
-          {editing ? (
+          {message.isRemoved ? (
+            "Mensagem removida."
+          ) : editing ? (
             <InlineMessageEditor
               message={message}
               channelId={channelId}
@@ -471,8 +502,6 @@ export default function MessageBubble({
               onCancel={() => setEditing(false)}
               onForbidden={handleForbidden}
             />
-          ) : message.isRemoved ? (
-            "Mensagem removida."
           ) : (
             <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
           )}
@@ -500,8 +529,12 @@ export default function MessageBubble({
                 }
               : undefined
           }
+          onDelete={
+            isMine && message.kind === "user" && !editing ? () => void handleDelete() : undefined
+          }
+          deleting={deleting}
         />
-        {historyOpen && (
+        {historyOpen && !message.isRemoved && (
           <MessageEditHistory messageId={message.id} onClose={() => setHistoryOpen(false)} />
         )}
       </div>

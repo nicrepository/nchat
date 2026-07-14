@@ -57,6 +57,7 @@ const {
   mockPinMessage,
   mockUnpinMessage,
   mockEditMessage,
+  mockDeleteMessage,
   mockGetMessageHistory,
   wsMockState,
 } = vi.hoisted(() => ({
@@ -101,6 +102,7 @@ const {
     vi.fn<(target: { kind: "channel" | "dm"; id: string }, messageId: string) => Promise<void>>(),
   mockEditMessage:
     vi.fn<(messageId: string, body: string, bodyFormat: number) => Promise<Message>>(),
+  mockDeleteMessage: vi.fn<(messageId: string) => Promise<Message>>(),
   mockGetMessageHistory: vi.fn(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
@@ -154,6 +156,7 @@ vi.mock("./chatApi", () => ({
     mockUnpinMessage(target, messageId),
   editMessage: (messageId: string, body: string, bodyFormat: number) =>
     mockEditMessage(messageId, body, bodyFormat),
+  deleteMessage: (messageId: string) => mockDeleteMessage(messageId),
   getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
 }));
 
@@ -2826,5 +2829,150 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
       cursor: "1",
       limit: 50,
     });
+  });
+});
+
+describe("ChatMessageArea — exclusão com placeholder (RF-14)", () => {
+  const ownMessage = () =>
+    makeMessage({ id: "msg-delete", senderId: "me-123", bodyText: "Conteúdo privado" });
+
+  async function revealDeleteAction() {
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    return screen.findByRole("button", { name: "Excluir mensagem" });
+  }
+
+  it("confirms, prevents duplicate submission and replaces the message in place", async () => {
+    const original = ownMessage();
+    const deletedAt = "2026-07-14T12:00:00Z";
+    let resolveDelete!: (message: Message) => void;
+    mockFetchChannelMessages.mockResolvedValue(messagePage([original]));
+    mockDeleteMessage.mockImplementation(() => new Promise((resolve) => (resolveDelete = resolve)));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderChannelAreaForUser();
+
+    await userEvent.click(await revealDeleteAction());
+
+    const loadingButton = screen.getByRole("button", { name: "Excluindo mensagem" });
+    expect(loadingButton).toBeDisabled();
+    expect(loadingButton).toHaveAttribute("aria-busy", "true");
+    await userEvent.click(loadingButton);
+    expect(mockDeleteMessage).toHaveBeenCalledTimes(1);
+
+    act(() =>
+      resolveDelete(
+        makeMessage({
+          ...original,
+          bodyText: "",
+          status: "deleted",
+          isRemoved: true,
+          deletedAt,
+          updatedAt: deletedAt,
+        }),
+      ),
+    );
+
+    expect(await screen.findByText("Mensagem removida.")).toBeInTheDocument();
+    expect(screen.queryByText("Conteúdo privado")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Editar mensagem" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Excluir mensagem/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Reagir/ })).not.toBeInTheDocument();
+  });
+
+  it("cancels confirmation without calling DELETE", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderChannelAreaForUser();
+
+    await userEvent.click(await revealDeleteAction());
+
+    expect(mockDeleteMessage).not.toHaveBeenCalled();
+    expect(screen.getByText("Conteúdo privado")).toBeInTheDocument();
+  });
+
+  it("keeps the original message and shows generic feedback on failure", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockDeleteMessage.mockRejectedValue(new Error("authorization detail"));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderChannelAreaForUser();
+
+    await userEvent.click(await revealDeleteAction());
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Não foi possível excluir a mensagem. Tente novamente.",
+    );
+    expect(screen.getByText("Conteúdo privado")).toBeInTheDocument();
+  });
+
+  it("does not offer deletion to another author or to a removed message", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "other", senderId: "other-user", bodyText: "de outro" }),
+        makeMessage({
+          id: "removed",
+          senderId: "me-123",
+          bodyText: "conteúdo residual",
+          status: "deleted",
+          isRemoved: true,
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const bubbles = await screen.findAllByTestId("chat-msg-bubble");
+    for (const bubble of bubbles) fireEvent.mouseEnter(bubble);
+
+    expect(screen.queryByRole("button", { name: "Excluir mensagem" })).not.toBeInTheDocument();
+    expect(screen.getByText("Mensagem removida.")).toBeInTheDocument();
+    expect(screen.queryByText("conteúdo residual")).not.toBeInTheDocument();
+  });
+
+  it("replaces a reply quote when the referenced message is deleted over WebSocket", async () => {
+    const original = ownMessage();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        original,
+        makeMessage({
+          id: "reply",
+          bodyText: "resposta",
+          quoted: {
+            id: original.id,
+            authorId: original.senderId,
+            bodyText: original.bodyText,
+            bodyFormat: "v1",
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: original.createdAt,
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+    expect(await screen.findAllByText("Conteúdo privado")).toHaveLength(2);
+
+    act(() =>
+      wsMockState.capturedWSMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_update: {
+          message_id: original.id,
+          channel_id: "geral",
+          body: "",
+          body_format: "v1",
+          edited_at: "",
+          edit_count: 0,
+          is_edited: false,
+          status: "deleted",
+          is_removed: true,
+          deleted_at: "2026-07-14T12:00:00Z",
+        },
+      }),
+    );
+
+    expect(await screen.findByText("Mensagem removida.")).toBeInTheDocument();
+    expect(screen.getByText("Mensagem original indisponível.")).toBeInTheDocument();
+    expect(screen.queryByText("Conteúdo privado")).not.toBeInTheDocument();
+    expect(screen.getByText("resposta")).toBeInTheDocument();
   });
 });
