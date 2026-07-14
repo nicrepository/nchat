@@ -269,6 +269,7 @@ interface MessageListProps {
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   onEditMessage: MessageBubbleProps["onEditMessage"];
   onEditForbidden: MessageBubbleProps["onEditForbidden"];
+  onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
   editDisabledIds: Set<string>;
   channelId?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -291,6 +292,7 @@ function MessageList({
   onToggleFavorite,
   onEditMessage,
   onEditForbidden,
+  onDeleteMessage,
   editDisabledIds,
   channelId,
   onTogglePin,
@@ -504,6 +506,7 @@ function MessageList({
             onToggleFavorite={onToggleFavorite}
             onEditMessage={onEditMessage}
             onEditForbidden={onEditForbidden}
+            onDeleteMessage={onDeleteMessage}
             editDisabled={editDisabledIds.has(item.message.id)}
             channelId={channelId}
             onTogglePin={onTogglePin}
@@ -650,12 +653,14 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     toggleReaction,
     toggleFavorite,
     editMessageLocal,
+    deleteMessageLocal,
   } = useMessages({
     kind,
     targetId,
     currentUserId: ctx.currentUserId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
+    onMessageRemoved: reloadPins,
   });
 
   useEffect(() => {
@@ -751,6 +756,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onToggleFavorite={toggleFavorite}
           onEditMessage={editMessageLocal}
           onEditForbidden={handleEditForbidden}
+          onDeleteMessage={deleteMessageLocal}
           editDisabledIds={editDisabledIds}
           channelId={kind === "channel" ? targetId : undefined}
           onTogglePin={togglePin}

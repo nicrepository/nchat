@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
+  deleteMessage as deleteMessageRequest,
   editMessage as editMessageRequest,
   favoriteMessage,
   fetchChannelMessage,
@@ -116,6 +117,8 @@ type Action =
   | { type: "edit_confirmed"; message: Message }
   | { type: "edit_revert"; message: Message; optimisticEditedAt: string }
   | { type: "message_updated"; event: WSMessageUpdatedEvent }
+  | { type: "message_snapshot"; message: Message; insertIfMissing: boolean }
+  | { type: "delete_error"; error: string }
   | { type: "reaction_updated"; event: WSReactionUpdatedEvent; actorIsMe: boolean }
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
@@ -149,6 +152,27 @@ function toggleOptimisticReaction(
   return reactions.map((item, i) =>
     i === index ? { ...item, count: item.count - 1, reactedByMe: false } : item,
   );
+}
+
+function insertMessageChronologically(
+  messages: Message[],
+  message: Message,
+): { messages: Message[]; isNewer: boolean } {
+  const isNewer =
+    messages.length === 0 ||
+    message.createdAt > messages[messages.length - 1].createdAt ||
+    (message.createdAt === messages[messages.length - 1].createdAt &&
+      message.id > messages[messages.length - 1].id);
+  return {
+    messages: isNewer
+      ? [...messages, message]
+      : [...messages, message].sort((a, b) => {
+          if (a.createdAt < b.createdAt) return -1;
+          if (a.createdAt > b.createdAt) return 1;
+          return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+        }),
+    isNewer,
+  };
 }
 
 const initialState: MessagesState = {
@@ -245,28 +269,15 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       // Insert in stable (createdAt, id) order to handle out-of-order delivery.
       // Most WS messages are newer than all existing ones, so a quick tail-check
       // avoids a full sort in the common case.
-      const msg = action.message;
-      const msgs = state.messages;
-      const isNewer =
-        msgs.length === 0 ||
-        msg.createdAt > msgs[msgs.length - 1].createdAt ||
-        (msg.createdAt === msgs[msgs.length - 1].createdAt && msg.id > msgs[msgs.length - 1].id);
-
-      const newMessages = isNewer
-        ? [...msgs, msg]
-        : [...msgs, msg].sort((a, b) => {
-            if (a.createdAt < b.createdAt) return -1;
-            if (a.createdAt > b.createdAt) return 1;
-            return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-          });
+      const insertion = insertMessageChronologically(state.messages, action.message);
 
       return {
         ...state,
-        messages: newMessages,
+        messages: insertion.messages,
         // ws_append: MessageList scrolls to bottom only if the user is already
         // near the bottom, preserving position when reading history.
         // If the message was inserted mid-list (out-of-order), no auto-scroll.
-        lastMutation: isNewer ? "ws_append" : "none",
+        lastMutation: insertion.isNewer ? "ws_append" : "none",
         realtimeError: null,
       };
     }
@@ -290,7 +301,9 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       return {
         ...state,
         messages: state.messages.map((message) =>
-          message.id === action.message.id && action.message.editCount >= message.editCount
+          message.id === action.message.id &&
+          !message.isRemoved &&
+          action.message.editCount >= message.editCount
             ? {
                 ...message,
                 bodyText: action.message.bodyText,
@@ -308,7 +321,9 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       return {
         ...state,
         messages: state.messages.map((message) =>
-          message.id === action.message.id && message.editedAt === action.optimisticEditedAt
+          message.id === action.message.id &&
+          !message.isRemoved &&
+          message.editedAt === action.optimisticEditedAt
             ? action.message
             : message,
         ),
@@ -316,27 +331,89 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       };
     case "message_updated": {
       const update = action.event.message_update;
+      if (!update) return state;
+      const removed = update.is_removed === true || update.status === "deleted";
+      const deletedAt = update.deleted_at ?? update.updated_at ?? null;
       return {
         ...state,
-        messages: state.messages.map((message) =>
-          message.id === update.message_id
-            ? update.edit_count < message.editCount
+        messages: state.messages.map((message) => {
+          if (message.id === update.message_id) {
+            if (message.isRemoved || removed) {
+              return removed
+                ? {
+                    ...message,
+                    bodyText: "",
+                    quoted: undefined,
+                    reactions: [],
+                    status: "deleted" as const,
+                    isRemoved: true,
+                    deletedAt,
+                    updatedAt: update.updated_at ?? deletedAt ?? message.updatedAt,
+                  }
+                : message;
+            }
+            return update.edit_count < message.editCount
               ? message
               : {
                   ...message,
                   bodyText: update.body,
                   bodyFormat: normalizeBodyFormat(update.body_format),
                   editedAt: update.edited_at,
-                  updatedAt: update.edited_at,
+                  updatedAt: update.updated_at ?? update.edited_at,
                   editCount: update.edit_count,
                   isEdited: update.is_edited,
-                }
-            : message,
-        ),
+                };
+          }
+          if (removed && message.quoted?.id === update.message_id) {
+            return {
+              ...message,
+              quoted: { ...message.quoted, bodyText: "", isRemoved: true, deletedAt },
+            };
+          }
+          return message;
+        }),
+        replyTo: removed && state.replyTo?.id === update.message_id ? null : state.replyTo,
         lastMutation: "none",
         realtimeError: null,
       };
     }
+    case "message_snapshot": {
+      const removed = action.message.isRemoved || action.message.status === "deleted";
+      const snapshot = removed
+        ? { ...action.message, bodyText: "", quoted: undefined, reactions: [] }
+        : action.message;
+      const alreadyPresent = state.messages.some((message) => message.id === snapshot.id);
+      let insertedAsNewer = false;
+      let messages = state.messages.map((message) => {
+        if (message.id === snapshot.id) return message.isRemoved && !removed ? message : snapshot;
+        if (removed && message.quoted?.id === snapshot.id) {
+          return {
+            ...message,
+            quoted: {
+              ...message.quoted,
+              bodyText: "",
+              isRemoved: true,
+              deletedAt: snapshot.deletedAt ?? snapshot.updatedAt,
+            },
+          };
+        }
+        return message;
+      });
+      if (!alreadyPresent && action.insertIfMissing) {
+        const insertion = insertMessageChronologically(messages, snapshot);
+        messages = insertion.messages;
+        insertedAsNewer = insertion.isNewer;
+      }
+      return {
+        ...state,
+        messages,
+        replyTo: removed && state.replyTo?.id === snapshot.id ? null : state.replyTo,
+        lastMutation: insertedAsNewer ? "ws_append" : "none",
+        realtimeError: null,
+      };
+    }
+    case "delete_error":
+      return { ...state, actionError: action.error };
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
     case "reaction_error": {
@@ -455,6 +532,7 @@ interface UseMessagesOptions {
   onOwnReactionConfirmed?: (emoji: string) => void;
   /** RF-05: called on a pin.updated event for the active target (refetch pins). */
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
+  onMessageRemoved?: () => void;
 }
 
 export interface UseMessagesResult {
@@ -471,6 +549,7 @@ export interface UseMessagesResult {
     body: string,
     bodyFormat: Message["bodyFormat"],
   ) => Promise<Message>;
+  deleteMessageLocal: (messageId: string) => Promise<void>;
 }
 
 export function useMessages({
@@ -479,6 +558,7 @@ export function useMessages({
   currentUserId,
   onOwnReactionConfirmed,
   onPinUpdated,
+  onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
 
@@ -509,14 +589,71 @@ export function useMessages({
 
   const abortRef = useRef<AbortController | null>(null);
   const loadMoreAbortRef = useRef<AbortController | null>(null);
-  const wsFallbackAbortRef = useRef<AbortController | null>(null);
+  const wsFallbackAbortRefs = useRef<Map<string, AbortController>>(new Map());
+  const deletedMessageTombstonesRef = useRef<Map<string, string | null>>(new Map());
+  const deletedMessageTombstoneTargetRef = useRef(`${kind}:${targetId}`);
   const pendingReactionTimersRef = useRef<Map<string, number>>(new Map());
+  const onMessageRemovedRef = useRef(onMessageRemoved);
+  useLayoutEffect(() => {
+    onMessageRemovedRef.current = onMessageRemoved;
+  }, [onMessageRemoved]);
   const clearReactionTimer = useCallback((messageId: string) => {
     const timer = pendingReactionTimersRef.current.get(messageId);
     if (timer !== undefined) {
       window.clearTimeout(timer);
       pendingReactionTimersRef.current.delete(messageId);
     }
+  }, []);
+
+  const abortWsFallbacks = useCallback(() => {
+    for (const ctrl of wsFallbackAbortRefs.current.values()) ctrl.abort();
+    wsFallbackAbortRefs.current.clear();
+  }, []);
+
+  const startWsFallback = useCallback((key: string) => {
+    wsFallbackAbortRefs.current.get(key)?.abort();
+    const ctrl = new AbortController();
+    wsFallbackAbortRefs.current.set(key, ctrl);
+    return ctrl;
+  }, []);
+
+  const cancelWsFallback = useCallback((key: string) => {
+    const ctrl = wsFallbackAbortRefs.current.get(key);
+    ctrl?.abort();
+    wsFallbackAbortRefs.current.delete(key);
+  }, []);
+
+  const finishWsFallback = useCallback((key: string, ctrl: AbortController) => {
+    if (wsFallbackAbortRefs.current.get(key) === ctrl) {
+      wsFallbackAbortRefs.current.delete(key);
+    }
+  }, []);
+
+  const sanitizeTombstonedMessage = useCallback((message: Message): Message => {
+    if (deletedMessageTombstonesRef.current.has(message.id)) {
+      return {
+        ...message,
+        bodyText: "",
+        quoted: undefined,
+        reactions: [],
+        isRemoved: true,
+        status: "deleted",
+        deletedAt: deletedMessageTombstonesRef.current.get(message.id) ?? message.deletedAt,
+      };
+    }
+    if (message.quoted && deletedMessageTombstonesRef.current.has(message.quoted.id)) {
+      return {
+        ...message,
+        quoted: {
+          ...message.quoted,
+          bodyText: "",
+          isRemoved: true,
+          deletedAt:
+            deletedMessageTombstonesRef.current.get(message.quoted.id) ?? message.quoted.deletedAt,
+        },
+      };
+    }
+    return message;
   }, []);
 
   const isCurrentTarget = useCallback((loadKey: string) => {
@@ -529,13 +666,17 @@ export function useMessages({
 
   const load = useCallback(
     (id: string, k: "channel" | "dm") => {
+      const loadKey = `${k}:${id}`;
       abortRef.current?.abort();
       loadMoreAbortRef.current?.abort();
-      wsFallbackAbortRef.current?.abort();
+      abortWsFallbacks();
+      if (deletedMessageTombstoneTargetRef.current !== loadKey) {
+        deletedMessageTombstonesRef.current.clear();
+        deletedMessageTombstoneTargetRef.current = loadKey;
+      }
       const ctrl = new AbortController();
       abortRef.current = ctrl;
 
-      const loadKey = `${k}:${id}`;
       dispatch({ type: "loading" });
 
       const fetchFn: () => Promise<MessagePage> =
@@ -546,7 +687,10 @@ export function useMessages({
       fetchFn().then(
         (page) => {
           if (!isCurrentTarget(loadKey)) return;
-          dispatch({ type: "loaded", page });
+          dispatch({
+            type: "loaded",
+            page: { ...page, messages: page.messages.map(sanitizeTombstonedMessage) },
+          });
         },
         (err: unknown) => {
           if (!isCurrentTarget(loadKey)) return;
@@ -558,12 +702,12 @@ export function useMessages({
       return () => {
         ctrl.abort();
         loadMoreAbortRef.current?.abort();
-        wsFallbackAbortRef.current?.abort();
+        abortWsFallbacks();
         for (const timer of pendingReactionTimersRef.current.values()) window.clearTimeout(timer);
         pendingReactionTimersRef.current.clear();
       };
     },
-    [isCurrentTarget],
+    [abortWsFallbacks, isCurrentTarget, sanitizeTombstonedMessage],
   );
 
   useEffect(() => {
@@ -602,7 +746,10 @@ export function useMessages({
       (page) => {
         stateRef.current.loadingMore = false;
         if (!isCurrentTarget(loadKey)) return;
-        dispatch({ type: "prepended", page });
+        dispatch({
+          type: "prepended",
+          page: { ...page, messages: page.messages.map(sanitizeTombstonedMessage) },
+        });
       },
       (err: unknown) => {
         stateRef.current.loadingMore = false;
@@ -611,7 +758,7 @@ export function useMessages({
         dispatch({ type: "prepend_error" });
       },
     );
-  }, [kind, targetId, isCurrentTarget]);
+  }, [kind, targetId, isCurrentTarget, sanitizeTombstonedMessage]);
 
   const sendMessage = useCallback(
     async (body: string): Promise<SendResult> => {
@@ -630,7 +777,7 @@ export function useMessages({
         const msg = await sendFn();
 
         if (stateRef.current.target !== sendKey) return { status: "stale" };
-        dispatch({ type: "sent", message: msg });
+        dispatch({ type: "sent", message: sanitizeTombstonedMessage(msg) });
         return { status: "sent" };
       } catch (err: unknown) {
         // Stale failure: silently discard — do not update state for a previous target.
@@ -641,7 +788,7 @@ export function useMessages({
         throw err;
       }
     },
-    [kind, targetId],
+    [kind, sanitizeTombstonedMessage, targetId],
   );
 
   // Handle incoming message.created WS events.
@@ -662,19 +809,21 @@ export function useMessages({
       if (evt.target_id !== targetId) return;
 
       if (evt.payload) {
-        wsFallbackAbortRef.current?.abort();
+        cancelWsFallback(`created:${evt.message_id}`);
         // Build Message from the full DTO carried in the event.
         const p = evt.payload;
+        const removed = p.is_removed || p.status === "deleted" || Boolean(p.deleted_at);
         const msg: Message = {
           id: p.id,
           senderId: p.sender_id,
           senderDisplayName: p.sender_display_name,
           senderEmail: p.sender_email ?? "",
           kind: p.kind as Message["kind"],
-          bodyText: p.body_text,
+          bodyText: removed ? "" : p.body_text,
           bodyFormat: normalizeBodyFormat(p.body_format),
-          isRemoved: p.is_removed,
-          status: p.status as Message["status"],
+          isRemoved: removed,
+          status: removed ? "deleted" : "active",
+          deletedAt: p.deleted_at ?? null,
           createdAt: p.created_at,
           updatedAt: p.updated_at,
           isEdited: Boolean(p.edited_at),
@@ -684,27 +833,27 @@ export function useMessages({
           // WS create events never carry the caller's favorite state; a message
           // just created cannot be favorited yet.
           isFavorited: false,
-          quoted: p.quoted
-            ? {
-                id: p.quoted.id,
-                authorId: p.quoted.author_id,
-                bodyText: p.quoted.body ?? "",
-                bodyFormat: normalizeBodyFormat(p.quoted.body_format),
-                isRemoved: p.quoted.is_removed ?? false,
-                deletedAt: p.quoted.deleted_at ?? null,
-                createdAt: p.quoted.created_at ?? "",
-              }
-            : undefined,
+          quoted:
+            !removed && p.quoted
+              ? {
+                  id: p.quoted.id,
+                  authorId: p.quoted.author_id,
+                  bodyText: p.quoted.body ?? "",
+                  bodyFormat: normalizeBodyFormat(p.quoted.body_format),
+                  isRemoved: p.quoted.is_removed ?? false,
+                  deletedAt: p.quoted.deleted_at ?? null,
+                  createdAt: p.quoted.created_at ?? "",
+                }
+              : undefined,
         };
         if (!isCurrentTarget(loadKey)) return;
-        dispatch({ type: "ws_received", message: msg });
+        dispatch({ type: "ws_received", message: sanitizeTombstonedMessage(msg) });
         return;
       }
 
       // Fallback: payload absent — fetch the message by ID.
-      wsFallbackAbortRef.current?.abort();
-      const ctrl = new AbortController();
-      wsFallbackAbortRef.current = ctrl;
+      const fallbackKey = `created:${evt.message_id}`;
+      const ctrl = startWsFallback(fallbackKey);
       const fetchFn =
         kind === "channel"
           ? () => fetchChannelMessage(targetId, evt.message_id, ctrl.signal)
@@ -712,24 +861,34 @@ export function useMessages({
 
       fetchFn().then(
         (msg) => {
+          finishWsFallback(fallbackKey, ctrl);
+          if (ctrl.signal.aborted) return;
           if (!isCurrentTarget(loadKey)) return;
-          dispatch({ type: "ws_received", message: msg });
+          dispatch({ type: "ws_received", message: sanitizeTombstonedMessage(msg) });
         },
         (err: unknown) => {
+          finishWsFallback(fallbackKey, ctrl);
           if (!isCurrentTarget(loadKey)) return;
           if (err instanceof Error && err.name === "AbortError") return;
           dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
         },
       );
     },
-    [kind, targetId, isCurrentTarget],
+    [
+      cancelWsFallback,
+      finishWsFallback,
+      kind,
+      targetId,
+      isCurrentTarget,
+      sanitizeTombstonedMessage,
+      startWsFallback,
+    ],
   );
 
   const fetchReactionSnapshot = useCallback(
     (messageId: string) => {
-      wsFallbackAbortRef.current?.abort();
-      const ctrl = new AbortController();
-      wsFallbackAbortRef.current = ctrl;
+      const fallbackKey = `reaction:${messageId}`;
+      const ctrl = startWsFallback(fallbackKey);
       const loadKey = `${kind}:${targetId}`;
       const fetchFn =
         kind === "channel"
@@ -737,6 +896,8 @@ export function useMessages({
           : () => fetchDMMessage(targetId, messageId, ctrl.signal);
       fetchFn().then(
         (message) => {
+          finishWsFallback(fallbackKey, ctrl);
+          if (ctrl.signal.aborted) return;
           if (!isCurrentTarget(loadKey)) return;
           clearReactionTimer(message.id);
           dispatch({
@@ -746,6 +907,7 @@ export function useMessages({
           });
         },
         (err: unknown) => {
+          finishWsFallback(fallbackKey, ctrl);
           if (err instanceof Error && err.name === "AbortError") return;
           if (isCurrentTarget(loadKey)) {
             dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
@@ -753,7 +915,7 @@ export function useMessages({
         },
       );
     },
-    [clearReactionTimer, isCurrentTarget, kind, targetId],
+    [clearReactionTimer, finishWsFallback, isCurrentTarget, kind, startWsFallback, targetId],
   );
 
   const handleReactionUpdated = useCallback(
@@ -782,14 +944,72 @@ export function useMessages({
     ],
   );
 
+  const fetchMessageUpdateSnapshot = useCallback(
+    (messageId: string, insertIfMissing: boolean) => {
+      const fallbackKey = `updated:${messageId}`;
+      const ctrl = startWsFallback(fallbackKey);
+      const loadKey = `${kind}:${targetId}`;
+      const fetchFn =
+        kind === "channel"
+          ? () => fetchChannelMessage(targetId, messageId, ctrl.signal)
+          : () => fetchDMMessage(targetId, messageId, ctrl.signal);
+      void fetchFn().then(
+        (message) => {
+          finishWsFallback(fallbackKey, ctrl);
+          if (ctrl.signal.aborted || !isCurrentTarget(loadKey)) return;
+          const removed = message.isRemoved || message.status === "deleted";
+          if (removed) {
+            deletedMessageTombstonesRef.current.set(
+              message.id,
+              message.deletedAt ?? message.updatedAt,
+            );
+          }
+          const snapshot = sanitizeTombstonedMessage(message);
+          dispatch({ type: "message_snapshot", message: snapshot, insertIfMissing });
+          if (snapshot.isRemoved) onMessageRemovedRef.current?.();
+        },
+        (error: unknown) => {
+          finishWsFallback(fallbackKey, ctrl);
+          if (error instanceof Error && error.name === "AbortError") return;
+          if (isCurrentTarget(loadKey)) {
+            dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
+          }
+        },
+      );
+    },
+    [finishWsFallback, isCurrentTarget, kind, sanitizeTombstonedMessage, startWsFallback, targetId],
+  );
+
   const handleMessageUpdated = useCallback(
     (event: WSMessageUpdatedEvent) => {
-      if (event.target_id !== targetId || !isMessageRendered(event.message_update.message_id)) {
+      if (event.target_id !== targetId) return;
+      if (event.message_update) {
+        const messageId = event.message_update.message_id;
+        if (event.message_update.is_removed || event.message_update.status === "deleted") {
+          deletedMessageTombstonesRef.current.set(
+            messageId,
+            event.message_update.deleted_at ?? event.message_update.updated_at ?? null,
+          );
+        }
+        cancelWsFallback(`updated:${messageId}`);
+        const createdFallbackKey = `created:${messageId}`;
+        if (wsFallbackAbortRefs.current.has(createdFallbackKey) && !isMessageRendered(messageId)) {
+          cancelWsFallback(createdFallbackKey);
+          fetchMessageUpdateSnapshot(messageId, true);
+        }
+        dispatch({ type: "message_updated", event });
+        if (event.message_update.is_removed || event.message_update.status === "deleted") {
+          onMessageRemovedRef.current?.();
+        }
         return;
       }
-      dispatch({ type: "message_updated", event });
+
+      const messageId = event.message_id;
+      if (!messageId) return;
+      const insertIfMissing = wsFallbackAbortRefs.current.has(`created:${messageId}`);
+      fetchMessageUpdateSnapshot(messageId, insertIfMissing);
     },
-    [isMessageRendered, targetId],
+    [cancelWsFallback, fetchMessageUpdateSnapshot, isMessageRendered, targetId],
   );
 
   const handleReactionError = useCallback((event: WSClientErrorEvent) => {
@@ -905,6 +1125,36 @@ export function useMessages({
     [kind, targetId],
   );
 
+  const deleteMessageLocal = useCallback(
+    async (messageId: string) => {
+      const deleteKey = `${kind}:${targetId}`;
+      try {
+        const deleted = await deleteMessageRequest(messageId);
+        if (stateRef.current.target === deleteKey) {
+          deletedMessageTombstonesRef.current.set(
+            deleted.id,
+            deleted.deletedAt ?? deleted.updatedAt,
+          );
+          dispatch({
+            type: "message_snapshot",
+            message: sanitizeTombstonedMessage(deleted),
+            insertIfMissing: false,
+          });
+          onMessageRemovedRef.current?.();
+        }
+      } catch (error) {
+        if (stateRef.current.target === deleteKey) {
+          dispatch({
+            type: "delete_error",
+            error: "Não foi possível excluir a mensagem. Tente novamente.",
+          });
+        }
+        throw error;
+      }
+    },
+    [kind, sanitizeTombstonedMessage, targetId],
+  );
+
   return {
     state,
     sendMessage,
@@ -915,5 +1165,6 @@ export function useMessages({
     toggleReaction,
     toggleFavorite,
     editMessageLocal,
+    deleteMessageLocal,
   };
 }

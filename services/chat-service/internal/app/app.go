@@ -264,11 +264,26 @@ func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID,
 }
 
 func (b *hubBroadcaster) PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
-	b.hub.PublishMessageUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, ws.MessageUpdatedPayload{
+	b.hub.PublishMessageUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, domainMessageToWSUpdatedPayload(msg))
+}
+
+func domainMessageToWSUpdatedPayload(msg domain.Message) ws.MessageUpdatedPayload {
+	removed := msg.Status == domain.MessageStatusDeleted || !msg.DeletedAt.IsZero()
+	var deletedAt *time.Time
+	if !msg.DeletedAt.IsZero() {
+		t := msg.DeletedAt
+		deletedAt = &t
+	}
+	body := msg.BodyText
+	if removed {
+		body = ""
+	}
+	return ws.MessageUpdatedPayload{
 		MessageID: msg.ID, ChannelID: msg.ChannelID, DMID: msg.DMConversationID,
-		Body: msg.BodyText, BodyFormat: string(msg.BodyFormat), EditedAt: msg.EditedAt,
-		EditCount: msg.EditCount, IsEdited: true,
-	})
+		Body: body, BodyFormat: string(msg.BodyFormat), EditedAt: msg.EditedAt,
+		EditCount: msg.EditCount, IsEdited: msg.EditCount > 0,
+		Status: string(msg.Status), IsRemoved: removed, DeletedAt: deletedAt, UpdatedAt: msg.UpdatedAt,
+	}
 }
 
 // PublishPinUpdated adapts the hub for the RF-05 pin broadcaster interface.
@@ -286,6 +301,12 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		t := msg.DeletedAt
 		deletedAt = &t
 	}
+	removed := msg.Status == domain.MessageStatusDeleted || deletedAt != nil
+	body := msg.BodyText
+	quoted := domainQuoteToWSPayload(msg.Quoted)
+	if removed {
+		body, quoted = "", nil
+	}
 	return ws.MessagePayload{
 		ID:                msg.ID,
 		WorkspaceID:       msg.WorkspaceID,
@@ -294,15 +315,15 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		SenderID:          msg.SenderID,
 		SenderDisplayName: msg.SenderDisplayName,
 		Kind:              string(msg.Kind),
-		BodyText:          msg.BodyText,
+		BodyText:          body,
 		BodyFormat:        string(msg.BodyFormat),
 		Status:            string(msg.Status),
-		IsRemoved:         msg.Status == domain.MessageStatusDeleted || deletedAt != nil,
+		IsRemoved:         removed,
 		CreatedAt:         msg.CreatedAt,
 		UpdatedAt:         msg.UpdatedAt,
 		EditedAt:          editedAt,
 		DeletedAt:         deletedAt,
-		Quoted:            domainQuoteToWSPayload(msg.Quoted),
+		Quoted:            quoted,
 	}
 }
 

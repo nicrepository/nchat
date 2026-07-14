@@ -92,6 +92,13 @@ type EditMessageInput struct {
 	BodyFormat  domain.MessageBodyFormat
 }
 
+// DeleteMessageInput contains only server-derived identity and scope fields.
+type DeleteMessageInput struct {
+	WorkspaceID string
+	MessageID   string
+	RequesterID string
+}
+
 // ListMessageEditHistoryInput identifies one authorized history page.
 type ListMessageEditHistoryInput struct {
 	WorkspaceID string
@@ -138,6 +145,7 @@ type MessageStore interface {
 	// callers cannot determine whether the referenced message exists.
 	CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error)
 	EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error)
+	DeleteMessage(ctx context.Context, input DeleteMessageInput) (domain.Message, bool, error)
 	ListMessageEditHistory(ctx context.Context, input ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
 
 	// GetMessageByIDInWorkspace returns the message only if it belongs to workspaceID.
@@ -549,6 +557,72 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 	return updated, nil
 }
 
+// DeleteMessage atomically re-checks read access and authorship, then marks the
+// row deleted. The bool reports whether this call performed the state change.
+func (s *PGXMessageStore) DeleteMessage(ctx context.Context, input DeleteMessageInput) (domain.Message, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Message{}, false, fmt.Errorf("begin message delete: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var current domain.Message
+	var deletedAt *time.Time
+	var databaseNow time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT m.sender_id::text, m.kind, m.status, m.deleted_at, clock_timestamp()
+		FROM chat.messages m`+messageAccessJoins("$3")+`
+		WHERE m.workspace_id = $1 AND m.id = $2
+		  AND `+messageAccessPredicate+`
+		FOR UPDATE OF m`,
+		input.WorkspaceID, input.MessageID, input.RequesterID,
+	).Scan(&current.SenderID, (*string)(&current.Kind), (*string)(&current.Status), &deletedAt, &databaseNow)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, false, domain.ErrNotFound
+		}
+		return domain.Message{}, false, fmt.Errorf("lock deletable message: %w", err)
+	}
+	if deletedAt != nil {
+		current.DeletedAt = *deletedAt
+	}
+	if err := domain.ValidateMessageDelete(current, input.RequesterID); err != nil {
+		return domain.Message{}, false, err
+	}
+
+	changed := current.Status != domain.MessageStatusDeleted || deletedAt == nil
+	if changed {
+		tag, err := tx.Exec(ctx, `
+			UPDATE chat.messages
+			SET status = 'deleted', deleted_at = COALESCE(deleted_at, $4), updated_at = $4
+			WHERE id = $1 AND workspace_id = $2 AND sender_id = $3`,
+			input.MessageID, input.WorkspaceID, input.RequesterID, databaseNow,
+		)
+		if err != nil {
+			return domain.Message{}, false, fmt.Errorf("soft delete message: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.Message{}, false, domain.ErrNotFound
+		}
+	}
+
+	row := tx.QueryRow(ctx, `
+		SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
+		FROM chat.messages m
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
+		WHERE m.id = $1 AND m.workspace_id = $2`,
+		input.MessageID, input.WorkspaceID, input.RequesterID,
+	)
+	deleted, err := scanMessageWithSenderAndQuote(row)
+	if err != nil {
+		return domain.Message{}, false, fmt.Errorf("read deleted message: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Message{}, false, fmt.Errorf("commit message delete: %w", err)
+	}
+	return deleted, changed, nil
+}
+
 func (s *PGXMessageStore) ListMessageEditHistory(ctx context.Context, input ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
 	limit := resolveLimit(input.Limit)
 	offset := max(input.Offset, 0)
@@ -557,6 +631,7 @@ func (s *PGXMessageStore) ListMessageEditHistory(ctx context.Context, input List
 			SELECT m.id
 			FROM chat.messages m`+messageAccessJoins("$3")+`
 			WHERE m.workspace_id = $1 AND m.id = $2
+			  AND m.status = 'active' AND m.deleted_at IS NULL
 			  AND `+messageAccessPredicate+`
 		)
 		SELECT COALESCE(h.id::text, ''), COALESCE(h.message_id::text, ''),

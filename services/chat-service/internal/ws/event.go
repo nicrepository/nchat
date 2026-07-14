@@ -65,16 +65,20 @@ type MessagePayload struct {
 	Quoted            *QuotePayload `json:"quoted,omitempty"`
 }
 
-// MessageUpdatedPayload carries the authoritative post-edit fields.
+// MessageUpdatedPayload carries authoritative edit or deletion fields.
 type MessageUpdatedPayload struct {
-	MessageID  string    `json:"message_id"`
-	ChannelID  string    `json:"channel_id,omitempty"`
-	DMID       string    `json:"dm_id,omitempty"`
-	Body       string    `json:"body"`
-	BodyFormat string    `json:"body_format"`
-	EditedAt   time.Time `json:"edited_at"`
-	EditCount  int       `json:"edit_count"`
-	IsEdited   bool      `json:"is_edited"`
+	MessageID  string     `json:"message_id"`
+	ChannelID  string     `json:"channel_id,omitempty"`
+	DMID       string     `json:"dm_id,omitempty"`
+	Body       string     `json:"body"`
+	BodyFormat string     `json:"body_format"`
+	EditedAt   time.Time  `json:"edited_at"`
+	EditCount  int        `json:"edit_count"`
+	IsEdited   bool       `json:"is_edited"`
+	Status     string     `json:"status"`
+	IsRemoved  bool       `json:"is_removed"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 type QuotePayload struct {

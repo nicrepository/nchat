@@ -92,7 +92,9 @@ export interface WSMessageUpdatedEvent {
   type: "message.updated";
   target_type: "channel" | "dm";
   target_id: string;
-  message_update: {
+  /** Present on route-only events relayed through another server instance. */
+  message_id?: string;
+  message_update?: {
     message_id: string;
     channel_id?: string;
     dm_id?: string;
@@ -101,6 +103,10 @@ export interface WSMessageUpdatedEvent {
     edited_at: string;
     edit_count: number;
     is_edited: boolean;
+    status?: "active" | "deleted";
+    is_removed?: boolean;
+    deleted_at?: string | null;
+    updated_at?: string;
   };
 }
 
@@ -108,6 +114,7 @@ function isMessageUpdatedEvent(
   value: Record<string, unknown>,
 ): value is Record<string, unknown> & WSMessageUpdatedEvent {
   const update = value["message_update"];
+  if (update === undefined) return typeof value["message_id"] === "string";
   if (!update || typeof update !== "object") return false;
   const payload = update as Record<string, unknown>;
   return (
@@ -118,7 +125,15 @@ function isMessageUpdatedEvent(
       payload["body_format"] === "v3") &&
     typeof payload["edited_at"] === "string" &&
     typeof payload["edit_count"] === "number" &&
-    typeof payload["is_edited"] === "boolean"
+    typeof payload["is_edited"] === "boolean" &&
+    (payload["status"] === undefined ||
+      payload["status"] === "active" ||
+      payload["status"] === "deleted") &&
+    (payload["is_removed"] === undefined || typeof payload["is_removed"] === "boolean") &&
+    (payload["deleted_at"] === undefined ||
+      payload["deleted_at"] === null ||
+      typeof payload["deleted_at"] === "string") &&
+    (payload["updated_at"] === undefined || typeof payload["updated_at"] === "string")
   );
 }
 

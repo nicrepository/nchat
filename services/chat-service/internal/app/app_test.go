@@ -325,7 +325,7 @@ func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1", SenderID: "user-1",
 		BodyText: "hello", EditedAt: now, DeletedAt: now,
 	})
-	if got.ID != "message-1" || got.WorkspaceID != "workspace-1" || got.ChannelID != "channel-1" || got.SenderID != "user-1" || got.BodyText != "hello" {
+	if got.ID != "message-1" || got.WorkspaceID != "workspace-1" || got.ChannelID != "channel-1" || got.SenderID != "user-1" || got.BodyText != "" {
 		t.Fatalf("unexpected payload: %+v", got)
 	}
 	if !got.IsRemoved || got.EditedAt == nil || got.DeletedAt == nil {
@@ -338,6 +338,18 @@ func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 	})
 	if !got.IsRemoved || got.DeletedAt != nil {
 		t.Fatalf("deleted status without timestamp must still map as removed: %+v", got)
+	}
+}
+
+func TestDomainMessageToWSUpdatedPayloadWithholdsDeletedBody(t *testing.T) {
+	now := time.Now().UTC()
+	got := domainMessageToWSUpdatedPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		BodyText: "deleted secret", BodyFormat: domain.MessageBodyFormatV3,
+		Status: domain.MessageStatusDeleted, DeletedAt: now, UpdatedAt: now,
+	})
+	if got.Body != "" || !got.IsRemoved || got.Status != "deleted" || got.DeletedAt == nil || !got.UpdatedAt.Equal(now) {
+		t.Fatalf("deleted update was not sanitized: %+v", got)
 	}
 }
 

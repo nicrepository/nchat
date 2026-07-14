@@ -704,6 +704,113 @@ func TestPGXMessageStore_EditMessage_MissingSnapshotRowRollsBack(t *testing.T) {
 	checkExpectations(t, mock)
 }
 
+func TestPGXMessageStore_DeleteMessage_SoftDeletesAndPreservesRow(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now().UTC()
+	createdAt := now.Add(-time.Hour)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text, m\.kind, m\.status, m\.deleted_at, clock_timestamp\(\).*FOR UPDATE OF m`).
+		WithArgs("ws-1", "msg-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "now"}).
+			AddRow("user-1", "user", "active", nil, now))
+	mock.ExpectExec(`(?s)UPDATE chat\.messages.*status = 'deleted'.*sender_id = \$3`).
+		WithArgs("msg-1", "ws-1", "user-1", now).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	row := listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", createdAt)
+	row[8], row[14], row[16] = "deleted", &now, now
+	mock.ExpectQuery(`(?s)SELECT .*FROM chat\.messages m.*WHERE m\.id = \$1 AND m\.workspace_id = \$2`).
+		WithArgs("msg-1", "ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
+	mock.ExpectCommit()
+
+	message, changed, err := storage.NewPGXMessageStore(mock).DeleteMessage(t.Context(), storage.DeleteMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: "user-1",
+	})
+	if err != nil || !changed {
+		t.Fatalf("DeleteMessage = %+v, changed=%v, err=%v", message, changed, err)
+	}
+	if message.Status != domain.MessageStatusDeleted || message.DeletedAt.IsZero() || message.BodyText != "hello" || !message.CreatedAt.Equal(createdAt) {
+		t.Fatalf("soft-deleted row not preserved: %+v", message)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_DeleteMessage_RejectsOtherAuthorWithoutUpdate(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now().UTC()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
+		WithArgs("ws-1", "msg-1", "user-2").
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "now"}).
+			AddRow("user-1", "user", "active", nil, now))
+	mock.ExpectRollback()
+
+	_, changed, err := storage.NewPGXMessageStore(mock).DeleteMessage(t.Context(), storage.DeleteMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: "user-2",
+	})
+	if !errors.Is(err, domain.ErrForbidden) || changed {
+		t.Fatalf("expected forbidden unchanged delete, changed=%v err=%v", changed, err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_DeleteMessage_HidesMissingOrInaccessibleScope(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*m\.workspace_id = \$1.*FOR UPDATE OF m`).
+		WithArgs("other-workspace", "msg-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "now"}))
+	mock.ExpectRollback()
+
+	_, changed, err := storage.NewPGXMessageStore(mock).DeleteMessage(t.Context(), storage.DeleteMessageInput{
+		WorkspaceID: "other-workspace", MessageID: "msg-1", RequesterID: "user-1",
+	})
+	if !errors.Is(err, domain.ErrNotFound) || changed {
+		t.Fatalf("expected non-enumerable not found, changed=%v err=%v", changed, err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_DeleteMessage_IsIdempotent(t *testing.T) {
+	mock := newMock(t)
+	deletedAt := time.Now().UTC().Add(-time.Minute)
+	now := deletedAt.Add(time.Minute)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
+		WithArgs("ws-1", "msg-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "now"}).
+			AddRow("user-1", "user", "deleted", &deletedAt, now))
+	row := listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", deletedAt.Add(-time.Hour))
+	row[8], row[14] = "deleted", &deletedAt
+	mock.ExpectQuery(`(?s)SELECT .*FROM chat\.messages m.*WHERE m\.id = \$1 AND m\.workspace_id = \$2`).
+		WithArgs("msg-1", "ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
+	mock.ExpectCommit()
+
+	message, changed, err := storage.NewPGXMessageStore(mock).DeleteMessage(t.Context(), storage.DeleteMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: "user-1",
+	})
+	if err != nil || changed || !message.DeletedAt.Equal(deletedAt) {
+		t.Fatalf("idempotent DeleteMessage = %+v, changed=%v, err=%v", message, changed, err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ListMessageEditHistory_FiltersDeletedMessages(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(`(?s)WITH authorized AS.*m\.status = 'active' AND m\.deleted_at IS NULL.*message_edit_history`).
+		WithArgs("ws-1", "msg-1", "user-1", 50, 0).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "message_id", "body", "body_format", "editor_user_id", "versioned_at"}))
+
+	_, err := storage.NewPGXMessageStore(mock).ListMessageEditHistory(t.Context(), storage.ListMessageEditHistoryInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", UserID: "user-1",
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected deleted history to be hidden, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_ListMessageEditHistory_ReturnsMultipleVersionsNewestFirst(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now().UTC()
