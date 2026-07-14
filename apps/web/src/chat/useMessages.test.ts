@@ -21,6 +21,7 @@ import { clearTokens, setTokens } from "../lib/authSession";
 import type {
   WSClientErrorEvent,
   WSMessageCreatedEvent,
+  WSMessageUpdatedEvent,
   WSMessagePayload,
   WSPinUpdatedEvent,
   WSReactionUpdatedEvent,
@@ -32,6 +33,7 @@ import type { Message, MessagePage } from "./chatTypes";
 
 // Captures the latest onMessageCreated callback so tests can fire WS events.
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
+let capturedOnMessageUpdated: ((evt: WSMessageUpdatedEvent) => void) | null = null;
 let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
 let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
 let capturedOnPinUpdated: ((evt: WSPinUpdatedEvent) => void) | null = null;
@@ -40,6 +42,7 @@ const mockToggleReaction = vi.fn(() => true);
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
+    onMessageUpdated,
     onReactionUpdated,
     onPinUpdated,
     onReactionError,
@@ -47,11 +50,13 @@ vi.mock("./useChatWebSocket", () => ({
     kind: string;
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
+    onMessageUpdated?: (evt: WSMessageUpdatedEvent) => void;
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
     onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
     onReactionError?: (evt: WSClientErrorEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
+    capturedOnMessageUpdated = onMessageUpdated ?? null;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
     capturedOnPinUpdated = onPinUpdated ?? null;
     capturedOnReactionError = onReactionError ?? null;
@@ -68,9 +73,11 @@ const {
   mockFetchDMMessage,
   mockFavoriteMessage,
   mockUnfavoriteMessage,
+  mockEditMessage,
 } = vi.hoisted(() => ({
   mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
+  mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockFetchChannelMessages:
     vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
   mockFetchChannelMessage:
@@ -94,6 +101,8 @@ vi.mock("./chatApi", () => ({
   postDMMessage: vi.fn(),
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
   unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
+  editMessage: (id: string, body: string, bodyFormat: number) =>
+    mockEditMessage(id, body, bodyFormat),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -112,6 +121,8 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   status: "active",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
+  isEdited: false,
+  editCount: 0,
   reactions: [],
   isFavorited: false,
   ...overrides,
@@ -173,6 +184,7 @@ function fireWsEventNoPayload(
 beforeEach(() => {
   setTokens("test-access-token");
   capturedOnMessageCreated = null;
+  capturedOnMessageUpdated = null;
   capturedOnReactionUpdated = null;
   capturedOnReactionError = null;
   capturedOnPinUpdated = null;
@@ -1020,5 +1032,152 @@ describe("useMessages — toggleFavorite", () => {
 
     await waitFor(() => expect(result.current.state.actionError).toMatch(/favorito/i));
     expect(result.current.state.messages[0].isFavorited).toBe(false);
+  });
+});
+
+describe("useMessages — message editing", () => {
+  it("confirms server edit fields without clearing reactions or favorite state", async () => {
+    const initial = makeMessage({
+      id: "msg-edit",
+      reactions: [{ emoji: "👍", count: 2, reactedByMe: true }],
+      isFavorited: true,
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [initial], nextCursor: "" });
+    mockEditMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-edit",
+        bodyText: "persistida",
+        bodyFormat: "v3",
+        editCount: 1,
+        isEdited: true,
+        editedAt: "2026-07-13T12:00:00Z",
+        reactions: [],
+        isFavorited: false,
+      }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.editMessageLocal("msg-edit", "persistida", "v3"));
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "persistida",
+      reactions: initial.reactions,
+      isFavorited: true,
+    });
+  });
+
+  it("applies an optimistic edit and restores the exact message when PATCH fails", async () => {
+    const original = makeMessage({ id: "msg-edit", bodyText: "original", bodyFormat: "v2" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [original], nextCursor: "" });
+    let rejectEdit!: (error: Error) => void;
+    mockEditMessage.mockImplementation(
+      () => new Promise((_resolve, reject) => (rejectEdit = reject)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let request!: Promise<Message>;
+    act(() => {
+      request = result.current.editMessageLocal("msg-edit", "rascunho otimista", "v3");
+    });
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "rascunho otimista",
+      bodyFormat: "v3",
+      isEdited: true,
+      editCount: 1,
+    });
+    const settled = request.catch((error: unknown) => error);
+    act(() => rejectEdit(new Error("PATCH failed")));
+    await settled;
+
+    await waitFor(() => expect(result.current.state.messages[0]).toEqual(original));
+    expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "rascunho otimista", 3);
+  });
+
+  it("does not let a late PATCH failure overwrite a newer authoritative WS edit", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-edit", bodyText: "original" })],
+      nextCursor: "",
+    });
+    let rejectEdit!: (error: Error) => void;
+    mockEditMessage.mockImplementation(
+      () => new Promise((_resolve, reject) => (rejectEdit = reject)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let request!: Promise<Message>;
+    act(() => {
+      request = result.current.editMessageLocal("msg-edit", "otimista", "v2");
+    });
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "ch-1",
+          body: "versão mais nova",
+          body_format: "v3",
+          edited_at: "2026-07-13T13:00:00Z",
+          edit_count: 2,
+          is_edited: true,
+        },
+      }),
+    );
+    const settled = request.catch((error: unknown) => error);
+    act(() => rejectEdit(new Error("late failure")));
+    await settled;
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "versão mais nova",
+      editCount: 2,
+      editedAt: "2026-07-13T13:00:00Z",
+    });
+  });
+
+  it("reconciles message.updated with every authoritative server field", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-edit", bodyText: "original" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "ch-1",
+          body: "versão persistida",
+          body_format: "v3",
+          edited_at: "2026-07-13T12:00:00Z",
+          edit_count: 4,
+          is_edited: true,
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "versão persistida",
+      bodyFormat: "v3",
+      editedAt: "2026-07-13T12:00:00Z",
+      editCount: 4,
+      isEdited: true,
+    });
   });
 });

@@ -12,7 +12,11 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
-import { useChatWebSocket, type WSMessageCreatedEvent } from "./useChatWebSocket";
+import {
+  useChatWebSocket,
+  type WSMessageCreatedEvent,
+  type WSMessageUpdatedEvent,
+} from "./useChatWebSocket";
 
 // ── Mock WebSocket ────────────────────────────────────────────────────────────
 
@@ -190,6 +194,63 @@ describe("useChatWebSocket", () => {
     expect(onReactionUpdated).toHaveBeenCalledWith(
       expect.objectContaining({ message_id: "msg-1" }),
     );
+  });
+
+  it("routes message.updated only for the active target", () => {
+    const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageUpdated,
+      }),
+    );
+    const update = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_update: {
+        message_id: "msg-1",
+        channel_id: "ch-1",
+        body: "editada",
+        body_format: "v3",
+        edited_at: "2026-07-13T12:00:00Z",
+        edit_count: 2,
+        is_edited: true,
+      },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateMessage(update);
+      FakeWebSocket.instances[0].simulateMessage({ ...update, target_id: "ch-2" });
+    });
+
+    expect(onMessageUpdated).toHaveBeenCalledTimes(1);
+    expect(onMessageUpdated).toHaveBeenCalledWith(update);
+  });
+
+  it("ignores malformed message.updated payloads", () => {
+    const onMessageUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageUpdated,
+      }),
+    );
+
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: { message_id: "msg-1" },
+      }),
+    );
+
+    expect(onMessageUpdated).not.toHaveBeenCalled();
   });
 
   it("calls onMessageCreated for matching message.created event", () => {
