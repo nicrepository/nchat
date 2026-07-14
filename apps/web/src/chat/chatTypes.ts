@@ -73,11 +73,20 @@ export interface Message {
   status: MessageStatus;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
+  isEdited: boolean;
+  editCount: number;
+  editedAt?: string;
   reactions: MessageReaction[];
   /** True when the current user favorited this message (RF-06, private per user). */
   isFavorited: boolean;
   /** Immediate parent preview for RF-07 quote-reply. One level only. */
   quoted?: QuotedMessage;
+}
+
+export interface MessageEditHistoryEntry {
+  body: string;
+  bodyFormat: number;
+  versionedAt: string;
 }
 
 export interface MessageReaction {

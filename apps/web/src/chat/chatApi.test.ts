@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiRequestError } from "../lib/api";
 
 // ── Mock authenticatedFetch ───────────────────────────────────────────────────
 
@@ -11,6 +12,7 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import {
+  editMessage,
   favoriteMessage,
   fetchChannelMessage,
   fetchChannelMessages,
@@ -22,6 +24,8 @@ import {
   fetchDMMessages,
   fetchDMs,
   fetchMentionCandidates,
+  getMessageHistory,
+  MessageEditError,
   fetchSidebarData,
   messagesPath,
   pinMessage,
@@ -522,6 +526,77 @@ describe("fetchChannelMessages", () => {
     const page = await fetchChannelMessages("geral");
     expect(page.messages).toEqual([]);
     expect(page.nextCursor).toBe("");
+  });
+});
+
+describe("message editing", () => {
+  it("sends only the editable fields and maps the authoritative response", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          body_text: "Texto editado",
+          body_format: "v3",
+          edited_at: "2026-07-13T12:00:00Z",
+          edit_count: 2,
+          is_edited: true,
+        }),
+      ),
+    );
+
+    const message = await editMessage("msg/1", "Texto editado", 3);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg%2F1", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body: "Texto editado", body_format: "v3" }),
+    });
+    expect(message).toMatchObject({
+      bodyText: "Texto editado",
+      bodyFormat: "v3",
+      isEdited: true,
+      editCount: 2,
+      editedAt: "2026-07-13T12:00:00Z",
+    });
+  });
+
+  it.each([
+    [403, "forbidden"],
+    [404, "not_found"],
+    [409, "window_expired"],
+    [429, "rate_limited"],
+  ] as const)("maps HTTP %s to a typed %s error", async (status, reason) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "request_failed", "failed"));
+
+    await expect(editMessage("msg-1", "body", 2)).rejects.toMatchObject({
+      status,
+      reason,
+      name: "MessageEditError",
+    } satisfies Partial<MessageEditError>);
+  });
+
+  it("maps history, pagination and body formats", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        history: [
+          { body: "mais recente", body_format: "v3", versioned_at: "2026-07-13T12:00:00Z" },
+          { body: "anterior", body_format: "v2", versioned_at: "2026-07-13T11:00:00Z" },
+        ],
+        offset: 2,
+      },
+    });
+
+    const page = await getMessageHistory("msg-1", { cursor: "2", limit: 2 });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg-1/history?limit=2&offset=2", {
+      method: "GET",
+    });
+    expect(page).toEqual({
+      entries: [
+        { body: "mais recente", bodyFormat: 3, versionedAt: "2026-07-13T12:00:00Z" },
+        { body: "anterior", bodyFormat: 2, versionedAt: "2026-07-13T11:00:00Z" },
+      ],
+      nextCursor: "4",
+    });
   });
 });
 
