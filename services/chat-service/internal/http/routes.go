@@ -17,7 +17,7 @@ const (
 	RouteChannelPins           = "/api/chat/channels/{channelID}/pins"
 	RouteDMMessagePin          = "/api/chat/dm/{conversationID}/messages/{messageID}/pin"
 	RouteDMPins                = "/api/chat/dm/{conversationID}/pins"
-	RouteMessageEdit           = "/api/chat/messages/{messageID}"
+	RouteMessage               = "/api/chat/messages/{messageID}"
 	RouteMessageEditHistory    = "/api/chat/messages/{messageID}/history"
 	RouteWorkspaceSettings     = "/api/v1/workspaces/{workspaceID}/settings"
 	RouteWS                    = "/api/chat/ws"

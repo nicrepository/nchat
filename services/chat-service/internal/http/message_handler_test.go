@@ -44,6 +44,8 @@ type fakeMessageProvider struct {
 	dmMsgErr      error
 	editedMsg     domain.Message
 	editErr       error
+	deletedMsg    domain.Message
+	deleteErr     error
 	history       []domain.MessageEditHistory
 	historyErr    error
 
@@ -54,6 +56,7 @@ type fakeMessageProvider struct {
 	lastGetChannelInput    service.GetChannelMessageInput
 	lastGetDMInput         service.GetDMMessageInput
 	lastEditInput          service.EditMessageInput
+	lastDeleteInput        service.DeleteMessageInput
 	lastHistoryInput       service.GetMessageEditHistoryInput
 }
 
@@ -62,6 +65,11 @@ func (f *fakeMessageProvider) EditMessage(_ context.Context, in service.EditMess
 	f.editedMsg.BodyText = in.Body
 	f.editedMsg.BodyFormat = in.BodyFormat
 	return f.editedMsg, f.editErr
+}
+
+func (f *fakeMessageProvider) DeleteMessage(_ context.Context, in service.DeleteMessageInput) (domain.Message, error) {
+	f.lastDeleteInput = in
+	return f.deletedMsg, f.deleteErr
 }
 
 func (f *fakeMessageProvider) GetMessageEditHistory(_ context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
@@ -258,6 +266,75 @@ func TestMessageHandler_EditMessage_ReturnsUpdatedMessage(t *testing.T) {
 	}
 	if messages.lastEditInput.EditorID != msgTestUserID || messages.lastEditInput.Body != "edited" || messages.lastEditInput.BodyFormat != domain.MessageBodyFormatV3 {
 		t.Fatalf("unexpected service input: %+v", messages.lastEditInput)
+	}
+}
+
+func TestMessageHandler_DeleteMessage_ReturnsSanitizedPlaceholder(t *testing.T) {
+	deletedAt := testNow().Add(time.Minute)
+	messages := &fakeMessageProvider{deletedMsg: domain.Message{
+		ID: testMessageID, WorkspaceID: testWorkspaceID, ChannelID: testChannelID,
+		SenderID: msgTestUserID, Kind: domain.MessageKindUser, BodyText: "secret body",
+		BodyFormat: domain.MessageBodyFormatV3, Status: domain.MessageStatusDeleted,
+		DeletedAt: deletedAt, CreatedAt: testNow(), UpdatedAt: deletedAt,
+		Quoted: &domain.QuotedMessage{ID: "parent", BodyText: "quoted secret"},
+	}}
+	request := requestWithUser(http.MethodDelete, "/api/chat/messages/"+testMessageID, nil)
+	request.SetPathValue("messageID", testMessageID)
+	recorder := httptest.NewRecorder()
+
+	makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages).DeleteMessage(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	body := decodeBody(t, recorder)
+	data := body["data"].(map[string]any)
+	if data["status"] != "deleted" || data["is_removed"] != true || data["deleted_at"] == nil {
+		t.Fatalf("unexpected placeholder: %#v", data)
+	}
+	if _, ok := data["body_text"]; ok {
+		t.Fatalf("deleted response leaked body_text: %#v", data)
+	}
+	if _, ok := data["quoted"]; ok {
+		t.Fatalf("deleted response leaked quote: %#v", data)
+	}
+	if messages.lastDeleteInput != (service.DeleteMessageInput{WorkspaceID: testWorkspaceID, MessageID: testMessageID, RequesterID: msgTestUserID}) {
+		t.Fatalf("unexpected delete input: %+v", messages.lastDeleteInput)
+	}
+}
+
+func TestMessageHandler_DeleteMessage_ValidatesAuthIDAndAuthorization(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		request    *http.Request
+		provider   *fakeMessageProvider
+		wantStatus int
+	}{
+		{
+			name: "invalid id", request: requestWithUser(http.MethodDelete, "/api/chat/messages/not-a-uuid", nil),
+			provider: &fakeMessageProvider{}, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "unauthenticated", request: httptest.NewRequest(http.MethodDelete, "/api/chat/messages/"+testMessageID, nil),
+			provider: &fakeMessageProvider{}, wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "other author", request: requestWithUser(http.MethodDelete, "/api/chat/messages/"+testMessageID, nil),
+			provider: &fakeMessageProvider{deleteErr: domain.ErrNotFound}, wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "inaccessible or missing", request: requestWithUser(http.MethodDelete, "/api/chat/messages/"+testMessageID, nil),
+			provider: &fakeMessageProvider{deleteErr: domain.ErrNotFound}, wantStatus: http.StatusNotFound,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.request.SetPathValue("messageID", map[bool]string{true: "not-a-uuid", false: testMessageID}[tt.name == "invalid id"])
+			recorder := httptest.NewRecorder()
+			makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, tt.provider).DeleteMessage(recorder, tt.request)
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("expected %d, got %d: %s", tt.wantStatus, recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 

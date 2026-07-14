@@ -37,6 +37,7 @@ type messageProvider interface {
 	CreateDMMessage(ctx context.Context, in service.CreateDMMessageInput) (domain.Message, error)
 	GetDMMessage(ctx context.Context, in service.GetDMMessageInput) (domain.Message, error)
 	EditMessage(ctx context.Context, in service.EditMessageInput) (domain.Message, error)
+	DeleteMessage(ctx context.Context, in service.DeleteMessageInput) (domain.Message, error)
 	GetMessageEditHistory(ctx context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
 }
 
@@ -107,6 +108,7 @@ type messageJSON struct {
 	BodyFormat        string         `json:"body_format"`
 	IsRemoved         bool           `json:"is_removed,omitempty"`
 	Status            string         `json:"status"`
+	DeletedAt         *time.Time     `json:"deleted_at,omitempty"`
 	CreatedAt         time.Time      `json:"created_at"`
 	UpdatedAt         time.Time      `json:"updated_at"`
 	EditedAt          *time.Time     `json:"edited_at,omitempty"`
@@ -260,17 +262,22 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		IsEdited:          m.EditCount > 0,
 		Reactions:         make([]reactionJSON, len(m.Reactions)),
 		IsFavorited:       m.IsFavorited,
-		Quoted:            mapQuoteJSON(m.Quoted),
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
 			Emoji: reaction.Emoji, Count: reaction.Count, ReactedByMe: reaction.ReactedByMe,
 		}
 	}
-	if m.Status == domain.MessageStatusDeleted {
+	if m.Status == domain.MessageStatusDeleted || !m.DeletedAt.IsZero() {
 		j.IsRemoved = true
+		j.Status = string(domain.MessageStatusDeleted)
+		if !m.DeletedAt.IsZero() {
+			deletedAt := m.DeletedAt
+			j.DeletedAt = &deletedAt
+		}
 	} else {
 		j.BodyText = m.BodyText
+		j.Quoted = mapQuoteJSON(m.Quoted)
 	}
 	return j
 }
@@ -371,6 +378,34 @@ func (h *MessageHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
 	message, err := h.messages.EditMessage(r.Context(), service.EditMessageInput{
 		WorkspaceID: workspaceID, MessageID: messageID, EditorID: userID,
 		Body: req.Body, BodyFormat: domain.MessageBodyFormat(req.BodyFormat),
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, mapToMessageJSON(message))
+}
+
+// DeleteMessage handles DELETE /api/chat/messages/{messageID}.
+func (h *MessageHandler) DeleteMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	messageID := r.PathValue("messageID")
+	if !validateTargetID(w, messageID, "message_id") {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	message, err := h.messages.DeleteMessage(r.Context(), service.DeleteMessageInput{
+		WorkspaceID: workspaceID, MessageID: messageID, RequesterID: userID,
 	})
 	if err != nil {
 		mapServiceError(w, err)

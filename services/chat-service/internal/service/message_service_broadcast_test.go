@@ -32,6 +32,12 @@ func (p *fakePublisher) updateCount() int {
 	return len(p.updates)
 }
 
+func (p *fakePublisher) updateSnapshot() []publishCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]publishCall(nil), p.updates...)
+}
+
 type publishCall struct {
 	workspaceID  string
 	targetType   string
@@ -104,6 +110,55 @@ func TestMessageService_EditMessage_BroadcastsUpdatedAfterPersist(t *testing.T) 
 	}
 	if publisher.updateCount() != 1 {
 		t.Fatalf("expected one message.updated publish, got %d", publisher.updateCount())
+	}
+}
+
+func TestMessageService_DeleteMessage_BroadcastsSanitizedPlaceholderOnce(t *testing.T) {
+	store := &fakeMessageStore{
+		deletedMessage: domain.Message{
+			ID: "msg-1", WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: user1,
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusDeleted, BodyText: "secret",
+		},
+		deleteChanged: true,
+	}
+	publisher := &fakePublisher{}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store)
+	svc.SetPublisher(publisher)
+	if _, err := svc.DeleteMessage(t.Context(), service.DeleteMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: user1,
+	}); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for publisher.updateCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	updates := publisher.updateSnapshot()
+	if len(updates) != 1 || updates[0].targetType != "dm" || updates[0].targetID != "dm-1" || updates[0].msg.BodyText != "" {
+		t.Fatalf("unexpected delete broadcast: %+v", updates)
+	}
+
+	store.deleteChanged = false
+	if _, err := svc.DeleteMessage(t.Context(), service.DeleteMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: user1,
+	}); err != nil {
+		t.Fatalf("idempotent DeleteMessage: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if publisher.updateCount() != 1 {
+		t.Fatalf("idempotent delete published again: %d", publisher.updateCount())
+	}
+}
+
+func TestMessageService_DeleteMessage_DoesNotPublishOnStorageFailure(t *testing.T) {
+	publisher := &fakePublisher{}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{deleteErr: errors.New("db down")})
+	svc.SetPublisher(publisher)
+	_, err := svc.DeleteMessage(t.Context(), service.DeleteMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: user1,
+	})
+	if err == nil || publisher.updateCount() != 0 {
+		t.Fatalf("storage failure err=%v publishes=%d", err, publisher.updateCount())
 	}
 }
 

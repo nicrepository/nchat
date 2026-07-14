@@ -55,11 +55,15 @@ type fakeMessageStore struct {
 	resolveAuthorizedErr    error
 	editedMessage           domain.Message
 	editErr                 error
+	deletedMessage          domain.Message
+	deleteChanged           bool
+	deleteErr               error
 	editHistory             []domain.MessageEditHistory
 	historyErr              error
 
 	lastCreateInput        storage.CreateMessageInput
 	lastHistoryInput       storage.ListMessageEditHistoryInput
+	lastDeleteInput        storage.DeleteMessageInput
 	createCalls            int
 	listChannelCalls       int
 	listDMCalls            int
@@ -75,6 +79,11 @@ func (f *fakeMessageStore) EditMessage(_ context.Context, input storage.EditMess
 		return f.editedMessage, nil
 	}
 	return domain.Message{ID: input.MessageID, WorkspaceID: input.WorkspaceID, SenderID: input.EditorID, BodyText: input.Body, BodyFormat: input.BodyFormat}, nil
+}
+
+func (f *fakeMessageStore) DeleteMessage(_ context.Context, input storage.DeleteMessageInput) (domain.Message, bool, error) {
+	f.lastDeleteInput = input
+	return f.deletedMessage, f.deleteChanged, f.deleteErr
 }
 
 func (f *fakeMessageStore) ListMessageEditHistory(_ context.Context, input storage.ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
@@ -104,6 +113,50 @@ func TestMessageService_EditMessage_PropagatesEditForbiddenFromStorage(t *testin
 				t.Fatalf("expected ErrEditForbidden, got %v", err)
 			}
 		})
+	}
+}
+
+func TestMessageService_DeleteMessage_SanitizesResultAndScopesInput(t *testing.T) {
+	store := &fakeMessageStore{
+		deletedMessage: domain.Message{
+			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusDeleted, BodyText: "secret",
+			Quoted: &domain.QuotedMessage{ID: "parent", BodyText: "quoted secret"},
+		},
+		deleteChanged: true,
+	}
+	message, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).DeleteMessage(
+		t.Context(), service.DeleteMessageInput{WorkspaceID: " ws-1 ", MessageID: " msg-1 ", RequesterID: " " + user1 + " "},
+	)
+	if err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	if message.BodyText != "" || message.Quoted != nil || message.Status != domain.MessageStatusDeleted {
+		t.Fatalf("deleted response was not sanitized: %+v", message)
+	}
+	if store.lastDeleteInput != (storage.DeleteMessageInput{WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: user1}) {
+		t.Fatalf("unexpected delete input: %+v", store.lastDeleteInput)
+	}
+}
+
+func TestMessageService_DeleteMessage_RejectsInvalidInput(t *testing.T) {
+	_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{}).DeleteMessage(
+		t.Context(), service.DeleteMessageInput{},
+	)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestMessageService_DeleteMessage_HidesForbiddenTargets(t *testing.T) {
+	store := &fakeMessageStore{deleteErr: domain.ErrForbidden}
+	_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store).DeleteMessage(
+		t.Context(), service.DeleteMessageInput{
+			WorkspaceID: "ws-1", MessageID: "msg-1", RequesterID: user1,
+		},
+	)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected non-enumerable ErrNotFound, got %v", err)
 	}
 }
 

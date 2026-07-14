@@ -92,6 +92,10 @@ func (s *integMessageStore) EditMessage(_ context.Context, in storage.EditMessag
 	return domain.Message{ID: in.MessageID, WorkspaceID: in.WorkspaceID, SenderID: in.EditorID, BodyText: in.Body, BodyFormat: in.BodyFormat}, nil
 }
 
+func (s *integMessageStore) DeleteMessage(_ context.Context, in storage.DeleteMessageInput) (domain.Message, bool, error) {
+	return domain.Message{ID: in.MessageID, WorkspaceID: in.WorkspaceID, SenderID: in.RequesterID, Kind: domain.MessageKindUser, Status: domain.MessageStatusDeleted}, true, nil
+}
+
 func (s *integMessageStore) ListMessageEditHistory(context.Context, storage.ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
 	return nil, nil
 }

@@ -32,3 +32,23 @@ func TestValidateMessageEdit(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateMessageDelete(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		message   Message
+		requester string
+		want      error
+	}{
+		{name: "author active", message: Message{SenderID: "author", Kind: MessageKindUser, Status: MessageStatusActive}, requester: "author"},
+		{name: "author already deleted", message: Message{SenderID: "author", Kind: MessageKindUser, Status: MessageStatusDeleted}, requester: "author"},
+		{name: "other user", message: Message{SenderID: "author", Kind: MessageKindUser}, requester: "other", want: ErrForbidden},
+		{name: "system message", message: Message{SenderID: "author", Kind: MessageKindSystem}, requester: "author", want: ErrForbidden},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateMessageDelete(tt.message, tt.requester); !errors.Is(err, tt.want) {
+				t.Fatalf("ValidateMessageDelete() error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
