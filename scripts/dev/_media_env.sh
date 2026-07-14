@@ -89,6 +89,36 @@ render_media_config() {
   chmod 600 "$LIVEKIT_RUNTIME" "$COTURN_RUNTIME" 2>/dev/null || true
 }
 
+resolve_media_compose_extra_file() {
+  local extra_file="${MEDIA_COMPOSE_EXTRA_FILE:-}"
+  MEDIA_COMPOSE_EXTRA_FILE_RESOLVED=""
+
+  if [ -z "$extra_file" ]; then
+    return 0
+  fi
+  if [[ "$extra_file" != /* ]]; then
+    extra_file="$ROOT_DIR/$extra_file"
+  fi
+  if [ ! -f "$extra_file" ]; then
+    echo "MEDIA_COMPOSE_EXTRA_FILE does not reference a file: $extra_file" >&2
+    return 1
+  fi
+
+  MEDIA_COMPOSE_EXTRA_FILE_RESOLVED="$extra_file"
+}
+
 media_compose() {
-  docker compose --env-file "$_MEDIA_ENV_DEV" -f "$_MEDIA_COMPOSE_FILE" --profile media "$@"
+  # Opt-in, additive override: when MEDIA_COMPOSE_EXTRA_FILE is set (e.g. for
+  # the office-network LAN test — see
+  # docs/runbooks/task-158-webrtc-office-network-validation.md), pass it as
+  # an extra `-f` layer on top of compose.dev.yml. Unset by default, so
+  # default dev behavior (127.0.0.1-only) is unchanged.
+  local -a _extra_compose_args=()
+  if ! resolve_media_compose_extra_file; then
+    return 1
+  fi
+  if [ -n "$MEDIA_COMPOSE_EXTRA_FILE_RESOLVED" ]; then
+    _extra_compose_args=(-f "$MEDIA_COMPOSE_EXTRA_FILE_RESOLVED")
+  fi
+  docker compose --env-file "$_MEDIA_ENV_DEV" -f "$_MEDIA_COMPOSE_FILE" "${_extra_compose_args[@]}" --profile media "$@"
 }

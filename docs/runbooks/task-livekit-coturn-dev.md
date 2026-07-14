@@ -110,9 +110,13 @@ comandos DOS/PowerShell-only.
   mais lento para publicar ranges grandes de porta; por isso o range de dev foi mantido
   propositalmente pequeno (11 portas LiveKit + 41 portas de relay coturn).
 - **`node_ip` do LiveKit**: fixado em `127.0.0.1` (`LIVEKIT_NODE_IP`) para uso no mesmo
-  host. Para testar de outro dispositivo na mesma LAN, troque `LIVEKIT_NODE_IP` para o IP
-  da máquina Windows na rede e garanta que o firewall libera as portas UDP/TCP acima para
-  a rede local.
+  host. Para testar de outro dispositivo na mesma LAN, **não altere somente
+  `LIVEKIT_NODE_IP`**. Siga o procedimento único em
+  [task-158-webrtc-office-network-validation.md](task-158-webrtc-office-network-validation.md):
+  identifique o IP LAN, configure `LIVEKIT_NODE_IP`, prepare e use o override
+  LAN via `MEDIA_COMPOSE_EXTRA_FILE`, renderize e suba novamente com
+  `scripts/dev/dev-media-up.sh`, valide a configuração renderizada e só então
+  teste pelo segundo dispositivo.
 - **`docker compose` vs `docker-compose`**: use `docker compose` (Compose v2, integrado
   ao Docker Desktop); não é necessário instalar `docker-compose` separado.
 

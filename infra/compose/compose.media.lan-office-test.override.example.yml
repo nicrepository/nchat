@@ -1,0 +1,50 @@
+# Compose override EXAMPLE — WebRTC office network validation (TASK-158)
+#
+# This file is an EXAMPLE only. It is NOT used by default and is NOT
+# referenced by any Makefile/package.json target — the operator must copy it
+# and pass it explicitly with `-f` to `docker compose`.
+#
+# Purpose: infra/compose/compose.dev.yml binds LiveKit/coturn ports to
+# 127.0.0.1 by default (see docs/runbooks/task-livekit-coturn-dev.md and
+# scripts/ci/media-config-check.sh, which enforces this for the default dev
+# stack). That is correct for same-host dev, but a real office-network test
+# with a second physical device requires the ports to be reachable from the
+# LAN, not just localhost.
+#
+# How to use (manual, temporary, reversible, in this exact order):
+#   1. Identify the LAN IP of the machine running the stack. Then copy this
+#      file (do not edit compose.dev.yml directly) and replace
+#      OFFICE_LAN_BIND_IP in the copy with that specific IP (never 0.0.0.0):
+#        cp infra/compose/compose.media.lan-office-test.override.example.yml \
+#           infra/compose/compose.media.lan-office-test.override.yml
+#   2. Set LIVEKIT_NODE_IP in infra/compose/.env.dev to the same LAN IP
+#      before rendering or starting containers.
+#   3. Re-run the existing render/up flow only after LIVEKIT_NODE_IP is set.
+#      The flow renders livekit.runtime.yaml before Compose starts services.
+#   4. Start the stack through that flow with the opt-in LAN override:
+#        MEDIA_COMPOSE_EXTRA_FILE=infra/compose/compose.media.lan-office-test.override.yml \
+#          bash scripts/dev/dev-media-up.sh
+#   5. Validate the effective configuration before testing:
+#        bash scripts/dev/dev-media-validate.sh
+#        grep node_ip infra/compose/livekit/livekit.runtime.yaml
+#   6. Run the test from the real second device/browser on the office LAN.
+#      Confirm with the network/security owner that only the office subnet
+#      can reach the bind IP, not the public internet.
+#   7. After the test: stop the stack and delete the local override copy. Do
+#      not leave the LAN binding running unattended.
+#
+# The override file itself (your local copy with a real IP) must never be
+# committed. The local copy without the .example suffix is ignored by the
+# repository-specific rule in .gitignore; keep the real IP only in that
+# local copy, never in this committed example.
+services:
+  livekit:
+    ports:
+      - "OFFICE_LAN_BIND_IP:${LIVEKIT_HOST_PORT}:7880"
+      - "OFFICE_LAN_BIND_IP:${LIVEKIT_RTC_TCP_HOST_PORT}:7881"
+      - "OFFICE_LAN_BIND_IP:${LIVEKIT_RTC_UDP_PORT_START}-${LIVEKIT_RTC_UDP_PORT_END}:${LIVEKIT_RTC_UDP_PORT_START}-${LIVEKIT_RTC_UDP_PORT_END}/udp"
+  coturn:
+    ports:
+      - "OFFICE_LAN_BIND_IP:${COTURN_LISTENING_PORT}:3478"
+      - "OFFICE_LAN_BIND_IP:${COTURN_LISTENING_PORT}:3478/udp"
+      - "OFFICE_LAN_BIND_IP:${COTURN_RELAY_MIN_PORT}-${COTURN_RELAY_MAX_PORT}:${COTURN_RELAY_MIN_PORT}-${COTURN_RELAY_MAX_PORT}/udp"
