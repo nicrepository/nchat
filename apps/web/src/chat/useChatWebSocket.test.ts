@@ -12,7 +12,11 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
-import { useChatWebSocket, type WSMessageCreatedEvent } from "./useChatWebSocket";
+import {
+  useChatWebSocket,
+  type WSMessageCreatedEvent,
+  type WSMessageUpdatedEvent,
+} from "./useChatWebSocket";
 
 // ── Mock WebSocket ────────────────────────────────────────────────────────────
 
@@ -190,6 +194,117 @@ describe("useChatWebSocket", () => {
     expect(onReactionUpdated).toHaveBeenCalledWith(
       expect.objectContaining({ message_id: "msg-1" }),
     );
+  });
+
+  it("routes every supported message.updated body format only for the active target", () => {
+    const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageUpdated,
+      }),
+    );
+    const update = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_update: {
+        message_id: "msg-1",
+        channel_id: "ch-1",
+        body: "editada",
+        body_format: "v1",
+        edited_at: "2026-07-13T12:00:00Z",
+        edit_count: 2,
+        is_edited: true,
+      },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateMessage(update);
+      FakeWebSocket.instances[0].simulateMessage({
+        ...update,
+        message_update: { ...update.message_update, body_format: "v2" },
+      });
+      FakeWebSocket.instances[0].simulateMessage({
+        ...update,
+        message_update: { ...update.message_update, body_format: "v3" },
+      });
+      FakeWebSocket.instances[0].simulateMessage({ ...update, target_id: "ch-2" });
+    });
+
+    expect(onMessageUpdated).toHaveBeenCalledTimes(3);
+    expect(onMessageUpdated).toHaveBeenCalledWith(update);
+  });
+
+  it("ignores malformed message.updated payloads", () => {
+    const onMessageUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageUpdated,
+      }),
+    );
+
+    const base = {
+      message_id: "msg-1",
+      body: "editada",
+      body_format: "v3",
+      edited_at: "2026-07-13T12:00:00Z",
+      edit_count: 2,
+      is_edited: true,
+    };
+    const malformedUpdates: unknown[] = [
+      undefined,
+      "not-an-object",
+      { ...base, message_id: 1 },
+      { ...base, body: null },
+      { ...base, body_format: "v4" },
+      { ...base, edited_at: 1 },
+      { ...base, edit_count: "2" },
+      { ...base, is_edited: "true" },
+    ];
+
+    act(() => {
+      for (const message_update of malformedUpdates) {
+        FakeWebSocket.instances[0].simulateMessage({
+          type: "message.updated",
+          target_type: "channel",
+          target_id: "ch-1",
+          message_update,
+        });
+      }
+    });
+
+    expect(onMessageUpdated).not.toHaveBeenCalled();
+  });
+
+  it("ignores a valid message.updated when no update callback is registered", () => {
+    const onMessageCreated = vi.fn();
+    renderHook(() => useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated }));
+
+    expect(() =>
+      act(() =>
+        FakeWebSocket.instances[0].simulateMessage({
+          type: "message.updated",
+          target_type: "channel",
+          target_id: "ch-1",
+          message_update: {
+            message_id: "msg-1",
+            channel_id: "ch-1",
+            body: "editada",
+            body_format: "v3",
+            edited_at: "2026-07-13T12:00:00Z",
+            edit_count: 2,
+            is_edited: true,
+          },
+        }),
+      ),
+    ).not.toThrow();
+    expect(onMessageCreated).not.toHaveBeenCalled();
   });
 
   it("calls onMessageCreated for matching message.created event", () => {

@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
+  editMessage as editMessageRequest,
   favoriteMessage,
   fetchChannelMessage,
   fetchChannelMessages,
@@ -37,6 +38,7 @@ import { normalizeBodyFormat, type Message, type MessagePage } from "./chatTypes
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
+  type WSMessageUpdatedEvent,
   type WSClientErrorEvent,
   type WSPinUpdatedEvent,
   type WSReactionUpdatedEvent,
@@ -104,6 +106,16 @@ type Action =
   | { type: "prepended"; page: MessagePage }
   | { type: "prepend_error" }
   | { type: "ws_received"; message: Message }
+  | {
+      type: "edit_optimistic";
+      messageId: string;
+      body: string;
+      bodyFormat: Message["bodyFormat"];
+      editedAt: string;
+    }
+  | { type: "edit_confirmed"; message: Message }
+  | { type: "edit_revert"; message: Message; optimisticEditedAt: string }
+  | { type: "message_updated"; event: WSMessageUpdatedEvent }
   | { type: "reaction_updated"; event: WSReactionUpdatedEvent; actorIsMe: boolean }
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
   | { type: "reaction_error"; error: string }
@@ -258,6 +270,73 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         realtimeError: null,
       };
     }
+    case "edit_optimistic": {
+      const messages = state.messages.map((message) =>
+        message.id === action.messageId
+          ? {
+              ...message,
+              bodyText: action.body,
+              bodyFormat: action.bodyFormat,
+              isEdited: true,
+              editCount: message.editCount + 1,
+              editedAt: action.editedAt,
+              updatedAt: action.editedAt,
+            }
+          : message,
+      );
+      return { ...state, messages, lastMutation: "none" };
+    }
+    case "edit_confirmed":
+      return {
+        ...state,
+        messages: state.messages.map((message) =>
+          message.id === action.message.id && action.message.editCount >= message.editCount
+            ? {
+                ...message,
+                bodyText: action.message.bodyText,
+                bodyFormat: action.message.bodyFormat,
+                editedAt: action.message.editedAt,
+                updatedAt: action.message.updatedAt,
+                editCount: action.message.editCount,
+                isEdited: action.message.isEdited,
+              }
+            : message,
+        ),
+        lastMutation: "none",
+      };
+    case "edit_revert":
+      return {
+        ...state,
+        messages: state.messages.map((message) =>
+          message.id === action.message.id && message.editedAt === action.optimisticEditedAt
+            ? action.message
+            : message,
+        ),
+        lastMutation: "none",
+      };
+    case "message_updated": {
+      const update = action.event.message_update;
+      return {
+        ...state,
+        messages: state.messages.map((message) =>
+          message.id === update.message_id
+            ? update.edit_count < message.editCount
+              ? message
+              : {
+                  ...message,
+                  bodyText: update.body,
+                  bodyFormat: normalizeBodyFormat(update.body_format),
+                  editedAt: update.edited_at,
+                  updatedAt: update.edited_at,
+                  editCount: update.edit_count,
+                  isEdited: update.is_edited,
+                }
+            : message,
+        ),
+        lastMutation: "none",
+        realtimeError: null,
+      };
+    }
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
     case "reaction_error": {
@@ -387,6 +466,11 @@ export interface UseMessagesResult {
   cancelReply: () => void;
   toggleReaction: (messageId: string, emoji: string) => void;
   toggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  editMessageLocal: (
+    messageId: string,
+    body: string,
+    bodyFormat: Message["bodyFormat"],
+  ) => Promise<Message>;
 }
 
 export function useMessages({
@@ -593,6 +677,9 @@ export function useMessages({
           status: p.status as Message["status"],
           createdAt: p.created_at,
           updatedAt: p.updated_at,
+          isEdited: Boolean(p.edited_at),
+          editCount: 0,
+          editedAt: p.edited_at ?? undefined,
           reactions: [],
           // WS create events never carry the caller's favorite state; a message
           // just created cannot be favorited yet.
@@ -695,6 +782,16 @@ export function useMessages({
     ],
   );
 
+  const handleMessageUpdated = useCallback(
+    (event: WSMessageUpdatedEvent) => {
+      if (event.target_id !== targetId || !isMessageRendered(event.message_update.message_id)) {
+        return;
+      }
+      dispatch({ type: "message_updated", event });
+    },
+    [isMessageRendered, targetId],
+  );
+
   const handleReactionError = useCallback((event: WSClientErrorEvent) => {
     const messages: Record<string, string> = {
       rate_limited: "Muitas reações em sequência. Aguarde um minuto e tente novamente.",
@@ -725,6 +822,7 @@ export function useMessages({
     kind,
     targetId,
     onMessageCreated: handleWsMessageCreated,
+    onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: handleReactionUpdated,
     onPinUpdated: handlePinUpdated,
     onReactionError: handleReactionError,
@@ -785,6 +883,28 @@ export function useMessages({
     [isMessageRendered],
   );
 
+  const editMessageLocal = useCallback(
+    async (messageId: string, body: string, bodyFormat: Message["bodyFormat"]) => {
+      const previous = stateRef.current.messages.find((message) => message.id === messageId);
+      if (!previous) throw new Error("Mensagem não encontrada.");
+      const editKey = `${kind}:${targetId}`;
+      const editedAt = new Date().toISOString();
+      dispatch({ type: "edit_optimistic", messageId, body, bodyFormat, editedAt });
+      try {
+        const version = bodyFormat === "v3" ? 3 : bodyFormat === "v2" ? 2 : 1;
+        const updated = await editMessageRequest(messageId, body, version);
+        if (stateRef.current.target === editKey)
+          dispatch({ type: "edit_confirmed", message: updated });
+        return updated;
+      } catch (error) {
+        if (stateRef.current.target === editKey)
+          dispatch({ type: "edit_revert", message: previous, optimisticEditedAt: editedAt });
+        throw error;
+      }
+    },
+    [kind, targetId],
+  );
+
   return {
     state,
     sendMessage,
@@ -794,5 +914,6 @@ export function useMessages({
     cancelReply,
     toggleReaction,
     toggleFavorite,
+    editMessageLocal,
   };
 }

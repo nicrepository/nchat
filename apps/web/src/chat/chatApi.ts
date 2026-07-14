@@ -11,6 +11,7 @@
  */
 
 import { authenticatedFetch } from "../lib/authClient";
+import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
@@ -21,6 +22,7 @@ import {
   type FavoriteItem,
   type FavoritesPage,
   type Message,
+  type MessageEditHistoryEntry,
   type MessagePage,
   type PinnedItem,
 } from "./chatTypes";
@@ -156,6 +158,9 @@ interface MessageResponse {
   status: string;
   created_at: string;
   updated_at: string;
+  edited_at?: string | null;
+  edit_count?: number;
+  is_edited?: boolean;
   reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited?: boolean;
   quoted?: QuoteResponse;
@@ -205,6 +210,30 @@ interface MessageListEnvelope {
 
 interface MessageEnvelope {
   data: MessageResponse;
+}
+
+interface MessageEditHistoryResponse {
+  body: string;
+  body_format: string;
+  versioned_at: string;
+}
+
+interface MessageEditHistoryEnvelope {
+  data: { history?: MessageEditHistoryResponse[]; offset?: number };
+}
+
+export type MessageEditErrorReason = "forbidden" | "not_found" | "window_expired" | "rate_limited";
+
+export class MessageEditError extends Error {
+  readonly status: number;
+  readonly reason: MessageEditErrorReason;
+
+  constructor(status: number, reason: MessageEditErrorReason, message: string) {
+    super(message);
+    this.name = "MessageEditError";
+    this.status = status;
+    this.reason = reason;
+  }
 }
 
 interface MentionCandidateResponse {
@@ -258,6 +287,9 @@ function mapMessage(r: MessageResponse): Message {
     status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    isEdited: r.is_edited ?? (r.edit_count ?? 0) > 0,
+    editCount: r.edit_count ?? 0,
+    editedAt: r.edited_at ?? undefined,
     reactions: (r.reactions ?? []).map((reaction) => ({
       emoji: reaction.emoji,
       count: reaction.count,
@@ -266,6 +298,25 @@ function mapMessage(r: MessageResponse): Message {
     isFavorited: r.is_favorited ?? false,
     quoted: r.quoted ? mapQuote(r.quoted) : undefined,
   };
+}
+
+function bodyFormatVersion(format: string | undefined): number {
+  const normalized = normalizeBodyFormat(format);
+  return normalized === "v3" ? 3 : normalized === "v2" ? 2 : 1;
+}
+
+function mapMessageEditError(error: unknown): never {
+  if (error instanceof ApiRequestError) {
+    const reasonByStatus: Partial<Record<number, MessageEditErrorReason>> = {
+      403: "forbidden",
+      404: "not_found",
+      409: "window_expired",
+      429: "rate_limited",
+    };
+    const reason = reasonByStatus[error.status];
+    if (reason) throw new MessageEditError(error.status, reason, error.message);
+  }
+  throw error;
 }
 
 function mapQuote(r: QuoteResponse): Message["quoted"] {
@@ -380,6 +431,53 @@ export async function fetchChannelMessage(
   const url = `${messagesPath("channel", channelId)}/${encodeURIComponent(messageId)}`;
   const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
   return mapMessage(res.data);
+}
+
+export async function editMessage(
+  messageId: string,
+  body: string,
+  bodyFormat: number,
+): Promise<Message> {
+  const wireFormat = bodyFormat === 3 ? "v3" : bodyFormat === 2 ? "v2" : "v1";
+  try {
+    const response = await authenticatedFetch<MessageEnvelope>(
+      `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body, body_format: wireFormat }),
+      },
+    );
+    return mapMessage(response.data);
+  } catch (error) {
+    return mapMessageEditError(error);
+  }
+}
+
+export async function getMessageHistory(
+  messageId: string,
+  opts: { cursor?: string; limit?: number } = {},
+): Promise<{ entries: MessageEditHistoryEntry[]; nextCursor?: string }> {
+  const offset = Number.parseInt(opts.cursor ?? "0", 10) || 0;
+  const limit = opts.limit ?? 50;
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  try {
+    const response = await authenticatedFetch<MessageEditHistoryEnvelope>(
+      `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}/history?${params}`,
+      { method: "GET" },
+    );
+    const history = response.data.history ?? [];
+    return {
+      entries: history.map((entry) => ({
+        body: entry.body,
+        bodyFormat: bodyFormatVersion(entry.body_format),
+        versionedAt: entry.versioned_at,
+      })),
+      nextCursor: history.length === limit ? String(offset + history.length) : undefined,
+    };
+  } catch (error) {
+    return mapMessageEditError(error);
+  }
 }
 
 // ── Favorites API (RF-06) ─────────────────────────────────────────────────────

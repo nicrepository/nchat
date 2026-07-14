@@ -15,7 +15,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import ChatMessageArea from "./ChatMessageArea";
 import type { Message, MessagePage } from "./chatTypes";
-import type { WSMessageCreatedEvent } from "./useChatWebSocket";
+import type {
+  WSMessageCreatedEvent,
+  WSMessageUpdatedEvent,
+  WSReactionUpdatedEvent,
+} from "./useChatWebSocket";
 import { useChatWebSocket } from "./useChatWebSocket";
 import * as chatApi from "./chatApi";
 
@@ -32,6 +36,12 @@ async function fillEditor(element: HTMLElement, text: string) {
   await waitFor(() => expect(element).toHaveTextContent(text));
 }
 
+async function replaceEditorText(element: HTMLElement, text: string) {
+  element.focus();
+  await userEvent.keyboard("{Control>}a{/Control}{Backspace}");
+  await fillEditor(element, text);
+}
+
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
 const {
@@ -46,6 +56,8 @@ const {
   mockFetchPins,
   mockPinMessage,
   mockUnpinMessage,
+  mockEditMessage,
+  mockGetMessageHistory,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -87,14 +99,29 @@ const {
     vi.fn<(target: { kind: "channel" | "dm"; id: string }, messageId: string) => Promise<void>>(),
   mockUnpinMessage:
     vi.fn<(target: { kind: "channel" | "dm"; id: string }, messageId: string) => Promise<void>>(),
+  mockEditMessage:
+    vi.fn<(messageId: string, body: string, bodyFormat: number) => Promise<Message>>(),
+  mockGetMessageHistory: vi.fn(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
-    capturedReactionUpdated: null as ((event: unknown) => void) | null,
+    capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
+    capturedReactionUpdated: null as ((event: WSReactionUpdatedEvent) => void) | null,
     toggleReaction: vi.fn(() => true),
   },
 }));
 
 vi.mock("./chatApi", () => ({
+  MessageEditError: class MessageEditError extends Error {
+    readonly status: number;
+    readonly reason: string;
+
+    constructor(status: number, reason: string, message: string) {
+      super(message);
+      this.name = "MessageEditError";
+      this.status = status;
+      this.reason = reason;
+    }
+  },
   fetchSidebarData: vi.fn(),
   fetchChannels: vi.fn(),
   fetchDMs: vi.fn(),
@@ -125,6 +152,9 @@ vi.mock("./chatApi", () => ({
     mockPinMessage(target, messageId),
   unpinMessage: (target: { kind: "channel" | "dm"; id: string }, messageId: string) =>
     mockUnpinMessage(target, messageId),
+  editMessage: (messageId: string, body: string, bodyFormat: number) =>
+    mockEditMessage(messageId, body, bodyFormat),
+  getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
@@ -133,12 +163,15 @@ vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
     ({
       onMessageCreated,
+      onMessageUpdated,
       onReactionUpdated,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
-      onReactionUpdated?: (event: unknown) => void;
+      onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
+      onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
+      wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
       return { toggleReaction: wsMockState.toggleReaction };
     },
@@ -159,6 +192,8 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   status: "active",
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
+  isEdited: false,
+  editCount: 0,
   reactions: [],
   isFavorited: false,
   ...overrides,
@@ -217,8 +252,17 @@ beforeEach(() => {
   setTokens("test-at");
   localStorage.clear();
   wsMockState.capturedWSMessageCreated = null;
+  wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
   vi.clearAllMocks();
+  vi.mocked(useChatWebSocket).mockImplementation(
+    ({ onMessageCreated, onMessageUpdated, onReactionUpdated }) => {
+      wsMockState.capturedWSMessageCreated = onMessageCreated;
+      wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
+      wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      return { toggleReaction: wsMockState.toggleReaction };
+    },
+  );
   mockFetchAllowedReactionEmojis.mockResolvedValue([
     "👍",
     "❤️",
@@ -240,6 +284,7 @@ beforeEach(() => {
   mockFetchPins.mockResolvedValue([]);
   mockPinMessage.mockResolvedValue(undefined);
   mockUnpinMessage.mockResolvedValue(undefined);
+  mockGetMessageHistory.mockResolvedValue({ entries: [], nextCursor: undefined });
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
 });
@@ -2564,5 +2609,222 @@ describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
 
     expect(mockPinMessage).toHaveBeenCalledWith({ kind: "dm", id: "dm-juliane" }, "m1");
     expect(await screen.findByTestId("chat-pins")).toHaveTextContent("1 mensagem fixada");
+  });
+});
+
+describe("ChatMessageArea — edição e histórico (RF-13)", () => {
+  const ownMessage = () =>
+    makeMessage({
+      id: "msg-edit",
+      senderId: "me-123",
+      bodyText: "Texto original",
+      bodyFormat: "v2",
+    });
+
+  async function openEditor() {
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Editar mensagem" }));
+    return screen.findByTestId("chat-edit-input-msg-edit");
+  }
+
+  it("edits inline, saves the strict body version and shows the edited indicator", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockResolvedValue(
+      makeMessage({
+        ...ownMessage(),
+        bodyText: "Texto atualizado",
+        bodyFormat: "v2",
+        isEdited: true,
+        editCount: 1,
+        editedAt: "2026-07-13T12:00:00Z",
+      }),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    expect(editor).toHaveTextContent("Texto original");
+    await replaceEditorText(editor, "Texto atualizado");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    await waitFor(() =>
+      expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "Texto atualizado", 2),
+    );
+    expect(await screen.findByText("Texto atualizado")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ver histórico de edições" })).toBeInTheDocument();
+  });
+
+  it("cancels an inline edit without calling the API or changing the message", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Mudança descartada");
+    await userEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+
+    expect(screen.getByText("Texto original")).toBeInTheDocument();
+    expect(screen.queryByText("Mudança descartada")).not.toBeInTheDocument();
+    expect(mockEditMessage).not.toHaveBeenCalled();
+  });
+
+  it("preserves v3 as the edit format and cancels the inline editor with Escape", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ ...ownMessage(), bodyText: "Texto v3", bodyFormat: "v3" })]),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Mudança v3");
+    fireEvent.keyDown(editor, { key: "Escape", code: "Escape" });
+
+    expect(await screen.findByText("Texto v3")).toBeInTheDocument();
+    expect(screen.queryByText("Mudança v3")).not.toBeInTheDocument();
+    expect(mockEditMessage).not.toHaveBeenCalled();
+  });
+
+  it("shows the expired-window error and keeps the persisted content", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(
+      new chatApi.MessageEditError(409, "window_expired", "expired"),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Janela de edição expirada.");
+    await userEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+    expect(screen.getByText("Texto original")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Ver histórico de edições" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows rate-limit feedback and keeps the persisted content", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(
+      new chatApi.MessageEditError(429, "rate_limited", "rate limited"),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Aguarde antes de editar novamente.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+    expect(screen.getByText("Texto original")).toBeInTheDocument();
+  });
+
+  it("shows not-found feedback when the edited message is no longer visible", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(new chatApi.MessageEditError(404, "not_found", "missing"));
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Mensagem não encontrada.");
+  });
+
+  it("shows generic feedback when editing fails without a typed API error", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(new TypeError("network unavailable"));
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Não foi possível editar a mensagem.",
+    );
+  });
+
+  it("hides editing and reloads after a 403 without retaining the optimistic body", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(new chatApi.MessageEditError(403, "forbidden", "forbidden"));
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não autorizado");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2));
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    expect(bubble).toHaveTextContent("Texto original");
+    fireEvent.mouseEnter(bubble);
+    expect(screen.queryByRole("button", { name: "Editar mensagem" })).not.toBeInTheDocument();
+  });
+
+  it("reconciles a message.updated event without reloading the page", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    renderChannelAreaForUser();
+    await screen.findByText("Texto original");
+    await waitFor(() => expect(wsMockState.capturedWSMessageUpdated).not.toBeNull());
+
+    await act(async () =>
+      wsMockState.capturedWSMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "geral",
+          body: "Atualizada por WS",
+          body_format: "v3",
+          edited_at: "2026-07-13T12:00:00Z",
+          edit_count: 3,
+          is_edited: true,
+        },
+      }),
+    );
+
+    expect(await screen.findByText("Atualizada por WS")).toBeInTheDocument();
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Ver histórico de edições" })).toBeInTheDocument();
+  });
+
+  it("loads history lazily and renders versions through the safe rich-text renderer", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([{ ...ownMessage(), isEdited: true, editCount: 2 }]),
+    );
+    mockGetMessageHistory
+      .mockResolvedValueOnce({
+        entries: [
+          {
+            body: "**Versão segura** <img src=x onerror=alert(1)>",
+            bodyFormat: 2,
+            versionedAt: "2026-07-13T12:00:00Z",
+          },
+        ],
+        nextCursor: "1",
+      })
+      .mockResolvedValueOnce({
+        entries: [{ body: "Versão inicial", bodyFormat: 1, versionedAt: "2026-07-13T11:00:00Z" }],
+      });
+    renderChannelAreaForUser();
+
+    expect(mockGetMessageHistory).not.toHaveBeenCalled();
+    await userEvent.click(await screen.findByRole("button", { name: "Ver histórico de edições" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Histórico de edições" });
+    expect(dialog).toHaveTextContent("Versão segura");
+    expect(dialog.querySelector("strong")).toHaveTextContent("Versão segura");
+    expect(dialog.querySelector("img")).toBeNull();
+    expect(mockGetMessageHistory).toHaveBeenCalledWith("msg-edit", {
+      cursor: undefined,
+      limit: 50,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Carregar mais" }));
+    expect(await screen.findByText("Versão inicial")).toBeInTheDocument();
+    expect(mockGetMessageHistory).toHaveBeenLastCalledWith("msg-edit", {
+      cursor: "1",
+      limit: 50,
+    });
   });
 });

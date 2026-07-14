@@ -32,6 +32,8 @@ const makeFavorite = (overrides: Partial<FavoriteItem> = {}): FavoriteItem => ({
     status: "active",
     createdAt: "2025-01-15T10:00:00Z",
     updatedAt: "2025-01-15T10:00:00Z",
+    isEdited: false,
+    editCount: 0,
     reactions: [],
     isFavorited: true,
     ...(overrides.message ?? {}),
