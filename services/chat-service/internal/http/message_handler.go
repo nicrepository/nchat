@@ -332,7 +332,7 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-// EditMessage handles PATCH /api/v1/messages/{messageID}.
+// EditMessage handles PATCH /api/chat/messages/{messageID}.
 func (h *MessageHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
 	if !h.checkDeps(w) {
 		return
@@ -379,7 +379,7 @@ func (h *MessageHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
 	httputil.WriteJSON(w, http.StatusOK, mapToMessageJSON(message))
 }
 
-// GetMessageEditHistory handles GET /api/v1/messages/{messageID}/history.
+// GetMessageEditHistory handles GET /api/chat/messages/{messageID}/history.
 func (h *MessageHandler) GetMessageEditHistory(w http.ResponseWriter, r *http.Request) {
 	if !h.checkDeps(w) {
 		return
