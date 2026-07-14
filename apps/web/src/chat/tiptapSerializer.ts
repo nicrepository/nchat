@@ -10,17 +10,27 @@
  */
 
 import {
-  BOLD_ITALIC_MARKER,
   BOLD_MARKER,
+  BOLD_ITALIC_MARKER,
   CODE_BLOCK_MARKER,
   CODE_MARKER,
+  INLINE_MARKERS,
   ITALIC_MARKER,
+  LEGACY_INLINE_RE,
+  MENTION_TOKEN_RE,
   buildMentionToken,
   escapeRichText,
   escapeRichTextV3,
+  findUnescapedMarker,
   formatListLine,
+  isCodeFence,
+  parseLegacyListLine,
+  parseListLine,
+  unescapeRichText,
+  unescapeRichTextV3,
 } from "./richTextMarkers";
 import type { ListType } from "./richTextMarkers";
+import type { MessageBodyFormat } from "./chatTypes";
 
 // ── ProseMirror node shape ────────────────────────────────────────────────────
 
@@ -161,4 +171,154 @@ function serializeBlock(node: TTNode, format: CodecFormat): string {
  */
 export function tiptapDocToMarkdown(doc: TTNode, format: CodecFormat): string {
   return (doc.content ?? []).map((node) => serializeBlock(node, format)).join("\n");
+}
+
+// ── Stored body → TipTap document ────────────────────────────────────────────
+
+function textNode(text: string, marks: Array<{ type: string }> = []): TTNode[] {
+  return text ? [{ type: "text", text, ...(marks.length ? { marks } : {}) }] : [];
+}
+
+function markerMarks(type: string): Array<{ type: string }> {
+  if (type === "boldItalic") return [{ type: "bold" }, { type: "italic" }];
+  return [{ type }];
+}
+
+function legacyInline(text: string): TTNode[] {
+  return text.split(LEGACY_INLINE_RE).flatMap((chunk) => {
+    if (!chunk) return [];
+    if (chunk.startsWith(BOLD_MARKER) && chunk.endsWith(BOLD_MARKER))
+      return textNode(chunk.slice(2, -2), [{ type: "bold" }]);
+    if (chunk.startsWith(CODE_MARKER) && chunk.endsWith(CODE_MARKER))
+      return textNode(chunk.slice(1, -1), [{ type: "code" }]);
+    if (chunk.startsWith(ITALIC_MARKER) && chunk.endsWith(ITALIC_MARKER))
+      return textNode(chunk.slice(1, -1), [{ type: "italic" }]);
+    return textNode(chunk);
+  });
+}
+
+function canonicalInline(text: string, format: "v2" | "v3"): TTNode[] {
+  const nodes: TTNode[] = [];
+  const unescape = format === "v3" ? unescapeRichTextV3 : unescapeRichText;
+  let plain = "";
+  let index = 0;
+  const flush = () => {
+    nodes.push(...textNode(unescape(plain)));
+    plain = "";
+  };
+
+  while (index < text.length) {
+    if (text[index] === "\\" && index + 1 < text.length) {
+      plain += text.slice(index, index + 2);
+      index += 2;
+      continue;
+    }
+    if (format === "v3") {
+      const mention = MENTION_TOKEN_RE.exec(text.slice(index));
+      if (mention) {
+        flush();
+        nodes.push({
+          type: "mention",
+          attrs: {
+            label: unescapeRichTextV3(mention[1]),
+            mentionType: mention[2],
+            id: mention[3].toLowerCase(),
+          },
+        });
+        index += mention[0].length;
+        continue;
+      }
+    }
+    const opening = INLINE_MARKERS.find(({ marker }) => text.startsWith(marker, index));
+    if (opening) {
+      const start = index + opening.marker.length;
+      const end = findUnescapedMarker(text, opening.marker, start);
+      if (end > start) {
+        flush();
+        nodes.push(...textNode(unescape(text.slice(start, end)), markerMarks(opening.type)));
+        index = end + opening.marker.length;
+        continue;
+      }
+    }
+    plain += text[index++];
+  }
+  flush();
+  return nodes;
+}
+
+function parseInline(text: string, format: MessageBodyFormat): TTNode[] {
+  return format === "v1" ? legacyInline(text) : canonicalInline(text, format);
+}
+
+function parseList(
+  lines: string[],
+  startAt: number,
+  depth: number,
+  format: MessageBodyFormat,
+): [TTNode, number] {
+  const parseLine = format === "v1" ? parseLegacyListLine : parseListLine;
+  const first = parseLine(lines[startAt])!;
+  const type = first.type;
+  const items: TTNode[] = [];
+  let index = startAt;
+
+  while (index < lines.length) {
+    const line = parseLine(lines[index]);
+    if (!line || line.depth < depth) break;
+    if (line.depth > depth) {
+      if (!items.length) break;
+      const [child, next] = parseList(lines, index, line.depth, format);
+      items.at(-1)!.content!.push(child);
+      index = next;
+      continue;
+    }
+    if (line.type !== type) break;
+    items.push({
+      type: "listItem",
+      content: [{ type: "paragraph", content: parseInline(line.text, format) }],
+    });
+    index++;
+  }
+
+  return [
+    {
+      type: type === "ol" ? "orderedList" : "bulletList",
+      ...(type === "ol" ? { attrs: { start: first.index } } : {}),
+      content: items,
+    },
+    index,
+  ];
+}
+
+/** Decodes the persisted rich-text grammar into the shared TipTap schema. */
+export function richTextToTiptapDoc(text: string, format: MessageBodyFormat): TTNode {
+  const lines = text.split("\n");
+  const content: TTNode[] = [];
+  const parseLine = format === "v1" ? parseLegacyListLine : parseListLine;
+  let index = 0;
+
+  while (index < lines.length) {
+    if (isCodeFence(lines[index])) {
+      const code: string[] = [];
+      index++;
+      while (index < lines.length && !isCodeFence(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index++;
+      const unescape = format === "v3" ? unescapeRichTextV3 : unescapeRichText;
+      content.push({
+        type: "codeBlock",
+        content: textNode(format === "v1" ? code.join("\n") : unescape(code.join("\n"))),
+      });
+      continue;
+    }
+    const listLine = parseLine(lines[index]);
+    if (listLine) {
+      const [list, next] = parseList(lines, index, listLine.depth, format);
+      content.push(list);
+      index = next;
+      continue;
+    }
+    content.push({ type: "paragraph", content: parseInline(lines[index], format) });
+    index++;
+  }
+  return { type: "doc", content: content.length ? content : [{ type: "paragraph" }] };
 }

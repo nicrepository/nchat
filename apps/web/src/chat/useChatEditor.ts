@@ -29,7 +29,7 @@ import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
 import { createMentionExtension } from "./mentionExtension";
 import { tiptapDocToMarkdown } from "./tiptapSerializer";
-import type { CodecFormat } from "./tiptapSerializer";
+import type { CodecFormat, TTNode } from "./tiptapSerializer";
 import type { SendResult } from "./useMessages";
 
 declare module "@tiptap/core" {
@@ -64,6 +64,9 @@ export interface UseChatEditorOptions {
   disabled: boolean;
   channelId?: string;
   bodyFormat: CodecFormat;
+  initialContent?: TTNode;
+  clearOnSend?: boolean;
+  testId?: string;
   onSend: (body: string) => Promise<SendResult>;
 }
 
@@ -102,6 +105,9 @@ export function useChatEditor({
   disabled,
   channelId,
   bodyFormat,
+  initialContent,
+  clearOnSend = true,
+  testId = "chat-composer-input",
   onSend,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
@@ -142,12 +148,14 @@ export function useChatEditor({
           "aria-label": placeholder,
           "aria-multiline": "true",
           role: "textbox",
-          "data-testid": "chat-composer-input",
+          "data-testid": testId,
         },
       },
       onUpdate: ({ editor: e }) => {
         setHasContent(!e.isEmpty);
       },
+      content: initialContent,
+      onCreate: ({ editor: e }) => setHasContent(!e.isEmpty),
     },
     [bodyFormat],
   );
@@ -175,7 +183,7 @@ export function useChatEditor({
     setSending(true);
     try {
       const result = await onSend(body);
-      if (result.status === "sent") {
+      if (result.status === "sent" && clearOnSend) {
         editor.commands.clearContent(true);
       }
       // result.status === "stale": target changed — editor content preserved

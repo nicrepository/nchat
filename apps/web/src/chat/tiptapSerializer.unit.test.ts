@@ -9,7 +9,11 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { tiptapDocToMarkdown as serializeDoc, applyMarks } from "./tiptapSerializer";
+import {
+  tiptapDocToMarkdown as serializeDoc,
+  applyMarks,
+  richTextToTiptapDoc,
+} from "./tiptapSerializer";
 import type { CodecFormat, TTNode } from "./tiptapSerializer";
 import { buildMentionToken, MENTION_TOKEN_RE } from "./richTextMarkers";
 
@@ -392,5 +396,28 @@ describe("tiptapDocToMarkdown — nested lists", () => {
     );
 
     expect(result).toBe("- parent\n  1. child\n    - grandchild");
+  });
+});
+
+describe("richTextToTiptapDoc — edit initialization", () => {
+  it("round-trips v2 formatting, code blocks and nested lists", () => {
+    const stored = "**forte** e `código`\n```\nconst x = 1\n```\n- pai\n  1. filho";
+
+    expect(serializeDoc(richTextToTiptapDoc(stored, "v2"), "v2")).toBe(stored);
+  });
+
+  it("round-trips an authorized v3 mention node", () => {
+    const stored = "@[Ana](mention:user:123e4567-e89b-12d3-a456-426614174000)";
+    const decoded = richTextToTiptapDoc(stored, "v3");
+
+    expect(decoded.content?.[0].content?.[0]).toMatchObject({
+      type: "mention",
+      attrs: {
+        label: "Ana",
+        mentionType: "user",
+        id: "123e4567-e89b-12d3-a456-426614174000",
+      },
+    });
+    expect(serializeDoc(decoded, "v3")).toBe(stored);
   });
 });
