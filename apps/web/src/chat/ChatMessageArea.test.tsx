@@ -2667,6 +2667,21 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
     expect(mockEditMessage).not.toHaveBeenCalled();
   });
 
+  it("preserves v3 as the edit format and cancels the inline editor with Escape", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ ...ownMessage(), bodyText: "Texto v3", bodyFormat: "v3" })]),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Mudança v3");
+    fireEvent.keyDown(editor, { key: "Escape", code: "Escape" });
+
+    expect(await screen.findByText("Texto v3")).toBeInTheDocument();
+    expect(screen.queryByText("Mudança v3")).not.toBeInTheDocument();
+    expect(mockEditMessage).not.toHaveBeenCalled();
+  });
+
   it("shows the expired-window error and keeps the persisted content", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
     mockEditMessage.mockRejectedValue(
@@ -2684,6 +2699,50 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
     expect(
       screen.queryByRole("button", { name: "Ver histórico de edições" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows rate-limit feedback and keeps the persisted content", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(
+      new chatApi.MessageEditError(429, "rate_limited", "rate limited"),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Aguarde antes de editar novamente.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+    expect(screen.getByText("Texto original")).toBeInTheDocument();
+  });
+
+  it("shows not-found feedback when the edited message is no longer visible", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(new chatApi.MessageEditError(404, "not_found", "missing"));
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Mensagem não encontrada.");
+  });
+
+  it("shows generic feedback when editing fails without a typed API error", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
+    mockEditMessage.mockRejectedValue(new TypeError("network unavailable"));
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, "Não persistir");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Não foi possível editar a mensagem.",
+    );
   });
 
   it("hides editing and reloads after a 403 without retaining the optimistic body", async () => {

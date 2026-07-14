@@ -1100,6 +1100,28 @@ describe("useMessages — message editing", () => {
     expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "rascunho otimista", 3);
   });
 
+  it("sends legacy v1 edits using the backend body-format version", async () => {
+    const original = makeMessage({ id: "msg-edit", bodyText: "original", bodyFormat: "v1" });
+    const updated = makeMessage({
+      ...original,
+      bodyText: "texto legado editado",
+      bodyFormat: "v1",
+      isEdited: true,
+      editCount: 1,
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [original], nextCursor: "" });
+    mockEditMessage.mockResolvedValue(updated);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.editMessageLocal("msg-edit", "texto legado editado", "v1"));
+
+    expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "texto legado editado", 1);
+    expect(result.current.state.messages[0]).toMatchObject(updated);
+  });
+
   it("does not let a late PATCH failure overwrite a newer authoritative WS edit", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "msg-edit", bodyText: "original" })],
@@ -1145,6 +1167,58 @@ describe("useMessages — message editing", () => {
     });
   });
 
+  it("does not let a stale PATCH success overwrite a newer authoritative WS edit", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-edit", bodyText: "original" })],
+      nextCursor: "",
+    });
+    let resolveEdit!: (message: Message) => void;
+    mockEditMessage.mockImplementation(() => new Promise((resolve) => (resolveEdit = resolve)));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let request!: Promise<Message>;
+    act(() => {
+      request = result.current.editMessageLocal("msg-edit", "resposta atrasada", "v2");
+    });
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "ch-1",
+          body: "versão mais nova",
+          body_format: "v3",
+          edited_at: "2026-07-13T13:00:00Z",
+          edit_count: 3,
+          is_edited: true,
+        },
+      }),
+    );
+    act(() =>
+      resolveEdit(
+        makeMessage({
+          id: "msg-edit",
+          bodyText: "resposta atrasada",
+          editCount: 1,
+          isEdited: true,
+        }),
+      ),
+    );
+    await request;
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "versão mais nova",
+      bodyFormat: "v3",
+      editCount: 3,
+      editedAt: "2026-07-13T13:00:00Z",
+    });
+  });
+
   it("reconciles message.updated with every authoritative server field", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "msg-edit", bodyText: "original" })],
@@ -1179,5 +1253,75 @@ describe("useMessages — message editing", () => {
       editCount: 4,
       isEdited: true,
     });
+  });
+
+  it("ignores an older message.updated version for the rendered message", async () => {
+    const current = makeMessage({
+      id: "msg-edit",
+      bodyText: "versão atual",
+      bodyFormat: "v3",
+      editCount: 4,
+      isEdited: true,
+      editedAt: "2026-07-13T12:00:00Z",
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [current], nextCursor: "" });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "ch-1",
+          body: "versão antiga",
+          body_format: "v2",
+          edited_at: "2026-07-13T11:00:00Z",
+          edit_count: 3,
+          is_edited: true,
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0]).toEqual(current);
+  });
+
+  it("ignores message.updated for another target or an unknown message", async () => {
+    const original = makeMessage({ id: "msg-edit", bodyText: "original" });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [original], nextCursor: "" });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const update: WSMessageUpdatedEvent = {
+      type: "message.updated",
+      target_type: "channel",
+      target_id: "ch-2",
+      message_update: {
+        message_id: "msg-edit",
+        channel_id: "ch-2",
+        body: "não aplicar",
+        body_format: "v3",
+        edited_at: "2026-07-13T12:00:00Z",
+        edit_count: 1,
+        is_edited: true,
+      },
+    };
+
+    act(() => capturedOnMessageUpdated?.(update));
+    act(() =>
+      capturedOnMessageUpdated?.({
+        ...update,
+        target_id: "ch-1",
+        message_update: { ...update.message_update, message_id: "missing", channel_id: "ch-1" },
+      }),
+    );
+
+    expect(result.current.state.messages).toEqual([original]);
   });
 });

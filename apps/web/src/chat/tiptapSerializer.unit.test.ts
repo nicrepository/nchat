@@ -400,6 +400,45 @@ describe("tiptapDocToMarkdown — nested lists", () => {
 });
 
 describe("richTextToTiptapDoc — edit initialization", () => {
+  it("decodes legacy bold, code and italic markers into editor marks", () => {
+    const decoded = richTextToTiptapDoc("**forte** `código` *ênfase* texto", "v1");
+
+    expect(decoded.content?.[0].content).toEqual([
+      text("forte", "bold"),
+      { type: "text", text: " " },
+      text("código", "code"),
+      { type: "text", text: " " },
+      text("ênfase", "italic"),
+      { type: "text", text: " texto" },
+    ]);
+  });
+
+  it("loads escaped canonical markers as literal editor text", () => {
+    const stored = String.raw`\*literal\* e \`código\``;
+    const decoded = richTextToTiptapDoc(stored, "v2");
+
+    expect(decoded.content?.[0].content).toEqual([{ type: "text", text: "*literal* e `código`" }]);
+    expect(serializeDoc(decoded, "v2")).toBe(stored);
+  });
+
+  it("decodes combined canonical emphasis into both editor marks", () => {
+    const decoded = richTextToTiptapDoc("***ênfase forte***", "v2");
+
+    expect(decoded.content?.[0].content).toEqual([
+      {
+        type: "text",
+        text: "ênfase forte",
+        marks: [{ type: "bold" }, { type: "italic" }],
+      },
+    ]);
+  });
+
+  it("keeps an unmatched canonical marker as literal initial content", () => {
+    const decoded = richTextToTiptapDoc("**marcador aberto", "v2");
+
+    expect(decoded.content?.[0].content).toEqual([{ type: "text", text: "**marcador aberto" }]);
+  });
+
   it("round-trips v2 formatting, code blocks and nested lists", () => {
     const stored = "**forte** e `código`\n```\nconst x = 1\n```\n- pai\n  1. filho";
 
