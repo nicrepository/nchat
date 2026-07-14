@@ -1036,3 +1036,185 @@
 .composer-toolbar__emoji-btn:hover {
   background: var(--color-surface-2, #faf8fd);
 }
+
+/* ── Message editing and history (RF-13) ─────────────────────────────────── */
+
+.chat-msg-area__edited {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chat-msg-area__edited:hover,
+.chat-msg-area__edited:focus-visible {
+  color: var(--color-primary, #0e7490);
+  text-decoration: underline;
+}
+
+.chat-msg-area__inline-edit {
+  min-width: min(520px, 60vw);
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+}
+
+.chat-msg-area__inline-edit .chat-msg-area__composer-input {
+  min-height: 44px;
+  max-height: 240px;
+}
+
+.chat-msg-area__inline-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-msg-area__inline-edit-bar > button {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-md, 10px);
+  background: transparent;
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-msg-area__inline-edit-bar > .composer-toolbar {
+  margin-right: auto;
+}
+
+.chat-msg-area__inline-edit-bar > .chat-msg-area__inline-save {
+  background: var(--color-primary, #0e7490);
+  color: #fff;
+}
+
+.chat-msg-area__inline-edit-bar > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.chat-msg-area__inline-edit > p {
+  margin: 0;
+  padding: 0 10px 8px;
+  color: var(--color-danger, #dc2626);
+  font-size: 12px;
+}
+
+.message-history__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(22 18 31 / 42%);
+}
+
+.message-history {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: min(680px, 85vh);
+  overflow: hidden;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-md, 0 12px 40px rgb(22 18 31 / 20%));
+}
+
+.message-history__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.message-history__header h2,
+.message-history__header p {
+  margin: 0;
+}
+
+.message-history__header h2 {
+  font-size: 17px;
+}
+
+.message-history__header p,
+.message-history__entry time,
+.message-history__status {
+  color: var(--color-muted, #7c7390);
+  font-size: 12px;
+}
+
+.message-history__header button {
+  border: 0;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.message-history__content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 14px 20px;
+}
+
+.message-history__entry {
+  padding: 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.message-history__body {
+  margin-top: 6px;
+  color: var(--color-ink, #16121f);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message-history__status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 64px;
+}
+
+.message-history__status button,
+.message-history__load-more {
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  cursor: pointer;
+}
+
+.message-history__load-more {
+  align-self: center;
+  margin: 0 0 14px;
+  padding: 7px 14px;
+  font-size: 12px;
+}
+
+@media (max-width: 680px) {
+  .chat-msg-area__inline-edit {
+    min-width: min(280px, 72vw);
+  }
+
+  .chat-msg-area__inline-edit-bar > .composer-toolbar {
+    display: none;
+  }
+}
