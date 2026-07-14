@@ -206,7 +206,7 @@ func TestMessageHandler_EditMessage_RejectsMalformedAndUnknownFields(t *testing.
 		t.Run(tt.name, func(t *testing.T) {
 			handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}).
 				WithEditing(nil, nil, fakeEditLimiter{allowed: true})
-			request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID, strings.NewReader(tt.body))
+			request := requestWithUser(http.MethodPatch, "/api/chat/messages/"+testMessageID, strings.NewReader(tt.body))
 			request.SetPathValue("messageID", testMessageID)
 			recorder := httptest.NewRecorder()
 
@@ -222,7 +222,7 @@ func TestMessageHandler_EditMessage_RejectsMalformedAndUnknownFields(t *testing.
 func TestMessageHandler_EditMessage_MapsInvalidBodyFormatToBadRequest(t *testing.T) {
 	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{editErr: domain.ErrInvalidInput}).
 		WithEditing(nil, nil, fakeEditLimiter{allowed: true})
-	request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID,
+	request := requestWithUser(http.MethodPatch, "/api/chat/messages/"+testMessageID,
 		strings.NewReader(`{"body":"edited","body_format":"v4"}`))
 	request.SetPathValue("messageID", testMessageID)
 	recorder := httptest.NewRecorder()
@@ -242,7 +242,7 @@ func TestMessageHandler_EditMessage_ReturnsUpdatedMessage(t *testing.T) {
 	}}
 	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages).
 		WithEditing(nil, nil, fakeEditLimiter{allowed: true})
-	request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID,
+	request := requestWithUser(http.MethodPatch, "/api/chat/messages/"+testMessageID,
 		strings.NewReader(`{"body":"edited","body_format":"v3"}`))
 	request.SetPathValue("messageID", testMessageID)
 	recorder := httptest.NewRecorder()
@@ -265,7 +265,7 @@ func TestMessageHandler_EditMessage_EnforcesAuthenticationAndRateLimit(t *testin
 	t.Run("unauthenticated", func(t *testing.T) {
 		handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}).
 			WithEditing(nil, nil, fakeEditLimiter{allowed: true})
-		request := httptest.NewRequest(http.MethodPatch, "/api/v1/messages/"+testMessageID, strings.NewReader(`{"body":"edited","body_format":"v1"}`))
+		request := httptest.NewRequest(http.MethodPatch, "/api/chat/messages/"+testMessageID, strings.NewReader(`{"body":"edited","body_format":"v1"}`))
 		request.SetPathValue("messageID", testMessageID)
 		recorder := httptest.NewRecorder()
 		handler.EditMessage(recorder, request)
@@ -289,7 +289,7 @@ func TestMessageHandler_EditMessage_EnforcesAuthenticationAndRateLimit(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}).
 				WithEditing(nil, nil, tt.limiter)
-			request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID, strings.NewReader(`{"body":"edited","body_format":"v1"}`))
+			request := requestWithUser(http.MethodPatch, "/api/chat/messages/"+testMessageID, strings.NewReader(`{"body":"edited","body_format":"v1"}`))
 			request.SetPathValue("messageID", testMessageID)
 			recorder := httptest.NewRecorder()
 			handler.EditMessage(recorder, request)
@@ -307,8 +307,8 @@ func TestMessageEditingHandlers_RejectInvalidTargetIDs(t *testing.T) {
 		path   string
 		param  string
 	}{
-		{name: "edit message", path: "/api/v1/messages/not-a-uuid", param: "messageID", invoke: (*httpapi.MessageHandler).EditMessage},
-		{name: "message history", path: "/api/v1/messages/not-a-uuid/history", param: "messageID", invoke: (*httpapi.MessageHandler).GetMessageEditHistory},
+		{name: "edit message", path: "/api/chat/messages/not-a-uuid", param: "messageID", invoke: (*httpapi.MessageHandler).EditMessage},
+		{name: "message history", path: "/api/chat/messages/not-a-uuid/history", param: "messageID", invoke: (*httpapi.MessageHandler).GetMessageEditHistory},
 		{name: "workspace settings", path: "/api/v1/workspaces/not-a-uuid/settings", param: "workspaceID", invoke: (*httpapi.MessageHandler).UpdateWorkspaceEditWindow},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -333,8 +333,8 @@ func TestMessageEditingHandlers_ReturnNotFoundWhenWorkspaceCannotBeResolved(t *t
 		path   string
 		invoke func(*httpapi.MessageHandler, http.ResponseWriter, *http.Request)
 	}{
-		{name: "edit message", path: "/api/v1/messages/" + testMessageID, invoke: (*httpapi.MessageHandler).EditMessage},
-		{name: "message history", path: "/api/v1/messages/" + testMessageID + "/history", invoke: (*httpapi.MessageHandler).GetMessageEditHistory},
+		{name: "edit message", path: "/api/chat/messages/" + testMessageID, invoke: (*httpapi.MessageHandler).EditMessage},
+		{name: "message history", path: "/api/chat/messages/" + testMessageID + "/history", invoke: (*httpapi.MessageHandler).GetMessageEditHistory},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			handler := makeHandlerWithUser(&fakeWorkspaceResolver{err: domain.ErrNotFound}, &fakeMessageProvider{}).
@@ -368,7 +368,7 @@ func TestMessageHandler_GetMessageEditHistory_ReturnsPageAndEmptyList(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			messages := &fakeMessageProvider{history: tt.history}
 			handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
-			request := requestWithUser(http.MethodGet, "/api/v1/messages/"+testMessageID+"/history?limit=2&offset=1", nil)
+			request := requestWithUser(http.MethodGet, "/api/chat/messages/"+testMessageID+"/history?limit=2&offset=1", nil)
 			request.SetPathValue("messageID", testMessageID)
 			recorder := httptest.NewRecorder()
 
@@ -396,7 +396,7 @@ func TestMessageHandler_GetMessageEditHistory_NonMemberAndMissingReturnNotFound(
 	for _, name := range []string{"non-member", "missing-message"} {
 		t.Run(name, func(t *testing.T) {
 			handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{historyErr: domain.ErrNotFound})
-			request := requestWithUser(http.MethodGet, "/api/v1/messages/"+testMessageID+"/history", nil)
+			request := requestWithUser(http.MethodGet, "/api/chat/messages/"+testMessageID+"/history", nil)
 			request.SetPathValue("messageID", testMessageID)
 			recorder := httptest.NewRecorder()
 
@@ -412,7 +412,7 @@ func TestMessageHandler_GetMessageEditHistory_NonMemberAndMissingReturnNotFound(
 func TestMessageHandler_GetMessageEditHistory_RejectsUnauthenticatedAndInvalidOffset(t *testing.T) {
 	t.Run("unauthenticated", func(t *testing.T) {
 		handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
-		request := httptest.NewRequest(http.MethodGet, "/api/v1/messages/"+testMessageID+"/history", nil)
+		request := httptest.NewRequest(http.MethodGet, "/api/chat/messages/"+testMessageID+"/history", nil)
 		request.SetPathValue("messageID", testMessageID)
 		recorder := httptest.NewRecorder()
 		handler.GetMessageEditHistory(recorder, request)
@@ -424,7 +424,7 @@ func TestMessageHandler_GetMessageEditHistory_RejectsUnauthenticatedAndInvalidOf
 	for _, offset := range []string{"invalid", "-1", "10001"} {
 		t.Run(offset, func(t *testing.T) {
 			handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
-			request := requestWithUser(http.MethodGet, "/api/v1/messages/"+testMessageID+"/history?offset="+offset, nil)
+			request := requestWithUser(http.MethodGet, "/api/chat/messages/"+testMessageID+"/history?offset="+offset, nil)
 			request.SetPathValue("messageID", testMessageID)
 			recorder := httptest.NewRecorder()
 			handler.GetMessageEditHistory(recorder, request)
@@ -439,7 +439,7 @@ func TestMessageHandler_EditMessage_MapsNonAuthorToForbidden(t *testing.T) {
 	messages := &fakeMessageProvider{editErr: domain.ErrEditForbidden}
 	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages).
 		WithEditing(nil, nil, fakeEditLimiter{allowed: true})
-	request := requestWithUser(http.MethodPatch, "/api/v1/messages/"+testMessageID,
+	request := requestWithUser(http.MethodPatch, "/api/chat/messages/"+testMessageID,
 		strings.NewReader(`{"body":"edited","body_format":"v1"}`))
 	request.SetPathValue("messageID", testMessageID)
 	recorder := httptest.NewRecorder()
