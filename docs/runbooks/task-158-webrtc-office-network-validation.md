@@ -133,16 +133,16 @@ o comportamento padrão (sem a variável) não muda.
 
 ## Cenários mínimos de teste
 
-| Cenário | Descrição | Automatizável | Como validar |
-| --- | --- | --- | --- |
-| A | Conectividade básica ao endpoint LiveKit | Sim | `validate-webrtc-office-network.sh` (curl com timeout) |
-| B | ICE com UDP disponível — STUN binding | Sim | `validate-webrtc-office-network.sh` (`turnutils_stunclient`) |
-| C | TURN obrigatório (relay forçado) — UDP, TCP, TLS/443 | Sim (UDP/TCP); TLS reportado como NÃO CONFIGURADO no template dev atual | `validate-webrtc-office-network.sh` (`turnutils_uclient -y [-t] [-S]`) |
-| D | UDP bloqueado → fallback TCP/TLS | Parcial — bloqueio de UDP é manual (firewall do operador); detecção do fallback é automática | Bloquear UDP manualmente (regra de firewall local, temporária) e reexecutar o script |
-| E | **Conectividade de sala e presença de participantes** (infra apenas — ver nota abaixo) | Sim (via `livekit-cli`, mídia sintética `--publish-demo`) | `validate-webrtc-office-network.sh` |
-| F | Estabilidade por período mínimo (10-15 min sugerido) | Sim (polling, sem sleep único) | `WEBRTC_QA_STABILITY_SECONDS=900` |
-| G | Falha controlada (endpoint indisponível) | Sim | Rodar com `WEBRTC_QA_TARGET_HOST` inválido/inacessível — script falha rápido, com mensagem clara, exit code != 0 |
-| — | Tipos de candidato ICE por sessão (host/srflx/relay) | **Manual** — requer browser real | `chrome://webrtc-internals` ou `about:webrtc` (Firefox), inspecionar `candidate-pair` selecionado e `local-candidate`/`remote-candidate` types |
+| Cenário | Descrição                                                                              | Automatizável                                                                                | Como validar                                                                                                                                   |
+| ------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| A       | Conectividade básica ao endpoint LiveKit                                               | Sim                                                                                          | `validate-webrtc-office-network.sh` (curl com timeout)                                                                                         |
+| B       | ICE com UDP disponível — STUN binding                                                  | Sim                                                                                          | `validate-webrtc-office-network.sh` (`turnutils_stunclient`)                                                                                   |
+| C       | TURN obrigatório (relay forçado) — UDP, TCP, TLS/443                                   | Sim (UDP/TCP); TLS reportado como NÃO CONFIGURADO no template dev atual                      | `validate-webrtc-office-network.sh` (`turnutils_uclient -y [-t] [-S]`)                                                                         |
+| D       | UDP bloqueado → fallback TCP/TLS                                                       | Parcial — bloqueio de UDP é manual (firewall do operador); detecção do fallback é automática | Bloquear UDP manualmente (regra de firewall local, temporária) e reexecutar o script                                                           |
+| E       | **Conectividade de sala e presença de participantes** (infra apenas — ver nota abaixo) | Sim (via `livekit-cli`, mídia sintética `--publish-demo`)                                    | `validate-webrtc-office-network.sh`                                                                                                            |
+| F       | Estabilidade por período mínimo (10-15 min sugerido)                                   | Sim (polling, sem sleep único)                                                               | `WEBRTC_QA_STABILITY_SECONDS=900`                                                                                                              |
+| G       | Falha controlada (endpoint indisponível)                                               | Sim                                                                                          | Rodar com `WEBRTC_QA_TARGET_HOST` inválido/inacessível — script falha rápido, com mensagem clara, exit code != 0                               |
+| —       | Tipos de candidato ICE por sessão (host/srflx/relay)                                   | **Manual** — requer browser real                                                             | `chrome://webrtc-internals` ou `about:webrtc` (Firefox), inspecionar `candidate-pair` selecionado e `local-candidate`/`remote-candidate` types |
 
 ### Importante: o que o Cenário E prova (e o que não prova)
 
@@ -212,12 +212,12 @@ Ao final da execução, o script consolida todos os cenários em um resultado
 único (`FINAL_RESULT`) e retorna um exit code correspondente — **nunca 0**
 para um resultado que não seja `APPROVED`:
 
-| Resultado | Exit code | Significado |
-| --- | --- | --- |
-| `APPROVED` | `0` | Todos os critérios automatizáveis obrigatórios passaram **e** a evidência manual obrigatória foi confirmada (`WEBRTC_QA_MANUAL_EVIDENCE_CONFIRMED=1`) **e** o alvo não é loopback (teste de campo real). |
-| `FAILED` | `1` | Um cenário obrigatório automatizado falhou (A, B, C-UDP ou E). |
-| `PARTIAL` | `2` | Conectividade parcial — ex.: fallback TCP/TLS ausente/falhou, ou a estabilidade detectou quedas, mas nenhum cenário obrigatório falhou. |
-| `PENDING` | `3` | Um resultado automatizado obrigatório está ausente, vazio ou foi pulado; e/ou a execução física/evidência manual não foi confirmada (alvo loopback e/ou `WEBRTC_QA_MANUAL_EVIDENCE_CONFIRMED=0`). |
+| Resultado  | Exit code | Significado                                                                                                                                                                                              |
+| ---------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `APPROVED` | `0`       | Todos os critérios automatizáveis obrigatórios passaram **e** a evidência manual obrigatória foi confirmada (`WEBRTC_QA_MANUAL_EVIDENCE_CONFIRMED=1`) **e** o alvo não é loopback (teste de campo real). |
+| `FAILED`   | `1`       | Um cenário obrigatório automatizado falhou (A, B, C-UDP ou E).                                                                                                                                           |
+| `PARTIAL`  | `2`       | Conectividade parcial — ex.: fallback TCP/TLS ausente/falhou, ou a estabilidade detectou quedas, mas nenhum cenário obrigatório falhou.                                                                  |
+| `PENDING`  | `3`       | Um resultado automatizado obrigatório está ausente, vazio ou foi pulado; e/ou a execução física/evidência manual não foi confirmada (alvo loopback e/ou `WEBRTC_QA_MANUAL_EVIDENCE_CONFIRMED=0`).        |
 
 Esses códigos são o contrato interno do script executado diretamente em
 Bash: `0=APPROVED`, `1=FAILED`, `2=PARTIAL` e `3=PENDING`. Alguns
