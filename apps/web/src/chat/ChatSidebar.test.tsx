@@ -6,20 +6,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
-import type { Channel, DMConversation } from "./chatTypes";
+import type { Channel, DMCandidate, DirectDMResult, DMConversation } from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
-const { mockFetchSidebarData } = vi.hoisted(() => ({
-  mockFetchSidebarData:
-    vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
-}));
+const { mockFetchSidebarData, mockSearchDMCandidates, mockGetOrCreateDirectDM } = vi.hoisted(
+  () => ({
+    mockFetchSidebarData:
+      vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
+    mockSearchDMCandidates:
+      vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
+    mockGetOrCreateDirectDM:
+      vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
+  }),
+);
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: () => mockFetchSidebarData(),
   // Keep individual exports so chatApi.test.ts can still import them.
   fetchChannels: vi.fn(),
   fetchDMs: vi.fn(),
+  searchDMCandidates: (query: string, signal?: AbortSignal) =>
+    mockSearchDMCandidates(query, signal),
+  getOrCreateDirectDM: (userId: string, signal?: AbortSignal) =>
+    mockGetOrCreateDirectDM(userId, signal),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -104,6 +114,8 @@ function renderChat(initialPath = "/chat", authenticated = true) {
 beforeEach(() => {
   clearTokens();
   vi.clearAllMocks();
+  mockSearchDMCandidates.mockResolvedValue([]);
+  mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
 });
 
 afterEach(() => {
@@ -310,6 +322,57 @@ describe("ChatSidebar — DMs", () => {
     await waitFor(() => {
       expect(screen.getByText(/nenhuma mensagem direta/i)).toBeInTheDocument();
     });
+  });
+
+  it("opens and closes the new-message dialog, restoring focus to its trigger", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
+    renderChat();
+
+    const trigger = await screen.findByRole("button", { name: "Nova mensagem direta" });
+    await user.click(trigger);
+    expect(screen.getByRole("dialog", { name: "Nova mensagem" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Fechar nova mensagem" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("opens the canonical DM, revalidates the sidebar and does not duplicate an existing item", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: SAMPLE_CHANNELS,
+      dms: SAMPLE_DMS,
+    });
+    mockSearchDMCandidates.mockResolvedValue([{ userId: "juliane", displayName: "Juliane Lino" }]);
+    mockGetOrCreateDirectDM.mockResolvedValue({
+      conversationId: "dm-juliane",
+      created: false,
+    });
+    renderChat();
+
+    await user.click(await screen.findByRole("button", { name: "Nova mensagem direta" }));
+    await user.type(screen.getByRole("searchbox"), "ju");
+    await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
+
+    await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith("juliane", expect.any(AbortSignal));
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(
+      screen.getAllByRole("option", { name: /mensagem direta com juliane lino/i }),
+    ).toHaveLength(1);
+
+    const trigger = screen.getByRole("button", { name: "Nova mensagem direta" });
+    expect(trigger).toHaveFocus();
+    await user.click(trigger);
+    expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toHaveValue("");
   });
 });
 

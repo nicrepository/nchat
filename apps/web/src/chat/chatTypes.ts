@@ -31,6 +31,16 @@ export interface DMConversation {
   unreadCount?: number;
 }
 
+export interface DMCandidate {
+  userId: string;
+  displayName: string;
+}
+
+export interface DirectDMResult {
+  conversationId: string;
+  created: boolean;
+}
+
 // ── Current user (sidebar footer) ───────────────────────────────────────────
 
 export interface CurrentUser {
