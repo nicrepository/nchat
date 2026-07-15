@@ -94,6 +94,15 @@ func ValidateMessageEdit(message Message, requesterID string, editWindowSeconds 
 	return nil
 }
 
+// ValidateMessageDelete allows only the author of a user message to remove it.
+// Already-deleted messages are valid so DELETE remains idempotent.
+func ValidateMessageDelete(message Message, requesterID string) error {
+	if message.SenderID != requesterID || message.Kind != MessageKindUser {
+		return ErrForbidden
+	}
+	return nil
+}
+
 // QuotedMessage is the inline parent preview attached to a reply.
 // Status is kept for serializers to reuse the deleted-message placeholder rule.
 type QuotedMessage struct {

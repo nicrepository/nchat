@@ -364,10 +364,18 @@ Allowing them is future scope and must be explicitly documented and tested if ad
 
 ### Soft delete and message lifecycle
 
-Deletion is model-ready: `status` can be `'deleted'` and `deleted_at` records
-the soft-delete time. The service does not yet expose a delete operation; that
-is deferred to a future PR (RF-14, RF-66, RF-67). Listing returns messages with
-`status='deleted'` as placeholder records; body redaction policy is future scope.
+`DELETE /api/chat/messages/{messageID}` lets the authenticated author soft-delete
+an active user message. The transaction locks the message row, verifies current
+workspace and target access, sets `status='deleted'`, and assigns `deleted_at`
+and `updated_at` from the database clock. Repeated deletion by the same author is
+idempotent; unauthorized and inaccessible messages are externally indistinguishable.
+
+The original body remains in PostgreSQL. A future retention, purge, or audit
+lifecycle remains outside this change (RF-64 through RF-67). Normal HTTP
+responses, references, and `message.updated` WebSocket events are centrally
+redacted: deleted messages preserve identity, author, target, and chronology,
+but expose an empty body and no quote. Clients render the localized
+removed-message placeholder and suppress content actions and edit history.
 
 ## Cross-schema identity
 

@@ -71,6 +71,7 @@ export interface Message {
   bodyFormat: MessageBodyFormat;
   isRemoved: boolean;
   status: MessageStatus;
+  deletedAt?: string | null;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
   isEdited: boolean;

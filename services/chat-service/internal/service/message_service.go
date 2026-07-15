@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -137,6 +138,12 @@ type EditMessageInput struct {
 	EditorID    string
 	Body        string
 	BodyFormat  domain.MessageBodyFormat
+}
+
+type DeleteMessageInput struct {
+	WorkspaceID string
+	MessageID   string
+	RequesterID string
 }
 
 type GetMessageEditHistoryInput struct {
@@ -425,6 +432,37 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	}
 	s.publishMessageUpdated(ctx, updated)
 	return updated, nil
+}
+
+// DeleteMessage soft-deletes an authored user message and publishes the
+// sanitized placeholder only after the transaction commits.
+func (s *MessageService) DeleteMessage(ctx context.Context, input DeleteMessageInput) (domain.Message, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	messageID := strings.TrimSpace(input.MessageID)
+	requesterID := strings.TrimSpace(input.RequesterID)
+	if workspaceID == "" || messageID == "" || requesterID == "" {
+		return domain.Message{}, fmt.Errorf("%w: workspace_id, message_id, and requester_id are required", domain.ErrInvalidInput)
+	}
+
+	deleted, changed, err := s.messages.DeleteMessage(ctx, storage.DeleteMessageInput{
+		WorkspaceID: workspaceID, MessageID: messageID, RequesterID: requesterID,
+	})
+	if err != nil {
+		// Do not expose whether a readable message belongs to another author (or
+		// is a non-deletable system message) through a distinct HTTP status.
+		if errors.Is(err, domain.ErrForbidden) {
+			return domain.Message{}, domain.ErrNotFound
+		}
+		return domain.Message{}, fmt.Errorf("delete message: %w", err)
+	}
+	// The database retains the body for future retention/audit policy, but no
+	// normal service response or event may carry it after deletion.
+	deleted.BodyText = ""
+	deleted.Quoted = nil
+	if changed {
+		s.publishMessageUpdated(ctx, deleted)
+	}
+	return deleted, nil
 }
 
 func (s *MessageService) resolveAndRewriteMentions(ctx context.Context, workspaceID, channelID, requesterID, body string, bodyFormat domain.MessageBodyFormat) (string, error) {

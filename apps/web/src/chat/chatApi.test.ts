@@ -12,6 +12,7 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import {
+  deleteMessage,
   editMessage,
   favoriteMessage,
   fetchChannelMessage,
@@ -518,6 +519,28 @@ describe("fetchChannelMessages", () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ status: "deleted" })]));
     const page = await fetchChannelMessages("geral");
     expect(page.messages[0].status).toBe("deleted");
+    expect(page.messages[0].bodyText).toBe("");
+  });
+
+  it("fails closed when deleted_at is present despite an active status", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          status: "active",
+          body_text: "não expor",
+          deleted_at: "2026-07-14T12:00:00Z",
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0]).toMatchObject({
+      bodyText: "",
+      status: "deleted",
+      isRemoved: true,
+      deletedAt: "2026-07-14T12:00:00Z",
+    });
   });
 
   it("handles absent messages field as empty array", async () => {
@@ -600,6 +623,42 @@ describe("message editing", () => {
       ],
       nextCursor: "4",
     });
+  });
+});
+
+describe("message deletion", () => {
+  it("DELETEs the encoded message path and maps a sanitized placeholder", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          body_text: "conteúdo que não deve reaparecer",
+          quoted: { id: "parent-1", body: "citação antiga" },
+          status: "deleted",
+          deleted_at: "2026-07-14T12:00:00Z",
+        }),
+      ),
+    );
+
+    const message = await deleteMessage("msg/1");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg%2F1", {
+      method: "DELETE",
+    });
+    expect(message).toMatchObject({
+      id: "msg-1",
+      bodyText: "",
+      status: "deleted",
+      isRemoved: true,
+      deletedAt: "2026-07-14T12:00:00Z",
+    });
+    expect(message.quoted).toBeUndefined();
+  });
+
+  it("propagates a rejected deletion without changing its error details", async () => {
+    const error = new ApiRequestError(403, "forbidden", "request failed");
+    mockAuthFetch.mockRejectedValue(error);
+
+    await expect(deleteMessage("msg-1")).rejects.toBe(error);
   });
 });
 

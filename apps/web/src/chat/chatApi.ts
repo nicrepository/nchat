@@ -156,6 +156,7 @@ interface MessageResponse {
   body_format?: string;
   is_removed?: boolean;
   status: string;
+  deleted_at?: string | null;
   created_at: string;
   updated_at: string;
   edited_at?: string | null;
@@ -275,16 +276,18 @@ function isMentionEnvelope(value: unknown): value is MentionEnvelope {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 function mapMessage(r: MessageResponse): Message {
+  const isRemoved = r.is_removed === true || r.status === "deleted" || Boolean(r.deleted_at);
   return {
     id: r.id,
     senderId: r.sender_id,
     senderDisplayName: r.sender_display_name ?? "",
     senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
-    bodyText: r.body_text ?? "",
+    bodyText: isRemoved ? "" : (r.body_text ?? ""),
     bodyFormat: normalizeBodyFormat(r.body_format),
-    isRemoved: r.is_removed ?? false,
-    status: (r.status === "deleted" ? "deleted" : "active") as Message["status"],
+    isRemoved,
+    status: isRemoved ? "deleted" : "active",
+    deletedAt: r.deleted_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     isEdited: r.is_edited ?? (r.edit_count ?? 0) > 0,
@@ -296,7 +299,7 @@ function mapMessage(r: MessageResponse): Message {
       reactedByMe: reaction.reacted_by_me,
     })),
     isFavorited: r.is_favorited ?? false,
-    quoted: r.quoted ? mapQuote(r.quoted) : undefined,
+    quoted: !isRemoved && r.quoted ? mapQuote(r.quoted) : undefined,
   };
 }
 
@@ -452,6 +455,14 @@ export async function editMessage(
   } catch (error) {
     return mapMessageEditError(error);
   }
+}
+
+export async function deleteMessage(messageId: string): Promise<Message> {
+  const response = await authenticatedFetch<MessageEnvelope>(
+    `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}`,
+    { method: "DELETE" },
+  );
+  return mapMessage(response.data);
 }
 
 export async function getMessageHistory(

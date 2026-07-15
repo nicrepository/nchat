@@ -100,9 +100,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
 	))
 
-	// RF-13 message editing/history and workspace edit-window configuration.
+	// RF-13/RF-14 message editing, history, soft deletion, and workspace edit-window configuration.
 	// The edit handler applies the shared Valkey Lua limiter before touching DB.
-	mux.Handle("PATCH "+RouteMessageEdit, authMiddleware(http.HandlerFunc(messages.EditMessage)))
+	mux.Handle("PATCH "+RouteMessage, authMiddleware(http.HandlerFunc(messages.EditMessage)))
+	mux.Handle("DELETE "+RouteMessage, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.DeleteMessage)),
+	))
 	mux.Handle("GET "+RouteMessageEditHistory, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageEditHistory)),
 	))
