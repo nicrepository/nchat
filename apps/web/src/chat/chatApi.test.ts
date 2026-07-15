@@ -25,6 +25,7 @@ import {
   fetchDMMessages,
   fetchDMs,
   fetchMentionCandidates,
+  getOrCreateDirectDM,
   getMessageHistory,
   MessageEditError,
   fetchSidebarData,
@@ -33,6 +34,7 @@ import {
   postChannelMessage,
   postDMMessage,
   resetAllowedReactionEmojisCache,
+  searchDMCandidates,
   unfavoriteMessage,
   unpinMessage,
 } from "./chatApi";
@@ -325,6 +327,43 @@ describe("fetchSidebarData", () => {
     });
     const { dms } = await fetchSidebarData();
     expect(dms).toEqual([]);
+  });
+});
+
+describe("direct DM contracts", () => {
+  it("searches candidates with the authenticated endpoint and maps the response", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        candidates: [{ user_id: "user-2", display_name: "Joana Silva" }],
+      },
+    });
+    const controller = new AbortController();
+
+    await expect(searchDMCandidates("  Joana  ", controller.signal)).resolves.toEqual([
+      { userId: "user-2", displayName: "Joana Silva" },
+    ]);
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm-candidates?query=Joana&limit=20", {
+      method: "GET",
+      signal: controller.signal,
+    });
+  });
+
+  it("posts only the selected user ID and returns the canonical conversation", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { conversation_id: "dm-canonical", created: false },
+    });
+    const controller = new AbortController();
+
+    await expect(getOrCreateDirectDM("user-2", controller.signal)).resolves.toEqual({
+      conversationId: "dm-canonical",
+      created: false,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ other_user_id: "user-2" }),
+      signal: controller.signal,
+    });
   });
 });
 

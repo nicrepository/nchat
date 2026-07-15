@@ -1,7 +1,9 @@
+import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import "./ChatSidebar.css";
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
+import NewDirectMessageDialog from "./NewDirectMessageDialog";
 
 /**
  * Placeholder user shown in the sidebar footer.
@@ -334,6 +336,16 @@ interface ChatSidebarProps {
 export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const [newDMOpen, setNewDMOpen] = useState(false);
+  const newDMButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreNewDMFocusRef = useRef(false);
+
+  useEffect(() => {
+    if (!newDMOpen && state.status === "ready" && restoreNewDMFocusRef.current) {
+      newDMButtonRef.current?.focus();
+      restoreNewDMFocusRef.current = false;
+    }
+  }, [newDMOpen, state.status]);
 
   // Derive active item from pathname: /chat/channel/:id or /chat/dm/:id
   // decodeURIComponent handles IDs that were encoded with encodeURIComponent on navigate.
@@ -351,6 +363,17 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
   function handleDMSelect(id: string) {
     navigate(`/chat/dm/${encodeURIComponent(id)}`);
+  }
+
+  function closeNewDM() {
+    restoreNewDMFocusRef.current = true;
+    setNewDMOpen(false);
+  }
+
+  function handleDMOpened(id: string) {
+    closeNewDM();
+    navigate(`/chat/dm/${encodeURIComponent(id)}`);
+    retry();
   }
 
   return (
@@ -415,12 +438,12 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
             <div className="chat-sidebar__section-label chat-sidebar__section-label--mt">
               <span>Mensagens diretas</span>
               <button
+                ref={newDMButtonRef}
                 type="button"
                 className="chat-sidebar__section-action"
                 aria-label="Nova mensagem direta"
-                disabled
-                aria-disabled="true"
-                title="Em breve"
+                aria-haspopup="dialog"
+                onClick={() => setNewDMOpen(true)}
               >
                 <IconAdd />
               </button>
@@ -457,6 +480,13 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
           </div>
         </div>
       </div>
+      {newDMOpen && state.status === "ready" && (
+        <NewDirectMessageDialog
+          currentUserId={state.currentUserId}
+          onClose={closeNewDM}
+          onOpened={handleDMOpened}
+        />
+      )}
     </aside>
   );
 }

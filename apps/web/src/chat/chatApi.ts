@@ -16,6 +16,8 @@ import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
   type Channel,
+  type DMCandidate,
+  type DirectDMResult,
   type MessageBodyFormat,
   type MentionCandidate,
   type DMConversation,
@@ -54,6 +56,14 @@ interface SidebarResponse {
 
 interface SidebarEnvelope {
   data: SidebarResponse;
+}
+
+interface DMCandidateEnvelope {
+  data: { candidates: Array<{ user_id: string; display_name: string }> };
+}
+
+interface DirectDMEnvelope {
+  data: { conversation_id: string; created: boolean };
 }
 
 interface AllowedReactionEmojisEnvelope {
@@ -123,6 +133,37 @@ export async function fetchSidebarData(): Promise<{
     participants: [],
   }));
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
+}
+
+export async function searchDMCandidates(
+  query: string,
+  signal?: AbortSignal,
+): Promise<DMCandidate[]> {
+  const params = new URLSearchParams({ query: query.trim(), limit: "20" });
+  const response = await authenticatedFetch<DMCandidateEnvelope>(
+    `${CHAT_BASE}/dm-candidates?${params}`,
+    { method: "GET", signal },
+  );
+  return response.data.candidates.map((candidate) => ({
+    userId: candidate.user_id,
+    displayName: candidate.display_name,
+  }));
+}
+
+export async function getOrCreateDirectDM(
+  otherUserId: string,
+  signal?: AbortSignal,
+): Promise<DirectDMResult> {
+  const response = await authenticatedFetch<DirectDMEnvelope>(`${CHAT_BASE}/dms`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ other_user_id: otherUserId }),
+    signal,
+  });
+  return {
+    conversationId: response.data.conversation_id,
+    created: response.data.created,
+  };
 }
 
 export function fetchAllowedReactionEmojis(): Promise<string[]> {
