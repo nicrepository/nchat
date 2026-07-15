@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -329,6 +330,91 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			COMMIT;`)
 		if err != nil {
 			t.Fatalf("same pair key should be isolated by workspace: %v", err)
+		}
+	})
+
+	t.Run("concurrent direct dm creation returns one canonical conversation", func(t *testing.T) {
+		const (
+			workspaceID = "00000000-0000-0000-0000-000000000001"
+			userA       = "71000000-0000-0000-0000-000000000001"
+			userB       = "71000000-0000-0000-0000-000000000002"
+			pairKey     = "concurrent-direct-pair"
+		)
+		t.Cleanup(func() {
+			if _, err := conn.Exec(context.Background(), `DELETE FROM chat.dm_conversations WHERE workspace_id = $1 AND direct_pair_key = $2`, workspaceID, pairKey); err != nil {
+				t.Errorf("cleanup concurrent direct dm: %v", err)
+			}
+		})
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+			VALUES ($1, $2, 'active'), ($1, $3, 'active')
+			ON CONFLICT (workspace_id, user_id) DO UPDATE SET status = 'active'`, workspaceID, userA, userB); err != nil {
+			t.Fatalf("seed concurrent members: %v", err)
+		}
+		pool, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			t.Fatalf("open concurrent pool: %v", err)
+		}
+		defer pool.Close()
+		store := storage.NewPGXDMStore(pool)
+		start := make(chan struct{})
+		results := make(chan storage.CreateDirectConversationResult, 2)
+		errs := make(chan error, 2)
+		var workers sync.WaitGroup
+		for range 2 {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				<-start
+				result, err := store.CreateDirectConversation(ctx, storage.CreateDirectConversationInput{
+					WorkspaceID: workspaceID, CreatedBy: userA, DirectPairKey: pairKey,
+					ParticipantUserIDs: []string{userA, userB},
+				})
+				results <- result
+				errs <- err
+			}()
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent create: %v", err)
+			}
+		}
+		var conversationID string
+		createdCount := 0
+		for result := range results {
+			if conversationID == "" {
+				conversationID = result.Conversation.ID
+			}
+			if result.Conversation.ID != conversationID {
+				t.Fatalf("different canonical IDs: %q and %q", conversationID, result.Conversation.ID)
+			}
+			if result.Created {
+				createdCount++
+			}
+		}
+		if createdCount != 1 {
+			t.Fatalf("created count = %d, want 1", createdCount)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM chat.dm_conversations WHERE workspace_id = $1 AND direct_pair_key = $2`, workspaceID, pairKey).Scan(&count); err != nil {
+			t.Fatalf("count canonical DMs: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("canonical DM count = %d, want 1", count)
+		}
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*)
+			FROM chat.dm_members dm
+			JOIN chat.dm_conversations dc ON dc.id = dm.conversation_id
+			WHERE dc.workspace_id = $1 AND dc.direct_pair_key = $2`, workspaceID, pairKey).Scan(&count); err != nil {
+			t.Fatalf("count canonical DM members: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("canonical DM member count = %d, want 2", count)
 		}
 	})
 

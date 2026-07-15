@@ -14,6 +14,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	ws "github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
@@ -30,8 +31,14 @@ func (allowRouterSessionValidator) ValidateActiveSession(_ context.Context, _, _
 	return nil
 }
 
+type rejectRouterSessionValidator struct{}
+
+func (rejectRouterSessionValidator) ValidateActiveSession(_ context.Context, _, _ string) error {
+	return domain.ErrInvalidToken
+}
+
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -60,7 +67,7 @@ func TestHealthzContract(t *testing.T) {
 }
 
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -104,7 +111,7 @@ func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -127,7 +134,7 @@ func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
 		t.Fatalf("new token validator: %v", err)
 	}
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator, allowRouterSessionValidator{},
-		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteAllowedReactionEmojis, nil))
@@ -138,7 +145,7 @@ func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 
 	tests := []struct {
 		name   string
@@ -170,7 +177,7 @@ func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
 	}
 	router := NewRouter(
 		testConfig(), platformlog.New("chat-service", "test"), validator,
-		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
+		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil,
 	)
 	path := "/api/chat/channels/22222222-2222-2222-2222-222222222222/mentions?q=a"
 
@@ -189,6 +196,80 @@ func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
 	router.ServeHTTP(response, req)
 	if response.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 after autocomplete budget, got %d", response.Code)
+	}
+}
+
+func TestDMContractRoutesRequireAuthentication(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator,
+		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
+		NewDMHandler(nil, nil, nil))
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, RouteDMCandidates+"?query=an", nil),
+		httptest.NewRequest(http.MethodPost, RouteDMConversations, strings.NewReader(`{"other_user_id":"55555555-5555-5555-5555-555555555555"}`)),
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s status=%d, want 401", request.Method, request.URL.Path, response.Code)
+		}
+	}
+}
+
+func TestDMContractRoutesRejectInvalidTokenAndRevokedSession(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	for _, test := range []struct {
+		name     string
+		sessions SessionValidator
+		request  *http.Request
+	}{
+		{name: "invalid bearer", sessions: allowRouterSessionValidator{}, request: httptest.NewRequest(http.MethodGet, RouteDMCandidates+"?query=an", nil)},
+		{name: "revoked session", sessions: rejectRouterSessionValidator{}, request: routerGETRequest(t, RouteDMCandidates+"?query=an")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "invalid bearer" {
+				test.request.Header.Set("Authorization", bearerScheme+"not.a.valid.jwt")
+			}
+			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator,
+				test.sessions, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
+				NewDMHandler(nil, nil, nil))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, test.request)
+			if response.Code != http.StatusUnauthorized || strings.Contains(response.Body.String(), "session") {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestDMContractRoutesAreRegisteredOnlyWithHandler(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		handler *DMHandler
+		want    int
+	}{
+		{name: "absent", want: http.StatusNotFound},
+		{name: "registered", handler: NewDMHandler(nil, nil, nil), want: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator,
+				allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, test.handler)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, routerGETRequest(t, RouteDMCandidates+"?query=an"))
+			if response.Code != test.want {
+				t.Fatalf("status=%d, want %d", response.Code, test.want)
+			}
+		})
 	}
 }
 
@@ -264,7 +345,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -290,6 +371,7 @@ func TestNewRouter_NilWSHandlerReturns503AfterAuth(t *testing.T) {
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
+		nil,
 		nil,
 	)
 
@@ -353,6 +435,7 @@ func newRouterForRateLimit(t *testing.T) http.Handler {
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
+		nil,
 		nil,
 	)
 }
@@ -563,6 +646,7 @@ func newRouterWithWS(t *testing.T, wsHandler http.Handler) http.Handler {
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
 		wsHandler,
+		nil,
 	)
 }
 

@@ -17,7 +17,7 @@ func dmConversationCols() []string {
 	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at"}
 }
 
-func TestPGXDMStore_CreateDirectConversation_UpsertsAndReactivatesCanonicalPair(t *testing.T) {
+func TestPGXDMStore_CreateDirectConversation_CreatesCanonicalPair(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -26,7 +26,7 @@ func TestPGXDMStore_CreateDirectConversation_UpsertsAndReactivatesCanonicalPair(
 
 	now := time.Now()
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_conversations.*ON CONFLICT \(workspace_id, direct_pair_key\) WHERE type = 'direct'.*DO UPDATE SET status = 'active'`).
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_conversations.*ON CONFLICT \(workspace_id, direct_pair_key\) WHERE type = 'direct'.*DO NOTHING`).
 		WithArgs("ws-1", "user-1", "pair-key").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now))
@@ -39,7 +39,7 @@ func TestPGXDMStore_CreateDirectConversation_UpsertsAndReactivatesCanonicalPair(
 	mock.ExpectCommit()
 
 	store := storage.NewPGXDMStore(mock)
-	conversation, err := store.CreateDirectConversation(context.Background(), storage.CreateDirectConversationInput{
+	result, err := store.CreateDirectConversation(context.Background(), storage.CreateDirectConversationInput{
 		WorkspaceID:        "ws-1",
 		CreatedBy:          "user-1",
 		DirectPairKey:      "pair-key",
@@ -48,11 +48,112 @@ func TestPGXDMStore_CreateDirectConversation_UpsertsAndReactivatesCanonicalPair(
 	if err != nil {
 		t.Fatalf("CreateDirectConversation: %v", err)
 	}
-	if conversation.ID != "dm-1" || conversation.Type != domain.DMConversationTypeDirect {
-		t.Fatalf("unexpected conversation: %+v", conversation)
+	if !result.Created || result.Conversation.ID != "dm-1" || result.Conversation.Type != domain.DMConversationTypeDirect {
+		t.Fatalf("unexpected result: %+v", result)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXDMStore_CreateDirectConversation_ReturnsExistingCanonicalPair(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_conversations.*DO NOTHING`).
+		WithArgs("ws-1", "user-1", "pair-key").
+		WillReturnRows(pgxmock.NewRows(dmConversationCols()))
+	mock.ExpectQuery(`(?s)UPDATE chat\.dm_conversations.*status = 'active'.*direct_pair_key = \$2`).
+		WithArgs("ws-1", "pair-key").
+		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-2", now, now))
+	for _, userID := range []string{"user-1", "user-2"} {
+		mock.ExpectExec(`INSERT INTO chat\.dm_members`).
+			WithArgs("dm-1", "ws-1", userID).
+			WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	}
+	mock.ExpectCommit()
+
+	result, err := storage.NewPGXDMStore(mock).CreateDirectConversation(context.Background(), storage.CreateDirectConversationInput{
+		WorkspaceID:        "ws-1",
+		CreatedBy:          "user-1",
+		DirectPairKey:      "pair-key",
+		ParticipantUserIDs: []string{"user-1", "user-2"},
+	})
+	if err != nil {
+		t.Fatalf("CreateDirectConversation: %v", err)
+	}
+	if result.Created || result.Conversation.ID != "dm-1" {
+		t.Fatalf("unexpected existing result: %+v", result)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXDMStore_CreateDirectConversation_RollsBackFailurePaths(t *testing.T) {
+	now := time.Now()
+	conversationRows := func() *pgxmock.Rows {
+		return pgxmock.NewRows(dmConversationCols()).
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now)
+	}
+	for _, test := range []struct {
+		name  string
+		setup func(pgxmock.PgxPoolIface)
+	}{
+		{name: "begin", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin().WillReturnError(errors.New("begin failed"))
+		}},
+		{name: "insert", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", "user-1", "pair-key").WillReturnError(errors.New("insert failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "recover existing", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", "user-1", "pair-key").WillReturnRows(pgxmock.NewRows(dmConversationCols()))
+			mock.ExpectQuery(`UPDATE chat\.dm_conversations`).WithArgs("ws-1", "pair-key").WillReturnError(errors.New("update failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "member", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", "user-1", "pair-key").WillReturnRows(conversationRows())
+			mock.ExpectExec(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", "user-1").WillReturnError(errors.New("member failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", "user-1", "pair-key").WillReturnRows(conversationRows())
+			for _, userID := range []string{"user-1", "user-2"} {
+				mock.ExpectExec(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", userID).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			}
+			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
+			mock.ExpectRollback()
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			test.setup(mock)
+			_, err = storage.NewPGXDMStore(mock).CreateDirectConversation(context.Background(), storage.CreateDirectConversationInput{
+				WorkspaceID: "ws-1", CreatedBy: "user-1", DirectPairKey: "pair-key",
+				ParticipantUserIDs: []string{"user-1", "user-2"},
+			})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
 	}
 }
 
@@ -158,6 +259,49 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenParticipantIsNotActiveW
 	}
 }
 
+func TestPGXDMStore_CreateGroupConversation_PropagatesTransactionFailures(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name  string
+		setup func(pgxmock.PgxPoolIface)
+	}{
+		{name: "begin", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin().WillReturnError(errors.New("begin failed"))
+		}},
+		{name: "insert", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1").WillReturnError(errors.New("insert failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
+				WillReturnRows(pgxmock.NewRows(dmConversationCols()).AddRow("dm-1", "ws-1", "group", "", "active", "user-1", now, now))
+			mock.ExpectExec(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", "user-1").WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
+			mock.ExpectRollback()
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			test.setup(mock)
+			_, err = storage.NewPGXDMStore(mock).CreateGroupConversation(context.Background(), storage.CreateGroupConversationInput{
+				WorkspaceID: "ws-1", CreatedBy: "user-1", ParticipantUserIDs: []string{"user-1"},
+			})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
 func TestPGXDMStore_ListVisibleConversationsByUser_UsesSQLVisibility(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -184,6 +328,35 @@ func TestPGXDMStore_ListVisibleConversationsByUser_UsesSQLVisibility(t *testing.
 	}
 }
 
+func TestPGXDMStore_ListVisibleConversationsByUser_PropagatesReadFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		rows *pgxmock.Rows
+		err  error
+	}{
+		{name: "query", err: errors.New("query failed")},
+		{name: "scan", rows: pgxmock.NewRows([]string{"id"}).AddRow("dm-1")},
+		{name: "rows", rows: pgxmock.NewRows(dmConversationCols()).AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now()).RowError(0, errors.New("rows failed"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			expectation := mock.ExpectQuery(`FROM chat\.dm_conversations dc`).WithArgs("ws-1", "user-1")
+			if test.err != nil {
+				expectation.WillReturnError(test.err)
+			} else {
+				expectation.WillReturnRows(test.rows)
+			}
+			if _, err := storage.NewPGXDMStore(mock).ListVisibleConversationsByUser(context.Background(), "ws-1", "user-1"); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
 func TestPGXDMStore_GetVisibleConversationByID_NotFound(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -202,6 +375,38 @@ func TestPGXDMStore_GetVisibleConversationByID_NotFound(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXDMStore_GetVisibleConversationByID_SuccessAndDatabaseError(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		rows *pgxmock.Rows
+		err  error
+	}{
+		{name: "success", rows: pgxmock.NewRows(dmConversationCols()).AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now())},
+		{name: "database error", err: errors.New("database failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			expectation := mock.ExpectQuery(`FROM chat\.dm_conversations dc`).WithArgs("ws-1", "dm-1", "user-1")
+			if test.err != nil {
+				expectation.WillReturnError(test.err)
+			} else {
+				expectation.WillReturnRows(test.rows)
+			}
+			conversation, gotErr := storage.NewPGXDMStore(mock).GetVisibleConversationByID(context.Background(), "ws-1", "dm-1", "user-1")
+			if test.err == nil && (gotErr != nil || conversation.ID != "dm-1") {
+				t.Fatalf("conversation=%+v error=%v", conversation, gotErr)
+			}
+			if test.err != nil && !errors.Is(gotErr, test.err) {
+				t.Fatalf("error=%v", gotErr)
+			}
+		})
 	}
 }
 
@@ -287,5 +492,30 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_DBError_Propagate
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_PropagatesRowFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		rows *pgxmock.Rows
+	}{
+		{name: "scan", rows: pgxmock.NewRows([]string{"id"}).AddRow("dm-1")},
+		{name: "rows", rows: pgxmock.NewRows(dmWithParticipantCols()).
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}).
+			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}).
+			RowError(1, errors.New("rows failed"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			mock.ExpectQuery(`FROM chat\.dm_conversations dc`).WithArgs("ws-1", "user-1").WillReturnRows(test.rows)
+			if _, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1"); err == nil {
+				t.Fatal("expected error")
+			}
+		})
 	}
 }

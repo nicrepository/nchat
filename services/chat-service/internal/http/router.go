@@ -32,7 +32,7 @@ const mentionSearchRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
@@ -88,6 +88,10 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	mux.Handle("GET "+RouteChannelMentions, authMiddleware(
 		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchMentions)),
 	))
+	if directMessages != nil {
+		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
+		mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))
+	}
 
 	// DM message endpoints: GET list, POST create, GET single.
 	mux.Handle("GET "+RouteDMMessages, authMiddleware(

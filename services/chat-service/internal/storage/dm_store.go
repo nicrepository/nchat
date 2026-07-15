@@ -20,6 +20,11 @@ type CreateDirectConversationInput struct {
 	ParticipantUserIDs []string
 }
 
+type CreateDirectConversationResult struct {
+	Conversation domain.DMConversation
+	Created      bool
+}
+
 // CreateGroupConversationInput holds storage-only fields for group DM creation.
 type CreateGroupConversationInput struct {
 	WorkspaceID        string
@@ -30,7 +35,7 @@ type CreateGroupConversationInput struct {
 
 // DMStore is the persistence interface for direct and group DM conversations.
 type DMStore interface {
-	CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (domain.DMConversation, error)
+	CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (CreateDirectConversationResult, error)
 	CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (domain.DMConversation, error)
 	ListVisibleConversationsByUser(ctx context.Context, workspaceID, userID string) ([]domain.DMConversation, error)
 	// ListVisibleConversationsWithParticipantIDs returns active DM conversations
@@ -49,10 +54,10 @@ func NewPGXDMStore(pool Pool) *PGXDMStore {
 	return &PGXDMStore{pool: pool}
 }
 
-func (s *PGXDMStore) CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (domain.DMConversation, error) {
+func (s *PGXDMStore) CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (CreateDirectConversationResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.DMConversation{}, fmt.Errorf("begin create direct conversation: %w", err)
+		return CreateDirectConversationResult{}, fmt.Errorf("begin create direct conversation: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -61,31 +66,30 @@ func (s *PGXDMStore) CreateDirectConversation(ctx context.Context, input CreateD
 		}
 	}()
 
-	conversation, err := createDirectConversation(ctx, tx, input)
+	result, err := createDirectConversation(ctx, tx, input)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateDirectConversationResult{}, err
 	}
 	for _, userID := range input.ParticipantUserIDs {
-		if err := upsertDMMember(ctx, tx, conversation.ID, input.WorkspaceID, userID); err != nil {
-			return domain.DMConversation{}, err
+		if err := upsertDMMember(ctx, tx, result.Conversation.ID, input.WorkspaceID, userID); err != nil {
+			return CreateDirectConversationResult{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return domain.DMConversation{}, fmt.Errorf("commit create direct conversation: %w", err)
+		return CreateDirectConversationResult{}, fmt.Errorf("commit create direct conversation: %w", err)
 	}
 	committed = true
-	return conversation, nil
+	return result, nil
 }
 
-func createDirectConversation(ctx context.Context, q dmQuerier, input CreateDirectConversationInput) (domain.DMConversation, error) {
+func createDirectConversation(ctx context.Context, q dmQuerier, input CreateDirectConversationInput) (CreateDirectConversationResult, error) {
 	var conversation domain.DMConversation
 	err := q.QueryRow(ctx, `
 		INSERT INTO chat.dm_conversations
 			(workspace_id, type, title, status, created_by, direct_pair_key)
 		VALUES ($1, 'direct', NULL, 'active', $2, $3)
 		ON CONFLICT (workspace_id, direct_pair_key) WHERE type = 'direct'
-		DO UPDATE SET status = 'active',
-		              updated_at = now()
+		DO NOTHING
 		RETURNING id, workspace_id, type, COALESCE(title, ''), status, created_by,
 		          created_at, updated_at`,
 		input.WorkspaceID, input.CreatedBy, input.DirectPairKey,
@@ -94,10 +98,31 @@ func createDirectConversation(ctx context.Context, q dmQuerier, input CreateDire
 		&conversation.Title, (*string)(&conversation.Status), &conversation.CreatedBy,
 		&conversation.CreatedAt, &conversation.UpdatedAt,
 	)
-	if err != nil {
-		return domain.DMConversation{}, fmt.Errorf("create direct conversation: %w", err)
+	if err == nil {
+		return CreateDirectConversationResult{Conversation: conversation, Created: true}, nil
 	}
-	return conversation, nil
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return CreateDirectConversationResult{}, fmt.Errorf("create direct conversation: %w", err)
+	}
+
+	err = q.QueryRow(ctx, `
+		UPDATE chat.dm_conversations
+		SET status = 'active', updated_at = now()
+		WHERE workspace_id = $1
+		  AND direct_pair_key = $2
+		  AND type = 'direct'
+		RETURNING id, workspace_id, type, COALESCE(title, ''), status, created_by,
+		          created_at, updated_at`,
+		input.WorkspaceID, input.DirectPairKey,
+	).Scan(
+		&conversation.ID, &conversation.WorkspaceID, (*string)(&conversation.Type),
+		&conversation.Title, (*string)(&conversation.Status), &conversation.CreatedBy,
+		&conversation.CreatedAt, &conversation.UpdatedAt,
+	)
+	if err != nil {
+		return CreateDirectConversationResult{}, fmt.Errorf("get existing direct conversation: %w", err)
+	}
+	return CreateDirectConversationResult{Conversation: conversation}, nil
 }
 
 func (s *PGXDMStore) CreateGroupConversation(ctx context.Context, input CreateGroupConversationInput) (domain.DMConversation, error) {

@@ -49,13 +49,21 @@ func (l *ValkeyReactionLimiter) Allow(ctx context.Context, userID string) (bool,
 
 // AllowAction applies the shared Lua fixed-window limiter to a named user action.
 func (l *ValkeyReactionLimiter) AllowAction(ctx context.Context, userID, action string) (bool, error) {
+	return l.AllowActionWithLimit(ctx, userID, action, l.maxActions, l.windowSeconds)
+}
+
+// AllowActionWithLimit applies the shared limiter with an operation-specific budget.
+func (l *ValkeyReactionLimiter) AllowActionWithLimit(ctx context.Context, userID, action string, maxActions, windowSeconds int) (bool, error) {
+	if maxActions <= 0 || windowSeconds <= 0 {
+		return false, errors.New("action limiter requires positive limit and window")
+	}
 	sum := sha256.Sum256([]byte(userID))
 	key := "nchat:chat:action:" + action + ":" + hex.EncodeToString(sum[:])
-	count, err := actionRateScript.Exec(ctx, l.client, []string{key}, []string{strconv.Itoa(l.windowSeconds)}).AsInt64()
+	count, err := actionRateScript.Exec(ctx, l.client, []string{key}, []string{strconv.Itoa(windowSeconds)}).AsInt64()
 	if err != nil {
 		return false, err
 	}
-	return count <= int64(l.maxActions), nil
+	return count <= int64(maxActions), nil
 }
 
 func (l *ValkeyReactionLimiter) Close() { l.client.Close() }

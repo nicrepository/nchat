@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
@@ -219,7 +220,8 @@ func (h *MessageHandler) resolveWorkspaceID(ctx context.Context, w http.Response
 // validateTargetID validates that the given path parameter is a well-formed UUID.
 // Writes 400 and returns false on failure.
 func validateTargetID(w http.ResponseWriter, id, paramName string) bool {
-	if !uuidPattern.MatchString(id) {
+	parsed, err := uuid.Parse(id)
+	if !uuidPattern.MatchString(id) || err != nil || parsed == uuid.Nil {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, paramName+" must be a valid UUID")
 		return false
 	}

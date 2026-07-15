@@ -14,8 +14,12 @@ import (
 )
 
 const (
-	minGroupDMParticipants = 3
-	maxDMTitleRunes        = 120
+	minGroupDMParticipants  = 3
+	maxDMTitleRunes         = 120
+	minDMCandidateQuery     = 2
+	maxDMCandidateQuery     = 64
+	defaultDMCandidateLimit = 20
+	maxDMCandidateLimit     = 50
 )
 
 // CreateDirectConversationInput contains caller-provided fields for 1:1 DM creation.
@@ -23,6 +27,18 @@ type CreateDirectConversationInput struct {
 	WorkspaceID string
 	CallerID    string
 	OtherUserID string
+}
+
+type CreateDirectConversationOutput struct {
+	Conversation domain.DMConversation
+	Created      bool
+}
+
+type SearchDMCandidatesInput struct {
+	WorkspaceID string
+	CallerID    string
+	Query       string
+	Limit       int // Zero uses the server default.
 }
 
 // CreateGroupConversationInput contains caller-provided fields for ad-hoc group DM creation.
@@ -54,43 +70,92 @@ func NewDMService(workspaces storage.WorkspaceStore, dms storage.DMStore, member
 // CreateDirectConversation creates or returns the canonical 1:1 DM for caller and other user.
 // Archived direct DMs are reactivated by the storage upsert instead of creating duplicates.
 func (s *DMService) CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (domain.DMConversation, error) {
+	result, err := s.GetOrCreateDirectConversation(ctx, input)
+	return result.Conversation, err
+}
+
+// GetOrCreateDirectConversation returns the canonical direct DM and whether this call created it.
+func (s *DMService) GetOrCreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (CreateDirectConversationOutput, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
 	rawCallerID := strings.TrimSpace(input.CallerID)
 	rawOtherUserID := strings.TrimSpace(input.OtherUserID)
 	if workspaceID == "" || rawCallerID == "" || rawOtherUserID == "" {
-		return domain.DMConversation{}, fmt.Errorf("%w: workspace_id, caller_id, and other_user_id are required", domain.ErrInvalidInput)
+		return CreateDirectConversationOutput{}, fmt.Errorf("%w: workspace_id, caller_id, and other_user_id are required", domain.ErrInvalidInput)
 	}
 	callerID, err := canonicalizeUserID(rawCallerID)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateDirectConversationOutput{}, err
 	}
 	otherUserID, err := canonicalizeUserID(rawOtherUserID)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateDirectConversationOutput{}, err
 	}
 	if callerID == otherUserID {
-		return domain.DMConversation{}, fmt.Errorf("%w: self-DM is not supported", domain.ErrInvalidInput)
+		return CreateDirectConversationOutput{}, fmt.Errorf("%w: self-DM is not supported", domain.ErrInvalidInput)
 	}
 
-	callerMember, err := s.requireActiveWorkspaceMember(ctx, workspaceID, callerID)
+	callerMember, err := s.requireEligibleDMMember(ctx, workspaceID, callerID)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateDirectConversationOutput{}, err
 	}
-	otherMember, err := s.requireActiveWorkspaceMember(ctx, workspaceID, otherUserID)
+	otherMember, err := s.requireEligibleDMMember(ctx, workspaceID, otherUserID)
 	if err != nil {
-		return domain.DMConversation{}, err
+		return CreateDirectConversationOutput{}, err
 	}
 
-	conversation, err := s.dms.CreateDirectConversation(ctx, storage.CreateDirectConversationInput{
+	result, err := s.dms.CreateDirectConversation(ctx, storage.CreateDirectConversationInput{
 		WorkspaceID:        workspaceID,
 		CreatedBy:          callerMember.UserID,
 		DirectPairKey:      canonicalDirectPairKey(callerMember.UserID, otherMember.UserID),
 		ParticipantUserIDs: []string{callerMember.UserID, otherMember.UserID},
 	})
 	if err != nil {
-		return domain.DMConversation{}, fmt.Errorf("create direct conversation: %w", err)
+		return CreateDirectConversationOutput{}, fmt.Errorf("create direct conversation: %w", err)
 	}
-	return conversation, nil
+	return CreateDirectConversationOutput{Conversation: result.Conversation, Created: result.Created}, nil
+}
+
+// SearchDMCandidates returns active same-workspace users eligible for a direct DM.
+func (s *DMService) SearchDMCandidates(ctx context.Context, input SearchDMCandidatesInput) ([]domain.DMCandidate, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	query := strings.TrimSpace(input.Query)
+	queryRunes := utf8.RuneCountInString(query)
+	if workspaceID == "" || queryRunes < minDMCandidateQuery || queryRunes > maxDMCandidateQuery {
+		return nil, fmt.Errorf("%w: invalid dm candidate search", domain.ErrInvalidInput)
+	}
+	limit := input.Limit
+	if limit < 0 {
+		return nil, fmt.Errorf("%w: invalid dm candidate limit", domain.ErrInvalidInput)
+	}
+	if limit == 0 {
+		limit = defaultDMCandidateLimit
+	}
+	if limit > maxDMCandidateLimit {
+		limit = maxDMCandidateLimit
+	}
+	callerID, err := canonicalizeUserID(strings.TrimSpace(input.CallerID))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.requireEligibleDMMember(ctx, workspaceID, callerID); err != nil {
+		return nil, err
+	}
+	candidates, err := s.members.SearchDMCandidates(ctx, workspaceID, callerID, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search dm candidates: %w", err)
+	}
+	return candidates, nil
+}
+
+func (s *DMService) requireEligibleDMMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	member, err := s.members.GetEligibleDMMember(ctx, workspaceID, userID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.WorkspaceMember{}, domain.ErrForbidden
+		}
+		return domain.WorkspaceMember{}, err
+	}
+	return member, nil
 }
 
 // CreateGroupConversation creates an ad-hoc group DM and automatically includes the caller.
@@ -229,7 +294,7 @@ func canonicalDirectPairKey(userA, userB string) string {
 // Returns ErrInvalidInput for any input that is not a valid UUID.
 func canonicalizeUserID(s string) (string, error) {
 	id, err := uuid.Parse(s)
-	if err != nil {
+	if err != nil || id == uuid.Nil {
 		return "", fmt.Errorf("%w: user_id is not a valid UUID", domain.ErrInvalidInput)
 	}
 	return id.String(), nil
