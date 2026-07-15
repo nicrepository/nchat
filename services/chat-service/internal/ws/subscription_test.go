@@ -25,8 +25,8 @@ type fakeDMStore struct {
 	err          error
 }
 
-func (f *fakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (domain.DMConversation, error) {
-	return domain.DMConversation{}, nil
+func (f *fakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
+	return storage.CreateDirectConversationResult{}, nil
 }
 func (f *fakeDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil

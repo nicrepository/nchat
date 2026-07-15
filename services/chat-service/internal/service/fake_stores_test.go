@@ -196,10 +196,36 @@ type fakeMemberStore struct {
 	getCMErr          error
 	mentionCandidates []domain.MentionCandidate
 	mentionErr        error
+	dmCandidates      []domain.DMCandidate
+	dmCandidateErr    error
+	dmCandidateQuery  string
+	dmCandidateLimit  int
+	getEligibleCalls  int
 }
 
 func (f *fakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
 	return f.mentionCandidates, f.mentionErr
+}
+
+func (f *fakeMemberStore) SearchDMCandidates(_ context.Context, _, _, query string, limit int) ([]domain.DMCandidate, error) {
+	f.dmCandidateQuery = query
+	f.dmCandidateLimit = limit
+	return f.dmCandidates, f.dmCandidateErr
+}
+
+func (f *fakeMemberStore) GetEligibleDMMember(_ context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	f.getEligibleCalls++
+	if f.getWMErr != nil {
+		return domain.WorkspaceMember{}, f.getWMErr
+	}
+	if status, ok := f.workspaceStatus[workspaceID]; ok && status != domain.WorkspaceStatusActive {
+		return domain.WorkspaceMember{}, domain.ErrNotFound
+	}
+	member, ok := f.workspaceMembers[wmKey(workspaceID, userID)]
+	if !ok || member.Status != domain.MemberStatusActive || member.WorkspaceID != workspaceID {
+		return domain.WorkspaceMember{}, domain.ErrNotFound
+	}
+	return member, nil
 }
 
 func newFakeMemberStore() *fakeMemberStore {

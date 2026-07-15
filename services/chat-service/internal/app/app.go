@@ -77,6 +77,7 @@ func New(cfg config.Config) *App {
 	}
 
 	var sidebarSvc *service.SidebarService
+	var dmSvc *service.DMService
 	var messageSvc *service.MessageService
 	var mentionSvc *service.MentionService
 	var workspaceStore *storage.PGXWorkspaceStore
@@ -102,6 +103,7 @@ func New(cfg config.Config) *App {
 			channelStore = storage.NewPGXChannelStore(pool)
 			memberStore = storage.NewPGXMemberStore(pool)
 			dmStore = storage.NewPGXDMStore(pool)
+			dmSvc = service.NewDMService(workspaceStore, dmStore, memberStore)
 			messages := storage.NewPGXMessageStore(pool)
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
@@ -159,6 +161,10 @@ func New(cfg config.Config) *App {
 	if workspaceStore != nil {
 		messageHandler = messageHandler.WithEditing(workspaceStore, permissionSvc, reactionLimiter)
 	}
+	var directMessages *httpapi.DMHandler
+	if dmSvc != nil {
+		directMessages = httpapi.NewDMHandler(workspaceStore, dmSvc, reactionLimiter)
+	}
 	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
 
@@ -176,7 +182,7 @@ func New(cfg config.Config) *App {
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, validator, sessionValidator, sidebar, messageHandler, wsHandler),
+		Handler:         httpapi.NewRouter(cfg, logger, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages),
 		TracingShutdown: shutdown,
 		hub:             hub,
 		presence:        presence,

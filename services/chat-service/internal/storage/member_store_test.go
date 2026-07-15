@@ -37,6 +37,123 @@ func TestPGXMemberStore_SearchChannelMembers_ScopesWorkspaceChannelAndActiveMemb
 	}
 }
 
+func TestPGXMemberStore_SearchDMCandidates_ScopesEligibilityAndOrdersResults(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)SELECT u\.id::text, u\.display_name.*FROM chat\.workspace_members wm.*w\.status = 'active'.*u\.status = 'active'.*u\.deleted_at IS NULL.*wm\.user_id <> \$2::uuid.*caller\.status = 'active'.*ORDER BY lower\(u\.display_name\), u\.id.*LIMIT \$4`).
+		WithArgs("ws-1", "user-1", "an", 20).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).
+			AddRow("user-2", "Ana").
+			AddRow("user-3", "André"))
+
+	got, err := storage.NewPGXMemberStore(mock).SearchDMCandidates(
+		context.Background(), "ws-1", "user-1", "an", 20,
+	)
+	if err != nil {
+		t.Fatalf("SearchDMCandidates: %v", err)
+	}
+	if len(got) != 2 || got[0].DisplayName != "Ana" || got[1].DisplayName != "André" {
+		t.Fatalf("unexpected candidates: %#v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_SearchDMCandidates_EmptyAndFailurePaths(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		rows *pgxmock.Rows
+		err  error
+	}{
+		{name: "empty", rows: pgxmock.NewRows([]string{"id", "display_name"})},
+		{name: "scan error", rows: pgxmock.NewRows([]string{"id"}).AddRow("user-2")},
+		{name: "rows error", rows: pgxmock.NewRows([]string{"id", "display_name"}).AddRow("user-2", "Ana").AddRow("user-3", "André").RowError(1, errors.New("row stream failed"))},
+		{name: "query error", err: errors.New("query failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			expectation := mock.ExpectQuery(`FROM chat\.workspace_members wm`).WithArgs("ws-1", "user-1", "an", 20)
+			if test.err != nil {
+				expectation.WillReturnError(test.err)
+			} else {
+				expectation.WillReturnRows(test.rows)
+			}
+
+			got, gotErr := storage.NewPGXMemberStore(mock).SearchDMCandidates(context.Background(), "ws-1", "user-1", "an", 20)
+			if test.name == "empty" {
+				if gotErr != nil || len(got) != 0 {
+					t.Fatalf("candidates=%v error=%v", got, gotErr)
+				}
+			} else if gotErr == nil {
+				t.Fatal("expected error")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestPGXMemberStore_GetEligibleDMMember_RequiresActiveWorkspaceMembershipAndAccount(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	now := time.Now()
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*w\.status = 'active'.*u\.status = 'active'.*u\.deleted_at IS NULL.*wm\.status = 'active'`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
+			AddRow("ws-1", "user-1", "member", "active", now))
+
+	member, err := storage.NewPGXMemberStore(mock).GetEligibleDMMember(context.Background(), "ws-1", "user-1")
+	if err != nil || member.UserID != "user-1" {
+		t.Fatalf("member=%+v err=%v", member, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_GetEligibleDMMember_HidesIneligibleUser(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", "user-1").
+		WillReturnError(pgx.ErrNoRows)
+
+	_, err = storage.NewPGXMemberStore(mock).GetEligibleDMMember(context.Background(), "ws-1", "user-1")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("error=%v, want ErrNotFound", err)
+	}
+}
+
+func TestPGXMemberStore_GetEligibleDMMember_PropagatesDatabaseError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	want := errors.New("database unavailable")
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).WithArgs("ws-1", "user-1").WillReturnError(want)
+
+	_, err = storage.NewPGXMemberStore(mock).GetEligibleDMMember(context.Background(), "ws-1", "user-1")
+	if !errors.Is(err, want) {
+		t.Fatalf("error=%v, want wrapped database error", err)
+	}
+}
+
 func TestPGXMemberStore_AddWorkspaceMember_Success(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

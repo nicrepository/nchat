@@ -20,9 +20,11 @@ type MemberStore interface {
 	AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error)
 	ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
+	GetEligibleDMMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
 	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
+	SearchDMCandidates(ctx context.Context, workspaceID, callerID, prefix string, limit int) ([]domain.DMCandidate, error)
 	// RemoveChannelMember deletes the channel membership for userID in channelID, scoped to
 	// workspaceID. Returns ErrCannotLeaveGeneralChannel if the channel has is_general=true.
 	// Returns nil when the membership does not exist (idempotent).
@@ -386,6 +388,69 @@ func (s *PGXMemberStore) SearchChannelMembers(ctx context.Context, workspaceID, 
 		return nil, fmt.Errorf("iterate channel member mentions: %w", err)
 	}
 	return results, nil
+}
+
+func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, callerID, prefix string, limit int) ([]domain.DMCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.display_name
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		JOIN auth.users u
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE wm.workspace_id = $1::uuid
+		  AND wm.status = 'active'
+		  AND wm.user_id <> $2::uuid
+		  AND left(lower(u.display_name), length($3)) = lower($3)
+		  AND EXISTS (
+		      SELECT 1
+		      FROM chat.workspace_members caller
+		      WHERE caller.workspace_id = wm.workspace_id
+		        AND caller.user_id = $2::uuid
+		        AND caller.status = 'active'
+		  )
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $4`, workspaceID, callerID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search dm candidates: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]domain.DMCandidate, 0, limit)
+	for rows.Next() {
+		var candidate domain.DMCandidate
+		if err := rows.Scan(&candidate.UserID, &candidate.DisplayName); err != nil {
+			return nil, fmt.Errorf("scan dm candidate: %w", err)
+		}
+		results = append(results, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dm candidates: %w", err)
+	}
+	return results, nil
+}
+
+func (s *PGXMemberStore) GetEligibleDMMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	var member domain.WorkspaceMember
+	err := s.pool.QueryRow(ctx, `
+		SELECT wm.workspace_id, wm.user_id, wm.role, wm.status, wm.joined_at
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		JOIN auth.users u
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE wm.workspace_id = $1::uuid
+		  AND wm.user_id = $2::uuid
+		  AND wm.status = 'active'`, workspaceID, userID).Scan(
+		&member.WorkspaceID, &member.UserID, (*string)(&member.Role), (*string)(&member.Status), &member.JoinedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.WorkspaceMember{}, domain.ErrNotFound
+		}
+		return domain.WorkspaceMember{}, fmt.Errorf("get eligible dm member: %w", err)
+	}
+	return member, nil
 }
 
 // RemoveChannelMember deletes a channel membership, scoped to workspaceID.

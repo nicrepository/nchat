@@ -160,6 +160,12 @@ type DMConversationWithParticipantIDs struct {
 	ParticipantIDs []string
 }
 
+// DMCandidate is the minimal profile data exposed when starting a direct DM.
+type DMCandidate struct {
+	UserID      string
+	DisplayName string
+}
+
 // CanReadChannel reports whether a user may read ch.
 // wm is the workspace membership (nil = non-member).
 // cm is the channel membership (nil = not a channel member).

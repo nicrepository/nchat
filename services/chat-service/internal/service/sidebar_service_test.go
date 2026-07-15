@@ -41,6 +41,9 @@ func (f *sidebarFakeMemberStore) ActivateWorkspaceMember(_ context.Context, _, _
 func (f *sidebarFakeMemberStore) GetWorkspaceMember(_ context.Context, _, _ string) (domain.WorkspaceMember, error) {
 	return f.member, f.err
 }
+func (f *sidebarFakeMemberStore) GetEligibleDMMember(_ context.Context, _, _ string) (domain.WorkspaceMember, error) {
+	return f.member, f.err
+}
 func (f *sidebarFakeMemberStore) AddChannelMember(_ context.Context, _, _ string, _ domain.ChannelRole) (domain.ChannelMember, error) {
 	return domain.ChannelMember{}, nil
 }
@@ -48,6 +51,9 @@ func (f *sidebarFakeMemberStore) GetChannelMember(_ context.Context, _, _ string
 	return domain.ChannelMember{}, nil
 }
 func (f *sidebarFakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
+	return nil, nil
+}
+func (f *sidebarFakeMemberStore) SearchDMCandidates(_ context.Context, _, _, _ string, _ int) ([]domain.DMCandidate, error) {
 	return nil, nil
 }
 func (f *sidebarFakeMemberStore) RemoveChannelMember(_ context.Context, _, _, _ string) error {
@@ -107,8 +113,8 @@ type sidebarFakeDMStore struct {
 	err error
 }
 
-func (f *sidebarFakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (domain.DMConversation, error) {
-	return domain.DMConversation{}, nil
+func (f *sidebarFakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
+	return storage.CreateDirectConversationResult{}, nil
 }
 func (f *sidebarFakeDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil

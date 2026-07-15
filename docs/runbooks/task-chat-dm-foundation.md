@@ -1,7 +1,7 @@
 # Task: Chat DM — Conversation Foundation
 
 **Branch:** feat/chat-dm-foundation
-**Status:** Foundation — service/storage/tests/docs only; no HTTP API
+**Status:** Foundation + authenticated direct-DM HTTP contracts
 
 ## What this implements
 
@@ -68,9 +68,25 @@ non-participant reads all return the same not-found style error:
 
 ## HTTP API
 
-No HTTP endpoints are exposed. `chat-service` has no authenticated user context
-or JWT middleware, so DM endpoints are deferred until every request can be bound
-to a verified caller identity.
+`GET /api/chat/dm-candidates?query=<prefix>&limit=<n>` returns active users from
+the caller's default workspace. The caller and workspace come from the validated
+session/server-side workspace resolver. Queries contain 2–64 characters; results
+default to 20 and are capped at 50. The response exposes only `user_id` and
+`display_name` and excludes the caller.
+
+`POST /api/chat/dms` accepts `application/json` with the strict body
+`{"other_user_id":"<uuid>"}`. It returns the canonical direct conversation as
+`{"data":{"conversation_id":"<uuid>","created":true|false}}`. Repeated or
+concurrent requests for the same pair return the same ID; an ineligible target is
+reported as `404` without distinguishing missing, inactive, or cross-workspace
+users.
+
+Both routes require a valid Bearer access token and active session. Their
+per-user fixed-window limits are stored atomically in Valkey and shared across
+replicas: 30 searches and 10 get-or-create calls per 60 seconds, in independent
+namespaces. Valkey failure is fail-closed with `503`. Client-provided
+caller/workspace identities, participant lists, roles, and membership fields
+are not accepted.
 
 ## Out of scope
 

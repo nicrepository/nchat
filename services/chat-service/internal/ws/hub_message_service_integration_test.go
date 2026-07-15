@@ -61,8 +61,8 @@ type integDMStore struct {
 	conv domain.DMConversation
 }
 
-func (s *integDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (domain.DMConversation, error) {
-	return domain.DMConversation{}, nil
+func (s *integDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
+	return storage.CreateDirectConversationResult{}, nil
 }
 func (s *integDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil

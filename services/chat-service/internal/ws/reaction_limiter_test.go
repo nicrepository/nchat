@@ -13,13 +13,24 @@ import (
 
 type reactionLimiterValkey struct {
 	mu     sync.Mutex
-	count  int
+	counts map[string]int
 	fail   bool
 	key    string
 	window string
 }
 
 func newTestReactionLimiter(t *testing.T, server *reactionLimiterValkey, maxActions, windowSeconds int) *ValkeyReactionLimiter {
+	t.Helper()
+	url := startTestReactionLimiterValkey(t, server)
+	limiter, err := NewValkeyReactionLimiter(url, maxActions, windowSeconds)
+	if err != nil {
+		t.Fatalf("new reaction limiter: %v", err)
+	}
+	t.Cleanup(limiter.Close)
+	return limiter
+}
+
+func startTestReactionLimiterValkey(t *testing.T, server *reactionLimiterValkey) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -35,12 +46,7 @@ func newTestReactionLimiter(t *testing.T, server *reactionLimiterValkey, maxActi
 			go server.serve(conn)
 		}
 	}()
-	limiter, err := NewValkeyReactionLimiter("valkey://"+listener.Addr().String()+"?protocol=2&client_cache=0", maxActions, windowSeconds)
-	if err != nil {
-		t.Fatalf("new reaction limiter: %v", err)
-	}
-	t.Cleanup(limiter.Close)
-	return limiter
+	return "valkey://" + listener.Addr().String() + "?protocol=2&client_cache=0"
 }
 
 func (s *reactionLimiterValkey) serve(conn net.Conn) {
@@ -63,10 +69,13 @@ func (s *reactionLimiterValkey) serve(conn net.Conn) {
 				_, _ = io.WriteString(conn, "-ERR unavailable\r\n")
 				continue
 			}
-			s.count++
 			s.key = command[3]
 			s.window = command[4]
-			count := s.count
+			if s.counts == nil {
+				s.counts = make(map[string]int)
+			}
+			s.counts[s.key]++
+			count := s.counts[s.key]
 			s.mu.Unlock()
 			_, _ = fmt.Fprintf(conn, ":%d\r\n", count)
 		default:
@@ -158,5 +167,42 @@ func TestValkeyReactionLimiterScopesEditMessageActionWithoutExposingUserID(t *te
 	}
 	if !strings.Contains(server.key, ":edit_message:") || strings.Contains(server.key, "sensitive-user-id") {
 		t.Fatalf("unexpected edit rate-limit key: %q", server.key)
+	}
+}
+
+func TestValkeyReactionLimiterSharesActionBudgetAcrossClients(t *testing.T) {
+	server := &reactionLimiterValkey{}
+	url := startTestReactionLimiterValkey(t, server)
+	first, err := NewValkeyReactionLimiter(url, 60, 60)
+	if err != nil {
+		t.Fatalf("first limiter: %v", err)
+	}
+	t.Cleanup(first.Close)
+	second, err := NewValkeyReactionLimiter(url, 60, 60)
+	if err != nil {
+		t.Fatalf("second limiter: %v", err)
+	}
+	t.Cleanup(second.Close)
+
+	for range 2 {
+		allowed, err := first.AllowActionWithLimit(t.Context(), "user-1", "dm_search", 2, 60)
+		if err != nil || !allowed {
+			t.Fatalf("within budget: allowed=%v err=%v", allowed, err)
+		}
+	}
+	allowed, err := second.AllowActionWithLimit(t.Context(), "user-1", "dm_search", 2, 60)
+	if err != nil || allowed {
+		t.Fatalf("shared budget: allowed=%v err=%v", allowed, err)
+	}
+	allowed, err = second.AllowActionWithLimit(t.Context(), "user-1", "dm_create", 1, 60)
+	if err != nil || !allowed {
+		t.Fatalf("independent action: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestValkeyReactionLimiterRejectsInvalidActionBudget(t *testing.T) {
+	limiter := newTestReactionLimiter(t, &reactionLimiterValkey{}, 60, 60)
+	if allowed, err := limiter.AllowActionWithLimit(t.Context(), "user-1", "dm_search", 0, 60); err == nil || allowed {
+		t.Fatalf("allowed=%v err=%v", allowed, err)
 	}
 }
