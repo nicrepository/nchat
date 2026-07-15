@@ -11,6 +11,10 @@ infra/compose/.env.dev
 infra/compose/livekit/livekit.runtime.yaml
 infra/compose/coturn/turnserver.runtime.conf
 
+# Operator's local copy of the office-network LAN bind override (real IP —
+# never the committed .example.yml). See TASK-158 runbook.
+infra/compose/compose.media.lan-office-test.override.yml
+
 # Secrets, private keys, certificates, and dumps
 *.pem
 *.key
@@ -117,6 +121,11 @@ ruvector.db
 # Local PoC outputs
 poc-results/*
 !poc-results/.gitkeep
+# WebRTC office network validation (TASK-158): keep the sanitized template
+# versioned, but never the raw run summaries (may contain office network IPs).
+!poc-results/webrtc-office-network/
+poc-results/webrtc-office-network/*
+!poc-results/webrtc-office-network/RESULT-TEMPLATE.md
 
 # Playwright local artifacts
 apps/web/playwright-report/

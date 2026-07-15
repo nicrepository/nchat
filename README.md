@@ -26,6 +26,8 @@ A stack atual está registrada no ADR-0002. Destaques:
 - Chamadas de áudio/vídeo (LiveKit) estão fora do MVP conforme requisitos v5.0; integram na V1.0.
   Preparação técnica de infraestrutura dev (LiveKit + coturn via Docker Compose, profile `media`):
   ver [docs/runbooks/task-livekit-coturn-dev.md](docs/runbooks/task-livekit-coturn-dev.md).
+  Validação de conectividade WebRTC na rede real do escritório (PoC, issue #187/TASK-158):
+  ver [docs/runbooks/task-158-webrtc-office-network-validation.md](docs/runbooks/task-158-webrtc-office-network-validation.md).
 - Próximas decisões críticas serão registradas via ADR antes de serem implementadas.
 
 ## Project tracking
