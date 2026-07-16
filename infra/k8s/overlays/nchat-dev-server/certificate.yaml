@@ -1,0 +1,11 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nchat-dev-tls
+spec:
+  secretName: nchat-dev-tls
+  dnsNames:
+    - REPLACE_ME_HOST
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod

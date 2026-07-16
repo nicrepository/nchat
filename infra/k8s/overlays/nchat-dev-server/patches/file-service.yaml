@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-service
+  namespace: nchat
+spec:
+  template:
+    spec:
+      containers:
+        - name: file-service
+          envFrom:
+            - configMapRef:
+                name: nchat-config
