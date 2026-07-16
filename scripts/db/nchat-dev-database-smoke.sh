@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-POSTGRES_IMAGE=postgres:16.10-alpine
+POSTGRES_IMAGE="postgres:16.10-alpine@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297"
 CONTAINER="nchat-db-smoke-$$"
 MIGRATIONS_IMAGE="nchat-migrations-smoke:$$"
 BOOTSTRAP="$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/data/postgres-bootstrap.sh"
@@ -11,6 +11,7 @@ APP_PASSWORD="$(printf 'nchat-app-smoke-%s' "$$" | sha256sum | cut -c1-32)"
 
 cleanup() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  docker image rm -f "$MIGRATIONS_IMAGE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -21,11 +22,29 @@ docker run --detach --name "$CONTAINER" \
   --volume "$BOOTSTRAP:/bootstrap.sh:ro" \
   "$POSTGRES_IMAGE" >/dev/null
 
-for _ in {1..30}; do
-  docker exec "$CONTAINER" pg_isready --username nchat_admin --dbname nchat >/dev/null 2>&1 && break
+database_ready=false
+
+for _ in {1..60}; do
+  if docker exec "$CONTAINER" \
+    psql \
+      --username nchat_admin \
+      --dbname nchat \
+      --tuples-only \
+      --no-align \
+      --command 'SELECT 1;' 2>/dev/null |
+    grep -Fxq '1'; then
+    database_ready=true
+    break
+  fi
+
   sleep 1
 done
-docker exec "$CONTAINER" pg_isready --username nchat_admin --dbname nchat >/dev/null
+
+if [[ "$database_ready" != true ]]; then
+  echo "PostgreSQL did not finish initializing the nchat database." >&2
+  docker logs "$CONTAINER" >&2 || true
+  exit 1
+fi
 
 for _ in 1 2; do
   docker exec \
