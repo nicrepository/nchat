@@ -8,8 +8,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+SENSITIVE_ASSIGNMENT_NAMES = (
+    "pass" "word",
+    "sec" "ret",
+    "tok" "en",
+    "private" "_key",
+)
+
+PRIVATE_KEY_HEADER = "BEGIN PRIVATE" " KEY"
+
+assignment_names_pattern = "|".join(
+    re.escape(name) for name in SENSITIVE_ASSIGNMENT_NAMES
+)
+
 ASSIGNMENT_PATTERN = re.compile(
-    r"(?:password|secret|token|private_key)="
+    rf"(?:{assignment_names_pattern})="
     r"(?P<value>"
     r"\$\{\{\s*(?:secrets|vars|env)\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}"
     r'|"[^"\r\n]*"'
@@ -67,7 +80,7 @@ def is_safe_reference(value: str) -> bool:
 def inspect_line(line: str) -> list[str]:
     findings: list[str] = []
 
-    if "BEGIN PRIVATE KEY" in line:
+    if PRIVATE_KEY_HEADER in line:
         findings.append("private key PEM header")
 
     for match in ASSIGNMENT_PATTERN.finditer(line):
@@ -77,26 +90,32 @@ def inspect_line(line: str) -> list[str]:
     return findings
 
 
+def make_assignment(name: str, value: str) -> str:
+    return f"{name}={value}"
+
+
 def run_self_test() -> None:
-    safe_lines = (
-        '--set=migrator_password="$POSTGRES_MIGRATOR_PASSWORD" \\',
-        '--set=app_password="$POSTGRES_APP_PASSWORD" <<\'SQL\'',
-        "token=${TOKEN}",
-        'secret="${SECRET_VALUE}"',
-        "private_key=REPLACE_ME_PRIVATE_KEY",
-        "password=<generated-locally>",
-        "token=***",
-        "token=${{ secrets.GITHUB_TOKEN }}",
+    password_name, secret_name, token_name, private_key_name = (
+        SENSITIVE_ASSIGNMENT_NAMES
     )
 
-    # Construct unsafe fixtures in fragments so this scanner does not flag
-    # its own source after the file becomes tracked.
+    safe_lines = (
+        f'--set=migrator_{password_name}="$POSTGRES_MIGRATOR_PASSWORD" \\',
+        f'--set=app_{password_name}="$POSTGRES_APP_PASSWORD" <<\'SQL\'',
+        make_assignment(token_name, "${TOKEN}"),
+        make_assignment(secret_name, '"${SECRET_VALUE}"'),
+        make_assignment(private_key_name, "REPLACE_ME_PRIVATE_KEY"),
+        make_assignment(password_name, "<generated-locally>"),
+        make_assignment(token_name, "***"),
+        make_assignment(token_name, "${{ secrets.GITHUB_TOKEN }}"),
+    )
+
     unsafe_lines = (
-        "pass" "word=hunter2",
-        "sec" 'ret="literal-value"',
-        "tok" "en='abc123'",
-        "private" "_key=/tmp/private.pem",
-        "-----BEGIN PRIVATE" " KEY-----",
+        make_assignment(password_name, "hunter2"),
+        make_assignment(secret_name, '"literal-value"'),
+        make_assignment(token_name, "'abc123'"),
+        make_assignment(private_key_name, "/tmp/private.pem"),
+        f"-----{PRIVATE_KEY_HEADER}-----",
     )
 
     for line in safe_lines:
