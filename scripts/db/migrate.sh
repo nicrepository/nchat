@@ -69,9 +69,15 @@ load_env() {
 }
 
 need_db() {
-  load_env
-  export PGPASSWORD
-  DSN="postgresql://$PGUSER@$PGHOST:$PGPORT/$PGDATABASE"
+  if [[ -n "${MIGRATIONS_DATABASE_URL:-}" ]]; then
+    DSN="$MIGRATIONS_DATABASE_URL"
+  elif [[ -n "${DATABASE_URL:-}" ]]; then
+    DSN="$DATABASE_URL"
+  else
+    load_env
+    export PGPASSWORD
+    DSN="postgresql://$PGUSER@$PGHOST:$PGPORT/$PGDATABASE"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -82,7 +88,9 @@ db_exec() {
 }
 
 db_scalar() {
-  db_exec -t -A -c "$1" | tr -d '[:space:]'
+  local query="$1"
+  shift
+  printf '%s\n' "$query" | db_exec "$@" -t -A | tr -d '[:space:]'
 }
 
 # ---------------------------------------------------------------------------
@@ -132,14 +140,14 @@ validate_checksum() {
 # Advisory lock: held by an open psql coprocess for the full mutating command.
 # ---------------------------------------------------------------------------
 acquire_migration_lock() {
-  coproc MIGRATION_LOCK_PSQL { psql --no-password -v ON_ERROR_STOP=1 -q -t -A "$DSN"; }
+  coproc MIGRATION_LOCK_PSQL { psql --no-password -v ON_ERROR_STOP=1 -q -t -A --set=lock_id="$MIGRATION_LOCK_ID" "$DSN"; }
   LOCK_HOLDER_PID="$MIGRATION_LOCK_PSQL_PID"
 
-  printf "SELECT pg_advisory_lock(%s);\nSELECT 'locked';\n" "$MIGRATION_LOCK_ID" >&${MIGRATION_LOCK_PSQL[1]}
+  printf "%s\n" "SELECT pg_advisory_lock(:'lock_id'::bigint);" "SELECT 'locked';" 1>&"${MIGRATION_LOCK_PSQL[1]}"
 
   local line
   while true; do
-    if IFS= read -r -t 60 line <&${MIGRATION_LOCK_PSQL[0]}; then
+    if IFS= read -r -t 60 line 0<&"${MIGRATION_LOCK_PSQL[0]}"; then
       if [[ "$line" == "locked" ]]; then
         LOCK_ACQUIRED=true
         return
@@ -155,10 +163,10 @@ acquire_migration_lock() {
 release_migration_lock() {
   if [[ -n "${LOCK_HOLDER_PID:-}" ]]; then
     if [[ "${LOCK_ACQUIRED:-false}" == "true" ]]; then
-      printf "SELECT pg_advisory_unlock(%s);\n" "$MIGRATION_LOCK_ID" >&${MIGRATION_LOCK_PSQL[1]} 2>/dev/null || true
+      printf "%s\n" "SELECT pg_advisory_unlock(:'lock_id'::bigint);" 1>&"${MIGRATION_LOCK_PSQL[1]}" 2>/dev/null || true
       LOCK_ACQUIRED=false
     fi
-    printf "\\q\n" >&${MIGRATION_LOCK_PSQL[1]} 2>/dev/null || true
+    printf "\\q\n" 1>&"${MIGRATION_LOCK_PSQL[1]}" 2>/dev/null || true
     wait "$LOCK_HOLDER_PID" >/dev/null 2>&1 || true
     LOCK_HOLDER_PID=""
   fi
@@ -227,9 +235,12 @@ assert_no_dirty_migrations() {
 }
 
 is_applied() {
+  validate_domain "$1"
+  validate_migration_base "$2"
   [[ "$MIGRATIONS_TABLE_EXISTS" == "true" ]] || return 1
   local n
-  n=$(db_scalar "SELECT COUNT(*) FROM public.schema_migrations WHERE domain='$1' AND filename='$2';")
+  n=$(db_scalar "SELECT COUNT(*) FROM public.schema_migrations WHERE domain=:'domain' AND filename=:'filename';" \
+    --set=domain="$1" --set=filename="$2")
   [[ "${n:-0}" -gt 0 ]]
 }
 
@@ -239,7 +250,10 @@ migration_checksum() {
 }
 
 stored_checksum() {
-  db_scalar "SELECT COALESCE((SELECT checksum_sha256 FROM public.schema_migrations WHERE domain='$1' AND filename='$2'), '');"
+  validate_domain "$1"
+  validate_migration_base "$2"
+  db_scalar "SELECT COALESCE((SELECT checksum_sha256 FROM public.schema_migrations WHERE domain=:'domain' AND filename=:'filename'), '');" \
+    --set=domain="$1" --set=filename="$2"
 }
 
 verify_applied_checksum() {
@@ -266,9 +280,10 @@ record_apply_started() {
   validate_domain "$domain"
   validate_migration_base "$filename"
   validate_checksum "$checksum"
-  db_exec -q -c "
+  db_exec -q --set=domain="$domain" --set=filename="$filename" --set=checksum="$checksum" <<'SQL'
     INSERT INTO public.schema_migrations(domain, filename, checksum_sha256, dirty, in_progress, applied_at, updated_at)
-    VALUES('$domain', '$filename', '$checksum', true, true, now(), now());"
+    VALUES(:'domain', :'filename', :'checksum', true, true, now(), now());
+SQL
 }
 
 record_apply_clean() {
@@ -276,28 +291,31 @@ record_apply_clean() {
   validate_domain "$domain"
   validate_migration_base "$filename"
   validate_checksum "$checksum"
-  db_exec -q -c "
+  db_exec -q --set=domain="$domain" --set=filename="$filename" --set=checksum="$checksum" <<'SQL'
     UPDATE public.schema_migrations
-       SET checksum_sha256 = '$checksum', dirty = false, in_progress = false, applied_at = now(), updated_at = now()
-     WHERE domain = '$domain' AND filename = '$filename';"
+       SET checksum_sha256 = :'checksum', dirty = false, in_progress = false, applied_at = now(), updated_at = now()
+     WHERE domain = :'domain' AND filename = :'filename';
+SQL
 }
 
 record_rollback_started() {
   local domain="$1" filename="$2"
   validate_domain "$domain"
   validate_migration_base "$filename"
-  db_exec -q -c "
+  db_exec -q --set=domain="$domain" --set=filename="$filename" <<'SQL'
     UPDATE public.schema_migrations
        SET dirty = true, in_progress = true, updated_at = now()
-     WHERE domain = '$domain' AND filename = '$filename';"
+     WHERE domain = :'domain' AND filename = :'filename';
+SQL
 }
 
 record_rollback_clean() {
   local domain="$1" filename="$2"
   validate_domain "$domain"
   validate_migration_base "$filename"
-  db_exec -q -c "
-    DELETE FROM public.schema_migrations WHERE domain='$domain' AND filename='$filename';"
+  db_exec -q --set=domain="$domain" --set=filename="$filename" <<'SQL'
+    DELETE FROM public.schema_migrations WHERE domain = :'domain' AND filename = :'filename';
+SQL
 }
 
 # ---------------------------------------------------------------------------
@@ -377,8 +395,20 @@ cmd_up_locked() {
     record_apply_clean "$MDOM" "$MFILE" "$checksum"
     applied=$((applied + 1))
   done < <(collect_up_files)
+  run_post_up_sql
   echo ""
   echo "Applied $applied migration(s)."
+}
+
+run_post_up_sql() {
+  $DRY_RUN && return 0
+  local sql_file="${MIGRATIONS_POST_UP_SQL_FILE:-}"
+  [[ -n "$sql_file" ]] || return 0
+  if [[ ! -f "$sql_file" || -L "$sql_file" ]]; then
+    echo "[ERROR] Post-migration SQL file is missing or unsafe." >&2
+    return 1
+  fi
+  db_exec -f "$sql_file"
 }
 
 cmd_up() {
@@ -418,10 +448,12 @@ run_down_steps() {
     db_exec -f "$down_file"
     record_rollback_clean "$dom" "$file"
     rolled=$((rolled + 1))
-  done < <(db_exec -t -A -F '|' -c "
+  done < <(db_exec -t -A -F '|' --set=steps="$steps" <<'SQL'
     SELECT domain, filename FROM public.schema_migrations
     ORDER BY applied_at DESC, id DESC
-    LIMIT $steps;")
+    LIMIT :'steps'::integer;
+SQL
+  )
   echo ""
   echo "Rolled back $rolled migration(s)."
 }
@@ -515,7 +547,7 @@ Flags:
   --steps N    Migrations to roll back (down only, default 1)
   --force      Allow non-interactive reset
 
-Source: infra/compose/.env.dev (falls back to .env.dev.example)
+Connection: MIGRATIONS_DATABASE_URL, then DATABASE_URL, then infra/compose/.env.dev
 Tables:  public.schema_migrations (created automatically on first run)
 USAGE
 }
