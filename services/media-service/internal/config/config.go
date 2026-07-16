@@ -12,6 +12,7 @@ type Config struct {
 	Env                      string
 	Port                     int
 	ReadHeaderTimeoutSeconds int
+	LiveKitURL               string
 }
 
 func Load() Config {
@@ -20,5 +21,6 @@ func Load() Config {
 		Env:                      platformconfig.GetString("APP_ENV", "development"),
 		Port:                     platformconfig.GetInt("PORT", defaultPort),
 		ReadHeaderTimeoutSeconds: platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
+		LiveKitURL:               platformconfig.GetString("LIVEKIT_URL", ""),
 	}
 }

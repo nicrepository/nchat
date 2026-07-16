@@ -31,7 +31,7 @@ fi
 if ! command -v govulncheck >/dev/null 2>&1; then
   echo "govulncheck is not installed." >&2
   echo "Install it with:" >&2
-  echo "  go install golang.org/x/vuln/cmd/govulncheck@latest" >&2
+  echo "  go install golang.org/x/vuln/cmd/govulncheck@v1.1.4" >&2
   exit 127
 fi
 

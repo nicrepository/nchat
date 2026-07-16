@@ -311,4 +311,6 @@ if [ "$ERRORS" -gt 0 ]; then
   exit 1
 fi
 
+"$ROOT_DIR/scripts/db/migration-runtime-tests.sh"
+
 echo "migrations check passed."

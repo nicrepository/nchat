@@ -6,6 +6,9 @@ coverage
 .git
 *.lock
 pnpm-lock.yaml
+infra/k8s/security/sealed-secrets/controller/controller.yaml
+semgrep_results.json
+trivy_results.json
 # Tool configuration directories — not subject to project formatting
 .claude/
 .claude-flow/

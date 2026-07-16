@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+data:
+  APP_ENV: nchat-dev
+  AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
+  AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
+  VALKEY_WS_BROADCAST_ENABLED: "true"
+  SEAWEEDFS_FILER_URL: null
+  SEAWEEDFS_S3_ENDPOINT: null

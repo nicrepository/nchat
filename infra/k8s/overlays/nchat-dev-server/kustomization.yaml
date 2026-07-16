@@ -1,0 +1,163 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nchat-dev
+resources:
+  - ../../base
+  - certificate.yaml
+  - ingress.yaml
+  - media.yaml
+  - network-policies.yaml
+configMapGenerator:
+  - name: nchat-dev-topology
+    envs:
+      - topology.env
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  - target:
+      kind: Namespace
+      name: nchat
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: nchat-dev
+  - path: configmap-patch.yaml
+  - path: quota-patch.yaml
+  - path: delete-permissive-network-policy.yaml
+  - path: patches/web.yaml
+  - path: patches/auth-service.yaml
+  - path: patches/chat-service.yaml
+  - path: patches/file-service.yaml
+  - path: patches/notification-service.yaml
+  - path: patches/admin-service.yaml
+  - path: patches/search-service.yaml
+  - path: patches/media-service.yaml
+  - target:
+      kind: Deployment
+      annotationSelector: nchat.nicrepository.io/image-placeholder=true
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: ghcr-pull
+images:
+  - name: ghcr.io/nicrepository/nchat/web
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/auth-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/chat-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/file-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/notification-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/admin-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/search-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/media-service
+    newTag: sha-placeholder
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-dev
+replacements:
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.NCHAT_DEV_HOST
+    targets:
+      - select:
+          kind: Certificate
+          name: nchat-dev-tls
+        fieldPaths:
+          - spec.dnsNames.0
+      - select:
+          kind: Ingress
+          name: nchat-dev
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+      - select:
+          kind: Ingress
+          name: nchat-dev-livekit
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+      - select:
+          kind: Ingress
+          name: nchat-dev-http
+        fieldPaths:
+          - spec.rules.0.host
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.NCHAT_DEV_PUBLIC_URL
+    targets:
+      - select:
+          kind: ConfigMap
+          name: nchat-config
+        fieldPaths:
+          - data.AUTH_PUBLIC_WEB_BASE_URL
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.NCHAT_DEV_NODE_CIDR
+    targets:
+      - select:
+          kind: NetworkPolicy
+          name: nchat-allow-livekit-api-egress
+        fieldPaths:
+          - spec.egress.0.to.0.ipBlock.cidr
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.LIVEKIT_API_PORT
+    targets:
+      - select:
+          kind: Service
+          name: livekit
+        fieldPaths:
+          - spec.ports.[name=http].port
+      - select:
+          kind: Deployment
+          name: livekit
+        fieldPaths:
+          - spec.template.spec.containers.[name=livekit].ports.[name=http].containerPort
+      - select:
+          kind: NetworkPolicy
+          name: nchat-allow-livekit-api-egress
+        fieldPaths:
+          - spec.egress.0.ports.0.port
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.LIVEKIT_RTC_TCP_PORT
+    targets:
+      - select:
+          kind: Deployment
+          name: livekit
+        fieldPaths:
+          - spec.template.spec.containers.[name=livekit].ports.[name=rtc-tcp].containerPort
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.LIVEKIT_RTC_UDP_PORT
+    targets:
+      - select:
+          kind: Deployment
+          name: livekit
+        fieldPaths:
+          - spec.template.spec.containers.[name=livekit].ports.[name=rtc-udp].containerPort
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.TURN_LISTEN_PORT
+    targets:
+      - select:
+          kind: Deployment
+          name: coturn
+        fieldPaths:
+          - spec.template.spec.containers.[name=coturn].ports.[name=turn-tcp].containerPort
+          - spec.template.spec.containers.[name=coturn].ports.[name=turn-udp].containerPort
