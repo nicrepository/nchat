@@ -35,6 +35,22 @@ if git -C "$ROOT_DIR" ls-files 'infra/traefik/local/certs/*' | grep -E '\.(pem|k
   exit 1
 fi
 
+for generated in \
+  infra/traefik/local/certs/nchat.local.pem \
+  infra/traefik/local/certs/nchat.local-key.pem \
+  infra/traefik/local/certs/nchat.local.crt \
+  infra/traefik/local/certs/nchat.local.key; do
+  git -C "$ROOT_DIR" check-ignore -q "$generated" || {
+    echo "Generated local TLS file is not ignored: $generated" >&2
+    exit 1
+  }
+done
+
+if git -C "$ROOT_DIR" ls-files | grep -Ei '(^|/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]*(private|priv)[^/]*\.(pem|key)|[^/]*-key\.pem)$' >/dev/null; then
+  echo "A private-key filename is still tracked." >&2
+  exit 1
+fi
+
 if ! grep -q 'TRAEFIK_HTTPS_HOST_PORT=8443' "$ROOT_DIR/infra/compose/.env.dev.example"; then
   echo "infra/compose/.env.dev.example must define TRAEFIK_HTTPS_HOST_PORT=8443." >&2
   exit 1
