@@ -95,7 +95,9 @@ func (c liveKitAPIChecker) Check(ctx context.Context) health.CheckResult {
 		}
 		return result
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		result.Message = "LiveKit API returned non-success status"
