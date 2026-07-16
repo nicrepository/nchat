@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -194,5 +195,59 @@ func TestMetricsRouteReturns200(t *testing.T) {
 	body := response.Body.String()
 	if body == "" {
 		t.Fatal("expected non-empty metrics body")
+	}
+}
+
+func TestLiveKitAPICheckerUsesConfiguredEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	checker := liveKitAPIChecker{rawURL: server.URL}
+	if result := checker.Check(context.Background()); result.Status != health.CheckPass {
+		t.Fatalf("expected reachable LiveKit endpoint, got %+v", result)
+	}
+	server.Close()
+	if result := checker.Check(context.Background()); result.Status != health.CheckFail {
+		t.Fatalf("expected closed LiveKit endpoint to fail, got %+v", result)
+	}
+}
+
+func TestLiveKitAPICheckerTimesOut(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	result := (liveKitAPIChecker{rawURL: server.URL, timeout: 50 * time.Millisecond}).Check(context.Background())
+	if result.Status != health.CheckFail || result.Message != "LiveKit API timeout" {
+		t.Fatalf("expected timeout failure, got %+v", result)
+	}
+}
+
+func TestLiveKitAPICheckerRejectsNonSuccessStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	result := (liveKitAPIChecker{rawURL: server.URL}).Check(context.Background())
+	if result.Status != health.CheckFail || result.Message != "LiveKit API returned non-success status" {
+		t.Fatalf("expected non-success failure, got %+v", result)
+	}
+}
+
+func TestLiveKitAPICheckerHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := (liveKitAPIChecker{rawURL: "http://127.0.0.1:1"}).Check(ctx)
+	if result.Status != health.CheckFail || result.Message != "LiveKit API check canceled" {
+		t.Fatalf("expected cancellation failure, got %+v", result)
+	}
+}
+
+func TestLiveKitAPICheckerRejectsInvalidURL(t *testing.T) {
+	result := (liveKitAPIChecker{rawURL: "://invalid"}).Check(context.Background())
+	if result.Status != health.CheckFail || result.Message != "invalid LiveKit URL" {
+		t.Fatalf("expected invalid URL failure, got %+v", result)
 	}
 }

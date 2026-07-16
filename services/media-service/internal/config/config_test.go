@@ -12,8 +12,9 @@ func TestLoadDefaults(t *testing.T) {
 func TestLoadUsesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("APP_ENV", "test")
 	t.Setenv("PORT", "18087")
+	t.Setenv("LIVEKIT_URL", "http://livekit.internal:7880")
 	cfg := Load()
-	if cfg.Env != "test" || cfg.Port != 18087 {
+	if cfg.Env != "test" || cfg.Port != 18087 || cfg.LiveKitURL != "http://livekit.internal:7880" {
 		t.Fatalf("expected env/port overrides, got %+v", cfg)
 	}
 }
