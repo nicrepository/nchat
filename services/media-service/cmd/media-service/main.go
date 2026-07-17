@@ -13,12 +13,17 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("%s configuration invalid: %v", cfg.ServiceName, err)
+	}
 	application := app.New(cfg)
 	addr := ":" + strconv.Itoa(cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           application.Handler,
 		ReadHeaderTimeout: time.Duration(cfg.ReadHeaderTimeoutSeconds) * time.Second,
+		ReadTimeout:       time.Duration(cfg.ReadTimeoutSeconds) * time.Second,
+		WriteTimeout:      time.Duration(cfg.WriteTimeoutSeconds) * time.Second,
 	}
 
 	application.Logger.Info("service starting", "port", cfg.Port)
