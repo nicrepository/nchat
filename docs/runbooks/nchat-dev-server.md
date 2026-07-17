@@ -236,15 +236,18 @@ kubectl_diff_review() {
   local manifest="$1"
   local rc
 
-  set +e
-  kubectl diff -f "$manifest"
-  rc=$?
-  set -e
-
-  if [ "$rc" -gt 1 ]; then
-    echo "ERRO: kubectl diff falhou para $manifest, código $rc." >&2
-    return "$rc"
+  if kubectl diff -f "$manifest"; then
+    return 0
+  else
+    rc=$?
   fi
+
+  if [ "$rc" -eq 1 ]; then
+    return 0
+  fi
+
+  echo "ERRO: kubectl diff falhou para $manifest, código $rc." >&2
+  return "$rc"
 }
 
 kubectl_diff_review \
@@ -999,9 +1002,19 @@ Antes do loop, confirme que cada Deployment pertence de fato ao namespace `nchat
 
 ```bash
 # [srv-apps-01]
-kubectl rollout history deployment -n nchat-dev
+# A sessão pode ter saído do clone (ex.: `cd /opt/actions-runner-nchat-dev` na
+# seção 15); volte ao repositório antes de qualquer `source` com caminho relativo.
+cd "$NCHAT_REPO_DIR"
+
 set -Eeuo pipefail
+
+source scripts/deploy/nchat-dev/topology.sh
+load_nchat_dev_topology \
+  infra/k8s/overlays/nchat-dev-server/topology.env
+
 source scripts/deploy/nchat-dev/lib.sh
+
+kubectl rollout history deployment -n nchat-dev
 
 printf '%s\n' "${NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}"
 
@@ -1011,8 +1024,12 @@ done
 
 for deployment in "${NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}"; do
   kubectl rollout undo "deployment/$deployment" -n nchat-dev
-  kubectl rollout status "deployment/$deployment" -n nchat-dev --timeout=180s
+  kubectl rollout status \
+    "deployment/$deployment" \
+    -n nchat-dev \
+    --timeout=180s
 done
+
 curl -fsS "https://${NCHAT_DEV_HOST}/" >/dev/null
 ```
 
