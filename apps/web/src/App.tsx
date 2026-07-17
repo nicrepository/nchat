@@ -14,6 +14,9 @@ import ChatShell from "./chat/ChatShell";
 
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
+const LiveKitSpikePage = import.meta.env.DEV
+  ? lazy(() => import("./mediaSpike/LiveKitSpikePage"))
+  : null;
 
 export default function App() {
   return (
@@ -24,6 +27,17 @@ export default function App() {
         <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/accept-invite" element={<AcceptInvitePage />} />
         <Route path="/oidc-callback" element={<OIDCCallbackPage />} />
+
+        {LiveKitSpikePage && (
+          <Route
+            path="/spike/livekit-1to1"
+            element={
+              <Suspense fallback={<p>Carregando Spike LiveKit…</p>}>
+                <LiveKitSpikePage />
+              </Suspense>
+            }
+          />
+        )}
 
         {/* ── Chat shell (authenticated) ─────────────────────────────── */}
         <Route
