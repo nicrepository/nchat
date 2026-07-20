@@ -20,7 +20,7 @@ segredos permanecem fora do deploy automático.
   e os digests de manifest list das três imagens são centralizados no Kustomization
   de dados; LiveKit e coturn também usam tag mais digest verificado.
 - LiveKit e coturn usam `hostNetwork` somente para WebRTC. A API LiveKit permanece
-  em TCP 7880; RTC usa 7881/TCP e 7882/UDP; coturn usa 3479/TCP+UDP e
+  em TCP 7880; RTC usa 7881/TCP e 7882/UDP; coturn usa 3480/TCP+UDP e
   49300-49340/UDP. A porta 3478 continua reservada ao UniFi.
 - Build e deploy são workflows separados. O inventário canônico
   `scripts/deploy/nchat-dev/images.txt` gera a matriz de build, valida o
