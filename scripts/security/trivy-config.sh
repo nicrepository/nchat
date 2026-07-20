@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+TEMPORARY="$(mktemp -d "${TMPDIR:-/tmp}/nchat-trivy-config.XXXXXX")"
+trap 'rm -rf "$TEMPORARY"' EXIT
 
 if ! command -v trivy >/dev/null 2>&1; then
   echo "trivy is not installed." >&2
@@ -17,4 +19,5 @@ if trivy config --help 2>&1 | grep -q -- "--no-progress"; then
   QUIET_FLAG="--no-progress"
 fi
 
-trivy config --severity HIGH,CRITICAL --exit-code 1 "$QUIET_FLAG" "$ROOT"
+"$ROOT/scripts/security/prepare-trivy-config.sh" "$TEMPORARY/input"
+trivy config --severity HIGH,CRITICAL --exit-code 1 --ignorefile "$ROOT/.trivyignore.yaml" "$QUIET_FLAG" "$TEMPORARY/input"

@@ -10,8 +10,11 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ServiceName != "media-service" || cfg.Env != "development" || cfg.Port != 8087 || cfg.ReadHeaderTimeoutSeconds != 5 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
-	if cfg.MediaSpikeEnabled || cfg.MediaSpikeTokenTTLSeconds != 300 {
+	if cfg.MediaSpikeEnabled || cfg.LiveKitAPIURL != "" || cfg.LiveKitURL != "" || cfg.MediaSpikeTokenTTLSeconds != 300 {
 		t.Fatalf("unexpected spike defaults: %+v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default disabled spike configuration should be valid: %v", err)
 	}
 }
 
@@ -147,9 +150,39 @@ func validSpikeConfig() Config {
 func TestLoadUsesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("APP_ENV", "test")
 	t.Setenv("PORT", "18087")
+	t.Setenv("LIVEKIT_API_URL", "http://livekit.internal:7880")
+	t.Setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
 	cfg := Load()
-	if cfg.Env != "test" || cfg.Port != 18087 {
+	if cfg.Env != "test" || cfg.Port != 18087 || cfg.LiveKitAPIURL != "http://livekit.internal:7880" || cfg.LiveKitURL != "ws://127.0.0.1:7880" {
 		t.Fatalf("expected env/port overrides, got %+v", cfg)
+	}
+}
+
+func TestLoadKeepsLiveKitAPIURLAndSpikeURLSeparate(t *testing.T) {
+	t.Setenv("LIVEKIT_API_URL", "http://livekit.internal:7880")
+	t.Setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
+
+	cfg := Load()
+
+	if cfg.LiveKitAPIURL != "http://livekit.internal:7880" {
+		t.Fatalf("expected HTTP LiveKit API URL for readiness, got %q", cfg.LiveKitAPIURL)
+	}
+	if cfg.LiveKitURL != "ws://127.0.0.1:7880" {
+		t.Fatalf("expected WebSocket LiveKit URL for spike, got %q", cfg.LiveKitURL)
+	}
+}
+
+func TestValidateIgnoresLiveKitAPIURLForSpikeValidation(t *testing.T) {
+	cfg := validSpikeConfig()
+	cfg.LiveKitAPIURL = "http://livekit.internal:7880"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("HTTP LiveKit API URL should not affect spike validation: %v", err)
+	}
+
+	cfg.LiveKitURL = "http://127.0.0.1:7880"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("HTTP LiveKit URL must not be accepted for spike WebSocket configuration")
 	}
 }
 

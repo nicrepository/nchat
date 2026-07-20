@@ -1,0 +1,21 @@
+misconfigurations:
+  - id: KSV-0009
+    paths:
+      - application.yaml
+    statement: Exact LiveKit and coturn host ports require host networking; remove this exception when media moves to a dedicated IP or node network design.
+    expired_at: 2027-01-16
+  - id: KSV-0109
+    paths:
+      - data.yaml
+    statement: The ConfigMap contains POSIX bootstrap code that references passwords supplied by distinct Secrets at runtime; it contains no credential value. Remove if the bootstrap moves into an image.
+    expired_at: 2027-01-16
+  - id: KSV-0056
+    paths:
+      - runner-rbac.yaml
+    statement: The namespace-scoped deploy runner must reconcile Services, Ingress and NetworkPolicies; remove if deployment is delegated to a narrower in-cluster controller.
+    expired_at: 2027-01-16
+  - id: KSV-0041
+    paths:
+      - controller.yaml
+    statement: This checksum-verified upstream Sealed Secrets controller must reconcile Secret objects by design; reassess on every pinned controller upgrade.
+    expired_at: 2027-01-16

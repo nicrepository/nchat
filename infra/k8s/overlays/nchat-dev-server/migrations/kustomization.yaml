@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nchat-dev
+resources:
+  - job.yaml
+images:
+  - name: ghcr.io/nicrepository/nchat/migrations
+    newTag: sha-placeholder
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-dev

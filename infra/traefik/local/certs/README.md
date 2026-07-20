@@ -8,3 +8,14 @@ Rules:
 - Use `mkcert` when available.
 - The fallback `openssl` certificate is self-signed and is not trusted automatically by browsers.
 - Keep only `.gitkeep` and this README in Git.
+- Generation refuses to overwrite existing material unless `--force` is supplied:
+
+  ```bash
+  make dev-tls-generate
+  bash scripts/dev/dev-tls-generate.sh --force nchat.local
+  ```
+
+Removing a key from the current tree does not remove prior copies from Git history.
+After this change is merged, rotate any certificate/key pair that may have been shared.
+History rewriting is a separate coordinated operation and is not performed by the
+generator or this repository task.

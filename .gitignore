@@ -43,6 +43,9 @@ private/
 !scripts/secrets/**
 
 # Local TLS material
+infra/traefik/local/certs/*.pem
+infra/traefik/local/certs/*.key
+infra/traefik/local/certs/*.crt
 infra/traefik/local/certs/*
 !infra/traefik/local/certs/.gitkeep
 !infra/traefik/local/certs/README.md
@@ -102,6 +105,7 @@ kubeconfig
 *.kubeconfig
 kind-kubeconfig*
 *.sealed-secret.local.yaml
+infra/k8s/overlays/nchat-dev-server/topology.env
 
 # IDEs and editors
 .idea/
@@ -136,3 +140,6 @@ results.sarif
 *.sarif
 *.patch
 *_results.txt
+semgrep_results.json
+trivy_results.json
+kustomize_render.yaml

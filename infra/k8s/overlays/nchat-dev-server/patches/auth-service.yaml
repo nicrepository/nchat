@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: nchat
+spec:
+  template:
+    spec:
+      containers:
+        - name: auth-service
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+            - name: AUTH_JWT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_JWT_HMAC_SECRET
+            - name: AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY
+            - name: ADMIN_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: ADMIN_BOOTSTRAP_TOKEN
+                  optional: true

@@ -33,6 +33,7 @@ type Config struct {
 	WriteTimeoutSeconds       int
 	MediaSpikeEnabled         bool
 	MediaSpikeLocalOnly       bool
+	LiveKitAPIURL             string
 	LiveKitURL                string
 	LiveKitAPIKey             string
 	LiveKitAPISecret          string
@@ -51,6 +52,7 @@ func Load() Config {
 		WriteTimeoutSeconds:       positiveInt("WRITE_TIMEOUT_SECONDS", 10),
 		MediaSpikeEnabled:         platformconfig.GetBool("MEDIA_SPIKE_ENABLED", false),
 		MediaSpikeLocalOnly:       platformconfig.GetBool("MEDIA_SPIKE_LOCAL_ONLY", false),
+		LiveKitAPIURL:             strings.TrimSpace(platformconfig.GetString("LIVEKIT_API_URL", "")),
 		LiveKitURL:                strings.TrimSpace(platformconfig.GetString("LIVEKIT_URL", "")),
 		LiveKitAPIKey:             strings.TrimSpace(platformconfig.GetString("LIVEKIT_API_KEY", "")),
 		LiveKitAPISecret:          platformconfig.GetString("LIVEKIT_API_SECRET", ""),
