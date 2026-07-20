@@ -38,9 +38,9 @@ id = "generic-api-key"
     '^services/auth-service/internal/config/config_test\.go$',
   ]
 
-[[allowlists]]
-description = "Ignore generic-api-key false positives in encrypted SealedSecret manifests"
-targetRules = ["generic-api-key"]
-paths = [
-  '''^infra/k8s/secrets/sealed/[^/]+/[^/]+\.ya?ml$'''
-]
+  [[rules.allowlists]]
+  description = "Encrypted values in validated SealedSecret manifests"
+  condition = "AND"
+  paths = [
+    '^infra/k8s/secrets/sealed/[^/]+/[^/]+\.ya?ml$',
+  ]
