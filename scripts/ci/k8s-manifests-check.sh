@@ -187,8 +187,8 @@ validate_nchat_dev() {
   grep -Fq "port: $LIVEKIT_API_PORT" <<<"$policy_block"
   grep -Fq 'protocol: TCP' <<<"$policy_block"
   grep -Fq 'app.kubernetes.io/component: media' <<<"$policy_block"
-  [[ "$(grep -R -l 'name: LIVEKIT_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches" | wc -l)" -eq 1 ]]
-  grep -q 'name: LIVEKIT_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml"
+  [[ "$(grep -R -l 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches" | wc -l)" -eq 1 ]]
+  grep -q 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml"
 
   [[ "$(grep -Fxc '  activeDeadlineSeconds: 300' "$migrations")" -eq 1 ]]
   [[ "$(grep -Fxc '  backoffLimit: 0' "$migrations")" -eq 1 ]]
