@@ -32,6 +32,8 @@ patches:
       kind: Namespace
       name: nchat
     path: namespace-patch.yaml
+  - path: configmap-patch.yaml
+  - path: web-env-patch.yaml
   - path: patches/web-replicas.yaml
   - path: patches/auth-service-replicas.yaml
   - path: patches/chat-service-replicas.yaml
