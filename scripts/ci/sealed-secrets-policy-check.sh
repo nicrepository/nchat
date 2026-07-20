@@ -72,6 +72,11 @@ while IFS= read -r file; do
         exit 1
       fi
       ;;
+    infra/k8s/secrets/sealed/*.yaml|infra/k8s/secrets/sealed/*.yml)
+      # SealedSecret encryptedData preserves the original Secret key names,
+      # while the corresponding values are ciphertext. These manifests are
+      # validated separately as SealedSecret resources.
+      ;;
     *.yaml|*.yml)
       if grep -E 'POSTGRES_[A-Z0-9_]*PASSWORD:[[:space:]]*"?[^" ]+' "$ROOT_DIR/$file" | grep -Ev 'REPLACE_ME|replace-me|\$\{[A-Z0-9_]+\}' >/dev/null; then
         echo "A PostgreSQL password appears in non-template YAML with a non-placeholder value: $file" >&2
