@@ -72,6 +72,24 @@ while IFS= read -r file; do
         exit 1
       fi
       ;;
+    infra/k8s/secrets/sealed/kustomization.yaml|infra/k8s/secrets/sealed/*/kustomization.yaml)
+      ;;
+    infra/k8s/secrets/sealed/*.yaml|infra/k8s/secrets/sealed/*.yml)
+      if ! grep -Eq '^kind:[[:space:]]+SealedSecret[[:space:]]*$' "$ROOT_DIR/$file"; then
+        echo "Only SealedSecret resources are allowed under infra/k8s/secrets/sealed: $file" >&2
+        exit 1
+      fi
+
+      if ! grep -Eq '^[[:space:]]{2}encryptedData:[[:space:]]*$' "$ROOT_DIR/$file"; then
+        echo "SealedSecret is missing spec.encryptedData: $file" >&2
+        exit 1
+      fi
+
+      if grep -Eq '^[[:space:]]*(data|stringData):[[:space:]]*$' "$ROOT_DIR/$file"; then
+        echo "Plaintext Secret fields are forbidden in sealed manifests: $file" >&2
+        exit 1
+      fi
+      ;;
     *.yaml|*.yml)
       if grep -E 'POSTGRES_[A-Z0-9_]*PASSWORD:[[:space:]]*"?[^" ]+' "$ROOT_DIR/$file" | grep -Ev 'REPLACE_ME|replace-me|\$\{[A-Z0-9_]+\}' >/dev/null; then
         echo "A PostgreSQL password appears in non-template YAML with a non-placeholder value: $file" >&2

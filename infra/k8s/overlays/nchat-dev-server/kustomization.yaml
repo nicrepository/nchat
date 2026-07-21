@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: nchat-dev
 resources:
   - ../../base
+  - ../../secrets/sealed/nchat-dev
   - certificate.yaml
   - ingress.yaml
   - media.yaml

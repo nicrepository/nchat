@@ -37,3 +37,10 @@ id = "generic-api-key"
   paths = [
     '^services/auth-service/internal/config/config_test\.go$',
   ]
+
+  [[rules.allowlists]]
+  description = "Encrypted values in validated SealedSecret manifests"
+  condition = "AND"
+  paths = [
+    '^infra/k8s/secrets/sealed/[^/]+/[^/]+\.ya?ml$',
+  ]

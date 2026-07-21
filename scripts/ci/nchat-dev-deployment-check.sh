@@ -102,6 +102,9 @@ validate_image_inventory() {
   grep -Fq 'fromJSON(needs.inventory.outputs.images)' "$ROOT_DIR/.github/workflows/images.yml" || fail "image workflow does not derive its matrix"
   ! grep -q 'workflow_dispatch:' "$ROOT_DIR/.github/workflows/images.yml" || fail "unprotected manual image publishing is enabled"
   ! grep -Eq 'for image in (web|auth-service)' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "deploy duplicates the image inventory"
+  ! grep -Eq 'kubectl[[:space:]]+apply[[:space:]]+-k' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "deploy uses kubectl embedded Kustomize"
+  grep -Fq 'actual_kustomize="$(kustomize version)"' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "deploy does not validate standalone Kustomize"
+  grep -Fq 'validate_rendered_overlay "$DATA_OVERLAY" "$TEMPORARY_ROOT/data.yaml"' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "data overlay is not rendered with standalone Kustomize"
 
   for image in "${NCHAT_DEV_RUNTIME_IMAGES[@]}"; do
     [[ "$(grep -Fxc "  - name: ghcr.io/nicrepository/nchat/$image" "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/kustomization.yaml")" -eq 1 ]] || fail "Kustomize image missing or duplicated: $image"
