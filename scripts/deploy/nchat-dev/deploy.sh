@@ -45,19 +45,20 @@ trap cleanup EXIT
 trap on_error ERR
 
 require_prerequisites() {
-  local command embedded_kustomize
+  local command actual_kustomize
   for command in curl grep kustomize kubectl; do
     command -v "$command" >/dev/null
   done
   [[ "$(kubectl config current-context)" == nchat-dev-deployer ]]
   [[ "$(kubectl auth can-i patch deployments -n nchat-dev)" == yes ]]
-  embedded_kustomize="$(kubectl version --client -o yaml | grep '^kustomizeVersion:' | cut -d' ' -f2)"
-  [[ "$embedded_kustomize" == "$KUSTOMIZE_VERSION" ]]
+  actual_kustomize="$(kustomize version)"
+  [[ "$actual_kustomize" == "$KUSTOMIZE_VERSION" ]]
 }
 
 prepare_application_overlays() {
   local image
   prepare_deploy_tree "$ROOT_DIR" "$TEMPORARY_ROOT"
+  DATA_OVERLAY="$TEMPORARY_ROOT/infra-k8s/overlays/nchat-dev-server/data"
   MIGRATIONS_OVERLAY="$TEMPORARY_ROOT/infra-k8s/overlays/nchat-dev-server/migrations"
   APPLICATION_OVERLAY="$TEMPORARY_ROOT/infra-k8s/overlays/nchat-dev-server"
   set_digest_image "$MIGRATIONS_OVERLAY" \
@@ -66,6 +67,7 @@ prepare_application_overlays() {
     set_digest_image "$APPLICATION_OVERLAY" "ghcr.io/nicrepository/nchat/$image" \
       "$ARTIFACTS_DIR/digest-$image.txt"
   done
+  validate_rendered_overlay "$DATA_OVERLAY" "$TEMPORARY_ROOT/data.yaml"
   validate_rendered_overlay "$MIGRATIONS_OVERLAY" "$TEMPORARY_ROOT/migrations.yaml"
   validate_rendered_overlay "$APPLICATION_OVERLAY" "$TEMPORARY_ROOT/application.yaml"
 }
@@ -73,7 +75,7 @@ prepare_application_overlays() {
 start_data_services() {
   DEPLOY_STAGE=bootstrap
   kubectl delete job/postgres-bootstrap -n nchat-dev --ignore-not-found --wait=true
-  kubectl apply -k "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/data"
+  kubectl apply -f "$TEMPORARY_ROOT/data.yaml"
   kubectl rollout status statefulset/postgres -n nchat-dev --timeout=180s
   kubectl wait job/postgres-bootstrap -n nchat-dev --for=condition=complete --timeout=210s
 }
@@ -81,13 +83,13 @@ start_data_services() {
 run_migrations() {
   DEPLOY_STAGE=migrations
   kubectl delete job/nchat-migrations -n nchat-dev --ignore-not-found --wait=true
-  kubectl apply -k "$MIGRATIONS_OVERLAY"
+  kubectl apply -f "$TEMPORARY_ROOT/migrations.yaml"
   kubectl wait job/nchat-migrations -n nchat-dev --for=condition=complete --timeout=330s
 }
 
 apply_application() {
   DEPLOY_STAGE=application
-  kubectl apply -k "$APPLICATION_OVERLAY"
+  kubectl apply -f "$TEMPORARY_ROOT/application.yaml"
 }
 
 wait_for_rollouts() {

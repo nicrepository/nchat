@@ -93,6 +93,39 @@ db_scalar() {
   printf '%s\n' "$query" | db_exec "$@" -t -A | tr -d '[:space:]'
 }
 
+wait_for_database() {
+  local max_attempts="${MIGRATIONS_DATABASE_WAIT_ATTEMPTS:-30}"
+  local delay_seconds="${MIGRATIONS_DATABASE_WAIT_SECONDS:-2}"
+  local attempt
+
+  if [[ ! "$max_attempts" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] MIGRATIONS_DATABASE_WAIT_ATTEMPTS must be a positive integer." >&2
+    return 1
+  fi
+
+  if [[ ! "$delay_seconds" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] MIGRATIONS_DATABASE_WAIT_SECONDS must be a non-negative integer." >&2
+    return 1
+  fi
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if db_exec -t -A -c 'SELECT 1' >/dev/null 2>&1; then
+      if ((attempt > 1)); then
+        echo "[INFO] PostgreSQL became available on attempt $attempt/$max_attempts." >&2
+      fi
+      return 0
+    fi
+
+    if ((attempt == max_attempts)); then
+      echo "[ERROR] PostgreSQL unavailable after $max_attempts attempts." >&2
+      return 1
+    fi
+
+    echo "[INFO] PostgreSQL unavailable (attempt $attempt/$max_attempts); retrying in ${delay_seconds}s." >&2
+    sleep "$delay_seconds"
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Validation helpers: path-derived identifiers must be safe before SQL/path use.
 # ---------------------------------------------------------------------------
@@ -413,6 +446,7 @@ run_post_up_sql() {
 
 cmd_up() {
   need_db
+  wait_for_database
   with_migration_lock cmd_up_locked
 }
 
@@ -479,11 +513,13 @@ cmd_down() {
   local steps="${1:-$STEPS}"
   validate_steps "$steps"
   need_db
+  wait_for_database
   with_migration_lock cmd_down_locked "$steps"
 }
 
 cmd_status() {
   need_db
+  wait_for_database
   ensure_migrations_table
   assert_no_dirty_migrations
   echo "=== migration status ==="
@@ -527,6 +563,7 @@ cmd_reset_locked() {
 
 cmd_reset() {
   need_db
+  wait_for_database
   with_migration_lock cmd_reset_locked
 }
 

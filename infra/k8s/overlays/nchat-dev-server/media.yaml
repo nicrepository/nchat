@@ -30,6 +30,7 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      enableServiceLinks: false
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/hostname: srv-apps-01
@@ -120,6 +121,7 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      enableServiceLinks: false
       automountServiceAccountToken: false
       nodeSelector:
         kubernetes.io/hostname: srv-apps-01
@@ -164,6 +166,8 @@ spec:
             capabilities:
               drop:
                 - ALL
+              add:
+                - NET_BIND_SERVICE
           volumeMounts:
             - name: config
               mountPath: /etc/coturn

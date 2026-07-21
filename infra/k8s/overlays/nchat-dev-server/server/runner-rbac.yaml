@@ -108,6 +108,17 @@ rules:
       - patch
       - update
   - apiGroups:
+      - bitnami.com
+    resources:
+      - sealedsecrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+      - update
+  - apiGroups:
       - cert-manager.io
     resources:
       - certificates
