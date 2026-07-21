@@ -171,6 +171,7 @@ validate_coturn_template() {
 
 validate_nchat_dev() {
   local application="$1" data="$2" migrations="$3" policy_block component image_ref
+  local livekit_block coturn_block
   local -a external_image_refs=()
   validate_no_duplicate_resources "$application" "$data" "$migrations"
   validate_workload_hardening "$application"
@@ -189,6 +190,18 @@ validate_nchat_dev() {
   grep -Fq 'app.kubernetes.io/component: media' <<<"$policy_block"
   [[ "$(grep -R -l 'name: LIVEKIT_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches" | wc -l)" -eq 1 ]]
   grep -q 'name: LIVEKIT_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml"
+
+  livekit_block="$(yaml_document "$application" Deployment livekit)"
+  coturn_block="$(yaml_document "$application" Deployment coturn)"
+
+  [[ "$(grep -Fc 'enableServiceLinks: false' <<<"$livekit_block")" -eq 1 ]]
+  [[ "$(grep -Fc 'enableServiceLinks: false' <<<"$coturn_block")" -eq 1 ]]
+  [[ "$(grep -Fc -- '- NET_BIND_SERVICE' <<<"$coturn_block")" -eq 1 ]]
+
+  if grep -Fq -- '- NET_BIND_SERVICE' <<<"$livekit_block"; then
+    echo "error: LiveKit must not receive Coturn capabilities" >&2
+    return 1
+  fi
 
   [[ "$(grep -Fxc '  activeDeadlineSeconds: 300' "$migrations")" -eq 1 ]]
   [[ "$(grep -Fxc '  backoffLimit: 0' "$migrations")" -eq 1 ]]
