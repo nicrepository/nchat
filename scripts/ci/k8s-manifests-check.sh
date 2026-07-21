@@ -225,7 +225,13 @@ validate_nchat_dev() {
     nchat-allow-livekit-api-egress; do
     grep -q 'ports:' <<<"$(yaml_document "$application" NetworkPolicy "$policy_block")"
   done
-  grep -Fq 'port: http' <<<"$(yaml_document "$application" NetworkPolicy nchat-allow-traefik-http)"
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-traefik-http)"
+  grep -Fq 'port: http' <<<"$policy_block"
+  grep -Fq 'kubernetes.io/metadata.name: ingress-system' <<<"$policy_block"
+  if grep -Fq 'kubernetes.io/metadata.name: kube-system' <<<"$policy_block"; then
+    echo "error: Traefik NetworkPolicy must target ingress-system" >&2
+    return 1
+  fi
   if grep -q 'namespaceSelector: {}' "$application"; then return 1; fi
   if grep -Eq 'port: (8333|9333)' "$application"; then return 1; fi
   if grep -Eq 'name: s3|port: 8333|containerPort: 8333|[[:space:]]- -s3$' "$data"; then return 1; fi
