@@ -59,6 +59,63 @@ test_dsn_resolution() {
   fi
 }
 
+test_database_wait_retry() {
+  (
+    source_migrate
+
+    DSN='postgresql://redacted'
+    attempts=0
+    sleeps=0
+
+    db_exec() {
+      attempts=$((attempts + 1))
+      [[ "$attempts" -ge 2 ]]
+    }
+
+    sleep() {
+      sleeps=$((sleeps + 1))
+    }
+
+    MIGRATIONS_DATABASE_WAIT_ATTEMPTS=3
+    MIGRATIONS_DATABASE_WAIT_SECONDS=0
+
+    wait_for_database >/dev/null 2>&1
+
+    [[ "$attempts" -eq 2 ]]
+    [[ "$sleeps" -eq 1 ]]
+  ) || fail "database wait did not recover from a transient failure"
+
+  local output="$TEMP_DIR/database-wait-failure.log"
+
+  set +e
+  (
+    source_migrate
+
+    DSN='postgresql://redacted'
+
+    db_exec() {
+      return 1
+    }
+
+    sleep() {
+      :
+    }
+
+    MIGRATIONS_DATABASE_WAIT_ATTEMPTS=2
+    MIGRATIONS_DATABASE_WAIT_SECONDS=0
+
+    wait_for_database
+  ) >"$output" 2>&1
+  local status=$?
+  set -e
+
+  [[ "$status" -ne 0 ]] ||
+    fail "database wait accepted a permanent failure"
+
+  grep -Fq     'PostgreSQL unavailable after 2 attempts.'     "$output" ||
+    fail "database wait did not report exhaustion"
+}
+
 test_internal_identifier_validation() {
   (
     source_migrate
@@ -187,6 +244,7 @@ test_grant_failure() {
 }
 
 test_dsn_resolution
+test_database_wait_retry
 test_internal_identifier_validation
 test_sql_parameterization
 test_wrapper
