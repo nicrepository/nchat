@@ -42,4 +42,13 @@ describe("App", () => {
     expect(mockListAdminUsers).not.toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: /^usuários$/i })).not.toBeInTheDocument();
   });
+
+  it("renders the isolated LiveKit development spike route", async () => {
+    window.history.pushState({}, "", "/spike/livekit-1to1");
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", { name: /spike livekit.*chamada 1:1/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/somente desenvolvimento/i)).toBeInTheDocument();
+  });
 });

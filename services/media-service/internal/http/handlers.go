@@ -45,8 +45,8 @@ func readinessChecks(cfg config.Config) []health.Checker {
 		health.NewStaticChecker("service-bootstrap", true, health.CheckPass, ""),
 		health.NewStaticChecker("config-loaded", true, health.CheckPass, ""),
 	}
-	if cfg.LiveKitURL != "" {
-		checks = append(checks, liveKitAPIChecker{rawURL: cfg.LiveKitURL})
+	if cfg.LiveKitAPIURL != "" {
+		checks = append(checks, liveKitAPIChecker{rawURL: cfg.LiveKitAPIURL})
 	}
 	return checks
 }

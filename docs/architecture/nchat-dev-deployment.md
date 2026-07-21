@@ -45,7 +45,7 @@ segredos permanecem fora do deploy automático.
 | chat-service                    | PostgreSQL             | TCP 5432                  | `DATABASE_URL`/pgx                             |
 | chat-service                    | Valkey                 | TCP 6379                  | cache, rate limit e broadcast por `VALKEY_URL` |
 | notification-service            | PostgreSQL             | TCP 5432                  | outbox por `DATABASE_URL`                      |
-| media-service                   | IP canônico do LiveKit | TCP 7880                  | `LIVEKIT_URL` e readiness TCP da API           |
+| media-service                   | IP canônico do LiveKit | TCP 7880                  | `LIVEKIT_API_URL` e readiness TCP da API       |
 | migrations e postgres-bootstrap | PostgreSQL             | TCP 5432                  | schema, grants e papéis                        |
 | browser                         | LiveKit/coturn         | WSS/HTTPS e portas WebRTC | cliente fora do PodNetwork                     |
 

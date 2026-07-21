@@ -12,7 +12,7 @@ spec:
             - configMapRef:
                 name: nchat-config
           env:
-            - name: LIVEKIT_URL
+            - name: LIVEKIT_API_URL
               valueFrom:
                 configMapKeyRef:
                   name: nchat-dev-topology
