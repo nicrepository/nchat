@@ -34,10 +34,69 @@ import {
   postChannelMessage,
   postDMMessage,
   resetAllowedReactionEmojisCache,
+  resolveChannelMessageReferences,
+  resolveDMMessageReferences,
   searchDMCandidates,
   unfavoriteMessage,
   unpinMessage,
 } from "./chatApi";
+
+describe("message reference batch resolution", () => {
+  it("posts destination IDs once and maps authorized and unavailable references", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        references: [
+          {
+            message_id: "destination-1",
+            reference: {
+              available: true,
+              message_id: "source-1",
+              target_type: "channel",
+              target_id: "private-source",
+              target_label: "Privado",
+              author_display_name: "Ana",
+              body: "segredo",
+              body_format: "v3",
+              created_at: "2026-07-21T12:00:00Z",
+            },
+          },
+          { message_id: "destination-2", reference: { available: false } },
+        ],
+      },
+    });
+    const signal = new AbortController().signal;
+
+    const references = await resolveChannelMessageReferences(
+      "canal privado",
+      ["destination-1", "destination-2"],
+      signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/canal%20privado/message-references",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ message_ids: ["destination-1", "destination-2"] }),
+        signal,
+      }),
+    );
+    expect(references["destination-1"]).toMatchObject({
+      available: true,
+      messageId: "source-1",
+      bodyText: "segredo",
+    });
+    expect(references["destination-2"]).toEqual({ available: false });
+  });
+
+  it("uses the DM batch endpoint", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { references: [] } });
+    await resolveDMMessageReferences("dm-1", ["destination-1"]);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm-1/message-references",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -512,6 +571,114 @@ describe("fetchChannelMessages", () => {
     });
   });
 
+  it("maps authorized and unavailable cross-channel references", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          reference: {
+            available: true,
+            message_id: "source-1",
+            target_type: "channel",
+            target_id: "private-1",
+            target_label: "privado",
+            author_display_name: "Ana",
+            body: "<img src=x onerror=alert(1)>",
+            body_format: "v3",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+        msgRaw({ id: "msg-2", reference: { available: false } }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0].reference).toEqual({
+      available: true,
+      messageId: "source-1",
+      targetType: "channel",
+      targetId: "private-1",
+      targetLabel: "privado",
+      authorDisplayName: "Ana",
+      bodyText: "<img src=x onerror=alert(1)>",
+      bodyFormat: "v3",
+      createdAt: "2024-01-15T09:00:00Z",
+    });
+    expect(page.messages[1].reference).toEqual({ available: false });
+  });
+
+  it("fails closed when an available reference is missing navigation fields", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ reference: { available: true, body: "must not render" } })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reference).toEqual({ available: false });
+  });
+
+  it("fails closed for each malformed navigation field and defaults optional preview text", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          id: "bad-type",
+          reference: {
+            available: true,
+            message_id: "source-1",
+            target_type: "workspace",
+            target_id: "target-1",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+        msgRaw({
+          id: "missing-target",
+          reference: {
+            available: true,
+            message_id: "source-2",
+            target_type: "channel",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+        msgRaw({
+          id: "missing-created-at",
+          reference: {
+            available: true,
+            message_id: "source-3",
+            target_type: "dm",
+            target_id: "dm-1",
+          },
+        }),
+        msgRaw({
+          id: "minimal-valid",
+          reference: {
+            available: true,
+            message_id: "source-4",
+            target_type: "dm",
+            target_id: "dm-1",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages.slice(0, 3).map((message) => message.reference)).toEqual([
+      { available: false },
+      { available: false },
+      { available: false },
+    ]);
+    expect(page.messages[3].reference).toEqual({
+      available: true,
+      messageId: "source-4",
+      targetType: "dm",
+      targetId: "dm-1",
+      targetLabel: "",
+      authorDisplayName: "",
+      bodyText: "",
+      bodyFormat: "v1",
+      createdAt: "2024-01-15T09:00:00Z",
+    });
+  });
+
   it("maps an explicit v2 body format", async () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v2" })]));
     const page = await fetchChannelMessages("geral");
@@ -825,7 +992,7 @@ describe("postChannelMessage", () => {
   it("passes abort signal to authenticatedFetch", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postChannelMessage("geral", "Hello", undefined, ctrl.signal);
+    await postChannelMessage("geral", "Hello", undefined, undefined, ctrl.signal);
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ signal: ctrl.signal }),
@@ -842,6 +1009,31 @@ describe("postChannelMessage", () => {
       body_format: "v3",
       parent_message_id: "parent-1",
     });
+  });
+
+  it("sends referenced_message_id for RF-09", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Veja", undefined, "source-1");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v3",
+      referenced_message_id: "source-1",
+    });
+  });
+
+  it("preserves reply and reference with an abort signal", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postChannelMessage("geral", "Veja", "parent-1", "source-1", ctrl.signal);
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v3",
+      parent_message_id: "parent-1",
+      referenced_message_id: "source-1",
+    });
+    expect(options.signal).toBe(ctrl.signal);
   });
 
   it("returns mapped Message from response", async () => {
@@ -936,7 +1128,7 @@ describe("postDMMessage", () => {
   it("passes abort signal to authenticatedFetch", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postDMMessage("dm-juliane", "Hi", undefined, ctrl.signal);
+    await postDMMessage("dm-juliane", "Hi", undefined, undefined, ctrl.signal);
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ signal: ctrl.signal }),
@@ -953,6 +1145,31 @@ describe("postDMMessage", () => {
       body_format: "v2",
       parent_message_id: "parent-dm-1",
     });
+  });
+
+  it("sends referenced_message_id when citing into a DM", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Veja", undefined, "source-1");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v2",
+      referenced_message_id: "source-1",
+    });
+  });
+
+  it("preserves reply and reference with an abort signal", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postDMMessage("dm-juliane", "Veja", "parent-1", "source-1", ctrl.signal);
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v2",
+      parent_message_id: "parent-1",
+      referenced_message_id: "source-1",
+    });
+    expect(options.signal).toBe(ctrl.signal);
   });
 
   it("returns mapped Message from response", async () => {

@@ -71,6 +71,8 @@ const {
   mockFetchChannelMessage,
   mockFetchDMMessages,
   mockFetchDMMessage,
+  mockResolveChannelMessageReferences,
+  mockResolveDMMessageReferences,
   mockFavoriteMessage,
   mockUnfavoriteMessage,
   mockPostChannelMessage,
@@ -91,6 +93,22 @@ const {
     vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
   mockFetchDMMessage:
     vi.fn<(id: string, msgId: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockResolveChannelMessageReferences:
+    vi.fn<
+      (
+        id: string,
+        messageIds: string[],
+        signal?: AbortSignal,
+      ) => Promise<Record<string, NonNullable<Message["reference"]>>>
+    >(),
+  mockResolveDMMessageReferences:
+    vi.fn<
+      (
+        id: string,
+        messageIds: string[],
+        signal?: AbortSignal,
+      ) => Promise<Record<string, NonNullable<Message["reference"]>>>
+    >(),
 }));
 
 vi.mock("./chatApi", () => ({
@@ -102,6 +120,10 @@ vi.mock("./chatApi", () => ({
     mockFetchDMMessages(id, cursor, signal),
   fetchDMMessage: (id: string, msgId: string, signal?: AbortSignal) =>
     mockFetchDMMessage(id, msgId, signal),
+  resolveChannelMessageReferences: (id: string, messageIds: string[], signal?: AbortSignal) =>
+    mockResolveChannelMessageReferences(id, messageIds, signal),
+  resolveDMMessageReferences: (id: string, messageIds: string[], signal?: AbortSignal) =>
+    mockResolveDMMessageReferences(id, messageIds, signal),
   postChannelMessage: (id: string, body: string, parentMessageId?: string) =>
     mockPostChannelMessage(id, body, parentMessageId),
   postDMMessage: vi.fn(),
@@ -227,6 +249,260 @@ afterEach(() => {
 // ── WS integration tests ──────────────────────────────────────────────────────
 
 describe("useMessages — WS message.created integration", () => {
+  it("does not refetch a focused message already present in the page", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "focused" })],
+      nextCursor: "",
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        focusMessageId: "focused",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("loads a focused DM message outside the current page", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    mockFetchDMMessage.mockResolvedValue(makeMessage({ id: "focused-dm" }));
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "dm",
+        targetId: "dm-1",
+        currentUserId: "user-me",
+        focusMessageId: "focused-dm",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["focused-dm"]);
+    expect(mockFetchDMMessage).toHaveBeenCalledWith("dm-1", "focused-dm", expect.any(AbortSignal));
+  });
+
+  it("keeps the page generic when a focused message cannot be read", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockRejectedValue(new Error("not found"));
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        focusMessageId: "protected",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.realtimeError).toBeNull();
+  });
+
+  it("revalidates a mounted reference on focus and removes a revoked preview", async () => {
+    const destination = makeMessage({
+      id: "destination-message",
+      reference: {
+        available: true,
+        messageId: "source-message",
+        targetType: "channel",
+        targetId: "private-source",
+        targetLabel: "Privado",
+        authorDisplayName: "Ana",
+        bodyText: "segredo",
+        bodyFormat: "v3",
+        createdAt: "2026-07-21T12:00:00Z",
+      },
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [destination], nextCursor: "" });
+    mockResolveChannelMessageReferences.mockResolvedValue({
+      "destination-message": { available: false },
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "destination", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.state.messages[0].reference).toMatchObject({ available: true });
+
+    act(() => window.dispatchEvent(new Event("focus")));
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0].reference).toEqual({ available: false }),
+    );
+    expect(mockResolveChannelMessageReferences).toHaveBeenCalledWith(
+      "destination",
+      ["destination-message"],
+      expect.any(AbortSignal),
+    );
+
+    mockResolveChannelMessageReferences.mockRejectedValueOnce(new Error("revoked"));
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalledTimes(2));
+    expect(result.current.state.messages[0].reference).toEqual({ available: false });
+  });
+
+  it("revalidates mounted DM references through the authorized DM endpoint", async () => {
+    const destination = makeMessage({
+      id: "destination-dm-message",
+      reference: { available: false },
+    });
+    mockFetchDMMessages.mockResolvedValue({ messages: [destination], nextCursor: "" });
+    mockResolveDMMessageReferences.mockResolvedValue({
+      "destination-dm-message": { available: false },
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-destination", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => window.dispatchEvent(new Event("focus")));
+
+    await waitFor(() =>
+      expect(mockResolveDMMessageReferences).toHaveBeenCalledWith(
+        "dm-destination",
+        ["destination-dm-message"],
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
+  it("coalesces fifty mounted references into one authorized batch", async () => {
+    const messages = Array.from({ length: 50 }, (_, index) =>
+      makeMessage({ id: `destination-${index}`, reference: { available: false } }),
+    );
+    mockFetchChannelMessages.mockResolvedValue({ messages, nextCursor: "" });
+    mockResolveChannelMessageReferences.mockResolvedValue(
+      Object.fromEntries(messages.map((message) => [message.id, { available: false }])),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "destination", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    expect(mockResolveChannelMessageReferences).not.toHaveBeenCalled();
+    visibility.mockReturnValue("visible");
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalledTimes(1));
+    expect(mockResolveChannelMessageReferences.mock.calls[0][1]).toHaveLength(50);
+    visibility.mockRestore();
+  });
+
+  it("fails closed beyond the bounded one-request revalidation window", async () => {
+    const protectedReference: NonNullable<Message["reference"]> = {
+      available: true,
+      messageId: "protected-source",
+      targetType: "channel",
+      targetId: "private-source",
+      targetLabel: "Privado",
+      authorDisplayName: "Ana",
+      bodyText: "segredo",
+      bodyFormat: "v3",
+      createdAt: "2026-07-21T12:00:00Z",
+    };
+    const messages = Array.from({ length: 101 }, (_, index) =>
+      makeMessage({
+        id: `destination-${index}`,
+        reference: index === 0 ? protectedReference : { available: false },
+      }),
+    );
+    mockFetchChannelMessages.mockResolvedValue({ messages, nextCursor: "" });
+    mockResolveChannelMessageReferences.mockResolvedValue({});
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "destination", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0].reference).toEqual({ available: false }),
+    );
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalledTimes(1));
+    expect(mockResolveChannelMessageReferences.mock.calls[0][1]).toHaveLength(100);
+    expect(mockResolveChannelMessageReferences.mock.calls[0][1]).not.toContain("destination-0");
+  });
+
+  it("ignores an older authorized batch after a newer unavailable result", async () => {
+    const destination = makeMessage({ id: "destination-message", reference: { available: false } });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [destination], nextCursor: "" });
+    let resolveFirst!: (value: Record<string, NonNullable<Message["reference"]>>) => void;
+    let resolveSecond!: (value: Record<string, NonNullable<Message["reference"]>>) => void;
+    mockResolveChannelMessageReferences
+      .mockReturnValueOnce(new Promise((resolve) => (resolveFirst = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (resolveSecond = resolve)));
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "destination", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalledTimes(1));
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalledTimes(2));
+
+    act(() => resolveSecond({ "destination-message": { available: false } }));
+    await waitFor(() =>
+      expect(result.current.state.messages[0].reference).toEqual({ available: false }),
+    );
+    act(() =>
+      resolveFirst({
+        "destination-message": {
+          available: true,
+          messageId: "protected-source",
+          targetType: "channel",
+          targetId: "private-source",
+          targetLabel: "Privado",
+          authorDisplayName: "Ana",
+          bodyText: "segredo",
+          bodyFormat: "v3",
+          createdAt: "2026-07-21T12:00:00Z",
+        },
+      }),
+    );
+    await act(async () => Promise.resolve());
+    expect(result.current.state.messages[0].reference).toEqual({ available: false });
+  });
+
+  it("refreshes only the reference and preserves the destination snapshot", async () => {
+    const destination = makeMessage({
+      id: "destination-message",
+      bodyText: "edited body",
+      editedAt: "2026-07-21T13:00:00Z",
+      reactions: [{ emoji: "👍", count: 4, reactedByMe: true }],
+      isFavorited: true,
+      reference: { available: false },
+    });
+    mockFetchChannelMessages.mockResolvedValue({ messages: [destination], nextCursor: "" });
+    mockResolveChannelMessageReferences.mockResolvedValue({
+      "destination-message": { available: false },
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "destination", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalled());
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "edited body",
+      editedAt: "2026-07-21T13:00:00Z",
+      reactions: [{ emoji: "👍", count: 4, reactedByMe: true }],
+      isFavorited: true,
+      reference: { available: false },
+    });
+  });
+
   it("replaces reaction counts from WS and marks the authenticated actor", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "msg-1", reactions: [] })],

@@ -92,6 +92,8 @@ export interface Message {
   isFavorited: boolean;
   /** Immediate parent preview for RF-07 quote-reply. One level only. */
   quoted?: QuotedMessage;
+  /** RF-09 cross-target reference, resolved for the current reader. */
+  reference?: MessageReference;
 }
 
 export interface MessageEditHistoryEntry {
@@ -116,6 +118,20 @@ export interface QuotedMessage {
   deletedAt: string | null;
   createdAt: string;
 }
+
+export type MessageReference =
+  | { available: false }
+  | {
+      available: true;
+      messageId: string;
+      targetType: "channel" | "dm";
+      targetId: string;
+      targetLabel: string;
+      authorDisplayName: string;
+      bodyText: string;
+      bodyFormat: MessageBodyFormat;
+      createdAt: string;
+    };
 
 export interface MessagePage {
   messages: Message[];

@@ -49,6 +49,7 @@ const {
   mockFetchChannelMessage,
   mockPostChannelMessage,
   mockFetchDMMessages,
+  mockFetchDMMessage,
   mockPostDMMessage,
   mockFetchAllowedReactionEmojis,
   mockFavoriteMessage,
@@ -73,6 +74,7 @@ const {
         channelId: string,
         bodyText: string,
         parentMessageId?: string,
+        referencedMessageId?: string,
         signal?: AbortSignal,
       ) => Promise<Message>
     >(),
@@ -80,12 +82,15 @@ const {
     vi.fn<
       (conversationId: string, beforeCursor?: string, signal?: AbortSignal) => Promise<MessagePage>
     >(),
+  mockFetchDMMessage:
+    vi.fn<(conversationId: string, messageId: string, signal?: AbortSignal) => Promise<Message>>(),
   mockPostDMMessage:
     vi.fn<
       (
         conversationId: string,
         bodyText: string,
         parentMessageId?: string,
+        referencedMessageId?: string,
         signal?: AbortSignal,
       ) => Promise<Message>
     >(),
@@ -134,17 +139,19 @@ vi.mock("./chatApi", () => ({
     channelId: string,
     bodyText: string,
     parentMessageId?: string,
+    referencedMessageId?: string,
     signal?: AbortSignal,
-  ) => mockPostChannelMessage(channelId, bodyText, parentMessageId, signal),
+  ) => mockPostChannelMessage(channelId, bodyText, parentMessageId, referencedMessageId, signal),
   fetchDMMessages: (conversationId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchDMMessages(conversationId, beforeCursor, signal),
   postDMMessage: (
     conversationId: string,
     bodyText: string,
     parentMessageId?: string,
+    referencedMessageId?: string,
     signal?: AbortSignal,
-  ) => mockPostDMMessage(conversationId, bodyText, parentMessageId, signal),
-  fetchDMMessage: vi.fn(),
+  ) => mockPostDMMessage(conversationId, bodyText, parentMessageId, referencedMessageId, signal),
+  fetchDMMessage: mockFetchDMMessage,
   fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
   unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
@@ -235,6 +242,65 @@ function renderChannelAreaForUser(currentUserId = "me-123") {
         <Route
           path="/chat"
           element={<ParentWithContext ctx={{ currentUserId, channels: [], dms: [] }} />}
+        >
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+const rf09SourceMessageID = "22222222-2222-4222-8222-222222222222";
+const rf09SecondMessageID = "44444444-4444-4444-8444-444444444444";
+const rf09SourceChannelID = "11111111-1111-4111-8111-111111111111";
+const rf09SourceDMID = "33333333-3333-4333-8333-333333333333";
+
+function renderPendingReference(
+  messageId = rf09SourceMessageID,
+  source: { kind: "channel" | "dm"; id: string } = {
+    kind: "channel",
+    id: rf09SourceChannelID,
+  },
+) {
+  return renderPendingReferenceState({
+    referencedMessageId: messageId,
+    referenceTargetKind: source.kind,
+    referenceTargetId: source.id,
+  });
+}
+
+function renderPendingReferenceState(state: unknown) {
+  return render(
+    <MemoryRouter
+      initialEntries={[
+        {
+          pathname: "/chat/channel/destination",
+          state,
+        },
+      ]}
+    >
+      <Routes>
+        <Route
+          path="/chat"
+          element={
+            <ParentWithContext
+              ctx={{
+                currentUserId: "me-123",
+                channels: [
+                  { id: "destination", name: "Destino", type: "public" },
+                  { id: rf09SourceChannelID, name: "Origem privada", type: "private" },
+                ],
+                dms: [
+                  {
+                    id: rf09SourceDMID,
+                    type: "1:1",
+                    name: "Conversa privada",
+                    participants: [],
+                  },
+                ],
+              }}
+            />
+          }
         >
           <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
         </Route>
@@ -1457,6 +1523,542 @@ describe("ChatMessageArea — send message", () => {
     act(() => vi.advanceTimersByTime(1_200));
 
     expect(originalMessageElement).not.toHaveClass("chat-msg-area__msg--highlight");
+  });
+});
+
+describe("ChatMessageArea — RF-09 cross-channel references", () => {
+  it("renders only the generic unavailable state", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ bodyText: "destino", reference: { available: false } })]),
+    );
+    renderChannelAreaForUser();
+
+    const reference = await screen.findByTestId("chat-message-reference");
+    expect(reference).toHaveTextContent("citação indisponível");
+    expect(reference).toHaveAttribute("aria-disabled", "true");
+    expect(reference).not.toHaveAttribute("role");
+    expect(reference).not.toHaveAttribute("tabindex");
+    expect(reference).not.toHaveAttribute("title");
+    expect(reference).not.toHaveAttribute("data-message-id");
+  });
+
+  it("renders authorized rich text as safe React text", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          reference: {
+            available: true,
+            messageId: "source-1",
+            targetType: "channel",
+            targetId: "private-1",
+            targetLabel: "privado",
+            authorDisplayName: "Ana",
+            bodyText: "<img src=x onerror=alert(1)>",
+            bodyFormat: "v3",
+            createdAt: new Date().toISOString(),
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const reference = await screen.findByTestId("chat-message-reference");
+    expect(reference).toHaveTextContent("#privado");
+    expect(reference).toHaveTextContent("<img src=x onerror=alert(1)>");
+    expect(reference.querySelector("img")).toBeNull();
+    expect(reference.querySelector("script")).toBeNull();
+    const referenceLink = screen.getByRole("link", { name: "Ir para mensagem citada" });
+    expect(referenceLink).not.toHaveAttribute("aria-label", expect.stringContaining("privado"));
+    expect(referenceLink).not.toHaveAttribute("aria-label", expect.stringContaining("Ana"));
+    referenceLink.focus();
+    await userEvent.keyboard(" ");
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "private-1",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
+  it("uses generic visible labels for an authorized DM reference without optional names", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          reference: {
+            available: true,
+            messageId: "source-dm",
+            targetType: "dm",
+            targetId: "dm-private",
+            targetLabel: "",
+            authorDisplayName: "",
+            bodyText: "- um\n- dois",
+            bodyFormat: "v3",
+            createdAt: new Date().toISOString(),
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const reference = await screen.findByTestId("chat-message-reference");
+    expect(reference).toHaveTextContent("Conversa");
+    expect(reference).toHaveTextContent("Usuário");
+    expect(reference.querySelector(".chat-msg-area__reference-body ul")).not.toBeNull();
+    expect(reference.querySelector("button ul")).toBeNull();
+  });
+
+  it.each([
+    ["null", null],
+    ["primitive", "not-an-object"],
+    [
+      "empty message ID",
+      {
+        referencedMessageId: "",
+        referenceTargetKind: "channel",
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+    [
+      "whitespace message ID",
+      {
+        referencedMessageId: "   ",
+        referenceTargetKind: "channel",
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+    [
+      "malformed message ID",
+      {
+        referencedMessageId: "../../private-message?leak=true",
+        referenceTargetKind: "channel",
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+    [
+      "oversized message ID",
+      {
+        referencedMessageId: "a".repeat(10_000),
+        referenceTargetKind: "channel",
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+    [
+      "nil message UUID",
+      {
+        referencedMessageId: "00000000-0000-0000-0000-000000000000",
+        referenceTargetKind: "channel",
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+    [
+      "empty target ID",
+      {
+        referencedMessageId: rf09SourceMessageID,
+        referenceTargetKind: "channel",
+        referenceTargetId: "",
+      },
+    ],
+    [
+      "malformed target ID",
+      {
+        referencedMessageId: rf09SourceMessageID,
+        referenceTargetKind: "channel",
+        referenceTargetId: "javascript:alert(1)",
+      },
+    ],
+    [
+      "unknown target kind",
+      {
+        referencedMessageId: rf09SourceMessageID,
+        referenceTargetKind: "thread",
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+    [
+      "missing target kind",
+      {
+        referencedMessageId: rf09SourceMessageID,
+        referenceTargetId: rf09SourceChannelID,
+      },
+    ],
+  ])("ignores %s without resolving a reference", async (_name, state) => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    renderPendingReferenceState(state);
+
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalled());
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+    expect(mockFetchDMMessage).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("chat-composer-reference")).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("private-message");
+    expect(mockPostChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not send an invalid pending reference", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockPostChannelMessage.mockResolvedValue(makeMessage({ id: "created", bodyText: "seguro" }));
+    renderPendingReferenceState({
+      referencedMessageId: "not-a-uuid",
+      referenceTargetKind: "channel",
+      referenceTargetId: rf09SourceChannelID,
+    });
+
+    await screen.findByTestId("chat-msg-empty");
+    await fillEditor(screen.getByTestId("chat-composer-input"), "seguro");
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
+    expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 4)).toEqual([
+      "destination",
+      "seguro",
+      undefined,
+      undefined,
+    ]);
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+    expect(mockFetchDMMessage).not.toHaveBeenCalled();
+  });
+
+  it("loads an authorized preview once without expanding or persisting nested data", async () => {
+    let resolveSource!: (message: Message) => void;
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockReturnValue(
+      new Promise<Message>((resolve) => {
+        resolveSource = resolve;
+      }),
+    );
+    renderPendingReference();
+
+    const loading = await screen.findByTestId("chat-composer-reference");
+    expect(loading).toHaveTextContent("Carregando citação…");
+    expect(screen.getByRole("status")).toHaveTextContent("Carregando citação…");
+    expect(mockFetchChannelMessage).toHaveBeenCalledTimes(1);
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      rf09SourceChannelID,
+      rf09SourceMessageID,
+      expect.any(AbortSignal),
+    );
+
+    resolveSource(
+      makeMessage({
+        id: rf09SourceMessageID,
+        senderDisplayName: "Autora protegida",
+        bodyText: "**conteúdo autorizado**",
+        bodyFormat: "v3",
+        reference: {
+          available: true,
+          messageId: "nested-secret-id",
+          targetType: "channel",
+          targetId: "nested-private-channel",
+          targetLabel: "Canal aninhado secreto",
+          authorDisplayName: "Autor aninhado",
+          bodyText: "segredo aninhado",
+          bodyFormat: "v3",
+          createdAt: new Date().toISOString(),
+        },
+      }),
+    );
+
+    const preview = await screen.findByTestId("chat-composer-reference");
+    expect(preview).toHaveTextContent("Autora protegida · #Origem privada");
+    expect(preview).toHaveTextContent("conteúdo autorizado");
+    expect(preview.querySelector("strong")).not.toBeNull();
+    expect(preview).not.toHaveTextContent("segredo aninhado");
+    expect(preview).not.toHaveTextContent("Canal aninhado secreto");
+    const persisted = [localStorage, sessionStorage].flatMap((storage) =>
+      Array.from({ length: storage.length }, (_, index) =>
+        storage.getItem(storage.key(index) ?? ""),
+      ),
+    );
+    expect(persisted.join(" ")).not.toContain("conteúdo autorizado");
+    expect(persisted.join(" ")).not.toContain("Autora protegida");
+  });
+
+  it.each([403, 404])("fails closed when preview GET returns %i", async (status) => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockRejectedValue(Object.assign(new Error("protected"), { status }));
+    renderPendingReference();
+
+    const preview = await screen.findByTestId("chat-composer-reference");
+    await waitFor(() => expect(preview).toHaveTextContent("citação indisponível"));
+    const html = preview.outerHTML;
+    expect(html).not.toContain("Origem privada");
+    expect(html).not.toContain("protected");
+    expect(html).not.toContain(rf09SourceMessageID);
+    expect(preview).not.toHaveAttribute("title");
+  });
+
+  it("uses the authorized DM single-message GET for a DM origin", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchDMMessage.mockResolvedValue(
+      makeMessage({
+        id: rf09SourceMessageID,
+        senderDisplayName: "Bruno",
+        bodyText: "origem em DM",
+      }),
+    );
+    renderPendingReference(rf09SourceMessageID, { kind: "dm", id: rf09SourceDMID });
+
+    expect(await screen.findByTestId("chat-composer-reference")).toHaveTextContent(
+      "Bruno · Conversa privada",
+    );
+    expect(mockFetchDMMessage).toHaveBeenCalledWith(
+      rf09SourceDMID,
+      rf09SourceMessageID,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("accepts canonical UUIDs with uppercase hexadecimal digits", async () => {
+    const messageID = "ABCDEF12-3456-4789-ABCD-EF1234567890";
+    const channelID = "ABCDEF12-3456-4789-8BCD-EF1234567891";
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: messageID, senderDisplayName: "Ana", bodyText: "origem válida" }),
+    );
+    renderPendingReference(messageID, { kind: "channel", id: channelID });
+
+    expect(await screen.findByTestId("chat-composer-reference")).toHaveTextContent("origem válida");
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      channelID,
+      messageID,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("aborts the preview request on unmount", async () => {
+    let signal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockImplementation((_channelId, _messageId, requestSignal) => {
+      signal = requestSignal;
+      return new Promise<Message>(() => undefined);
+    });
+    const view = renderPendingReference();
+
+    await waitFor(() => expect(signal).toBeDefined());
+    view.unmount();
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("cancels an in-flight preview and ignores its late response", async () => {
+    let signal: AbortSignal | undefined;
+    let resolveSource!: (message: Message) => void;
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockImplementation((_channelId, _messageId, requestSignal) => {
+      signal = requestSignal;
+      return new Promise<Message>((resolve) => {
+        resolveSource = resolve;
+      });
+    });
+    renderPendingReference();
+    await screen.findByText("Carregando citação…");
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancelar citação" }));
+    expect(signal?.aborted).toBe(true);
+    resolveSource(makeMessage({ id: rf09SourceMessageID, bodyText: "conteúdo que chegou tarde" }));
+    await act(async () => undefined);
+    expect(screen.queryByTestId("chat-composer-reference")).not.toBeInTheDocument();
+    expect(screen.queryByText("conteúdo que chegou tarde")).not.toBeInTheDocument();
+  });
+
+  it("aborts a stale ID request and renders only the latest selection", async () => {
+    let firstSignal: AbortSignal | undefined;
+    let resolveFirst!: (message: Message) => void;
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockImplementation((_channelId, messageId, signal) => {
+      if (messageId === rf09SourceMessageID) {
+        firstSignal = signal;
+        return new Promise<Message>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return Promise.resolve(
+        makeMessage({
+          id: rf09SecondMessageID,
+          senderDisplayName: "Nova",
+          bodyText: "nova origem",
+        }),
+      );
+    });
+
+    function ReferenceSwitcher() {
+      const navigate = useNavigate();
+      return (
+        <>
+          <button
+            type="button"
+            onClick={() =>
+              navigate("/chat/channel/destination", {
+                state: {
+                  referencedMessageId: rf09SecondMessageID,
+                  referenceTargetKind: "channel",
+                  referenceTargetId: rf09SourceChannelID,
+                },
+              })
+            }
+          >
+            Trocar origem
+          </button>
+          <Outlet
+            context={{
+              currentUserId: "me-123",
+              channels: [
+                { id: "destination", name: "Destino", type: "public" },
+                { id: rf09SourceChannelID, name: "Origem privada", type: "private" },
+              ],
+              dms: [],
+            }}
+          />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          {
+            pathname: "/chat/channel/destination",
+            state: {
+              referencedMessageId: rf09SourceMessageID,
+              referenceTargetKind: "channel",
+              referenceTargetId: rf09SourceChannelID,
+            },
+          },
+        ]}
+      >
+        <Routes>
+          <Route path="/chat" element={<ReferenceSwitcher />}>
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText("Carregando citação…");
+
+    await userEvent.click(screen.getByRole("button", { name: "Trocar origem" }));
+    expect(firstSignal?.aborted).toBe(true);
+    expect(await screen.findByText("nova origem")).toBeInTheDocument();
+    resolveFirst(makeMessage({ id: rf09SourceMessageID, bodyText: "origem obsoleta" }));
+    await act(async () => undefined);
+    expect(screen.queryByText("origem obsoleta")).not.toBeInTheDocument();
+    expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the authorized reference after a failed send", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: rf09SourceMessageID, senderDisplayName: "Ana", bodyText: "origem" }),
+    );
+    mockPostChannelMessage.mockRejectedValue(new Error("send failed"));
+    renderPendingReference();
+    await screen.findByText("origem");
+
+    await fillEditor(screen.getByTestId("chat-composer-input"), "tentar enviar");
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("chat-composer-reference")).toHaveTextContent("origem");
+  });
+
+  it("selects another channel and sends only the referenced message ID", async () => {
+    const source = makeMessage({
+      id: rf09SourceMessageID,
+      senderDisplayName: "Ana",
+      bodyText: "**origem autorizada**",
+      bodyFormat: "v3",
+    });
+    mockFetchChannelMessages.mockImplementation(async (id) =>
+      id === rf09SourceChannelID ? messagePage([source]) : emptyPage,
+    );
+    mockFetchChannelMessage.mockResolvedValue(source);
+    mockPostChannelMessage.mockResolvedValue(makeMessage({ id: "created", bodyText: "veja" }));
+    render(
+      <MemoryRouter initialEntries={[`/chat/channel/${rf09SourceChannelID}`]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [
+                    { id: rf09SourceChannelID, name: "Origem", type: "public" },
+                    { id: "destination", name: "Destino", type: "public" },
+                  ],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    const referenceAction = screen.getByRole("button", { name: "Citar em outra conversa" });
+    await userEvent.click(referenceAction);
+    const closeDialog = screen.getByRole("button", { name: "Fechar" });
+    const destinationButton = screen.getByRole("button", { name: /Destino/ });
+    expect(closeDialog).toHaveFocus();
+    destinationButton.focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(closeDialog).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(destinationButton).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(referenceAction).toHaveFocus();
+
+    await userEvent.click(referenceAction);
+    await userEvent.click(screen.getByRole("button", { name: /Destino/ }));
+    const preview = await screen.findByTestId("chat-composer-reference");
+    expect(preview).toHaveTextContent("Ana · #Origem");
+    expect(preview).toHaveTextContent("origem autorizada");
+    expect(preview.querySelector("strong")).not.toBeNull();
+    expect(mockFetchChannelMessage).toHaveBeenCalledTimes(1);
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      rf09SourceChannelID,
+      rf09SourceMessageID,
+      expect.any(AbortSignal),
+    );
+    await fillEditor(screen.getByTestId("chat-composer-input"), "veja");
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
+    expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 4)).toEqual([
+      "destination",
+      "veja",
+      undefined,
+      rf09SourceMessageID,
+    ]);
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-composer-reference")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("loads and highlights a directly navigated source outside the latest page", async () => {
+    const focused = makeMessage({ id: "older-message", bodyText: "mensagem antiga" });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockResolvedValue(focused);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/source?message=older-message"]}>
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("mensagem antiga")).toBeInTheDocument();
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+      "source",
+      "older-message",
+      expect.any(AbortSignal),
+    );
+    expect(window.Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
   });
 });
 

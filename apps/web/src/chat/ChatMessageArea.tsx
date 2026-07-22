@@ -17,15 +17,16 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useOutletContext, useParams } from "react-router-dom";
+import { createPortal } from "react-dom";
+import { useLocation, useNavigate, useOutletContext, useParams } from "react-router-dom";
 
 import "./ChatMessageArea.css";
 import type { ChatOutletContext } from "./ChatShell";
 import type { Message, PinnedItem } from "./chatTypes";
-import { fetchAllowedReactionEmojis } from "./chatApi";
+import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import { usePins } from "./usePins";
-import ChatComposer from "./ChatComposer";
+import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
 import { formatTime, senderLabel } from "./messageDisplay";
 
@@ -67,6 +68,36 @@ function safeDecodeURIComponent(s: string): string {
   } catch {
     return s;
   }
+}
+
+interface PendingReferenceLocation {
+  messageId: string;
+  targetKind: "channel" | "dm";
+  targetId: string;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
+
+function isValidUUID(value: unknown): value is string {
+  return typeof value === "string" && UUID_PATTERN.test(value) && value.toLowerCase() !== NIL_UUID;
+}
+
+function readPendingReference(state: unknown): PendingReferenceLocation | null {
+  if (typeof state !== "object" || state === null) return null;
+  const value = state as Record<string, unknown>;
+  if (
+    !isValidUUID(value.referencedMessageId) ||
+    !isValidUUID(value.referenceTargetId) ||
+    (value.referenceTargetKind !== "channel" && value.referenceTargetKind !== "dm")
+  ) {
+    return null;
+  }
+  return {
+    messageId: value.referencedMessageId,
+    targetKind: value.referenceTargetKind,
+    targetId: value.referenceTargetId,
+  };
 }
 
 function quoteAuthorLabel(
@@ -266,6 +297,8 @@ interface MessageListProps {
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onReplyMessage: (message: Message) => void;
+  onReferenceMessage: (message: Message) => void;
+  onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   onEditMessage: MessageBubbleProps["onEditMessage"];
   onEditForbidden: MessageBubbleProps["onEditForbidden"];
@@ -278,6 +311,7 @@ interface MessageListProps {
   pinnedIds?: Set<string>;
   allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
+  focusMessageId?: string;
 }
 
 function MessageList({
@@ -289,6 +323,8 @@ function MessageList({
   onLoadMore,
   onToggleReaction,
   onReplyMessage,
+  onReferenceMessage,
+  onReferenceJump,
   onToggleFavorite,
   onEditMessage,
   onEditForbidden,
@@ -299,6 +335,7 @@ function MessageList({
   pinnedIds,
   allowedReactionEmojis,
   recentReactionEmojis,
+  focusMessageId,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -328,6 +365,18 @@ function MessageList({
       highlightTimerRef.current = null;
     }, quoteHighlightMs);
   }, []);
+  const focusedMessageRef = useRef("");
+  useEffect(() => {
+    if (!focusMessageId) {
+      focusedMessageRef.current = "";
+      return;
+    }
+    if (focusedMessageRef.current === focusMessageId) return;
+    const el = messageRefs.current.get(focusMessageId);
+    if (!el) return;
+    focusedMessageRef.current = focusMessageId;
+    handleQuoteJump(focusMessageId);
+  }, [focusMessageId, handleQuoteJump, messages]);
   const handlePickerOpenChange = useCallback((messageId: string, open: boolean) => {
     setOpenPickerMessageId(open ? messageId : null);
   }, []);
@@ -503,6 +552,7 @@ function MessageList({
             isGrouped={item.isGrouped}
             onToggleReaction={onToggleReaction}
             onReplyMessage={onReplyMessage}
+            onReferenceMessage={onReferenceMessage}
             onToggleFavorite={onToggleFavorite}
             onEditMessage={onEditMessage}
             onEditForbidden={onEditForbidden}
@@ -522,6 +572,7 @@ function MessageList({
             }
             canJumpToQuote={item.message.quoted ? messagesById.has(item.message.quoted.id) : false}
             onQuoteJump={handleQuoteJump}
+            onReferenceJump={onReferenceJump}
             isHighlighted={highlightedMessageId === item.message.id}
             setMessageRef={setMessageRef}
           />
@@ -529,6 +580,100 @@ function MessageList({
       )}
       <div ref={bottomRef} />
     </div>
+  );
+}
+
+function ReferenceDestinationDialog({
+  current,
+  channels,
+  dms,
+  onClose,
+  onSelect,
+}: {
+  current: { kind: "channel" | "dm"; id: string };
+  channels: ChatOutletContext["channels"];
+  dms: ChatOutletContext["dms"];
+  onClose: () => void;
+  onSelect: (target: { kind: "channel" | "dm"; id: string }) => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement;
+    closeButtonRef.current!.focus();
+    const handleDialogKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = dialogRef.current!.querySelectorAll<HTMLButtonElement>("button");
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleDialogKey);
+    return () => {
+      document.removeEventListener("keydown", handleDialogKey);
+      previouslyFocused.focus();
+    };
+  }, [onClose]);
+  const targets = [
+    ...channels.map((channel) => ({
+      kind: "channel" as const,
+      id: channel.id,
+      name: channel.name,
+    })),
+    ...dms.map((dm) => ({ kind: "dm" as const, id: dm.id, name: dm.name })),
+  ].filter((target) => target.kind !== current.kind || target.id !== current.id);
+
+  return createPortal(
+    <div className="chat-reference-dialog__backdrop" onMouseDown={onClose}>
+      <div
+        ref={dialogRef}
+        className="chat-reference-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="chat-reference-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <h2 id="chat-reference-dialog-title">Citar em outra conversa</h2>
+            <p>Escolha onde a nova mensagem será enviada.</p>
+          </div>
+          <button ref={closeButtonRef} type="button" aria-label="Fechar" onClick={onClose}>
+            <span className="material-symbols-outlined" aria-hidden="true">
+              close
+            </span>
+          </button>
+        </header>
+        {targets.length === 0 ? (
+          <p className="chat-reference-dialog__empty">Nenhum outro destino disponível.</p>
+        ) : (
+          <ul aria-label="Destinos disponíveis">
+            {targets.map((target) => (
+              <li key={`${target.kind}:${target.id}`}>
+                <button type="button" onClick={() => onSelect(target)}>
+                  <span className="material-symbols-outlined" aria-hidden="true">
+                    {target.kind === "channel" ? "tag" : "forum"}
+                  </span>
+                  {target.name}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -590,6 +735,25 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const params = useParams<{ id: string }>();
   const rawId = params.id ?? "";
   const targetId = safeDecodeURIComponent(rawId);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const focusMessageId = new URLSearchParams(location.search).get("message") ?? "";
+  const [referenceSource, setReferenceSource] = useState<Message | null>(null);
+  const pendingReference = useMemo(() => readPendingReference(location.state), [location.state]);
+  const pendingReferenceId = pendingReference?.messageId ?? "";
+  const pendingReferenceKey = pendingReference
+    ? `${pendingReference.targetKind}:${pendingReference.targetId}:${pendingReference.messageId}`
+    : "";
+  const [referenceResolution, setReferenceResolution] = useState<{
+    key: string;
+    preview: Extract<PendingReferencePreview, { status: "available" | "unavailable" }>;
+  } | null>(null);
+  const referencePreview = useMemo<PendingReferencePreview>(() => {
+    if (!pendingReference) return { status: "idle" };
+    return referenceResolution?.key === pendingReferenceKey
+      ? referenceResolution.preview
+      : { status: "loading", messageId: pendingReference.messageId };
+  }, [pendingReference, pendingReferenceKey, referenceResolution]);
 
   const ctx = useOutletContext<ChatOutletContext>() ?? { currentUserId: "", channels: [], dms: [] };
 
@@ -597,6 +761,16 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     kind === "channel"
       ? (ctx.channels.find((ch) => ch.id === targetId)?.name ?? targetId)
       : (ctx.dms.find((dm) => dm.id === targetId)?.name ?? targetId);
+  const referenceTargetLabel = useMemo(() => {
+    if (pendingReference?.targetKind === "channel") {
+      const name = ctx.channels.find((channel) => channel.id === pendingReference.targetId)?.name;
+      return name ? `#${name}` : "Canal";
+    }
+    if (pendingReference?.targetKind === "dm") {
+      return ctx.dms.find((dm) => dm.id === pendingReference.targetId)?.name ?? "Conversa";
+    }
+    return "Conversa";
+  }, [ctx.channels, ctx.dms, pendingReference]);
 
   const [allowedReactionEmojiState, setAllowedReactionEmojis] = useState<string[]>([]);
   const [sessionRecentReactions, setSessionRecentReactions] = useState<{
@@ -658,10 +832,43 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     kind,
     targetId,
     currentUserId: ctx.currentUserId,
+    focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
     onMessageRemoved: reloadPins,
   });
+
+  useEffect(() => {
+    if (!pendingReference) return;
+    const { messageId, targetKind, targetId: sourceTargetId } = pendingReference;
+
+    const controller = new AbortController();
+    const request =
+      targetKind === "channel"
+        ? fetchChannelMessage(sourceTargetId, messageId, controller.signal)
+        : fetchDMMessage(sourceTargetId, messageId, controller.signal);
+    request.then(
+      (message) => {
+        if (controller.signal.aborted) return;
+        setReferenceResolution({
+          key: pendingReferenceKey,
+          preview:
+            message.id === messageId && !message.isRemoved
+              ? { status: "available", messageId, message }
+              : { status: "unavailable", messageId },
+        });
+      },
+      () => {
+        if (!controller.signal.aborted) {
+          setReferenceResolution({
+            key: pendingReferenceKey,
+            preview: { status: "unavailable", messageId },
+          });
+        }
+      },
+    );
+    return () => controller.abort();
+  }, [pendingReference, pendingReferenceKey]);
 
   useEffect(() => {
     let active = true;
@@ -679,8 +886,40 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   }, []);
 
   const handleSend = useCallback(
-    (body: string): Promise<SendResult> => sendMessage(body),
-    [sendMessage],
+    async (body: string): Promise<SendResult> => {
+      const result = await sendMessage(body, pendingReferenceId || undefined);
+      if (result.status === "sent") {
+        navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+      }
+      return result;
+    },
+    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage],
+  );
+
+  const selectReferenceDestination = useCallback(
+    (target: { kind: "channel" | "dm"; id: string }) => {
+      if (!referenceSource) return;
+      const sourceID = referenceSource.id;
+      setReferenceSource(null);
+      navigate(`/chat/${target.kind}/${encodeURIComponent(target.id)}`, {
+        state: {
+          referencedMessageId: sourceID,
+          referenceTargetKind: kind,
+          referenceTargetId: targetId,
+        },
+      });
+    },
+    [kind, navigate, referenceSource, targetId],
+  );
+
+  const jumpToReference = useCallback(
+    (reference: NonNullable<Message["reference"]>) => {
+      if (!reference.available) return;
+      navigate(
+        `/chat/${reference.targetType}/${encodeURIComponent(reference.targetId)}?message=${encodeURIComponent(reference.messageId)}`,
+      );
+    },
+    [navigate],
   );
 
   const replyPreview = useMemo(
@@ -753,6 +992,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onLoadMore={loadMore}
           onToggleReaction={handleToggleReaction}
           onReplyMessage={selectReply}
+          onReferenceMessage={setReferenceSource}
+          onReferenceJump={jumpToReference}
           onToggleFavorite={toggleFavorite}
           onEditMessage={editMessageLocal}
           onEditForbidden={handleEditForbidden}
@@ -763,6 +1004,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           pinnedIds={pinnedIds}
           allowedReactionEmojis={allowedReactionEmojis}
           recentReactionEmojis={recentReactionEmojis}
+          focusMessageId={focusMessageId}
         />
       )}
 
@@ -800,8 +1042,22 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         disabled={state.status !== "ready"}
         replyPreview={replyPreview}
         onCancelReply={cancelReply}
+        referencePreview={referencePreview}
+        referenceTargetLabel={referenceTargetLabel}
+        onCancelReference={() =>
+          navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
+        }
         onSend={handleSend}
       />
+      {referenceSource && (
+        <ReferenceDestinationDialog
+          current={{ kind, id: targetId }}
+          channels={ctx.channels}
+          dms={ctx.dms}
+          onClose={() => setReferenceSource(null)}
+          onSelect={selectReferenceDestination}
+        />
+      )}
     </div>
   );
 }
