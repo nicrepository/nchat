@@ -96,6 +96,13 @@ func NewMessageHandler(workspaces workspaceResolver, messages messageProvider, m
 	return &MessageHandler{workspaces: workspaces, messages: messages, mentions: mentions}
 }
 
+// Ready reports whether the handler is wired to the DB-backed message service
+// and workspace resolver. Used by the readiness probe; when either is nil the
+// message endpoints return 503.
+func (h *MessageHandler) Ready() bool {
+	return h != nil && h.messages != nil && h.workspaces != nil
+}
+
 // ── JSON response shapes ──────────────────────────────────────────────────────
 
 // messageJSON is the outbound representation of a single message.

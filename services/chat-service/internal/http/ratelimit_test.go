@@ -425,6 +425,7 @@ func TestUserRateLimiter_Middleware_DoesNotBreakAuthorization(t *testing.T) {
 	router := NewRouter(
 		testConfig(),
 		nil, // logger not needed
+		ReadinessState{},
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),

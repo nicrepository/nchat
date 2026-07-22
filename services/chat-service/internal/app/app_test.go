@@ -7,8 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,9 +29,25 @@ const shutdownTestTimeout = 500 * time.Millisecond
 // themselves; subsequent cleanup calls are no-ops (idempotent via sync.Once).
 func newTestApp(t *testing.T, cfg config.Config) *App {
 	t.Helper()
-	a := New(cfg)
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected bootstrap error: %v", err)
+	}
 	t.Cleanup(func() { _ = a.Shutdown(context.Background()) })
 	return a
+}
+
+// stubPool is a non-nil storage.Pool whose methods are never called during
+// bootstrap wiring (constructors only store the pool).
+type stubPool struct{ storage.Pool }
+
+// stubOpenDB swaps the bootstrap DB opener for the duration of the test.
+// Tests in this package must not use t.Parallel while a stub is installed.
+func stubOpenDB(t *testing.T, fn func(context.Context, string, int, *slog.Logger) (storage.Pool, error)) {
+	t.Helper()
+	previous := openDBWithRetry
+	openDBWithRetry = fn
+	t.Cleanup(func() { openDBWithRetry = previous })
 }
 
 func TestNewCreatesApp(t *testing.T) {
@@ -42,22 +61,123 @@ func TestNewCreatesApp(t *testing.T) {
 	}
 }
 
-// TestNew_UnavailableDB_GracefullyDegrades verifies that when DATABASE_URL is set
-// but the DB is unavailable, the app still starts (sidebar disabled, no panic).
-// This covers the dbErr != nil branch in app.New.
-func TestNew_UnavailableDB_GracefullyDegrades(t *testing.T) {
+// TestNew_UnavailableDB_FailsFast verifies that when DATABASE_URL is set but
+// the DB stays unavailable through the whole bootstrap retry window, New
+// refuses to build a degraded server and returns a sanitized error. The
+// opener is stubbed: no network, no real sleeps.
+func TestNew_UnavailableDB_FailsFast(t *testing.T) {
+	const testDSN = "postgresql://nchat:sentinel-password@db.invalid:5432/nchat_test" //nolint:gosec
+	attempts := 0
+	stubOpenDB(t, func(context.Context, string, int, *slog.Logger) (storage.Pool, error) {
+		attempts++
+		return nil, storage.ErrDBBootstrapFailed
+	})
 	cfg := config.Config{
 		ServiceName:              "chat-service",
 		Env:                      "test",
 		Port:                     8082,
 		ReadHeaderTimeoutSeconds: 5,
-		// Use an unreachable address with a fast 1s timeout.
-		DatabaseURL:             "postgresql://localhost:19999/nonexistent_test_db",
-		DBConnectTimeoutSeconds: 1,
+		DatabaseURL:              testDSN,
+		DBConnectTimeoutSeconds:  1,
 	}
+
+	start := time.Now()
+	a, err := New(cfg)
+
+	if err == nil {
+		t.Fatal("expected bootstrap error when the DB is unreachable")
+	}
+	if !errors.Is(err, storage.ErrDBBootstrapFailed) {
+		t.Fatalf("expected sanitized ErrDBBootstrapFailed, got %v", err)
+	}
+	for _, fragment := range []string{"sentinel-password", "db.invalid", "5432", "nchat_test"} {
+		if strings.Contains(err.Error(), fragment) {
+			t.Fatalf("bootstrap error must not leak DSN details (%q): %v", fragment, err)
+		}
+	}
+	if a != nil {
+		t.Fatal("expected no app when DB bootstrap fails; a degraded server must not start")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected exactly one opener call, got %d", attempts)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fail-fast path must not sleep for real; took %s", elapsed)
+	}
+}
+
+// TestNewWithStubbedDB_ReadyzReportsReady covers the success path without a
+// real database: with a stubbed pool, valid JWT config, and a fake Valkey
+// server for the reaction limiter, the app boots and /readyz reports 200.
+func TestNewWithStubbedDB_ReadyzReportsReady(t *testing.T) {
+	stubOpenDB(t, func(context.Context, string, int, *slog.Logger) (storage.Pool, error) {
+		return stubPool{}, nil
+	})
+	cfg := config.Config{
+		ServiceName:                    "chat-service",
+		Env:                            "test",
+		Port:                           8082,
+		ReadHeaderTimeoutSeconds:       5,
+		DatabaseURL:                    "postgres://stubbed",
+		DBConnectTimeoutSeconds:        1,
+		AuthJWTHMACSecret:              strings.Repeat("a", 32),
+		AuthJWTIssuer:                  "nchat-auth",
+		AuthJWTAudience:                "nchat-api",
+		ValkeyURL:                      startFakeValkeyServer(t),
+		ReactionRateLimitMaxActions:    5,
+		ReactionRateLimitWindowSeconds: 60,
+	}
+
 	a := newTestApp(t, cfg)
-	if a == nil || a.Handler == nil {
-		t.Fatal("expected app to start with degraded sidebar when DB is unavailable")
+
+	rec := httptest.NewRecorder()
+	a.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected readyz 200 after successful bootstrap, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestApp_Shutdown_ClosesPoolOnce verifies that Shutdown closes the DB pool
+// exactly once even when called repeatedly.
+func TestApp_Shutdown_ClosesPoolOnce(t *testing.T) {
+	cfg := config.Config{ServiceName: "chat-service", Env: "test", Port: 8082, ReadHeaderTimeoutSeconds: 5}
+	a := newTestApp(t, cfg)
+
+	closed := 0
+	a.closeDB = func() { closed++ }
+
+	if err := a.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	_ = a.Shutdown(context.Background())
+
+	if closed != 1 {
+		t.Fatalf("expected pool closed exactly once, got %d", closed)
+	}
+}
+
+// TestApp_Shutdown_ConcurrentClosesPoolOnce hammers Shutdown from many
+// goroutines: the pool must close exactly once (hub/presence/tracing order
+// is covered by the sequential tests) and no call may panic. Run with -race.
+func TestApp_Shutdown_ConcurrentClosesPoolOnce(t *testing.T) {
+	cfg := config.Config{ServiceName: "chat-service", Env: "test", Port: 8082, ReadHeaderTimeoutSeconds: 5}
+	a := newTestApp(t, cfg)
+
+	closed := 0
+	a.closeDB = func() { closed++ }
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = a.Shutdown(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	if closed != 1 {
+		t.Fatalf("expected pool closed exactly once under concurrency, got %d", closed)
 	}
 }
 

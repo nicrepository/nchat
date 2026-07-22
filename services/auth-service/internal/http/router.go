@@ -28,9 +28,21 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 		logger.Warn("login attempts auth disabled", "reason", "invalid_jwt_config")
 	}
 
+	// Readiness reflects the dependencies mandatory for the auth API. Every
+	// check is derived from the actual component instance — never from an
+	// error variable or configuration value, which can read as "ok" when the
+	// construction was skipped entirely. Nil means the instance is partially
+	// initialized and must not receive traffic.
+	readiness := ReadinessState{
+		Database:       users != nil,
+		TokenManager:   tokens != nil,
+		LoginManager:   login != nil,
+		SessionManager: sessions != nil,
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle(RouteHealthz, httputil.MethodNotAllowed(http.MethodGet, Healthz(cfg)))
-	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
+	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg, readiness)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
 	rateLimitKeyer := newRateLimitKeyer(cfg.AuthJWTHMACSecret)

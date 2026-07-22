@@ -38,7 +38,7 @@ func (rejectRouterSessionValidator) ValidateActiveSession(_ context.Context, _, 
 }
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -66,13 +66,53 @@ func TestHealthzContract(t *testing.T) {
 	}
 }
 
+// readySidebarStub / readyMessagesStub / readyWorkspacesStub give the
+// handlers non-nil dependencies for readiness tests; the embedded interfaces
+// are never invoked by the probe.
+type readySidebarStub struct{ sidebarProvider }
+type readyMessagesStub struct{ messageProvider }
+type readyWorkspacesStub struct{ workspaceResolver }
+
+// newFullyWiredRouter builds a router with every mandatory dependency
+// present, mirroring a successful bootstrap.
+// fullyReadyState mirrors what app.New reports after a successful bootstrap.
+func fullyReadyState() ReadinessState {
+	return ReadinessState{Database: true, TokenValidator: true, SessionValidator: true, Sidebar: true, Messages: true, WebSocket: true}
+}
+
+// stubWSHandler stands in for the real, functional WebSocket handler.
+func stubWSHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+}
+
+func routerTestValidator(t *testing.T) *TokenValidator {
+	t.Helper()
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("create validator: %v", err)
+	}
+	return validator
+}
+
+func newFullyWiredRouter(t *testing.T) http.Handler {
+	t.Helper()
+	return NewRouter(testConfig(), platformlog.New("chat-service", "test"), fullyReadyState(),
+		routerTestValidator(t), allowRouterSessionValidator{},
+		NewSidebarHandler(readySidebarStub{}),
+		NewMessageHandler(readyWorkspacesStub{}, readyMessagesStub{}, nil),
+		stubWSHandler(), nil)
+}
+
+// TestReadyzContract: a partially initialized instance (no DB-backed
+// services, no validators) must never report Ready — Kubernetes keeps it out
+// of the Endpoints and the previous pod continues serving.
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
 
-	assertJSONResponse(t, response, http.StatusOK)
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
 	body := decodeHealthEnvelope(t, response)
 	if body.Data.Service != "chat-service" {
 		t.Fatalf("expected service chat-service, got %q", body.Data.Service)
@@ -80,8 +120,8 @@ func TestReadyzContract(t *testing.T) {
 	if body.Data.Probe != health.ProbeReadiness {
 		t.Fatalf("expected readiness probe, got %q", body.Data.Probe)
 	}
-	if body.Data.Status != health.StatusReady {
-		t.Fatalf("expected ready status, got %q", body.Data.Status)
+	if body.Data.Status != health.StatusUnready {
+		t.Fatalf("expected unready status, got %q", body.Data.Status)
 	}
 	if body.Data.Version != "0.0.0" {
 		t.Fatalf("expected version 0.0.0, got %q", body.Data.Version)
@@ -92,6 +132,128 @@ func TestReadyzContract(t *testing.T) {
 	assertRFC3339(t, body.Data.CheckedAt)
 	assertReadinessCheck(t, body.Data.Checks, "service-bootstrap")
 	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
+	for _, name := range []string{"database", "jwt-validator", "session-validator", "sidebar-service", "message-service", "websocket"} {
+		assertReadinessCheckFails(t, body.Data.Checks, name)
+	}
+}
+
+func TestReadyzReadyWhenAllMandatoryDependenciesWired(t *testing.T) {
+	router := newFullyWiredRouter(t)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusOK)
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Status != health.StatusReady {
+		t.Fatalf("expected ready status, got %q", body.Data.Status)
+	}
+	for _, name := range []string{"database", "jwt-validator", "session-validator", "sidebar-service", "message-service", "websocket"} {
+		assertReadinessCheck(t, body.Data.Checks, name)
+	}
+}
+
+// TestReadyzDatabaseUpWithInvalidJWT: PostgreSQL opened but the JWT
+// validator is missing → database must still report pass (it is an
+// independent signal), while jwt-validator and the dependent components
+// fail. This is the operational-diagnosis scenario from the code review.
+func TestReadyzDatabaseUpWithInvalidJWT(t *testing.T) {
+	// Mirrors app.New with pool opened and validator==nil: DB-backed services
+	// are not wired, so only Database is true.
+	state := ReadinessState{Database: true}
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), state,
+		nil, nil,
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	assertReadinessCheck(t, body.Data.Checks, "database")
+	for _, name := range []string{"jwt-validator", "session-validator", "sidebar-service", "message-service", "websocket"} {
+		assertReadinessCheckFails(t, body.Data.Checks, name)
+	}
+}
+
+// TestReadyzUnreadyWithoutSessionValidator: everything wired except the
+// session validator → readiness (including the websocket check) must fail
+// while database stays pass.
+func TestReadyzUnreadyWithoutSessionValidator(t *testing.T) {
+	state := fullyReadyState()
+	state.SessionValidator = false
+	state.WebSocket = false // app computes WebSocket from the validators too
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), state,
+		routerTestValidator(t), nil,
+		NewSidebarHandler(readySidebarStub{}),
+		NewMessageHandler(readyWorkspacesStub{}, readyMessagesStub{}, nil),
+		stubWSHandler(), nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	assertReadinessCheckFails(t, body.Data.Checks, "session-validator")
+	assertReadinessCheckFails(t, body.Data.Checks, "websocket")
+	assertReadinessCheck(t, body.Data.Checks, "database")
+}
+
+// TestReadyzUnreadyWithoutDatabase: validators present but the pool never
+// opened → database fails and every DB-backed component fails with it.
+func TestReadyzUnreadyWithoutDatabase(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{TokenValidator: true, SessionValidator: true},
+		routerTestValidator(t), allowRouterSessionValidator{},
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	for _, name := range []string{"database", "sidebar-service", "message-service", "websocket"} {
+		assertReadinessCheckFails(t, body.Data.Checks, name)
+	}
+	assertReadinessCheck(t, body.Data.Checks, "jwt-validator")
+	assertReadinessCheck(t, body.Data.Checks, "session-validator")
+}
+
+// TestReadyzNilWSHandlerNeverReportsWebSocketPass: when the router has to
+// substitute the 503 WebSocket handler, the websocket check must fail even
+// if the caller claimed it was ready.
+func TestReadyzNilWSHandlerNeverReportsWebSocketPass(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), fullyReadyState(),
+		routerTestValidator(t), allowRouterSessionValidator{},
+		NewSidebarHandler(readySidebarStub{}),
+		NewMessageHandler(readyWorkspacesStub{}, readyMessagesStub{}, nil),
+		nil, nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	assertReadinessCheckFails(t, body.Data.Checks, "websocket")
+	assertReadinessCheck(t, body.Data.Checks, "database")
+}
+
+// TestReadyzUnwiredHandlersDowngradeChecksButNotDatabase: a caller claiming
+// sidebar/messages ready while passing unwired handlers gets downgraded by
+// the router; database is untouched because it is the app's own signal.
+func TestReadyzUnwiredHandlersDowngradeChecksButNotDatabase(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), fullyReadyState(),
+		routerTestValidator(t), allowRouterSessionValidator{},
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil),
+		stubWSHandler(), nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	assertReadinessCheckFails(t, body.Data.Checks, "sidebar-service")
+	assertReadinessCheckFails(t, body.Data.Checks, "message-service")
+	assertReadinessCheck(t, body.Data.Checks, "database")
 }
 
 func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.T) {
@@ -99,7 +261,8 @@ func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.
 	cfg.DatabaseURL = "postgres://configured"
 	response := httptest.NewRecorder()
 
-	Readyz(cfg).ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+	fullyReady := ReadinessState{Database: true, TokenValidator: true, SessionValidator: true, Sidebar: true, Messages: true, WebSocket: true}
+	Readyz(cfg, fullyReady).ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
 
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected status 503, got %d", response.Code)
@@ -111,7 +274,7 @@ func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -133,7 +296,7 @@ func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new token validator: %v", err)
 	}
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator, allowRouterSessionValidator{},
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator, allowRouterSessionValidator{},
 		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
@@ -145,7 +308,7 @@ func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 
 	tests := []struct {
 		name   string
@@ -176,7 +339,7 @@ func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
 		t.Fatalf("new token validator: %v", err)
 	}
 	router := NewRouter(
-		testConfig(), platformlog.New("chat-service", "test"), validator,
+		testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil,
 	)
 	path := "/api/chat/channels/22222222-2222-2222-2222-222222222222/mentions?q=a"
@@ -204,7 +367,7 @@ func TestDMContractRoutesRequireAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new token validator: %v", err)
 	}
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator,
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
 		NewDMHandler(nil, nil, nil))
 	for _, request := range []*http.Request{
@@ -236,7 +399,7 @@ func TestDMContractRoutesRejectInvalidTokenAndRevokedSession(t *testing.T) {
 			if test.name == "invalid bearer" {
 				test.request.Header.Set("Authorization", bearerScheme+"not.a.valid.jwt")
 			}
-			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator,
+			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 				test.sessions, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
 				NewDMHandler(nil, nil, nil))
 			response := httptest.NewRecorder()
@@ -262,7 +425,7 @@ func TestDMContractRoutesAreRegisteredOnlyWithHandler(t *testing.T) {
 		{name: "registered", handler: NewDMHandler(nil, nil, nil), want: http.StatusServiceUnavailable},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), validator,
+			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 				allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, test.handler)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, routerGETRequest(t, RouteDMCandidates+"?query=an"))
@@ -332,6 +495,23 @@ func assertReadinessCheck(t *testing.T, checks []health.CheckResult, name string
 	t.Fatalf("expected readiness check %s in %+v", name, checks)
 }
 
+func assertReadinessCheckFails(t *testing.T, checks []health.CheckResult, name string) {
+	t.Helper()
+
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != health.CheckFail {
+				t.Fatalf("expected %s to fail, got %q", name, check.Status)
+			}
+			if !check.Critical {
+				t.Fatalf("expected %s to be critical", name)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected readiness check %s in %+v", name, checks)
+}
+
 func assertRFC3339(t *testing.T, value string) {
 	t.Helper()
 
@@ -345,7 +525,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -367,6 +547,7 @@ func TestNewRouter_NilWSHandlerReturns503AfterAuth(t *testing.T) {
 	router := NewRouter(
 		testConfig(),
 		platformlog.New("chat-service", "test"),
+		ReadinessState{},
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
@@ -431,6 +612,7 @@ func newRouterForRateLimit(t *testing.T) http.Handler {
 	return NewRouter(
 		testConfig(),
 		platformlog.New("chat-service", "test"),
+		ReadinessState{},
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),
@@ -641,6 +823,7 @@ func newRouterWithWS(t *testing.T, wsHandler http.Handler) http.Handler {
 	return NewRouter(
 		testConfig(),
 		platformlog.New("chat-service", "test"),
+		ReadinessState{},
 		validator,
 		allowRouterSessionValidator{},
 		NewSidebarHandler(nil),

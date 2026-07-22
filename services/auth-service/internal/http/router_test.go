@@ -46,13 +46,28 @@ func TestHealthzContract(t *testing.T) {
 	}
 }
 
+// readyUsersStub is a non-nil service.UserAdmin for readiness tests; its
+// methods are never invoked by the probe.
+type readyUsersStub struct{ service.UserAdmin }
+
+// newFullyWiredRouter builds a router with every mandatory dependency
+// present, mirroring a successful bootstrap.
+func newFullyWiredRouter(t *testing.T) http.Handler {
+	t.Helper()
+	return NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		readyUsersStub{}, routerAuthStub{}, routerLoginStub{}, nil, nil, nil, routerSessionStub{}, nil)
+}
+
+// TestReadyzContract: a partially initialized instance (no DB, no login,
+// no session manager) must never report Ready — Kubernetes keeps it out of
+// the Endpoints and the previous pod continues serving.
 func TestReadyzContract(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
 
-	assertJSONResponse(t, response, http.StatusOK)
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
 	body := decodeHealthEnvelope(t, response)
 	if body.Data.Service != "auth-service" {
 		t.Fatalf("expected service auth-service, got %q", body.Data.Service)
@@ -60,8 +75,8 @@ func TestReadyzContract(t *testing.T) {
 	if body.Data.Probe != health.ProbeReadiness {
 		t.Fatalf("expected readiness probe, got %q", body.Data.Probe)
 	}
-	if body.Data.Status != health.StatusReady {
-		t.Fatalf("expected ready status, got %q", body.Data.Status)
+	if body.Data.Status != health.StatusUnready {
+		t.Fatalf("expected unready status, got %q", body.Data.Status)
 	}
 	if body.Data.Version != "0.0.0" {
 		t.Fatalf("expected version 0.0.0, got %q", body.Data.Version)
@@ -72,6 +87,102 @@ func TestReadyzContract(t *testing.T) {
 	assertRFC3339(t, body.Data.CheckedAt)
 	assertReadinessCheck(t, body.Data.Checks, "service-bootstrap")
 	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
+	assertReadinessCheckFails(t, body.Data.Checks, "database")
+	assertReadinessCheckFails(t, body.Data.Checks, "login-manager")
+	assertReadinessCheckFails(t, body.Data.Checks, "session-manager")
+}
+
+func TestReadyzReadyWhenAllMandatoryDependenciesWired(t *testing.T) {
+	router := newFullyWiredRouter(t)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusOK)
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Status != health.StatusReady {
+		t.Fatalf("expected ready status, got %q", body.Data.Status)
+	}
+	for _, name := range []string{"database", "jwt-token-manager", "login-manager", "session-manager"} {
+		assertReadinessCheck(t, body.Data.Checks, name)
+	}
+}
+
+// TestReadyzUnreadyWhenJWTConfigInvalid: dependencies wired but the JWT
+// secret is missing → the token manager cannot be built and readiness must
+// stay failing.
+func TestReadyzUnreadyWhenJWTConfigInvalid(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"),
+		readyUsersStub{}, routerAuthStub{}, routerLoginStub{}, nil, nil, nil, routerSessionStub{}, nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	if body.Data.Status != health.StatusUnready {
+		t.Fatalf("expected unready status, got %q", body.Data.Status)
+	}
+	assertReadinessCheckFails(t, body.Data.Checks, "jwt-token-manager")
+	assertReadinessCheck(t, body.Data.Checks, "database")
+}
+
+// TestReadyzSecretAbsentFailsJWTAndDependentChecks: database up (stub) but
+// AUTH_JWT_HMAC_SECRET empty — the token manager is never built, so
+// jwt-token-manager must fail (not silently pass via a zero-value error) and
+// the JWT-dependent managers, unwired as in app.New, fail with it. database
+// must stay pass: it is an independent signal.
+func TestReadyzSecretAbsentFailsJWTAndDependentChecks(t *testing.T) {
+	cfg := testConfig() // AuthJWTHMACSecret empty
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"),
+		readyUsersStub{}, nil, nil, nil, nil, nil, nil, nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	assertReadinessCheck(t, body.Data.Checks, "database")
+	assertReadinessCheckFails(t, body.Data.Checks, "jwt-token-manager")
+	assertReadinessCheckFails(t, body.Data.Checks, "login-manager")
+	assertReadinessCheckFails(t, body.Data.Checks, "session-manager")
+}
+
+// TestReadyzSecretTooShortFailsJWTCheck: a secret shorter than the
+// TokenManager minimum must fail the jwt-token-manager check while database
+// stays pass. The value is a deliberately invalid test literal.
+func TestReadyzSecretTooShortFailsJWTCheck(t *testing.T) {
+	cfg := jwtTestConfig()
+	cfg.AuthJWTHMACSecret = "too-short" //nolint:gosec
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"),
+		readyUsersStub{}, routerAuthStub{}, routerLoginStub{}, nil, nil, nil, routerSessionStub{}, nil)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	assertJSONResponse(t, response, http.StatusServiceUnavailable)
+	body := decodeHealthEnvelope(t, response)
+	assertReadinessCheck(t, body.Data.Checks, "database")
+	assertReadinessCheckFails(t, body.Data.Checks, "jwt-token-manager")
+}
+
+// TestLoginNotPublishedByPartiallyInitializedInstance: the same instance
+// that reports unready must also refuse login instead of exposing a
+// half-wired endpoint.
+func TestLoginNotPublishedByPartiallyInitializedInstance(t *testing.T) {
+	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+
+	ready := httptest.NewRecorder()
+	router.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected readyz 503, got %d", ready.Code)
+	}
+
+	login := httptest.NewRecorder()
+	router.ServeHTTP(login, httptest.NewRequest(http.MethodPost, RouteAuthLogin, strings.NewReader(`{"email":"a@b.c","password":"x"}`)))
+	if login.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected login 503 on partially initialized instance, got %d", login.Code)
+	}
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
@@ -167,6 +278,23 @@ func assertReadinessCheck(t *testing.T, checks []health.CheckResult, name string
 			}
 			if check.DurationMS < 0 {
 				t.Fatalf("expected %s duration to be non-negative, got %d", name, check.DurationMS)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected readiness check %s in %+v", name, checks)
+}
+
+func assertReadinessCheckFails(t *testing.T, checks []health.CheckResult, name string) {
+	t.Helper()
+
+	for _, check := range checks {
+		if check.Name == name {
+			if check.Status != health.CheckFail {
+				t.Fatalf("expected %s to fail, got %q", name, check.Status)
+			}
+			if !check.Critical {
+				t.Fatalf("expected %s to be critical", name)
 			}
 			return
 		}
