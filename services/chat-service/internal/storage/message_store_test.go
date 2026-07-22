@@ -23,7 +23,8 @@ import (
 //
 // The INSERT is wrapped in a CTE (inserted AS (INSERT ... RETURNING ...)) so the
 // outer SELECT can JOIN auth.users and return sender display info in one round-trip.
-const createMsgSQL = `(?s)INSERT INTO chat\.messages.*` +
+const createMsgSQL = `(?s)invalid_refs AS.*m\.status = 'active'.*m\.deleted_at IS NULL.*AND NOT.*` +
+	`INSERT INTO chat\.messages.*` +
 	`chat\.workspace_members.*wm\.status.*active.*` +
 	`chat\.channels.*c\.status.*active.*` +
 	`chat\.channel_members.*` +
@@ -561,6 +562,37 @@ func TestPGXMessageStore_ValidateRefMessageInTarget_DeletedReturnsErrInvalidRef(
 		t.Fatalf("expected ErrInvalidMessageReference for deleted ref, got %v", err)
 	}
 	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ResolveMessageReferences_FiltersWithCanonicalReadAccess(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now().UTC()
+	mock.ExpectQuery(`(?s)FROM unnest\(\$3::text\[\]\).*JOIN chat\.messages m.*JOIN chat\.workspace_members wm.*LEFT JOIN chat\.channel_members cm.*LEFT JOIN chat\.dm_members dm.*m\.status = 'active'.*m\.deleted_at IS NULL`).
+		WithArgs("ws-1", "user-1", []string{"msg-visible", "msg-hidden"}).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"message_id", "target_type", "target_id", "target_label", "author", "body", "body_format", "created_at",
+		}).AddRow("msg-visible", "channel", "ch-private", "privado", "Ana", "conteúdo", "v3", now))
+
+	refs, err := storage.NewPGXMessageStore(mock).ResolveMessageReferences(
+		t.Context(), "ws-1", "user-1", []string{"msg-visible", "msg-hidden"},
+	)
+	if err != nil {
+		t.Fatalf("ResolveMessageReferences: %v", err)
+	}
+	if len(refs) != 1 || !refs["msg-visible"].Available || refs["msg-visible"].BodyText != "conteúdo" {
+		t.Fatalf("unexpected resolved references: %+v", refs)
+	}
+	if _, leaked := refs["msg-hidden"]; leaked {
+		t.Fatalf("inaccessible reference leaked into result: %+v", refs["msg-hidden"])
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ResolveMessageReferences_EmptySkipsDatabase(t *testing.T) {
+	refs, err := storage.NewPGXMessageStore(newMock(t)).ResolveMessageReferences(t.Context(), "ws-1", "user-1", nil)
+	if err != nil || len(refs) != 0 {
+		t.Fatalf("empty references = %+v, %v", refs, err)
+	}
 }
 
 // ---- GetMessageByIDInWorkspace ----------------------------------------------

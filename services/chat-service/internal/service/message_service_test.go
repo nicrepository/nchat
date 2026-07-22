@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -49,6 +50,10 @@ type fakeMessageStore struct {
 	messagesByKey           map[string]domain.Message // key: workspaceID+":"+messageID
 	getByIDErr              error
 	validateRefTargetErr    error
+	messageReferences       map[string]domain.MessageReference
+	resolveReferencesErr    error
+	referencedMessageIDs    map[string]string
+	listReferencedIDsErr    error
 	mentionLabels           map[string]string
 	resolveMentionErr       error
 	authorizedMentionLabels map[string]string
@@ -314,6 +319,14 @@ func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspac
 
 func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _, _ string) error {
 	return f.validateRefTargetErr
+}
+
+func (f *fakeMessageStore) ResolveMessageReferences(_ context.Context, _, _ string, _ []string) (map[string]domain.MessageReference, error) {
+	return f.messageReferences, f.resolveReferencesErr
+}
+
+func (f *fakeMessageStore) ListReferencedMessageIDs(_ context.Context, _, _, _, _ string, _ []string) (map[string]string, error) {
+	return f.referencedMessageIDs, f.listReferencedIDsErr
 }
 
 func (f *fakeMessageStore) ResolveMentionLabels(_ context.Context, _ string, _, _ []string) (map[string]string, error) {
@@ -881,6 +894,160 @@ func TestMessageService_CreateChannelMessage_ReferencedInvalidDenied(t *testing.
 	}
 }
 
+func TestMessageService_CreateChannelMessage_CrossChannelReferenceSucceeds(t *testing.T) {
+	sourceID := user2
+	ref := domain.MessageReference{
+		Available: true, MessageID: sourceID, TargetType: "channel", TargetID: "22222222-2222-2222-2222-222222222222",
+		TargetLabel: "privado", AuthorDisplayName: "Ana", BodyText: "origem", BodyFormat: domain.MessageBodyFormatV3,
+	}
+	msgs := &fakeMessageStore{
+		messageReferences: map[string]domain.MessageReference{sourceID: ref},
+		createdMessage:    domain.Message{ID: "msg-new", WorkspaceID: "ws-1", ChannelID: "ch-1", ReferencedMessageID: sourceID},
+	}
+
+	got, err := service.NewMessageService(&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}, &fakeDMStore{}, msgs).
+		CreateChannelMessage(t.Context(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "veja",
+			ReferencedMessageID: sourceID,
+		})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
+	}
+	if msgs.lastCreateInput.ReferencedMessageID != sourceID || got.Reference == nil || !got.Reference.Available || got.Reference.BodyText != "origem" {
+		t.Fatalf("cross-channel reference not preserved: input=%+v message=%+v", msgs.lastCreateInput, got)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_SameChannelReferenceDenied(t *testing.T) {
+	sourceID := user2
+	msgs := &fakeMessageStore{messageReferences: map[string]domain.MessageReference{sourceID: {
+		Available: true, MessageID: sourceID, TargetType: "channel", TargetID: "ch-1",
+	}}}
+
+	_, err := service.NewMessageService(&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}, &fakeDMStore{}, msgs).
+		CreateChannelMessage(t.Context(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, BodyText: "veja",
+			ReferencedMessageID: sourceID,
+		})
+	if !errors.Is(err, domain.ErrInvalidMessageReference) || msgs.createCalls != 0 {
+		t.Fatalf("expected same-target denial before insert, calls=%d err=%v", msgs.createCalls, err)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_ReferenceIsReauthorizedAfterInsert(t *testing.T) {
+	sourceID := user2
+	store := &fakeMessageStore{
+		messageReferences: map[string]domain.MessageReference{sourceID: {
+			Available: true, MessageID: sourceID, TargetType: "channel", TargetID: "ch-source", BodyText: "segredo",
+		}},
+		createdMessage: domain.Message{
+			ID: "msg-new", WorkspaceID: "ws-1", ChannelID: "ch-destination", ReferencedMessageID: sourceID,
+		},
+	}
+	store.afterCreate = func() { store.messageReferences = map[string]domain.MessageReference{} }
+
+	got, err := service.NewMessageService(
+		&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-destination")},
+		&fakeDMStore{}, store,
+	).CreateChannelMessage(t.Context(), service.CreateChannelMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-destination", SenderID: user1,
+		BodyText: "veja", ReferencedMessageID: sourceID,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
+	}
+	if got.Reference == nil || got.Reference.Available || got.Reference.BodyText != "" {
+		t.Fatalf("post-insert authorization must fail closed, got %+v", got.Reference)
+	}
+}
+
+func TestMessageService_ListChannelMessages_ReferenceAuthorizationIsResolvedAtReadTime(t *testing.T) {
+	sourceID := user2
+	base := domain.Message{ID: "msg-ref", WorkspaceID: "ws-1", ChannelID: "ch-1", ReferencedMessageID: sourceID}
+	for _, tt := range []struct {
+		name      string
+		resolved  map[string]domain.MessageReference
+		available bool
+		wantBody  string
+	}{
+		{name: "reader still has access", resolved: map[string]domain.MessageReference{sourceID: {
+			Available: true, MessageID: sourceID, TargetType: "dm", TargetID: "dm-2", BodyText: "segredo permitido",
+		}}, available: true, wantBody: "segredo permitido"},
+		{name: "reader lost access", resolved: map[string]domain.MessageReference{}, available: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeMessageStore{channelMessages: []domain.Message{base}, messageReferences: tt.resolved}
+			out, err := service.NewMessageService(&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}, &fakeDMStore{}, store).
+				ListChannelMessages(t.Context(), service.ListChannelMessagesInput{WorkspaceID: "ws-1", ChannelID: "ch-1", CallerID: user1})
+			if err != nil {
+				t.Fatalf("ListChannelMessages: %v", err)
+			}
+			ref := out.Messages[0].Reference
+			if ref == nil || ref.Available != tt.available || ref.BodyText != tt.wantBody {
+				t.Fatalf("unexpected read-time reference: %+v", ref)
+			}
+		})
+	}
+}
+
+func TestMessageService_ResolveMessageReferenceBatch_FailsClosedPerDestination(t *testing.T) {
+	destinationWithAccess := user1
+	destinationRevoked := "33333333-3333-3333-3333-333333333333"
+	sourceWithAccess := user2
+	sourceRevoked := "44444444-4444-4444-4444-444444444444"
+	store := &fakeMessageStore{
+		referencedMessageIDs: map[string]string{
+			destinationWithAccess: sourceWithAccess,
+			destinationRevoked:    sourceRevoked,
+		},
+		messageReferences: map[string]domain.MessageReference{sourceWithAccess: {
+			Available: true, MessageID: sourceWithAccess, TargetType: "channel",
+			TargetID: "source-channel", BodyText: "allowed",
+		}},
+	}
+	svc := service.NewMessageService(
+		&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")},
+		&fakeDMStore{}, store,
+	)
+
+	resolved, err := svc.ResolveMessageReferenceBatch(t.Context(), service.ResolveMessageReferencesInput{
+		WorkspaceID: "ws-1", ChannelID: "destination", CallerID: user1,
+		MessageIDs: []string{destinationWithAccess, destinationRevoked},
+	})
+	if err != nil {
+		t.Fatalf("ResolveMessageReferenceBatch: %v", err)
+	}
+	if len(resolved) != 2 || !resolved[0].Reference.Available || resolved[0].Reference.BodyText != "allowed" {
+		t.Fatalf("authorized reference missing: %+v", resolved)
+	}
+	if resolved[1].Reference.Available || resolved[1].Reference.MessageID != "" || resolved[1].Reference.BodyText != "" {
+		t.Fatalf("revoked reference did not fail closed: %+v", resolved[1])
+	}
+}
+
+func TestMessageService_ResolveMessageReferenceBatch_EnforcesPageSizedLimit(t *testing.T) {
+	messageIDs := make([]string, service.MaxMessageReferenceBatchSize)
+	for i := range messageIDs {
+		messageIDs[i] = uuid.NewString()
+	}
+	svc := service.NewMessageService(
+		&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")},
+		&fakeDMStore{}, &fakeMessageStore{},
+	)
+	input := service.ResolveMessageReferencesInput{
+		WorkspaceID: "ws-1", ChannelID: "destination", CallerID: user1, MessageIDs: messageIDs,
+	}
+	resolved, err := svc.ResolveMessageReferenceBatch(t.Context(), input)
+	if err != nil || len(resolved) != service.MaxMessageReferenceBatchSize {
+		t.Fatalf("page-sized batch = %d, %v", len(resolved), err)
+	}
+
+	input.MessageIDs = append(input.MessageIDs, uuid.NewString())
+	if _, err := svc.ResolveMessageReferenceBatch(t.Context(), input); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected oversized batch rejection, got %v", err)
+	}
+}
+
 func TestMessageService_CreateChannelMessage_RefMessageInvalidUUIDDenied(t *testing.T) {
 	ch := publicActiveChannel("ws-1", "ch-1")
 	channels := &fakeChannelStore{visibleChannel: ch}
@@ -915,6 +1082,27 @@ func TestMessageService_CreateDMMessage_RefMessageDMToChannelDenied(t *testing.T
 		})
 	if !errors.Is(err, domain.ErrInvalidMessageReference) {
 		t.Fatalf("expected ErrInvalidMessageReference for DM-to-channel ref, got %v", err)
+	}
+}
+
+func TestMessageService_CreateDMMessage_CrossChannelReferenceSucceeds(t *testing.T) {
+	sourceID := user2
+	store := &fakeMessageStore{
+		messageReferences: map[string]domain.MessageReference{sourceID: {
+			Available: true, MessageID: sourceID, TargetType: "channel", TargetID: "ch-private", BodyText: "origem",
+		}},
+		createdMessage: domain.Message{ID: "msg-new", WorkspaceID: "ws-1", DMConversationID: "dm-1", ReferencedMessageID: sourceID},
+	}
+	svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{visibleConversation: activeDMConversation("ws-1", "dm-1")}, store)
+	got, err := svc.CreateDMMessage(t.Context(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "dm-1", SenderID: user1,
+		BodyText: "veja", ReferencedMessageID: sourceID,
+	})
+	if err != nil {
+		t.Fatalf("CreateDMMessage: %v", err)
+	}
+	if store.lastCreateInput.ReferencedMessageID != sourceID || got.Reference == nil || !got.Reference.Available {
+		t.Fatalf("cross-channel DM reference not preserved: input=%+v message=%+v", store.lastCreateInput, got)
 	}
 }
 

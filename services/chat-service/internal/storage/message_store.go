@@ -159,6 +159,16 @@ type MessageStore interface {
 	// missing, cross-workspace, cross-channel, and cross-DM all return the same error.
 	ValidateRefMessageInTarget(ctx context.Context, workspaceID, channelID, dmConversationID, messageID, userID string) error
 
+	// ResolveMessageReferences returns only active messages the caller can read
+	// right now. Missing map entries are intentionally indistinguishable from
+	// nonexistent, deleted, cross-workspace, and inaccessible origins.
+	ResolveMessageReferences(ctx context.Context, workspaceID, userID string, messageIDs []string) (map[string]domain.MessageReference, error)
+	// ListReferencedMessageIDs returns destination-message -> source-message IDs
+	// only for active destination messages the caller can currently read. Source
+	// IDs never leave the service boundary; they are resolved separately using
+	// the caller's current access to each origin.
+	ListReferencedMessageIDs(ctx context.Context, workspaceID, userID, channelID, dmConversationID string, messageIDs []string) (map[string]string, error)
+
 	// ResolveMentionLabels returns current display labels keyed by "user:<uuid>"
 	// or "channel:<uuid>", scoped to workspaceID.
 	ResolveMentionLabels(ctx context.Context, workspaceID string, userIDs, channelIDs []string) (map[string]string, error)
@@ -329,10 +339,9 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	// workspace_member because the workspace_members JOIN filters wm.status = 'active'
 	// independently.
 	//
-	// The invalid_refs CTE fires when any provided reference message does not belong
-	// to the same workspace + same target. Both conditions are checked together;
-	// either failure results in 0 rows, which maps to ErrNotFound (non-enumerating
-	// TOCTOU backstop — the service layer performs typed pre-validation before insert).
+	// The invalid_refs CTE keeps parent/forwarded references in the same target and
+	// permits RF-09 referenced messages in another target only when the sender can
+	// currently read the active origin. Any failure maps to the same zero-row result.
 	//
 	// The INSERT is wrapped in a CTE so the outer SELECT can JOIN auth.users and
 	// return sender display info (sender_display_name, sender_email) in the same
@@ -353,6 +362,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 					SELECT 1 FROM chat.messages
 					WHERE id = $8::uuid
 					  AND workspace_id = $1::uuid
+					  AND status = 'active'
 					  AND channel_id IS NOT DISTINCT FROM $2::uuid
 					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
@@ -360,15 +370,21 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 					SELECT 1 FROM chat.messages
 					WHERE id = $9::uuid
 					  AND workspace_id = $1::uuid
+					  AND status = 'active'
 					  AND channel_id IS NOT DISTINCT FROM $2::uuid
 					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
 				OR ($10::uuid IS NOT NULL AND NOT EXISTS (
-					SELECT 1 FROM chat.messages
-					WHERE id = $10::uuid
-					  AND workspace_id = $1::uuid
-					  AND channel_id IS NOT DISTINCT FROM $2::uuid
-					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
+					SELECT 1 FROM chat.messages m`+messageAccessJoins("$4")+`
+					WHERE m.id = $10::uuid
+					  AND m.workspace_id = $1::uuid
+					  AND m.status = 'active'
+					  AND m.deleted_at IS NULL
+					  AND NOT (
+						m.channel_id IS NOT DISTINCT FROM $2::uuid
+						AND m.dm_conversation_id IS NOT DISTINCT FROM $3::uuid
+					  )
+					  AND `+messageAccessPredicate+`
 				))
 		),
 		invalid_mentions AS (
@@ -782,6 +798,87 @@ func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, worksp
 		return fmt.Errorf("validate ref message in target: %w", err)
 	}
 	return nil
+}
+
+func (s *PGXMessageStore) ResolveMessageReferences(ctx context.Context, workspaceID, userID string, messageIDs []string) (map[string]domain.MessageReference, error) {
+	resolved := make(map[string]domain.MessageReference, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return resolved, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.id::text,
+		       CASE WHEN m.channel_id IS NOT NULL THEN 'channel' ELSE 'dm' END,
+		       COALESCE(m.channel_id::text, m.dm_conversation_id::text),
+		       COALESCE(c.display_name, dc.title, ''),
+		       COALESCE(author.display_name, ''),
+		       m.body_text, m.body_format, m.created_at
+		FROM unnest($3::text[]) AS ids(id)
+		JOIN chat.messages m ON m.id = ids.id::uuid`+messageAccessJoins("$2")+`
+		LEFT JOIN auth.users author ON author.id = m.sender_id
+		WHERE m.workspace_id = $1::uuid
+		  AND m.status = 'active'
+		  AND m.deleted_at IS NULL
+		  AND `+messageAccessPredicate,
+		workspaceID, userID, messageIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve message references: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ref domain.MessageReference
+		ref.Available = true
+		if err := rows.Scan(
+			&ref.MessageID, &ref.TargetType, &ref.TargetID, &ref.TargetLabel,
+			&ref.AuthorDisplayName, &ref.BodyText, (*string)(&ref.BodyFormat), &ref.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan message reference: %w", err)
+		}
+		resolved[ref.MessageID] = ref
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate message references: %w", err)
+	}
+	return resolved, nil
+}
+
+func (s *PGXMessageStore) ListReferencedMessageIDs(ctx context.Context, workspaceID, userID, channelID, dmConversationID string, messageIDs []string) (map[string]string, error) {
+	referenced := make(map[string]string, len(messageIDs))
+	if len(messageIDs) == 0 {
+		return referenced, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.id::text, m.referenced_message_id::text
+		FROM unnest($5::text[]) AS ids(id)
+		JOIN chat.messages m ON m.id = ids.id::uuid`+messageAccessJoins("$2")+`
+		WHERE m.workspace_id = $1::uuid
+		  AND m.channel_id IS NOT DISTINCT FROM $3::uuid
+		  AND m.dm_conversation_id IS NOT DISTINCT FROM $4::uuid
+		  AND m.status = 'active'
+		  AND m.deleted_at IS NULL
+		  AND m.referenced_message_id IS NOT NULL
+		  AND `+messageAccessPredicate,
+		workspaceID, userID, nullableUUID(channelID), nullableUUID(dmConversationID), messageIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list referenced message ids: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var destinationID, sourceID string
+		if err := rows.Scan(&destinationID, &sourceID); err != nil {
+			return nil, fmt.Errorf("scan referenced message id: %w", err)
+		}
+		referenced[destinationID] = sourceID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate referenced message ids: %w", err)
+	}
+	return referenced, nil
 }
 
 func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID, userID string) (domain.Message, error) {

@@ -48,6 +48,8 @@ type fakeMessageProvider struct {
 	deleteErr     error
 	history       []domain.MessageEditHistory
 	historyErr    error
+	referenceOut  []service.MessageReferenceResolution
+	referenceErr  error
 
 	lastCreateChannelInput service.CreateChannelMessageInput
 	lastCreateDMInput      service.CreateDMMessageInput
@@ -58,6 +60,7 @@ type fakeMessageProvider struct {
 	lastEditInput          service.EditMessageInput
 	lastDeleteInput        service.DeleteMessageInput
 	lastHistoryInput       service.GetMessageEditHistoryInput
+	lastReferenceInput     service.ResolveMessageReferencesInput
 }
 
 func (f *fakeMessageProvider) EditMessage(_ context.Context, in service.EditMessageInput) (domain.Message, error) {
@@ -146,6 +149,11 @@ func (f *fakeMessageProvider) GetChannelMessage(_ context.Context, in service.Ge
 func (f *fakeMessageProvider) GetDMMessage(_ context.Context, in service.GetDMMessageInput) (domain.Message, error) {
 	f.lastGetDMInput = in
 	return f.dmMsg, f.dmMsgErr
+}
+
+func (f *fakeMessageProvider) ResolveMessageReferenceBatch(_ context.Context, in service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error) {
+	f.lastReferenceInput = in
+	return f.referenceOut, f.referenceErr
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -735,6 +743,91 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	}
 }
 
+func TestMessageHandler_ListChannelMessages_ReferenceDTOFailsClosed(t *testing.T) {
+	msg := testMessage()
+	msg.ReferencedMessageID = "66666666-6666-6666-6666-666666666666"
+	msg.Reference = &domain.MessageReference{Available: false}
+	provider := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{Messages: []domain.Message{msg}}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+
+	body := decodeBody(t, rec)
+	message := body["data"].(map[string]any)["messages"].([]any)[0].(map[string]any)
+	ref := message["reference"].(map[string]any)
+	if len(ref) != 1 || ref["available"] != false {
+		t.Fatalf("unavailable reference leaked fields: %#v", ref)
+	}
+}
+
+func TestMessageHandler_ListChannelMessages_AuthorizedReferenceUsesMinimalDTO(t *testing.T) {
+	msg := testMessage()
+	msg.ReferencedMessageID = "66666666-6666-6666-6666-666666666666"
+	msg.Reference = &domain.MessageReference{
+		Available: true, MessageID: msg.ReferencedMessageID, TargetType: "channel",
+		TargetID: "77777777-7777-7777-7777-777777777777", TargetLabel: "privado",
+		AuthorDisplayName: "Ana", BodyText: "<script>alert(1)</script>",
+		BodyFormat: domain.MessageBodyFormatV3, CreatedAt: testNow(),
+	}
+	provider := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{Messages: []domain.Message{msg}}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+
+	body := decodeBody(t, rec)
+	ref := body["data"].(map[string]any)["messages"].([]any)[0].(map[string]any)["reference"].(map[string]any)
+	if ref["body"] != "<script>alert(1)</script>" || ref["author_display_name"] != "Ana" {
+		t.Fatalf("authorized reference missing summary: %#v", ref)
+	}
+	for _, forbidden := range []string{"author_id", "edited_at", "deleted_at", "reactions", "history"} {
+		if _, exists := ref[forbidden]; exists {
+			t.Fatalf("reference exposed forbidden field %q: %#v", forbidden, ref)
+		}
+	}
+}
+
+func TestMessageHandler_ResolveChannelMessageReferences_SerializesUnavailableWithoutMetadata(t *testing.T) {
+	provider := &fakeMessageProvider{referenceOut: []service.MessageReferenceResolution{
+		{MessageID: testMessageID, Reference: domain.MessageReference{Available: false}},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/message-references", strings.NewReader(
+		`{"message_ids":["`+testMessageID+`"]}`,
+	))
+	r.SetPathValue("channelID", testChannelID)
+	rec := httptest.NewRecorder()
+
+	h.ResolveChannelMessageReferences(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); !strings.Contains(got, `"reference":{"available":false}`) || strings.Contains(got, "target_id") || strings.Contains(got, "author_display_name") || strings.Contains(got, `"body"`) {
+		t.Fatalf("unavailable reference leaked metadata: %s", got)
+	}
+	if provider.lastReferenceInput.ChannelID != testChannelID || provider.lastReferenceInput.CallerID != msgTestUserID || len(provider.lastReferenceInput.MessageIDs) != 1 {
+		t.Fatalf("unexpected service input: %+v", provider.lastReferenceInput)
+	}
+}
+
+func TestMessageHandler_ResolveDMMessageReferences_RejectsUnknownFields(t *testing.T) {
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/message-references", strings.NewReader(
+		`{"message_ids":["`+testMessageID+`"],"source_id":"secret"}`,
+	))
+	r.SetPathValue("conversationID", testConversationID)
+	rec := httptest.NewRecorder()
+
+	h.ResolveDMMessageReferences(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestMessageHandler_ListChannelMessages_EmptyListReturnsEmptyArray(t *testing.T) {
 	msgs := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{Messages: nil}}
 	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
@@ -943,6 +1036,20 @@ func TestMessageHandler_CreateChannelMessage_AcceptsParentMessageID(t *testing.T
 	}
 	if msgs.lastCreateChannelInput.ParentMessageID != parentID {
 		t.Fatalf("parent_message_id not forwarded: %+v", msgs.lastCreateChannelInput)
+	}
+}
+
+func TestMessageHandler_CreateChannelMessage_AcceptsReferencedMessageID(t *testing.T) {
+	const referenceID = "77777777-7777-7777-7777-777777777777"
+	msgs := &fakeMessageProvider{createdMsg: testMessage()}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"hello","referenced_message_id":"`+referenceID+`"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+	if rec.Code != http.StatusCreated || msgs.lastCreateChannelInput.ReferencedMessageID != referenceID {
+		t.Fatalf("reference not forwarded: status=%d input=%+v body=%s", rec.Code, msgs.lastCreateChannelInput, rec.Body.String())
 	}
 }
 

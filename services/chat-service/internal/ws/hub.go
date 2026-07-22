@@ -277,6 +277,10 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 // Delivery guarantee: in-process best-effort. No durability, no replay.
 // Wiring: call this from MessageService after a message is persisted.
 func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, targetType TargetType, targetID string, payload MessagePayload) {
+	var eventPayload *MessagePayload
+	if !payload.HasReference {
+		eventPayload = &payload
+	}
 	evt := Event{
 		SchemaVersion:    CurrentEventSchemaVersion,
 		Type:             EventTypeMessageCreated,
@@ -284,7 +288,7 @@ func (h *Hub) PublishMessageCreated(ctx context.Context, workspaceID string, tar
 		TargetType:       targetType,
 		TargetID:         targetID,
 		MessageID:        payload.ID,
-		Payload:          &payload,
+		Payload:          eventPayload,
 		EventID:          uuid.New().String(),
 		SourceInstanceID: h.instanceID,
 		CreatedAt:        time.Now().UTC(),

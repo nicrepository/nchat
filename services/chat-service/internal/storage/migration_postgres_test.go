@@ -70,6 +70,21 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 	if _, err := conn.Exec(ctx, readChatMigration(t, "000012_message_parent_reply.up.sql")); err != nil {
 		t.Fatalf("re-apply 000012_message_parent_reply.up.sql: %v", err)
 	}
+	for _, name := range []string{
+		"000005_chat_message_body_format.up.sql",
+		"000006_chat_mentions.up.sql",
+		"000007_chat_mention_channel_visibility.up.sql",
+		"000008_message_reactions.up.sql",
+		"000009_message_reactions_message_id_index.up.sql",
+		"000010_message_favorites.up.sql",
+		"000011_message_pins.up.sql",
+		"000013_message_edit_history.up.sql",
+		"000014_cross_channel_message_reference.up.sql",
+	} {
+		if _, err := conn.Exec(ctx, readChatMigration(t, name)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+	}
 
 	t.Run("SQL visibility excludes unauthorized private and cross-workspace channels", func(t *testing.T) {
 		_, err := conn.Exec(ctx, `
@@ -560,6 +575,141 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			t.Fatalf("unexpected dm message: %+v", dmMsg)
 		}
 	})
+}
+
+func TestResolveMessageReferences_PostgreSQLAuthorization(t *testing.T) {
+	dsn := os.Getenv("CHAT_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("CHAT_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	var databaseName string
+	if err := conn.QueryRow(ctx, `SELECT current_database()`).Scan(&databaseName); err != nil {
+		t.Fatalf("read current database: %v", err)
+	}
+	if !strings.HasSuffix(databaseName, "_test") {
+		t.Fatalf("refusing destructive reference test against non-test database %q", databaseName)
+	}
+	if _, err := conn.Exec(ctx, `DROP SCHEMA IF EXISTS chat CASCADE`); err != nil {
+		t.Fatalf("reset chat schema: %v", err)
+	}
+	t.Cleanup(func() { _, _ = conn.Exec(context.Background(), `DROP SCHEMA IF EXISTS chat CASCADE`) })
+	if _, err := conn.Exec(ctx, `
+		CREATE SCHEMA IF NOT EXISTS auth;
+		CREATE TABLE IF NOT EXISTS auth.users (
+			id UUID PRIMARY KEY,
+			email TEXT NOT NULL DEFAULT '',
+			display_name TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'active',
+			deleted_at TIMESTAMPTZ
+		)`); err != nil {
+		t.Fatalf("prepare auth schema required by chat foreign keys: %v", err)
+	}
+	if _, err := conn.Exec(ctx, readAllChatUpMigrations(t)); err != nil {
+		t.Fatalf("apply chat migrations: %v", err)
+	}
+
+	const (
+		workspaceA  = "a1000000-0000-0000-0000-000000000001"
+		workspaceB  = "b1000000-0000-0000-0000-000000000001"
+		reader      = "a1000000-0000-0000-0000-000000000002"
+		author      = "a1000000-0000-0000-0000-000000000003"
+		privateCh   = "a1000000-0000-0000-0000-000000000004"
+		destCh      = "a1000000-0000-0000-0000-000000000005"
+		archivedCh  = "a1000000-0000-0000-0000-000000000006"
+		crossCh     = "b1000000-0000-0000-0000-000000000002"
+		dmID        = "a1000000-0000-0000-0000-000000000007"
+		privateMsg  = "a1000000-0000-0000-0000-000000000008"
+		dmMsg       = "a1000000-0000-0000-0000-000000000009"
+		deletedMsg  = "a1000000-0000-0000-0000-00000000000a"
+		archivedMsg = "a1000000-0000-0000-0000-00000000000b"
+		crossMsg    = "b1000000-0000-0000-0000-000000000003"
+		destMsg     = "a1000000-0000-0000-0000-00000000000c"
+	)
+	seed := &pgx.Batch{}
+	seed.Queue(`INSERT INTO chat.workspaces (id, slug, name) VALUES ($1, 'rf09-a', 'RF09 A'), ($2, 'rf09-b', 'RF09 B')`, workspaceA, workspaceB)
+	seed.Queue(`INSERT INTO chat.workspace_members (workspace_id, user_id, status) VALUES
+		($1, $3, 'active'), ($1, $4, 'active'), ($2, $3, 'active'), ($2, $4, 'active')`, workspaceA, workspaceB, reader, author)
+	seed.Queue(`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status, is_general) VALUES
+		($3, $1, 'private-source', 'Private Source', 'private', 'active', false),
+		($4, $1, 'destination', 'Destination', 'public', 'active', true),
+		($5, $1, 'archived-source', 'Archived Source', 'private', 'archived', false),
+		($6, $2, 'cross-source', 'Cross Source', 'public', 'active', true)`,
+		workspaceA, workspaceB, privateCh, destCh, archivedCh, crossCh)
+	seed.Queue(`INSERT INTO chat.channel_members (channel_id, user_id) VALUES
+		($1, $3), ($1, $4), ($2, $3), ($2, $4)`, privateCh, archivedCh, reader, author)
+	seed.Queue(`INSERT INTO chat.dm_conversations (id, workspace_id, type, status, created_by)
+		VALUES ($1, $2, 'group', 'active', $3)`, dmID, workspaceA, author)
+	seed.Queue(`INSERT INTO chat.dm_members (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`, dmID, reader, author)
+	seed.Queue(`INSERT INTO chat.messages
+		(id, workspace_id, channel_id, dm_conversation_id, sender_id, body_text, body_format, status, deleted_at)
+		VALUES
+			($3, $1, $5, NULL, $2, 'private body', 'v3', 'active', NULL),
+			($4, $1, NULL, $6, $2, 'dm body', 'v2', 'active', NULL),
+			($7, $1, $5, NULL, $2, '', 'v1', 'deleted', now()),
+			($8, $1, $9, NULL, $2, 'archived body', 'v1', 'active', NULL),
+			($10, $11, $12, NULL, $2, 'cross body', 'v1', 'active', NULL),
+			($13, $1, $14, NULL, $15, 'destination body', 'v1', 'active', NULL)`,
+		workspaceA, author, privateMsg, dmMsg, privateCh, dmID, deletedMsg, archivedMsg, archivedCh,
+		crossMsg, workspaceB, crossCh, destMsg, destCh, reader)
+	seed.Queue(`UPDATE chat.messages SET referenced_message_id = $1 WHERE id = $2`, privateMsg, destMsg)
+	if err := conn.SendBatch(ctx, seed).Close(); err != nil {
+		t.Fatalf("seed RF-09 authorization cases: %v", err)
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open reference pool: %v", err)
+	}
+	defer pool.Close()
+	store := storage.NewPGXMessageStore(pool)
+	ids := []string{privateMsg, dmMsg, deletedMsg, archivedMsg, crossMsg}
+	resolved, err := store.ResolveMessageReferences(ctx, workspaceA, reader, ids)
+	if err != nil {
+		t.Fatalf("resolve authorized references: %v", err)
+	}
+	if len(resolved) != 2 || resolved[privateMsg].BodyText != "private body" || resolved[dmMsg].BodyText != "dm body" {
+		t.Fatalf("unexpected authorized references: %+v", resolved)
+	}
+	destinationRefs, err := store.ListReferencedMessageIDs(ctx, workspaceA, reader, destCh, "", []string{destMsg})
+	if err != nil {
+		t.Fatalf("list destination references: %v", err)
+	}
+	if destinationRefs[destMsg] != privateMsg {
+		t.Fatalf("destination reference = %q, want %q", destinationRefs[destMsg], privateMsg)
+	}
+
+	if _, err := conn.Exec(ctx, `DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`, privateCh, reader); err != nil {
+		t.Fatalf("revoke private channel access: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE chat.dm_members SET status = 'left', left_at = now()
+		WHERE conversation_id = $1 AND user_id = $2`, dmID, reader); err != nil {
+		t.Fatalf("revoke DM access: %v", err)
+	}
+	resolved, err = store.ResolveMessageReferences(ctx, workspaceA, reader, ids)
+	if err != nil {
+		t.Fatalf("resolve revoked references: %v", err)
+	}
+	if len(resolved) != 0 {
+		t.Fatalf("revoked reader received source metadata: %+v", resolved)
+	}
+
+	if _, err := conn.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, privateMsg); err != nil {
+		t.Fatalf("hard-delete referenced origin: %v", err)
+	}
+	var retained string
+	if err := conn.QueryRow(ctx, `SELECT referenced_message_id::text FROM chat.messages WHERE id = $1`, destMsg).Scan(&retained); err != nil {
+		t.Fatalf("read retained opaque reference: %v", err)
+	}
+	if retained != privateMsg {
+		t.Fatalf("retained reference = %q, want %q", retained, privateMsg)
+	}
 }
 
 func requirePostgresConstraint(t *testing.T, err error, constraint string) {

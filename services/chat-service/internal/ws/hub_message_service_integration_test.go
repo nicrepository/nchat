@@ -144,6 +144,13 @@ func (s *integMessageStore) GetMessageByIDInWorkspace(_ context.Context, _, _, _
 func (s *integMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _, _ string) error {
 	return nil
 }
+func (s *integMessageStore) ResolveMessageReferences(_ context.Context, _, _ string, _ []string) (map[string]domain.MessageReference, error) {
+	return map[string]domain.MessageReference{}, nil
+}
+
+func (s *integMessageStore) ListReferencedMessageIDs(_ context.Context, _, _, _, _ string, _ []string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
 func (s *integMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {
 	return storage.ListMessagesResult{}, nil
 }

@@ -402,6 +402,34 @@ func TestHub_Bus_PublishedEvent_StripsPayloadFromBusButKeepsLocalPayload(t *test
 	}
 }
 
+func TestHub_PublishMessageCreated_ReferenceIsRouteOnlyForLocalSubscribers(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", testWorkspaceID, TargetTypeChannel, testChannelID, true)
+	hub := newBusTestHub(auth, &fakeBus{})
+	defer hub.Shutdown()
+
+	c := newClient("c1", "user-1", testWorkspaceID, &fakeSender{})
+	registerInRunningHub(t, hub, c)
+	if err := hub.Subscribe(t.Context(), c, TargetTypeChannel, testChannelID); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	payload := testPayload()
+	payload.BodyText = "destination body"
+	payload.HasReference = true
+	hub.PublishMessageCreated(t.Context(), testWorkspaceID, TargetTypeChannel, testChannelID, payload)
+
+	if !waitForOutbox(c, 1) {
+		t.Fatal("expected route-only local delivery")
+	}
+	var event Event
+	if err := json.Unmarshal(<-c.outbox, &event); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+	if event.Payload != nil || event.MessageID != testMessageID {
+		t.Fatalf("RF-09 event must carry only route identity, got %+v", event)
+	}
+}
+
 // Bus publish failure must not prevent local delivery.
 func TestHub_Bus_PublishFailure_LocalDeliveryStillWorks(t *testing.T) {
 	auth := &fakeAuthorizer{}
