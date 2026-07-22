@@ -41,9 +41,14 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
+	// A configured database makes JWT and active-session validation critical.
+	// sessionValidator is only created after the startup database connection
+	// succeeds, so a one-shot bootstrap failure must keep the pod unready.
+	chatBootstrapReady := cfg.DatabaseURL == "" || (validator != nil && sessionValidator != nil)
+
 	mux := http.NewServeMux()
 	mux.Handle(RouteHealthz, httputil.MethodNotAllowed(http.MethodGet, Healthz(cfg)))
-	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
+	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, ReadyzWithBootstrap(cfg, chatBootstrapReady)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
 
