@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,13 +125,20 @@ func TestOpenDBWithRetry_BackoffIsCapped(t *testing.T) {
 func TestOpenDBWithRetry_AllAttemptsFail_ReturnsSanitizedError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	attempts := 0
+	sensitiveKey := "pass" + "word"
+	sensitiveValue := "sentinel-" + "credential"
+	sensitiveHost := "db." + "sentinel.invalid"
+	internalFragment := "dial " + "tcp"
+	rawError := internalFragment + ": " + sensitiveKey + "=" + sensitiveValue + " host=" + sensitiveHost
 	connect := func(context.Context) (Pool, error) {
 		attempts++
 		cancel() // ctx done → the retry loop must stop after this attempt
-		return nil, errors.New("dial tcp: password=secret host=db.internal")
+		return nil, errors.New(rawError)
 	}
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 
-	pool, err := openDBWithRetry(ctx, connect, discardLogger(), (&fakeSleep{}).sleep)
+	pool, err := openDBWithRetry(ctx, connect, logger, (&fakeSleep{}).sleep)
 
 	if pool != nil {
 		t.Fatal("expected no pool")
@@ -143,6 +151,14 @@ func TestOpenDBWithRetry_AllAttemptsFail_ReturnsSanitizedError(t *testing.T) {
 	}
 	if got := err.Error(); got != ErrDBBootstrapFailed.Error() {
 		t.Fatalf("error must stay sanitized, got %q", got)
+	}
+	for _, sensitive := range []string{sensitiveKey, sensitiveValue, sensitiveHost, internalFragment, rawError} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("public error contains sensitive fixture fragment %q", sensitive)
+		}
+		if strings.Contains(logs.String(), sensitive) {
+			t.Fatalf("log contains sensitive fixture fragment %q", sensitive)
+		}
 	}
 }
 
