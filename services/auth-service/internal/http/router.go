@@ -28,9 +28,15 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 		logger.Warn("login attempts auth disabled", "reason", "invalid_jwt_config")
 	}
 
+	// A configured database makes the auth bootstrap a critical dependency.
+	// When the one-shot startup connection fails, the handlers are nil and the
+	// pod must remain unready so Kubernetes keeps the previous replica serving
+	// and restarts the failed container through the startup probe.
+	authBootstrapReady := cfg.DatabaseURL == "" || (users != nil && auth != nil && login != nil)
+
 	mux := http.NewServeMux()
 	mux.Handle(RouteHealthz, httputil.MethodNotAllowed(http.MethodGet, Healthz(cfg)))
-	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
+	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, ReadyzWithBootstrap(cfg, authBootstrapReady)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
 	rateLimitKeyer := newRateLimitKeyer(cfg.AuthJWTHMACSecret)
