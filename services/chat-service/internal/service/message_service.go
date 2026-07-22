@@ -51,6 +51,7 @@ type messageUpdatedPublisher interface {
 
 const maxMessageBodyRunes = 40_000
 const maxEditHistoryOffset = 10_000
+const MaxMessageReferenceBatchSize = 100
 
 // CreateChannelMessageInput is the caller-provided input for posting to a channel.
 // Status, timestamps, edited_at, deleted_at, and workspace_id are not caller-settable.
@@ -61,9 +62,7 @@ type CreateChannelMessageInput struct {
 	BodyText        string
 	BodyFormat      domain.MessageBodyFormat
 	ParentMessageID string
-	// ForwardedFromMessageID and ReferencedMessageID are reserved for
-	// future RF-08 (forward) and RF-09 (thread reference) and are not
-	// yet exposed via the API.
+	// ForwardedFromMessageID remains reserved for RF-08 and is not exposed via HTTP.
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
 }
@@ -77,9 +76,7 @@ type CreateDMMessageInput struct {
 	BodyText        string
 	BodyFormat      domain.MessageBodyFormat
 	ParentMessageID string
-	// ForwardedFromMessageID and ReferencedMessageID are reserved for
-	// future RF-08 (forward) and RF-09 (thread reference) and are not
-	// yet exposed via the API.
+	// ForwardedFromMessageID remains reserved for RF-08 and is not exposed via HTTP.
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
 }
@@ -130,6 +127,21 @@ type GetDMMessageInput struct {
 	ConversationID string
 	CallerID       string
 	MessageID      string
+}
+
+// ResolveMessageReferencesInput identifies destination messages whose RF-09
+// references must be re-authorized for the current caller.
+type ResolveMessageReferencesInput struct {
+	WorkspaceID      string
+	ChannelID        string
+	DMConversationID string
+	CallerID         string
+	MessageIDs       []string
+}
+
+type MessageReferenceResolution struct {
+	MessageID string
+	Reference domain.MessageReference
 }
 
 type EditMessageInput struct {
@@ -270,9 +282,12 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	if err != nil {
 		return domain.Message{}, err
 	}
-	referencedID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", senderID, strings.TrimSpace(input.ReferencedMessageID))
+	referencedID, reference, err := s.validateReferencedMessage(ctx, workspaceID, senderID, strings.TrimSpace(input.ReferencedMessageID))
 	if err != nil {
 		return domain.Message{}, err
+	}
+	if reference != nil && reference.TargetType == "channel" && reference.TargetID == channelID {
+		return domain.Message{}, domain.ErrInvalidMessageReference
 	}
 
 	msg, err := s.messages.CreateMessage(ctx, storage.CreateMessageInput{
@@ -290,6 +305,14 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create channel message: %w", err)
+	}
+	// The validation preview is never serialized: authorization and source state
+	// may have changed while the destination message was being persisted.
+	created := []domain.Message{msg}
+	if err := s.resolveMessageReferences(ctx, workspaceID, senderID, created); err != nil {
+		msg.Reference = &domain.MessageReference{Available: false}
+	} else {
+		msg = created[0]
 	}
 	s.publishMessageCreated(ctx, workspaceID, "channel", channelID, msg)
 	return msg, nil
@@ -331,9 +354,12 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	if err != nil {
 		return domain.Message{}, err
 	}
-	referencedID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ReferencedMessageID))
+	referencedID, reference, err := s.validateReferencedMessage(ctx, workspaceID, senderID, strings.TrimSpace(input.ReferencedMessageID))
 	if err != nil {
 		return domain.Message{}, err
+	}
+	if reference != nil && reference.TargetType == "dm" && reference.TargetID == conversationID {
+		return domain.Message{}, domain.ErrInvalidMessageReference
 	}
 
 	msg, err := s.messages.CreateMessage(ctx, storage.CreateMessageInput{
@@ -349,6 +375,14 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create dm message: %w", err)
+	}
+	// Resolve again after persistence so the HTTP response never reuses the
+	// preview obtained during pre-validation.
+	created := []domain.Message{msg}
+	if err := s.resolveMessageReferences(ctx, workspaceID, senderID, created); err != nil {
+		msg.Reference = &domain.MessageReference{Available: false}
+	} else {
+		msg = created[0]
 	}
 	s.publishMessageCreated(ctx, workspaceID, "dm", conversationID, msg)
 	return msg, nil
@@ -430,6 +464,11 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("edit message: %w", err)
 	}
+	updatedMessages := []domain.Message{updated}
+	if err := s.resolveMessageReferences(ctx, workspaceID, editorID, updatedMessages); err != nil {
+		return domain.Message{}, err
+	}
+	updated = updatedMessages[0]
 	s.publishMessageUpdated(ctx, updated)
 	return updated, nil
 }
@@ -535,6 +574,9 @@ func (s *MessageService) ListChannelMessages(ctx context.Context, input ListChan
 	if err := s.refreshMentionLabels(ctx, workspaceID, result.Messages); err != nil {
 		return ListChannelMessagesOutput{}, err
 	}
+	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, result.Messages); err != nil {
+		return ListChannelMessagesOutput{}, err
+	}
 
 	var nextCursor string
 	if result.NextCursor != nil {
@@ -577,6 +619,9 @@ func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessage
 	if err != nil {
 		return ListDMMessagesOutput{}, fmt.Errorf("list dm messages: %w", err)
 	}
+	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, result.Messages); err != nil {
+		return ListDMMessagesOutput{}, err
+	}
 
 	var nextCursor string
 	if result.NextCursor != nil {
@@ -585,11 +630,7 @@ func (s *MessageService) ListDMMessages(ctx context.Context, input ListDMMessage
 	return ListDMMessagesOutput{Messages: result.Messages, NextCursor: nextCursor}, nil
 }
 
-// validateRefMessage validates an optional reference message ID (parent, forwarded_from,
-// or referenced). Returns "" when refID is empty. Returns ErrInvalidMessageReference
-// for any invalid case (invalid UUID, non-existent, cross-workspace, cross-channel,
-// channel-to-DM, DM-to-channel). The error is intentionally non-enumerating: callers
-// cannot determine whether the referenced message exists.
+// validateRefMessage validates the same-target IDs used by RF-07 and reserved RF-08.
 func (s *MessageService) validateRefMessage(ctx context.Context, workspaceID, channelID, dmConversationID, senderID, refID string) (string, error) {
 	if refID == "" {
 		return "", nil
@@ -601,6 +642,115 @@ func (s *MessageService) validateRefMessage(ctx context.Context, workspaceID, ch
 		return "", err
 	}
 	return refID, nil
+}
+
+func (s *MessageService) validateReferencedMessage(ctx context.Context, workspaceID, senderID, refID string) (string, *domain.MessageReference, error) {
+	if refID == "" {
+		return "", nil, nil
+	}
+	parsed, err := uuid.Parse(refID)
+	if err != nil {
+		return "", nil, domain.ErrInvalidMessageReference
+	}
+	refID = parsed.String()
+	resolved, err := s.messages.ResolveMessageReferences(ctx, workspaceID, senderID, []string{refID})
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve referenced message: %w", err)
+	}
+	ref, ok := resolved[refID]
+	if !ok {
+		return "", nil, domain.ErrInvalidMessageReference
+	}
+	return refID, &ref, nil
+}
+
+func (s *MessageService) resolveMessageReferences(ctx context.Context, workspaceID, userID string, messages []domain.Message) error {
+	ids := make([]string, 0)
+	for i := range messages {
+		if messages[i].ReferencedMessageID == "" {
+			continue
+		}
+		messages[i].Reference = &domain.MessageReference{Available: false}
+		ids = append(ids, messages[i].ReferencedMessageID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	resolved, err := s.messages.ResolveMessageReferences(ctx, workspaceID, userID, uniqueStrings(ids))
+	if err != nil {
+		return fmt.Errorf("resolve message references: %w", err)
+	}
+	for i := range messages {
+		if ref, ok := resolved[messages[i].ReferencedMessageID]; ok {
+			copy := ref
+			messages[i].Reference = &copy
+		}
+	}
+	return nil
+}
+
+// ResolveMessageReferenceBatch re-authorizes RF-09 origins for a bounded set
+// of destination messages. Missing, invalid, inaccessible, and unreferenced
+// destinations all receive the same unavailable result.
+func (s *MessageService) ResolveMessageReferenceBatch(ctx context.Context, input ResolveMessageReferencesInput) ([]MessageReferenceResolution, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	callerID := strings.TrimSpace(input.CallerID)
+	channelID := strings.TrimSpace(input.ChannelID)
+	dmConversationID := strings.TrimSpace(input.DMConversationID)
+	if workspaceID == "" || callerID == "" || (channelID == "") == (dmConversationID == "") {
+		return nil, fmt.Errorf("%w: workspace_id, caller_id, and exactly one target are required", domain.ErrInvalidInput)
+	}
+	if len(input.MessageIDs) == 0 || len(input.MessageIDs) > MaxMessageReferenceBatchSize {
+		return nil, fmt.Errorf("%w: message_ids must contain 1-%d values", domain.ErrInvalidInput, MaxMessageReferenceBatchSize)
+	}
+
+	messageIDs := make([]string, 0, len(input.MessageIDs))
+	seen := make(map[string]struct{}, len(input.MessageIDs))
+	for _, rawID := range input.MessageIDs {
+		parsed, err := uuid.Parse(strings.TrimSpace(rawID))
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid message id", domain.ErrInvalidInput)
+		}
+		id := parsed.String()
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		messageIDs = append(messageIDs, id)
+	}
+
+	if channelID != "" {
+		if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID); err != nil {
+			return nil, err
+		}
+	} else if _, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, dmConversationID, callerID); err != nil {
+		return nil, err
+	}
+
+	referencedIDs, err := s.messages.ListReferencedMessageIDs(ctx, workspaceID, callerID, channelID, dmConversationID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list destination references: %w", err)
+	}
+	sourceIDs := make([]string, 0, len(referencedIDs))
+	for _, sourceID := range referencedIDs {
+		sourceIDs = append(sourceIDs, sourceID)
+	}
+	resolved, err := s.messages.ResolveMessageReferences(ctx, workspaceID, callerID, uniqueStrings(sourceIDs))
+	if err != nil {
+		return nil, fmt.Errorf("resolve destination references: %w", err)
+	}
+
+	result := make([]MessageReferenceResolution, 0, len(messageIDs))
+	for _, destinationID := range messageIDs {
+		ref := domain.MessageReference{Available: false}
+		if sourceID := referencedIDs[destinationID]; sourceID != "" {
+			if available, ok := resolved[sourceID]; ok {
+				ref = available
+			}
+		}
+		result = append(result, MessageReferenceResolution{MessageID: destinationID, Reference: ref})
+	}
+	return result, nil
 }
 
 func validateMessageBody(body string) error {
@@ -663,6 +813,9 @@ func (s *MessageService) GetChannelMessage(ctx context.Context, input GetChannel
 	}
 	messages := []domain.Message{msg}
 	if err := s.refreshMentionLabels(ctx, workspaceID, messages); err != nil {
+		return domain.Message{}, err
+	}
+	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, messages); err != nil {
 		return domain.Message{}, err
 	}
 	return messages[0], nil
@@ -769,5 +922,10 @@ func (s *MessageService) GetDMMessage(ctx context.Context, input GetDMMessageInp
 	if msg.DMConversationID != conversationID {
 		return domain.Message{}, domain.ErrNotFound
 	}
+	messages := []domain.Message{msg}
+	if err := s.resolveMessageReferences(ctx, workspaceID, callerID, messages); err != nil {
+		return domain.Message{}, err
+	}
+	msg = messages[0]
 	return msg, nil
 }

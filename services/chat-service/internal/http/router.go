@@ -85,6 +85,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	mux.Handle("GET "+RouteChannelMessage, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetChannelMessage)),
 	))
+	mux.Handle("POST "+RouteChannelReferences, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ResolveChannelMessageReferences)),
+	))
 	mux.Handle("GET "+RouteChannelMentions, authMiddleware(
 		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchMentions)),
 	))
@@ -102,6 +105,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator
 	))
 	mux.Handle("GET "+RouteDMMessage, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
+	))
+	mux.Handle("POST "+RouteDMReferences, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.ResolveDMMessageReferences)),
 	))
 
 	// RF-13/RF-14 message editing, history, soft deletion, and workspace edit-window configuration.

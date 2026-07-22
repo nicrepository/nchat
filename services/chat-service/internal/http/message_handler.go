@@ -37,6 +37,7 @@ type messageProvider interface {
 	ListDMMessages(ctx context.Context, in service.ListDMMessagesInput) (service.ListDMMessagesOutput, error)
 	CreateDMMessage(ctx context.Context, in service.CreateDMMessageInput) (domain.Message, error)
 	GetDMMessage(ctx context.Context, in service.GetDMMessageInput) (domain.Message, error)
+	ResolveMessageReferenceBatch(ctx context.Context, in service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error)
 	EditMessage(ctx context.Context, in service.EditMessageInput) (domain.Message, error)
 	DeleteMessage(ctx context.Context, in service.DeleteMessageInput) (domain.Message, error)
 	GetMessageEditHistory(ctx context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
@@ -118,6 +119,7 @@ type messageJSON struct {
 	Reactions         []reactionJSON `json:"reactions"`
 	IsFavorited       bool           `json:"is_favorited,omitempty"`
 	Quoted            *quoteJSON     `json:"quoted,omitempty"`
+	Reference         *referenceJSON `json:"reference,omitempty"`
 }
 
 type quoteJSON struct {
@@ -130,6 +132,18 @@ type quoteJSON struct {
 	CreatedAt  time.Time  `json:"created_at"`
 }
 
+type referenceJSON struct {
+	Available         bool       `json:"available"`
+	MessageID         string     `json:"message_id,omitempty"`
+	TargetType        string     `json:"target_type,omitempty"`
+	TargetID          string     `json:"target_id,omitempty"`
+	TargetLabel       string     `json:"target_label,omitempty"`
+	AuthorDisplayName string     `json:"author_display_name,omitempty"`
+	Body              string     `json:"body,omitempty"`
+	BodyFormat        string     `json:"body_format,omitempty"`
+	CreatedAt         *time.Time `json:"created_at,omitempty"`
+}
+
 type reactionJSON struct {
 	Emoji       string `json:"emoji"`
 	Count       int    `json:"count"`
@@ -140,6 +154,19 @@ type reactionJSON struct {
 type listMessagesResponseData struct {
 	Messages   []messageJSON `json:"messages"`
 	NextCursor string        `json:"next_cursor,omitempty"`
+}
+
+type resolveMessageReferencesRequest struct {
+	MessageIDs []string `json:"message_ids"`
+}
+
+type messageReferenceResolutionJSON struct {
+	MessageID string        `json:"message_id"`
+	Reference referenceJSON `json:"reference"`
+}
+
+type messageReferenceResolutionsData struct {
+	References []messageReferenceResolutionJSON `json:"references"`
 }
 
 type mentionJSON struct {
@@ -156,14 +183,13 @@ type searchMentionsResponseData struct {
 // ── Request shapes ────────────────────────────────────────────────────────────
 
 // createMessageRequest is the inbound body for POST message endpoints.
-// Only body_text, body_format, and parent_message_id are accepted. Any unrecognised field causes a 400.
-// ForwardedFromMessageID and ReferencedMessageID are reserved for
-// future RF-08 (forward) and RF-09 (thread reference) and are not
-// yet exposed via the API.
+// Only body_text, body_format, parent_message_id, and referenced_message_id are
+// accepted. Any unrecognised field causes a 400.
 type createMessageRequest struct {
-	BodyText        string `json:"body_text"`
-	BodyFormat      string `json:"body_format"`
-	ParentMessageID string `json:"parent_message_id"`
+	BodyText            string `json:"body_text"`
+	BodyFormat          string `json:"body_format"`
+	ParentMessageID     string `json:"parent_message_id"`
+	ReferencedMessageID string `json:"referenced_message_id"`
 }
 
 type editMessageRequest struct {
@@ -280,8 +306,33 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 	} else {
 		j.BodyText = m.BodyText
 		j.Quoted = mapQuoteJSON(m.Quoted)
+		j.Reference = mapReferenceJSON(m)
 	}
 	return j
+}
+
+func mapReferenceJSON(m domain.Message) *referenceJSON {
+	if m.Reference == nil && m.ReferencedMessageID == "" {
+		return nil
+	}
+	if m.Reference == nil || !m.Reference.Available {
+		return &referenceJSON{Available: false}
+	}
+	ref := mapDomainReferenceJSON(*m.Reference)
+	return &ref
+}
+
+func mapDomainReferenceJSON(ref domain.MessageReference) referenceJSON {
+	if !ref.Available {
+		return referenceJSON{Available: false}
+	}
+	createdAt := ref.CreatedAt
+	return referenceJSON{
+		Available: true, MessageID: ref.MessageID,
+		TargetType: ref.TargetType, TargetID: ref.TargetID,
+		TargetLabel: ref.TargetLabel, AuthorDisplayName: ref.AuthorDisplayName,
+		Body: ref.BodyText, BodyFormat: string(ref.BodyFormat), CreatedAt: &createdAt,
+	}
 }
 
 func mapQuoteJSON(q *domain.QuotedMessage) *quoteJSON {
@@ -640,12 +691,13 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	msg, err := h.messages.CreateChannelMessage(r.Context(), service.CreateChannelMessageInput{
-		WorkspaceID:     wsID,
-		ChannelID:       channelID,
-		SenderID:        userID, // always from auth context — never from body
-		BodyText:        req.BodyText,
-		BodyFormat:      domain.MessageBodyFormat(req.BodyFormat),
-		ParentMessageID: req.ParentMessageID,
+		WorkspaceID:         wsID,
+		ChannelID:           channelID,
+		SenderID:            userID, // always from auth context — never from body
+		BodyText:            req.BodyText,
+		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
+		ParentMessageID:     req.ParentMessageID,
+		ReferencedMessageID: req.ReferencedMessageID,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -737,12 +789,13 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 	}
 
 	msg, err := h.messages.CreateDMMessage(r.Context(), service.CreateDMMessageInput{
-		WorkspaceID:     wsID,
-		ConversationID:  convID,
-		SenderID:        userID,
-		BodyText:        req.BodyText,
-		BodyFormat:      domain.MessageBodyFormat(req.BodyFormat),
-		ParentMessageID: req.ParentMessageID,
+		WorkspaceID:         wsID,
+		ConversationID:      convID,
+		SenderID:            userID,
+		BodyText:            req.BodyText,
+		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
+		ParentMessageID:     req.ParentMessageID,
+		ReferencedMessageID: req.ReferencedMessageID,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -836,6 +889,60 @@ func (h *MessageHandler) GetDMMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httputil.WriteJSON(w, http.StatusOK, mapToMessageJSON(msg))
+}
+
+// ResolveChannelMessageReferences re-authorizes RF-09 references for a bounded
+// set of destination messages in one server-side batch.
+func (h *MessageHandler) ResolveChannelMessageReferences(w http.ResponseWriter, r *http.Request) {
+	h.resolveMessageReferences(w, r, r.PathValue("channelID"), "")
+}
+
+// ResolveDMMessageReferences is the DM equivalent of
+// ResolveChannelMessageReferences.
+func (h *MessageHandler) ResolveDMMessageReferences(w http.ResponseWriter, r *http.Request) {
+	h.resolveMessageReferences(w, r, "", r.PathValue("conversationID"))
+}
+
+func (h *MessageHandler) resolveMessageReferences(w http.ResponseWriter, r *http.Request, channelID, conversationID string) {
+	if !h.checkDeps(w) {
+		return
+	}
+	targetID, targetParam := channelID, "channel_id"
+	if targetID == "" {
+		targetID, targetParam = conversationID, "conversation_id"
+	}
+	if !validateTargetID(w, targetID, targetParam) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var req resolveMessageReferencesRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	resolved, err := h.messages.ResolveMessageReferenceBatch(r.Context(), service.ResolveMessageReferencesInput{
+		WorkspaceID: workspaceID, ChannelID: channelID, DMConversationID: conversationID,
+		CallerID: userID, MessageIDs: req.MessageIDs,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	response := messageReferenceResolutionsData{References: make([]messageReferenceResolutionJSON, 0, len(resolved))}
+	for _, resolution := range resolved {
+		response.References = append(response.References, messageReferenceResolutionJSON{
+			MessageID: resolution.MessageID,
+			Reference: mapDomainReferenceJSON(resolution.Reference),
+		})
+	}
+	httputil.WriteJSON(w, http.StatusOK, response)
 }
 
 func mapMessages(msgs []domain.Message) []messageJSON {

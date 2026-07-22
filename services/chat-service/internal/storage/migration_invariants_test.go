@@ -240,6 +240,22 @@ func TestChatMigration_AddsParentReplyMigration(t *testing.T) {
 	}
 }
 
+func TestChatMigration_CrossChannelReferencePreservesUnavailableTombstone(t *testing.T) {
+	up := readChatMigration(t, "000014_cross_channel_message_reference.up.sql")
+	if !strings.Contains(up, "DROP CONSTRAINT IF EXISTS messages_referenced_message_id_fkey") {
+		t.Fatal("RF-09 up migration must allow the opaque source ID to outlive its origin")
+	}
+	down := readChatMigration(t, "000014_cross_channel_message_reference.down.sql")
+	for _, expected := range []string{
+		"ADD CONSTRAINT messages_referenced_message_id_fkey",
+		"FOREIGN KEY (referenced_message_id) REFERENCES chat.messages (id) NOT VALID",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("RF-09 down migration missing %q", expected)
+		}
+	}
+}
+
 func TestChatMigration_MessagesDownDoesNotDropSchemaCascade(t *testing.T) {
 	migration := readChatMigration(t, "000004_chat_messages.down.sql")
 	if strings.Contains(strings.ToUpper(migration), "DROP SCHEMA") {

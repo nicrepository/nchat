@@ -63,6 +63,9 @@ type MessagePayload struct {
 	EditedAt          *time.Time    `json:"edited_at,omitempty"`
 	DeletedAt         *time.Time    `json:"deleted_at,omitempty"`
 	Quoted            *QuotePayload `json:"quoted,omitempty"`
+	// HasReference forces route-only delivery so each subscriber resolves RF-09
+	// through an authenticated GET. It is process-local and never serialized.
+	HasReference bool `json:"-"`
 }
 
 // MessageUpdatedPayload carries authoritative edit or deletion fields.

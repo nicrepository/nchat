@@ -206,6 +206,7 @@ interface MessageResponse {
   reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited?: boolean;
   quoted?: QuoteResponse;
+  reference?: ReferenceResponse;
 }
 
 interface QuoteResponse {
@@ -216,6 +217,24 @@ interface QuoteResponse {
   is_removed?: boolean;
   deleted_at?: string;
   created_at: string;
+}
+
+interface ReferenceResponse {
+  available: boolean;
+  message_id?: string;
+  target_type?: "channel" | "dm";
+  target_id?: string;
+  target_label?: string;
+  author_display_name?: string;
+  body?: string;
+  body_format?: MessageBodyFormat;
+  created_at?: string;
+}
+
+interface MessageReferenceResolutionsEnvelope {
+  data: {
+    references: Array<{ message_id: string; reference: ReferenceResponse }>;
+  };
 }
 
 interface FavoriteResponse {
@@ -341,6 +360,7 @@ function mapMessage(r: MessageResponse): Message {
     })),
     isFavorited: r.is_favorited ?? false,
     quoted: !isRemoved && r.quoted ? mapQuote(r.quoted) : undefined,
+    reference: !isRemoved && r.reference ? mapReference(r.reference) : undefined,
   };
 }
 
@@ -375,6 +395,29 @@ function mapQuote(r: QuoteResponse): Message["quoted"] {
   };
 }
 
+function mapReference(r: ReferenceResponse): NonNullable<Message["reference"]> {
+  if (
+    !r.available ||
+    !r.message_id ||
+    (r.target_type !== "channel" && r.target_type !== "dm") ||
+    !r.target_id ||
+    !r.created_at
+  ) {
+    return { available: false };
+  }
+  return {
+    available: true,
+    messageId: r.message_id,
+    targetType: r.target_type,
+    targetId: r.target_id,
+    targetLabel: r.target_label ?? "",
+    authorDisplayName: r.author_display_name ?? "",
+    bodyText: r.body ?? "",
+    bodyFormat: normalizeBodyFormat(r.body_format),
+    createdAt: r.created_at,
+  };
+}
+
 /** Returns the base path for the message collection of a channel or DM. */
 export function messagesPath(kind: "channel" | "dm", id: string): string {
   const segment = kind === "channel" ? "channels" : "dm";
@@ -405,6 +448,7 @@ export async function postChannelMessage(
   channelId: string,
   bodyText: string,
   parentMessageId?: string,
+  referencedMessageId?: string,
   signal?: AbortSignal,
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
@@ -414,6 +458,7 @@ export async function postChannelMessage(
       body_text: bodyText,
       body_format: "v3",
       ...(parentMessageId ? { parent_message_id: parentMessageId } : {}),
+      ...(referencedMessageId ? { referenced_message_id: referencedMessageId } : {}),
     }),
     signal,
   });
@@ -431,6 +476,43 @@ export async function fetchDMMessages(
     messages: (res.data.messages ?? []).map(mapMessage),
     nextCursor: res.data.next_cursor ?? "",
   };
+}
+
+export async function resolveChannelMessageReferences(
+  channelId: string,
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, NonNullable<Message["reference"]>>> {
+  return resolveMessageReferences("channel", channelId, messageIds, signal);
+}
+
+export async function resolveDMMessageReferences(
+  conversationId: string,
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, NonNullable<Message["reference"]>>> {
+  return resolveMessageReferences("dm", conversationId, messageIds, signal);
+}
+
+async function resolveMessageReferences(
+  kind: "channel" | "dm",
+  targetId: string,
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, NonNullable<Message["reference"]>>> {
+  const targetSegment = kind === "channel" ? "channels" : "dm";
+  const res = await authenticatedFetch<MessageReferenceResolutionsEnvelope>(
+    `${CHAT_BASE}/${targetSegment}/${encodeURIComponent(targetId)}/message-references`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message_ids: messageIds }),
+      signal,
+    },
+  );
+  return Object.fromEntries(
+    (res.data.references ?? []).map((item) => [item.message_id, mapReference(item.reference)]),
+  );
 }
 
 export async function fetchMentionCandidates(
@@ -452,6 +534,7 @@ export async function postDMMessage(
   conversationId: string,
   bodyText: string,
   parentMessageId?: string,
+  referencedMessageId?: string,
   signal?: AbortSignal,
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
@@ -461,6 +544,7 @@ export async function postDMMessage(
       body_text: bodyText,
       body_format: "v2",
       ...(parentMessageId ? { parent_message_id: parentMessageId } : {}),
+      ...(referencedMessageId ? { referenced_message_id: referencedMessageId } : {}),
     }),
     signal,
   });

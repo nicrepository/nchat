@@ -15,7 +15,8 @@ import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
 import type { CodecFormat } from "./tiptapSerializer";
-import type { MessageBodyFormat } from "./chatTypes";
+import type { Message, MessageBodyFormat } from "./chatTypes";
+import { senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
@@ -48,6 +49,9 @@ export interface ChatComposerProps {
   disabled?: boolean;
   replyPreview?: ComposerReplyPreview | null;
   onCancelReply?: () => void;
+  referencePreview?: PendingReferencePreview;
+  referenceTargetLabel?: string;
+  onCancelReference?: () => void;
   onSend: (body: string) => Promise<SendResult>;
 }
 
@@ -56,6 +60,62 @@ export interface ComposerReplyPreview {
   bodyText: string;
   bodyFormat: MessageBodyFormat;
   isRemoved: boolean;
+}
+
+export type PendingReferencePreview =
+  | { status: "idle" }
+  | { status: "loading"; messageId: string }
+  | { status: "available"; messageId: string; message: Message }
+  | { status: "unavailable"; messageId: string };
+
+function ComposerReference({
+  preview,
+  targetLabel,
+  onCancel,
+}: {
+  preview: PendingReferencePreview;
+  targetLabel: string;
+  onCancel?: () => void;
+}) {
+  if (preview.status === "idle") return null;
+
+  return (
+    <div className="chat-msg-area__composer-quote" data-testid="chat-composer-reference">
+      <div className="chat-msg-area__composer-quote-body">
+        {preview.status === "loading" && (
+          <div className="chat-msg-area__quote-excerpt" role="status">
+            Carregando citação…
+          </div>
+        )}
+        {preview.status === "unavailable" && (
+          <div className="chat-msg-area__quote-excerpt">citação indisponível</div>
+        )}
+        {preview.status === "available" && (
+          <>
+            <div className="chat-msg-area__quote-author">
+              {senderLabel(preview.message)} · {targetLabel}
+            </div>
+            <div className="chat-msg-area__quote-excerpt">
+              <RichTextRenderer
+                text={preview.message.bodyText}
+                bodyFormat={preview.message.bodyFormat}
+              />
+            </div>
+          </>
+        )}
+      </div>
+      <button
+        type="button"
+        className="chat-msg-area__composer-quote-close"
+        aria-label="Cancelar citação"
+        onClick={onCancel}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          close
+        </span>
+      </button>
+    </div>
+  );
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -67,6 +127,9 @@ export default function ChatComposer({
   disabled = false,
   replyPreview = null,
   onCancelReply,
+  referencePreview = { status: "idle" },
+  referenceTargetLabel = "Conversa",
+  onCancelReference,
   onSend,
 }: ChatComposerProps) {
   const { editor, canSend, sending, handleSend } = useChatEditor({
@@ -76,18 +139,20 @@ export default function ChatComposer({
     bodyFormat,
     onSend,
   });
-  const prevReplyRef = useRef<typeof replyPreview>(null);
+  const hadContextRef = useRef(false);
 
   useEffect(() => {
-    if (replyPreview && !prevReplyRef.current && editor && !disabled) {
+    const hasContext = Boolean(replyPreview) || referencePreview.status !== "idle";
+    if (hasContext && !hadContextRef.current && editor && !disabled) {
       editor.commands.focus("end");
     }
-    prevReplyRef.current = replyPreview;
-  }, [disabled, editor, replyPreview]);
+    hadContextRef.current = hasContext;
+  }, [disabled, editor, referencePreview.status, replyPreview]);
 
   const handleKeyDownCapture = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Escape" || !replyPreview) return;
-    onCancelReply?.();
+    if (event.key !== "Escape") return;
+    if (referencePreview.status !== "idle") onCancelReference?.();
+    else if (replyPreview) onCancelReply?.();
   };
 
   return (
@@ -123,6 +188,11 @@ export default function ChatComposer({
             </button>
           </div>
         )}
+        <ComposerReference
+          preview={referencePreview}
+          targetLabel={referenceTargetLabel}
+          onCancel={onCancelReference}
+        />
         <div className="chat-msg-area__composer-editor-wrap">
           {editor?.isEmpty && !editor.isActive("listItem") && (
             <div className="chat-msg-area__composer-placeholder" aria-hidden="true">

@@ -36,6 +36,7 @@ export interface MessageBubbleProps {
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onReplyMessage: (message: Message) => void;
+  onReferenceMessage: (message: Message) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   onEditMessage: (
     messageId: string,
@@ -59,6 +60,7 @@ export interface MessageBubbleProps {
   quoteAuthorLabel?: string;
   canJumpToQuote?: boolean;
   onQuoteJump?: (messageId: string) => void;
+  onReferenceJump?: (reference: NonNullable<Message["reference"]>) => void;
   isHighlighted?: boolean;
   setMessageRef?: (messageId: string, el: HTMLDivElement | null) => void;
 }
@@ -69,6 +71,7 @@ type MessageReactionsProps = Pick<
   | "isMine"
   | "onToggleReaction"
   | "onReplyMessage"
+  | "onReferenceMessage"
   | "onToggleFavorite"
   | "onTogglePin"
   | "isPinned"
@@ -91,6 +94,7 @@ function MessageReactions({
   bubbleRef,
   onToggleReaction,
   onReplyMessage,
+  onReferenceMessage,
   onToggleFavorite,
   onTogglePin,
   isPinned = false,
@@ -233,6 +237,15 @@ function MessageReactions({
           <button type="button" aria-label="Responder" onClick={() => onReplyMessage(message)}>
             <span className="material-symbols-outlined" aria-hidden="true">
               reply
+            </span>
+          </button>
+          <button
+            type="button"
+            aria-label="Citar em outra conversa"
+            onClick={() => onReferenceMessage(message)}
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              format_quote
             </span>
           </button>
           {onStartEdit && (
@@ -394,12 +407,62 @@ function QuoteBlock({ quote, authorLabel, canJump, onJump }: QuoteBlockProps) {
   );
 }
 
+function ReferenceBlock({
+  reference,
+  onJump,
+}: {
+  reference: NonNullable<Message["reference"]>;
+  onJump?: (reference: NonNullable<Message["reference"]>) => void;
+}) {
+  if (!reference.available) {
+    return (
+      <div
+        className="chat-msg-area__reference chat-msg-area__reference--unavailable"
+        aria-disabled="true"
+        data-testid="chat-message-reference"
+      >
+        citação indisponível
+      </div>
+    );
+  }
+  const targetLabel = reference.targetLabel
+    ? `${reference.targetType === "channel" ? "#" : ""}${reference.targetLabel}`
+    : reference.targetType === "channel"
+      ? "Canal"
+      : "Conversa";
+  return (
+    <div
+      className="chat-msg-area__reference chat-msg-area__reference--clickable"
+      data-testid="chat-message-reference"
+      role="link"
+      tabIndex={0}
+      aria-label="Ir para mensagem citada"
+      onClick={() => onJump?.(reference)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onJump?.(reference);
+        }
+      }}
+    >
+      <span className="chat-msg-area__reference-origin">{targetLabel}</span>
+      <div className="chat-msg-area__reference-author">
+        {reference.authorDisplayName || "Usuário"}
+      </div>
+      <div className="chat-msg-area__reference-body">
+        <RichTextRenderer text={reference.bodyText} bodyFormat={reference.bodyFormat} />
+      </div>
+    </div>
+  );
+}
+
 export default function MessageBubble({
   message,
   isMine = false,
   isGrouped = false,
   onToggleReaction,
   onReplyMessage,
+  onReferenceMessage,
   onToggleFavorite,
   onEditMessage,
   onEditForbidden,
@@ -417,6 +480,7 @@ export default function MessageBubble({
   quoteAuthorLabel,
   canJumpToQuote = false,
   onQuoteJump,
+  onReferenceJump,
   isHighlighted = false,
   setMessageRef,
 }: MessageBubbleProps) {
@@ -483,6 +547,9 @@ export default function MessageBubble({
           ref={bubbleRef}
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
+          {message.reference && !message.isRemoved && (
+            <ReferenceBlock reference={message.reference} onJump={onReferenceJump} />
+          )}
           {/* Quote ocultado em mensagens removidas para não misturar contexto residual com o placeholder de remoção. */}
           {message.quoted && !message.isRemoved && (
             <QuoteBlock
@@ -512,6 +579,7 @@ export default function MessageBubble({
           bubbleRef={bubbleRef}
           onToggleReaction={onToggleReaction}
           onReplyMessage={onReplyMessage}
+          onReferenceMessage={onReferenceMessage}
           onToggleFavorite={onToggleFavorite}
           onTogglePin={onTogglePin}
           isPinned={isPinned}

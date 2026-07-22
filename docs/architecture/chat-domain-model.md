@@ -138,7 +138,7 @@ creating the channel in this path.
 | status                    | text        | active / deleted (soft delete)                             |
 | parent_message_id         | uuid        | Nullable; self-ref FK for quote-reply (RF-07)              |
 | forwarded_from_message_id | uuid        | Nullable; self-ref FK for forwarding (RF-08)               |
-| referenced_message_id     | uuid        | Nullable; self-ref FK for references (RF-09)               |
+| referenced_message_id     | uuid        | Nullable; opaque source ID for references (RF-09)          |
 | edited_at                 | timestamptz | Nullable; set on first edit (RF-13)                        |
 | deleted_at                | timestamptz | Nullable; set on soft delete (RF-14, RF-66)                |
 | created_at                | timestamptz |                                                            |
@@ -342,10 +342,9 @@ target IDs all yield `ErrNotFound`.
 ### Reference messages (parent, forwarded_from, referenced)
 
 `parent_message_id`, `forwarded_from_message_id`, and `referenced_message_id`
-are nullable placeholders for quote-reply (RF-07), forwarding (RF-08), and
-references (RF-09). In this foundation PR all three fields are **same-target only**:
-the referenced message must belong to the same workspace and the same target
-(channel or DM conversation) as the new message.
+represent quote-reply (RF-07), forwarding (RF-08), and cross-target references
+(RF-09). Parent and forwarding remain same-target. RF-09 requires a different
+channel or DM in the same workspace and stores no content snapshot.
 
 Validation is **non-enumerating**: missing, cross-workspace, cross-channel,
 and cross-DM references all return the same `domain.ErrInvalidMessageReference`
@@ -359,8 +358,20 @@ TOCTOU backstop). `ErrInvalidMessageReference` is returned by the service's
 pre-validation step (`ValidateRefMessageInTarget`) before `CreateMessage` is
 ever called.
 
-Cross-target references (channel → DM or DM → channel) are invalid in this PR.
-Allowing them is future scope and must be explicitly documented and tested if added.
+RF-09 previews are resolved at read time with the caller's current channel/DM
+access. Inaccessible, deleted, missing, or cross-workspace origins expose only a
+generic unavailable state. The opaque ID intentionally has no FK so a hard-deleted
+origin remains distinguishable from a message that never had a reference without
+retaining protected content.
+
+Mounted clients periodically re-authorize displayed references through the
+page-sized batch endpoints (maximum 100 destination IDs per request)
+`POST /api/chat/channels/{channelID}/message-references`
+and `POST /api/chat/dm/{conversationID}/message-references`. Each response is
+scoped to the authenticated reader and returns only the destination message ID
+plus its freshly resolved reference; unavailable origins contain only
+`{"available":false}`. A newer batch cancels and supersedes an older one so an
+out-of-order response cannot restore a revoked preview.
 
 ### Soft delete and message lifecycle
 

@@ -21,7 +21,7 @@
  * Cleanup happens on unmount and target change via useChatWebSocket's effect.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef } from "react";
 
 import {
   deleteMessage as deleteMessageRequest,
@@ -33,6 +33,8 @@ import {
   fetchDMMessages,
   postChannelMessage,
   postDMMessage,
+  resolveChannelMessageReferences,
+  resolveDMMessageReferences,
   unfavoriteMessage,
 } from "./chatApi";
 import { normalizeBodyFormat, type Message, type MessagePage } from "./chatTypes";
@@ -58,6 +60,9 @@ type MessagesStatus = "idle" | "loading" | "ready" | "error";
  *               to bottom only when the user is already near the bottom.
  */
 export type LastMutation = "initial" | "append" | "prepend" | "ws_append" | "none";
+
+const referenceRevalidationMs = 15_000;
+const referenceRevalidationBatchSize = 100;
 
 export interface MessagesState {
   status: MessagesStatus;
@@ -118,6 +123,10 @@ type Action =
   | { type: "edit_revert"; message: Message; optimisticEditedAt: string }
   | { type: "message_updated"; event: WSMessageUpdatedEvent }
   | { type: "message_snapshot"; message: Message; insertIfMissing: boolean }
+  | {
+      type: "references_refreshed";
+      references: Record<string, NonNullable<Message["reference"]>>;
+    }
   | { type: "delete_error"; error: string }
   | { type: "reaction_updated"; event: WSReactionUpdatedEvent; actorIsMe: boolean }
   | { type: "reaction_snapshot"; messageId: string; reactions: Message["reactions"] }
@@ -412,6 +421,14 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         realtimeError: null,
       };
     }
+    case "references_refreshed":
+      return {
+        ...state,
+        messages: state.messages.map((message) => {
+          const reference = action.references[message.id];
+          return reference && message.reference ? { ...message, reference } : message;
+        }),
+      };
     case "delete_error":
       return { ...state, actionError: action.error };
     case "ws_fetch_error":
@@ -529,6 +546,8 @@ interface UseMessagesOptions {
   kind: "channel" | "dm";
   targetId: string;
   currentUserId: string;
+  /** Direct-navigation target resolved through the authorized single-message GET. */
+  focusMessageId?: string;
   onOwnReactionConfirmed?: (emoji: string) => void;
   /** RF-05: called on a pin.updated event for the active target (refetch pins). */
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
@@ -537,7 +556,7 @@ interface UseMessagesOptions {
 
 export interface UseMessagesResult {
   state: MessagesState;
-  sendMessage: (body: string) => Promise<SendResult>;
+  sendMessage: (body: string, referencedMessageId?: string) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;
   selectReply: (message: Message) => void;
@@ -556,6 +575,7 @@ export function useMessages({
   kind,
   targetId,
   currentUserId,
+  focusMessageId,
   onOwnReactionConfirmed,
   onPinUpdated,
   onMessageRemoved,
@@ -684,7 +704,27 @@ export function useMessages({
           ? () => fetchChannelMessages(id, undefined, ctrl.signal)
           : () => fetchDMMessages(id, undefined, ctrl.signal);
 
-      fetchFn().then(
+      const fetchPage = async (): Promise<MessagePage> => {
+        const page = await fetchFn();
+        if (!focusMessageId || page.messages.some((message) => message.id === focusMessageId)) {
+          return page;
+        }
+        try {
+          const focused =
+            k === "channel"
+              ? await fetchChannelMessage(id, focusMessageId, ctrl.signal)
+              : await fetchDMMessage(id, focusMessageId, ctrl.signal);
+          return {
+            ...page,
+            messages: insertMessageChronologically(page.messages, focused).messages,
+          };
+        } catch {
+          // Invalid, removed, or inaccessible focus IDs never reveal which case occurred.
+          return page;
+        }
+      };
+
+      fetchPage().then(
         (page) => {
           if (!isCurrentTarget(loadKey)) return;
           dispatch({
@@ -707,13 +747,97 @@ export function useMessages({
         pendingReactionTimersRef.current.clear();
       };
     },
-    [abortWsFallbacks, isCurrentTarget, sanitizeTombstonedMessage],
+    [abortWsFallbacks, focusMessageId, isCurrentTarget, sanitizeTombstonedMessage],
   );
 
   useEffect(() => {
     if (!targetId) return;
     return load(targetId, kind);
   }, [kind, targetId, load]);
+
+  const referencedMessageIDs = useMemo(
+    () => state.messages.filter((message) => message.reference).map((message) => message.id),
+    [state.messages],
+  );
+  const referencedMessageIDsKey = referencedMessageIDs.join(",");
+
+  useEffect(() => {
+    if (!targetId || !referencedMessageIDsKey) return;
+    const loadKey = `${kind}:${targetId}`;
+    const allMessageIDs = referencedMessageIDsKey.split(",");
+    const messageIDs = allMessageIDs.slice(-referenceRevalidationBatchSize);
+    const overflowMessageIDs = allMessageIDs.slice(0, -referenceRevalidationBatchSize);
+    if (overflowMessageIDs.length > 0) {
+      dispatch({
+        type: "references_refreshed",
+        references: Object.fromEntries(
+          overflowMessageIDs.map((messageID) => [messageID, { available: false }]),
+        ),
+      });
+    }
+    let generation = 0;
+    let activeController: AbortController | null = null;
+    let disposed = false;
+    let revalidationScheduled = false;
+
+    const revalidate = () => {
+      generation += 1;
+      const currentGeneration = generation;
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+      const request =
+        kind === "channel"
+          ? resolveChannelMessageReferences(targetId, messageIDs, controller.signal)
+          : resolveDMMessageReferences(targetId, messageIDs, controller.signal);
+      void request.then(
+        (references) => {
+          if (disposed || currentGeneration !== generation || !isCurrentTarget(loadKey)) return;
+          dispatch({
+            type: "references_refreshed",
+            references: Object.fromEntries(
+              messageIDs.map((messageID) => [
+                messageID,
+                references[messageID] ?? { available: false },
+              ]),
+            ),
+          });
+        },
+        () => {
+          if (disposed || currentGeneration !== generation || !isCurrentTarget(loadKey)) return;
+          dispatch({
+            type: "references_refreshed",
+            references: Object.fromEntries(
+              messageIDs.map((messageID) => [messageID, { available: false }]),
+            ),
+          });
+        },
+      );
+    };
+    const scheduleRevalidation = () => {
+      if (revalidationScheduled) return;
+      revalidationScheduled = true;
+      queueMicrotask(() => {
+        revalidationScheduled = false;
+        if (!disposed) revalidate();
+      });
+    };
+
+    const timer = window.setInterval(revalidate, referenceRevalidationMs);
+    window.addEventListener("focus", scheduleRevalidation);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") scheduleRevalidation();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      disposed = true;
+      generation += 1;
+      activeController?.abort();
+      window.clearInterval(timer);
+      window.removeEventListener("focus", scheduleRevalidation);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [isCurrentTarget, kind, referencedMessageIDsKey, targetId]);
 
   const retry = useCallback(() => {
     if (targetId) load(targetId, kind);
@@ -761,7 +885,7 @@ export function useMessages({
   }, [kind, targetId, isCurrentTarget, sanitizeTombstonedMessage]);
 
   const sendMessage = useCallback(
-    async (body: string): Promise<SendResult> => {
+    async (body: string, referencedMessageId?: string): Promise<SendResult> => {
       if (!targetId || !body.trim()) return { status: "stale" };
 
       const sendKey = `${kind}:${targetId}`;
@@ -771,8 +895,8 @@ export function useMessages({
       try {
         const sendFn =
           kind === "channel"
-            ? () => postChannelMessage(targetId, body, parentMessageId)
-            : () => postDMMessage(targetId, body, parentMessageId);
+            ? () => postChannelMessage(targetId, body, parentMessageId, referencedMessageId)
+            : () => postDMMessage(targetId, body, parentMessageId, referencedMessageId);
 
         const msg = await sendFn();
 

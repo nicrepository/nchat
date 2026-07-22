@@ -70,6 +70,11 @@ type Message struct {
 	// Quoted is the immediate parent message preview for quote-reply.
 	// It is intentionally one level only; nested parent quotes are not populated.
 	Quoted *QuotedMessage
+
+	// Reference is the caller-authorized RF-09 preview. When the message has a
+	// reference but the caller cannot currently read its origin, Available is false
+	// and every other field is empty.
+	Reference *MessageReference
 }
 
 // MessageEditHistory is a previous persisted version of a message body.
@@ -113,6 +118,21 @@ type QuotedMessage struct {
 	Status     MessageStatus
 	DeletedAt  time.Time
 	CreatedAt  time.Time
+}
+
+// MessageReference is the one-level, read-time preview of a cross-target
+// message reference. It deliberately excludes author IDs, reactions, edit
+// history, deletion state, attachments, and nested references.
+type MessageReference struct {
+	Available         bool
+	MessageID         string
+	TargetType        string
+	TargetID          string
+	TargetLabel       string
+	AuthorDisplayName string
+	BodyText          string
+	BodyFormat        MessageBodyFormat
+	CreatedAt         time.Time
 }
 
 // FavoriteMessage is one entry in a user's private favorites list.
