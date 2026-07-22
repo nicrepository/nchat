@@ -26,6 +26,19 @@ interface RawMessage {
   reactions: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited: boolean;
   quoted?: RawQuote;
+  reference?: RawReference;
+}
+
+interface RawReference {
+  available: boolean;
+  message_id?: string;
+  target_type?: TargetKind;
+  target_id?: string;
+  target_label?: string;
+  author_display_name?: string;
+  body?: string;
+  body_format?: "v1" | "v2" | "v3";
+  created_at?: string;
 }
 
 interface RawQuote {
@@ -61,8 +74,16 @@ export interface MessagingScenario {
   targetName: string;
   messagesByTarget: Map<string, RawMessage[]>;
   requests: {
-    channelPosts: Array<{ body_text?: string; parent_message_id?: string }>;
-    dmPosts: Array<{ body_text?: string; parent_message_id?: string }>;
+    channelPosts: Array<{
+      body_text?: string;
+      parent_message_id?: string;
+      referenced_message_id?: string;
+    }>;
+    dmPosts: Array<{
+      body_text?: string;
+      parent_message_id?: string;
+      referenced_message_id?: string;
+    }>;
     patches: PatchRequest[];
     deletes: string[];
   };
@@ -99,6 +120,7 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     reactions: overrides.reactions ?? [],
     is_favorited: overrides.is_favorited ?? false,
     quoted: overrides.quoted,
+    reference: overrides.reference,
   };
 }
 
@@ -188,15 +210,33 @@ export async function installMessagingMocks(
       body: JSON.stringify({
         data: {
           current_user_id: CURRENT_USER_ID,
-          channels: [
-            {
-              id: scenario.kind === "channel" ? scenario.targetId : "e2e-channel-other",
-              slug: "e2e-canal",
-              display_name: scenario.kind === "channel" ? scenario.targetName : "Canal E2E",
-              type: "public",
-              unread_count: 0,
-            },
-          ],
+          channels:
+            scenario.kind === "channel"
+              ? [
+                  {
+                    id: scenario.targetId,
+                    slug: "e2e-canal",
+                    display_name: scenario.targetName,
+                    type: "public",
+                    unread_count: 0,
+                  },
+                  {
+                    id: "e2e-channel-other",
+                    slug: "e2e-canal-secundario",
+                    display_name: "Canal E2E",
+                    type: "public",
+                    unread_count: 0,
+                  },
+                ]
+              : [
+                  {
+                    id: "e2e-channel-other",
+                    slug: "e2e-canal",
+                    display_name: "Canal E2E",
+                    type: "public",
+                    unread_count: 0,
+                  },
+                ],
           dm_conversations: [
             {
               id: scenario.kind === "dm" ? scenario.targetId : "e2e-dm-other",
@@ -342,6 +382,14 @@ export async function installMessagingMocks(
     await route.fallback();
   });
 
+  await page.route("**/api/chat/channels/*/messages/*", async (route) => {
+    await handleSingleTargetMessageRoute(route, scenario, "channel");
+  });
+
+  await page.route("**/api/chat/dm/*/messages/*", async (route) => {
+    await handleSingleTargetMessageRoute(route, scenario, "dm");
+  });
+
   await page.route("**/api/chat/channels/*/messages", async (route) => {
     await handleTargetMessagesRoute(route, scenario, "channel");
   });
@@ -349,6 +397,42 @@ export async function installMessagingMocks(
   await page.route("**/api/chat/dm/*/messages", async (route) => {
     await handleTargetMessagesRoute(route, scenario, "dm");
   });
+
+  await page.route("**/api/chat/**/message-references", async (route) => {
+    const body = (await route.request().postDataJSON()) as { message_ids?: string[] };
+    const references = (body.message_ids ?? []).map((messageId) => ({
+      message_id: messageId,
+      reference: findMessageLocation(scenario, messageId)?.message.reference ?? {
+        available: false,
+      },
+    }));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { references } }),
+    });
+  });
+}
+
+async function handleSingleTargetMessageRoute(
+  route: Route,
+  scenario: MessagingScenario,
+  routeKind: TargetKind,
+) {
+  const target = parseMessagesTarget(route.request().url(), routeKind);
+  const messageId = decodeMessageId(route.request().url(), 1);
+  const location = messageId ? findMessageLocation(scenario, messageId) : undefined;
+  if (
+    route.request().method() !== "GET" ||
+    !target ||
+    !location ||
+    location.kind !== routeKind ||
+    location.targetId !== target.targetId
+  ) {
+    await route.fulfill({ status: 404 });
+    return;
+  }
+  await fulfillMessage(route, location.message);
 }
 
 async function handleTargetMessagesRoute(
@@ -378,12 +462,20 @@ async function handleTargetMessagesRoute(
       body_text?: string;
       body_format?: RawMessage["body_format"];
       parent_message_id?: string;
+      referenced_message_id?: string;
     };
     const requests =
       routeKind === "channel" ? scenario.requests.channelPosts : scenario.requests.dmPosts;
-    requests.push({ body_text: body.body_text, parent_message_id: body.parent_message_id });
+    requests.push({
+      body_text: body.body_text,
+      parent_message_id: body.parent_message_id,
+      referenced_message_id: body.referenced_message_id,
+    });
 
     const parent = messages.find((message) => message.id === body.parent_message_id);
+    const source = body.referenced_message_id
+      ? findMessageLocation(scenario, body.referenced_message_id)
+      : undefined;
     const created = makeMessage({
       id: `${target.targetId}-reply-${messages.length + 1}`,
       sender_id: CURRENT_USER_ID,
@@ -393,6 +485,24 @@ async function handleTargetMessagesRoute(
       created_at: "2026-07-15T12:03:00.000Z",
       updated_at: "2026-07-15T12:03:00.000Z",
       quoted: parent ? quoteFrom(parent) : undefined,
+      reference: source
+        ? {
+            available: true,
+            message_id: source.message.id,
+            target_type: source.kind,
+            target_id: source.targetId,
+            target_label:
+              source.targetId === scenario.targetId
+                ? scenario.targetName
+                : source.kind === "channel"
+                  ? "Canal E2E"
+                  : OTHER_USER_NAME,
+            author_display_name: source.message.sender_display_name,
+            body: source.message.body_text ?? "",
+            body_format: source.message.body_format,
+            created_at: source.message.created_at,
+          }
+        : undefined,
     });
     messages.push(created);
     await fulfillMessage(route, created);
@@ -490,7 +600,7 @@ export async function fillComposer(page: Page, text: string) {
   const input = page.getByTestId("chat-composer-input");
   await expect(input).toBeVisible();
   await input.click();
-  await pasteWithKeyboard(page, text);
+  await page.keyboard.insertText(text);
   await expect(input).toContainText(text);
 }
 
@@ -501,9 +611,4 @@ export async function replaceEditorText(page: Page, editor: Locator, text: strin
   await page.keyboard.press("Backspace");
   await page.keyboard.type(text);
   await expect(editor).toHaveText(text);
-}
-
-async function pasteWithKeyboard(page: Page, text: string) {
-  await page.evaluate((value) => navigator.clipboard.writeText(value), text);
-  await page.keyboard.press(process.platform === "darwin" ? "Meta+V" : "Control+V");
 }
