@@ -2,20 +2,30 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/config"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
+	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
 func TestNewCreatesApp(t *testing.T) {
 	cfg := config.Config{ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5}
 
-	app := New(cfg)
+	app, err := New(cfg)
 
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if app == nil {
 		t.Fatal("expected app")
 	}
@@ -30,21 +40,148 @@ func TestNewCreatesApp(t *testing.T) {
 	}
 }
 
-func TestNewWithUnreachableDB_DisablesAdminEndpoint(t *testing.T) {
-	// Port 9 is discard protocol — connections are refused immediately.
-	// DATABASE_URL contains a dummy password for testing purposes only.
-	t.Setenv("DATABASE_URL", "postgres://nchat:pass@localhost:9/nonexistent?sslmode=disable") //nolint:gosec
-	t.Setenv("DB_CONNECT_TIMEOUT_SECONDS", "1")
+// stubPool is a non-nil storage.Pool whose methods are never called during
+// bootstrap wiring (constructors only store the pool).
+type stubPool struct{ storage.Pool }
 
-	cfg := config.Load()
+// stubOpenDB swaps the bootstrap DB opener for the duration of the test.
+// Tests in this package must not use t.Parallel while a stub is installed.
+func stubOpenDB(t *testing.T, fn func(context.Context, string, int, *slog.Logger) (storage.Pool, error)) {
+	t.Helper()
+	previous := openDBWithRetry
+	openDBWithRetry = fn
+	t.Cleanup(func() { openDBWithRetry = previous })
+}
 
-	app := New(cfg)
+func TestNewWithUnreachableDB_FailsFast(t *testing.T) {
+	// The DSN below never reaches the network: the opener is stubbed. It only
+	// serves as a known fragment that must not leak into the returned error.
+	const testDSN = "postgres://nchat:sentinel-password@db.invalid:5432/nchat" //nolint:gosec
+	attempts := 0
+	stubOpenDB(t, func(context.Context, string, int, *slog.Logger) (storage.Pool, error) {
+		attempts++
+		return nil, storage.ErrDBBootstrapFailed
+	})
 
-	if app == nil {
-		t.Fatal("expected app even when DB is unavailable")
+	cfg := config.Config{ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5, DatabaseURL: testDSN, DBConnectTimeoutSeconds: 1}
+	start := time.Now()
+	app, err := New(cfg)
+
+	if err == nil {
+		t.Fatal("expected bootstrap error when DATABASE_URL is set and the DB is unreachable")
 	}
-	if app.Handler == nil {
-		t.Fatal("expected handler")
+	if !errors.Is(err, storage.ErrDBBootstrapFailed) {
+		t.Fatalf("expected sanitized ErrDBBootstrapFailed, got %v", err)
+	}
+	for _, fragment := range []string{"sentinel-password", "db.invalid", "5432"} {
+		if strings.Contains(err.Error(), fragment) {
+			t.Fatalf("bootstrap error must not leak DSN details (%q): %v", fragment, err)
+		}
+	}
+	if app != nil {
+		t.Fatal("expected no app when DB bootstrap fails; a degraded server must not start")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected exactly one opener call, got %d", attempts)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fail-fast path must not sleep for real; took %s", elapsed)
+	}
+}
+
+// TestNewWithStubbedDB_ReadyzReportsReady covers the success path without a
+// real database: with a stubbed pool and valid JWT config, the app boots and
+// /readyz reports 200 with every mandatory check passing.
+func TestNewWithStubbedDB_ReadyzReportsReady(t *testing.T) {
+	stubOpenDB(t, func(context.Context, string, int, *slog.Logger) (storage.Pool, error) {
+		return stubPool{}, nil
+	})
+
+	cfg := config.Config{
+		ServiceName:                "auth-service",
+		Env:                        "test",
+		Port:                       8081,
+		ReadHeaderTimeoutSeconds:   5,
+		DatabaseURL:                "postgres://stubbed",
+		DBConnectTimeoutSeconds:    1,
+		AuthJWTHMACSecret:          strings.Repeat("a", 32),
+		AuthJWTIssuer:              "test-issuer",
+		AuthJWTAudience:            "test-audience",
+		AuthAccessTokenTTLSeconds:  900,
+		AuthRefreshTokenTTLSeconds: 3600,
+	}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected bootstrap error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected readyz 200 after successful bootstrap, got %d — %s", rec.Code, rec.Body.String())
+	}
+}
+
+// readinessCheckStatus decodes the /readyz envelope and returns the status
+// of the named check, failing the test if the check is absent.
+func readinessCheckStatus(t *testing.T, body []byte, name string) string {
+	t.Helper()
+	var envelope struct {
+		Data struct {
+			Checks []struct {
+				Name   string `json:"name"`
+				Status string `json:"status"`
+			} `json:"checks"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode readyz envelope: %v", err)
+	}
+	for _, check := range envelope.Data.Checks {
+		if check.Name == name {
+			return check.Status
+		}
+	}
+	t.Fatalf("readiness check %q not found in %s", name, body)
+	return ""
+}
+
+// TestNewWithStubbedDBAndMissingJWTSecret_JWTCheckFails: pool opened via
+// stub but AUTH_JWT_HMAC_SECRET empty — the token manager is never built.
+// jwt-token-manager must fail (a skipped construction must not read as
+// pass) while database stays pass, and /readyz stays 503.
+func TestNewWithStubbedDBAndMissingJWTSecret_JWTCheckFails(t *testing.T) {
+	stubOpenDB(t, func(context.Context, string, int, *slog.Logger) (storage.Pool, error) {
+		return stubPool{}, nil
+	})
+
+	cfg := config.Config{
+		ServiceName:              "auth-service",
+		Env:                      "test",
+		Port:                     8081,
+		ReadHeaderTimeoutSeconds: 5,
+		DatabaseURL:              "postgres://stubbed",
+		DBConnectTimeoutSeconds:  1,
+		// AuthJWTHMACSecret intentionally empty.
+	}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected bootstrap error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected readyz 503 with missing JWT secret, got %d — %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.Bytes()
+	if got := readinessCheckStatus(t, body, "database"); got != "pass" {
+		t.Fatalf("expected database check to pass with stubbed pool, got %q", got)
+	}
+	for _, name := range []string{"jwt-token-manager", "login-manager", "session-manager"} {
+		if got := readinessCheckStatus(t, body, name); got != "fail" {
+			t.Fatalf("expected %s check to fail with missing JWT secret, got %q", name, got)
+		}
 	}
 }
 
@@ -73,9 +210,75 @@ func TestNewWithOIDCEnabledAndInvalidConfigFailsClosed(t *testing.T) {
 		AuthTokenEndpointRateLimitBurst:     10,
 	}
 
-	app := New(cfg)
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if app == nil || app.Handler == nil {
 		t.Fatal("expected app with handler")
+	}
+}
+
+// TestAppShutdownClosesPoolOnce verifies that Shutdown closes the DB pool
+// exactly once even when called repeatedly.
+func TestAppShutdownClosesPoolOnce(t *testing.T) {
+	cfg := config.Config{ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	closed := 0
+	app.closeDB = func() { closed++ }
+
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	_ = app.Shutdown(context.Background())
+
+	if closed != 1 {
+		t.Fatalf("expected pool closed exactly once, got %d", closed)
+	}
+}
+
+// TestAppShutdownConcurrentClosesPoolOnce hammers Shutdown from many
+// goroutines: the pool must close exactly once and no call may panic.
+// Run with -race.
+func TestAppShutdownConcurrentClosesPoolOnce(t *testing.T) {
+	cfg := config.Config{ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	closed := 0
+	app.closeDB = func() { closed++ }
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = app.Shutdown(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	if closed != 1 {
+		t.Fatalf("expected pool closed exactly once under concurrency, got %d", closed)
+	}
+}
+
+// TestAppShutdownNilPoolDoesNotPanic: Shutdown without a DB pool (closeDB
+// nil) must be a safe no-op.
+func TestAppShutdownNilPoolDoesNotPanic(t *testing.T) {
+	cfg := config.Config{ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown with nil pool: %v", err)
 	}
 }
 

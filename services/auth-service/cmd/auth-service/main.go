@@ -13,7 +13,11 @@ import (
 
 func main() {
 	cfg := config.Load()
-	application := app.New(cfg)
+	application, err := app.New(cfg)
+	if err != nil {
+		// err is a static, sanitized bootstrap error — safe to log.
+		log.Fatalf("%s bootstrap failed: %v", cfg.ServiceName, err)
+	}
 
 	addr := ":" + strconv.Itoa(cfg.Port)
 	httpServer := &http.Server{
@@ -24,7 +28,7 @@ func main() {
 
 	application.Logger.Info("service starting", "port", cfg.Port)
 	serveErr := httpServer.ListenAndServe()
-	_ = application.TracingShutdown(context.Background())
+	_ = application.Shutdown(context.Background())
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatalf("%s failed: %v", cfg.ServiceName, serveErr)
 	}

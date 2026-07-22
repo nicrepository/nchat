@@ -13,7 +13,11 @@ import (
 
 func main() {
 	cfg := config.Load()
-	application := app.New(cfg)
+	application, err := app.New(cfg)
+	if err != nil {
+		// err is a static, sanitized bootstrap error — safe to log.
+		log.Fatalf("%s bootstrap failed: %v", cfg.ServiceName, err)
+	}
 	addr := ":" + strconv.Itoa(cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,

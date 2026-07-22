@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/emailcrypto"
@@ -18,14 +19,53 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
+// dbBootstrapTimeout bounds the total retry window for the initial database
+// connection. Keep it below the Kubernetes startupProbe budget (60s) so a
+// failed bootstrap exits and the container is restarted before the kubelet
+// intervenes.
+const dbBootstrapTimeout = 30 * time.Second
+
+// openDBWithRetry is swappable in tests so app bootstrap failure paths run
+// without real network access or real sleeps.
+var openDBWithRetry = storage.OpenDBWithRetry
+
 type App struct {
 	Config          config.Config
 	Logger          *slog.Logger
 	Handler         http.Handler
 	TracingShutdown observability.ShutdownFunc
+
+	closeDB      func()
+	shutdownOnce sync.Once
 }
 
-func New(cfg config.Config) *App {
+// Shutdown closes the database pool and flushes the tracing exporter.
+// Safe to call multiple times — subsequent calls are no-ops.
+func (a *App) Shutdown(ctx context.Context) error {
+	var err error
+	a.shutdownOnce.Do(func() {
+		if a.closeDB != nil {
+			a.closeDB()
+		}
+		if a.TracingShutdown != nil {
+			err = a.TracingShutdown(ctx)
+		}
+	})
+	return err
+}
+
+// New assembles the application. Bootstrap outcomes by state:
+//
+//   - DATABASE_URL configured but unreachable: retry with backoff, then
+//     fail fast — New returns an error, the process exits non-zero and
+//     Kubernetes restarts the container.
+//   - DATABASE_URL absent: configuration choice, not a transient failure —
+//     the process stays alive and /readyz reports 503.
+//   - Invalid JWT config: the process stays alive and /readyz reports 503.
+//
+// In every degraded state the pod never becomes Ready, so the Service sends
+// it no traffic.
+func New(cfg config.Config) (*App, error) {
 	logger := platformlog.New(cfg.ServiceName, cfg.Env)
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
@@ -37,16 +77,23 @@ func New(cfg config.Config) *App {
 	var invites service.InviteManager
 	var oidc service.OIDCManager
 	var pool storage.Pool
+	var closeDB func()
 	if cfg.DatabaseURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
-		defer cancel()
-		openedPool, err := storage.OpenDB(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
-		if err != nil {
-			logger.Warn("database unavailable; auth database endpoints disabled", "reason", "open_db_failed")
-		} else {
-			pool = openedPool
-			users = service.NewUserService(storage.NewPGXUserStore(pool))
+		ctx, cancel := context.WithTimeout(context.Background(), dbBootstrapTimeout)
+		openedPool, dbErr := openDBWithRetry(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, logger)
+		cancel()
+		if dbErr != nil {
+			// Fail fast: a half-wired server must never start serving.
+			// Kubernetes restarts the container and the retry window resets.
+			logger.Error("database bootstrap failed; refusing degraded start", "reason", "open_db_failed")
+			_ = shutdown(context.Background())
+			return nil, dbErr
 		}
+		pool = openedPool
+		if closer, ok := openedPool.(interface{ Close() }); ok {
+			closeDB = closer.Close
+		}
+		users = service.NewUserService(storage.NewPGXUserStore(pool))
 	}
 
 	emailOutboxEncryptor, emailOutboxErr := emailcrypto.New(cfg.AuthEmailOutboxEncryptionKey)
@@ -115,12 +162,23 @@ func New(cfg config.Config) *App {
 		}
 	}
 
+	// Pass untyped nils when device sessions were not wired: a nil
+	// *DeviceSessionService inside a non-nil interface would defeat the
+	// router's `sessions != nil` readiness and gating checks (typed-nil trap).
+	var sessionManager httpapi.SessionManager
+	var deviceManager httpapi.DeviceManager
+	if deviceSessions != nil {
+		sessionManager = deviceSessions
+		deviceManager = deviceSessions
+	}
+
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, deviceSessions, deviceSessions, oidc),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, sessionManager, deviceManager, oidc),
 		TracingShutdown: shutdown,
-	}
+		closeDB:         closeDB,
+	}, nil
 }
 
 func splitOIDCDomains(raw string) []string {

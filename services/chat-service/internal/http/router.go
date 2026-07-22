@@ -32,18 +32,30 @@ const mentionSearchRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
+		// The substituted 503 handler is never functional WebSocket wiring.
+		state.WebSocket = false
 	}
+
+	// state comes from the app bootstrap; Database is the app's exclusive
+	// signal (pool opened) and is never derived from handler wiring. The
+	// router only downgrades the other fields with what it can observe
+	// directly, so an inconsistent caller cannot report a component as ready
+	// while its wiring is missing.
+	state.TokenValidator = state.TokenValidator && validator != nil
+	state.SessionValidator = state.SessionValidator && sessionValidator != nil
+	state.Sidebar = state.Sidebar && sidebar.Ready()
+	state.Messages = state.Messages && messages.Ready()
 
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
 	mux := http.NewServeMux()
 	mux.Handle(RouteHealthz, httputil.MethodNotAllowed(http.MethodGet, Healthz(cfg)))
-	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
+	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg, state)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
 

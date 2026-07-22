@@ -21,6 +21,16 @@ import (
 // which a user is considered away. Not configurable yet; adjust here if needed.
 const defaultPresenceAwayTimeout = 5 * time.Minute
 
+// dbBootstrapTimeout bounds the total retry window for the initial database
+// connection. Keep it below the Kubernetes startupProbe budget (60s) so a
+// failed bootstrap exits and the container is restarted before the kubelet
+// intervenes.
+const dbBootstrapTimeout = 30 * time.Second
+
+// openDBWithRetry is swappable in tests so app bootstrap failure paths run
+// without real network access or real sleeps.
+var openDBWithRetry = storage.OpenDBWithRetry
+
 // App is the fully assembled chat-service application.
 //
 // Lifecycle ownership:
@@ -39,6 +49,7 @@ type App struct {
 	presence        *ws.PresenceTracker
 	mentionCache    *storage.ValkeyMentionLabelCache
 	reactionLimiter *ws.ValkeyReactionLimiter
+	closeDB         func()
 	shutdownOnce    sync.Once
 }
 
@@ -48,7 +59,8 @@ type App struct {
 // Shutdown order:
 //  1. hub.Shutdown() — drains and closes all WebSocket connections.
 //  2. presence.Stop() — stops the background away-check goroutine.
-//  3. TracingShutdown(ctx) — flushes and closes the tracing exporter.
+//  3. closeDB() — closes the PostgreSQL pool after in-flight queries drain.
+//  4. TracingShutdown(ctx) — flushes and closes the tracing exporter.
 func (a *App) Shutdown(ctx context.Context) error {
 	var err error
 	a.shutdownOnce.Do(func() {
@@ -60,12 +72,28 @@ func (a *App) Shutdown(ctx context.Context) error {
 		if a.reactionLimiter != nil {
 			a.reactionLimiter.Close()
 		}
+		// Close the DB pool only after the hub has drained connections that
+		// may still be issuing queries.
+		if a.closeDB != nil {
+			a.closeDB()
+		}
 		err = a.TracingShutdown(ctx)
 	})
 	return err
 }
 
-func New(cfg config.Config) *App {
+// New assembles the application. Bootstrap outcomes by state:
+//
+//   - DATABASE_URL configured but unreachable: retry with backoff, then
+//     fail fast — New returns an error, the process exits non-zero and
+//     Kubernetes restarts the container.
+//   - DATABASE_URL absent: configuration choice, not a transient failure —
+//     the process stays alive and /readyz reports 503.
+//   - Invalid JWT config: the process stays alive and /readyz reports 503.
+//
+// In every degraded state the pod never becomes Ready, so the Service sends
+// it no traffic.
+func New(cfg config.Config) (*App, error) {
 	logger := platformlog.New(cfg.ServiceName, cfg.Env)
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
@@ -91,13 +119,24 @@ func New(cfg config.Config) *App {
 	var pinSvc *service.PinService
 	var permissionSvc *service.PermissionService
 
+	var closeDB func()
+	databaseReady := false
 	if cfg.DatabaseURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DBConnectTimeoutSeconds)*time.Second)
-		defer cancel()
-		pool, dbErr := storage.OpenDB(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
+		ctx, cancel := context.WithTimeout(context.Background(), dbBootstrapTimeout)
+		pool, dbErr := openDBWithRetry(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, logger)
+		cancel()
 		if dbErr != nil {
-			logger.Warn("database unavailable; endpoints disabled", "reason", "open_db_failed")
-		} else if validator != nil {
+			// Fail fast: a half-wired server must never start serving.
+			// Kubernetes restarts the container and the retry window resets.
+			logger.Error("database bootstrap failed; refusing degraded start", "reason", "open_db_failed")
+			_ = shutdown(context.Background())
+			return nil, dbErr
+		}
+		databaseReady = true
+		if closer, ok := pool.(interface{ Close() }); ok {
+			closeDB = closer.Close
+		}
+		if validator != nil {
 			sessionValidator = storage.NewPGXSessionValidator(pool)
 			workspaceStore = storage.NewPGXWorkspaceStore(pool)
 			channelStore = storage.NewPGXChannelStore(pool)
@@ -179,16 +218,28 @@ func New(cfg config.Config) *App {
 		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
 	}
 
+	// Database is the pool's own bootstrap outcome, independent of JWT or
+	// service wiring; the remaining fields reflect each component's wiring.
+	readiness := httpapi.ReadinessState{
+		Database:         databaseReady,
+		TokenValidator:   validator != nil,
+		SessionValidator: sessionValidator != nil,
+		Sidebar:          sidebarSvc != nil,
+		Messages:         messageSvc != nil,
+		WebSocket:        wsWorkspaces != nil && validator != nil && sessionValidator != nil,
+	}
+
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages),
+		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages),
 		TracingShutdown: shutdown,
 		hub:             hub,
 		presence:        presence,
 		mentionCache:    mentionCache,
 		reactionLimiter: reactionLimiter,
-	}
+		closeDB:         closeDB,
+	}, nil
 }
 
 // wireMentionLabelCache creates the Valkey-backed mention label cache and

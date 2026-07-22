@@ -60,6 +60,12 @@ func NewSidebarHandler(svc sidebarProvider) *SidebarHandler {
 	return &SidebarHandler{svc: svc}
 }
 
+// Ready reports whether the handler is wired to a real sidebar service.
+// Used by the readiness probe; a nil service means every request returns 503.
+func (h *SidebarHandler) Ready() bool {
+	return h != nil && h.svc != nil
+}
+
 func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.svc == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "sidebar not available")
