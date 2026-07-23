@@ -242,8 +242,9 @@ func TestSidebarService_ActiveMember_ReturnsChannelsAndDMs(t *testing.T) {
 	}
 	dms := []domain.DMConversationWithParticipantIDs{
 		{
-			DMConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect},
-			ParticipantIDs: []string{sidebarUserID, "other-user"},
+			DMConversation:         domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect},
+			ParticipantIDs:         []string{sidebarUserID, "other-user"},
+			CounterpartDisplayName: "Juliane Lino",
 		},
 	}
 	svc := newSidebarService(
@@ -269,6 +270,11 @@ func TestSidebarService_ActiveMember_ReturnsChannelsAndDMs(t *testing.T) {
 	}
 	if len(data.DMs) != 1 {
 		t.Fatalf("expected 1 DM, got %d", len(data.DMs))
+	}
+	// The service must forward the storage-resolved counterpart untouched; it is
+	// the handler's job to turn it into a display name.
+	if data.DMs[0].CounterpartDisplayName != "Juliane Lino" {
+		t.Fatalf("expected counterpart name to reach the caller, got %q", data.DMs[0].CounterpartDisplayName)
 	}
 }
 
