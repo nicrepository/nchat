@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,7 @@ import (
 
 // uuidPattern matches a canonical UUID (case-insensitive).
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
 // maxBodyBytes caps request body reads to prevent memory abuse.
 const maxBodyBytes = 1 << 16 // 64 KiB
@@ -33,6 +35,7 @@ type workspaceResolver interface {
 type messageProvider interface {
 	ListChannelMessages(ctx context.Context, in service.ListChannelMessagesInput) (service.ListChannelMessagesOutput, error)
 	CreateChannelMessage(ctx context.Context, in service.CreateChannelMessageInput) (domain.Message, error)
+	ForwardChannelMessage(ctx context.Context, in service.ForwardChannelMessageInput) (service.ForwardChannelMessageOutput, error)
 	GetChannelMessage(ctx context.Context, in service.GetChannelMessageInput) (domain.Message, error)
 	ListDMMessages(ctx context.Context, in service.ListDMMessagesInput) (service.ListDMMessagesOutput, error)
 	CreateDMMessage(ctx context.Context, in service.CreateDMMessageInput) (domain.Message, error)
@@ -125,6 +128,7 @@ type messageJSON struct {
 	IsEdited          bool           `json:"is_edited"`
 	Reactions         []reactionJSON `json:"reactions"`
 	IsFavorited       bool           `json:"is_favorited,omitempty"`
+	IsForwarded       bool           `json:"is_forwarded"`
 	Quoted            *quoteJSON     `json:"quoted,omitempty"`
 	Reference         *referenceJSON `json:"reference,omitempty"`
 }
@@ -199,6 +203,10 @@ type createMessageRequest struct {
 	ReferencedMessageID string `json:"referenced_message_id"`
 }
 
+type forwardMessageRequest struct {
+	SourceMessageID string `json:"source_message_id"`
+}
+
 type editMessageRequest struct {
 	Body       string `json:"body"`
 	BodyFormat string `json:"body_format"`
@@ -261,6 +269,23 @@ func validateTargetID(w http.ResponseWriter, id, paramName string) bool {
 	return true
 }
 
+func parseIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	values := r.Header.Values("Idempotency-Key")
+	if len(values) == 0 {
+		return "", true
+	}
+	if len(values) != 1 {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid Idempotency-Key")
+		return "", false
+	}
+	key := strings.TrimSpace(values[0])
+	if !idempotencyKeyPattern.MatchString(key) {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid Idempotency-Key")
+		return "", false
+	}
+	return key, true
+}
+
 // parseLimitParam parses the optional ?limit= query parameter.
 // Returns 0 (default) when absent or invalid.
 func parseLimitParam(r *http.Request) int {
@@ -297,6 +322,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		IsEdited:          m.EditCount > 0,
 		Reactions:         make([]reactionJSON, len(m.Reactions)),
 		IsFavorited:       m.IsFavorited,
+		IsForwarded:       m.ForwardedFromMessageID != "",
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
@@ -714,6 +740,52 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 	httputil.WriteJSON(w, http.StatusCreated, mapToMessageJSON(msg))
 }
 
+// ForwardChannelMessage handles POST /api/chat/channels/{channelID}/messages/forward.
+// The client supplies only the source ID; the server snapshots content and provenance.
+func (h *MessageHandler) ForwardChannelMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	destinationChannelID := r.PathValue("channelID")
+	if !validateTargetID(w, destinationChannelID, "channel_id") {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var req forwardMessageRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	if !validateTargetID(w, req.SourceMessageID, "source_message_id") {
+		return
+	}
+	idempotencyKey, ok := parseIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	result, err := h.messages.ForwardChannelMessage(r.Context(), service.ForwardChannelMessageInput{
+		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
+		ActorID: userID, SourceMessageID: req.SourceMessageID,
+		IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Replayed {
+		status = http.StatusOK
+	}
+	httputil.WriteJSON(w, status, mapToMessageJSON(result.Message))
+}
+
 // ── DM endpoints ──────────────────────────────────────────────────────────────
 
 // ListDMMessages handles GET /api/chat/dm/{conversationID}/messages.
@@ -992,6 +1064,8 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "message edit forbidden")
 	case errors.Is(err, domain.ErrEditWindowExpired):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "message edit window expired")
+	case errors.Is(err, domain.ErrConflict):
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflict")
 	case errors.Is(err, domain.ErrPinLimitReached):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "pin limit reached")
 	default:

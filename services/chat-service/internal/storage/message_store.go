@@ -83,6 +83,23 @@ type CreateMessageInput struct {
 	MentionedChannelIDs    []string
 }
 
+// ForwardChannelMessageInput contains only server-derived forwarding fields.
+// The store copies the source body and format atomically; callers never provide them.
+type ForwardChannelMessageInput struct {
+	WorkspaceID          string
+	DestinationChannelID string
+	ActorID              string
+	SourceMessageID      string
+	IdempotencyKey       string
+}
+
+// ForwardChannelMessageResult distinguishes the original insert from an
+// idempotent replay so callers do not publish duplicate side effects.
+type ForwardChannelMessageResult struct {
+	Message  domain.Message
+	Replayed bool
+}
+
 // EditMessageInput contains only server-derived identity and validated body fields.
 type EditMessageInput struct {
 	WorkspaceID string
@@ -144,6 +161,9 @@ type MessageStore interface {
 	// same target as the new message. This is a non-enumerating storage backstop:
 	// callers cannot determine whether the referenced message exists.
 	CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error)
+	// ForwardChannelMessage atomically re-authorizes both channels, snapshots the
+	// active source message, and inserts or replays the forwarded destination message.
+	ForwardChannelMessage(ctx context.Context, input ForwardChannelMessageInput) (ForwardChannelMessageResult, error)
 	EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error)
 	DeleteMessage(ctx context.Context, input DeleteMessageInput) (domain.Message, bool, error)
 	ListMessageEditHistory(ctx context.Context, input ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
@@ -266,11 +286,15 @@ func quotedMessageJoin(alias, quoteAlias string) string {
 // display info and optional quote preview. It must be called with exactly the
 // columns listed in listMessageWithQuoteColumns.
 func scanMessageWithSenderAndQuote(row pgx.Row) (domain.Message, error) {
+	return scanMessageWithSenderAndQuoteExtra(row)
+}
+
+func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Message, error) {
 	var msg domain.Message
 	var editedAt, deletedAt *time.Time
 	var quote domain.QuotedMessage
 	var quoteDeletedAt, quoteCreatedAt *time.Time
-	err := row.Scan(
+	destinations := []any{
 		&msg.ID, &msg.WorkspaceID,
 		&msg.ChannelID, &msg.DMConversationID,
 		&msg.SenderID,
@@ -282,7 +306,9 @@ func scanMessageWithSenderAndQuote(row pgx.Row) (domain.Message, error) {
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
 		&quoteDeletedAt, &quoteCreatedAt,
-	)
+	}
+	destinations = append(destinations, extra...)
+	err := row.Scan(destinations...)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -501,6 +527,75 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
 	}
 	return msg, nil
+}
+
+func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input ForwardChannelMessageInput) (ForwardChannelMessageResult, error) {
+	// This CTE is the authoritative authorization and consistency control.
+	// Keep source and destination predicates in this atomic statement; zero rows
+	// deliberately maps every inaccessible or invalid resource to ErrNotFound.
+	row := s.pool.QueryRow(ctx, `
+		WITH source AS (
+			SELECT m.id, m.body_text, m.body_format
+			FROM chat.messages m`+messageAccessJoins("$3")+`
+			WHERE m.id = $4::uuid
+			  AND m.workspace_id = $1::uuid
+			  AND m.channel_id IS NOT NULL
+			  AND m.channel_id <> $2::uuid
+			  AND m.kind = 'user'
+			  AND m.status = 'active'
+			  AND m.deleted_at IS NULL
+			  AND `+messageAccessPredicate+`
+			FOR SHARE OF m
+		),
+		inserted AS (
+			INSERT INTO chat.messages
+				(workspace_id, channel_id, sender_id, kind, body_text, body_format,
+				 status, forwarded_from_message_id, forward_idempotency_key)
+			SELECT $1::uuid, $2::uuid, $3::uuid, 'user', source.body_text,
+			       source.body_format, 'active', source.id, NULLIF($5, '')
+			FROM source
+			JOIN chat.workspaces destination_workspace
+			  ON destination_workspace.id = $1::uuid AND destination_workspace.status = 'active'
+			JOIN chat.workspace_members destination_member
+			  ON destination_member.workspace_id = destination_workspace.id
+			 AND destination_member.user_id = $3::uuid
+			 AND destination_member.status = 'active'
+			JOIN chat.channels destination_channel
+			  ON destination_channel.id = $2::uuid
+			 AND destination_channel.workspace_id = destination_workspace.id
+			 AND destination_channel.status = 'active'
+			LEFT JOIN chat.channel_members destination_channel_member
+			  ON destination_channel_member.channel_id = destination_channel.id
+			 AND destination_channel_member.user_id = $3::uuid
+			WHERE destination_channel.type = 'public'
+			   OR destination_channel_member.user_id IS NOT NULL
+			ON CONFLICT (workspace_id, sender_id, channel_id, forward_idempotency_key)
+				WHERE forward_idempotency_key IS NOT NULL
+			DO UPDATE SET forward_idempotency_key = EXCLUDED.forward_idempotency_key
+			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
+			          kind, body_text, body_format, status,
+			          parent_message_id, forwarded_from_message_id, referenced_message_id,
+			          edited_at, edit_count, deleted_at, created_at, updated_at,
+			          (xmax <> 0) AS replayed
+		)
+		SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`, m.replayed
+		FROM inserted m
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
+		input.WorkspaceID, input.DestinationChannelID, input.ActorID, input.SourceMessageID,
+		input.IdempotencyKey,
+	)
+	var replayed bool
+	msg, err := scanMessageWithSenderAndQuoteExtra(row, &replayed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ForwardChannelMessageResult{}, domain.ErrNotFound
+		}
+		return ForwardChannelMessageResult{}, fmt.Errorf("forward channel message storage: %w", err)
+	}
+	if replayed && msg.ForwardedFromMessageID != input.SourceMessageID {
+		return ForwardChannelMessageResult{}, domain.ErrConflict
+	}
+	return ForwardChannelMessageResult{Message: msg, Replayed: replayed}, nil
 }
 
 // EditMessage atomically snapshots the current body and replaces it after

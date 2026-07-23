@@ -44,6 +44,12 @@ type UpdateChannelInput struct {
 	EnsureMemberUserID string
 }
 
+// VisibleChannelAccess carries the membership used to evaluate channel policy.
+type VisibleChannelAccess struct {
+	Channel       domain.Channel
+	ChannelMember *domain.ChannelMember
+}
+
 // ChannelStore is the persistence interface for channel operations.
 type ChannelStore interface {
 	CreateCategory(ctx context.Context, input CreateCategoryInput) (domain.ChannelCategory, error)
@@ -321,10 +327,26 @@ func (s *PGXChannelStore) ListChannelsByWorkspace(ctx context.Context, workspace
 }
 
 func (s *PGXChannelStore) ListVisibleChannelsByUser(ctx context.Context, workspaceID, userID string) ([]domain.Channel, error) {
+	accesses, err := s.ListVisibleChannelAccessByUser(ctx, workspaceID, userID)
+	if err != nil {
+		return nil, err
+	}
+	channels := make([]domain.Channel, 0, len(accesses))
+	for _, access := range accesses {
+		channels = append(channels, access.Channel)
+	}
+	return channels, nil
+}
+
+// ListVisibleChannelAccessByUser returns visible channels and the caller's
+// optional channel membership in one query.
+func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, workspaceID, userID string) ([]VisibleChannelAccess, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id, c.workspace_id, COALESCE(c.category_id::text, ''), c.slug, c.display_name,
 		       c.type, c.status, c.is_general, c.position, COALESCE(c.created_by::text, ''),
-		       c.created_at, c.updated_at
+		       c.created_at, c.updated_at,
+		       COALESCE(cm.channel_id::text, ''), COALESCE(cm.user_id::text, ''),
+		       COALESCE(cm.role::text, '')
 		FROM chat.channels c
 		JOIN chat.workspaces w
 		  ON c.workspace_id = w.id AND w.status = 'active'
@@ -343,19 +365,29 @@ func (s *PGXChannelStore) ListVisibleChannelsByUser(ctx context.Context, workspa
 	}
 	defer rows.Close()
 
-	var channels []domain.Channel
+	var accesses []VisibleChannelAccess
 	for rows.Next() {
 		var ch domain.Channel
+		var memberChannelID, memberUserID, memberRole string
 		if err := rows.Scan(
 			&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
 			(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
 			&ch.CreatedAt, &ch.UpdatedAt,
+			&memberChannelID, &memberUserID, &memberRole,
 		); err != nil {
 			return nil, fmt.Errorf("scan visible channel: %w", err)
 		}
-		channels = append(channels, ch)
+		var member *domain.ChannelMember
+		if memberChannelID != "" {
+			member = &domain.ChannelMember{
+				ChannelID: memberChannelID,
+				UserID:    memberUserID,
+				Role:      domain.ChannelRole(memberRole),
+			}
+		}
+		accesses = append(accesses, VisibleChannelAccess{Channel: ch, ChannelMember: member})
 	}
-	return channels, rows.Err()
+	return accesses, rows.Err()
 }
 
 func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {

@@ -86,3 +86,13 @@ func NewMetrics(cfg Config) *Metrics {
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
+
+// Register adds service-specific collectors to the shared registry when
+// metrics are enabled. It returns false when metrics are disabled.
+func (m *Metrics) Register(collectors ...prometheus.Collector) bool {
+	if m == nil || !m.cfg.MetricsEnabled {
+		return false
+	}
+	m.registry.MustRegister(collectors...)
+	return true
+}

@@ -81,6 +81,19 @@ type CreateDMMessageInput struct {
 	ReferencedMessageID    string
 }
 
+type ForwardChannelMessageInput struct {
+	WorkspaceID          string
+	DestinationChannelID string
+	ActorID              string
+	SourceMessageID      string
+	IdempotencyKey       string
+}
+
+type ForwardChannelMessageOutput struct {
+	Message  domain.Message
+	Replayed bool
+}
+
 // ListChannelMessagesInput identifies the channel and caller for a message list.
 type ListChannelMessagesInput struct {
 	WorkspaceID  string
@@ -316,6 +329,36 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	}
 	s.publishMessageCreated(ctx, workspaceID, "channel", channelID, msg)
 	return msg, nil
+}
+
+// ForwardChannelMessage creates a server-side snapshot of an authorized source
+// message in another authorized channel. Source provenance never leaves the API.
+func (s *MessageService) ForwardChannelMessage(ctx context.Context, input ForwardChannelMessageInput) (ForwardChannelMessageOutput, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	destinationChannelID := strings.TrimSpace(input.DestinationChannelID)
+	actorID := strings.TrimSpace(input.ActorID)
+	sourceMessageID := strings.TrimSpace(input.SourceMessageID)
+	if workspaceID == "" || destinationChannelID == "" || actorID == "" || sourceMessageID == "" {
+		return ForwardChannelMessageOutput{}, fmt.Errorf("%w: forwarding identifiers are required", domain.ErrInvalidInput)
+	}
+
+	result, err := s.messages.ForwardChannelMessage(ctx, storage.ForwardChannelMessageInput{
+		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
+		ActorID: actorID, SourceMessageID: sourceMessageID,
+		IdempotencyKey: strings.TrimSpace(input.IdempotencyKey),
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidInput) || errors.Is(err, domain.ErrNotFound) ||
+			errors.Is(err, domain.ErrConflict) || errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return ForwardChannelMessageOutput{}, err
+		}
+		return ForwardChannelMessageOutput{}, fmt.Errorf("forward channel message: %w", err)
+	}
+	if !result.Replayed {
+		s.publishMessageCreated(ctx, workspaceID, "channel", destinationChannelID, result.Message)
+	}
+	return ForwardChannelMessageOutput{Message: result.Message, Replayed: result.Replayed}, nil
 }
 
 // CreateDMMessage posts a message to a DM conversation.
