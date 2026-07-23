@@ -40,7 +40,8 @@ type DMStore interface {
 	ListVisibleConversationsByUser(ctx context.Context, workspaceID, userID string) ([]domain.DMConversation, error)
 	// ListVisibleConversationsWithParticipantIDs returns active DM conversations
 	// visible to userID, each annotated with the full list of active member user
-	// IDs. A single SQL query (no N+1) is used to fetch participants.
+	// IDs and, for direct 1:1 conversations, the display name of the other
+	// participant as seen by userID. A single SQL query (no N+1) is used.
 	ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error)
 	GetVisibleConversationByID(ctx context.Context, workspaceID, conversationID, userID string) (domain.DMConversation, error)
 }
@@ -246,6 +247,14 @@ func (s *PGXDMStore) ListVisibleConversationsByUser(ctx context.Context, workspa
 	return conversations, rows.Err()
 }
 
+// counterpart_display_name is resolved in the same round-trip so the sidebar
+// never needs a per-conversation lookup. It is excluded from the requesting
+// user by comparing against dm.user_id — the caller's own membership row — so
+// no client-supplied identifier and no UUID text formatting is involved.
+// auth.users is joined without a status filter on purpose: the conversation is
+// already authorized by membership, and hiding the name of a deactivated
+// colleague would degrade a working conversation to a meaningless label.
+// Anonymization of removed users is owned by auth-service at the source.
 func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT dc.id, dc.workspace_id, dc.type, COALESCE(dc.title, ''), dc.status,
@@ -255,7 +264,18 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 		           FROM chat.dm_members dm2
 		           WHERE dm2.conversation_id = dc.id AND dm2.status = 'active'
 		           ORDER BY dm2.user_id
-		       ) AS participant_ids
+		       ) AS participant_ids,
+		       COALESCE((
+		           SELECT u.display_name
+		           FROM chat.dm_members other
+		           JOIN auth.users u ON u.id = other.user_id
+		           WHERE dc.type = 'direct'
+		             AND other.conversation_id = dc.id
+		             AND other.status = 'active'
+		             AND other.user_id <> dm.user_id
+		           ORDER BY other.user_id
+		           LIMIT 1
+		       ), '') AS counterpart_display_name
 		FROM chat.dm_conversations dc
 		JOIN chat.workspaces w
 		  ON w.id = dc.workspace_id AND w.status = 'active'
@@ -279,7 +299,7 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 		if err := rows.Scan(
 			&c.ID, &c.WorkspaceID, (*string)(&c.Type),
 			&c.Title, (*string)(&c.Status), &c.CreatedBy,
-			&c.CreatedAt, &c.UpdatedAt, &c.ParticipantIDs,
+			&c.CreatedAt, &c.UpdatedAt, &c.ParticipantIDs, &c.CounterpartDisplayName,
 		); err != nil {
 			return nil, fmt.Errorf("scan visible dm conversation with participants: %w", err)
 		}

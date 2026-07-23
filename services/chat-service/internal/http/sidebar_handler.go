@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -100,7 +101,7 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Slug: data.Workspace.Slug,
 		},
 		Channels: mapChannels(data.Channels),
-		DMConvs:  mapDMs(data.DMs, userID),
+		DMConvs:  mapDMs(data.DMs),
 	}
 	// Ensure arrays are never null in JSON output.
 	if body.Channels == nil {
@@ -130,14 +131,13 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 }
 
 // mapDMs converts domain DMs to JSON, computing a display name for each.
-func mapDMs(dms []domain.DMConversationWithParticipantIDs, currentUserID string) []sidebarDMJSON {
+func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 	out := make([]sidebarDMJSON, 0, len(dms))
 	for _, dm := range dms {
-		name := computeDMName(dm.Type, dm.Title, dm.ParticipantIDs, currentUserID)
 		out = append(out, sidebarDMJSON{
 			ID:   dm.ID,
 			Type: string(dm.Type),
-			Name: name,
+			Name: computeDMName(dm.Type, dm.Title, dm.CounterpartDisplayName),
 		})
 	}
 	return out
@@ -145,19 +145,24 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs, currentUserID string)
 
 // computeDMName derives a sidebar display name for a DM conversation.
 // Group DMs use their title (or "Grupo DM" if untitled).
-// Direct DMs use a neutral placeholder pending a profile-safe display source.
-// Participant IDs are used internally for group fallback counting but are not
-// returned in the JSON response.
-func computeDMName(dmType domain.DMConversationType, title string, participantIDs []string, currentUserID string) string {
+// Direct DMs show the other participant, already resolved by the storage layer
+// for the requesting user, so the same conversation reads as B for A and as A
+// for B. The generic placeholder is a last resort for conversations whose
+// counterpart cannot be resolved at all.
+func computeDMName(dmType domain.DMConversationType, title, counterpartDisplayName string) string {
 	if dmType == domain.DMConversationTypeGroup {
 		if title != "" {
 			return title
 		}
 		return "Grupo DM"
 	}
-	// Direct DM: neutral fallback to avoid leaking participant user IDs.
-	// Real display name will come from a profile service in a future iteration.
-	_ = currentUserID
-	_ = participantIDs
+	if name := strings.TrimSpace(counterpartDisplayName); name != "" {
+		return name
+	}
+	// Direct conversations are created with a NULL title; a non-empty one only
+	// occurs in legacy or hand-written rows, where it still beats the placeholder.
+	if title != "" {
+		return title
+	}
 	return "Mensagem Direta"
 }

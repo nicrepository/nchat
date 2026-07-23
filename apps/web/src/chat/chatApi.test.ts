@@ -426,6 +426,42 @@ describe("fetchSidebarData", () => {
     await expect(fetchSidebarData()).rejects.toThrow("network error");
   });
 
+  it("keeps distinct names for distinct 1:1 conversations", async () => {
+    // The backend resolves `name` per viewer; the client must not collapse or
+    // reorder them.
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "dm-1", type: "direct", name: "Juliane Lino" },
+          { id: "dm-2", type: "direct", name: "Caio Almeida" },
+        ],
+      }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms.map((dm) => [dm.id, dm.name])).toEqual([
+      ["dm-1", "Juliane Lino"],
+      ["dm-2", "Caio Almeida"],
+    ]);
+  });
+
+  it("keeps the conversation id untouched for navigation", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [{ id: "9f1c0d2e-0000-4000-8000-000000000001", type: "direct", name: "Ana" }],
+      }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms[0].id).toBe("9f1c0d2e-0000-4000-8000-000000000001");
+  });
+
+  it("passes the generic backend fallback through unchanged", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({ dms: [{ id: "dm-1", type: "direct", name: "Mensagem Direta" }] }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms[0].name).toBe("Mensagem Direta");
+  });
+
   it("handles missing dm_conversations field with empty array fallback", async () => {
     // Covers the `?? []` null-coalescing branch for dm_conversations.
     mockAuthFetch.mockResolvedValue({

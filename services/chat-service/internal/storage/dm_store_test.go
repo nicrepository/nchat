@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -413,7 +414,7 @@ func TestPGXDMStore_GetVisibleConversationByID_SuccessAndDatabaseError(t *testin
 // ── ListVisibleConversationsWithParticipantIDs tests ──────────────────────────
 
 func dmWithParticipantCols() []string {
-	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids"}
+	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids", "counterpart_display_name"}
 }
 
 func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly(t *testing.T) {
@@ -424,11 +425,12 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 	defer mock.Close()
 
 	now := time.Now()
-	// SQL must join workspace, workspace_members, and dm_members for current user.
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
+	// SQL must join workspace, workspace_members, and dm_members for current user,
+	// and resolve the counterpart display name in the same statement (no N+1).
+	mock.ExpectQuery(`(?s)counterpart_display_name.*FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}))
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}, "Juliane Lino"))
 
 	store := storage.NewPGXDMStore(mock)
 	convs, err := store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
@@ -443,6 +445,81 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 	}
 	if len(convs[0].ParticipantIDs) != 2 {
 		t.Fatalf("expected 2 participant IDs, got %d", len(convs[0].ParticipantIDs))
+	}
+	if convs[0].CounterpartDisplayName != "Juliane Lino" {
+		t.Fatalf("expected counterpart display name, got %q", convs[0].CounterpartDisplayName)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_SingleQueryForManyDMs
+// is the no-N+1 evidence: many conversations resolve their counterpart names
+// from exactly one statement. pgxmock fails on any unexpected extra query.
+func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_SingleQueryForManyDMs(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	rows := pgxmock.NewRows(dmWithParticipantCols())
+	want := []string{"Ana", "Bruno", "Caio", "Duda", "Elis"}
+	for i, name := range want {
+		id := fmt.Sprintf("dm-%d", i)
+		peer := fmt.Sprintf("user-%d", i+2)
+		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", peer}, name)
+	}
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc`).WithArgs("ws-1", "user-1").WillReturnRows(rows)
+
+	convs, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(convs) != len(want) {
+		t.Fatalf("expected %d conversations, got %d", len(want), len(convs))
+	}
+	for i, name := range want {
+		if convs[i].CounterpartDisplayName != name {
+			t.Fatalf("conversation %d: expected %q, got %q", i, name, convs[i].CounterpartDisplayName)
+		}
+	}
+	// Any per-conversation follow-up query would be an unmet/unexpected expectation.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounterpart
+// documents that the counterpart subquery is scoped to direct conversations, so
+// group DMs never carry (or leak) a participant name.
+func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounterpart(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectQuery(`(?s)dc\.type = 'direct'.*FROM chat\.dm_conversations dc`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
+			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, []string{"user-1", "user-2", "user-3"}, ""))
+
+	convs, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(convs) != 1 {
+		t.Fatalf("expected 1 conversation, got %d", len(convs))
+	}
+	if convs[0].CounterpartDisplayName != "" {
+		t.Fatalf("group DM must not carry a counterpart name, got %q", convs[0].CounterpartDisplayName)
+	}
+	if convs[0].Title != "Equipe Infra" {
+		t.Fatalf("group DM must keep its title, got %q", convs[0].Title)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -502,8 +579,8 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_PropagatesRowFail
 	}{
 		{name: "scan", rows: pgxmock.NewRows([]string{"id"}).AddRow("dm-1")},
 		{name: "rows", rows: pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}).
-			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}).
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}, "Ana").
+			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}, "Bruno").
 			RowError(1, errors.New("rows failed"))},
 	} {
 		t.Run(test.name, func(t *testing.T) {

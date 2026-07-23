@@ -189,40 +189,143 @@ func TestSidebarHandler_PostMethod_Returns405(t *testing.T) {
 	}
 }
 
-func TestSidebarHandler_DM_DirectName_UsesNeutralFallback(t *testing.T) {
-	// Direct DMs must not expose the other participant's user ID as display name.
-	// A neutral placeholder is used until a profile-safe display source exists.
-	v := makeTestValidator(t)
-	svc := &stubSidebarProvider{data: service.SidebarData{
-		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
-		DMs: []domain.DMConversationWithParticipantIDs{
-			{
-				DMConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect},
-				ParticipantIDs: []string{testUserID, "other-user-id"},
-			},
-		},
-	}}
-	router := sidebarRouter(v, svc)
-	rr := httptest.NewRecorder()
-	router.ServeHTTP(rr, authGet(t))
-
+// decodeDMNames returns the dm_conversations names from a sidebar response.
+func decodeDMNames(t *testing.T, rr *httptest.ResponseRecorder) []string {
+	t.Helper()
 	var envelope struct {
 		Data struct {
 			DMs []struct {
+				ID   string `json:"id"`
 				Name string `json:"name"`
 			} `json:"dm_conversations"`
 		} `json:"data"`
 	}
 	mustDecode(t, rr, &envelope)
-	if len(envelope.Data.DMs) == 0 {
-		t.Fatal("expected at least 1 DM")
+	names := make([]string, 0, len(envelope.Data.DMs))
+	for _, dm := range envelope.Data.DMs {
+		names = append(names, dm.Name)
 	}
-	// Must NOT expose the other participant's ID; neutral fallback expected.
-	if envelope.Data.DMs[0].Name == "other-user-id" {
-		t.Fatal("direct DM name must not leak participant user ID")
+	return names
+}
+
+// directDM builds a direct conversation whose counterpart was already resolved
+// for the requesting user by the storage layer.
+func directDM(id, counterpart string, participantIDs ...string) domain.DMConversationWithParticipantIDs {
+	return domain.DMConversationWithParticipantIDs{
+		DMConversation:         domain.DMConversation{ID: id, Type: domain.DMConversationTypeDirect},
+		ParticipantIDs:         participantIDs,
+		CounterpartDisplayName: counterpart,
 	}
-	if envelope.Data.DMs[0].Name == "" {
-		t.Fatal("direct DM name must not be empty")
+}
+
+func sidebarWithDMs(dms ...domain.DMConversationWithParticipantIDs) service.SidebarData {
+	return service.SidebarData{
+		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+		DMs:       dms,
+	}
+}
+
+func TestSidebarHandler_DM_DirectName_UsesOtherParticipant(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &stubSidebarProvider{data: sidebarWithDMs(
+		directDM("dm-1", "Juliane Lino", testUserID, "other-user-id"),
+	)}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	names := decodeDMNames(t, rr)
+	if len(names) != 1 {
+		t.Fatalf("expected 1 DM, got %d", len(names))
+	}
+	if names[0] != "Juliane Lino" {
+		t.Fatalf("expected other participant name, got %q", names[0])
+	}
+}
+
+// TestSidebarHandler_DM_DirectName_IsViewerScoped asserts the same conversation
+// renders as B for A and as A for B: the name is never persisted per-conversation.
+func TestSidebarHandler_DM_DirectName_IsViewerScoped(t *testing.T) {
+	const conversationID = "dm-shared"
+	v := makeTestValidator(t)
+
+	for _, test := range []struct {
+		viewer      string
+		counterpart string
+	}{
+		{viewer: "user-a", counterpart: "User B"},
+		{viewer: "user-b", counterpart: "User A"},
+	} {
+		t.Run(test.viewer, func(t *testing.T) {
+			svc := &stubSidebarProvider{data: sidebarWithDMs(
+				directDM(conversationID, test.counterpart, "user-a", "user-b"),
+			)}
+			router := sidebarRouter(v, svc)
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, httpapi.RouteSidebar, nil)
+			setBearerToken(req, makeTestToken(t, test.viewer, testHMACSecret, testIssuer, testAudience, time.Hour))
+			router.ServeHTTP(rr, req)
+
+			names := decodeDMNames(t, rr)
+			if len(names) != 1 || names[0] != test.counterpart {
+				t.Fatalf("viewer %s: expected %q, got %v", test.viewer, test.counterpart, names)
+			}
+			if names[0] == test.viewer {
+				t.Fatalf("viewer %s must never be the title of their own DM", test.viewer)
+			}
+		})
+	}
+}
+
+// TestSidebarHandler_DM_DistinctConversations_KeepDistinctNames guards against a
+// single resolved name bleeding across conversations.
+func TestSidebarHandler_DM_DistinctConversations_KeepDistinctNames(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &stubSidebarProvider{data: sidebarWithDMs(
+		directDM("dm-1", "Juliane Lino", testUserID, "u2"),
+		directDM("dm-2", "Caio Almeida", testUserID, "u3"),
+	)}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	names := decodeDMNames(t, rr)
+	if len(names) != 2 || names[0] != "Juliane Lino" || names[1] != "Caio Almeida" {
+		t.Fatalf("expected distinct per-conversation names, got %v", names)
+	}
+}
+
+// TestSidebarHandler_DM_DirectName_FallsBackWhenUnresolvable covers removed
+// participants, missing user rows and blank display names.
+func TestSidebarHandler_DM_DirectName_FallsBackWhenUnresolvable(t *testing.T) {
+	v := makeTestValidator(t)
+	for _, test := range []struct {
+		name        string
+		counterpart string
+		title       string
+		want        string
+	}{
+		{name: "unresolved counterpart", counterpart: "", want: "Mensagem Direta"},
+		{name: "blank display name", counterpart: "   ", want: "Mensagem Direta"},
+		{name: "legacy explicit title", counterpart: "", title: "Suporte", want: "Suporte"},
+		{name: "counterpart wins over title", counterpart: "Juliane", title: "Suporte", want: "Juliane"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dm := directDM("dm-1", test.counterpart, testUserID, "other-user-id")
+			dm.Title = test.title
+			svc := &stubSidebarProvider{data: sidebarWithDMs(dm)}
+			router := sidebarRouter(v, svc)
+			rr := httptest.NewRecorder()
+			router.ServeHTTP(rr, authGet(t))
+
+			names := decodeDMNames(t, rr)
+			if len(names) != 1 || names[0] != test.want {
+				t.Fatalf("expected %q, got %v", test.want, names)
+			}
+			if names[0] == "other-user-id" {
+				t.Fatal("direct DM name must not leak participant user ID")
+			}
+		})
 	}
 }
 
@@ -352,6 +455,25 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 	}
 	if strings.Contains(body, `"title"`) {
 		t.Fatalf("response must not expose title field; body: %s", body)
+	}
+
+	// Exact key set: resolving the counterpart name must not widen the contract
+	// with user IDs, emails or any other personal field.
+	var raw struct {
+		Data struct {
+			DMs []map[string]json.RawMessage `json:"dm_conversations"`
+		} `json:"data"`
+	}
+	mustDecode(t, rr, &raw)
+	for _, dm := range raw.Data.DMs {
+		if len(dm) != 3 {
+			t.Fatalf("expected exactly 3 DM fields, got %d: %v", len(dm), dm)
+		}
+		for _, key := range []string{"id", "type", "name"} {
+			if _, ok := dm[key]; !ok {
+				t.Fatalf("missing expected DM field %q in %v", key, dm)
+			}
+		}
 	}
 }
 

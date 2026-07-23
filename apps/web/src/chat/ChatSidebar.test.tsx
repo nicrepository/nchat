@@ -324,6 +324,76 @@ describe("ChatSidebar — DMs", () => {
     });
   });
 
+  // The API client always yields `participants: []`, so these use the real
+  // production shape rather than the avatar-rich fixtures above.
+  it("labels each 1:1 DM with its own participant name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        { id: "dm-1", type: "1:1", name: "Juliane Lino", participants: [] },
+        { id: "dm-2", type: "1:1", name: "Caio Almeida", participants: [] },
+      ],
+    });
+    renderChat();
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("option", { name: /mensagem direta com juliane lino/i }),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("option", { name: /mensagem direta com caio almeida/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Mensagem Direta")).not.toBeInTheDocument();
+  });
+
+  it("keeps a group DM labelled with its group name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        { id: "dm-1", type: "1:1", name: "Juliane Lino", participants: [] },
+        { id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] },
+      ],
+    });
+    renderChat();
+
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /grupo equipe infra/i })).toBeInTheDocument();
+    });
+  });
+
+  it("renders names with special characters as text, never as markup", async () => {
+    const hostileName = '<img src=x onerror="alert(1)"> Ana & Bruno';
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-1", type: "1:1", name: hostileName, participants: [] }],
+    });
+    renderChat();
+
+    const label = await screen.findByText(hostileName);
+    // The name reaches the DOM as a text node; no markup was interpreted.
+    expect(label.querySelector("img")).toBeNull();
+    expect(label.textContent).toBe(hostileName);
+  });
+
+  it("still shows the generic label when the backend could not resolve a name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-1", type: "1:1", name: "Mensagem Direta", participants: [] }],
+    });
+    renderChat();
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("option", { name: /mensagem direta com mensagem direta/i }),
+      ).toBeInTheDocument();
+    });
+  });
+
   it("shows empty DMs state when list is empty", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "",
@@ -386,6 +456,31 @@ describe("ChatSidebar — DMs", () => {
     expect(trigger).toHaveFocus();
     await user.click(trigger);
     expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toHaveValue("");
+  });
+
+  it("shows the resolved participant name after the post-creation refresh", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData
+      .mockResolvedValueOnce({ currentUserId: "current-user", channels: [], dms: [] })
+      .mockResolvedValue({
+        currentUserId: "current-user",
+        channels: [],
+        dms: [{ id: "dm-new", type: "1:1", name: "Juliane Lino", participants: [] }],
+      });
+    mockSearchDMCandidates.mockResolvedValue([{ userId: "juliane", displayName: "Juliane Lino" }]);
+    mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
+    renderChat();
+
+    await user.click(await screen.findByRole("button", { name: "Nova mensagem direta" }));
+    await user.type(screen.getByRole("searchbox"), "ju");
+    await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("option", { name: /mensagem direta com juliane lino/i }),
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Mensagem Direta")).not.toBeInTheDocument();
   });
 });
 
