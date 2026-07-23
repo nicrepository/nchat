@@ -31,6 +31,12 @@ const createMsgSQL = `(?s)invalid_refs AS.*m\.status = 'active'.*m\.deleted_at I
 	`chat\.dm_conversations.*dc\.status.*active.*` +
 	`chat\.dm_members.*dm\.status.*active`
 
+const forwardMsgSQL = `(?s)WITH source AS.*` +
+	`m\.channel_id <>.*m\.kind = 'user'.*m\.status = 'active'.*FOR SHARE OF m.*` +
+	`INSERT INTO chat\.messages.*source\.body_text.*source\.body_format.*source\.id.*` +
+	`destination_workspace.*destination_member.*destination_channel.*destination_channel_member.*` +
+	`ON CONFLICT.*forward_idempotency_key`
+
 // messageCols returns the column names matching messageColumns("") scan order.
 func messageCols() []string {
 	return []string{
@@ -67,6 +73,10 @@ func listMessageWithQuoteCols() []string {
 		"quote_id", "quote_author_id", "quote_body_text", "quote_body_format",
 		"quote_status", "quote_deleted_at", "quote_created_at",
 	)
+}
+
+func forwardMessageCols() []string {
+	return append(listMessageWithQuoteCols(), "replayed")
 }
 
 func listMessageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
@@ -139,6 +149,103 @@ func emptyReactionRows() *pgxmock.Rows {
 }
 
 // ---- CreateMessage: success paths -------------------------------------------
+
+func TestPGXMessageStore_ForwardChannelMessage_SnapshotsAndPersistsProvenance(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
+	row[6] = "copied snapshot"
+	row[7] = "v3"
+	row[10] = "source"
+	mock.ExpectQuery(forwardMsgSQL).
+		WithArgs("ws-1", "destination", "actor", "source", "action-1").
+		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
+
+	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+	})
+	if err != nil {
+		t.Fatalf("ForwardChannelMessage: %v", err)
+	}
+	if result.Replayed || result.Message.BodyText != "copied snapshot" ||
+		result.Message.BodyFormat != domain.MessageBodyFormatV3 ||
+		result.Message.ForwardedFromMessageID != "source" {
+		t.Fatalf("snapshot/provenance not returned: %+v", result)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ForwardChannelMessage_DeniedIsNonEnumerating(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(forwardMsgSQL).
+		WithArgs("ws-1", "destination", "actor", "source", "").
+		WillReturnRows(pgxmock.NewRows(forwardMessageCols()))
+	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor", SourceMessageID: "source",
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ForwardChannelMessage_IdempotentReplay(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
+	row[10] = "source"
+	mock.ExpectQuery(forwardMsgSQL).
+		WithArgs("ws-1", "destination", "actor", "source", "action-1").
+		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
+
+	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+	})
+
+	if err != nil || !result.Replayed || result.Message.ID != "forwarded" {
+		t.Fatalf("unexpected replay result: %+v err=%v", result, err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ForwardChannelMessage_IdempotencyFingerprintConflict(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
+	row[10] = "different-source"
+	mock.ExpectQuery(forwardMsgSQL).
+		WithArgs("ws-1", "destination", "actor", "source", "action-1").
+		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
+
+	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+	})
+
+	if err != domain.ErrConflict {
+		t.Fatalf("expected direct ErrConflict, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_ForwardChannelMessage_PreservesInfrastructureError(t *testing.T) {
+	mock := newMock(t)
+	databaseErr := errors.New("database unavailable")
+	mock.ExpectQuery(forwardMsgSQL).
+		WithArgs("ws-1", "destination", "actor", "source", "").
+		WillReturnError(databaseErr)
+
+	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor", SourceMessageID: "source",
+	})
+
+	if !errors.Is(err, databaseErr) {
+		t.Fatalf("expected wrapped database error, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
 
 func TestPGXMessageStore_CreateMessage_ChannelSuccess(t *testing.T) {
 	mock := newMock(t)

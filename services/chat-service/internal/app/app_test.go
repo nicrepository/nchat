@@ -491,6 +491,23 @@ func TestDomainMessageToWSPayloadMapsDeletedQuotePlaceholder(t *testing.T) {
 	}
 }
 
+func TestDomainMessageToWSPayloadMarksForwardedWithoutSourceMetadata(t *testing.T) {
+	payload := domainMessageToWSPayload(domain.Message{
+		ID: "forwarded", WorkspaceID: "workspace-1", ChannelID: "destination",
+		ForwardedFromMessageID: "private-source-message",
+	})
+	if !payload.IsForwarded {
+		t.Fatal("forwarded payload must carry is_forwarded")
+	}
+}
+
+func TestDomainMessageToWSPayloadMarksOrdinaryMessageNotForwarded(t *testing.T) {
+	payload := domainMessageToWSPayload(domain.Message{ID: "ordinary"})
+	if payload.IsForwarded {
+		t.Fatal("ordinary payload must carry is_forwarded=false")
+	}
+}
+
 func TestHubBroadcasterPublishesCreatedMessage(t *testing.T) {
 	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), ws.NopBus{}, "test-broadcaster")
 	t.Cleanup(hub.Shutdown)

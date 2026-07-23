@@ -570,9 +570,13 @@ func routerTestSigningKey() string {
 }
 
 func makeRouterTestToken(t *testing.T) string {
+	return makeRouterTestTokenForUser(t, routerTestUserID)
+}
+
+func makeRouterTestTokenForUser(t *testing.T, userID string) string {
 	t.Helper()
 	claims := jwt.MapClaims{
-		"sub": routerTestUserID,
+		"sub": userID,
 		"sid": routerTestSessionID,
 		"iss": routerTestIssuer,
 		"aud": jwt.ClaimStrings{routerTestAudience},
@@ -624,9 +628,13 @@ func newRouterForRateLimit(t *testing.T) http.Handler {
 
 // routerPOSTRequest creates an authenticated POST request for a send-message URL.
 func routerPOSTRequest(t *testing.T, url string) *http.Request {
+	return routerPOSTRequestForUser(t, url, routerTestUserID)
+}
+
+func routerPOSTRequestForUser(t *testing.T, url, userID string) *http.Request {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(`{"body":"hello"}`))
-	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestTokenForUser(t, userID))
 	req.Header.Set("Content-Type", "application/json")
 	return req
 }
@@ -695,6 +703,54 @@ func TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted(t *testing.T) {
 	router.ServeHTTP(w, routerPOSTRequest(t, url))
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 after DM POST budget exhausted; got %d", w.Code)
+	}
+}
+
+func TestNewRouter_ForwardMessagesUseDedicatedPerUserRateLimit(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	forwardURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/forward"
+	for i := range messageForwardRateLimit {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, routerPOSTRequest(t, forwardURL))
+		if recorder.Code == http.StatusTooManyRequests {
+			t.Fatalf("forward request %d should be within dedicated budget", i+1)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t, forwardURL))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected forwarding 429 after %d requests, got %d", messageForwardRateLimit, recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t,
+		"/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"))
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatal("forwarding budget must not consume ordinary message-create budget")
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequestForUser(t, forwardURL,
+		"22222222-2222-4222-8222-222222222222"))
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatal("one user's forwarding budget must not affect another user")
+	}
+}
+
+func TestNewRouter_MessageCreationDoesNotConsumeForwardingBudget(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	createURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+	for range msgPostRateLimit {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, routerPOSTRequest(t, createURL))
+	}
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t,
+		"/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/forward"))
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatal("ordinary message-create budget must not consume forwarding budget")
 	}
 }
 

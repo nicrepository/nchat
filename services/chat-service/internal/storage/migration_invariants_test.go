@@ -256,6 +256,28 @@ func TestChatMigration_CrossChannelReferencePreservesUnavailableTombstone(t *tes
 	}
 }
 
+func TestChatMigration_MessageForwardIdempotencyIsScopedAndPrivate(t *testing.T) {
+	up := readChatMigration(t, "000015_message_forward_idempotency.up.sql")
+	for _, expected := range []string{
+		"forward_idempotency_key VARCHAR(128)",
+		"workspace_id, sender_id, channel_id, forward_idempotency_key",
+		"WHERE forward_idempotency_key IS NOT NULL",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Fatalf("forward idempotency migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000015_message_forward_idempotency.down.sql")
+	for _, expected := range []string{
+		"DROP INDEX IF EXISTS chat.messages_forward_idempotency_uidx",
+		"DROP COLUMN IF EXISTS forward_idempotency_key",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("forward idempotency rollback missing %q", expected)
+		}
+	}
+}
+
 func TestChatMigration_MessagesDownDoesNotDropSchemaCascade(t *testing.T) {
 	migration := readChatMigration(t, "000004_chat_messages.down.sql")
 	if strings.Contains(strings.ToUpper(migration), "DROP SCHEMA") {
