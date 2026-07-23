@@ -15,6 +15,7 @@ import {
   deleteMessage,
   editMessage,
   favoriteMessage,
+  forwardChannelMessage,
   fetchChannelMessage,
   fetchChannelMessages,
   fetchPins,
@@ -156,6 +157,12 @@ describe("fetchAllowedReactionEmojis", () => {
     await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["👍", "🚀"]);
   });
 
+  it("fails closed when the allowlist is not an array", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: "👍" } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual([]);
+  });
+
   it("does not let a stale request failure clear the new session cache", async () => {
     let rejectStale!: (error: Error) => void;
     mockAuthFetch.mockImplementationOnce(
@@ -182,16 +189,53 @@ describe("fetchChannels", () => {
     mockAuthFetch.mockResolvedValue(
       sidebarResponse({
         channels: [
-          { id: "ch-1", slug: "geral", display_name: "geral", type: "public", is_general: true },
-          { id: "ch-2", slug: "eng", display_name: "eng", type: "private", is_general: false },
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            is_general: true,
+            can_write: true,
+          },
+          {
+            id: "ch-2",
+            slug: "eng",
+            display_name: "eng",
+            type: "private",
+            is_general: false,
+            can_write: false,
+          },
         ],
       }),
     );
 
     const channels = await fetchChannels();
     expect(channels).toHaveLength(2);
-    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public" });
-    expect(channels[1]).toEqual({ id: "ch-2", name: "eng", type: "private" });
+    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public", canWrite: true });
+    expect(channels[1]).toEqual({ id: "ch-2", name: "eng", type: "private", canWrite: false });
+  });
+
+  it("fails closed when can_write is missing or unexpected", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          { id: "missing", slug: "missing", display_name: "Missing", type: "public" },
+          {
+            id: "unexpected",
+            slug: "unexpected",
+            display_name: "Unexpected",
+            type: "public",
+            can_write: "true",
+          },
+        ],
+      }),
+    );
+
+    const channels = await fetchChannels();
+    expect(channels.map(({ id, canWrite }) => ({ id, canWrite }))).toEqual([
+      { id: "missing", canWrite: false },
+      { id: "unexpected", canWrite: false },
+    ]);
   });
 
   it("falls back to slug when display_name is empty", async () => {
@@ -331,7 +375,14 @@ describe("fetchSidebarData", () => {
     mockAuthFetch.mockResolvedValue(
       sidebarResponse({
         channels: [
-          { id: "ch-1", slug: "geral", display_name: "geral", type: "public", is_general: true },
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            is_general: true,
+            can_write: true,
+          },
         ],
         dms: [{ id: "dm-1", type: "direct", name: "Juliane" }],
       }),
@@ -339,7 +390,7 @@ describe("fetchSidebarData", () => {
 
     const { channels, dms } = await fetchSidebarData();
     expect(channels).toHaveLength(1);
-    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public" });
+    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public", canWrite: true });
     expect(dms).toHaveLength(1);
     expect(dms[0]).toEqual({ id: "dm-1", type: "1:1", name: "Juliane", participants: [] });
     expect(mockAuthFetch).toHaveBeenCalledTimes(1);
@@ -386,6 +437,25 @@ describe("fetchSidebarData", () => {
     });
     const { dms } = await fetchSidebarData();
     expect(dms).toEqual([]);
+  });
+});
+
+describe("partial sidebar compatibility", () => {
+  it("normalizes missing destination arrays to empty lists", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        current_user_id: "user-1",
+        workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
+      },
+    });
+
+    await expect(fetchChannels()).resolves.toEqual([]);
+    await expect(fetchDMs()).resolves.toEqual([]);
+    await expect(fetchSidebarData()).resolves.toEqual({
+      currentUserId: "user-1",
+      channels: [],
+      dms: [],
+    });
   });
 });
 
@@ -506,6 +576,26 @@ describe("fetchChannelMessages", () => {
       createdAt: "2024-01-15T10:00:00Z",
       updatedAt: "2024-01-15T10:00:00Z",
     });
+  });
+
+  it("maps the server-derived forwarding marker", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ is_forwarded: true })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isForwarded).toBe(true);
+  });
+
+  it.each([
+    ["false", false],
+    ["missing", undefined],
+    ["unexpected", "true"],
+  ])("normalizes %s is_forwarded to false", async (_case, isForwarded) => {
+    const legacyFields = _case === "missing" ? { body_text: undefined } : {};
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ is_forwarded: isForwarded, ...legacyFields })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isForwarded).toBe(false);
+    if (_case === "missing") expect(page.messages[0].bodyText).toBe("");
   });
 
   it("maps reaction aggregates", async () => {
@@ -803,21 +893,31 @@ describe("message editing", () => {
     } satisfies Partial<MessageEditError>);
   });
 
+  it.each([
+    ["transport error", new Error("network unavailable")],
+    ["unmapped HTTP error", new ApiRequestError(500, "internal_error", "failed")],
+  ])("preserves an unexpected %s", async (_name, error) => {
+    mockAuthFetch.mockRejectedValue(error);
+
+    await expect(editMessage("msg-1", "body", 2)).rejects.toBe(error);
+  });
+
   it("maps history, pagination and body formats", async () => {
     mockAuthFetch.mockResolvedValue({
       data: {
         history: [
           { body: "mais recente", body_format: "v3", versioned_at: "2026-07-13T12:00:00Z" },
           { body: "anterior", body_format: "v2", versioned_at: "2026-07-13T11:00:00Z" },
+          { body: "legado", body_format: "v1", versioned_at: "2026-07-13T10:00:00Z" },
         ],
         offset: 2,
       },
     });
 
-    const page = await getMessageHistory("msg-1", { cursor: "2", limit: 2 });
+    const page = await getMessageHistory("msg-1", { cursor: "2", limit: 3 });
 
     expect(mockAuthFetch).toHaveBeenCalledWith(
-      "/api/chat/messages/msg-1/history?limit=2&offset=2",
+      "/api/chat/messages/msg-1/history?limit=3&offset=2",
       {
         method: "GET",
       },
@@ -826,8 +926,9 @@ describe("message editing", () => {
       entries: [
         { body: "mais recente", bodyFormat: 3, versionedAt: "2026-07-13T12:00:00Z" },
         { body: "anterior", bodyFormat: 2, versionedAt: "2026-07-13T11:00:00Z" },
+        { body: "legado", bodyFormat: 1, versionedAt: "2026-07-13T10:00:00Z" },
       ],
-      nextCursor: "4",
+      nextCursor: "5",
     });
   });
 });
@@ -1041,6 +1142,40 @@ describe("postChannelMessage", () => {
     const msg = await postChannelMessage("geral", "Hello");
     expect(msg.bodyText).toBe("Hello");
     expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+describe("forwardChannelMessage", () => {
+  it("posts only source_message_id to the encoded dedicated destination route", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(msgRaw({ body_text: "snapshot", body_format: "v3", is_forwarded: true })),
+    );
+    const controller = new AbortController();
+
+    const message = await forwardChannelMessage(
+      "canal privado",
+      "source-1",
+      "forward-action-1",
+      controller.signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/canal%20privado/messages/forward",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "forward-action-1",
+        },
+        body: JSON.stringify({ source_message_id: "source-1" }),
+        signal: controller.signal,
+      }),
+    );
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("body_text");
+    expect(payload).not.toHaveProperty("forwarded_from_message_id");
+    expect(message).toMatchObject({ bodyText: "snapshot", bodyFormat: "v3", isForwarded: true });
   });
 });
 

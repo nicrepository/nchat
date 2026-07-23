@@ -154,6 +154,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   editCount: 0,
   reactions: [],
   isFavorited: false,
+  isForwarded: false,
   ...overrides,
 });
 
@@ -875,6 +876,46 @@ describe("useMessages — WS message.created integration", () => {
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
     expect(result.current.state.messages[0].bodyFormat).toBe("v3");
+  });
+
+  it("preserves the forwarded marker from a realtime payload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({ id: "forwarded", is_forwarded: true }),
+      ),
+    );
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].isForwarded).toBe(true);
+  });
+
+  it("normalizes false, missing, and unexpected realtime forwarding markers to false", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventWithPayload("channel", "ch-1", makePayload({ id: "normal", is_forwarded: false }));
+      fireWsEventWithPayload("channel", "ch-1", makePayload({ id: "legacy" }));
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({ id: "unexpected", is_forwarded: "true" }),
+      );
+    });
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(3));
+    expect(result.current.state.messages.every((message) => !message.isForwarded)).toBe(true);
   });
 
   it("maps quoted previews from realtime payloads", async () => {

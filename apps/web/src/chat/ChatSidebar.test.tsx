@@ -35,9 +35,9 @@ vi.mock("./chatApi", () => ({
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const SAMPLE_CHANNELS: Channel[] = [
-  { id: "geral", name: "geral", type: "public" },
-  { id: "infraestrutura", name: "infraestrutura", type: "public" },
-  { id: "projetos", name: "projetos", type: "private" },
+  { id: "geral", name: "geral", type: "public", canWrite: true },
+  { id: "infraestrutura", name: "infraestrutura", type: "public", canWrite: true },
+  { id: "projetos", name: "projetos", type: "private", canWrite: true },
 ];
 
 const SAMPLE_DMS: DMConversation[] = [
@@ -213,6 +213,19 @@ describe("ChatSidebar — loading state", () => {
 // ── Channels ──────────────────────────────────────────────────────────────────
 
 describe("ChatSidebar — channels", () => {
+  it("keeps a read-only channel visible in the sidebar", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "",
+      channels: [{ ...SAMPLE_CHANNELS[1], canWrite: false }],
+      dms: [],
+    });
+    renderChat();
+
+    expect(
+      await screen.findByRole("option", { name: /canal infraestrutura/i }),
+    ).toBeInTheDocument();
+  });
+
   it("renders the channels section", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "",
@@ -591,7 +604,12 @@ describe("ChatSidebar — footer", () => {
 describe("ChatSidebar — route encoding", () => {
   it("navigates with encoded channel ID containing special chars", async () => {
     const user = userEvent.setup();
-    const channelWithSpace: Channel = { id: "equipe infra", name: "equipe infra", type: "public" };
+    const channelWithSpace: Channel = {
+      id: "equipe infra",
+      name: "equipe infra",
+      type: "public",
+      canWrite: true,
+    };
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "",
       channels: [channelWithSpace],
@@ -612,7 +630,12 @@ describe("ChatSidebar — route encoding", () => {
   });
 
   it("marks channel active when route has encoded ID", async () => {
-    const channelWithSpace: Channel = { id: "equipe infra", name: "equipe infra", type: "public" };
+    const channelWithSpace: Channel = {
+      id: "equipe infra",
+      name: "equipe infra",
+      type: "public",
+      canWrite: true,
+    };
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "",
       channels: [channelWithSpace],

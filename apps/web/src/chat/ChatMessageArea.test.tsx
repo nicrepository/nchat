@@ -5,7 +5,7 @@
  * The component itself is the unit under test.
  */
 
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router-dom";
 
@@ -48,6 +48,7 @@ const {
   mockFetchChannelMessages,
   mockFetchChannelMessage,
   mockPostChannelMessage,
+  mockForwardChannelMessage,
   mockFetchDMMessages,
   mockFetchDMMessage,
   mockPostDMMessage,
@@ -75,6 +76,15 @@ const {
         bodyText: string,
         parentMessageId?: string,
         referencedMessageId?: string,
+        signal?: AbortSignal,
+      ) => Promise<Message>
+    >(),
+  mockForwardChannelMessage:
+    vi.fn<
+      (
+        destinationChannelId: string,
+        sourceMessageId: string,
+        idempotencyKey: string,
         signal?: AbortSignal,
       ) => Promise<Message>
     >(),
@@ -142,6 +152,12 @@ vi.mock("./chatApi", () => ({
     referencedMessageId?: string,
     signal?: AbortSignal,
   ) => mockPostChannelMessage(channelId, bodyText, parentMessageId, referencedMessageId, signal),
+  forwardChannelMessage: (
+    destinationChannelId: string,
+    sourceMessageId: string,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ) => mockForwardChannelMessage(destinationChannelId, sourceMessageId, idempotencyKey, signal),
   fetchDMMessages: (conversationId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchDMMessages(conversationId, beforeCursor, signal),
   postDMMessage: (
@@ -206,6 +222,7 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
   editCount: 0,
   reactions: [],
   isFavorited: false,
+  isForwarded: false,
   ...overrides,
 });
 
@@ -287,8 +304,13 @@ function renderPendingReferenceState(state: unknown) {
               ctx={{
                 currentUserId: "me-123",
                 channels: [
-                  { id: "destination", name: "Destino", type: "public" },
-                  { id: rf09SourceChannelID, name: "Origem privada", type: "private" },
+                  { id: "destination", name: "Destino", type: "public", canWrite: true },
+                  {
+                    id: rf09SourceChannelID,
+                    name: "Origem privada",
+                    type: "private",
+                    canWrite: true,
+                  },
                 ],
                 dms: [
                   {
@@ -354,6 +376,7 @@ beforeEach(() => {
   mockPinMessage.mockResolvedValue(undefined);
   mockUnpinMessage.mockResolvedValue(undefined);
   mockGetMessageHistory.mockResolvedValue({ entries: [], nextCursor: undefined });
+  mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
 });
@@ -361,6 +384,223 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   clearTokens();
+});
+
+function renderForwardingArea(messages: Message[]) {
+  mockFetchChannelMessages.mockResolvedValue(messagePage(messages));
+  return render(
+    <MemoryRouter initialEntries={["/chat/channel/current"]}>
+      <Routes>
+        <Route
+          path="/chat"
+          element={
+            <ParentWithContext
+              ctx={{
+                currentUserId: "me-123",
+                channels: [
+                  { id: "current", name: "Atual", type: "public", canWrite: true },
+                  {
+                    id: "destination-a",
+                    name: "Destino Alfa",
+                    type: "public",
+                    canWrite: true,
+                  },
+                  {
+                    id: "destination-b",
+                    name: "Equipe Beta",
+                    type: "private",
+                    canWrite: true,
+                  },
+                ],
+                dms: [],
+              }}
+            />
+          }
+        >
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("ChatMessageArea — RF-08 forwarding", () => {
+  it("opens the searchable dialog, submits once, and closes only after success", async () => {
+    let resolveForward!: (message: Message) => void;
+    mockForwardChannelMessage.mockReturnValue(
+      new Promise((resolve) => {
+        resolveForward = resolve;
+      }),
+    );
+    renderForwardingArea([makeMessage({ id: "source-1", senderId: "other" })]);
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Encaminhar mensagem" });
+    const dialogQueries = within(dialog);
+    expect(dialog).toBeVisible();
+    const search = dialogQueries.getByRole("searchbox", { name: "Buscar canal" });
+    expect(search).toHaveFocus();
+    expect(dialogQueries.queryByRole("button", { name: "Atual" })).not.toBeInTheDocument();
+    const confirm = dialogQueries.getByRole("button", { name: "Encaminhar" });
+    expect(confirm).toBeDisabled();
+
+    await userEvent.type(search, "beta");
+    expect(dialogQueries.queryByRole("button", { name: "Destino Alfa" })).not.toBeInTheDocument();
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Equipe Beta" }));
+    expect(dialogQueries.getByRole("button", { name: "Equipe Beta" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await userEvent.dblClick(confirm);
+
+    expect(mockForwardChannelMessage).toHaveBeenCalledTimes(1);
+    expect(mockForwardChannelMessage).toHaveBeenCalledWith(
+      "destination-b",
+      "source-1",
+      expect.any(String),
+      expect.any(AbortSignal),
+    );
+    expect(dialogQueries.getByRole("button", { name: "Encaminhando…" })).toBeDisabled();
+    expect(dialog).toBeVisible();
+
+    resolveForward(makeMessage({ id: "forwarded", isForwarded: true }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Encaminhar mensagem" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("cancels without calling the API and reports an empty search", async () => {
+    renderForwardingArea([makeMessage({ id: "source-1" })]);
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
+    const dialog = screen.getByRole("dialog", { name: "Encaminhar mensagem" });
+    const dialogQueries = within(dialog);
+    await userEvent.type(
+      dialogQueries.getByRole("searchbox", { name: "Buscar canal" }),
+      "inexistente",
+    );
+    expect(dialogQueries.getByText("Nenhum canal encontrado para a busca.")).toBeVisible();
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Cancelar" }));
+    expect(screen.queryByRole("dialog", { name: "Encaminhar mensagem" })).not.toBeInTheDocument();
+    expect(mockForwardChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps context after failure and allows retry", async () => {
+    mockForwardChannelMessage
+      .mockRejectedValueOnce(new Error("unavailable"))
+      .mockResolvedValueOnce(makeMessage({ id: "forwarded", isForwarded: true }));
+    renderForwardingArea([makeMessage({ id: "source-1" })]);
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
+    const dialogQueries = within(screen.getByRole("dialog", { name: "Encaminhar mensagem" }));
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Destino Alfa" }));
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Encaminhar" }));
+
+    expect(await dialogQueries.findByRole("alert")).toHaveTextContent(
+      "Não foi possível encaminhar",
+    );
+    expect(dialogQueries.getByRole("button", { name: "Destino Alfa" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Encaminhar" }));
+    await waitFor(() => expect(mockForwardChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("uses the newly selected source and does not offer forwarding for removed messages", async () => {
+    renderForwardingArea([
+      makeMessage({ id: "source-1" }),
+      makeMessage({ id: "source-2", bodyText: "segunda" }),
+      makeMessage({ id: "removed", isRemoved: true, status: "deleted", bodyText: "" }),
+    ]);
+    const bubbles = await screen.findAllByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubbles[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
+    await userEvent.click(
+      within(screen.getByRole("dialog", { name: "Encaminhar mensagem" })).getByRole("button", {
+        name: "Cancelar",
+      }),
+    );
+    fireEvent.mouseEnter(bubbles[1]);
+    await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
+    const dialogQueries = within(screen.getByRole("dialog", { name: "Encaminhar mensagem" }));
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Destino Alfa" }));
+    await userEvent.click(dialogQueries.getByRole("button", { name: "Encaminhar" }));
+    await waitFor(() =>
+      expect(mockForwardChannelMessage).toHaveBeenCalledWith(
+        "destination-a",
+        "source-2",
+        expect.any(String),
+        expect.any(AbortSignal),
+      ),
+    );
+    fireEvent.mouseEnter(bubbles[2]);
+    expect(screen.queryByRole("button", { name: "Encaminhar" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the captured source channel excluded while navigation changes the active route", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "source-1", senderId: "other" })]),
+    );
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [
+        { id: "current", name: "Atual", type: "public", canWrite: true },
+        { id: "next", name: "Próximo", type: "public", canWrite: true },
+        { id: "destination", name: "Destino", type: "public", canWrite: true },
+      ],
+      dms: [],
+    };
+    function NavigationParent() {
+      const navigate = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => navigate("/chat/channel/next")}>
+            Navegar
+          </button>
+          <Outlet context={ctx} />
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/current"]}>
+        <Routes>
+          <Route path="/chat" element={<NavigationParent />}>
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
+    expect(
+      within(screen.getByRole("dialog", { name: "Encaminhar mensagem" })).queryByRole("button", {
+        name: "Atual",
+      }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Navegar" }));
+
+    const dialog = within(screen.getByRole("dialog", { name: "Encaminhar mensagem" }));
+    expect(dialog.queryByRole("button", { name: "Atual" })).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: "Próximo" })).toBeVisible();
+  });
+
+  it("renders the server forwarding marker without changing the safe body renderer", async () => {
+    renderForwardingArea([
+      makeMessage({ id: "normal", bodyText: "normal" }),
+      makeMessage({ id: "forwarded", bodyText: "<img src=x onerror=alert(1)>", isForwarded: true }),
+    ]);
+    expect(await screen.findByTestId("chat-message-forwarded")).toHaveTextContent(
+      "Mensagem encaminhada",
+    );
+    expect(screen.getAllByTestId("chat-message-forwarded")).toHaveLength(1);
+    expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeVisible();
+    expect(document.querySelector("img")).toBeNull();
+  });
 });
 
 // ── Header rendering ──────────────────────────────────────────────────────────
@@ -1446,6 +1686,30 @@ describe("ChatMessageArea — send message", () => {
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
   });
 
+  it("uses a safe author fallback for an active quote whose parent is unavailable", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m2",
+          quoted: {
+            id: "missing-parent",
+            authorId: "",
+            bodyText: "trecho preservado",
+            bodyFormat: "v3",
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: new Date().toISOString(),
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const quote = await screen.findByTestId("chat-message-quote");
+    expect(quote).toHaveTextContent("Usuário desconhecido");
+    expect(quote).toHaveTextContent("trecho preservado");
+  });
+
   it("clicking a loaded quote scrolls to the original message", async () => {
     const parent = makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "original" });
     mockFetchChannelMessages.mockResolvedValue(
@@ -1572,6 +1836,44 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     expect(referenceLink).not.toHaveAttribute("aria-label", expect.stringContaining("Ana"));
     referenceLink.focus();
     await userEvent.keyboard(" ");
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "private-1",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
+  it("ignores unrelated keys and follows an authorized reference by click", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          reference: {
+            available: true,
+            messageId: "source-1",
+            targetType: "channel",
+            targetId: "private-1",
+            targetLabel: "privado",
+            authorDisplayName: "Ana",
+            bodyText: "origem",
+            bodyFormat: "v3",
+            createdAt: new Date().toISOString(),
+          },
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+    const reference = await screen.findByRole("link", { name: "Ir para mensagem citada" });
+
+    fireEvent.keyDown(reference, { key: "x" });
+    expect(mockFetchChannelMessages).not.toHaveBeenCalledWith(
+      "private-1",
+      undefined,
+      expect.any(AbortSignal),
+    );
+    await userEvent.click(reference);
+
     await waitFor(() =>
       expect(mockFetchChannelMessages).toHaveBeenCalledWith(
         "private-1",
@@ -1981,8 +2283,13 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
                 ctx={{
                   currentUserId: "me-123",
                   channels: [
-                    { id: rf09SourceChannelID, name: "Origem", type: "public" },
-                    { id: "destination", name: "Destino", type: "public" },
+                    {
+                      id: rf09SourceChannelID,
+                      name: "Origem",
+                      type: "public",
+                      canWrite: true,
+                    },
+                    { id: "destination", name: "Destino", type: "public", canWrite: true },
                   ],
                   dms: [],
                 }}
@@ -2891,7 +3198,7 @@ describe("ChatMessageArea — resolved display name", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "",
-                  channels: [{ id: "ch-uuid-001", name: "geral", type: "public" }],
+                  channels: [{ id: "ch-uuid-001", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                 }}
               />
@@ -2920,7 +3227,7 @@ describe("ChatMessageArea — resolved display name", () => {
               <ParentWithContext
                 ctx={{
                   currentUserId: "",
-                  channels: [{ id: "ch-uuid-001", name: "geral", type: "public" }],
+                  channels: [{ id: "ch-uuid-001", name: "geral", type: "public", canWrite: true }],
                   dms: [],
                 }}
               />

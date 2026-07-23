@@ -36,6 +36,7 @@ const makeFavorite = (overrides: Partial<FavoriteItem> = {}): FavoriteItem => ({
     editCount: 0,
     reactions: [],
     isFavorited: true,
+    isForwarded: false,
     ...(overrides.message ?? {}),
   },
   channelId: "ch-1",
