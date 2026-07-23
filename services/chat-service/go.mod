@@ -10,7 +10,7 @@ require (
 	github.com/nicrepository/nchat/libs/go/platform v0.0.0
 	github.com/pashagolub/pgxmock/v2 v2.12.0
 	github.com/prometheus/client_golang v1.22.0
-	github.com/valkey-io/valkey-go v1.0.75
+	github.com/valkey-io/valkey-go v1.0.76
 )
 
 require (
