@@ -957,6 +957,7 @@ export function useMessages({
           // WS create events never carry the caller's favorite state; a message
           // just created cannot be favorited yet.
           isFavorited: false,
+          isForwarded: p.is_forwarded === true,
           quoted:
             !removed && p.quoted
               ? {

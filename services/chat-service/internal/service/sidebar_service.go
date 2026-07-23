@@ -12,22 +12,32 @@ import (
 // SidebarData is the aggregate returned by SidebarService.GetSidebar.
 type SidebarData struct {
 	Workspace domain.Workspace
-	Channels  []domain.Channel
+	Channels  []SidebarChannel
 	DMs       []domain.DMConversationWithParticipantIDs
+}
+
+// SidebarChannel carries server-derived destination eligibility.
+type SidebarChannel struct {
+	Channel  domain.Channel
+	CanWrite bool
+}
+
+type sidebarChannelStore interface {
+	ListVisibleChannelAccessByUser(ctx context.Context, workspaceID, userID string) ([]storage.VisibleChannelAccess, error)
 }
 
 // SidebarService aggregates workspace, channel, and DM data for the sidebar
 // in a single authorized read. No N+1 queries are performed.
 type SidebarService struct {
 	workspaces storage.WorkspaceStore
-	channels   storage.ChannelStore
+	channels   sidebarChannelStore
 	members    storage.MemberStore
 	dms        storage.DMStore
 }
 
 func NewSidebarService(
 	workspaces storage.WorkspaceStore,
-	channels storage.ChannelStore,
+	channels sidebarChannelStore,
 	members storage.MemberStore,
 	dms storage.DMStore,
 ) *SidebarService {
@@ -69,9 +79,16 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 		return SidebarData{}, domain.ErrForbidden
 	}
 
-	channels, err := s.channels.ListVisibleChannelsByUser(ctx, workspace.ID, userID)
+	channels, err := s.channels.ListVisibleChannelAccessByUser(ctx, workspace.ID, userID)
 	if err != nil {
 		return SidebarData{}, fmt.Errorf("list channels: %w", err)
+	}
+	sidebarChannels := make([]SidebarChannel, 0, len(channels))
+	for _, access := range channels {
+		sidebarChannels = append(sidebarChannels, SidebarChannel{
+			Channel:  access.Channel,
+			CanWrite: domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+		})
 	}
 
 	dms, err := s.dms.ListVisibleConversationsWithParticipantIDs(ctx, workspace.ID, userID)
@@ -81,7 +98,7 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 
 	return SidebarData{
 		Workspace: workspace,
-		Channels:  channels,
+		Channels:  sidebarChannels,
 		DMs:       dms,
 	}, nil
 }

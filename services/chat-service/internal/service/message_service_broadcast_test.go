@@ -86,6 +86,74 @@ func waitForPublishCalls(t *testing.T, pub *fakePublisher, want int) []publishCa
 	return nil
 }
 
+func TestMessageService_ForwardChannelMessage_PublishesOnlyAfterPersistence(t *testing.T) {
+	baseStore := func() *fakeMessageStore {
+		return &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:source": {
+			ID: "source", WorkspaceID: "ws-1", ChannelID: "origin",
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+		}}}
+	}
+	t.Run("success targets destination", func(t *testing.T) {
+		store := baseStore()
+		store.forwardedMessage = domain.Message{
+			ID: "forwarded", WorkspaceID: "ws-1", ChannelID: "destination",
+			ForwardedFromMessageID: "source", Kind: domain.MessageKindUser,
+			Status: domain.MessageStatusActive,
+		}
+		publisher := &fakePublisher{}
+		svc := service.NewMessageService(
+			&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")}, &fakeDMStore{}, store,
+		)
+		svc.SetPublisher(publisher)
+		_, err := svc.ForwardChannelMessage(t.Context(), service.ForwardChannelMessageInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: user1, SourceMessageID: "source",
+		})
+		if err != nil {
+			t.Fatalf("ForwardChannelMessage: %v", err)
+		}
+		call := waitForPublishCalls(t, publisher, 1)[0]
+		if call.targetType != "channel" || call.targetID != "destination" || call.msg.ForwardedFromMessageID != "source" {
+			t.Fatalf("unexpected publish: %+v", call)
+		}
+	})
+	t.Run("persistence failure does not publish", func(t *testing.T) {
+		store := baseStore()
+		store.forwardErr = errors.New("database unavailable")
+		publisher := &fakePublisher{}
+		svc := service.NewMessageService(
+			&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")}, &fakeDMStore{}, store,
+		)
+		svc.SetPublisher(publisher)
+		_, err := svc.ForwardChannelMessage(t.Context(), service.ForwardChannelMessageInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: user1, SourceMessageID: "source",
+		})
+		if err == nil || publisher.count() != 0 {
+			t.Fatalf("failed persistence must not publish: err=%v calls=%d", err, publisher.count())
+		}
+	})
+	t.Run("idempotent replay does not publish", func(t *testing.T) {
+		store := baseStore()
+		store.forwardedMessage = domain.Message{
+			ID: "forwarded", WorkspaceID: "ws-1", ChannelID: "destination",
+			ForwardedFromMessageID: "source", Kind: domain.MessageKindUser,
+			Status: domain.MessageStatusActive,
+		}
+		store.forwardReplayed = true
+		publisher := &fakePublisher{}
+		svc := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, store)
+		svc.SetPublisher(publisher)
+
+		result, err := svc.ForwardChannelMessage(t.Context(), service.ForwardChannelMessageInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: user1,
+			SourceMessageID: "source", IdempotencyKey: "action-1",
+		})
+
+		if err != nil || !result.Replayed || publisher.count() != 0 {
+			t.Fatalf("replay must not publish: result=%+v err=%v calls=%d", result, err, publisher.count())
+		}
+	})
+}
+
 func TestMessageService_EditMessage_BroadcastsUpdatedAfterPersist(t *testing.T) {
 	store := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {

@@ -24,6 +24,9 @@ const msgGetSingleRateLimit = 120
 // user may make per minute across all channels and DMs.
 const msgPostRateLimit = 60
 
+// messageForwardRateLimit isolates forwards from ordinary message writes.
+const messageForwardRateLimit = 20
+
 // pinActionRateLimit is the maximum number of pin/unpin writes per user/minute.
 const pinActionRateLimit = 10
 
@@ -78,6 +81,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	msgListLimiter := NewUserRateLimiter(msgListRateLimit, time.Minute)
 	msgGetSingleLimiter := NewUserRateLimiter(msgGetSingleRateLimit, time.Minute)
 	msgPostLimiter := NewUserRateLimiter(msgPostRateLimit, time.Minute)
+	messageForwardLimiter := NewUserRateLimiter(messageForwardRateLimit, time.Minute)
 	pinActionLimiter := NewUserRateLimiter(pinActionRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
 
@@ -93,6 +97,11 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	))
 	mux.Handle("POST "+RouteChannelMessages, authMiddleware(
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.CreateChannelMessage)),
+	))
+	mux.Handle("POST "+RouteChannelMessageForward, authMiddleware(
+		newForwardMetrics(metrics).Middleware(
+			messageForwardLimiter.Middleware(http.HandlerFunc(messages.ForwardChannelMessage)),
+		),
 	))
 	mux.Handle("GET "+RouteChannelMessage, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetChannelMessage)),

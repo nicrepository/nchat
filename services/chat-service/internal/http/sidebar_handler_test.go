@@ -76,8 +76,9 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 	v := makeTestValidator(t)
 	svc := &stubSidebarProvider{data: service.SidebarData{
 		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
-		Channels: []domain.Channel{
-			{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic, IsGeneral: true, Status: domain.ChannelStatusActive},
+		Channels: []service.SidebarChannel{
+			{Channel: domain.Channel{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic, IsGeneral: true, Status: domain.ChannelStatusActive}, CanWrite: true},
+			{Channel: domain.Channel{ID: "ch-2", Slug: "arquivo", DisplayName: "arquivo", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusArchived}, CanWrite: false},
 		},
 		DMs: []domain.DMConversationWithParticipantIDs{
 			{
@@ -103,6 +104,7 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 				ID        string `json:"id"`
 				Slug      string `json:"slug"`
 				IsGeneral bool   `json:"is_general"`
+				CanWrite  bool   `json:"can_write"`
 			} `json:"channels"`
 			DMs []struct {
 				ID   string `json:"id"`
@@ -115,11 +117,17 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 	if envelope.Data.Workspace.ID != "ws-1" {
 		t.Fatalf("expected workspace ws-1, got %q", envelope.Data.Workspace.ID)
 	}
-	if len(envelope.Data.Channels) != 1 {
-		t.Fatalf("expected 1 channel, got %d", len(envelope.Data.Channels))
+	if len(envelope.Data.Channels) != 2 {
+		t.Fatalf("expected 2 channels, got %d", len(envelope.Data.Channels))
 	}
 	if !envelope.Data.Channels[0].IsGeneral {
 		t.Fatal("expected is_general=true for geral channel")
+	}
+	if !envelope.Data.Channels[0].CanWrite {
+		t.Fatal("expected server-derived can_write=true")
+	}
+	if envelope.Data.Channels[1].CanWrite {
+		t.Fatal("expected server-derived can_write=false")
 	}
 	if len(envelope.Data.DMs) != 1 {
 		t.Fatalf("expected 1 DM, got %d", len(envelope.Data.DMs))
@@ -286,8 +294,8 @@ func TestSidebarHandler_PrivateChannel_HasCorrectType(t *testing.T) {
 	v := makeTestValidator(t)
 	svc := &stubSidebarProvider{data: service.SidebarData{
 		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
-		Channels: []domain.Channel{
-			{ID: "ch-priv", Slug: "secreto", DisplayName: "secreto", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive},
+		Channels: []service.SidebarChannel{
+			{Channel: domain.Channel{ID: "ch-priv", Slug: "secreto", DisplayName: "secreto", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}, CanWrite: true},
 		},
 	}}
 	router := sidebarRouter(v, svc)

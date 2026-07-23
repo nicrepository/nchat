@@ -43,6 +43,7 @@ function pin(id: string): PinnedItem {
       editCount: 0,
       reactions: [],
       isFavorited: false,
+      isForwarded: false,
     },
     pinnedByUserId: "mod-1",
     pinnedAt: "2025-02-01T00:00:00Z",

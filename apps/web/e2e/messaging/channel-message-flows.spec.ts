@@ -17,6 +17,73 @@ import {
 } from "../helpers/messagingApi";
 
 test.describe("mensagens em canal", () => {
+  test("encaminha uma mensagem para outro canal e preserva o indicador após reload", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-source");
+    const originalText = `${uniqueId(testInfo, "forward")} conteúdo encaminhado`;
+    const original = makeMessage({
+      id: `${targetId}-original`,
+      sender_id: OTHER_USER_ID,
+      sender_display_name: OTHER_USER_NAME,
+      body_text: originalText,
+    });
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Origem E2E",
+      messages: [original],
+    });
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const sourceBubble = await revealActions(page, original.id);
+    await sourceBubble.getByRole("button", { name: "Encaminhar" }).click();
+    const dialog = page.getByRole("dialog", { name: "Encaminhar mensagem" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Origem E2E" })).toHaveCount(0);
+    await dialog.getByRole("searchbox", { name: "Buscar canal" }).fill("canal e2e");
+    await dialog.getByRole("button", { name: "Canal E2E" }).click();
+
+    const forwardResponse = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/chat/channels/e2e-channel-other/messages/forward") &&
+        response.request().method() === "POST",
+    );
+    await dialog.getByRole("button", { name: "Encaminhar" }).evaluate((button) => {
+      (button as HTMLButtonElement).click();
+      (button as HTMLButtonElement).click();
+    });
+    expect((await forwardResponse).status()).toBe(201);
+    await expect(dialog).toHaveCount(0);
+
+    expect(scenario.requests.forwards).toEqual([
+      {
+        destinationChannelId: "e2e-channel-other",
+        sourceMessageId: original.id,
+        idempotencyKey: expect.any(String),
+        raw: { source_message_id: original.id },
+      },
+    ]);
+    expect(scenario.requests.forwards[0].idempotencyKey).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+    expect(scenario.requests.forwards[0].raw).not.toHaveProperty("body_text");
+
+    const forwarded = messagesFor(scenario, "channel", "e2e-channel-other")[0];
+    expect(forwarded).toBeDefined();
+    await page.goto("/chat/channel/e2e-channel-other");
+    const forwardedBubble = messageBubble(page, forwarded.id);
+    await expect(forwardedBubble).toContainText(originalText);
+    await expect(forwardedBubble.getByTestId("chat-message-forwarded")).toContainText(
+      "Mensagem encaminhada",
+    );
+
+    await page.reload();
+    await expect(
+      messageBubble(page, forwarded.id).getByTestId("chat-message-forwarded"),
+    ).toContainText("Mensagem encaminhada");
+  });
+
   test("responde uma mensagem com quote inline e persiste após reload", async ({
     page,
   }, testInfo) => {

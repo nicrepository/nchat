@@ -67,8 +67,9 @@ func (f *sidebarFakeMemberStore) SyncGeneralMemberships(_ context.Context, _ str
 }
 
 type sidebarFakeChannelStore struct {
-	channels []domain.Channel
-	err      error
+	accesses        []storage.VisibleChannelAccess
+	err             error
+	listAccessCalls int
 }
 
 func (f *sidebarFakeChannelStore) CreateCategory(_ context.Context, _ storage.CreateCategoryInput) (domain.ChannelCategory, error) {
@@ -99,7 +100,11 @@ func (f *sidebarFakeChannelStore) ListChannelsByWorkspace(_ context.Context, _ s
 	return nil, nil
 }
 func (f *sidebarFakeChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ string) ([]domain.Channel, error) {
-	return f.channels, f.err
+	return nil, nil
+}
+func (f *sidebarFakeChannelStore) ListVisibleChannelAccessByUser(_ context.Context, _, _ string) ([]storage.VisibleChannelAccess, error) {
+	f.listAccessCalls++
+	return f.accesses, f.err
 }
 func (f *sidebarFakeChannelStore) UpdateChannel(_ context.Context, _ storage.UpdateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
@@ -147,7 +152,9 @@ func activeMember() domain.WorkspaceMember {
 func newSidebarService(
 	ws storage.WorkspaceStore,
 	ms storage.MemberStore,
-	cs storage.ChannelStore,
+	cs interface {
+		ListVisibleChannelAccessByUser(context.Context, string, string) ([]storage.VisibleChannelAccess, error)
+	},
 	ds storage.DMStore,
 ) *service.SidebarService {
 	return service.NewSidebarService(ws, cs, ms, ds) // real API: workspaces, channels, members, dms
@@ -224,9 +231,14 @@ func TestSidebarService_LeftMember_ReturnsForbidden(t *testing.T) {
 }
 
 func TestSidebarService_ActiveMember_ReturnsChannelsAndDMs(t *testing.T) {
-	channels := []domain.Channel{
-		{ID: "ch-1", Slug: "geral", Type: domain.ChannelTypePublic, IsGeneral: true, Status: domain.ChannelStatusActive},
-		{ID: "ch-2", Slug: "eng", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive},
+	accesses := []storage.VisibleChannelAccess{
+		{Channel: domain.Channel{ID: "ch-1", WorkspaceID: sidebarWsID, Slug: "geral", Type: domain.ChannelTypePublic, IsGeneral: true, Status: domain.ChannelStatusActive}},
+		{
+			Channel: domain.Channel{ID: "ch-2", WorkspaceID: sidebarWsID, Slug: "eng", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive},
+			ChannelMember: &domain.ChannelMember{
+				ChannelID: "ch-2", UserID: sidebarUserID, Role: domain.ChannelRoleMember,
+			},
+		},
 	}
 	dms := []domain.DMConversationWithParticipantIDs{
 		{
@@ -237,7 +249,7 @@ func TestSidebarService_ActiveMember_ReturnsChannelsAndDMs(t *testing.T) {
 	svc := newSidebarService(
 		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
 		&sidebarFakeMemberStore{member: activeMember()},
-		&sidebarFakeChannelStore{channels: channels},
+		&sidebarFakeChannelStore{accesses: accesses},
 		&sidebarFakeDMStore{dms: dms},
 	)
 	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
@@ -250,6 +262,11 @@ func TestSidebarService_ActiveMember_ReturnsChannelsAndDMs(t *testing.T) {
 	if len(data.Channels) != 2 {
 		t.Fatalf("expected 2 channels, got %d", len(data.Channels))
 	}
+	for _, channel := range data.Channels {
+		if !channel.CanWrite {
+			t.Fatalf("visible active channel must be writable under the current policy: %+v", channel)
+		}
+	}
 	if len(data.DMs) != 1 {
 		t.Fatalf("expected 1 DM, got %d", len(data.DMs))
 	}
@@ -259,7 +276,7 @@ func TestSidebarService_EmptyChannelsAndDMs_ReturnsEmptySlices(t *testing.T) {
 	svc := newSidebarService(
 		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
 		&sidebarFakeMemberStore{member: activeMember()},
-		&sidebarFakeChannelStore{channels: []domain.Channel{}},
+		&sidebarFakeChannelStore{accesses: []storage.VisibleChannelAccess{}},
 		&sidebarFakeDMStore{dms: []domain.DMConversationWithParticipantIDs{}},
 	)
 	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
@@ -290,8 +307,58 @@ func TestSidebarService_EmptyUserID_ReturnsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestSidebarService_InfrastructureErrorsAreWrapped(t *testing.T) {
+	storeErr := errors.New("store unavailable")
+	tests := []struct {
+		name     string
+		ws       *sidebarFakeWorkspaceStore
+		member   *sidebarFakeMemberStore
+		channels *sidebarFakeChannelStore
+		dms      *sidebarFakeDMStore
+	}{
+		{
+			name:     "workspace",
+			ws:       &sidebarFakeWorkspaceStore{err: storeErr},
+			member:   &sidebarFakeMemberStore{},
+			channels: &sidebarFakeChannelStore{},
+			dms:      &sidebarFakeDMStore{},
+		},
+		{
+			name:     "membership",
+			ws:       &sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+			member:   &sidebarFakeMemberStore{err: storeErr},
+			channels: &sidebarFakeChannelStore{},
+			dms:      &sidebarFakeDMStore{},
+		},
+		{
+			name:     "channels",
+			ws:       &sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+			member:   &sidebarFakeMemberStore{member: activeMember()},
+			channels: &sidebarFakeChannelStore{err: storeErr},
+			dms:      &sidebarFakeDMStore{},
+		},
+		{
+			name:     "direct messages",
+			ws:       &sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+			member:   &sidebarFakeMemberStore{member: activeMember()},
+			channels: &sidebarFakeChannelStore{},
+			dms:      &sidebarFakeDMStore{err: storeErr},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newSidebarService(tt.ws, tt.member, tt.channels, tt.dms)
+			_, err := svc.GetSidebar(context.Background(), sidebarUserID)
+			if !errors.Is(err, storeErr) {
+				t.Fatalf("expected wrapped store error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestSidebarService_NoChannelLeakage_PrivateOnlyIfMember(t *testing.T) {
-	// The channel store's ListVisibleChannelsByUser is responsible for filtering,
+	// The channel store's ListVisibleChannelAccessByUser is responsible for filtering,
 	// but the service must pass both workspaceID and userID so the store can apply
 	// visibility rules. We verify the service does not bypass these parameters.
 	var capturedWorkspaceID, capturedUserID string
@@ -319,7 +386,43 @@ func TestSidebarService_NoChannelLeakage_PrivateOnlyIfMember(t *testing.T) {
 	}
 }
 
-// capturingChannelStore records the args passed to ListVisibleChannelsByUser.
+func TestSidebarService_CanWriteUsesDomainPolicyWithoutNPlusOne(t *testing.T) {
+	store := &sidebarFakeChannelStore{accesses: []storage.VisibleChannelAccess{
+		{Channel: domain.Channel{ID: "public", WorkspaceID: sidebarWsID, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}},
+		{Channel: domain.Channel{ID: "private", WorkspaceID: sidebarWsID, Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}},
+		{
+			Channel: domain.Channel{ID: "archived", WorkspaceID: sidebarWsID, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusArchived},
+			ChannelMember: &domain.ChannelMember{
+				ChannelID: "archived", UserID: sidebarUserID, Role: domain.ChannelRoleMember,
+			},
+		},
+	}}
+	svc := newSidebarService(
+		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+		&sidebarFakeMemberStore{member: activeMember()},
+		store,
+		&sidebarFakeDMStore{},
+	)
+
+	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+	if err != nil {
+		t.Fatalf("GetSidebar: %v", err)
+	}
+	if store.listAccessCalls != 1 {
+		t.Fatalf("expected one batched channel access query, got %d", store.listAccessCalls)
+	}
+	if !data.Channels[0].CanWrite {
+		t.Fatal("active public channel must follow CanWriteChannel=true")
+	}
+	if data.Channels[1].CanWrite {
+		t.Fatal("private channel without membership must follow CanWriteChannel=false")
+	}
+	if data.Channels[2].CanWrite {
+		t.Fatal("archived channel must follow CanWriteChannel=false")
+	}
+}
+
+// capturingChannelStore records the args passed to ListVisibleChannelAccessByUser.
 type capturingChannelStore struct {
 	onList func(workspaceID, userID string)
 }
@@ -352,6 +455,9 @@ func (c *capturingChannelStore) ListChannelsByWorkspace(_ context.Context, _ str
 	return nil, nil
 }
 func (c *capturingChannelStore) ListVisibleChannelsByUser(_ context.Context, workspaceID, userID string) ([]domain.Channel, error) {
+	return nil, nil
+}
+func (c *capturingChannelStore) ListVisibleChannelAccessByUser(_ context.Context, workspaceID, userID string) ([]storage.VisibleChannelAccess, error) {
 	if c.onList != nil {
 		c.onList(workspaceID, userID)
 	}

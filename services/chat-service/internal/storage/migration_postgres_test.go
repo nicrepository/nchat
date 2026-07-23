@@ -80,6 +80,7 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 		"000011_message_pins.up.sql",
 		"000013_message_edit_history.up.sql",
 		"000014_cross_channel_message_reference.up.sql",
+		"000015_message_forward_idempotency.up.sql",
 	} {
 		if _, err := conn.Exec(ctx, readChatMigration(t, name)); err != nil {
 			t.Fatalf("apply %s: %v", name, err)

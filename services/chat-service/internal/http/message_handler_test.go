@@ -50,6 +50,9 @@ type fakeMessageProvider struct {
 	historyErr    error
 	referenceOut  []service.MessageReferenceResolution
 	referenceErr  error
+	forwardedMsg  domain.Message
+	forwardReplay bool
+	forwardErr    error
 
 	lastCreateChannelInput service.CreateChannelMessageInput
 	lastCreateDMInput      service.CreateDMMessageInput
@@ -61,6 +64,7 @@ type fakeMessageProvider struct {
 	lastDeleteInput        service.DeleteMessageInput
 	lastHistoryInput       service.GetMessageEditHistoryInput
 	lastReferenceInput     service.ResolveMessageReferencesInput
+	lastForwardInput       service.ForwardChannelMessageInput
 }
 
 func (f *fakeMessageProvider) EditMessage(_ context.Context, in service.EditMessageInput) (domain.Message, error) {
@@ -129,6 +133,11 @@ func (f *fakeMessageProvider) ListChannelMessages(_ context.Context, in service.
 func (f *fakeMessageProvider) CreateChannelMessage(_ context.Context, in service.CreateChannelMessageInput) (domain.Message, error) {
 	f.lastCreateChannelInput = in
 	return f.createdMsg, f.createChErr
+}
+
+func (f *fakeMessageProvider) ForwardChannelMessage(_ context.Context, in service.ForwardChannelMessageInput) (service.ForwardChannelMessageOutput, error) {
+	f.lastForwardInput = in
+	return service.ForwardChannelMessageOutput{Message: f.forwardedMsg, Replayed: f.forwardReplay}, f.forwardErr
 }
 
 func (f *fakeMessageProvider) ListDMMessages(_ context.Context, in service.ListDMMessagesInput) (service.ListDMMessagesOutput, error) {
@@ -741,6 +750,9 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	if !ok || len(reactions) != 1 || reactions[0].(map[string]any)["reacted_by_me"] != true {
 		t.Fatalf("expected reaction aggregate, got %#v", msgsArr[0].(map[string]any)["reactions"])
 	}
+	if forwarded, present := msgsArr[0].(map[string]any)["is_forwarded"]; !present || forwarded != false {
+		t.Fatalf("normal list item must contain is_forwarded=false, got %#v", msgsArr[0])
+	}
 }
 
 func TestMessageHandler_ListChannelMessages_ReferenceDTOFailsClosed(t *testing.T) {
@@ -1020,6 +1032,258 @@ func TestMessageHandler_CreateChannelMessage_Success(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — body: %s", rec.Code, rec.Body.String())
 	}
+	data := decodeBody(t, rec)["data"].(map[string]any)
+	if forwarded, present := data["is_forwarded"]; !present || forwarded != false {
+		t.Fatalf("normal create response must contain is_forwarded=false, got %#v", data)
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_Success(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	forwarded := testMessage()
+	forwarded.ForwardedFromMessageID = sourceID
+	forwarded.BodyFormat = domain.MessageBodyFormatV3
+	msgs := &fakeMessageProvider{forwardedMsg: forwarded}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+		strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+	r.Header.Set("Idempotency-Key", "action-1")
+	r.SetPathValue("channelID", testChannelID)
+	h.ForwardChannelMessage(rec, r)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotency-Replayed") != "" {
+		t.Fatal("first execution must not expose replay metadata")
+	}
+	want := service.ForwardChannelMessageInput{
+		WorkspaceID: testWorkspaceID, DestinationChannelID: testChannelID,
+		ActorID: msgTestUserID, SourceMessageID: sourceID, IdempotencyKey: "action-1",
+	}
+	if msgs.lastForwardInput != want {
+		t.Fatalf("unexpected forwarding input: %+v", msgs.lastForwardInput)
+	}
+	var envelope struct {
+		Data struct {
+			IsForwarded bool `json:"is_forwarded"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !envelope.Data.IsForwarded {
+		t.Fatal("forwarded response must expose is_forwarded=true")
+	}
+	if strings.Contains(rec.Body.String(), sourceID) {
+		t.Fatal("forwarded response must not expose source provenance")
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_IdempotentReplay(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	forwarded := testMessage()
+	forwarded.ForwardedFromMessageID = sourceID
+	msgs := &fakeMessageProvider{forwardedMsg: forwarded, forwardReplay: true}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+		strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+	r.Header.Set("Idempotency-Key", "action-1")
+	r.SetPathValue("channelID", testChannelID)
+
+	h.ForwardChannelMessage(rec, r)
+
+	if rec.Code != http.StatusOK || rec.Header().Get("Idempotency-Replayed") != "" {
+		t.Fatalf("expected replay response, status=%d headers=%v", rec.Code, rec.Header())
+	}
+	if strings.Contains(rec.Body.String(), "action-1") {
+		t.Fatal("idempotency key must not be serialized")
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_AllowsMissingIdempotencyKeyForCompatibility(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	forwarded := testMessage()
+	forwarded.ForwardedFromMessageID = sourceID
+	msgs := &fakeMessageProvider{forwardedMsg: forwarded}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+		strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+	r.SetPathValue("channelID", testChannelID)
+
+	h.ForwardChannelMessage(rec, r)
+
+	if rec.Code != http.StatusCreated || msgs.lastForwardInput.IdempotencyKey != "" {
+		t.Fatalf("missing compatibility key failed: status=%d input=%+v", rec.Code, msgs.lastForwardInput)
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_MapsIdempotencyConflict(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	msgs := &fakeMessageProvider{forwardErr: domain.ErrConflict}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+		strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+	r.Header.Set("Idempotency-Key", "action-1")
+	r.SetPathValue("channelID", testChannelID)
+
+	h.ForwardChannelMessage(rec, r)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotency-Replayed") != "" {
+		t.Fatal("conflict must not expose replay metadata")
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_RejectsInvalidIdempotencyKeys(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	for _, key := range []string{" ", "contains spaces", strings.Repeat("a", 129)} {
+		t.Run(key, func(t *testing.T) {
+			msgs := &fakeMessageProvider{}
+			h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+			rec := httptest.NewRecorder()
+			r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+				strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+			r.Header["Idempotency-Key"] = []string{key}
+			r.SetPathValue("channelID", testChannelID)
+
+			h.ForwardChannelMessage(rec, r)
+
+			if rec.Code != http.StatusBadRequest || msgs.lastForwardInput.SourceMessageID != "" {
+				t.Fatalf("invalid key reached service: status=%d input=%+v", rec.Code, msgs.lastForwardInput)
+			}
+		})
+	}
+
+	t.Run("multiple values", func(t *testing.T) {
+		msgs := &fakeMessageProvider{}
+		h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+		rec := httptest.NewRecorder()
+		r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+			strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+		r.Header["Idempotency-Key"] = []string{"action-1", "action-2"}
+		r.SetPathValue("channelID", testChannelID)
+
+		h.ForwardChannelMessage(rec, r)
+
+		if rec.Code != http.StatusBadRequest || msgs.lastForwardInput.SourceMessageID != "" {
+			t.Fatalf("multiple keys reached service: status=%d input=%+v", rec.Code, msgs.lastForwardInput)
+		}
+	})
+}
+
+func TestMessageHandler_ForwardChannelMessage_RejectsInvalidContextBeforeService(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	for _, test := range []struct {
+		name        string
+		destination string
+		workspace   *fakeWorkspaceResolver
+		withUser    bool
+		wantStatus  int
+	}{
+		{
+			name: "invalid destination", destination: "not-a-uuid",
+			workspace: &fakeWorkspaceResolver{workspace: activeWorkspace()}, withUser: true,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "unauthenticated", destination: testChannelID,
+			workspace:  &fakeWorkspaceResolver{workspace: activeWorkspace()},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "workspace unavailable", destination: testChannelID,
+			workspace: &fakeWorkspaceResolver{err: domain.ErrNotFound}, withUser: true,
+			wantStatus: http.StatusNotFound,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			msgs := &fakeMessageProvider{}
+			h := httpapi.NewMessageHandler(test.workspace, msgs, nil)
+			var r *http.Request
+			if test.withUser {
+				r = requestWithUser(http.MethodPost, "/api/chat/channels/"+test.destination+"/messages/forward",
+					strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+			} else {
+				r = httptest.NewRequest(http.MethodPost, "/api/chat/channels/"+test.destination+"/messages/forward",
+					strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+			}
+			r.SetPathValue("channelID", test.destination)
+			rec := httptest.NewRecorder()
+
+			h.ForwardChannelMessage(rec, r)
+
+			if rec.Code != test.wantStatus || msgs.lastForwardInput.SourceMessageID != "" {
+				t.Fatalf("status=%d input=%+v", rec.Code, msgs.lastForwardInput)
+			}
+		})
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_RejectsInvalidRequests(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "invalid uuid", body: `{"source_message_id":"not-a-uuid"}`},
+		{name: "missing source", body: `{}`},
+		{name: "body text", body: `{"source_message_id":"` + sourceID + `","body_text":"spoof"}`},
+		{name: "body format", body: `{"source_message_id":"` + sourceID + `","body_format":"v3"}`},
+		{name: "author", body: `{"source_message_id":"` + sourceID + `","author_id":"spoof"}`},
+		{name: "sender", body: `{"source_message_id":"` + sourceID + `","sender_id":"spoof"}`},
+		{name: "forward marker", body: `{"source_message_id":"` + sourceID + `","is_forwarded":true}`},
+		{name: "provenance", body: `{"source_message_id":"` + sourceID + `","forwarded_from_message_id":"spoof"}`},
+		{name: "workspace", body: `{"source_message_id":"` + sourceID + `","workspace_id":"spoof"}`},
+		{name: "metadata", body: `{"source_message_id":"` + sourceID + `","metadata":{}}`},
+		{name: "malformed", body: `{"source_message_id":`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := &fakeMessageProvider{}
+			h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+			rec := httptest.NewRecorder()
+			r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward", strings.NewReader(tc.body))
+			r.SetPathValue("channelID", testChannelID)
+			h.ForwardChannelMessage(rec, r)
+			if rec.Code != http.StatusBadRequest || msgs.lastForwardInput.SourceMessageID != "" {
+				t.Fatalf("expected rejected request, status=%d input=%+v", rec.Code, msgs.lastForwardInput)
+			}
+		})
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_RejectsOversizedBody(t *testing.T) {
+	msgs := &fakeMessageProvider{}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+		strings.NewReader(`{"source_message_id":"`+strings.Repeat("a", 1<<16)+`"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.ForwardChannelMessage(rec, r)
+	if rec.Code != http.StatusBadRequest || msgs.lastForwardInput.SourceMessageID != "" {
+		t.Fatalf("oversized request was not rejected: status=%d input=%+v", rec.Code, msgs.lastForwardInput)
+	}
+}
+
+func TestMessageHandler_ForwardChannelMessage_UsesNonEnumeratingErrors(t *testing.T) {
+	const sourceID = "66666666-6666-4666-8666-666666666666"
+	for _, serviceErr := range []error{domain.ErrNotFound, domain.ErrInvalidMessageReference} {
+		msgs := &fakeMessageProvider{forwardErr: serviceErr}
+		h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+		rec := httptest.NewRecorder()
+		r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages/forward",
+			strings.NewReader(`{"source_message_id":"`+sourceID+`"}`))
+		r.SetPathValue("channelID", testChannelID)
+		h.ForwardChannelMessage(rec, r)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for %v, got %d", serviceErr, rec.Code)
+		}
+	}
 }
 
 func TestMessageHandler_CreateChannelMessage_AcceptsParentMessageID(t *testing.T) {
@@ -1094,6 +1358,32 @@ func TestMessageHandler_CreateChannelMessage_RejectsUnknownFormat(t *testing.T) 
 	h.CreateChannelMessage(rec, r)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for unknown body format, got %d", rec.Code)
+	}
+}
+
+func TestMessageHandler_CreateChannelMessage_RejectsMassAssignment(t *testing.T) {
+	for field, value := range map[string]string{
+		"forwarded_from_message_id": `"66666666-6666-6666-6666-666666666666"`,
+		"is_forwarded":              `true`,
+		"sender_id":                 `"attacker"`,
+		"workspace_id":              `"other"`,
+		"channel_id":                `"other"`,
+		"created_at":                `"2020-01-01T00:00:00Z"`,
+	} {
+		t.Run(field, func(t *testing.T) {
+			msgs := &fakeMessageProvider{createdMsg: testMessage()}
+			h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+			rec := httptest.NewRecorder()
+			r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+				strings.NewReader(`{"body_text":"mensagem","`+field+`":`+value+`}`))
+			r.SetPathValue("channelID", testChannelID)
+
+			h.CreateChannelMessage(rec, r)
+
+			if rec.Code != http.StatusBadRequest || msgs.lastCreateChannelInput.BodyText != "" {
+				t.Fatalf("field %s reached service: status=%d input=%+v", field, rec.Code, msgs.lastCreateChannelInput)
+			}
+		})
 	}
 }
 

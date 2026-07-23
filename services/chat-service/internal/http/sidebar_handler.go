@@ -29,6 +29,7 @@ type sidebarChannelJSON struct {
 	DisplayName string `json:"display_name"`
 	Type        string `json:"type"`
 	IsGeneral   bool   `json:"is_general"`
+	CanWrite    bool   `json:"can_write"`
 }
 
 // sidebarDMJSON is the JSON shape for a DM conversation in the sidebar response.
@@ -112,15 +113,17 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	httputil.WriteJSON(w, http.StatusOK, body)
 }
 
-func mapChannels(channels []domain.Channel) []sidebarChannelJSON {
+func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 	out := make([]sidebarChannelJSON, 0, len(channels))
-	for _, ch := range channels {
+	for _, sidebarChannel := range channels {
+		ch := sidebarChannel.Channel
 		out = append(out, sidebarChannelJSON{
 			ID:          ch.ID,
 			Slug:        ch.Slug,
 			DisplayName: ch.DisplayName,
 			Type:        string(ch.Type),
 			IsGeneral:   ch.IsGeneral,
+			CanWrite:    sidebarChannel.CanWrite,
 		})
 	}
 	return out

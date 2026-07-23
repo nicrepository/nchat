@@ -381,6 +381,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		EditedAt:          editedAt,
 		DeletedAt:         deletedAt,
 		Quoted:            quoted,
+		IsForwarded:       msg.ForwardedFromMessageID != "",
 		HasReference:      msg.ReferencedMessageID != "",
 	}
 }

@@ -191,6 +191,21 @@
   text-align: left;
 }
 
+.chat-msg-area__forwarded {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.chat-msg-area__forwarded .material-symbols-outlined {
+  font-size: 15px;
+}
+
 .chat-msg-area__quote--clickable {
   cursor: pointer;
 }
@@ -343,6 +358,169 @@
   margin-top: 5px;
   color: var(--color-muted, #7c7390);
   font-size: 13px;
+}
+
+.chat-forward-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 410;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.chat-forward-dialog {
+  width: min(460px, 100%);
+  max-height: min(600px, calc(100vh - 32px));
+  overflow: auto;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 16px;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+}
+
+.chat-forward-dialog header,
+.chat-forward-dialog footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-forward-dialog header {
+  align-items: flex-start;
+}
+
+.chat-forward-dialog footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  border-bottom: 0;
+}
+
+.chat-forward-dialog h2,
+.chat-forward-dialog p {
+  margin: 0;
+}
+
+.chat-forward-dialog h2 {
+  font-size: 19px;
+}
+
+.chat-forward-dialog header p {
+  margin-top: 4px;
+  color: var(--color-muted, #7c7390);
+  font-size: 13px;
+}
+
+.chat-forward-dialog header > button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-forward-dialog__content {
+  padding: 18px 22px;
+}
+
+.chat-forward-dialog__content > label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chat-forward-dialog__content > input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  color: var(--color-ink, #16121f);
+  font: inherit;
+}
+
+.chat-forward-dialog ul {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-forward-dialog li button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-forward-dialog li button:hover,
+.chat-forward-dialog li button:focus-visible,
+.chat-forward-dialog__selected {
+  border-color: var(--color-primary-tint-strong, #e6d7f7) !important;
+  background: var(--color-primary-tint, #f3ebfb) !important;
+  color: var(--color-primary-strong, #5b21b6) !important;
+  outline: none;
+}
+
+.chat-forward-dialog__empty,
+.chat-forward-dialog__error {
+  margin-top: 14px !important;
+  font-size: 13px;
+}
+
+.chat-forward-dialog__empty {
+  color: var(--color-muted, #7c7390);
+  text-align: center;
+}
+
+.chat-forward-dialog__error {
+  color: var(--color-danger, #b42318);
+}
+
+.chat-forward-dialog footer button {
+  padding: 9px 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 9px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.chat-forward-dialog__cancel {
+  background: var(--color-surface, #fff);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-forward-dialog__confirm {
+  border-color: var(--color-primary, #6d28d9) !important;
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+}
+
+.chat-forward-dialog footer button:disabled,
+.chat-forward-dialog li button:disabled,
+.chat-forward-dialog input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .chat-reference-dialog header > button {

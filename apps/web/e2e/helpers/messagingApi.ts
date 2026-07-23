@@ -25,6 +25,7 @@ interface RawMessage {
   deleted_at?: string | null;
   reactions: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited: boolean;
+  is_forwarded: boolean;
   quoted?: RawQuote;
   reference?: RawReference;
 }
@@ -84,9 +85,19 @@ export interface MessagingScenario {
       parent_message_id?: string;
       referenced_message_id?: string;
     }>;
+    forwards: Array<{
+      destinationChannelId: string;
+      sourceMessageId?: string;
+      idempotencyKey?: string;
+      raw: Record<string, unknown>;
+    }>;
     patches: PatchRequest[];
     deletes: string[];
   };
+  forwardedByIdempotencyKey: Map<
+    string,
+    { destinationChannelId: string; sourceMessageId: string; message: RawMessage }
+  >;
 }
 
 export function uniqueId(testInfo: TestInfo, suffix: string): string {
@@ -119,6 +130,7 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     deleted_at: overrides.deleted_at ?? null,
     reactions: overrides.reactions ?? [],
     is_favorited: overrides.is_favorited ?? false,
+    is_forwarded: overrides.is_forwarded ?? false,
     quoted: overrides.quoted,
     reference: overrides.reference,
   };
@@ -147,7 +159,8 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     targetId: options.targetId,
     targetName: options.targetName,
     messagesByTarget,
-    requests: { channelPosts: [], dmPosts: [], patches: [], deletes: [] },
+    requests: { channelPosts: [], dmPosts: [], forwards: [], patches: [], deletes: [] },
+    forwardedByIdempotencyKey: new Map(),
   };
 }
 
@@ -218,6 +231,7 @@ export async function installMessagingMocks(
                     slug: "e2e-canal",
                     display_name: scenario.targetName,
                     type: "public",
+                    can_write: true,
                     unread_count: 0,
                   },
                   {
@@ -225,6 +239,7 @@ export async function installMessagingMocks(
                     slug: "e2e-canal-secundario",
                     display_name: "Canal E2E",
                     type: "public",
+                    can_write: true,
                     unread_count: 0,
                   },
                 ]
@@ -234,6 +249,7 @@ export async function installMessagingMocks(
                     slug: "e2e-canal",
                     display_name: "Canal E2E",
                     type: "public",
+                    can_write: true,
                     unread_count: 0,
                   },
                 ],
@@ -398,6 +414,72 @@ export async function installMessagingMocks(
     await handleTargetMessagesRoute(route, scenario, "dm");
   });
 
+  await page.route("**/api/chat/channels/*/messages/forward", async (route) => {
+    const request = route.request();
+    const target = parseMessagesTarget(request.url(), "channel");
+    const raw = (await request.postDataJSON()) as Record<string, unknown>;
+    const sourceMessageId =
+      typeof raw.source_message_id === "string" ? raw.source_message_id : undefined;
+    const idempotencyKey = request.headers()["idempotency-key"];
+    if (request.method() !== "POST" || !target) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.requests.forwards.push({
+      destinationChannelId: target.targetId,
+      sourceMessageId,
+      idempotencyKey,
+      raw,
+    });
+    const source = sourceMessageId ? findMessageLocation(scenario, sourceMessageId) : undefined;
+    if (!source || source.message.is_removed) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    if (idempotencyKey) {
+      const replay = scenario.forwardedByIdempotencyKey.get(idempotencyKey);
+      if (replay) {
+        if (
+          replay.destinationChannelId !== target.targetId ||
+          replay.sourceMessageId !== sourceMessageId
+        ) {
+          await route.fulfill({ status: 409 });
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ data: replay.message }),
+        });
+        return;
+      }
+    }
+    const destination = messagesFor(scenario, "channel", target.targetId);
+    const created = makeMessage({
+      id: `${target.targetId}-forward-${destination.length + 1}`,
+      sender_id: CURRENT_USER_ID,
+      sender_display_name: CURRENT_USER_NAME,
+      body_text: source.message.body_text,
+      body_format: source.message.body_format,
+      created_at: "2026-07-15T12:04:00.000Z",
+      updated_at: "2026-07-15T12:04:00.000Z",
+      reactions: [],
+      is_favorited: false,
+      is_forwarded: true,
+      quoted: undefined,
+      reference: undefined,
+    });
+    destination.push(created);
+    if (idempotencyKey && sourceMessageId) {
+      scenario.forwardedByIdempotencyKey.set(idempotencyKey, {
+        destinationChannelId: target.targetId,
+        sourceMessageId,
+        message: created,
+      });
+    }
+    await fulfillMessage(route, created, 201);
+  });
+
   await page.route("**/api/chat/**/message-references", async (route) => {
     const body = (await route.request().postDataJSON()) as { message_ids?: string[] };
     const references = (body.message_ids ?? []).map((messageId) => ({
@@ -512,9 +594,9 @@ async function handleTargetMessagesRoute(
   await route.fallback();
 }
 
-async function fulfillMessage(route: Route, message: RawMessage) {
+async function fulfillMessage(route: Route, message: RawMessage, status = 200) {
   await route.fulfill({
-    status: 200,
+    status,
     contentType: "application/json",
     body: JSON.stringify({ data: message }),
   });

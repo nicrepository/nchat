@@ -10,11 +10,11 @@
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
 
 export const FIXTURE_CHANNELS: Channel[] = [
-  { id: "geral", name: "geral", type: "public" },
-  { id: "infraestrutura", name: "infraestrutura", type: "public" },
-  { id: "suporte", name: "suporte", type: "public" },
-  { id: "projetos", name: "projetos", type: "private" },
-  { id: "avisos", name: "avisos", type: "public" },
+  { id: "geral", name: "geral", type: "public", canWrite: true },
+  { id: "infraestrutura", name: "infraestrutura", type: "public", canWrite: true },
+  { id: "suporte", name: "suporte", type: "public", canWrite: true },
+  { id: "projetos", name: "projetos", type: "private", canWrite: true },
+  { id: "avisos", name: "avisos", type: "public", canWrite: true },
 ];
 
 export const FIXTURE_DMS: DMConversation[] = [

@@ -129,6 +129,14 @@ func (s *integMessageStore) CreateMessage(_ context.Context, in storage.CreateMe
 	return msg, nil
 }
 
+func (s *integMessageStore) ForwardChannelMessage(_ context.Context, in storage.ForwardChannelMessageInput) (storage.ForwardChannelMessageResult, error) {
+	return storage.ForwardChannelMessageResult{Message: domain.Message{
+		ID: s.seed.ID, WorkspaceID: in.WorkspaceID, ChannelID: in.DestinationChannelID,
+		SenderID: in.ActorID, ForwardedFromMessageID: in.SourceMessageID,
+		Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+	}}, nil
+}
+
 // listCreated returns a copy of all messages recorded by CreateMessage.
 func (s *integMessageStore) listCreated() []domain.Message {
 	s.mu.Lock()

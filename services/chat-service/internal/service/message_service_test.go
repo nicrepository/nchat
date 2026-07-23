@@ -65,15 +65,27 @@ type fakeMessageStore struct {
 	deleteErr               error
 	editHistory             []domain.MessageEditHistory
 	historyErr              error
+	forwardedMessage        domain.Message
+	forwardReplayed         bool
+	forwardErr              error
 
 	lastCreateInput        storage.CreateMessageInput
 	lastHistoryInput       storage.ListMessageEditHistoryInput
 	lastDeleteInput        storage.DeleteMessageInput
+	lastForwardInput       storage.ForwardChannelMessageInput
 	createCalls            int
+	forwardCalls           int
+	getByIDCalls           int
 	listChannelCalls       int
 	listDMCalls            int
 	resolveMentionCalls    int
 	resolveAuthorizedCalls int
+}
+
+func (f *fakeMessageStore) ForwardChannelMessage(_ context.Context, input storage.ForwardChannelMessageInput) (storage.ForwardChannelMessageResult, error) {
+	f.forwardCalls++
+	f.lastForwardInput = input
+	return storage.ForwardChannelMessageResult{Message: f.forwardedMessage, Replayed: f.forwardReplayed}, f.forwardErr
 }
 
 func (f *fakeMessageStore) EditMessage(_ context.Context, input storage.EditMessageInput) (domain.Message, error) {
@@ -304,6 +316,7 @@ func (f *fakeMessageStore) CreateMessage(_ context.Context, input storage.Create
 }
 
 func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspaceID, messageID, _ string) (domain.Message, error) {
+	f.getByIDCalls++
 	if f.getByIDErr != nil {
 		return domain.Message{}, f.getByIDErr
 	}
@@ -353,6 +366,82 @@ func (f *fakeMessageStore) ListDMMessages(_ context.Context, _ storage.ListDMMes
 }
 
 // ---- channel message tests -------------------------------------------------
+
+func TestMessageService_ForwardChannelMessage_Succeeds(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")}
+	store := &fakeMessageStore{
+		messagesByKey: map[string]domain.Message{"ws-1:source": {
+			ID: "source", WorkspaceID: "ws-1", ChannelID: "origin", SenderID: user2,
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+		}},
+		forwardedMessage: domain.Message{
+			ID: "forwarded", WorkspaceID: "ws-1", ChannelID: "destination", SenderID: user1,
+			BodyText: "snapshot", BodyFormat: domain.MessageBodyFormatV3,
+			ForwardedFromMessageID: "source", Status: domain.MessageStatusActive,
+		},
+	}
+
+	message, err := service.NewMessageService(channels, &fakeDMStore{}, store).ForwardChannelMessage(
+		t.Context(), service.ForwardChannelMessageInput{
+			WorkspaceID: " ws-1 ", DestinationChannelID: " destination ",
+			ActorID: " " + user1 + " ", SourceMessageID: " source ", IdempotencyKey: " action-1 ",
+		},
+	)
+	if err != nil {
+		t.Fatalf("ForwardChannelMessage: %v", err)
+	}
+	if message.Message.ID != "forwarded" || message.Message.BodyText != "snapshot" || message.Message.ForwardedFromMessageID != "source" {
+		t.Fatalf("unexpected forwarded message: %+v", message)
+	}
+	want := storage.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: user1,
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+	}
+	if store.lastForwardInput != want || store.forwardCalls != 1 {
+		t.Fatalf("unexpected forwarding input/calls: %+v / %d", store.lastForwardInput, store.forwardCalls)
+	}
+	if channels.getVisibleByIDCalls != 0 || store.getByIDCalls != 0 {
+		t.Fatalf("forwarding must use one authoritative storage call, channel_reads=%d message_reads=%d",
+			channels.getVisibleByIDCalls, store.getByIDCalls)
+	}
+}
+
+func TestMessageService_ForwardChannelMessage_ReturnsDomainErrorsFromAuthoritativeStore(t *testing.T) {
+	for _, storeErr := range []error{
+		domain.ErrNotFound, domain.ErrInvalidInput, domain.ErrConflict, context.Canceled,
+	} {
+		store := &fakeMessageStore{forwardErr: storeErr}
+		_, err := service.NewMessageService(
+			&fakeChannelStore{}, &fakeDMStore{}, store,
+		).ForwardChannelMessage(t.Context(), service.ForwardChannelMessageInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "private", ActorID: user1, SourceMessageID: "source",
+		})
+		if err != storeErr || store.forwardCalls != 1 {
+			t.Fatalf("store error must be returned directly: want=%v err=%v calls=%d", storeErr, err, store.forwardCalls)
+		}
+	}
+}
+
+func TestMessageService_ForwardChannelMessage_WrapsInfrastructureErrors(t *testing.T) {
+	infrastructureErr := errors.New("database unavailable")
+	store := &fakeMessageStore{forwardErr: infrastructureErr}
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{}, store,
+	).ForwardChannelMessage(t.Context(), service.ForwardChannelMessageInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: user1, SourceMessageID: "source",
+	})
+	if !errors.Is(err, infrastructureErr) || err.Error() != "forward channel message: database unavailable" {
+		t.Fatalf("unexpected wrapped error: %v", err)
+	}
+}
+
+func TestMessageService_ForwardChannelMessage_RejectsIncompleteInput(t *testing.T) {
+	_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{}, &fakeMessageStore{}).
+		ForwardChannelMessage(t.Context(), service.ForwardChannelMessageInput{})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
 
 func TestMessageService_CreateChannelMessage_PublicChannelActiveWorkspaceMemberSucceeds(t *testing.T) {
 	ch := publicActiveChannel("ws-1", "ch-1")

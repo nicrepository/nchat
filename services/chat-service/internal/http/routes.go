@@ -8,6 +8,7 @@ const (
 	RouteDMCandidates          = "/api/chat/dm-candidates"
 	RouteDMConversations       = "/api/chat/dms"
 	RouteChannelMessages       = "/api/chat/channels/{channelID}/messages"
+	RouteChannelMessageForward = "/api/chat/channels/{channelID}/messages/forward"
 	RouteChannelMessage        = "/api/chat/channels/{channelID}/messages/{messageID}"
 	RouteChannelReferences     = "/api/chat/channels/{channelID}/message-references"
 	RouteChannelMentions       = "/api/chat/channels/{channelID}/mentions"
