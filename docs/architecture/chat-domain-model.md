@@ -343,8 +343,46 @@ target IDs all yield `ErrNotFound`.
 
 `parent_message_id`, `forwarded_from_message_id`, and `referenced_message_id`
 represent quote-reply (RF-07), forwarding (RF-08), and cross-target references
-(RF-09). Parent and forwarding remain same-target. RF-09 requires a different
-channel or DM in the same workspace and stores no content snapshot.
+(RF-09). Parent remains same-target. RF-09 requires a different channel or DM in
+the same workspace and stores no content snapshot.
+
+RF-08 uses `POST /api/chat/channels/{destinationChannelID}/messages/forward` with
+the strict body `{ "source_message_id": "<uuid>" }`. `Idempotency-Key` is optional
+for compatibility and the web client always sends one per user action (maximum
+128 safe characters). A first execution returns `201`; a same-fingerprint replay
+returns the original message with `200`; reusing the key for another source in
+the same user/workspace/destination scope returns `409`. Replay metadata and the
+key are never serialized.
+
+The authenticated user must be able to read the active source channel message
+and write to the active destination channel in the same workspace. The single
+storage CTE is the authoritative authorization and consistency control: it
+revalidates source, destination, workspace and memberships in the same statement
+that copies `body_text`/`body_format`, persists `forwarded_from_message_id`, and
+arbitrates idempotency. Its zero-row `ErrNotFound` result is deliberately
+non-enumerating; service-side validation must never replace or weaken these SQL
+predicates.
+
+The sidebar emits server-derived `can_write` for each visible active channel.
+The service evaluates it through `CanWriteChannel` using the caller's real
+workspace and optional channel memberships. During rolling deployment, a web
+client receiving an older response without `can_write` keeps the channel visible
+for reading but normalizes destination eligibility to `false`. Forwarding
+authorization remains the final control. Forwarding has an independent budget
+of 20 requests per minute per authenticated user.
+`chat_message_forward_total` and `chat_message_forward_duration_seconds` record
+only the fixed `result` classes; message, user, workspace, channel and
+idempotency identifiers are never metric labels or forwarding log fields.
+
+Responses, lists, pagination and new WebSocket events always include
+`is_forwarded` (`false` for ordinary messages, `true` for forwarded snapshots).
+The web HTTP and WebSocket decoders normalize an absent or invalid field to
+`false` only for compatibility with pre-RF-08 servers; during a rolling deploy,
+the only possible impact is a temporarily absent forwarded badge. Reactions,
+favorites, pins, edit history, references and attachments are not copied. Later
+edits or soft deletion of the source do not change the forwarded snapshot. DMs,
+batch forwarding, comments, attachments and cross-workspace forwarding are out
+of scope.
 
 Validation is **non-enumerating**: missing, cross-workspace, cross-channel,
 and cross-DM references all return the same `domain.ErrInvalidMessageReference`
