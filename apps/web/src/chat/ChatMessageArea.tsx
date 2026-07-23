@@ -27,6 +27,7 @@ import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from 
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import { usePins } from "./usePins";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
+import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
 import { formatTime, senderLabel } from "./messageDisplay";
 
@@ -298,6 +299,7 @@ interface MessageListProps {
   onToggleReaction: (messageId: string, emoji: string) => void;
   onReplyMessage: (message: Message) => void;
   onReferenceMessage: (message: Message) => void;
+  onForwardMessage?: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   onEditMessage: MessageBubbleProps["onEditMessage"];
@@ -324,6 +326,7 @@ function MessageList({
   onToggleReaction,
   onReplyMessage,
   onReferenceMessage,
+  onForwardMessage,
   onReferenceJump,
   onToggleFavorite,
   onEditMessage,
@@ -553,6 +556,7 @@ function MessageList({
             onToggleReaction={onToggleReaction}
             onReplyMessage={onReplyMessage}
             onReferenceMessage={onReferenceMessage}
+            onForwardMessage={onForwardMessage}
             onToggleFavorite={onToggleFavorite}
             onEditMessage={onEditMessage}
             onEditForbidden={onEditForbidden}
@@ -739,6 +743,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const navigate = useNavigate();
   const focusMessageId = new URLSearchParams(location.search).get("message") ?? "";
   const [referenceSource, setReferenceSource] = useState<Message | null>(null);
+  const [forwardSource, setForwardSource] = useState<ForwardSourceContext | null>(null);
   const pendingReference = useMemo(() => readPendingReference(location.state), [location.state]);
   const pendingReferenceId = pendingReference?.messageId ?? "";
   const pendingReferenceKey = pendingReference
@@ -963,6 +968,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     },
     [retry],
   );
+  const closeForwardDialog = useCallback(() => setForwardSource(null), []);
+  const selectForwardSource = useCallback(
+    (message: Message) => {
+      if (kind === "channel" && targetId) {
+        setForwardSource({ messageID: message.id, sourceChannelID: targetId });
+      }
+    },
+    [kind, targetId],
+  );
 
   return (
     <div className="chat-msg-area" data-testid="chat-message-area">
@@ -993,6 +1007,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onToggleReaction={handleToggleReaction}
           onReplyMessage={selectReply}
           onReferenceMessage={setReferenceSource}
+          onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
           onReferenceJump={jumpToReference}
           onToggleFavorite={toggleFavorite}
           onEditMessage={editMessageLocal}
@@ -1056,6 +1071,14 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           dms={ctx.dms}
           onClose={() => setReferenceSource(null)}
           onSelect={selectReferenceDestination}
+        />
+      )}
+      {forwardSource && kind === "channel" && (
+        <ForwardMessageDialog
+          source={forwardSource}
+          channels={ctx.channels}
+          onClose={closeForwardDialog}
+          onSuccess={closeForwardDialog}
         />
       )}
     </div>

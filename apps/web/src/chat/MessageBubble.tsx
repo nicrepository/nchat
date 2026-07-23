@@ -37,6 +37,7 @@ export interface MessageBubbleProps {
   onToggleReaction: (messageId: string, emoji: string) => void;
   onReplyMessage: (message: Message) => void;
   onReferenceMessage: (message: Message) => void;
+  onForwardMessage?: (message: Message) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   onEditMessage: (
     messageId: string,
@@ -72,6 +73,7 @@ type MessageReactionsProps = Pick<
   | "onToggleReaction"
   | "onReplyMessage"
   | "onReferenceMessage"
+  | "onForwardMessage"
   | "onToggleFavorite"
   | "onTogglePin"
   | "isPinned"
@@ -95,6 +97,7 @@ function MessageReactions({
   onToggleReaction,
   onReplyMessage,
   onReferenceMessage,
+  onForwardMessage,
   onToggleFavorite,
   onTogglePin,
   isPinned = false,
@@ -248,6 +251,13 @@ function MessageReactions({
               format_quote
             </span>
           </button>
+          {onForwardMessage && message.kind === "user" && (
+            <button type="button" aria-label="Encaminhar" onClick={() => onForwardMessage(message)}>
+              <span className="material-symbols-outlined" aria-hidden="true">
+                forward
+              </span>
+            </button>
+          )}
           {onStartEdit && (
             <button type="button" aria-label="Editar mensagem" onClick={onStartEdit}>
               <span className="material-symbols-outlined" aria-hidden="true">
@@ -463,6 +473,7 @@ export default function MessageBubble({
   onToggleReaction,
   onReplyMessage,
   onReferenceMessage,
+  onForwardMessage,
   onToggleFavorite,
   onEditMessage,
   onEditForbidden,
@@ -547,6 +558,14 @@ export default function MessageBubble({
           ref={bubbleRef}
           className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
         >
+          {message.isForwarded && !message.isRemoved && (
+            <div className="chat-msg-area__forwarded" data-testid="chat-message-forwarded">
+              <span className="material-symbols-outlined" aria-hidden="true">
+                forward
+              </span>
+              Mensagem encaminhada
+            </div>
+          )}
           {message.reference && !message.isRemoved && (
             <ReferenceBlock reference={message.reference} onJump={onReferenceJump} />
           )}
@@ -580,6 +599,7 @@ export default function MessageBubble({
           onToggleReaction={onToggleReaction}
           onReplyMessage={onReplyMessage}
           onReferenceMessage={onReferenceMessage}
+          onForwardMessage={onForwardMessage}
           onToggleFavorite={onToggleFavorite}
           onTogglePin={onTogglePin}
           isPinned={isPinned}

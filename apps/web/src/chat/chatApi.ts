@@ -39,6 +39,8 @@ interface SidebarChannelResponse {
   display_name: string;
   type: "public" | "private";
   is_general: boolean;
+  /** Optional only while pre-RF-08 sidebar responses remain in rolling deploys. */
+  can_write?: unknown;
 }
 
 interface SidebarDMResponse {
@@ -89,15 +91,20 @@ async function fetchSidebar(): Promise<SidebarResponse> {
   return res.data;
 }
 
+function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
+  return {
+    id: ch.id,
+    name: ch.display_name || ch.slug,
+    type: ch.type,
+    canWrite: ch.can_write === true,
+  };
+}
+
 // ── Exported API ──────────────────────────────────────────────────────────────
 
 export async function fetchChannels(): Promise<Channel[]> {
   const sidebar = await fetchSidebar();
-  return (sidebar.channels ?? []).map((ch) => ({
-    id: ch.id,
-    name: ch.display_name || ch.slug,
-    type: ch.type,
-  }));
+  return (sidebar.channels ?? []).map(mapSidebarChannel);
 }
 
 export async function fetchDMs(): Promise<DMConversation[]> {
@@ -121,11 +128,7 @@ export async function fetchSidebarData(): Promise<{
   dms: DMConversation[];
 }> {
   const sidebar = await fetchSidebar();
-  const channels = (sidebar.channels ?? []).map((ch) => ({
-    id: ch.id,
-    name: ch.display_name || ch.slug,
-    type: ch.type,
-  }));
+  const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
   const dms = (sidebar.dm_conversations ?? []).map((dm) => ({
     id: dm.id,
     type: dm.type === "group" ? ("group" as const) : ("1:1" as const),
@@ -205,6 +208,8 @@ interface MessageResponse {
   is_edited?: boolean;
   reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited?: boolean;
+  /** Current servers always send this; optionality accepts pre-RF-08 responses. */
+  is_forwarded?: unknown;
   quoted?: QuoteResponse;
   reference?: ReferenceResponse;
 }
@@ -359,6 +364,7 @@ function mapMessage(r: MessageResponse): Message {
       reactedByMe: reaction.reacted_by_me,
     })),
     isFavorited: r.is_favorited ?? false,
+    isForwarded: r.is_forwarded === true,
     quoted: !isRemoved && r.quoted ? mapQuote(r.quoted) : undefined,
     reference: !isRemoved && r.reference ? mapReference(r.reference) : undefined,
   };
@@ -463,6 +469,27 @@ export async function postChannelMessage(
     signal,
   });
   return mapMessage(res.data);
+}
+
+export async function forwardChannelMessage(
+  destinationChannelId: string,
+  sourceMessageId: string,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<Message> {
+  const response = await authenticatedFetch<MessageEnvelope>(
+    `${messagesPath("channel", destinationChannelId)}/forward`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({ source_message_id: sourceMessageId }),
+      signal,
+    },
+  );
+  return mapMessage(response.data);
 }
 
 export async function fetchDMMessages(

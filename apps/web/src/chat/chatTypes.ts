@@ -6,6 +6,8 @@ export interface Channel {
   id: string;
   name: string;
   type: ChannelType;
+  /** Server-derived permission. The forwarding endpoint remains authoritative. */
+  canWrite: boolean;
   unreadCount?: number;
 }
 
@@ -90,6 +92,8 @@ export interface Message {
   reactions: MessageReaction[];
   /** True when the current user favorited this message (RF-06, private per user). */
   isFavorited: boolean;
+  /** Server-derived RF-08 snapshot marker; source provenance is intentionally hidden. */
+  isForwarded: boolean;
   /** Immediate parent preview for RF-07 quote-reply. One level only. */
   quoted?: QuotedMessage;
   /** RF-09 cross-target reference, resolved for the current reader. */

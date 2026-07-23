@@ -48,6 +48,8 @@ export interface WSMessagePayload {
   edited_at?: string | null;
   deleted_at?: string | null;
   quoted?: WSQuotePayload;
+  /** Missing means a pre-RF-08 server during rolling deploys. */
+  is_forwarded?: unknown;
 }
 
 export interface WSQuotePayload {
