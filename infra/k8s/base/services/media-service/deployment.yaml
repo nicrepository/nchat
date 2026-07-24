@@ -54,6 +54,11 @@ spec:
                 name: nchat-secrets
                 optional: true
           env:
+            - name: LIVEKIT_TOKEN_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: nchat-config
+                  key: LIVEKIT_TTL_SECONDS
             - name: PORT
               value: "8087"
             - name: SERVICE_NAME
