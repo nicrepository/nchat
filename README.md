@@ -231,13 +231,13 @@ Portas padrao dos servicos:
 Os servicos Go expõem probes padronizadas para Kubernetes e operacao local. As respostas usam o envelope JSON compartilhado `{"data": ...}` e nao incluem secrets, DSNs, tokens, hostname interno, stack traces nem detalhes sensiveis de infraestrutura.
 
 - `/healthz` e liveness. Ele confirma que o processo HTTP responde e nao verifica PostgreSQL, Valkey, SeaweedFS ou qualquer dependencia externa.
-- `/readyz` e readiness. Ele indica se o servico pode receber trafego. Hoje executa apenas checks locais (`service-bootstrap` e `config-loaded`); checks reais de PostgreSQL, Valkey e SeaweedFS entram quando essas integracoes forem implementadas.
+- `/readyz` e readiness. Ele indica se o servico pode receber trafego. Todos executam checks locais (`service-bootstrap` e `config-loaded`); integracoes habilitadas podem adicionar checks criticos. No media-service, `LIVEKIT_ENABLED=true` adiciona `postgres` e `livekit-api`.
 - Readiness retorna `503` quando um check critico falha. Falhas apenas em checks nao criticos resultam em `degraded` com HTTP `200`.
 
-| Endpoint   | Purpose           | External dependencies                | Success            | Failure                                 |
-| ---------- | ----------------- | ------------------------------------ | ------------------ | --------------------------------------- |
-| `/healthz` | Process liveness  | No                                   | 200 ok             | 500 only on unexpected internal failure |
-| `/readyz`  | Traffic readiness | Local checks now, dependencies later | 200 ready/degraded | 503 unready                             |
+| Endpoint   | Purpose           | External dependencies                  | Success            | Failure                                 |
+| ---------- | ----------------- | -------------------------------------- | ------------------ | --------------------------------------- |
+| `/healthz` | Process liveness  | No                                     | 200 ok             | 500 only on unexpected internal failure |
+| `/readyz`  | Traffic readiness | Local checks plus enabled dependencies | 200 ready/degraded | 503 unready                             |
 
 Exemplo `/healthz`:
 
@@ -421,7 +421,11 @@ Os servicos Go seguem uma estrutura interna padronizada:
 | notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                                                                                                                                              |
 | admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
 | search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
-| media-service        |         8087 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
+| media-service        |         8087 | /healthz, /readyz, /version, POST /media/livekit/token                                                                                                                                                                                                                                                        |
+
+O endpoint de token do media-service e somente preparacao tecnica para chamadas da
+V1.0. Contrato, autorizacao, TTL e configuracao:
+[docs/api/media-livekit-token.md](docs/api/media-livekit-token.md).
 
 ## Auth data model
 

@@ -33,7 +33,9 @@ func TestSecurityHeadersAppliesAPIHeaders(t *testing.T) {
 }
 
 func TestRequestIDGeneratesMissingID(t *testing.T) {
-	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var contextRequestID string
+	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contextRequestID = RequestIDFromContext(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	response := httptest.NewRecorder()
@@ -43,10 +45,15 @@ func TestRequestIDGeneratesMissingID(t *testing.T) {
 	if response.Header().Get("X-Request-ID") == "" {
 		t.Fatal("expected generated X-Request-ID")
 	}
+	if contextRequestID == "" || contextRequestID != response.Header().Get("X-Request-ID") {
+		t.Fatalf("generated request ID was not propagated to context: header=%q context=%q", response.Header().Get("X-Request-ID"), contextRequestID)
+	}
 }
 
 func TestRequestIDReusesIncomingID(t *testing.T) {
-	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var contextRequestID string
+	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contextRequestID = RequestIDFromContext(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -57,6 +64,9 @@ func TestRequestIDReusesIncomingID(t *testing.T) {
 
 	if response.Header().Get("X-Request-ID") != "req-123" {
 		t.Fatalf("expected request id req-123, got %q", response.Header().Get("X-Request-ID"))
+	}
+	if contextRequestID != "req-123" {
+		t.Fatalf("expected context request id req-123, got %q", contextRequestID)
 	}
 }
 

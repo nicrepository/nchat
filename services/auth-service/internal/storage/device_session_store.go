@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/nicrepository/nchat/libs/go/platform/authsession"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
@@ -149,18 +150,9 @@ func (s *PGXDeviceSessionStore) RevokeAllSessionsExcept(ctx context.Context, use
 // for userID and that the owning user can still authenticate.
 func (s *PGXDeviceSessionStore) ValidateActiveSession(ctx context.Context, userID, sessionID string) error {
 	var active bool
-	if err := s.pool.QueryRow(ctx, `
+	if err := s.pool.QueryRow(ctx, authsession.ActiveSessionCTE+`
 		SELECT true AS active
-		FROM auth.user_sessions AS s
-		JOIN auth.users AS u ON u.id = s.user_id
-		WHERE s.id = $1
-		  AND s.user_id = $2
-		  AND s.revoked_at IS NULL
-		  AND s.idle_expires_at > now()
-		  AND (s.absolute_expires_at IS NULL OR s.absolute_expires_at > now())
-		  AND u.status = 'active'
-		  AND u.deleted_at IS NULL
-		LIMIT 1`,
+		FROM active_session`,
 		sessionID, userID,
 	).Scan(&active); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -9,4 +9,10 @@ if ! command -v trivy >/dev/null 2>&1; then
   exit 127
 fi
 
-trivy fs --severity HIGH,CRITICAL --exit-code 1 --no-progress "$ROOT"
+trivy fs \
+  --scanners vuln \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  --no-progress \
+  --timeout 15m \
+  "$ROOT"

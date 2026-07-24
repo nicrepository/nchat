@@ -5,5 +5,4 @@ metadata:
   namespace: nchat
 data:
   APP_ENV: staging
-  MEDIA_SPIKE_ENABLED: "false"
-  MEDIA_SPIKE_LOCAL_ONLY: "false"
+  LIVEKIT_ENABLED: "false"
