@@ -9,6 +9,8 @@
  * - No token or message content is written to localStorage or sessionStorage.
  * - AbortController in useMessages cancels in-flight requests on target change or unmount.
  * - author_id is never sent; sender identity comes from the server-side JWT.
+ * - ChatComposer is keyed by `${kind}:${targetId}`, so an unsent draft can never
+ *   survive a target switch and be posted to the wrong conversation.
  *
  * WebSocket realtime delivery:
  * Implemented — see useMessages and useChatWebSocket.
@@ -1048,7 +1050,18 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         </div>
       )}
 
+      {/*
+        The composer is keyed by the conversation identity so switching targets
+        destroys the TipTap instance and mounts an empty one. The editor body is
+        the only per-target state React Router's in-place route update would
+        otherwise carry over — every other piece of state here already resets
+        through useMessages/usePins. Without this key, a draft typed in channel A
+        stays in the composer for channel B (both are bodyFormat "v3", so
+        useEditor keeps the same instance) and the send button would post it to
+        the wrong conversation. Drafts are deliberately not persisted.
+      */}
       <ChatComposer
+        key={`${kind}:${targetId}`}
         channelId={kind === "channel" ? targetId : undefined}
         bodyFormat={kind === "channel" ? "v3" : "v2"}
         placeholder={

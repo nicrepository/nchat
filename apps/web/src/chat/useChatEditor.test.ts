@@ -267,3 +267,44 @@ describe("useChatEditor — useEffect guard", () => {
     expect(result.current.editor).not.toBeNull();
   });
 });
+
+// ── bodyFormat switch (CHAT-378) ──────────────────────────────────────────────
+
+type FormatProps = { bodyFormat: "v2" | "v3" };
+
+describe("useChatEditor — bodyFormat switch on the same mounted composer", () => {
+  it("v2 → v3 rebuilds the editor and applies the mention channel", async () => {
+    const { result, rerender } = renderHook(
+      (props: FormatProps) => useChatEditor({ ...defaults, ...props, channelId: "chan-1" }),
+      { initialProps: { bodyFormat: "v2" } as FormatProps },
+    );
+    await waitForEditor(result);
+    const v2Editor = result.current.editor;
+    expect(v2Editor!.storage.mentionChannelContext).toBeUndefined();
+
+    // Route change DM → channel: bodyFormat flips one render before useEditor
+    // swaps the instance, so the effect must not assume the v3 command exists.
+    rerender({ bodyFormat: "v3" });
+
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionChannelContext?.channelId).toBe("chan-1"),
+    );
+  });
+
+  it("v3 → v2 rebuilds the editor without the mention extension", async () => {
+    const { result, rerender } = renderHook(
+      (props: FormatProps) => useChatEditor({ ...defaults, ...props, channelId: "chan-1" }),
+      { initialProps: { bodyFormat: "v2" } as FormatProps },
+    );
+    rerender({ bodyFormat: "v3" });
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionChannelContext?.channelId).toBe("chan-1"),
+    );
+
+    rerender({ bodyFormat: "v2" });
+
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionChannelContext).toBeUndefined(),
+    );
+  });
+});
