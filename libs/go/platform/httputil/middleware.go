@@ -1,12 +1,23 @@
 package httputil
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
 )
 
 const requestIDHeader = "X-Request-ID"
+
+type requestIDContextKey struct{}
+
+func RequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
+	return requestID
+}
 
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -16,7 +27,8 @@ func RequestID(next http.Handler) http.Handler {
 		}
 
 		w.Header().Set(requestIDHeader, requestID)
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
