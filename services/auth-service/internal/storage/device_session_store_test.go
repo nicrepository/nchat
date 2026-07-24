@@ -163,7 +163,7 @@ func TestPGXDeviceSessionStore_ValidateActiveSession_RequiresActiveSessionAndUse
 	mock := newMockPool(t)
 	defer mock.Close()
 
-	mock.ExpectQuery(`FROM auth\.user_sessions AS s\s+JOIN auth\.users AS u`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*FROM auth\.user_sessions AS s.*JOIN auth\.users AS u.*SELECT true AS active FROM active_session`).
 		WithArgs("session-1", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"active"}).AddRow(true))
 
@@ -180,7 +180,7 @@ func TestPGXDeviceSessionStore_ValidateActiveSession_InvalidCurrentSessionReturn
 	mock := newMockPool(t)
 	defer mock.Close()
 
-	mock.ExpectQuery(`FROM auth\.user_sessions AS s`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*FROM auth\.user_sessions AS s.*SELECT true AS active FROM active_session`).
 		WithArgs("revoked-or-expired-session", "user-1").
 		WillReturnError(pgx.ErrNoRows)
 
@@ -195,7 +195,7 @@ func TestPGXDeviceSessionStore_ValidateActiveSession_DBErrorPropagates(t *testin
 	mock := newMockPool(t)
 	defer mock.Close()
 
-	mock.ExpectQuery(`FROM auth\.user_sessions AS s`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*FROM auth\.user_sessions AS s.*SELECT true AS active FROM active_session`).
 		WithArgs("session-1", "user-1").
 		WillReturnError(errors.New("db down"))
 

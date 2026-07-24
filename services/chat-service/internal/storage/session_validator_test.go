@@ -23,7 +23,7 @@ func TestPGXSessionValidator_ActiveSession_ReturnsNil(t *testing.T) {
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`(?s)FROM auth\.user_sessions AS s.*JOIN auth\.users AS u`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*FROM auth\.user_sessions AS s.*JOIN auth\.users AS u.*SELECT true FROM active_session`).
 		WithArgs(testSVSessionID, testSVUserID).
 		WillReturnRows(pgxmock.NewRows([]string{"active"}).AddRow(true))
 
@@ -44,7 +44,7 @@ func TestPGXSessionValidator_NoRows_ReturnsErrInvalidToken(t *testing.T) {
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`(?s)FROM auth\.user_sessions AS s`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*FROM auth\.user_sessions AS s.*SELECT true FROM active_session`).
 		WithArgs(testSVSessionID, testSVUserID).
 		WillReturnRows(pgxmock.NewRows([]string{"active"})) // no rows
 
@@ -66,7 +66,7 @@ func TestPGXSessionValidator_DBError_Propagates(t *testing.T) {
 	defer mock.Close()
 
 	dbErr := errors.New("connection timeout")
-	mock.ExpectQuery(`(?s)FROM auth\.user_sessions AS s`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*FROM auth\.user_sessions AS s.*SELECT true FROM active_session`).
 		WithArgs(testSVSessionID, testSVUserID).
 		WillReturnError(dbErr)
 
