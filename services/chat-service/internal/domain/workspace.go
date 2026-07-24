@@ -156,16 +156,24 @@ type DMMember struct {
 // DMConversationWithParticipantIDs extends DMConversation with the list of
 // active member user IDs, used by the sidebar query to avoid N+1 fetches.
 //
-// CounterpartDisplayName is viewer-scoped: it holds the display name of the
-// other participant of a direct 1:1 conversation, as seen by the user the
-// listing was performed for. It is never persisted on the conversation, since
-// the same conversation resolves to a different name for each participant.
-// Empty for group conversations and whenever the counterpart cannot be
-// resolved (removed member, missing user row).
+// The Counterpart* fields are viewer-scoped: they describe the other
+// participant of a direct 1:1 conversation, as seen by the user the listing was
+// performed for. They are never persisted on the conversation, since the same
+// conversation resolves to a different counterpart for each participant.
+// All three are empty for group conversations and whenever the counterpart
+// cannot be resolved (removed member, missing user row).
+//
+// CounterpartDisplayName is already the resolved visual name: full_name when
+// present, display_name otherwise. CounterpartAvatarURL is optional and carries
+// whatever auth.users stores; the client decides whether it is renderable and
+// falls back to initials. The counterpart's e-mail, status, auth source and
+// external subject are never carried here.
 type DMConversationWithParticipantIDs struct {
 	DMConversation
 	ParticipantIDs         []string
+	CounterpartUserID      string
 	CounterpartDisplayName string
+	CounterpartAvatarURL   string
 }
 
 // DMCandidate is the minimal profile data exposed when starting a direct DM.

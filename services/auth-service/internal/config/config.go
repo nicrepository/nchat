@@ -21,6 +21,7 @@ const (
 
 	defaultOIDCProviderName        = "keycloak"
 	defaultOIDCScopes              = "openid email profile"
+	defaultAvatarBaseURL           = "/api/auth/avatars"
 	defaultOIDCHTTPTimeoutSeconds  = 10
 	defaultOIDCStateTTLMinutes     = 10
 	defaultOIDCAutoProvisionEnable = false
@@ -59,6 +60,14 @@ type Config struct {
 	// Leave empty (default) to always use RemoteAddr — safe for direct or single-instance deployments.
 	// In production behind Traefik, set this to the Traefik ingress CIDR.
 	AuthTrustedProxyCIDRs string
+
+	// AuthAvatarDir is the directory where processed avatar images are written.
+	// It must sit on a persistent volume in production (see the deployment
+	// manifest). Empty disables the avatar endpoints.
+	AuthAvatarDir string
+	// AuthAvatarBaseURL is the same-origin, root-relative prefix under which
+	// avatars are served and persisted into auth.users.avatar_url.
+	AuthAvatarBaseURL string
 }
 
 func Load() Config {
@@ -91,6 +100,8 @@ func Load() Config {
 		OIDCAutoProvisionEnabled:            platformconfig.GetBool("OIDC_AUTO_PROVISION_ENABLED", defaultOIDCAutoProvisionEnable),
 		OIDCAllowedEmailDomains:             strings.TrimSpace(platformconfig.GetString("OIDC_ALLOWED_EMAIL_DOMAINS", "")),
 		AuthTrustedProxyCIDRs:               platformconfig.GetString("AUTH_TRUSTED_PROXY_CIDRS", ""),
+		AuthAvatarDir:                       platformconfig.GetString("AUTH_AVATAR_DIR", ""),
+		AuthAvatarBaseURL:                   platformconfig.GetString("AUTH_AVATAR_BASE_URL", defaultAvatarBaseURL),
 	}
 }
 

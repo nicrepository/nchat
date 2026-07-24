@@ -5,7 +5,7 @@
  * The component itself is the unit under test.
  */
 
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router-dom";
 
@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import ChatMessageArea from "./ChatMessageArea";
+import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage } from "./chatTypes";
 import type {
   WSMessageCreatedEvent,
@@ -648,6 +649,231 @@ describe("ChatMessageArea — channel header", () => {
     );
 
     expect(await screen.findByTestId("chat-msg-header")).toHaveTextContent("Juliane");
+  });
+
+  // Header identity comes from the same sidebar payload the list uses, so these
+  // also stand as evidence that no extra request is made per DM.
+  const renderDMHeader = (dms: ChatOutletContext["dms"], dmId = "dm-1") => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    return render(
+      <MemoryRouter initialEntries={[`/chat/dm/${dmId}`]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms }} />}
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  };
+
+  it("shows the counterpart name and avatar in the DM header", async () => {
+    renderDMHeader([
+      {
+        id: "dm-1",
+        type: "1:1",
+        name: "Juliane Lino",
+        participants: [],
+        counterpart: {
+          userId: "user-2",
+          displayName: "Juliane Lino",
+          avatarUrl: "/media/avatars/juliane.png",
+        },
+      },
+    ]);
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(header).toHaveTextContent("Juliane Lino");
+    expect(header.querySelector("img")).toHaveAttribute("src", "/media/avatars/juliane.png");
+    expect(mockFetchDMMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows initials in the DM header when there is no avatar", async () => {
+    renderDMHeader([
+      {
+        id: "dm-1",
+        type: "1:1",
+        name: "Juliane Lino",
+        participants: [],
+        counterpart: { userId: "user-2", displayName: "Juliane Lino" },
+      },
+    ]);
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(header.querySelector("img")).toBeNull();
+    expect(header).toHaveTextContent("JL");
+  });
+
+  it("falls back to initials when the DM header avatar fails to load", async () => {
+    renderDMHeader([
+      {
+        id: "dm-1",
+        type: "1:1",
+        name: "Juliane Lino",
+        participants: [],
+        counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl: "/gone.png" },
+      },
+    ]);
+
+    const header = await screen.findByTestId("chat-msg-header");
+    fireEvent.error(header.querySelector("img") as HTMLImageElement);
+
+    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+    expect(header).toHaveTextContent("JL");
+  });
+
+  it("keeps the group DM header on its title with no avatar image", async () => {
+    renderDMHeader(
+      [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
+      "dm-grp",
+    );
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(header).toHaveTextContent("Equipe Infra");
+    expect(header.querySelector("img")).toBeNull();
+  });
+
+  it("colours the header fallback deterministically from the counterpart id, matching the sidebar", async () => {
+    const dmWithUser = (id: string, userId: string) => ({
+      id,
+      type: "1:1" as const,
+      name: "Jane Doe",
+      participants: [],
+      counterpart: { userId, displayName: "Jane Doe" },
+    });
+
+    // Same user id → same colour class, across two separate conversations.
+    renderDMHeader([dmWithUser("dm-1", "user-42")], "dm-1");
+    const first = await screen.findByTestId("chat-msg-header");
+    const firstAvatar = first.querySelector(".chat-msg-area__header-avatar");
+    const colorClass = Array.from(firstAvatar?.classList ?? []).find((c) =>
+      c.startsWith("chat-msg-area__header-avatar--"),
+    );
+    expect(colorClass).toBeTruthy();
+
+    cleanup();
+    renderDMHeader([dmWithUser("dm-2", "user-42")], "dm-2");
+    const second = await screen.findByTestId("chat-msg-header");
+    const secondAvatar = second.querySelector(".chat-msg-area__header-avatar");
+    expect(Array.from(secondAvatar?.classList ?? [])).toContain(colorClass);
+
+    // The same colour function the sidebar uses drives it.
+    expect(colorClass).toBe(`chat-msg-area__header-avatar--${avatarColorFor("user-42")}`);
+  });
+
+  // The src-swap tests keep the SAME HeaderDM instance mounted and change only
+  // the avatar URL, which is exactly what a naive `useState(false)` for the
+  // failed flag gets wrong: after the first image errors, the flag would stay
+  // true and block a subsequently valid image. Tracking the failed URL instead
+  // lets a new src try again.
+  const dmWith = (avatarUrl?: string, name = "Juliane Lino") => ({
+    id: "dm-1",
+    type: "1:1" as const,
+    name,
+    participants: [],
+    counterpart: { userId: "user-2", displayName: name, avatarUrl },
+  });
+
+  const renderHeaderCtx = (avatarUrl?: string, name?: string) => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [],
+      dms: [dmWith(avatarUrl, name)],
+    };
+    return render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route path="/chat" element={<ParentWithContext ctx={ctx} />}>
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  };
+
+  const rerenderHeaderCtx = (
+    rerender: ReturnType<typeof renderHeaderCtx>["rerender"],
+    avatarUrl?: string,
+    name?: string,
+  ) => {
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [],
+      dms: [dmWith(avatarUrl, name)],
+    };
+    rerender(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route path="/chat" element={<ParentWithContext ctx={ctx} />}>
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  };
+
+  it("header A → B → A: a failed A is retried after navigating to B and back", async () => {
+    const { rerender } = renderHeaderCtx("/avatar-a.png");
+    const header = await screen.findByTestId("chat-msg-header");
+
+    // A fails → initials fallback.
+    expect(header.querySelector("img")).toHaveAttribute("src", "/avatar-a.png");
+    fireEvent.error(header.querySelector("img") as HTMLImageElement);
+    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+    expect(header).toHaveTextContent("JL");
+
+    // Navigate to B (same header instance) → B renders.
+    rerenderHeaderCtx(rerender, "/avatar-b.png");
+    await waitFor(() =>
+      expect(header.querySelector("img")).toHaveAttribute("src", "/avatar-b.png"),
+    );
+
+    // Back to A → A must be tried again, not stuck on the earlier failure.
+    rerenderHeaderCtx(rerender, "/avatar-a.png");
+    await waitFor(() =>
+      expect(header.querySelector("img")).toHaveAttribute("src", "/avatar-a.png"),
+    );
+  });
+
+  it("keeps the header in fallback while the same failed src is retried", async () => {
+    const { rerender } = renderHeaderCtx("/avatar-a.png");
+    const header = await screen.findByTestId("chat-msg-header");
+    fireEvent.error(header.querySelector("img") as HTMLImageElement);
+    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+
+    // Re-render with the identical failed URL: no new attempt, stays initials.
+    rerenderHeaderCtx(rerender, "/avatar-a.png");
+    expect(header.querySelector("img")).toBeNull();
+    expect(header).toHaveTextContent("JL");
+  });
+
+  it("falls back in the header when a valid avatar is replaced by an absent one", async () => {
+    const { rerender } = renderHeaderCtx("/avatar-a.png");
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(header.querySelector("img")).toHaveAttribute("src", "/avatar-a.png");
+
+    rerenderHeaderCtx(rerender, undefined);
+    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+    expect(header).toHaveTextContent("JL");
+  });
+
+  it("shows B's avatar and name even when A and B share a name but differ by URL", async () => {
+    const { rerender } = renderHeaderCtx("/avatar-a.png", "Ana");
+    const header = await screen.findByTestId("chat-msg-header");
+    fireEvent.error(header.querySelector("img") as HTMLImageElement);
+    await waitFor(() => expect(header.querySelector("img")).toBeNull());
+
+    rerenderHeaderCtx(rerender, "/avatar-b.png", "Ana");
+    const image = await waitFor(() => {
+      const img = header.querySelector("img");
+      expect(img).not.toBeNull();
+      return img as HTMLImageElement;
+    });
+    expect(image).toHaveAttribute("src", "/avatar-b.png");
+    expect(header).toHaveTextContent("Ana");
   });
 
   it("renders the chat message area container", async () => {

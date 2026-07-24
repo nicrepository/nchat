@@ -130,6 +130,13 @@ func resolveOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInp
 		return domain.LoginUser{}, err
 	}
 	if found {
+		// The row is already locked FOR UPDATE by the select above, so the
+		// profile refresh runs inside the same transaction as the login.
+		displayName, syncErr := syncOIDCUserProfile(ctx, tx, user.ID, input)
+		if syncErr != nil {
+			return domain.LoginUser{}, syncErr
+		}
+		user.DisplayName = displayName
 		return user, nil
 	}
 
@@ -191,18 +198,58 @@ func oidcEmailExists(ctx context.Context, tx pgx.Tx, email string) (bool, error)
 }
 
 func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInput) (domain.LoginUser, error) {
+	// display_name is NOT NULL, so provisioning is the one place the generic
+	// placeholder applies. full_name and avatar_url stay NULL when unknown.
+	displayName := input.DisplayName
+	if displayName == "" {
+		displayName = domain.DefaultDisplayName
+	}
 	var user domain.LoginUser
 	err := tx.QueryRow(ctx, `
 		INSERT INTO auth.users
-		  (email, display_name, status, auth_source, external_provider, external_subject, email_verified_at)
-		VALUES ($1, $2, 'active', 'oidc', $3, $4, now())
+		  (email, display_name, full_name, avatar_url, status, auth_source,
+		   external_provider, external_subject, email_verified_at)
+		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), 'active', 'oidc', $5, $6, now())
 		RETURNING id, email::text, display_name`,
-		input.Email, input.DisplayName, input.Provider, input.Subject,
+		input.Email, displayName, input.FullName, input.AvatarURL,
+		input.Provider, input.Subject,
 	).Scan(&user.ID, &user.Email, &user.DisplayName)
 	if err != nil {
 		return domain.LoginUser{}, fmt.Errorf("insert oidc user: %w", err)
 	}
 	return user, nil
+}
+
+// syncOIDCUserProfile refreshes the profile of a returning OIDC user from the
+// claims of the login that just succeeded, so a rename at the IdP reaches the
+// sidebar on the next sign-in instead of staying frozen at provisioning time.
+//
+// COALESCE(NULLIF($n, ”), column) is the whole policy: a claim the provider
+// stopped sending arrives here as an empty string and leaves the stored value
+// untouched. A temporarily missing optional claim therefore never degrades an
+// identity, and clearing a name stays an explicit operation.
+//
+// avatar_url uses the reverse precedence — COALESCE(avatar_url, NULLIF($4, ”))
+// — so the OIDC picture only ever fills an EMPTY avatar and never overwrites one
+// already set. That makes the user-uploaded avatar authoritative: once a user
+// uploads (the sole operational producer), no later login can clobber it with a
+// provider picture.
+func syncOIDCUserProfile(ctx context.Context, tx pgx.Tx, userID string, input domain.OIDCSessionInput) (string, error) {
+	var displayName string
+	err := tx.QueryRow(ctx, `
+		UPDATE auth.users
+		SET display_name = COALESCE(NULLIF($2, ''), display_name),
+		    full_name    = COALESCE(NULLIF($3, ''), full_name),
+		    avatar_url   = COALESCE(avatar_url, NULLIF($4, '')),
+		    updated_at   = now()
+		WHERE id = $1
+		RETURNING display_name`,
+		userID, input.DisplayName, input.FullName, input.AvatarURL,
+	).Scan(&displayName)
+	if err != nil {
+		return "", fmt.Errorf("sync oidc user profile: %w", err)
+	}
+	return displayName, nil
 }
 
 func insertOIDCExchange(ctx context.Context, tx pgx.Tx, exchange domain.OIDCExchangeInput) error {

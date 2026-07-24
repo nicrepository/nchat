@@ -342,8 +342,200 @@ func TestOIDCDisplayNameFallsBackWithoutEmailPII(t *testing.T) {
 	if got := oidcDisplayName(domain.OIDCClaims{PreferredUsername: "username", Email: "pii@example.com"}); got != "username" {
 		t.Fatalf("expected preferred username fallback, got %q", got)
 	}
-	if got := oidcDisplayName(domain.OIDCClaims{Email: "pii@example.com"}); got != "Usuário" {
-		t.Fatalf("expected generic fallback, got %q", got)
+	// No usable claim yields "" — "no opinion" — so a re-login keeps whatever
+	// name the user already has. The generic placeholder is applied only when
+	// provisioning, by the storage layer.
+	if got := oidcDisplayName(domain.OIDCClaims{Email: "pii@example.com"}); got != "" {
+		t.Fatalf("expected empty result so an existing name survives, got %q", got)
+	}
+}
+
+// TestOIDCCallbackPersistsFullNameAndRejectsExternalPicture is the end-to-end
+// evidence that the identity claims reach the storage layer: full_name is
+// produced for a provider that sends a name, and the absolute picture claim
+// Keycloak emits is dropped rather than handed to the browser.
+func TestOIDCCallbackPersistsFullNameAndRejectsExternalPicture(t *testing.T) {
+	tokens := newTestOIDCTokenManager(t)
+	store, provider := newCallbackStoreAndProvider(t, tokens, domain.OIDCClaims{
+		Subject:           "sub",
+		Email:             "ana@example.com",
+		EmailVerified:     true,
+		PreferredUsername: "ana.souza",
+		GivenName:         "Ana",
+		FamilyName:        "Souza",
+		Picture:           "https://idp.example.test/avatars/ana.png",
+		Nonce:             "nonce",
+	})
+	svc := newTestOIDCService(t, tokens, store, provider)
+
+	if _, err := svc.Callback(context.Background(), OIDCCallbackInput{Code: "provider-code", State: "state"}); err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+
+	if store.createdInput.FullName != "Ana Souza" {
+		t.Fatalf("expected full name from given/family claims, got %q", store.createdInput.FullName)
+	}
+	// display_name keeps the short label; the username is only a fallback there.
+	if store.createdInput.DisplayName != "ana.souza" {
+		t.Fatalf("expected username as display name fallback, got %q", store.createdInput.DisplayName)
+	}
+	if store.createdInput.AvatarURL != "" {
+		t.Fatalf("an absolute picture claim must never be persisted, got %q", store.createdInput.AvatarURL)
+	}
+}
+
+// TestOIDCCallbackKeepsSameOriginPicture covers the one avatar shape that is
+// safe to store: a root-relative reference served by this deployment.
+func TestOIDCCallbackKeepsSameOriginPicture(t *testing.T) {
+	tokens := newTestOIDCTokenManager(t)
+	store, provider := newCallbackStoreAndProvider(t, tokens, domain.OIDCClaims{
+		Subject:       "sub",
+		Email:         "ana@example.com",
+		EmailVerified: true,
+		Name:          "Ana Carolina Souza",
+		Picture:       "/media/avatars/ana.png",
+		Nonce:         "nonce",
+	})
+	svc := newTestOIDCService(t, tokens, store, provider)
+
+	if _, err := svc.Callback(context.Background(), OIDCCallbackInput{Code: "provider-code", State: "state"}); err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+	if store.createdInput.AvatarURL != "/media/avatars/ana.png" {
+		t.Fatalf("expected same-origin picture to be persisted, got %q", store.createdInput.AvatarURL)
+	}
+	if store.createdInput.FullName != "Ana Carolina Souza" {
+		t.Fatalf("expected full name from the name claim, got %q", store.createdInput.FullName)
+	}
+}
+
+// TestOIDCCallbackSendsNoOpinionWhenClaimsAreAbsent guards the sync policy at
+// its source: absent claims must arrive at the storage layer as empty strings,
+// which is what lets a re-login preserve the stored identity.
+func TestOIDCCallbackSendsNoOpinionWhenClaimsAreAbsent(t *testing.T) {
+	tokens := newTestOIDCTokenManager(t)
+	store, provider := newCallbackStoreAndProvider(t, tokens, domain.OIDCClaims{
+		Subject:       "sub",
+		Email:         "ana@example.com",
+		EmailVerified: true,
+		Nonce:         "nonce",
+	})
+	svc := newTestOIDCService(t, tokens, store, provider)
+
+	if _, err := svc.Callback(context.Background(), OIDCCallbackInput{Code: "provider-code", State: "state"}); err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+	if store.createdInput.FullName != "" || store.createdInput.AvatarURL != "" || store.createdInput.DisplayName != "" {
+		t.Fatalf("absent claims must produce empty values, got %+v", store.createdInput)
+	}
+}
+
+// TestOIDCFullNamePrefersNameThenGivenFamily documents the resolution order for
+// the person's full name. preferred_username must never reach full_name: a
+// username is not a name, and display_name already covers that fallback.
+func TestOIDCFullNamePrefersNameThenGivenFamily(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		claims domain.OIDCClaims
+		want   string
+	}{
+		{
+			name:   "name wins over the parts",
+			claims: domain.OIDCClaims{Name: "Ana Carolina Souza", GivenName: "Ana", FamilyName: "Souza"},
+			want:   "Ana Carolina Souza",
+		},
+		{
+			name:   "given and family are joined",
+			claims: domain.OIDCClaims{GivenName: "Ana", FamilyName: "Souza"},
+			want:   "Ana Souza",
+		},
+		{name: "only given", claims: domain.OIDCClaims{GivenName: "Ana"}, want: "Ana"},
+		{name: "only family", claims: domain.OIDCClaims{FamilyName: "Souza"}, want: "Souza"},
+		{
+			name:   "whitespace-only claims are absent",
+			claims: domain.OIDCClaims{Name: "   ", GivenName: "\t", FamilyName: "\n"},
+			want:   "",
+		},
+		{
+			name:   "internal whitespace is collapsed",
+			claims: domain.OIDCClaims{Name: "  Ana   Carolina  Souza  "},
+			want:   "Ana Carolina Souza",
+		},
+		{
+			name:   "unicode is preserved",
+			claims: domain.OIDCClaims{Name: "Álvaro Nóbrega 李小龙"},
+			want:   "Álvaro Nóbrega 李小龙",
+		},
+		{
+			name:   "username is never promoted to full name",
+			claims: domain.OIDCClaims{PreferredUsername: "ana.souza", Email: "ana@example.test"},
+			want:   "",
+		},
+		{name: "no claims at all", claims: domain.OIDCClaims{}, want: ""},
+		{
+			name:   "control characters are rejected",
+			claims: domain.OIDCClaims{Name: "Ana\r\nX-Injected: 1"},
+			want:   "",
+		},
+		{
+			name:   "overly long name is rejected",
+			claims: domain.OIDCClaims{Name: strings.Repeat("a", 201)},
+			want:   "",
+		},
+		{
+			name:   "a name at the limit is accepted",
+			claims: domain.OIDCClaims{Name: strings.Repeat("á", 200)},
+			want:   strings.Repeat("á", 200),
+		},
+		{
+			name:   "a rejected name falls through to the parts",
+			claims: domain.OIDCClaims{Name: "bad\x00name", GivenName: "Ana", FamilyName: "Souza"},
+			want:   "Ana Souza",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := oidcFullName(test.claims); got != test.want {
+				t.Fatalf("expected %q, got %q", test.want, got)
+			}
+		})
+	}
+}
+
+// TestOIDCAvatarURLAcceptsOnlySameOriginReferences is the guard that keeps a
+// third-party image out of the browser: everything but a root-relative path is
+// dropped, so the deployed CSP never has to be relaxed and the avatar can never
+// become a tracking pixel.
+func TestOIDCAvatarURLAcceptsOnlySameOriginReferences(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		picture string
+		want    string
+	}{
+		{name: "root-relative path", picture: "/media/avatars/ana.png", want: "/media/avatars/ana.png"},
+		{name: "root-relative with query", picture: "/media/a.png?v=2", want: "/media/a.png?v=2"},
+		{name: "surrounding whitespace is trimmed", picture: "  /media/a.png  ", want: "/media/a.png"},
+		{name: "empty", picture: "", want: ""},
+		{name: "whitespace only", picture: "   ", want: ""},
+		{name: "keycloak absolute https", picture: "https://idp.example.test/avatar.png", want: ""},
+		{name: "absolute http", picture: "http://idp.example.test/avatar.png", want: ""},
+		{name: "protocol relative", picture: "//evil.example.test/a.png", want: ""},
+		{name: "backslash escape", picture: "/\\evil.example.test/a.png", want: ""},
+		// Built from parts so gosec does not flag a literal password-in-URL in
+		// what is precisely the fixture proving such URLs are rejected.
+		{name: "credentials in url", picture: "https://user:" + "pass" + "@idp.example.test/a.png", want: ""},
+		{name: "javascript scheme", picture: "javascript:alert(1)", want: ""},
+		{name: "data url", picture: "data:text/html;base64,PHN2Zz4=", want: ""},
+		{name: "file scheme", picture: "file:///etc/passwd", want: ""},
+		{name: "relative without leading slash", picture: "media/a.png", want: ""},
+		{name: "control characters", picture: "/media/a.png\r\nX: 1", want: ""},
+		{name: "excessively long", picture: "/" + strings.Repeat("a", 512), want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := oidcAvatarURL(domain.OIDCClaims{Picture: test.picture})
+			if got != test.want {
+				t.Fatalf("expected %q, got %q", test.want, got)
+			}
+		})
 	}
 }
 

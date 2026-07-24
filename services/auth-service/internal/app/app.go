@@ -172,10 +172,27 @@ func New(cfg config.Config) (*App, error) {
 		deviceManager = deviceSessions
 	}
 
+	// Avatar endpoints require both a database (for the association) and a
+	// writable persistent directory (for the files). Either missing disables
+	// them without degrading the rest of the service. Same typed-nil care.
+	var avatarManager httpapi.AvatarManager
+	var avatarReader httpapi.AvatarReader
+	if pool != nil && cfg.AuthAvatarDir != "" {
+		fsStore, avatarErr := storage.NewFilesystemAvatarStore(cfg.AuthAvatarDir)
+		if avatarErr != nil {
+			logger.Warn("avatar endpoints disabled", "reason", "avatar_dir_unavailable")
+		} else {
+			avatarManager = service.NewAvatarService(fsStore, storage.NewPGXUserStore(pool), cfg.AuthAvatarBaseURL)
+			avatarReader = fsStore
+		}
+	} else if cfg.AuthAvatarDir == "" {
+		logger.Warn("avatar endpoints disabled", "reason", "avatar_dir_not_configured")
+	}
+
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, sessionManager, deviceManager, oidc),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, sessionManager, deviceManager, avatarManager, avatarReader, oidc),
 		TracingShutdown: shutdown,
 		closeDB:         closeDB,
 	}, nil

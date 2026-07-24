@@ -13,7 +13,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, oidcManagers ...service.OIDCManager) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, avatars AvatarManager, avatarReader AvatarReader, oidcManagers ...service.OIDCManager) http.Handler {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
@@ -89,6 +89,13 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
 	))
+	profileHandler := GetMyProfile(users)
+	if tokens != nil && users != nil {
+		requireActive := RequireActiveSession(sessions)
+		profileHandler = BearerAuth(tokens)(requireActive(profileHandler))
+	}
+	mux.Handle(RouteAuthMe, httputil.MethodNotAllowed(http.MethodGet, profileHandler))
+
 	loginAttemptsHandler := GetMyLoginAttempts(loginAttempts)
 	if tokens != nil && loginAttempts != nil {
 		requireActive := RequireActiveSession(sessions)
@@ -129,6 +136,22 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 		http.MethodDelete: deleteDeviceHandler,
 		http.MethodPatch:  patchDeviceHandler,
 	}))
+
+	uploadAvatarHandler := UploadMyAvatar(avatars)
+	deleteAvatarHandler := DeleteMyAvatar(avatars)
+	if tokens != nil && avatars != nil {
+		requireActive := RequireActiveSession(sessions)
+		uploadAvatarHandler = BearerAuth(tokens)(requireActive(uploadAvatarHandler))
+		deleteAvatarHandler = BearerAuth(tokens)(requireActive(deleteAvatarHandler))
+	}
+	mux.Handle(RouteAuthMeAvatar, methodRouter(map[string]http.Handler{
+		http.MethodPost:   uploadAvatarHandler,
+		http.MethodDelete: deleteAvatarHandler,
+	}))
+	// Serving is intentionally unauthenticated: the object name is an opaque
+	// capability and an <img> tag cannot carry a Bearer token. Same-origin only,
+	// via the gateway's /api/auth prefix.
+	mux.Handle(RouteAuthAvatarByName, httputil.MethodNotAllowed(http.MethodGet, ServeAvatar(avatarReader)))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")

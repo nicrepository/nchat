@@ -155,6 +155,88 @@ auth.auth_policy_settings           (singleton, no FK)
 6. **Soft delete first (RF-55)**: `deleted_at` + `status = 'deleted'`. Hard
    delete deferred to V1.0 (RF-56); FK cascades are already correct for it.
 
+## Identity resolution (name & avatar)
+
+The chat sidebar renders the counterpart of a 1:1 DM by the person's name and,
+when available, their avatar. The values come only from `auth.users`; the
+resolution rules live in auth-service and are applied at write time.
+
+**Full name** (`full_name`):
+
+1. OIDC `name` claim, if non-blank after trimming;
+2. otherwise `given_name` + `family_name` joined and trimmed;
+3. otherwise left NULL.
+
+`preferred_username` is deliberately never written to `full_name` — a username
+is not a full name, and `display_name` already covers that fallback. All values
+are trimmed, have internal whitespace collapsed, reject control characters, and
+are capped (200 runes) counting code points so accented and CJK names survive.
+
+**Display name** (`display_name`, NOT NULL): OIDC `name`, else
+`preferred_username`, else the generic placeholder applied **only at
+provisioning**. On a returning login the placeholder is never re-applied, so an
+existing name is never clobbered.
+
+**Profile sync on login**: a returning OIDC user's row is refreshed with
+`COALESCE(NULLIF(claim, ''), column)`. A claim the provider stopped sending
+arrives empty and leaves the stored value untouched, so a temporarily missing
+optional claim never degrades an identity, and clearing a field stays an
+explicit operation. The refresh runs inside the login transaction and only for
+users that pass the active/`deleted_at IS NULL` check, so it can never
+resurrect a scrubbed identity.
+
+**Avatar** (`avatar_url`) — **operational via user upload.** auth-service owns
+the avatar file, the association, and serving:
+
+- **Upload:** `POST /api/auth/me/avatar` (multipart, field `avatar`), authenticated
+  by the session; identity is the JWT subject, never a client-supplied id. The
+  image is size-capped, sniffed, decoded, dimension/megapixel-checked, and
+  **re-encoded to a canonical 256×256 PNG** (strips EXIF; JPEG/PNG input only —
+  SVG/GIF/etc. rejected). The re-encoded file is written to a persistent volume
+  (`FilesystemAvatarStore`) under a server-generated opaque id; the client never
+  names the file.
+- **Ownership & URL:** the persisted `avatar_url` is decided by auth-service and
+  is always the same-origin, root-relative capability path
+  `/api/auth/avatars/<opaque-id>.png` (served by `GET /api/auth/avatars/{name}`
+  with `nosniff`, `inline`, immutable cache). The opaque id makes URLs
+  unenumerable, so serving needs no per-viewer auth (an `<img>` cannot send a
+  Bearer token).
+- **Replacement:** a new upload writes a new object, repoints `avatar_url`, then
+  deletes the old file only after the DB commit (crash leaves at most a GC-able
+  orphan, never a dangling reference).
+- **Removal:** `DELETE /api/auth/me/avatar` clears `avatar_url` and deletes the
+  file; idempotent.
+- **Reload:** `GET /api/auth/me` returns the current user's minimal profile
+  (`id`, `display_name`, optional `avatar_url`), so the persisted avatar survives
+  a page reload and can be removed later. It exposes no e-mail or other PII and
+  is `no-store`.
+
+**OIDC `picture` (optional, secondary):** accepted **only** as a same-origin
+root-relative reference; every absolute URL — including Keycloak's default
+`https://` `picture` — is rejected to NULL. Precedence is **no-clobber for the
+avatar**: the login sync uses `avatar_url = COALESCE(avatar_url, NULLIF(claim,''))`,
+so a `picture` only ever fills an empty avatar and **never overwrites a
+user-uploaded one**. The frontend applies a second, independent same-origin check
+against `window.location.origin` at render time. External `picture` is never
+loaded by the browser (CSP `img-src 'self'`, no IP leak, no tracking pixel) and
+the backend never fetches it (no SSRF). The CSP is not relaxed.
+
+**Fallback:** when `avatar_url` is empty the UI shows initials with a
+deterministic per-user colour (`avatarColorFor(userId)`), consistent between the
+sidebar and the conversation header.
+
+**Historical data:** rows created before this feature simply have `avatar_url`
+NULL and render as initials until the user uploads one; no backfill is required.
+
+**Anonymisation:** `anonymized_at`/`deleted_at` are owned by auth-service at the
+source. A reusable hook, `AvatarService.PurgeForAnonymization(userID)`, already
+clears `avatar_url` and deletes the backing file (tolerating an absent file); the
+full anonymisation/hard-delete _producer_ that will call it is deferred to V1.0
+(RF-55/56). The uploaded avatar is not resurrected on re-login, because the OIDC
+sync only runs for active, non-deleted users and only fills an empty avatar. The
+chat sidebar reads live from `auth.users`, so a scrubbed row is reflected
+immediately with no cache to invalidate.
+
 ## V1.0 hard delete note (RF-56)
 
 No schema changes are needed. The existing `ON DELETE CASCADE` constraints on

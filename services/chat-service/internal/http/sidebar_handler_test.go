@@ -209,13 +209,42 @@ func decodeDMNames(t *testing.T, rr *httptest.ResponseRecorder) []string {
 }
 
 // directDM builds a direct conversation whose counterpart was already resolved
-// for the requesting user by the storage layer.
+// for the requesting user by the storage layer. A resolved name always comes
+// with a resolved user ID, mirroring what the single sidebar query produces.
 func directDM(id, counterpart string, participantIDs ...string) domain.DMConversationWithParticipantIDs {
-	return domain.DMConversationWithParticipantIDs{
+	dm := domain.DMConversationWithParticipantIDs{
 		DMConversation:         domain.DMConversation{ID: id, Type: domain.DMConversationTypeDirect},
 		ParticipantIDs:         participantIDs,
 		CounterpartDisplayName: counterpart,
 	}
+	if counterpart != "" {
+		dm.CounterpartUserID = "counterpart-of-" + id
+	}
+	return dm
+}
+
+// dmJSON mirrors the wire shape of one sidebar DM, including the optional
+// counterpart object, so tests can assert on absence as well as on values.
+type dmJSON struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	Counterpart *struct {
+		UserID      string `json:"user_id"`
+		DisplayName string `json:"display_name"`
+		AvatarURL   string `json:"avatar_url"`
+	} `json:"counterpart"`
+}
+
+func decodeDMs(t *testing.T, rr *httptest.ResponseRecorder) []dmJSON {
+	t.Helper()
+	var envelope struct {
+		Data struct {
+			DMs []dmJSON `json:"dm_conversations"`
+		} `json:"data"`
+	}
+	mustDecode(t, rr, &envelope)
+	return envelope.Data.DMs
 }
 
 func sidebarWithDMs(dms ...domain.DMConversationWithParticipantIDs) service.SidebarData {
@@ -437,8 +466,11 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 				ParticipantIDs: []string{testUserID, "u2", "u3"},
 			},
 			{
-				DMConversation: domain.DMConversation{ID: "dm-direct", Type: domain.DMConversationTypeDirect},
-				ParticipantIDs: []string{testUserID, "other-user"},
+				DMConversation:         domain.DMConversation{ID: "dm-direct", Type: domain.DMConversationTypeDirect},
+				ParticipantIDs:         []string{testUserID, "other-user"},
+				CounterpartUserID:      "other-user",
+				CounterpartDisplayName: "Juliane Lino",
+				CounterpartAvatarURL:   "/media/avatars/juliane.png",
 			},
 		},
 	}}
@@ -457,8 +489,13 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 		t.Fatalf("response must not expose title field; body: %s", body)
 	}
 
-	// Exact key set: resolving the counterpart name must not widen the contract
-	// with user IDs, emails or any other personal field.
+	if strings.Contains(body, "@") {
+		t.Fatalf("response must not contain an e-mail address; body: %s", body)
+	}
+
+	// Exact key set: exposing the counterpart must not widen the contract with
+	// e-mails, status, auth source or any other personal field. Group DMs must
+	// not grow a counterpart at all.
 	var raw struct {
 		Data struct {
 			DMs []map[string]json.RawMessage `json:"dm_conversations"`
@@ -466,14 +503,126 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 	}
 	mustDecode(t, rr, &raw)
 	for _, dm := range raw.Data.DMs {
-		if len(dm) != 3 {
-			t.Fatalf("expected exactly 3 DM fields, got %d: %v", len(dm), dm)
-		}
 		for _, key := range []string{"id", "type", "name"} {
 			if _, ok := dm[key]; !ok {
 				t.Fatalf("missing expected DM field %q in %v", key, dm)
 			}
 		}
+		counterpart, hasCounterpart := dm["counterpart"]
+		wantFields := 3
+		if hasCounterpart {
+			wantFields = 4
+		}
+		if len(dm) != wantFields {
+			t.Fatalf("expected exactly %d DM fields, got %d: %v", wantFields, len(dm), dm)
+		}
+		if string(dm["type"]) == `"group"` && hasCounterpart {
+			t.Fatalf("group DM must not carry a counterpart: %v", dm)
+		}
+		if !hasCounterpart {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(counterpart, &fields); err != nil {
+			t.Fatalf("decode counterpart: %v", err)
+		}
+		allowed := map[string]bool{"user_id": true, "display_name": true, "avatar_url": true}
+		for key := range fields {
+			if !allowed[key] {
+				t.Fatalf("counterpart must not expose field %q: %v", key, fields)
+			}
+		}
+	}
+}
+
+// TestSidebarHandler_DM_Counterpart_IsViewerScoped is the wire-level evidence
+// for requirements 1-3: each viewer receives the other participant's identity,
+// name first (already resolved from full_name) and avatar alongside it.
+func TestSidebarHandler_DM_Counterpart_IsViewerScoped(t *testing.T) {
+	v := makeTestValidator(t)
+	for _, test := range []struct {
+		viewer      string
+		userID      string
+		displayName string
+		avatarURL   string
+	}{
+		{viewer: "user-a", userID: "user-b", displayName: "Bruno Lima", avatarURL: "/media/avatars/bruno.png"},
+		{viewer: "user-b", userID: "user-a", displayName: "Ana Carolina Souza", avatarURL: ""},
+	} {
+		t.Run(test.viewer, func(t *testing.T) {
+			dm := directDM("dm-shared", test.displayName, "user-a", "user-b")
+			dm.CounterpartUserID = test.userID
+			dm.CounterpartAvatarURL = test.avatarURL
+			svc := &stubSidebarProvider{data: sidebarWithDMs(dm)}
+			router := sidebarRouter(v, svc)
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, httpapi.RouteSidebar, nil)
+			setBearerToken(req, makeTestToken(t, test.viewer, testHMACSecret, testIssuer, testAudience, time.Hour))
+			router.ServeHTTP(rr, req)
+
+			dms := decodeDMs(t, rr)
+			if len(dms) != 1 || dms[0].Counterpart == nil {
+				t.Fatalf("expected one DM carrying a counterpart, got %+v", dms)
+			}
+			got := dms[0].Counterpart
+			if got.UserID != test.userID || got.DisplayName != test.displayName {
+				t.Fatalf("expected counterpart %s/%s, got %+v", test.userID, test.displayName, got)
+			}
+			if got.AvatarURL != test.avatarURL {
+				t.Fatalf("expected avatar %q, got %q", test.avatarURL, got.AvatarURL)
+			}
+			// `name` stays the resolved text for pre-counterpart clients.
+			if dms[0].Name != test.displayName {
+				t.Fatalf("name must stay resolved, got %q", dms[0].Name)
+			}
+		})
+	}
+}
+
+// TestSidebarHandler_DM_Counterpart_OmittedWhenUnresolvable asserts the client
+// never has to tell a missing counterpart from a fabricated one.
+func TestSidebarHandler_DM_Counterpart_OmittedWhenUnresolvable(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &stubSidebarProvider{data: sidebarWithDMs(
+		directDM("dm-orphan", "", testUserID),
+	)}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	dms := decodeDMs(t, rr)
+	if len(dms) != 1 {
+		t.Fatalf("expected 1 DM, got %d", len(dms))
+	}
+	if dms[0].Counterpart != nil {
+		t.Fatalf("unresolvable counterpart must be omitted, got %+v", dms[0].Counterpart)
+	}
+	if dms[0].Name != "Mensagem Direta" {
+		t.Fatalf("expected generic fallback name, got %q", dms[0].Name)
+	}
+}
+
+// TestSidebarHandler_DM_Counterpart_NameFallsBackWithoutAvatar covers a
+// resolvable user whose stored names are blank: the counterpart is still
+// exposed (the avatar needs its ID), but the name is the server-side fallback.
+func TestSidebarHandler_DM_Counterpart_NameFallsBackWithoutAvatar(t *testing.T) {
+	v := makeTestValidator(t)
+	dm := directDM("dm-blank", "   ", testUserID, "other-user-id")
+	dm.CounterpartUserID = "other-user-id"
+	svc := &stubSidebarProvider{data: sidebarWithDMs(dm)}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	dms := decodeDMs(t, rr)
+	if len(dms) != 1 || dms[0].Counterpart == nil {
+		t.Fatalf("expected one DM carrying a counterpart, got %+v", dms)
+	}
+	if dms[0].Counterpart.DisplayName != "Mensagem Direta" || dms[0].Name != "Mensagem Direta" {
+		t.Fatalf("counterpart name and DM name must agree on the fallback, got %+v", dms[0])
+	}
+	if dms[0].Counterpart.AvatarURL != "" {
+		t.Fatalf("expected no avatar, got %q", dms[0].Counterpart.AvatarURL)
 	}
 }
 

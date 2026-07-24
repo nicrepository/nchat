@@ -45,10 +45,26 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 			id UUID PRIMARY KEY,
 			email TEXT NOT NULL DEFAULT '',
 			display_name TEXT NOT NULL DEFAULT '',
+			full_name TEXT,
+			avatar_url TEXT,
 			status TEXT NOT NULL DEFAULT 'active',
-			deleted_at TIMESTAMPTZ
+			deleted_at TIMESTAMPTZ,
+			anonymized_at TIMESTAMPTZ
 		)`); err != nil {
 		t.Fatalf("prepare auth schema: %v", err)
+	}
+	// auth.users survives between tests in this package (only the chat schema is
+	// dropped), and sibling fixtures create it with fewer columns, so CREATE
+	// TABLE IF NOT EXISTS can silently be a no-op. Add what this test needs.
+	if _, err := pool.Exec(ctx, `
+		ALTER TABLE auth.users
+			ADD COLUMN IF NOT EXISTS full_name TEXT,
+			ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+			ADD COLUMN IF NOT EXISTS anonymized_at TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
+			ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '',
+			ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatalf("align auth.users columns: %v", err)
 	}
 	if _, err := pool.Exec(ctx, readAllChatUpMigrations(t)); err != nil {
 		t.Fatalf("apply chat migrations: %v", err)
@@ -62,6 +78,7 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 		userC     = "c1000000-0000-4000-8000-00000000000c"
 		outsider  = "c1000000-0000-4000-8000-00000000000d"
 		dmAB      = "c1000000-0000-4000-8000-000000000010"
+		dmAC      = "c1000000-0000-4000-8000-000000000014"
 		dmGroup   = "c1000000-0000-4000-8000-000000000011"
 		dmOrphan  = "c1000000-0000-4000-8000-000000000012"
 		dmForeign = "c2000000-0000-4000-8000-000000000013"
@@ -81,12 +98,17 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 		sql  string
 		args []any
 	}{
-		{sql: `INSERT INTO auth.users (id, email, display_name) VALUES
-			($1, 'a@example.test', 'Ana Souza'),
-			($2, 'b@example.test', 'Bruno Lima'),
-			($3, 'c@example.test', 'Caio Alves'),
-			($4, 'd@example.test', 'Dora Reis')
-			ON CONFLICT (id) DO UPDATE SET display_name = EXCLUDED.display_name`,
+		// Name resolution cases, one per user: A has a full_name and an avatar,
+		// B has neither (NULL full_name), C has a whitespace-only full_name.
+		{sql: `INSERT INTO auth.users (id, email, display_name, full_name, avatar_url) VALUES
+			($1, 'a@example.test', 'Ana Souza',  'Ana Carolina Souza', '/media/avatars/ana.png'),
+			($2, 'b@example.test', 'Bruno Lima', NULL,                 NULL),
+			($3, 'c@example.test', 'Caio Alves', '   ',                NULL),
+			($4, 'd@example.test', 'Dora Reis',  NULL,                 NULL)
+			ON CONFLICT (id) DO UPDATE SET
+				display_name = EXCLUDED.display_name,
+				full_name    = EXCLUDED.full_name,
+				avatar_url   = EXCLUDED.avatar_url`,
 			args: []any{userA, userB, userC, outsider}},
 		{sql: `INSERT INTO chat.workspaces (id, slug, name) VALUES
 			($1, 'sidebar-a', 'Sidebar A'),
@@ -101,17 +123,19 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 			($2, $3, 'active'), ($2, $4, 'active')`,
 			args: []any{workspace, otherWS, userA, userB, userC, outsider}},
 		{sql: `INSERT INTO chat.dm_conversations (id, workspace_id, type, title, status, created_by, direct_pair_key) VALUES
-			($1, $5, 'direct', NULL,           'active', $6, 'pair-ab'),
-			($2, $5, 'group',  'Equipe Infra', 'active', $6, NULL),
-			($3, $5, 'direct', NULL,           'active', $6, 'pair-orphan'),
-			($4, $7, 'direct', NULL,           'active', $6, 'pair-foreign')`,
-			args: []any{dmAB, dmGroup, dmOrphan, dmForeign, workspace, userA, otherWS}},
+			($1, $6, 'direct', NULL,           'active', $7, 'pair-ab'),
+			($2, $6, 'group',  'Equipe Infra', 'active', $7, NULL),
+			($3, $6, 'direct', NULL,           'active', $7, 'pair-orphan'),
+			($4, $8, 'direct', NULL,           'active', $7, 'pair-foreign'),
+			($5, $6, 'direct', NULL,           'active', $7, 'pair-ac')`,
+			args: []any{dmAB, dmGroup, dmOrphan, dmForeign, dmAC, workspace, userA, otherWS}},
 		{sql: `INSERT INTO chat.dm_members (conversation_id, user_id) VALUES
-			($1, $5), ($1, $6),
-			($2, $5), ($2, $6), ($2, $7),
-			($3, $5),
-			($4, $5), ($4, $6)`,
-			args: []any{dmAB, dmGroup, dmOrphan, dmForeign, userA, userB, userC}},
+			($1, $6), ($1, $7),
+			($2, $6), ($2, $7), ($2, $8),
+			($3, $6),
+			($4, $6), ($4, $7),
+			($5, $6), ($5, $8)`,
+			args: []any{dmAB, dmGroup, dmOrphan, dmForeign, dmAC, userA, userB, userC}},
 	} {
 		if _, err := tx.Exec(ctx, seed.sql, seed.args...); err != nil {
 			t.Fatalf("seed sidebar cases: %v", err)
@@ -142,25 +166,48 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list for user B: %v", err)
 	}
-	if got := byID(t, convsA, dmAB).CounterpartDisplayName; got != "Bruno Lima" {
-		t.Fatalf("user A must see B, got %q", got)
+	// B has no full_name: display_name is the fallback, and no avatar is stored.
+	seenByA := byID(t, convsA, dmAB)
+	if seenByA.CounterpartDisplayName != "Bruno Lima" {
+		t.Fatalf("user A must see B by display_name fallback, got %q", seenByA.CounterpartDisplayName)
 	}
-	if got := byID(t, convsB, dmAB).CounterpartDisplayName; got != "Ana Souza" {
-		t.Fatalf("user B must see A, got %q", got)
+	if seenByA.CounterpartUserID != userB {
+		t.Fatalf("user A must see B's user id, got %q", seenByA.CounterpartUserID)
+	}
+	if seenByA.CounterpartAvatarURL != "" {
+		t.Fatalf("user B has no avatar, got %q", seenByA.CounterpartAvatarURL)
+	}
+
+	// A has a full_name: it wins over display_name, and the avatar comes along.
+	seenByB := byID(t, convsB, dmAB)
+	if seenByB.CounterpartDisplayName != "Ana Carolina Souza" {
+		t.Fatalf("user B must see A by full_name, got %q", seenByB.CounterpartDisplayName)
+	}
+	if seenByB.CounterpartUserID != userA {
+		t.Fatalf("user B must see A's user id, got %q", seenByB.CounterpartUserID)
+	}
+	if seenByB.CounterpartAvatarURL != "/media/avatars/ana.png" {
+		t.Fatalf("user B must see A's avatar, got %q", seenByB.CounterpartAvatarURL)
+	}
+
+	// C's full_name is whitespace-only: it must be treated as absent.
+	if got := byID(t, convsA, dmAC).CounterpartDisplayName; got != "Caio Alves" {
+		t.Fatalf("whitespace full_name must fall back to display_name, got %q", got)
 	}
 
 	// Group DMs keep their title and never carry a participant name.
 	group := byID(t, convsA, dmGroup)
-	if group.CounterpartDisplayName != "" {
-		t.Fatalf("group DM must not resolve a counterpart, got %q", group.CounterpartDisplayName)
+	if group.CounterpartDisplayName != "" || group.CounterpartUserID != "" || group.CounterpartAvatarURL != "" {
+		t.Fatalf("group DM must not resolve a counterpart, got %+v", group)
 	}
 	if group.Title != "Equipe Infra" {
 		t.Fatalf("group DM title changed: %q", group.Title)
 	}
 
 	// A 1:1 conversation whose other member is gone falls back to an empty name.
-	if got := byID(t, convsA, dmOrphan).CounterpartDisplayName; got != "" {
-		t.Fatalf("orphan DM must not resolve a counterpart, got %q", got)
+	orphan := byID(t, convsA, dmOrphan)
+	if orphan.CounterpartDisplayName != "" || orphan.CounterpartUserID != "" || orphan.CounterpartAvatarURL != "" {
+		t.Fatalf("orphan DM must not resolve a counterpart, got %+v", orphan)
 	}
 
 	// Membership and workspace isolation remain enforced by the query itself.
@@ -177,6 +224,28 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 		t.Fatalf("non-member must receive no conversations, got %d", len(convsOutsider))
 	}
 
+	// Anonymization policy: auth-service owns it at the source. Once it has
+	// scrubbed the row, the sidebar reflects the scrubbed identity — it neither
+	// resurrects the old name nor hides the conversation behind a placeholder.
+	if _, err := pool.Exec(ctx, `
+		UPDATE auth.users
+		SET display_name = 'Usuário removido', full_name = NULL, avatar_url = NULL,
+		    anonymized_at = now(), deleted_at = now()
+		WHERE id = $1`, userC); err != nil {
+		t.Fatalf("anonymize user C: %v", err)
+	}
+	convsA, err = store.ListVisibleConversationsWithParticipantIDs(ctx, workspace, userA)
+	if err != nil {
+		t.Fatalf("list after anonymization: %v", err)
+	}
+	anonymized := byID(t, convsA, dmAC)
+	if anonymized.CounterpartDisplayName != "Usuário removido" {
+		t.Fatalf("anonymized counterpart must read from the scrubbed row, got %q", anonymized.CounterpartDisplayName)
+	}
+	if anonymized.CounterpartAvatarURL != "" {
+		t.Fatalf("anonymized counterpart must not keep an avatar, got %q", anonymized.CounterpartAvatarURL)
+	}
+
 	// A member who left stops resolving as a counterpart.
 	if _, err := pool.Exec(ctx, `
 		UPDATE chat.dm_members SET status = 'left', left_at = now()
@@ -187,7 +256,8 @@ func TestPGXDMStoreSidebarCounterpartPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list after member left: %v", err)
 	}
-	if got := byID(t, convsA, dmAB).CounterpartDisplayName; got != "" {
-		t.Fatalf("left member must not resolve as counterpart, got %q", got)
+	left := byID(t, convsA, dmAB)
+	if left.CounterpartDisplayName != "" || left.CounterpartUserID != "" || left.CounterpartAvatarURL != "" {
+		t.Fatalf("left member must not resolve as counterpart, got %+v", left)
 	}
 }

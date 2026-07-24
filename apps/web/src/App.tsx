@@ -11,6 +11,7 @@ import RequireAuth from "./auth/RequireAuth";
 import ResetPasswordPage from "./auth/ResetPasswordPage";
 import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
+import ProfilePage from "./profile/ProfilePage";
 
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
@@ -74,6 +75,16 @@ export default function App() {
             }
           />
         </Route>
+
+        {/* ── Profile (authenticated) ───────────────────────────────── */}
+        <Route
+          path="/profile"
+          element={
+            <RequireAuth>
+              <ProfilePage />
+            </RequireAuth>
+          }
+        />
 
         {/* ── Admin ─────────────────────────────────────────────────── */}
         <Route

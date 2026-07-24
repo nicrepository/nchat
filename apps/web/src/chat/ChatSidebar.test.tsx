@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
+import ChatSidebar from "./ChatSidebar";
 import type { Channel, DMCandidate, DirectDMResult, DMConversation } from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
@@ -362,6 +363,246 @@ describe("ChatSidebar — DMs", () => {
     await waitFor(() => {
       expect(screen.getByRole("option", { name: /grupo equipe infra/i })).toBeInTheDocument();
     });
+  });
+
+  it("shows the counterpart avatar in a 1:1 DM", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: {
+            userId: "user-2",
+            displayName: "Juliane Lino",
+            avatarUrl: "/media/avatars/juliane.png",
+          },
+        },
+      ],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    const image = option.querySelector("img");
+    expect(image).not.toBeNull();
+    expect(image).toHaveAttribute("src", "/media/avatars/juliane.png");
+    // The name is on the button label, so the picture stays decorative.
+    expect(image).toHaveAttribute("alt", "");
+    // No image request may be issued through the API client.
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to initials when the counterpart has no avatar", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino" },
+        },
+      ],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    expect(option.querySelector("img")).toBeNull();
+    expect(option.textContent).toContain("JL");
+  });
+
+  it("falls back to initials when the avatar image fails to load", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl: "/gone.png" },
+        },
+      ],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    const image = option.querySelector("img");
+    expect(image).not.toBeNull();
+    fireEvent.error(image as HTMLImageElement);
+
+    await waitFor(() => expect(option.querySelector("img")).toBeNull());
+    expect(option.textContent).toContain("JL");
+    // A broken image must never stay visible in the row.
+    expect(screen.getByRole("option", { name: /mensagem direta com juliane lino/i })).toBeVisible();
+  });
+
+  it("still renders an initials avatar when the server sends no counterpart", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-1", type: "1:1", name: "Juliane Lino", participants: [] }],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    expect(option.textContent).toContain("JL");
+  });
+
+  it("gives two different DMs their own avatars", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl: "/a.png" },
+        },
+        {
+          id: "dm-2",
+          type: "1:1",
+          name: "Caio Almeida",
+          participants: [],
+          counterpart: { userId: "user-3", displayName: "Caio Almeida", avatarUrl: "/b.png" },
+        },
+      ],
+    });
+    renderChat();
+
+    const first = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    const second = screen.getByRole("option", { name: /mensagem direta com caio almeida/i });
+    expect(first.querySelector("img")).toHaveAttribute("src", "/a.png");
+    expect(second.querySelector("img")).toHaveAttribute("src", "/b.png");
+  });
+
+  it("keeps each DM's avatar state independent when one image fails", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl: "/a.png" },
+        },
+        {
+          id: "dm-2",
+          type: "1:1",
+          name: "Caio Almeida",
+          participants: [],
+          counterpart: { userId: "user-3", displayName: "Caio Almeida", avatarUrl: "/b.png" },
+        },
+      ],
+    });
+    renderChat();
+
+    const first = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    const second = screen.getByRole("option", { name: /mensagem direta com caio almeida/i });
+
+    // Fail A's image only; B must keep showing its own picture.
+    fireEvent.error(first.querySelector("img") as HTMLImageElement);
+    await waitFor(() => expect(first.querySelector("img")).toBeNull());
+    expect(first.textContent).toContain("JL");
+    expect(second.querySelector("img")).toHaveAttribute("src", "/b.png");
+  });
+
+  it("sidebar A → B → A: a failed A is retried after the same slot shows B and returns to A", async () => {
+    // Rendering ChatSidebar directly with rerender keeps the SAME Avatar
+    // instance (keyed by dm.id) while its src changes /a.png → /b.png → /a.png,
+    // which is the src-swap cycle the hook-driven harness cannot express.
+    const readyState = (avatarUrl: string) => ({
+      status: "ready" as const,
+      currentUserId: "user-a",
+      channels: [] as Channel[],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1" as const,
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl },
+        },
+      ] as DMConversation[],
+    });
+
+    const tree = (avatarUrl: string) => (
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar state={readyState(avatarUrl)} retry={() => {}} />
+      </MemoryRouter>
+    );
+
+    const { rerender } = render(tree("/a.png"));
+    const dmOption = () =>
+      screen.getByRole("option", { name: /mensagem direta com juliane lino/i });
+
+    // A renders, then fails → initials.
+    expect(dmOption().querySelector("img")).toHaveAttribute("src", "/a.png");
+    fireEvent.error(dmOption().querySelector("img") as HTMLImageElement);
+    await waitFor(() => expect(dmOption().querySelector("img")).toBeNull());
+    expect(dmOption().textContent).toContain("JL");
+
+    // The same slot switches to B → B renders.
+    rerender(tree("/b.png"));
+    await waitFor(() => expect(dmOption().querySelector("img")).toHaveAttribute("src", "/b.png"));
+
+    // Back to A → A is tried again (not stuck on the earlier failure).
+    rerender(tree("/a.png"));
+    await waitFor(() => expect(dmOption().querySelector("img")).toHaveAttribute("src", "/a.png"));
+  });
+
+  it("stays on initials while the same failed avatar src is retried", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl: "/a.png" },
+        },
+      ],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: /mensagem direta com juliane lino/i });
+    const image = option.querySelector("img") as HTMLImageElement;
+    fireEvent.error(image);
+    await waitFor(() => expect(option.querySelector("img")).toBeNull());
+    // A repeated error event on the same element must not resurrect the image.
+    expect(option.textContent).toContain("JL");
+  });
+
+  it("keeps the accessible label on the full name, not on the avatar", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl: "/a.png" },
+        },
+      ],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Mensagem direta com Juliane Lino" });
+    expect(option.querySelector("img")?.closest("[aria-hidden='true']")).not.toBeNull();
   });
 
   it("renders names with special characters as text, never as markup", async () => {

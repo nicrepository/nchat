@@ -58,6 +58,10 @@ spec:
               value: "8081"
             - name: SERVICE_NAME
               value: auth-service
+            - name: AUTH_AVATAR_DIR
+              value: /var/lib/nchat/avatars
+            - name: AUTH_AVATAR_BASE_URL
+              value: /api/auth/avatars
             - name: OIDC_ISSUER_URL
               valueFrom:
                 secretKeyRef:
@@ -129,6 +133,14 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: avatars
+              mountPath: /var/lib/nchat/avatars
       volumes:
         - name: tmp
           emptyDir: {}
+        # Durable avatar storage. readOnlyRootFilesystem stays true; only this
+        # mounted volume is writable, and fsGroup 65532 makes it writable by the
+        # non-root runtime user.
+        - name: avatars
+          persistentVolumeClaim:
+            claimName: auth-service-avatars

@@ -414,7 +414,7 @@ func TestPGXDMStore_GetVisibleConversationByID_SuccessAndDatabaseError(t *testin
 // ── ListVisibleConversationsWithParticipantIDs tests ──────────────────────────
 
 func dmWithParticipantCols() []string {
-	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids", "counterpart_display_name"}
+	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids", "counterpart_user_id", "counterpart_display_name", "counterpart_avatar_url"}
 }
 
 func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly(t *testing.T) {
@@ -426,11 +426,11 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 
 	now := time.Now()
 	// SQL must join workspace, workspace_members, and dm_members for current user,
-	// and resolve the counterpart display name in the same statement (no N+1).
-	mock.ExpectQuery(`(?s)counterpart_display_name.*FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
+	// and resolve the whole counterpart identity in the same statement (no N+1).
+	mock.ExpectQuery(`(?s)counterpart_display_name.*counterpart_avatar_url.*FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}, "Juliane Lino"))
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}, "user-2", "Juliane Lino", "/media/avatars/juliane.png"))
 
 	store := storage.NewPGXDMStore(mock)
 	convs, err := store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
@@ -448,6 +448,12 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 	}
 	if convs[0].CounterpartDisplayName != "Juliane Lino" {
 		t.Fatalf("expected counterpart display name, got %q", convs[0].CounterpartDisplayName)
+	}
+	if convs[0].CounterpartUserID != "user-2" {
+		t.Fatalf("expected counterpart user id, got %q", convs[0].CounterpartUserID)
+	}
+	if convs[0].CounterpartAvatarURL != "/media/avatars/juliane.png" {
+		t.Fatalf("expected counterpart avatar url, got %q", convs[0].CounterpartAvatarURL)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -470,9 +476,12 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_SingleQueryForMan
 	for i, name := range want {
 		id := fmt.Sprintf("dm-%d", i)
 		peer := fmt.Sprintf("user-%d", i+2)
-		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", peer}, name)
+		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", peer}, peer, name, "")
 	}
-	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc`).WithArgs("ws-1", "user-1").WillReturnRows(rows)
+	// The ORDER BY is asserted here so that adding counterpart columns can never
+	// silently reorder the sidebar.
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*ORDER BY dc\.updated_at DESC, dc\.created_at DESC`).
+		WithArgs("ws-1", "user-1").WillReturnRows(rows)
 
 	convs, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
 	if err != nil {
@@ -503,10 +512,10 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounter
 	defer mock.Close()
 
 	now := time.Now()
-	mock.ExpectQuery(`(?s)dc\.type = 'direct'.*FROM chat\.dm_conversations dc`).
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*LEFT JOIN LATERAL.*dc\.type = 'direct'`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, []string{"user-1", "user-2", "user-3"}, ""))
+			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, []string{"user-1", "user-2", "user-3"}, "", "", ""))
 
 	convs, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
 	if err != nil {
@@ -515,8 +524,8 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounter
 	if len(convs) != 1 {
 		t.Fatalf("expected 1 conversation, got %d", len(convs))
 	}
-	if convs[0].CounterpartDisplayName != "" {
-		t.Fatalf("group DM must not carry a counterpart name, got %q", convs[0].CounterpartDisplayName)
+	if convs[0].CounterpartDisplayName != "" || convs[0].CounterpartUserID != "" || convs[0].CounterpartAvatarURL != "" {
+		t.Fatalf("group DM must not carry a counterpart, got %+v", convs[0])
 	}
 	if convs[0].Title != "Equipe Infra" {
 		t.Fatalf("group DM must keep its title, got %q", convs[0].Title)
@@ -579,8 +588,8 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_PropagatesRowFail
 	}{
 		{name: "scan", rows: pgxmock.NewRows([]string{"id"}).AddRow("dm-1")},
 		{name: "rows", rows: pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}, "Ana").
-			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}, "Bruno").
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}, "user-2", "Ana", "").
+			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}, "user-3", "Bruno", "").
 			RowError(1, errors.New("rows failed"))},
 	} {
 		t.Run(test.name, func(t *testing.T) {

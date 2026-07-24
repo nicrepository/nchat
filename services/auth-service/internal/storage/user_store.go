@@ -18,7 +18,20 @@ type UserStore interface {
 	CreateUser(ctx context.Context, input domain.CreateUserInput, passwordHash string) (domain.User, error)
 	GetPolicySettings(ctx context.Context) (domain.PolicySettings, error)
 	GetUserByID(ctx context.Context, id string) (domain.User, error)
+	// GetSelfProfile returns the minimal own-profile fields for an active user
+	// (id, display_name, avatar_url). ErrNotFound when the user is missing,
+	// deleted, or not active.
+	GetSelfProfile(ctx context.Context, id string) (domain.SelfProfile, error)
 	UpdateUserStatus(ctx context.Context, id, status string) (domain.User, error)
+	// SetAvatarURL points the user's avatar_url at url and returns the previous
+	// value (empty when there was none) so the caller can delete the orphaned
+	// file after the row is committed. Only an active, non-deleted user is
+	// updated; ErrNotFound otherwise.
+	SetAvatarURL(ctx context.Context, userID, url string) (previous string, err error)
+	// ClearAvatarURL sets avatar_url to NULL and returns the previous value.
+	// It is idempotent: clearing an already-empty avatar returns "" with no
+	// error, as long as the user exists and is active.
+	ClearAvatarURL(ctx context.Context, userID string) (previous string, err error)
 }
 
 // PGXUserStore implements UserStore using a pgx connection pool.
@@ -91,6 +104,29 @@ func (s *PGXUserStore) CreateUser(ctx context.Context, input domain.CreateUserIn
 		return domain.User{}, fmt.Errorf("commit tx: %w", err)
 	}
 	return u, nil
+}
+
+func (s *PGXUserStore) GetSelfProfile(ctx context.Context, id string) (domain.SelfProfile, error) {
+	var p domain.SelfProfile
+	var avatar *string
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, display_name, avatar_url
+		FROM auth.users
+		WHERE id = $1
+		  AND status = 'active'
+		  AND deleted_at IS NULL`,
+		id,
+	).Scan(&p.ID, &p.DisplayName, &avatar)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.SelfProfile{}, domain.ErrNotFound
+		}
+		return domain.SelfProfile{}, fmt.Errorf("get self profile: %w", err)
+	}
+	if avatar != nil {
+		p.AvatarURL = *avatar
+	}
+	return p, nil
 }
 
 func (s *PGXUserStore) GetUserByID(ctx context.Context, id string) (domain.User, error) {
@@ -202,4 +238,49 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// SetAvatarURL updates the avatar reference for an active user, returning the
+// prior value so the caller can clean up the replaced file. The UPDATE is
+// gated on status='active' AND deleted_at IS NULL so a suspended or scrubbed
+// user can never (re)acquire an avatar through this path.
+func (s *PGXUserStore) SetAvatarURL(ctx context.Context, userID, url string) (string, error) {
+	return s.swapAvatarURL(ctx, userID, nullableString(url))
+}
+
+// ClearAvatarURL sets avatar_url to NULL for an active user and returns the
+// prior value. Clearing an already-null avatar is not an error.
+func (s *PGXUserStore) ClearAvatarURL(ctx context.Context, userID string) (string, error) {
+	return s.swapAvatarURL(ctx, userID, nil)
+}
+
+func (s *PGXUserStore) swapAvatarURL(ctx context.Context, userID string, newValue any) (string, error) {
+	// The CTE captures the pre-update avatar_url (RETURNING on the UPDATE would
+	// otherwise expose the new value); the row lock also serialises concurrent
+	// avatar swaps for the same user.
+	var previous *string
+	err := s.pool.QueryRow(ctx, `
+		WITH target AS (
+		    SELECT id, avatar_url
+		    FROM auth.users
+		    WHERE id = $1 AND status = 'active' AND deleted_at IS NULL
+		    FOR UPDATE
+		)
+		UPDATE auth.users u
+		SET avatar_url = $2, updated_at = now()
+		FROM target
+		WHERE u.id = target.id
+		RETURNING target.avatar_url`,
+		userID, newValue,
+	).Scan(&previous)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrNotFound
+		}
+		return "", fmt.Errorf("swap avatar url: %w", err)
+	}
+	if previous == nil {
+		return "", nil
+	}
+	return *previous, nil
 }

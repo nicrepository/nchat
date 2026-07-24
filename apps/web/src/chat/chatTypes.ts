@@ -25,11 +25,26 @@ export interface DMParticipant {
   status: OnlineStatus;
 }
 
+/**
+ * The other participant of a 1:1 DM, as resolved by the server for the current
+ * viewer. Present only for `type: "1:1"` conversations whose counterpart could
+ * be resolved; groups never carry one. Presence/status is deliberately absent —
+ * the backend does not track it, so the UI must not invent it.
+ */
+export interface DMCounterpart {
+  userId: string;
+  /** Already resolved server-side: full_name, else display_name, else fallback. */
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe http(s) target. */
+  avatarUrl?: string;
+}
+
 export interface DMConversation {
   id: string;
   type: DMType;
   name: string;
   participants: DMParticipant[];
+  counterpart?: DMCounterpart;
   unreadCount?: number;
 }
 
