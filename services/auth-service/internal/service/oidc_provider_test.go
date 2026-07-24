@@ -120,6 +120,74 @@ func TestKeycloakProvider_ValidateIDTokenRejectsInvalidClaimsAndAlgorithm(t *tes
 	}
 }
 
+// TestKeycloakProvider_ValidateIDTokenDecodesProfileClaims proves the profile
+// claims added for the identity pipeline (given_name, family_name, picture) are
+// actually parsed out of a signed token, not merely present on the struct.
+func TestKeycloakProvider_ValidateIDTokenDecodesProfileClaims(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	const kid = "profile-key"
+	claims := keycloakIDClaims{
+		Nonce:             "nonce",
+		Email:             "ana@example.com",
+		EmailVerified:     true,
+		PreferredUsername: "ana.souza",
+		Name:              "Ana Carolina Souza",
+		GivenName:         "Ana",
+		FamilyName:        "Souza",
+		Picture:           "https://idp.example.test/avatars/ana.png",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "subject-1",
+			Audience:  jwt.ClaimStrings{"nchat-web"},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			//nolint:gosec // OIDC metadata keys, not credentials.
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"issuer":                 serverIssuer(r),
+				"authorization_endpoint": "http://" + r.Host + "/auth",
+				"token_endpoint":         "http://" + r.Host + "/token",
+				"jwks_uri":               "http://" + r.Host + "/certs",
+			})
+		case "/certs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+				"kty": "RSA",
+				"kid": kid,
+				"alg": "RS256",
+				"use": "sig",
+				"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
+			}}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	claims.Issuer = server.URL
+
+	provider := NewKeycloakProvider(KeycloakProviderConfig{IssuerURL: server.URL, ClientID: "nchat-web", HTTPClient: server.Client()})
+	got, err := provider.ValidateIDToken(context.Background(), signOIDCTestToken(t, key, kid, claims))
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if got.Name != "Ana Carolina Souza" || got.GivenName != "Ana" || got.FamilyName != "Souza" {
+		t.Fatalf("name claims not decoded: %+v", got)
+	}
+	if got.Picture != "https://idp.example.test/avatars/ana.png" {
+		t.Fatalf("picture claim not decoded: %q", got.Picture)
+	}
+	if got.PreferredUsername != "ana.souza" {
+		t.Fatalf("preferred_username not decoded: %q", got.PreferredUsername)
+	}
+}
+
 func TestKeycloakProvider_ValidateIDTokenRejectsMissingKidUnknownKidAndBadJWK(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

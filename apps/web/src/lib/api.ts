@@ -17,11 +17,17 @@ export class ApiRequestError extends Error {
 
 export async function apiFetch<T>(url: string, init: RequestInit): Promise<T> {
   let response: Response;
+  // FormData must set its own multipart Content-Type (with the boundary), so the
+  // JSON default is only applied to non-FormData bodies.
+  const isFormData = typeof FormData !== "undefined" && init.body instanceof FormData;
+  const baseHeaders: Record<string, string> = isFormData
+    ? {}
+    : { "Content-Type": "application/json" };
   try {
     response = await fetch(url, {
       ...init,
       headers: {
-        "Content-Type": "application/json",
+        ...baseHeaders,
         ...init.headers,
       },
     });

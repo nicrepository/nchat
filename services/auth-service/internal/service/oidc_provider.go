@@ -78,6 +78,9 @@ type keycloakIDClaims struct {
 	EmailVerified     bool   `json:"email_verified"`
 	PreferredUsername string `json:"preferred_username"`
 	Name              string `json:"name"`
+	GivenName         string `json:"given_name"`
+	FamilyName        string `json:"family_name"`
+	Picture           string `json:"picture"`
 	AuthorizedParty   string `json:"azp"`
 	jwt.RegisteredClaims
 }
@@ -194,6 +197,9 @@ func (p *KeycloakProvider) ValidateIDToken(ctx context.Context, rawIDToken strin
 		EmailVerified:     claims.EmailVerified,
 		PreferredUsername: claims.PreferredUsername,
 		Name:              claims.Name,
+		GivenName:         claims.GivenName,
+		FamilyName:        claims.FamilyName,
+		Picture:           claims.Picture,
 		Nonce:             claims.Nonce,
 	}, nil
 }

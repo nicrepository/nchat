@@ -130,21 +130,30 @@ type OIDCConsumedAuthRequest struct {
 }
 
 // OIDCClaims carries the validated identity claims used by nchat.
+// GivenName, FamilyName and Picture come from the standard `profile` scope and
+// are all optional: a provider that omits them must keep working.
 type OIDCClaims struct {
 	Subject           string
 	Email             string
 	EmailVerified     bool
 	PreferredUsername string
 	Name              string
+	GivenName         string
+	FamilyName        string
+	Picture           string
 	Nonce             string
 }
 
 // OIDCSessionInput carries provider identity and internal session material for atomic persistence.
+// FullName and AvatarURL are empty when the provider supplied nothing usable;
+// an empty value never overwrites an existing one (see resolveOIDCUser).
 type OIDCSessionInput struct {
 	Provider              string
 	Subject               string
 	Email                 string
 	DisplayName           string
+	FullName              string
+	AvatarURL             string
 	RefreshTokenHash      string
 	RefreshExpiresAt      time.Time
 	DeviceFingerprintHash string

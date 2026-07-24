@@ -35,6 +35,12 @@ func (f *fakeStore) UpdateUserStatus(_ context.Context, _, _ string) (domain.Use
 	return domain.User{}, nil
 }
 
+func (f *fakeStore) SetAvatarURL(_ context.Context, _, _ string) (string, error) { return "", nil }
+func (f *fakeStore) ClearAvatarURL(_ context.Context, _ string) (string, error)  { return "", nil }
+func (f *fakeStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProfile, error) {
+	return domain.SelfProfile{}, nil
+}
+
 func defaultPolicy() domain.PolicySettings {
 	return domain.PolicySettings{
 		MinPasswordLength: 8,
@@ -174,6 +180,13 @@ func (f *fakeUserStatusStore) UpdateUserStatus(_ context.Context, id, status str
 	return f.updatedUser, f.updateErr
 }
 
+func (f *fakeUserStatusStore) SetAvatarURL(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeUserStatusStore) ClearAvatarURL(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
 func activeUser() domain.User {
 	return domain.User{ID: "user-1", Email: "u@example.com", Status: "active"}
 }
@@ -242,5 +255,37 @@ func TestUpdateUserStatus_SelfDeactivation_Rejected(t *testing.T) {
 	// self-check fires before storage call
 	if store.gotUpdateID != "" {
 		t.Fatal("store must not be called on self-deactivation")
+	}
+}
+
+// profileStore is a fakeStore that returns a fixed self-profile.
+type profileStore struct {
+	fakeStore
+	profile domain.SelfProfile
+	err     error
+}
+
+func (p *profileStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProfile, error) {
+	return p.profile, p.err
+}
+
+func TestUserService_GetProfile_DelegatesToStore(t *testing.T) {
+	store := &profileStore{profile: domain.SelfProfile{ID: "u1", DisplayName: "Ana", AvatarURL: "/api/auth/avatars/x.png"}}
+	svc := service.NewUserService(store)
+
+	got, err := svc.GetProfile(context.Background(), "u1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.ID != "u1" || got.AvatarURL != "/api/auth/avatars/x.png" {
+		t.Fatalf("unexpected profile: %+v", got)
+	}
+}
+
+func TestUserService_GetProfile_PropagatesError(t *testing.T) {
+	store := &profileStore{err: domain.ErrNotFound}
+	svc := service.NewUserService(store)
+	if _, err := svc.GetProfile(context.Background(), "u1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

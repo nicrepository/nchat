@@ -33,14 +33,29 @@ type sidebarChannelJSON struct {
 	CanWrite    bool   `json:"can_write"`
 }
 
+// sidebarDMCounterpartJSON is the identity of the other participant of a 1:1
+// DM, as seen by the requesting user. It carries the minimum the UI needs to
+// render an avatar: a stable ID (for a deterministic fallback colour), the
+// resolved visual name, and an optional avatar URL. E-mail, status, auth source
+// and external subject are deliberately absent.
+type sidebarDMCounterpartJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+}
+
 // sidebarDMJSON is the JSON shape for a DM conversation in the sidebar response.
 // participant_ids and title are intentionally omitted: participant_ids would
 // leak member identity metadata, and title is an internal field not consumed
 // by the sidebar UI (the computed display name is in Name).
+// Counterpart is present only for direct conversations whose other participant
+// could be resolved; group conversations never carry one, and Name stays the
+// group title for them.
 type sidebarDMJSON struct {
-	ID   string `json:"id"`
-	Type string `json:"type"` // "direct" | "group"
-	Name string `json:"name"` // computed display name
+	ID          string                    `json:"id"`
+	Type        string                    `json:"type"` // "direct" | "group"
+	Name        string                    `json:"name"` // computed display name
+	Counterpart *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -134,13 +149,32 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 	out := make([]sidebarDMJSON, 0, len(dms))
 	for _, dm := range dms {
+		name := computeDMName(dm.Type, dm.Title, dm.CounterpartDisplayName)
 		out = append(out, sidebarDMJSON{
-			ID:   dm.ID,
-			Type: string(dm.Type),
-			Name: computeDMName(dm.Type, dm.Title, dm.CounterpartDisplayName),
+			ID:          dm.ID,
+			Type:        string(dm.Type),
+			Name:        name,
+			Counterpart: mapDMCounterpart(dm, name),
 		})
 	}
 	return out
+}
+
+// mapDMCounterpart exposes the other participant of a direct conversation.
+// It returns nil for group conversations and for direct ones whose counterpart
+// could not be resolved, so the client never has to distinguish a missing
+// counterpart from a fabricated one. DisplayName reuses the already computed
+// conversation name, keeping the structured field and `name` in agreement even
+// when the server had to fall back to the generic label.
+func mapDMCounterpart(dm domain.DMConversationWithParticipantIDs, name string) *sidebarDMCounterpartJSON {
+	if dm.Type != domain.DMConversationTypeDirect || dm.CounterpartUserID == "" {
+		return nil
+	}
+	return &sidebarDMCounterpartJSON{
+		UserID:      dm.CounterpartUserID,
+		DisplayName: name,
+		AvatarURL:   dm.CounterpartAvatarURL,
+	}
 }
 
 // computeDMName derives a sidebar display name for a DM conversation.

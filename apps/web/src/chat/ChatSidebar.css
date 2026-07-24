@@ -295,6 +295,16 @@
   background: linear-gradient(135deg, #7b43e8, #b485f4);
 }
 
+/* Fills the circle without changing its size, so a row keeps the same height
+   whether the counterpart has a picture or only initials. */
+.chat-sidebar__avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+
 .chat-sidebar__avatar--sm {
   width: 24px;
   height: 24px;

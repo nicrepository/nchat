@@ -312,6 +312,155 @@ describe("fetchDMs", () => {
     expect(dms[0]).toEqual({ id: "dm-1", type: "1:1", name: "Juliane Lino", participants: [] });
   });
 
+  it("maps the counterpart identity of a 1:1 DM", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          {
+            id: "dm-1",
+            type: "direct",
+            name: "Juliane Lino",
+            counterpart: {
+              user_id: "user-2",
+              display_name: "Juliane Lino",
+              avatar_url: "/media/avatars/juliane.png",
+            },
+          },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].counterpart).toEqual({
+      userId: "user-2",
+      displayName: "Juliane Lino",
+      avatarUrl: "/media/avatars/juliane.png",
+    });
+    // The counterpart must not be smuggled into the presence-bearing list.
+    expect(dms[0].participants).toEqual([]);
+  });
+
+  it("keeps the DM usable when the server sends no counterpart", async () => {
+    // Compatibility: a server that predates the counterpart field.
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({ dms: [{ id: "dm-1", type: "direct", name: "Juliane Lino" }] }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].name).toBe("Juliane Lino");
+    expect(dms[0].counterpart).toBeUndefined();
+  });
+
+  it("drops a counterpart that is missing an id or a name", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "dm-1", type: "direct", name: "A", counterpart: { display_name: "A" } },
+          { id: "dm-2", type: "direct", name: "B", counterpart: { user_id: "user-3" } },
+          { id: "dm-3", type: "direct", name: "C", counterpart: { user_id: "", display_name: "" } },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms.map((dm) => dm.counterpart)).toEqual([undefined, undefined, undefined]);
+  });
+
+  // jsdom serves these tests from http://localhost:3000, so that is the origin
+  // the same-origin policy is measured against.
+  it("rejects every avatar URL that is not same-origin, keeping the rest of the identity", async () => {
+    const hostile = [
+      "javascript:alert(1)",
+      "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+      "vbscript:msgbox(1)",
+      "file:///etc/passwd",
+      "blob:http://localhost:3000/abc",
+      "https://evil.example.test/a.png", // cross-origin absolute
+      "http://localhost:3001/a.png", // different port
+      "http://sub.localhost:3000/a.png", // different subdomain
+      "//evil.example.test/a.png", // protocol-relative cross-origin
+      "/\\evil.example.test/a.png", // backslash escape
+      "https://user:pass@localhost:3000/a.png", // credentials, even same host
+      "/media/a.png ", // control character
+      "media/a.png", // no leading slash -> would resolve relative to /chat, still same-origin? see below
+      "  ",
+      "\t\n",
+      `/${"a".repeat(512)}`, // over the length cap
+    ];
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: hostile.map((avatar, index) => ({
+          id: `dm-${index}`,
+          type: "direct",
+          name: "Juliane Lino",
+          counterpart: { user_id: `user-${index}`, display_name: "Juliane", avatar_url: avatar },
+        })),
+      }),
+    );
+
+    const dms = await fetchDMs();
+    for (const [index, dm] of dms.entries()) {
+      // "media/a.png" (no leading slash) resolves to a same-origin URL, so it
+      // is the one entry that is legitimately accepted.
+      if (hostile[index] === "media/a.png") {
+        expect(dm.counterpart?.avatarUrl).toBe("media/a.png");
+      } else {
+        expect(dm.counterpart?.avatarUrl).toBeUndefined();
+      }
+      // The rejection is scoped to the avatar; the counterpart survives.
+      expect(dm.counterpart?.displayName).toBe("Juliane");
+    }
+  });
+
+  it("accepts same-origin avatar URLs, relative or absolute, unchanged", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          {
+            id: "dm-rel",
+            type: "direct",
+            name: "A",
+            counterpart: { user_id: "u1", display_name: "A", avatar_url: "/media/a.png" },
+          },
+          {
+            id: "dm-abs",
+            type: "direct",
+            name: "B",
+            counterpart: {
+              user_id: "u2",
+              display_name: "B",
+              avatar_url: "http://localhost:3000/media/b.png?v=2#frag",
+            },
+          },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].counterpart?.avatarUrl).toBe("/media/a.png");
+    // The original string is returned verbatim — query and fragment intact.
+    expect(dms[1].counterpart?.avatarUrl).toBe("http://localhost:3000/media/b.png?v=2#frag");
+  });
+
+  it("never attaches a counterpart to a group DM", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          {
+            id: "dm-grp",
+            type: "group",
+            name: "Equipe Infra",
+            counterpart: { user_id: "user-2", display_name: "Juliane Lino" },
+          },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].counterpart).toBeUndefined();
+    expect(dms[0].name).toBe("Equipe Infra");
+  });
+
   it("maps group DM type correctly", async () => {
     mockAuthFetch.mockResolvedValue(
       sidebarResponse({

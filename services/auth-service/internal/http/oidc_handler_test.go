@@ -240,7 +240,7 @@ func TestOIDCExchange_InvalidCodeIsGenericAndDoesNotEchoCode(t *testing.T) {
 
 func TestOIDCRoutesRegisteredOnRouter(t *testing.T) {
 	cfg := testRouterConfigForOIDC()
-	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, &fakeOIDCManager{loginErr: domain.ErrOIDCMisconfigured})
+	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, &fakeOIDCManager{loginErr: domain.ErrOIDCMisconfigured})
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, httpapi.RouteAuthOIDCKeycloakLogin, nil))
 
@@ -254,7 +254,7 @@ func TestOIDCRouterDisabledRoutesReturn404BeforeRateLimit(t *testing.T) {
 	cfg.OIDCEnabled = false
 	cfg.AuthTokenEndpointRateLimitPerMinute = 1
 	cfg.AuthTokenEndpointRateLimitBurst = 1
-	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil)
+	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()

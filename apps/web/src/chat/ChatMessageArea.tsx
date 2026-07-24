@@ -24,14 +24,14 @@ import { useLocation, useNavigate, useOutletContext, useParams } from "react-rou
 
 import "./ChatMessageArea.css";
 import type { ChatOutletContext } from "./ChatShell";
-import type { Message, PinnedItem } from "./chatTypes";
+import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
 import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import { usePins } from "./usePins";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
-import { formatTime, senderLabel } from "./messageDisplay";
+import { avatarColorFor, formatTime, initialsFrom, senderLabel } from "./messageDisplay";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -206,19 +206,47 @@ function HeaderChannel({ name }: HeaderChannelProps) {
 
 interface HeaderDMProps {
   name: string;
+  /** Same structured counterpart the sidebar uses — never a second request. */
+  counterpart?: DMCounterpart;
 }
 
-function HeaderDM({ name }: HeaderDMProps) {
-  const initials = name
-    .split(" ")
-    .slice(0, 2)
-    .map((w) => w[0]?.toUpperCase() ?? "")
-    .join("");
+function HeaderDM({ name, counterpart }: HeaderDMProps) {
+  const src = counterpart?.avatarUrl;
+  // A load failure is scoped to the URL that was current when it happened, so a
+  // change of src must clear it — otherwise navigating A → B → A would never
+  // retry A. This uses React's "adjust state when a prop changes" pattern (reset
+  // during render, guarded so it runs ONLY when src actually changes, never every
+  // render); an effect would trip react-hooks/set-state-in-effect. An unchanged
+  // src that keeps failing stays on the initials fallback.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const [trackedSrc, setTrackedSrc] = useState(src);
+  if (src !== trackedSrc) {
+    setTrackedSrc(src);
+    setFailedSrc(null);
+  }
+  const showImage = Boolean(src) && failedSrc !== src;
+  // Same deterministic colour the sidebar uses for this person, so the initials
+  // fallback matches across both surfaces. Keyed on the counterpart user id
+  // (stable per person); legacy DMs without a counterpart fall back to the name.
+  const color = avatarColorFor(counterpart?.userId ?? name);
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
-      <div className="chat-msg-area__header-avatar" aria-hidden="true">
-        {initials || "?"}
+      <div
+        className={`chat-msg-area__header-avatar chat-msg-area__header-avatar--${color}`}
+        aria-hidden="true"
+      >
+        {showImage ? (
+          <img
+            className="chat-msg-area__header-avatar-img"
+            src={src}
+            alt=""
+            referrerPolicy="no-referrer"
+            onError={() => setFailedSrc(src ?? null)}
+          />
+        ) : (
+          initialsFrom(counterpart?.displayName ?? name)
+        )}
       </div>
       <h1 className="chat-msg-area__header-title">{name}</h1>
     </header>
@@ -764,10 +792,13 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   const ctx = useOutletContext<ChatOutletContext>() ?? { currentUserId: "", channels: [], dms: [] };
 
+  // The sidebar payload already carries the counterpart identity, so the header
+  // reads it from the outlet context instead of issuing a per-DM request.
+  const activeDM = kind === "dm" ? ctx.dms.find((dm) => dm.id === targetId) : undefined;
   const resolvedName =
     kind === "channel"
       ? (ctx.channels.find((ch) => ch.id === targetId)?.name ?? targetId)
-      : (ctx.dms.find((dm) => dm.id === targetId)?.name ?? targetId);
+      : (activeDM?.name ?? targetId);
   const referenceTargetLabel = useMemo(() => {
     if (pendingReference?.targetKind === "channel") {
       const name = ctx.channels.find((channel) => channel.id === pendingReference.targetId)?.name;
@@ -985,7 +1016,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       {kind === "channel" ? (
         <HeaderChannel name={resolvedName} />
       ) : (
-        <HeaderDM name={resolvedName} />
+        <HeaderDM name={resolvedName} counterpart={activeDM?.counterpart} />
       )}
 
       <PinnedBar pins={pins} onUnpin={togglePin} />

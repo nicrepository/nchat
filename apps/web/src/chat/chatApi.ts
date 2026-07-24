@@ -43,10 +43,18 @@ interface SidebarChannelResponse {
   can_write?: unknown;
 }
 
+interface SidebarDMCounterpartResponse {
+  user_id?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+}
+
 interface SidebarDMResponse {
   id: string;
   type: "direct" | "group";
   name: string;
+  /** Absent on group DMs and on pre-counterpart server responses. */
+  counterpart?: SidebarDMCounterpartResponse;
 }
 
 interface SidebarResponse {
@@ -100,6 +108,93 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
   };
 }
 
+/** Guards against a hostile payload turning an attribute into a memory hog. */
+const maxAvatarUrlLength = 512;
+
+/**
+ * Accepts an avatar URL only when it points at this very origin.
+ *
+ * Same-origin is the policy, not merely a consequence of the CSP: the deployed
+ * `img-src 'self'` would block a third-party image anyway, and loading one
+ * would leak the viewer's IP and referer to whoever hosts it — an avatar is a
+ * perfectly good tracking pixel. Rejecting cross-origin here means the UI never
+ * renders an <img> that is destined to fail, so the initials fallback is a real
+ * fallback rather than the normal outcome.
+ *
+ * `javascript:`, `data:`, `blob:`, `file:` and every other scheme are excluded
+ * by the http(s) check; backslashes and control characters are excluded before
+ * parsing because browsers normalise them in ways that can escape the origin.
+ *
+ * This is the render-time boundary. auth-service applies a stricter, separate
+ * rule at persistence time (root-relative only), because it cannot know the
+ * browser origin — the two checks guard different things and are not duplicates.
+ */
+function safeAvatarUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const value = raw.trim();
+  if (value === "" || value.length > maxAvatarUrlLength) return undefined;
+  // eslint-disable-next-line no-control-regex -- control characters are exactly what must be rejected.
+  if (/[\u0000-\u0020\u007f]/.test(value)) return undefined;
+  // Browsers treat "\" as "/", so "/\evil.test" and "\\evil.test" can leave the
+  // origin even though URL parsing may report otherwise.
+  if (value.includes("\\")) return undefined;
+
+  const origin = currentOrigin();
+  if (!origin) return undefined;
+  try {
+    const parsed = new URL(value, origin);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    if (parsed.origin !== origin) return undefined;
+    if (parsed.username !== "" || parsed.password !== "") return undefined;
+    // The original string is returned, never the resolved absolute form, so a
+    // relative path stays relative and nothing is rewritten behind the caller.
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Returns the origin to validate against, or "" when there is no document —
+ * server-side rendering, a worker, or a bare unit test. With no origin there is
+ * no way to prove an avatar is same-origin, so callers drop it and fall back to
+ * initials rather than guessing.
+ */
+function currentOrigin(): string {
+  if (typeof window === "undefined") return "";
+  const origin = window.location?.origin;
+  // Some environments expose the literal "null" origin (sandboxed frames).
+  return typeof origin === "string" && origin !== "" && origin !== "null" ? origin : "";
+}
+
+/**
+ * A counterpart is only usable when the server sent both an ID and a name;
+ * anything partial is dropped so the UI falls back to `name` + initials rather
+ * than rendering a half-built identity. Servers that predate the counterpart
+ * field simply yield undefined.
+ */
+function mapSidebarCounterpart(raw: SidebarDMCounterpartResponse | undefined) {
+  if (!raw || typeof raw.user_id !== "string" || typeof raw.display_name !== "string") {
+    return undefined;
+  }
+  if (raw.user_id === "" || raw.display_name === "") return undefined;
+  return {
+    userId: raw.user_id,
+    displayName: raw.display_name,
+    avatarUrl: safeAvatarUrl(raw.avatar_url),
+  };
+}
+
+function mapSidebarDM(dm: SidebarDMResponse): DMConversation {
+  return {
+    id: dm.id,
+    type: dm.type === "group" ? "group" : "1:1",
+    name: dm.name,
+    participants: [],
+    counterpart: dm.type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
+  };
+}
+
 // ── Exported API ──────────────────────────────────────────────────────────────
 
 export async function fetchChannels(): Promise<Channel[]> {
@@ -109,12 +204,7 @@ export async function fetchChannels(): Promise<Channel[]> {
 
 export async function fetchDMs(): Promise<DMConversation[]> {
   const sidebar = await fetchSidebar();
-  return (sidebar.dm_conversations ?? []).map((dm) => ({
-    id: dm.id,
-    type: dm.type === "group" ? ("group" as const) : ("1:1" as const),
-    name: dm.name,
-    participants: [],
-  }));
+  return (sidebar.dm_conversations ?? []).map(mapSidebarDM);
 }
 
 /**
@@ -129,12 +219,7 @@ export async function fetchSidebarData(): Promise<{
 }> {
   const sidebar = await fetchSidebar();
   const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
-  const dms = (sidebar.dm_conversations ?? []).map((dm) => ({
-    id: dm.id,
-    type: dm.type === "group" ? ("group" as const) : ("1:1" as const),
-    name: dm.name,
-    participants: [],
-  }));
+  const dms = (sidebar.dm_conversations ?? []).map(mapSidebarDM);
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
 }
 

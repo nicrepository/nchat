@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import "./ChatSidebar.css";
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
+import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewDirectMessageDialog from "./NewDirectMessageDialog";
 
 /**
@@ -113,18 +114,44 @@ function IconStar() {
 
 interface AvatarProps {
   initials: string;
+  /** Optional picture. Initials are shown when absent or when loading fails. */
+  src?: string;
   color?: string;
   status?: "online" | "away" | "offline";
   size?: "sm" | "md";
 }
 
-function Avatar({ initials, color = "purple", status, size = "sm" }: AvatarProps) {
+function Avatar({ initials, src, color = "purple", status, size = "sm" }: AvatarProps) {
+  // A load failure is scoped to the URL that was current when it happened, so a
+  // change of src must clear it — otherwise an A → B → A cycle would never retry
+  // A. This uses React's "adjust state when a prop changes" pattern (reset during
+  // render, guarded so it runs ONLY when src actually changes, never every
+  // render); an effect would trip react-hooks/set-state-in-effect. An unchanged
+  // src that keeps failing stays on the initials fallback.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const [trackedSrc, setTrackedSrc] = useState(src);
+  if (src !== trackedSrc) {
+    setTrackedSrc(src);
+    setFailedSrc(null);
+  }
+  const showImage = Boolean(src) && failedSrc !== src;
+
   return (
     <span
       className={`chat-sidebar__avatar chat-sidebar__avatar--${color} chat-sidebar__avatar--${size}`}
       aria-hidden="true"
     >
-      {initials}
+      {showImage ? (
+        <img
+          className="chat-sidebar__avatar-img"
+          src={src}
+          alt=""
+          referrerPolicy="no-referrer"
+          onError={() => setFailedSrc(src ?? null)}
+        />
+      ) : (
+        initials
+      )}
       {status && (
         <span className={`chat-sidebar__avatar-status chat-sidebar__avatar-status--${status}`} />
       )}
@@ -268,8 +295,8 @@ function DMList({ dms, activeDMId, onSelect }: DMListProps) {
     <>
       {dms.map((dm) => {
         const isActive = dm.id === activeDMId;
-        const firstParticipant = dm.participants[0];
         const isGroup = dm.type === "group";
+        const counterpart = dm.counterpart;
 
         return (
           <button
@@ -281,16 +308,19 @@ function DMList({ dms, activeDMId, onSelect }: DMListProps) {
             className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
             onClick={() => onSelect(dm.id)}
           >
+            {/* The 1:1 avatar always renders — with a picture when there is
+                one, with initials otherwise — so the row height never shifts
+                depending on whether a counterpart has an avatar. */}
             {isGroup ? (
               <GroupAvatars dm={dm} />
-            ) : firstParticipant ? (
+            ) : (
               <Avatar
-                initials={firstParticipant.initials}
-                color={firstParticipant.color}
-                status={firstParticipant.status}
+                initials={initialsFrom(counterpart?.displayName ?? dm.name)}
+                src={counterpart?.avatarUrl}
+                color={avatarColorFor(counterpart?.userId ?? dm.id)}
                 size="sm"
               />
-            ) : null}
+            )}
             <span className="chat-sidebar__dm-name">{dm.name}</span>
             {isGroup && (
               <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
@@ -467,7 +497,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
           <IconSettings />
           <span>Configurações</span>
         </Link>
-        <div className="chat-sidebar__user">
+        <Link to="/profile" className="chat-sidebar__user" aria-label="Meu perfil">
           <Avatar
             initials={PLACEHOLDER_USER.initials}
             color={PLACEHOLDER_USER.color}
@@ -478,7 +508,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
             <div className="chat-sidebar__user-name">{PLACEHOLDER_USER.displayName}</div>
             <div className="chat-sidebar__user-role">{PLACEHOLDER_USER.role}</div>
           </div>
-        </div>
+        </Link>
       </div>
       {newDMOpen && state.status === "ready" && (
         <NewDirectMessageDialog

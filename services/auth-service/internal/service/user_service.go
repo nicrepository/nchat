@@ -24,10 +24,18 @@ type UserStatusManager interface {
 	UpdateUserStatus(ctx context.Context, callerID, targetID, newStatus string) (domain.User, error)
 }
 
-// UserAdmin is the combined interface used by admin HTTP handlers.
+// SelfProfileReader reads the authenticated user's own minimal profile.
+type SelfProfileReader interface {
+	GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error)
+}
+
+// UserAdmin is the combined interface used by the auth HTTP handlers. It also
+// carries the self-profile read so the router can serve GET /auth/me from the
+// same user service without a new constructor parameter.
 type UserAdmin interface {
 	UserCreator
 	UserStatusManager
+	SelfProfileReader
 }
 
 // UserService implements UserCreator and UserStatusManager.
@@ -38,6 +46,12 @@ type UserService struct {
 // NewUserService creates a UserService backed by the given store.
 func NewUserService(store storage.UserStore) *UserService {
 	return &UserService{store: store}
+}
+
+// GetProfile returns the authenticated user's own minimal profile. The userID
+// comes from the session; there is no lookup by any client-supplied identifier.
+func (s *UserService) GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error) {
+	return s.store.GetSelfProfile(ctx, userID)
 }
 
 func (s *UserService) CreateUser(ctx context.Context, input domain.CreateUserInput) (domain.User, error) {

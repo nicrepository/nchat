@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -167,6 +169,8 @@ func (s *OIDCService) Callback(ctx context.Context, input OIDCCallbackInput) (st
 		Subject:               strings.TrimSpace(claims.Subject),
 		Email:                 email,
 		DisplayName:           oidcDisplayName(claims),
+		FullName:              oidcFullName(claims),
+		AvatarURL:             oidcAvatarURL(claims),
 		RefreshTokenHash:      refreshHash,
 		RefreshExpiresAt:      refreshExpiresAt,
 		DeviceFingerprintHash: s.tokens.HashDeviceFingerprint(input.DeviceFingerprint),
@@ -275,14 +279,99 @@ func pkceChallenge(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
 
+// oidcDisplayName resolves the short visual name: the provider's `name` first,
+// then preferred_username as a fallback. The e-mail is never used, so a login
+// cannot turn an address into a visible label.
+//
+// It returns "" when the provider sent nothing usable. That is deliberate: an
+// empty result means "no opinion", which lets the storage layer keep an existing
+// name on re-login and apply domain.DefaultDisplayName only when provisioning a
+// brand new user.
 func oidcDisplayName(claims domain.OIDCClaims) string {
-	if name := strings.TrimSpace(claims.Name); name != "" {
+	if name := sanitizeOIDCName(claims.Name); name != "" {
 		return name
 	}
-	if name := strings.TrimSpace(claims.PreferredUsername); name != "" {
+	return sanitizeOIDCName(claims.PreferredUsername)
+}
+
+// maxOIDCNameLength bounds identity strings coming from an external IdP. Names
+// are stored in unbounded TEXT columns, so the cap lives here rather than in the
+// schema; it counts runes so accented and CJK names are not truncated early.
+const maxOIDCNameLength = 200
+
+// maxOIDCAvatarURLLength bounds the avatar reference for the same reason.
+const maxOIDCAvatarURLLength = 512
+
+// oidcFullName resolves the person's full name from the standard profile claims.
+// `name` wins because Keycloak composes it from the user's first and last name;
+// given_name/family_name is the fallback for providers that only emit the parts.
+// preferred_username is deliberately never used: a username is not a full name,
+// and display_name already covers that fallback.
+// An empty result means "the provider told us nothing" and must never overwrite
+// a stored value.
+func oidcFullName(claims domain.OIDCClaims) string {
+	if name := sanitizeOIDCName(claims.Name); name != "" {
 		return name
 	}
-	return "Usuário"
+	given := sanitizeOIDCName(claims.GivenName)
+	family := sanitizeOIDCName(claims.FamilyName)
+	return sanitizeOIDCName(strings.TrimSpace(given + " " + family))
+}
+
+// sanitizeOIDCName trims, collapses internal whitespace and drops values that
+// carry control characters or exceed the length cap. Unicode letters, marks and
+// punctuation are preserved untouched.
+func sanitizeOIDCName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	for _, r := range trimmed {
+		// Rejects C0/C1 controls (including CR/LF) and the DEL character, which
+		// have no place in a name and would corrupt logs and headers downstream.
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	if utf8.RuneCountInString(trimmed) > maxOIDCNameLength {
+		return ""
+	}
+	return strings.Join(strings.Fields(trimmed), " ")
+}
+
+// oidcAvatarURL accepts the `picture` claim only as a same-origin reference.
+//
+// The auth-service has no knowledge of the browser origin, so the only form it
+// can verify as same-origin is a root-relative path: it resolves against
+// whatever origin serves the app, by construction. Every absolute URL is
+// rejected — including https:// ones — because loading a third-party image in
+// the browser would violate the deployed CSP (`img-src 'self'`), leak the
+// viewer's IP to the provider, and turn the avatar into a tracking pixel.
+//
+// Consequence: Keycloak's `picture` claim, which is absolute, is stored as
+// NULL. That is intentional. Making external pictures usable requires
+// same-origin ingestion, which does not exist yet (see docs/architecture).
+func oidcAvatarURL(claims domain.OIDCClaims) string {
+	raw := strings.TrimSpace(claims.Picture)
+	if raw == "" || utf8.RuneCountInString(raw) > maxOIDCAvatarURLLength {
+		return ""
+	}
+	for _, r := range raw {
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	// A leading "//" is protocol-relative: it points at another host despite
+	// looking relative. A backslash is treated as a slash by browsers, so
+	// "/\evil.com" would escape the origin too.
+	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") || strings.ContainsRune(raw, '\\') {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "" || parsed.Host != "" || parsed.User != nil {
+		return ""
+	}
+	return raw
 }
 
 func appendFixedCallbackCode(callbackURL, code string) (string, error) {

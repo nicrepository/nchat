@@ -145,6 +145,15 @@ func expectOIDCPolicyQuery(mock pgxmock.PgxPoolIface) {
 		}).AddRow(12, true, true, true, true, 5, 15, 15, 60, 5, 60, 72))
 }
 
+// expectOIDCProfileSync matches the profile refresh that every returning OIDC
+// user goes through. displayName is what the UPDATE returns, i.e. the value the
+// caller must end up seeing.
+func expectOIDCProfileSync(mock pgxmock.PgxPoolIface, displayName string) {
+	mock.ExpectQuery(`UPDATE auth\.users\s+SET display_name = COALESCE`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"display_name"}).AddRow(displayName))
+}
+
 func TestPGXOIDCStore_CreateOIDCSessionAndExchangeAutoProvisionsUser(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -164,7 +173,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeAutoProvisionsUser(t *testing.
 		WithArgs("new@example.com").
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`INSERT INTO auth\.users`).
-		WithArgs("new@example.com", "New User", "keycloak", "subject-1").
+		WithArgs("new@example.com", "New User", "", "", "keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name"}).AddRow("user-id", "new@example.com", "New User"))
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-id", "new@example.com", true, nil, nil, nil).
@@ -261,6 +270,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeLogsInExistingLinkedUser(t *te
 		WithArgs("keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).
 			AddRow("user-id", "linked@example.com", "Linked User", "active", nil))
+	expectOIDCProfileSync(mock, "Linked User")
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-id", "linked@example.com", true, nil, nil, nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -401,6 +411,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeBuilderError(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
 		WithArgs("keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).AddRow("user-id", "linked@example.com", "Linked User", "active", nil))
+	expectOIDCProfileSync(mock, "Linked User")
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-id", "linked@example.com", true, nil, nil, nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -471,6 +482,44 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeRejectsInactiveLinkedUser(t *t
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXOIDCStore_DeletedUserIsNotResurrectedByProfileSync is the anonymisation
+// safety net for the profile-refresh feature: a soft-deleted (anonymised) row is
+// rejected at the subject lookup, so the COALESCE UPDATE never runs and cannot
+// write a fresh name or avatar back onto a scrubbed identity. The absence of a
+// profile-sync expectation, together with ExpectationsWereMet, is the proof.
+func TestPGXOIDCStore_DeletedUserIsNotResurrectedByProfileSync(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	deletedAt := time.Now()
+	mock.ExpectBegin()
+	expectOIDCPolicyQuery(mock)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).
+			AddRow("user-id", "linked@example.com", "Usuário removido", "active", &deletedAt))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXOIDCStore(mock)
+	_, err = store.CreateOIDCSessionAndExchange(context.Background(), domain.OIDCSessionInput{
+		Provider: "keycloak", Subject: "subject-1", Email: "linked@example.com",
+		DisplayName: "Renamed", FullName: "Resurrected Name", AvatarURL: "/media/avatars/x.png",
+		AutoProvision: true,
+	}, func(domain.Session, domain.LoginUser) (domain.OIDCExchangeInput, error) {
+		t.Fatal("builder must not run for a deleted user")
+		return domain.OIDCExchangeInput{}, nil
+	})
+	if !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("expected invalid credentials, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations (a profile sync would be an unexpected query here): %v", err)
 	}
 }
 
@@ -545,7 +594,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeReturnsInsertUserError(t *test
 		WithArgs("new@example.com").
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`INSERT INTO auth\.users`).
-		WithArgs("new@example.com", "New User", "keycloak", "subject-1").
+		WithArgs("new@example.com", "New User", "", "", "keycloak", "subject-1").
 		WillReturnError(errors.New("insert user failed"))
 	mock.ExpectRollback()
 
@@ -555,6 +604,160 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeReturnsInsertUserError(t *test
 	})
 	if err == nil {
 		t.Fatal("expected insert user error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXOIDCStore_ProvisionsFullNameAndAvatar asserts the values resolved from
+// the claims are the ones written on provisioning, and that empty values become
+// NULL rather than empty strings.
+func TestPGXOIDCStore_ProvisionsFullNameAndAvatar(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		input       domain.OIDCSessionInput
+		wantDisplay string
+		wantFull    string
+		wantAvatar  string
+	}{
+		{
+			name: "full identity",
+			input: domain.OIDCSessionInput{
+				DisplayName: "ana.souza", FullName: "Ana Carolina Souza", AvatarURL: "/media/avatars/ana.png",
+			},
+			wantDisplay: "ana.souza", wantFull: "Ana Carolina Souza", wantAvatar: "/media/avatars/ana.png",
+		},
+		{
+			name:        "no claims at all falls back only for display_name",
+			input:       domain.OIDCSessionInput{},
+			wantDisplay: domain.DefaultDisplayName, wantFull: "", wantAvatar: "",
+		},
+		{
+			name:        "name without avatar",
+			input:       domain.OIDCSessionInput{DisplayName: "Ana", FullName: "Ana Souza"},
+			wantDisplay: "Ana", wantFull: "Ana Souza", wantAvatar: "",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+
+			refreshExpiresAt := time.Now().Add(time.Hour)
+			mock.ExpectBegin()
+			expectOIDCPolicyQuery(mock)
+			mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+				WithArgs("keycloak", "subject-1").
+				WillReturnError(pgx.ErrNoRows)
+			mock.ExpectQuery(`SELECT id\s+FROM auth\.users`).
+				WithArgs("new@example.com").
+				WillReturnError(pgx.ErrNoRows)
+			// NULLIF turns the empty strings into NULL inside PostgreSQL; the
+			// arguments themselves must carry exactly what was resolved.
+			mock.ExpectQuery(`INSERT INTO auth\.users\s+\(email, display_name, full_name, avatar_url`).
+				WithArgs("new@example.com", test.wantDisplay, test.wantFull, test.wantAvatar, "keycloak", "subject-1").
+				WillReturnError(errors.New("stop after the insert"))
+			mock.ExpectRollback()
+
+			input := test.input
+			input.Provider = "keycloak"
+			input.Subject = "subject-1"
+			input.Email = "new@example.com"
+			input.RefreshExpiresAt = refreshExpiresAt
+			input.AutoProvision = true
+
+			store := storage.NewPGXOIDCStore(mock)
+			if _, err := store.CreateOIDCSessionAndExchange(context.Background(), input,
+				func(domain.Session, domain.LoginUser) (domain.OIDCExchangeInput, error) {
+					return domain.OIDCExchangeInput{}, nil
+				}); err == nil {
+				t.Fatal("expected the seeded insert error")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestPGXOIDCStore_SyncsProfileOnReturningLogin is the anti-regression for the
+// update policy: the refresh runs with the freshly resolved values, and the
+// caller sees the display name the database returned, not the stale one.
+func TestPGXOIDCStore_SyncsProfileOnReturningLogin(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	expectOIDCPolicyQuery(mock)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).
+			AddRow("user-id", "linked@example.com", "Old Name", "active", nil))
+	// COALESCE(NULLIF(...)) is asserted through the arguments: a claim the IdP
+	// stopped sending arrives empty and must leave the column untouched.
+	mock.ExpectQuery(`UPDATE auth\.users\s+SET display_name = COALESCE\(NULLIF\(\$2, ''\), display_name\),\s+full_name    = COALESCE\(NULLIF\(\$3, ''\), full_name\),\s+avatar_url   = COALESCE\(avatar_url, NULLIF\(\$4, ''\)\)`).
+		WithArgs("user-id", "Renamed", "Ana Carolina Souza", "").
+		WillReturnRows(pgxmock.NewRows([]string{"display_name"}).AddRow("Renamed"))
+	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
+		WithArgs("user-id", "linked@example.com", true, nil, nil, nil).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery(`INSERT INTO auth\.user_sessions`).
+		WithArgs("user-id", nil, "refresh-hash", nil, nil, pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnError(errors.New("stop after the sync"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXOIDCStore(mock)
+	if _, err := store.CreateOIDCSessionAndExchange(context.Background(), domain.OIDCSessionInput{
+		Provider:         "keycloak",
+		Subject:          "subject-1",
+		Email:            "linked@example.com",
+		DisplayName:      "Renamed",
+		FullName:         "Ana Carolina Souza",
+		RefreshTokenHash: "refresh-hash",
+		RefreshExpiresAt: time.Now().Add(time.Hour),
+	}, func(domain.Session, domain.LoginUser) (domain.OIDCExchangeInput, error) {
+		return domain.OIDCExchangeInput{}, nil
+	}); err == nil {
+		t.Fatal("expected the seeded session error")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPGXOIDCStore_ProfileSyncErrorAbortsLogin keeps the refresh inside the
+// login transaction: a failed sync must not leave a half-updated identity.
+func TestPGXOIDCStore_ProfileSyncErrorAbortsLogin(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	expectOIDCPolicyQuery(mock)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).
+			AddRow("user-id", "linked@example.com", "Linked User", "active", nil))
+	mock.ExpectQuery(`UPDATE auth\.users\s+SET display_name = COALESCE`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnError(errors.New("sync failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXOIDCStore(mock)
+	if _, err := store.CreateOIDCSessionAndExchange(context.Background(), domain.OIDCSessionInput{
+		Provider: "keycloak", Subject: "subject-1", Email: "linked@example.com", DisplayName: "Linked User",
+	}, func(domain.Session, domain.LoginUser) (domain.OIDCExchangeInput, error) {
+		return domain.OIDCExchangeInput{}, nil
+	}); err == nil {
+		t.Fatal("expected the sync error to abort the login")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -575,6 +778,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeReturnsExchangeInsertError(t *
 	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
 		WithArgs("keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).AddRow("user-id", "linked@example.com", "Linked User", "active", nil))
+	expectOIDCProfileSync(mock, "Linked User")
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-id", "linked@example.com", true, nil, nil, nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -618,6 +822,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeReturnsCommitError(t *testing.
 	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
 		WithArgs("keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).AddRow("user-id", "linked@example.com", "Linked User", "active", nil))
+	expectOIDCProfileSync(mock, "Linked User")
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-id", "linked@example.com", true, nil, nil, nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -819,6 +1024,7 @@ func expectOIDCLinkedUser(mock pgxmock.PgxPoolIface) {
 	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
 		WithArgs("keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).AddRow("user-id", "linked@example.com", "Linked User", "active", nil))
+	expectOIDCProfileSync(mock, "Linked User")
 }
 
 func TestPGXOIDCStore_CreateOIDCSessionAndExchangeReturnsPolicyError(t *testing.T) {
