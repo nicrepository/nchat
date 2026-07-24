@@ -2505,14 +2505,13 @@ describe("ChatMessageArea — stale response guard", () => {
     resolveSendA!(makeMessage({ bodyText: "mensagem A sucesso" }));
 
     await waitFor(() => {
-      // Canal-2 is ready (empty state or loading done).
-      // Check only message bubbles — not the composer textarea which may still hold the draft.
+      // Canal-2 is ready (empty state or loading done) and shows none of canal-1's content.
       const bubbles = screen.queryAllByTestId("chat-msg-bubble");
       expect(bubbles.some((b) => b.textContent?.includes("mensagem A sucesso"))).toBe(false);
     });
   });
 
-  it("stale send success does not clear draft still in composer after target change", async () => {
+  it("stale send success leaves the new target's composer empty and usable", async () => {
     const user = userEvent.setup();
 
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
@@ -2544,28 +2543,28 @@ describe("ChatMessageArea — stale response guard", () => {
     await fillEditor(input, "rascunho canal 1");
     await user.click(screen.getByTestId("chat-send-btn"));
 
-    // Navigate to canal-2 while POST for canal-1 is still in-flight.
-    // Composer still carries "rascunho canal 1" (draft not cleared yet) and is disabled.
+    // Navigate to canal-2 while the POST for canal-1 is still in-flight. The
+    // composer is keyed by target, so canal-1's draft is destroyed with it.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
 
     // Resolve the stale POST for canal-1 — should return { status: "stale" }.
-    // With the bug: handleSend would call setDraft("") → draft erased.
     await act(async () => {
       resolveSendA!(makeMessage({ bodyText: "rascunho canal 1" }));
     });
 
-    // Content must still be present — stale success must not clear it.
-    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho canal 1");
-    // Canal-1 message must not appear in canal-2's message bubble list.
+    // Canal-1's draft must never surface in canal-2 — neither in the composer
+    // nor in the timeline — and the stale completion must not touch either.
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("");
     const bubbles = screen.queryAllByTestId("chat-msg-bubble");
     expect(bubbles.some((b) => b.textContent?.includes("rascunho canal 1"))).toBe(false);
     // No error banner in canal-2.
     expect(screen.queryByTestId("chat-send-error")).not.toBeInTheDocument();
-    // Send button usable (not stuck in sending state).
-    expect(screen.getByTestId("chat-send-btn")).not.toBeDisabled();
+    // The fresh composer is not stuck in a sending state: new content can be sent.
+    await fillEditor(screen.getByTestId("chat-composer-input"), "rascunho canal 2");
+    await waitFor(() => expect(screen.getByTestId("chat-send-btn")).not.toBeDisabled());
   });
 
-  it("stale send failure does not show error or clear draft in new target", async () => {
+  it("stale send failure shows no error and leaves the new target's composer empty", async () => {
     const user = userEvent.setup();
 
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
@@ -2608,12 +2607,13 @@ describe("ChatMessageArea — stale response guard", () => {
       rejectSendA!(new Error("Erro do canal A"));
     });
 
-    // Content must still be present — stale failure must not clear it.
-    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho canal 1");
+    // Canal-1's draft was destroyed with its composer and must not reappear.
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("");
     // No error banner in canal-2.
     expect(screen.queryByTestId("chat-send-error")).not.toBeInTheDocument();
-    // Send button usable (not stuck in sending state).
-    expect(screen.getByTestId("chat-send-btn")).not.toBeDisabled();
+    // The fresh composer is not stuck in a sending state: new content can be sent.
+    await fillEditor(screen.getByTestId("chat-composer-input"), "rascunho canal 2");
+    await waitFor(() => expect(screen.getByTestId("chat-send-btn")).not.toBeDisabled());
   });
 });
 

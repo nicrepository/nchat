@@ -160,9 +160,15 @@ export function useChatEditor({
     [bodyFormat],
   );
 
+  // Mentions (and therefore setMentionChannel) exist only on the v3 editor.
+  // The capability is read from the editor instance, never inferred from the
+  // bodyFormat prop: useEditor swaps instances from an effect, so on a
+  // v2 → v3 switch (DM → channel, same mounted composer) this effect runs once
+  // while `editor` is still the v2 instance. Calling the command there threw and
+  // tore down the whole React root, blanking the app until a reload.
   useEffect(() => {
-    if (bodyFormat === "v3") editor?.commands.setMentionChannel(channelId);
-  }, [editor, channelId, bodyFormat]);
+    editor?.commands.setMentionChannel?.(channelId);
+  }, [editor, channelId]);
 
   // Sync editable state and aria attributes when props change.
   useEffect(() => {
