@@ -16,7 +16,10 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("%s configuration invalid: %v", cfg.ServiceName, err)
 	}
-	application := app.New(cfg)
+	application, err := app.New(cfg)
+	if err != nil {
+		log.Fatalf("%s initialization failed: %v", cfg.ServiceName, err)
+	}
 	addr := ":" + strconv.Itoa(cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -28,7 +31,7 @@ func main() {
 
 	application.Logger.Info("service starting", "port", cfg.Port)
 	serveErr := httpServer.ListenAndServe()
-	_ = application.TracingShutdown(context.Background())
+	_ = application.Shutdown(context.Background())
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatalf("%s failed: %v", cfg.ServiceName, serveErr)
 	}
