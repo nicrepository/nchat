@@ -1,5 +1,5 @@
 import { type FormEvent, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 
 import "../tokens.css";
 import "./auth.css";
