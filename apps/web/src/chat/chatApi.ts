@@ -62,6 +62,8 @@ interface SidebarResponse {
   workspace: { id: string; name: string; slug: string };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
+  /** Absent on servers that predate RF-01 channel creation; absent means "no". */
+  can_create_channel?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -78,6 +80,10 @@ interface DirectDMEnvelope {
 
 interface GroupDMEnvelope {
   data: { conversation_id: string };
+}
+
+interface CreateChannelEnvelope {
+  data: { id: string; slug: string; display_name: string; type: "public" | "private" };
 }
 
 interface AllowedReactionEmojisEnvelope {
@@ -220,11 +226,19 @@ export async function fetchSidebarData(): Promise<{
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
+  canCreateChannel: boolean;
 }> {
   const sidebar = await fetchSidebar();
   const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
   const dms = (sidebar.dm_conversations ?? []).map(mapSidebarDM);
-  return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
+  return {
+    currentUserId: sidebar.current_user_id ?? "",
+    channels,
+    dms,
+    // Strict equality, so anything but a literal true — absent field, string,
+    // number — reads as "not allowed". The endpoint decides regardless.
+    canCreateChannel: sidebar.can_create_channel === true,
+  };
 }
 
 export async function searchDMCandidates(
@@ -284,6 +298,42 @@ export async function createGroupDM(
     signal,
   });
   return response.data.conversation_id;
+}
+
+/**
+ * Creates a channel (RF-01) and returns it as the sidebar models one.
+ *
+ * Only the three caller-owned fields are sent: the workspace, the creator, the
+ * general flag and the position are derived from the session server-side, and
+ * the endpoint rejects a body that carries them. The slug is trimmed and
+ * lowercased here because the server does the same before matching it against
+ * its pattern — this is shaping, never a check. Permission is not consulted on
+ * this side at all: a caller without the workspace role gets a 403, which the
+ * dialog surfaces as such rather than as a generic failure.
+ */
+export async function createChannel(
+  input: { slug: string; displayName: string; type: "public" | "private" },
+  signal?: AbortSignal,
+): Promise<Channel> {
+  const response = await authenticatedFetch<CreateChannelEnvelope>(`${CHAT_BASE}/channels`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      slug: input.slug.trim().toLowerCase(),
+      display_name: input.displayName.trim(),
+      type: input.type,
+    }),
+    signal,
+  });
+  const created = response.data;
+  return {
+    id: created.id,
+    name: created.display_name || created.slug,
+    type: created.type,
+    // The creator of a channel can write to it, but the sidebar refetch is what
+    // makes this authoritative; nothing here is trusted for a write decision.
+    canWrite: true,
+  };
 }
 
 export function fetchAllowedReactionEmojis(): Promise<string[]> {

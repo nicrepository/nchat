@@ -64,6 +64,9 @@ type sidebarResponseBody struct {
 	Workspace     sidebarWorkspaceJSON `json:"workspace"`
 	Channels      []sidebarChannelJSON `json:"channels"`
 	DMConvs       []sidebarDMJSON      `json:"dm_conversations"`
+	// CanCreateChannel is advisory UI state, not an authorization decision:
+	// POST /api/chat/channels checks the caller's role again for every request.
+	CanCreateChannel bool `json:"can_create_channel"`
 }
 
 // SidebarHandler handles GET /api/chat/sidebar.
@@ -115,8 +118,9 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Name: data.Workspace.Name,
 			Slug: data.Workspace.Slug,
 		},
-		Channels: mapChannels(data.Channels),
-		DMConvs:  mapDMs(data.DMs),
+		Channels:         mapChannels(data.Channels),
+		DMConvs:          mapDMs(data.DMs),
+		CanCreateChannel: data.CanCreateChannel,
 	}
 	// Ensure arrays are never null in JSON output.
 	if body.Channels == nil {

@@ -14,6 +14,10 @@ type SidebarData struct {
 	Workspace domain.Workspace
 	Channels  []SidebarChannel
 	DMs       []domain.DMConversationWithParticipantIDs
+	// CanCreateChannel mirrors the check POST /api/chat/channels performs. It
+	// exists so the UI can explain why the action is unavailable, never so the
+	// UI can decide: the endpoint re-derives it from the session on every call.
+	CanCreateChannel bool
 }
 
 // SidebarChannel carries server-derived destination eligibility.
@@ -97,8 +101,9 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 	}
 
 	return SidebarData{
-		Workspace: workspace,
-		Channels:  sidebarChannels,
-		DMs:       dms,
+		Workspace:        workspace,
+		Channels:         sidebarChannels,
+		DMs:              dms,
+		CanCreateChannel: domain.CanManageWorkspace(&member),
 	}, nil
 }

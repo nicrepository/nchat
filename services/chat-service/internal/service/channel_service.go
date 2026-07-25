@@ -220,7 +220,7 @@ func (s *ChannelService) requireManagePermission(ctx context.Context, workspaceI
 	if err != nil {
 		return domain.WorkspaceMember{}, err
 	}
-	if member.Role != domain.WorkspaceRoleOwner && member.Role != domain.WorkspaceRoleAdmin {
+	if !domain.CanManageWorkspace(&member) {
 		return domain.WorkspaceMember{}, domain.ErrForbidden
 	}
 	return member, nil

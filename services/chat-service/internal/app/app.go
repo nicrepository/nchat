@@ -118,6 +118,7 @@ func New(cfg config.Config) (*App, error) {
 	var favoriteSvc *service.FavoriteService
 	var pinSvc *service.PinService
 	var permissionSvc *service.PermissionService
+	var channelSvc *service.ChannelService
 
 	var closeDB func()
 	databaseReady := false
@@ -148,6 +149,7 @@ func New(cfg config.Config) (*App, error) {
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
 			permissionSvc = service.NewPermissionService(memberStore, channelStore)
+			channelSvc = service.NewChannelService(workspaceStore, channelStore, memberStore)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
@@ -204,6 +206,13 @@ func New(cfg config.Config) (*App, error) {
 	if dmSvc != nil {
 		directMessages = httpapi.NewDMHandler(workspaceStore, dmSvc, reactionLimiter)
 	}
+	// The limiter is required, not optional: without it the create route would run
+	// unthrottled, so an unconfigured Valkey leaves the route unregistered (404)
+	// rather than exposed. Readiness already fails in that configuration.
+	var channels *httpapi.ChannelHandler
+	if channelSvc != nil && reactionLimiter != nil {
+		channels = httpapi.NewChannelHandler(workspaceStore, channelSvc, reactionLimiter)
+	}
 	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
 
@@ -232,7 +241,7 @@ func New(cfg config.Config) (*App, error) {
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages),
+		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels),
 		TracingShutdown: shutdown,
 		hub:             hub,
 		presence:        presence,
