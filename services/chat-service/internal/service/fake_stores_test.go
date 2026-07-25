@@ -201,6 +201,11 @@ type fakeMemberStore struct {
 	dmCandidateQuery  string
 	dmCandidateLimit  int
 	getEligibleCalls  int
+	// ineligibleAccounts models what the GetEligibleDMMember query enforces with
+	// its auth.users join: a workspace membership row outlives the account, so a
+	// suspended or deleted user is still an active member here yet is not
+	// eligible for a DM.
+	ineligibleAccounts map[string]struct{}
 }
 
 func (f *fakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
@@ -221,6 +226,9 @@ func (f *fakeMemberStore) GetEligibleDMMember(_ context.Context, workspaceID, us
 	if status, ok := f.workspaceStatus[workspaceID]; ok && status != domain.WorkspaceStatusActive {
 		return domain.WorkspaceMember{}, domain.ErrNotFound
 	}
+	if _, ineligible := f.ineligibleAccounts[userID]; ineligible {
+		return domain.WorkspaceMember{}, domain.ErrNotFound
+	}
 	member, ok := f.workspaceMembers[wmKey(workspaceID, userID)]
 	if !ok || member.Status != domain.MemberStatusActive || member.WorkspaceID != workspaceID {
 		return domain.WorkspaceMember{}, domain.ErrNotFound
@@ -234,6 +242,8 @@ func newFakeMemberStore() *fakeMemberStore {
 		channelMembers:   make(map[string]domain.ChannelMember),
 		workspaceStatus:  make(map[string]domain.WorkspaceStatus),
 		generalChannels:  make(map[string]string),
+
+		ineligibleAccounts: make(map[string]struct{}),
 	}
 }
 

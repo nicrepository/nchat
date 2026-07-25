@@ -373,6 +373,7 @@ func TestDMContractRoutesRequireAuthentication(t *testing.T) {
 	for _, request := range []*http.Request{
 		httptest.NewRequest(http.MethodGet, RouteDMCandidates+"?query=an", nil),
 		httptest.NewRequest(http.MethodPost, RouteDMConversations, strings.NewReader(`{"other_user_id":"55555555-5555-5555-5555-555555555555"}`)),
+		httptest.NewRequest(http.MethodPost, RouteDMGroupConversations, strings.NewReader(`{"participant_user_ids":["55555555-5555-5555-5555-555555555555","66666666-6666-6666-6666-666666666666"]}`)),
 	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
@@ -416,6 +417,18 @@ func TestDMContractRoutesAreRegisteredOnlyWithHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new token validator: %v", err)
 	}
+	// Each route is rebuilt per subtest because a request body can only be read once.
+	routes := []struct {
+		name    string
+		request func(*testing.T) *http.Request
+	}{
+		{name: "candidate search", request: func(t *testing.T) *http.Request {
+			return routerGETRequest(t, RouteDMCandidates+"?query=an")
+		}},
+		{name: "group creation", request: func(t *testing.T) *http.Request {
+			return routerPOSTRequest(t, RouteDMGroupConversations)
+		}},
+	}
 	for _, test := range []struct {
 		name    string
 		handler *DMHandler
@@ -427,12 +440,37 @@ func TestDMContractRoutesAreRegisteredOnlyWithHandler(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 				allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, test.handler)
-			response := httptest.NewRecorder()
-			router.ServeHTTP(response, routerGETRequest(t, RouteDMCandidates+"?query=an"))
-			if response.Code != test.want {
-				t.Fatalf("status=%d, want %d", response.Code, test.want)
+			for _, route := range routes {
+				t.Run(route.name, func(t *testing.T) {
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, route.request(t))
+					if response.Code != test.want {
+						t.Fatalf("status=%d, want %d", response.Code, test.want)
+					}
+				})
 			}
 		})
+	}
+}
+
+// TestDMGroupRouteIsPOSTOnly: the group route is registered for POST only, so a
+// GET on the same path falls through to the catch-all 404. The distinction
+// matters — CreateGroup with nil dependencies answers 503, so any status other
+// than 404 would mean the wrong method still reached the handler.
+func TestDMGroupRouteIsPOSTOnly(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
+		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
+		NewDMHandler(nil, nil, nil))
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, routerGETRequest(t, RouteDMGroupConversations))
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("GET %s status=%d, want 404", RouteDMGroupConversations, response.Code)
 	}
 }
 

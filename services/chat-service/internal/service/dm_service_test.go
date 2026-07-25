@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -30,7 +31,7 @@ func TestDMService_CreateDirectConversation_SucceedsForActiveMembers(t *testing.
 		ID: "dm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive, CreatedBy: user1,
 	}}
 
-	got, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+	got, err := service.NewDMService(dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1",
 		CallerID:    user1,
 		OtherUserID: user2,
@@ -60,7 +61,7 @@ func TestDMService_CreateDirectConversation_ReversedParticipantsUseSamePairKey(t
 	dms := &fakeDMStore{createdConversation: domain.DMConversation{
 		ID: "dm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive,
 	}}
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms)
+	svc := service.NewDMService(dms, ms)
 
 	if _, err := svc.CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
@@ -84,7 +85,7 @@ func TestDMService_CreateDirectConversation_SelfDMDenied(t *testing.T) {
 	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
 	dms := &fakeDMStore{}
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+	_, err := service.NewDMService(dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user1,
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
@@ -96,7 +97,7 @@ func TestDMService_CreateDirectConversation_SelfDMDenied(t *testing.T) {
 }
 
 func TestDMService_CreateDirectConversation_InvalidInputDenied(t *testing.T) {
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{}, newFakeMemberStore()).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+	_, err := service.NewDMService(&fakeDMStore{}, newFakeMemberStore()).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: " ", CallerID: "user-1", OtherUserID: "user-2",
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
@@ -119,7 +120,7 @@ func TestDMService_CreateDirectConversation_InactiveParticipantDenied(t *testing
 			ms.workspaceMembers[wmKey(tc.member.WorkspaceID, tc.member.UserID)] = tc.member
 			dms := &fakeDMStore{}
 
-			_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+			_, err := service.NewDMService(dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 				WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
 			})
 			if !errors.Is(err, domain.ErrForbidden) {
@@ -137,9 +138,8 @@ func TestDMService_CreateDirectConversation_DisabledWorkspaceDenied(t *testing.T
 	ms.workspaceStatus["ws-1"] = domain.WorkspaceStatusDisabled
 	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
 	ms.workspaceMembers[wmKey("ws-1", user2)] = activeMembership("ws-1", user2)
-	workspaces := &fakeWorkspaceStore{workspace: domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusDisabled}}
 
-	_, err := service.NewDMService(workspaces, &fakeDMStore{}, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+	_, err := service.NewDMService(&fakeDMStore{}, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
 	})
 	if !errors.Is(err, domain.ErrForbidden) {
@@ -151,16 +151,17 @@ func TestDMService_GetOrCreateDirectConversation_DoesNotReloadWorkspace(t *testi
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
 	ms.workspaceMembers[wmKey("ws-1", user2)] = activeMembership("ws-1", user2)
-	workspaces := activeWorkspaceStore("ws-1")
 
-	_, err := service.NewDMService(workspaces, &fakeDMStore{}, ms).GetOrCreateDirectConversation(
+	_, err := service.NewDMService(&fakeDMStore{}, ms).GetOrCreateDirectConversation(
 		context.Background(), service.CreateDirectConversationInput{WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2},
 	)
 	if err != nil {
 		t.Fatalf("GetOrCreateDirectConversation: %v", err)
 	}
-	if workspaces.getByIDCalls != 0 || ms.getEligibleCalls != 2 {
-		t.Fatalf("workspace lookups=%d eligible lookups=%d, want 0 and 2", workspaces.getByIDCalls, ms.getEligibleCalls)
+	// One eligibility query per participant and nothing else: the workspace state
+	// rides along inside that same query instead of a separate read.
+	if ms.getEligibleCalls != 2 {
+		t.Fatalf("eligible lookups=%d, want 2", ms.getEligibleCalls)
 	}
 }
 
@@ -180,7 +181,7 @@ func TestDMService_GetOrCreateDirectConversation_RejectsIneligibleCallerBeforeCr
 			}
 			ms.workspaceMembers[wmKey("ws-1", user2)] = activeMembership("ws-1", user2)
 			dms := &fakeDMStore{}
-			_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).GetOrCreateDirectConversation(
+			_, err := service.NewDMService(dms, ms).GetOrCreateDirectConversation(
 				context.Background(), service.CreateDirectConversationInput{WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2},
 			)
 			if !errors.Is(err, domain.ErrForbidden) || dms.createDirectCalls != 0 {
@@ -196,7 +197,7 @@ func TestDMService_CreateDirectConversation_StorageErrorPropagates(t *testing.T)
 	ms.workspaceMembers[wmKey("ws-1", user2)] = activeMembership("ws-1", user2)
 	want := errors.New("dm storage unavailable")
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{createDirectErr: want}, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+	_, err := service.NewDMService(&fakeDMStore{createDirectErr: want}, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
 	})
 	if !errors.Is(err, want) {
@@ -213,7 +214,7 @@ func TestDMService_CreateGroupConversation_SucceedsWithActiveMembersAndAddsCalle
 		ID: "dm-group", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Title: "Project", Status: domain.DMConversationStatusActive, CreatedBy: user1,
 	}}
 
-	got, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+	got, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
 		WorkspaceID:        "ws-1",
 		CallerID:           user1,
 		ParticipantUserIDs: []string{user2, user3, user2},
@@ -239,7 +240,7 @@ func TestDMService_CreateGroupConversation_InvalidInputsDenied(t *testing.T) {
 	for _, uid := range []string{user1, user2, user3} {
 		ms.workspaceMembers[wmKey("ws-1", uid)] = activeMembership("ws-1", uid)
 	}
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{}, ms)
+	svc := service.NewDMService(&fakeDMStore{}, ms)
 
 	for _, tc := range []struct {
 		name  string
@@ -273,7 +274,7 @@ func TestDMService_CreateGroupConversation_RequiresAtLeastThreeUniqueParticipant
 	ms.workspaceMembers[wmKey("ws-1", user2)] = activeMembership("ws-1", user2)
 	dms := &fakeDMStore{}
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+	_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2},
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
@@ -284,6 +285,103 @@ func TestDMService_CreateGroupConversation_RequiresAtLeastThreeUniqueParticipant
 	}
 }
 
+// An oversized list is rejected before any membership look-up, so a hostile
+// payload cannot turn one request into thousands of database round-trips.
+func TestDMService_CreateGroupConversation_RejectsOversizedParticipantList(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
+	dms := &fakeDMStore{}
+	invited := make([]string, 50)
+	for i := range invited {
+		invited[i] = fmt.Sprintf("aabbccdd-1111-2222-3333-%012d", i+100)
+	}
+
+	_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+		WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: invited,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	// ErrInvalidInput (not ErrForbidden) proves the cap fired before the first
+	// membership look-up: only the caller is a registered member here, so an
+	// uncapped run would have failed on the very first unknown participant.
+	if dms.createGroupCalls != 0 {
+		t.Fatalf("oversized group must be denied before storage, calls=%d", dms.createGroupCalls)
+	}
+}
+
+// A workspace membership row survives the account it points at: deactivating or
+// deleting a user in auth does not remove chat.workspace_members. Checking only
+// the membership would therefore let a disabled account be pulled into a new
+// group, so group creation must use the same eligibility rule as a 1:1 DM.
+func TestDMService_CreateGroupConversation_RejectsParticipantWithIneligibleAccount(t *testing.T) {
+	for _, accountState := range []string{"suspended", "deleted"} {
+		t.Run(accountState, func(t *testing.T) {
+			ms := newFakeMemberStore()
+			for _, uid := range []string{user1, user2, user3} {
+				ms.workspaceMembers[wmKey("ws-1", uid)] = activeMembership("ws-1", uid)
+			}
+			// Membership stays active; only the account is gone.
+			ms.ineligibleAccounts[user3] = struct{}{}
+			dms := &fakeDMStore{}
+
+			_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+				WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2, user3},
+			})
+			// The same error a missing or foreign-workspace user produces: the
+			// caller cannot tell account state from membership state.
+			if !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("expected ErrForbidden, got %v", err)
+			}
+			if err != nil && strings.Contains(err.Error(), user3) {
+				t.Fatalf("error must not name the rejected participant: %v", err)
+			}
+			if dms.createGroupCalls != 0 {
+				t.Fatalf("nothing may be persisted, calls=%d", dms.createGroupCalls)
+			}
+		})
+	}
+}
+
+// The eligible participants of a partially valid list must not be created on
+// their own — the group is all or nothing, decided before storage is touched.
+func TestDMService_CreateGroupConversation_DoesNotDegradeToTheEligibleSubset(t *testing.T) {
+	ms := newFakeMemberStore()
+	for _, uid := range []string{user1, user2, user3} {
+		ms.workspaceMembers[wmKey("ws-1", uid)] = activeMembership("ws-1", uid)
+	}
+	ms.ineligibleAccounts[user2] = struct{}{}
+	dms := &fakeDMStore{}
+
+	_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+		WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2, user3},
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if dms.createGroupCalls != 0 {
+		t.Fatalf("partial group must never reach storage, calls=%d", dms.createGroupCalls)
+	}
+}
+
+// The caller is a participant too, so an account that lost eligibility cannot
+// open a group for others either.
+func TestDMService_CreateGroupConversation_RejectsIneligibleCaller(t *testing.T) {
+	ms := newFakeMemberStore()
+	for _, uid := range []string{user1, user2, user3} {
+		ms.workspaceMembers[wmKey("ws-1", uid)] = activeMembership("ws-1", uid)
+	}
+	ms.ineligibleAccounts[user1] = struct{}{}
+	dms := &fakeDMStore{}
+
+	_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+		WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2, user3},
+	})
+	if !errors.Is(err, domain.ErrForbidden) || dms.createGroupCalls != 0 {
+		t.Fatalf("err=%v calls=%d", err, dms.createGroupCalls)
+	}
+}
+
 func TestDMService_CreateGroupConversation_StorageErrorPropagates(t *testing.T) {
 	ms := newFakeMemberStore()
 	for _, uid := range []string{user1, user2, user3} {
@@ -291,7 +389,7 @@ func TestDMService_CreateGroupConversation_StorageErrorPropagates(t *testing.T) 
 	}
 	want := errors.New("dm group storage unavailable")
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{createGroupErr: want}, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+	_, err := service.NewDMService(&fakeDMStore{createGroupErr: want}, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2, user3},
 	})
 	if !errors.Is(err, want) {
@@ -315,7 +413,7 @@ func TestDMService_CreateGroupConversation_InvalidParticipantDenied(t *testing.T
 			ms.workspaceMembers[wmKey(tc.member.WorkspaceID, tc.member.UserID)] = tc.member
 			dms := &fakeDMStore{}
 
-			_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+			_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
 				WorkspaceID: "ws-1", CallerID: user1, ParticipantUserIDs: []string{user2, user3},
 			})
 			if !errors.Is(err, domain.ErrForbidden) {
@@ -333,7 +431,7 @@ func TestDMService_ListConversations_UsesSQLVisibility(t *testing.T) {
 		{ID: "dm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive},
 	}}
 
-	got, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, newFakeMemberStore()).ListConversations(context.Background(), "ws-1", "user-1")
+	got, err := service.NewDMService(dms, newFakeMemberStore()).ListConversations(context.Background(), "ws-1", "user-1")
 	if err != nil {
 		t.Fatalf("ListConversations: %v", err)
 	}
@@ -348,7 +446,7 @@ func TestDMService_ListConversations_UsesSQLVisibility(t *testing.T) {
 func TestDMService_ListConversations_StorageErrorPropagates(t *testing.T) {
 	want := errors.New("list dm unavailable")
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{listVisibleErr: want}, newFakeMemberStore()).ListConversations(context.Background(), "ws-1", "user-1")
+	_, err := service.NewDMService(&fakeDMStore{listVisibleErr: want}, newFakeMemberStore()).ListConversations(context.Background(), "ws-1", "user-1")
 	if !errors.Is(err, want) {
 		t.Fatalf("expected storage error, got %v", err)
 	}
@@ -359,7 +457,7 @@ func TestDMService_GetConversation_ReturnsVisibleConversation(t *testing.T) {
 		ID: "dm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
 	}}
 
-	got, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, newFakeMemberStore()).GetConversation(context.Background(), service.GetDMConversationInput{
+	got, err := service.NewDMService(dms, newFakeMemberStore()).GetConversation(context.Background(), service.GetDMConversationInput{
 		WorkspaceID: " ws-1 ", CallerID: " user-1 ", ConversationID: " dm-1 ",
 	})
 	if err != nil {
@@ -373,7 +471,7 @@ func TestDMService_GetConversation_ReturnsVisibleConversation(t *testing.T) {
 func TestDMService_GetConversation_NonParticipantLooksNotFound(t *testing.T) {
 	dms := &fakeDMStore{getVisibleErr: domain.ErrNotFound}
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, newFakeMemberStore()).GetConversation(context.Background(), service.GetDMConversationInput{
+	_, err := service.NewDMService(dms, newFakeMemberStore()).GetConversation(context.Background(), service.GetDMConversationInput{
 		WorkspaceID:    "ws-1",
 		CallerID:       "user-1",
 		ConversationID: "dm-private",
@@ -391,7 +489,7 @@ func TestDMService_CreateDirectConversation_SelfDMDeniedSameUUIDDifferentForm(t 
 	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
 	dms := &fakeDMStore{}
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
+	_, err := service.NewDMService(dms, ms).CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user1Up,
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
@@ -409,7 +507,7 @@ func TestDMService_CreateDirectConversation_AlternateCasingGivesSamePairKey(t *t
 	dms := &fakeDMStore{createdConversation: domain.DMConversation{
 		ID: "dm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive,
 	}}
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms)
+	svc := service.NewDMService(dms, ms)
 
 	if _, err := svc.CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
@@ -435,7 +533,7 @@ func TestDMService_CreateDirectConversation_CannotCreateDuplicatePairByAlternate
 	dms := &fakeDMStore{createdConversation: domain.DMConversation{
 		ID: "dm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive,
 	}}
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms)
+	svc := service.NewDMService(dms, ms)
 
 	if _, err := svc.CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
@@ -455,10 +553,6 @@ func TestDMService_CreateDirectConversation_CannotCreateDuplicatePairByAlternate
 }
 
 func TestDMService_CreateDirectConversation_SameCanonicalPairInDifferentWorkspacesIsolated(t *testing.T) {
-	ws := &fakeWorkspaceStore{workspaces: map[string]domain.Workspace{
-		"ws-1": {ID: "ws-1", Status: domain.WorkspaceStatusActive},
-		"ws-2": {ID: "ws-2", Status: domain.WorkspaceStatusActive},
-	}}
 	ms := newFakeMemberStore()
 	for _, wsID := range []string{"ws-1", "ws-2"} {
 		ms.workspaceMembers[wmKey(wsID, user1)] = activeMembership(wsID, user1)
@@ -467,7 +561,7 @@ func TestDMService_CreateDirectConversation_SameCanonicalPairInDifferentWorkspac
 	dms := &fakeDMStore{createdConversation: domain.DMConversation{
 		ID: "dm-x", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive,
 	}}
-	svc := service.NewDMService(ws, dms, ms)
+	svc := service.NewDMService(dms, ms)
 
 	if _, err := svc.CreateDirectConversation(context.Background(), service.CreateDirectConversationInput{
 		WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2,
@@ -495,7 +589,7 @@ func TestDMService_CreateDirectConversation_SameCanonicalPairInDifferentWorkspac
 }
 
 func TestDMService_CreateDirectConversation_InvalidUUIDRejected(t *testing.T) {
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{}, newFakeMemberStore())
+	svc := service.NewDMService(&fakeDMStore{}, newFakeMemberStore())
 	for _, tc := range []struct {
 		name  string
 		input service.CreateDirectConversationInput
@@ -520,7 +614,7 @@ func TestDMService_CreateDirectConversation_NilUUIDRejectedBeforeStores(t *testi
 	} {
 		ms := newFakeMemberStore()
 		dms := &fakeDMStore{}
-		_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateDirectConversation(context.Background(), input)
+		_, err := service.NewDMService(dms, ms).CreateDirectConversation(context.Background(), input)
 		if !errors.Is(err, domain.ErrInvalidInput) || ms.getEligibleCalls != 0 || dms.createDirectCalls != 0 {
 			t.Fatalf("input=%+v error=%v eligible calls=%d create calls=%d", input, err, ms.getEligibleCalls, dms.createDirectCalls)
 		}
@@ -536,7 +630,7 @@ func TestDMService_CreateGroupConversation_DeduplicatesByCanonicalUUID(t *testin
 		ID: "gm-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
 	}}
 
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+	_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
 		WorkspaceID:        "ws-1",
 		CallerID:           user1,
 		ParticipantUserIDs: []string{user2, user2Up, user3},
@@ -554,7 +648,7 @@ func TestDMService_CreateGroupConversation_CannotBypassMinimumWithDuplicateUUIDF
 	dms := &fakeDMStore{}
 
 	// caller=user1, invited=[user2, user1Up] — user1Up canonicalizes to user1 → only 2 unique
-	_, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
+	_, err := service.NewDMService(dms, ms).CreateGroupConversation(context.Background(), service.CreateGroupConversationInput{
 		WorkspaceID:        "ws-1",
 		CallerID:           user1,
 		ParticipantUserIDs: []string{user2, user1Up},
@@ -568,7 +662,7 @@ func TestDMService_CreateGroupConversation_CannotBypassMinimumWithDuplicateUUIDF
 }
 
 func TestDMService_CreateGroupConversation_InvalidUUIDRejected(t *testing.T) {
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{}, newFakeMemberStore())
+	svc := service.NewDMService(&fakeDMStore{}, newFakeMemberStore())
 	for _, tc := range []struct {
 		name  string
 		input service.CreateGroupConversationInput
@@ -594,7 +688,7 @@ func TestDMService_GetOrCreateDirectConversation_ReturnsCreatedSemantics(t *test
 		directCreated:       true,
 	}
 
-	result, err := service.NewDMService(activeWorkspaceStore("ws-1"), dms, ms).GetOrCreateDirectConversation(
+	result, err := service.NewDMService(dms, ms).GetOrCreateDirectConversation(
 		context.Background(),
 		service.CreateDirectConversationInput{WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2},
 	)
@@ -610,8 +704,7 @@ func TestDMService_SearchDMCandidates_UsesTrimmedQueryAndBoundedLimit(t *testing
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
 	ms.dmCandidates = []domain.DMCandidate{{UserID: user2, DisplayName: "Ana"}}
-	workspaces := activeWorkspaceStore("ws-1")
-	svc := service.NewDMService(workspaces, &fakeDMStore{}, ms)
+	svc := service.NewDMService(&fakeDMStore{}, ms)
 
 	got, err := svc.SearchDMCandidates(context.Background(), service.SearchDMCandidatesInput{
 		WorkspaceID: "ws-1", CallerID: user1, Query: "  an  ", Limit: 999,
@@ -631,13 +724,10 @@ func TestDMService_SearchDMCandidates_UsesTrimmedQueryAndBoundedLimit(t *testing
 	if ms.dmCandidateLimit != 20 {
 		t.Fatalf("default limit = %d, want 20", ms.dmCandidateLimit)
 	}
-	if workspaces.getByIDCalls != 0 {
-		t.Fatalf("search reloaded workspace %d times", workspaces.getByIDCalls)
-	}
 }
 
 func TestDMService_SearchDMCandidates_RejectsInvalidSearch(t *testing.T) {
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{}, newFakeMemberStore())
+	svc := service.NewDMService(&fakeDMStore{}, newFakeMemberStore())
 	for _, input := range []service.SearchDMCandidatesInput{
 		{WorkspaceID: "ws-1", CallerID: user1, Query: ""},
 		{WorkspaceID: "ws-1", CallerID: user1, Query: "a"},
@@ -655,7 +745,7 @@ func TestDMService_SearchDMCandidates_RequiresActiveCallerAndPropagatesStoreErro
 	ms.workspaceMembers[wmKey("ws-1", user1)] = domain.WorkspaceMember{
 		WorkspaceID: "ws-1", UserID: user1, Status: domain.MemberStatusSuspended,
 	}
-	svc := service.NewDMService(activeWorkspaceStore("ws-1"), &fakeDMStore{}, ms)
+	svc := service.NewDMService(&fakeDMStore{}, ms)
 	if _, err := svc.SearchDMCandidates(context.Background(), service.SearchDMCandidatesInput{
 		WorkspaceID: "ws-1", CallerID: user1, Query: "an",
 	}); !errors.Is(err, domain.ErrForbidden) {

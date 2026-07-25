@@ -76,6 +76,10 @@ interface DirectDMEnvelope {
   data: { conversation_id: string; created: boolean };
 }
 
+interface GroupDMEnvelope {
+  data: { conversation_id: string };
+}
+
 interface AllowedReactionEmojisEnvelope {
   data: { emojis: unknown };
 }
@@ -252,6 +256,34 @@ export async function getOrCreateDirectDM(
     conversationId: response.data.conversation_id,
     created: response.data.created,
   };
+}
+
+/**
+ * Creates an ad-hoc group DM (RF-02) and returns its conversation ID.
+ *
+ * Only the other participants are sent: the caller, the workspace and every
+ * membership field are derived from the session server-side, and the endpoint
+ * rejects them outright. The title is omitted — not sent as an empty string —
+ * when it is blank, so the server stores NULL and applies its own fallback name.
+ * De-duplication, participant eligibility and the count limits are enforced by
+ * chat-service; the shaping done here is for the request body, never a check.
+ */
+export async function createGroupDM(
+  participantUserIds: string[],
+  title: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const trimmedTitle = title.trim();
+  const response = await authenticatedFetch<GroupDMEnvelope>(`${CHAT_BASE}/dms/group`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      participant_user_ids: participantUserIds,
+      ...(trimmedTitle ? { title: trimmedTitle } : {}),
+    }),
+    signal,
+  });
+  return response.data.conversation_id;
 }
 
 export function fetchAllowedReactionEmojis(): Promise<string[]> {

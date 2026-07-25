@@ -7,6 +7,7 @@ const (
 	RouteSidebar               = "/api/chat/sidebar"
 	RouteDMCandidates          = "/api/chat/dm-candidates"
 	RouteDMConversations       = "/api/chat/dms"
+	RouteDMGroupConversations  = "/api/chat/dms/group"
 	RouteChannelMessages       = "/api/chat/channels/{channelID}/messages"
 	RouteChannelMessageForward = "/api/chat/channels/{channelID}/messages/forward"
 	RouteChannelMessage        = "/api/chat/channels/{channelID}/messages/{messageID}"

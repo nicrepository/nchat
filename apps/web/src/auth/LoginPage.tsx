@@ -1,5 +1,5 @@
 import { type FormEvent, useState } from "react";
-import { Link, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { Link, Navigate, useLocation, useNavigate } from "react-router";
 
 import { clearTokens, isAuthenticated, setTokens } from "../lib/authSession";
 import { safeFrom } from "../lib/safeRedirect";

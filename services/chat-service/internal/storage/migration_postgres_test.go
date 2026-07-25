@@ -367,6 +367,29 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			ON CONFLICT (workspace_id, user_id) DO UPDATE SET status = 'active'`, workspaceID, userA, userB); err != nil {
 			t.Fatalf("seed concurrent members: %v", err)
 		}
+		// DM membership requires an eligible account, not just a workspace
+		// membership row, so the participants must exist in auth.users. The table
+		// is shared with sibling fixtures in this package, which create it with
+		// varying column sets.
+		if _, err := conn.Exec(ctx, `
+			CREATE SCHEMA IF NOT EXISTS auth;
+			CREATE TABLE IF NOT EXISTS auth.users (
+				id UUID PRIMARY KEY,
+				email TEXT NOT NULL DEFAULT '',
+				display_name TEXT NOT NULL DEFAULT '',
+				status TEXT NOT NULL DEFAULT 'active',
+				deleted_at TIMESTAMPTZ
+			);
+			ALTER TABLE auth.users
+				ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active',
+				ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`); err != nil {
+			t.Fatalf("prepare auth schema: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO auth.users (id, email, display_name) VALUES ($1, 'a@example.test', 'A'), ($2, 'b@example.test', 'B')
+			ON CONFLICT (id) DO UPDATE SET status = 'active', deleted_at = NULL`, userA, userB); err != nil {
+			t.Fatalf("seed concurrent accounts: %v", err)
+		}
 		pool, err := pgxpool.New(ctx, dsn)
 		if err != nil {
 			t.Fatalf("open concurrent pool: %v", err)

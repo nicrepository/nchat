@@ -115,6 +115,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	if directMessages != nil {
 		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
 		mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))
+		mux.Handle("POST "+RouteDMGroupConversations, authMiddleware(http.HandlerFunc(directMessages.CreateGroup)))
 	}
 
 	// DM message endpoints: GET list, POST create, GET single.

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
@@ -11,16 +11,17 @@ import type { Channel, DMCandidate, DirectDMResult, DMConversation } from "./cha
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
-const { mockFetchSidebarData, mockSearchDMCandidates, mockGetOrCreateDirectDM } = vi.hoisted(
-  () => ({
+const { mockFetchSidebarData, mockSearchDMCandidates, mockGetOrCreateDirectDM, mockCreateGroupDM } =
+  vi.hoisted(() => ({
     mockFetchSidebarData:
       vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
     mockSearchDMCandidates:
       vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
     mockGetOrCreateDirectDM:
       vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
-  }),
-);
+    mockCreateGroupDM:
+      vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+  }));
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: () => mockFetchSidebarData(),
@@ -31,6 +32,8 @@ vi.mock("./chatApi", () => ({
     mockSearchDMCandidates(query, signal),
   getOrCreateDirectDM: (userId: string, signal?: AbortSignal) =>
     mockGetOrCreateDirectDM(userId, signal),
+  createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
+    mockCreateGroupDM(userIds, title, signal),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -722,6 +725,131 @@ describe("ChatSidebar — DMs", () => {
       ).toBeInTheDocument();
     });
     expect(screen.queryByText("Mensagem Direta")).not.toBeInTheDocument();
+  });
+});
+
+// ── Ad-hoc group creation (RF-02) ─────────────────────────────────────────────
+
+const GROUP_CANDIDATES: DMCandidate[] = [
+  { userId: "juliane", displayName: "Juliane Lino" },
+  { userId: "caio", displayName: "Caio Almeida" },
+];
+
+const GROUP_DM: DMConversation = {
+  id: "dm-group-new",
+  type: "group",
+  name: "Equipe Infra",
+  participants: [],
+};
+
+async function openGroupModeAndSelectBoth(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: "Nova mensagem direta" }));
+  await user.click(screen.getByRole("radio", { name: "Grupo" }));
+  await user.type(screen.getByRole("searchbox"), "eq");
+  await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
+  await user.click(screen.getByRole("button", { name: "Caio Almeida" }));
+}
+
+describe("ChatSidebar — ad-hoc group creation", () => {
+  it("creates a named group, opens it and lists it from the canonical sidebar source", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData
+      .mockResolvedValueOnce({ currentUserId: "current-user", channels: [], dms: [] })
+      .mockResolvedValue({ currentUserId: "current-user", channels: [], dms: [GROUP_DM] });
+    mockSearchDMCandidates.mockResolvedValue(GROUP_CANDIDATES);
+    mockCreateGroupDM.mockResolvedValue("dm-group-new");
+    renderChat();
+
+    await openGroupModeAndSelectBoth(user);
+    await user.type(screen.getByLabelText("Nome do grupo (opcional)"), "  Equipe Infra  ");
+    await user.click(screen.getByRole("button", { name: "Criar grupo" }));
+
+    await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
+    // Exactly the contract: the other participants and the raw title. Workspace
+    // and actor are never sent from the browser.
+    expect(mockCreateGroupDM).toHaveBeenCalledTimes(1);
+    expect(mockCreateGroupDM).toHaveBeenCalledWith(
+      ["juliane", "caio"],
+      "  Equipe Infra  ",
+      expect.any(AbortSignal),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    // The sidebar is refetched, not patched by hand.
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByRole("option", { name: "Grupo Equipe Infra" })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Nova mensagem direta" })).toHaveFocus();
+  });
+
+  it("does not duplicate a group the refreshed sidebar already contained", async () => {
+    const user = userEvent.setup();
+    // Same conversation present before and after creation — the equivalent of an
+    // out-of-band update racing the HTTP response.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: [],
+      dms: [GROUP_DM],
+    });
+    mockSearchDMCandidates.mockResolvedValue(GROUP_CANDIDATES);
+    mockCreateGroupDM.mockResolvedValue("dm-group-new");
+    renderChat();
+
+    await openGroupModeAndSelectBoth(user);
+    await user.click(screen.getByRole("button", { name: "Criar grupo" }));
+
+    await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
+    expect(screen.getAllByRole("option", { name: "Grupo Equipe Infra" })).toHaveLength(1);
+  });
+
+  it("creates a group without a name and shows the server-side fallback label", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData
+      .mockResolvedValueOnce({ currentUserId: "current-user", channels: [], dms: [] })
+      .mockResolvedValue({
+        currentUserId: "current-user",
+        channels: [],
+        dms: [{ ...GROUP_DM, name: "Grupo DM" }],
+      });
+    mockSearchDMCandidates.mockResolvedValue(GROUP_CANDIDATES);
+    mockCreateGroupDM.mockResolvedValue("dm-group-new");
+    renderChat();
+
+    await openGroupModeAndSelectBoth(user);
+    await user.click(screen.getByRole("button", { name: "Criar grupo" }));
+
+    await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
+    expect(mockCreateGroupDM).toHaveBeenCalledWith(
+      ["juliane", "caio"],
+      "",
+      expect.any(AbortSignal),
+    );
+    expect(await screen.findByRole("option", { name: "Grupo Grupo DM" })).toBeInTheDocument();
+  });
+
+  it("keeps the modal, the selection and the retry after a failed creation", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: [],
+      dms: [],
+    });
+    mockSearchDMCandidates.mockResolvedValue(GROUP_CANDIDATES);
+    mockCreateGroupDM
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce("dm-group-new");
+    renderChat();
+
+    await openGroupModeAndSelectBoth(user);
+    await user.click(screen.getByRole("button", { name: "Criar grupo" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Não foi possível criar o grupo");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Pessoas selecionadas" })).toHaveTextContent(
+      "Juliane Lino",
+    );
+    expect(screen.queryByTestId("chat-dm")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Criar grupo" }));
+    await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
   });
 });
 

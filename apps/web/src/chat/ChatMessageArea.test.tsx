@@ -7,7 +7,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router-dom";
+import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 
 import type { ChatOutletContext } from "./ChatShell";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

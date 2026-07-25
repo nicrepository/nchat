@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";

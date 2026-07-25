@@ -20,14 +20,18 @@ const (
 )
 
 type fakeDMProvider struct {
-	candidates      []domain.DMCandidate
-	searchErr       error
-	createOutput    service.CreateDirectConversationOutput
-	createErr       error
-	lastSearchInput service.SearchDMCandidatesInput
-	lastCreateInput service.CreateDirectConversationInput
-	searchCalls     int
-	createCalls     int
+	candidates       []domain.DMCandidate
+	searchErr        error
+	createOutput     service.CreateDirectConversationOutput
+	createErr        error
+	groupOutput      domain.DMConversation
+	groupErr         error
+	lastSearchInput  service.SearchDMCandidatesInput
+	lastCreateInput  service.CreateDirectConversationInput
+	lastGroupInput   service.CreateGroupConversationInput
+	searchCalls      int
+	createCalls      int
+	groupCreateCalls int
 }
 
 type fakeDMRateLimiter struct {
@@ -60,6 +64,12 @@ func (f *fakeDMProvider) GetOrCreateDirectConversation(_ context.Context, input 
 	f.createCalls++
 	f.lastCreateInput = input
 	return f.createOutput, f.createErr
+}
+
+func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error) {
+	f.groupCreateCalls++
+	f.lastGroupInput = input
+	return f.groupOutput, f.groupErr
 }
 
 func dmTestHandler(provider *fakeDMProvider) *httpapi.DMHandler {
@@ -325,5 +335,180 @@ func TestDMHandler_NilDependenciesReturn503(t *testing.T) {
 	httpapi.NewDMHandler(nil, nil, nil).SearchCandidates(recorder, requestWithUser(http.MethodGet, httpapi.RouteDMCandidates+"?query=an", nil))
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+}
+
+// ── Ad-hoc group DM creation (RF-02) ──────────────────────────────────────────
+
+const dmSecondUserID = "88888888-8888-8888-8888-888888888888"
+
+func groupRequest(body string) *http.Request {
+	request := requestWithUser(http.MethodPost, httpapi.RouteDMGroupConversations, strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	return request
+}
+
+func TestDMHandler_CreateGroup_RequiresAuthenticationAndJSONContentType(t *testing.T) {
+	handler := dmTestHandler(&fakeDMProvider{})
+	body := `{"participant_user_ids":["` + dmOtherUserID + `","` + dmSecondUserID + `"]}`
+
+	recorder := httptest.NewRecorder()
+	handler.CreateGroup(recorder, httptest.NewRequest(http.MethodPost, httpapi.RouteDMGroupConversations, strings.NewReader(body)))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.CreateGroup(recorder, requestWithUser(http.MethodPost, httpapi.RouteDMGroupConversations, strings.NewReader(body)))
+	if recorder.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("content-type status = %d", recorder.Code)
+	}
+}
+
+// Anything beyond participant_user_ids and title must be refused: accepting a
+// client-supplied workspace, caller or membership field would move authorization
+// into the browser.
+func TestDMHandler_CreateGroup_RejectsMalformedAndInjectedFields(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "malformed", body: `{`},
+		{name: "workspace injection", body: `{"participant_user_ids":["` + dmOtherUserID + `"],"workspace_id":"` + testWorkspaceID + `"}`},
+		{name: "caller injection", body: `{"participant_user_ids":["` + dmOtherUserID + `"],"caller_id":"` + dmOtherUserID + `"}`},
+		{name: "created_by injection", body: `{"participant_user_ids":["` + dmOtherUserID + `"],"created_by":"` + dmOtherUserID + `"}`},
+		{name: "role injection", body: `{"participant_user_ids":["` + dmOtherUserID + `"],"role":"owner"}`},
+		{name: "trailing json", body: `{"participant_user_ids":[]}{}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeDMProvider{}
+			recorder := httptest.NewRecorder()
+			dmTestHandler(provider).CreateGroup(recorder, groupRequest(test.body))
+			if recorder.Code != http.StatusBadRequest || provider.groupCreateCalls != 0 {
+				t.Fatalf("status=%d calls=%d body=%s", recorder.Code, provider.groupCreateCalls, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestDMHandler_CreateGroup_ForwardsServerIdentityAndReturnsOnlyConversationID(t *testing.T) {
+	provider := &fakeDMProvider{groupOutput: domain.DMConversation{
+		ID: dmConversationID, WorkspaceID: testWorkspaceID, CreatedBy: msgTestUserID, Title: "Infra",
+	}}
+	recorder := httptest.NewRecorder()
+	dmTestHandler(provider).CreateGroup(recorder, groupRequest(
+		`{"participant_user_ids":["`+dmOtherUserID+`","`+dmSecondUserID+`"],"title":"Infra"}`,
+	))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	input := provider.lastGroupInput
+	if input.WorkspaceID != testWorkspaceID || input.CallerID != msgTestUserID || input.Title != "Infra" {
+		t.Fatalf("unexpected input: %+v", input)
+	}
+	if len(input.ParticipantUserIDs) != 2 || input.ParticipantUserIDs[0] != dmOtherUserID || input.ParticipantUserIDs[1] != dmSecondUserID {
+		t.Fatalf("unexpected participants: %+v", input.ParticipantUserIDs)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"conversation_id":"`+dmConversationID+`"`) {
+		t.Fatalf("missing conversation id: %s", body)
+	}
+	for _, forbidden := range []string{"workspace_id", "created_by", "participant", "email", "title"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("response exposes %q: %s", forbidden, body)
+		}
+	}
+}
+
+// The title is optional at the transport layer; the service owns trimming and
+// the length limit, so an absent field must reach it as an empty string.
+func TestDMHandler_CreateGroup_AcceptsAbsentTitle(t *testing.T) {
+	provider := &fakeDMProvider{groupOutput: domain.DMConversation{ID: dmConversationID}}
+	recorder := httptest.NewRecorder()
+	dmTestHandler(provider).CreateGroup(recorder, groupRequest(
+		`{"participant_user_ids":["`+dmOtherUserID+`","`+dmSecondUserID+`"]}`,
+	))
+	if recorder.Code != http.StatusCreated || provider.lastGroupInput.Title != "" {
+		t.Fatalf("status=%d title=%q", recorder.Code, provider.lastGroupInput.Title)
+	}
+}
+
+func TestDMHandler_CreateGroup_MapsValidationAuthorizationAndInternalErrors(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "too few participants", err: domain.ErrInvalidInput, wantStatus: http.StatusBadRequest},
+		{name: "ineligible participant", err: domain.ErrForbidden, wantStatus: http.StatusNotFound},
+		{name: "hidden participant", err: domain.ErrNotFound, wantStatus: http.StatusNotFound},
+		{name: "internal", err: errors.New("postgres constraint detail"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			dmTestHandler(&fakeDMProvider{groupErr: test.err}).CreateGroup(recorder, groupRequest(
+				`{"participant_user_ids":["`+dmOtherUserID+`","`+dmSecondUserID+`"]}`,
+			))
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d", recorder.Code, test.wantStatus)
+			}
+			if strings.Contains(recorder.Body.String(), "constraint detail") {
+				t.Fatalf("internal detail leaked: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+// An ineligible participant — suspended, deleted, unknown or from another
+// workspace — must produce one indistinguishable answer that says nothing about
+// the account or about which participant was rejected.
+func TestDMHandler_CreateGroup_IneligibleParticipantResponseIsOpaque(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	dmTestHandler(&fakeDMProvider{groupErr: domain.ErrForbidden}).CreateGroup(recorder, groupRequest(
+		`{"participant_user_ids":["`+dmOtherUserID+`","`+dmSecondUserID+`"]}`,
+	))
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, forbidden := range []string{
+		"status", "deleted_at", "suspended", "inactive", "workspace_id", "email",
+		dmOtherUserID, dmSecondUserID, msgTestUserID, testWorkspaceID,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("response leaks %q: %s", forbidden, body)
+		}
+	}
+}
+
+// A burst of group creations must be stopped by its own budget, and stopping it
+// must not consume the direct-DM budget.
+func TestDMHandler_CreateGroup_RateLimitIsIndependentFromDirectCreate(t *testing.T) {
+	limiter := &fakeDMRateLimiter{}
+	provider := &fakeDMProvider{groupOutput: domain.DMConversation{ID: dmConversationID}}
+	handler := dmTestHandlerWithLimiter(provider, limiter)
+	body := `{"participant_user_ids":["` + dmOtherUserID + `","` + dmSecondUserID + `"]}`
+
+	for range 5 {
+		recorder := httptest.NewRecorder()
+		handler.CreateGroup(recorder, groupRequest(body))
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("within budget status=%d", recorder.Code)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	handler.CreateGroup(recorder, groupRequest(body))
+	if recorder.Code != http.StatusTooManyRequests || provider.groupCreateCalls != 5 || recorder.Header().Get("Retry-After") != "60" {
+		t.Fatalf("over budget status=%d calls=%d retry=%q", recorder.Code, provider.groupCreateCalls, recorder.Header().Get("Retry-After"))
+	}
+
+	directRequest := requestWithUser(http.MethodPost, httpapi.RouteDMConversations, strings.NewReader(`{"other_user_id":"`+dmOtherUserID+`"}`))
+	directRequest.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	handler.GetOrCreateDirect(recorder, directRequest)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("direct create status=%d after group budget exhaustion", recorder.Code)
 	}
 }
