@@ -71,10 +71,8 @@ func (s *PGXDMStore) CreateDirectConversation(ctx context.Context, input CreateD
 	if err != nil {
 		return CreateDirectConversationResult{}, err
 	}
-	for _, userID := range input.ParticipantUserIDs {
-		if err := upsertDMMember(ctx, tx, result.Conversation.ID, input.WorkspaceID, userID); err != nil {
-			return CreateDirectConversationResult{}, err
-		}
+	if err := upsertEligibleDMMembers(ctx, tx, result.Conversation.ID, input.WorkspaceID, input.ParticipantUserIDs); err != nil {
+		return CreateDirectConversationResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return CreateDirectConversationResult{}, fmt.Errorf("commit create direct conversation: %w", err)
@@ -142,10 +140,8 @@ func (s *PGXDMStore) CreateGroupConversation(ctx context.Context, input CreateGr
 	if err != nil {
 		return domain.DMConversation{}, err
 	}
-	for _, userID := range input.ParticipantUserIDs {
-		if err := upsertDMMember(ctx, tx, conversation.ID, input.WorkspaceID, userID); err != nil {
-			return domain.DMConversation{}, err
-		}
+	if err := upsertEligibleDMMembers(ctx, tx, conversation.ID, input.WorkspaceID, input.ParticipantUserIDs); err != nil {
+		return domain.DMConversation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.DMConversation{}, fmt.Errorf("commit create group conversation: %w", err)
@@ -184,28 +180,50 @@ type dmQuerier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-func upsertDMMember(ctx context.Context, q dmQuerier, conversationID, workspaceID, userID string) error {
+// upsertEligibleDMMembers adds every user in userIDs to conversationID, or none.
+//
+// This is the transactional backstop for DM participation, shared by the 1:1 and
+// the ad-hoc group flows so both obey exactly one rule. The service layer checks
+// eligibility before calling, but that check and the write are separate steps: an
+// account suspended or deleted in between would otherwise still receive
+// membership. Here the eligibility test and the insert are the same statement, so
+// there is no window to interleave — a user who stopped being eligible simply
+// produces no row.
+//
+// Eligibility mirrors MemberStore.GetEligibleDMMember: active workspace, active
+// workspace membership, conversation in that same workspace, and an active,
+// non-deleted auth.users row. Callers must pass de-duplicated IDs (both flows
+// canonicalise and de-duplicate upstream); a repeated ID would make Postgres
+// reject the whole statement rather than write a partial result.
+//
+// Fewer inserted rows than requested means at least one participant was not
+// eligible. The generic domain.ErrForbidden is returned without naming them —
+// the caller must not be able to probe account state — and the surrounding
+// transaction is rolled back, leaving neither an orphan conversation nor a
+// partial membership list.
+func upsertEligibleDMMembers(ctx context.Context, q dmQuerier, conversationID, workspaceID string, userIDs []string) error {
 	tag, err := q.Exec(ctx, `
 		INSERT INTO chat.dm_members (conversation_id, user_id, role, status, left_at)
 		SELECT $1, wm.user_id, 'member', 'active', NULL
-		FROM chat.workspace_members wm
+		FROM unnest($3::uuid[]) AS candidate(user_id)
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = $2 AND wm.user_id = candidate.user_id AND wm.status = 'active'
 		JOIN chat.workspaces w
 		  ON w.id = wm.workspace_id AND w.status = 'active'
 		JOIN chat.dm_conversations dc
 		  ON dc.id = $1 AND dc.workspace_id = wm.workspace_id
-		WHERE wm.workspace_id = $2
-		  AND wm.user_id = $3
-		  AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
 		ON CONFLICT (conversation_id, user_id)
 		DO UPDATE SET role = 'member',
 		              status = 'active',
 		              left_at = NULL`,
-		conversationID, workspaceID, userID,
+		conversationID, workspaceID, userIDs,
 	)
 	if err != nil {
-		return fmt.Errorf("upsert dm member: %w", err)
+		return fmt.Errorf("upsert dm members: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if tag.RowsAffected() != int64(len(userIDs)) {
 		return domain.ErrForbidden
 	}
 	return nil

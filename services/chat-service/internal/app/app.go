@@ -142,7 +142,7 @@ func New(cfg config.Config) (*App, error) {
 			channelStore = storage.NewPGXChannelStore(pool)
 			memberStore = storage.NewPGXMemberStore(pool)
 			dmStore = storage.NewPGXDMStore(pool)
-			dmSvc = service.NewDMService(workspaceStore, dmStore, memberStore)
+			dmSvc = service.NewDMService(dmStore, memberStore)
 			messages := storage.NewPGXMessageStore(pool)
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))

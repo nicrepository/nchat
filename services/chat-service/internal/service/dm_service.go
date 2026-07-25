@@ -14,7 +14,11 @@ import (
 )
 
 const (
-	minGroupDMParticipants  = 3
+	minGroupDMParticipants = 3
+	// maxGroupDMParticipants bounds the participant list, caller included. Without it
+	// a single request could fan out into an unbounded number of membership rows and
+	// per-participant eligibility look-ups.
+	maxGroupDMParticipants  = 50
 	maxDMTitleRunes         = 120
 	minDMCandidateQuery     = 2
 	maxDMCandidateQuery     = 64
@@ -57,14 +61,18 @@ type GetDMConversationInput struct {
 }
 
 // DMService handles direct and ad-hoc group DM use cases.
+//
+// It deliberately holds no WorkspaceStore: every DM decision goes through
+// MemberStore.GetEligibleDMMember, whose query already requires the workspace to
+// be active, so a separate workspace read would be a second source of truth for
+// the same rule.
 type DMService struct {
-	workspaces storage.WorkspaceStore
-	dms        storage.DMStore
-	members    storage.MemberStore
+	dms     storage.DMStore
+	members storage.MemberStore
 }
 
-func NewDMService(workspaces storage.WorkspaceStore, dms storage.DMStore, members storage.MemberStore) *DMService {
-	return &DMService{workspaces: workspaces, dms: dms, members: members}
+func NewDMService(dms storage.DMStore, members storage.MemberStore) *DMService {
+	return &DMService{dms: dms, members: members}
 }
 
 // CreateDirectConversation creates or returns the canonical 1:1 DM for caller and other user.
@@ -178,9 +186,15 @@ func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGro
 		return domain.DMConversation{}, err
 	}
 
+	// Every participant, the caller included, goes through the same eligibility
+	// rule as a 1:1 DM: active workspace, active membership, and an active,
+	// non-deleted account. A workspace membership alone is not enough — it
+	// outlives a suspended or deleted account. The failure is the undifferentiated
+	// ErrForbidden, so an ineligible, unknown and foreign-workspace participant
+	// are indistinguishable to the caller.
 	canonicalParticipants := make([]string, 0, len(participantUserIDs))
 	for _, uid := range participantUserIDs {
-		m, err := s.requireActiveWorkspaceMember(ctx, workspaceID, uid)
+		m, err := s.requireEligibleDMMember(ctx, workspaceID, uid)
 		if err != nil {
 			return domain.DMConversation{}, err
 		}
@@ -224,32 +238,12 @@ func (s *DMService) GetConversation(ctx context.Context, input GetDMConversation
 	return conversation, nil
 }
 
-func (s *DMService) requireActiveWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
-	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.WorkspaceMember{}, domain.ErrForbidden
-		}
-		return domain.WorkspaceMember{}, fmt.Errorf("get workspace: %w", err)
-	}
-	if workspace.Status != domain.WorkspaceStatusActive {
-		return domain.WorkspaceMember{}, domain.ErrForbidden
-	}
-
-	member, err := s.members.GetWorkspaceMember(ctx, workspaceID, userID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.WorkspaceMember{}, domain.ErrForbidden
-		}
-		return domain.WorkspaceMember{}, fmt.Errorf("get workspace member: %w", err)
-	}
-	if member.WorkspaceID != workspaceID || member.Status != domain.MemberStatusActive {
-		return domain.WorkspaceMember{}, domain.ErrForbidden
-	}
-	return member, nil
-}
-
 func normalizeGroupDMParticipants(callerID string, invited []string) ([]string, error) {
+	// Checked on the raw list, before any per-ID work, so an oversized payload is
+	// rejected without parsing every entry first.
+	if len(invited)+1 > maxGroupDMParticipants {
+		return nil, fmt.Errorf("%w: group DMs allow at most %d participants", domain.ErrInvalidInput, maxGroupDMParticipants)
+	}
 	participants := map[string]struct{}{callerID: {}}
 	for _, rawID := range invited {
 		rawID = strings.TrimSpace(rawID)
