@@ -91,7 +91,7 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  margin: 0 6px 14px;
+  margin: 0 6px 8px;
   transition: background 0.15s;
   cursor: pointer;
 }
@@ -103,6 +103,26 @@
 .chat-sidebar__cta:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+/* The default UA outline is barely visible on the dark sidebar, so the focus
+   ring is stated explicitly. */
+.chat-sidebar__cta:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+/* Starting a conversation is a peer action to creating a channel, not a
+   competing primary one — same shape, quieter fill. */
+.chat-sidebar__cta--conversation {
+  background: transparent;
+  color: var(--cs-sidebar-text);
+  border: 1px solid var(--cs-sidebar-divider);
+  margin-bottom: 14px;
+}
+
+.chat-sidebar__cta--conversation:hover:not(:disabled) {
+  background: var(--cs-sidebar-hover);
 }
 
 /* ── Nav scrollable container ────────────────────────────────────────────────── */

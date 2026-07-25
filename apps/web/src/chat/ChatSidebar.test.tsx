@@ -676,6 +676,70 @@ describe("ChatSidebar — DMs", () => {
     });
   });
 
+  // ── New-conversation trigger (ISSUE #387) ──
+  // The action must read as "start a conversation" without the user having to
+  // infer it from a bare "+", and must be distinct from channel creation.
+
+  it("names the new-conversation trigger by its visible text", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
+    renderChat();
+
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    expect(trigger).toHaveTextContent("Nova conversa");
+    expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
+    // Channel creation keeps its own, separate control.
+    expect(screen.getByRole("button", { name: "Novo canal" })).not.toBe(trigger);
+    expect(screen.queryByRole("button", { name: "Nova mensagem direta" })).not.toBeInTheDocument();
+  });
+
+  it("opens the dialog from the keyboard and keeps both conversation modes", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: SAMPLE_CHANNELS,
+      dms: [],
+    });
+    renderChat();
+
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    trigger.focus();
+    expect(trigger).toHaveFocus();
+    await user.keyboard("{Enter}");
+
+    expect(screen.getByRole("dialog", { name: "Nova mensagem" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Pessoa" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Grupo" })).toBeInTheDocument();
+  });
+
+  it("keeps the new-conversation trigger visible but disabled until the sidebar is ready", async () => {
+    let resolveSidebar!: (value: {
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+    }) => void;
+    mockFetchSidebarData.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSidebar = resolve;
+      }),
+    );
+    renderChat();
+
+    // The action stays discoverable and keeps its accessible name while
+    // loading — it is only unavailable, never hidden.
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    expect(trigger).toBeInTheDocument();
+    expect(trigger).toBeDisabled();
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    resolveSidebar({ currentUserId: "current-user", channels: SAMPLE_CHANNELS, dms: [] });
+    await waitFor(() => expect(trigger).toBeEnabled());
+  });
+
   it("opens and closes the new-message dialog, restoring focus to its trigger", async () => {
     const user = userEvent.setup();
     mockFetchSidebarData.mockResolvedValue({
@@ -685,7 +749,7 @@ describe("ChatSidebar — DMs", () => {
     });
     renderChat();
 
-    const trigger = await screen.findByRole("button", { name: "Nova mensagem direta" });
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
     await user.click(trigger);
     expect(screen.getByRole("dialog", { name: "Nova mensagem" })).toBeInTheDocument();
     expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toBeInTheDocument();
@@ -709,7 +773,7 @@ describe("ChatSidebar — DMs", () => {
     });
     renderChat();
 
-    await user.click(await screen.findByRole("button", { name: "Nova mensagem direta" }));
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
     await user.type(screen.getByRole("searchbox"), "ju");
     await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
 
@@ -721,7 +785,7 @@ describe("ChatSidebar — DMs", () => {
       screen.getAllByRole("option", { name: /mensagem direta com juliane lino/i }),
     ).toHaveLength(1);
 
-    const trigger = screen.getByRole("button", { name: "Nova mensagem direta" });
+    const trigger = screen.getByRole("button", { name: "Nova conversa" });
     expect(trigger).toHaveFocus();
     await user.click(trigger);
     expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toHaveValue("");
@@ -740,7 +804,7 @@ describe("ChatSidebar — DMs", () => {
     mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
     renderChat();
 
-    await user.click(await screen.findByRole("button", { name: "Nova mensagem direta" }));
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
     await user.type(screen.getByRole("searchbox"), "ju");
     await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
 
@@ -768,7 +832,7 @@ const GROUP_DM: DMConversation = {
 };
 
 async function openGroupModeAndSelectBoth(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByRole("button", { name: "Nova mensagem direta" }));
+  await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
   await user.click(screen.getByRole("radio", { name: "Grupo" }));
   await user.type(screen.getByRole("searchbox"), "eq");
   await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
@@ -802,7 +866,7 @@ describe("ChatSidebar — ad-hoc group creation", () => {
     // The sidebar is refetched, not patched by hand.
     expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
     expect(screen.getAllByRole("option", { name: "Grupo Equipe Infra" })).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "Nova mensagem direta" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Nova conversa" })).toHaveFocus();
   });
 
   it("does not duplicate a group the refreshed sidebar already contained", async () => {
