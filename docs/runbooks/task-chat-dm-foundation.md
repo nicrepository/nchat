@@ -39,18 +39,35 @@ or exposed through future API responses.
 
 ## Group DM semantics
 
-| Situation                                      | Outcome                    |
-| ---------------------------------------------- | -------------------------- |
-| Caller + at least two other active members     | Group DM created           |
-| Caller omitted from participant list           | Caller added automatically |
-| Duplicate invited participant IDs              | De-duplicated              |
-| Fewer than three unique participants total     | `ErrInvalidInput`          |
-| Missing/suspended/left/cross-workspace member  | `ErrForbidden`             |
-| Title present and <= 120 characters after trim | Stored                     |
-| Title empty after trim                         | Stored as NULL             |
+| Situation                                         | Outcome                    |
+| ------------------------------------------------- | -------------------------- |
+| Caller + at least two other active members        | Group DM created           |
+| Caller omitted from participant list              | Caller added automatically |
+| Duplicate invited participant IDs                 | De-duplicated              |
+| Fewer than three unique participants total        | `ErrInvalidInput`          |
+| More than 50 participants total (caller included) | `ErrInvalidInput`          |
+| Missing/suspended/left/cross-workspace member     | `ErrForbidden`             |
+| Participant whose account is disabled or deleted  | `ErrForbidden`             |
+| Title present and <= 120 characters after trim    | Stored                     |
+| Title empty after trim                            | Stored as NULL             |
 
 Callers cannot set `created_by`, membership role, conversation status, or member
 status. Group DM membership role is always `member`.
+
+Participant eligibility is the same rule the 1:1 flow uses
+(`MemberStore.GetEligibleDMMember`): active workspace, active workspace
+membership, and an `auth.users` row that is `status = 'active'` with
+`deleted_at IS NULL`. A workspace membership row outlives the account it points
+at, so checking membership alone would let a disabled or deleted user be pulled
+into a new conversation.
+
+The service check is not the only guard. `chat.dm_members` is written by a single
+`INSERT ... SELECT` that re-tests the same eligibility inside the creating
+transaction and requires the number of inserted rows to equal the number of
+requested participants. An account that stops being eligible between the service
+check and the write therefore produces no row, the mismatch aborts the
+transaction, and neither an orphan conversation nor a partial membership list
+survives. The same statement backs the 1:1 flow, so both obey one rule.
 
 ## Visibility and non-enumeration
 
@@ -81,12 +98,25 @@ concurrent requests for the same pair return the same ID; an ineligible target i
 reported as `404` without distinguishing missing, inactive, or cross-workspace
 users.
 
-Both routes require a valid Bearer access token and active session. Their
+`POST /api/chat/dms/group` accepts `application/json` with the strict body
+`{"participant_user_ids":["<uuid>", ...],"title":"<optional>"}` and returns
+`201` with `{"data":{"conversation_id":"<uuid>"}}`. The caller is added
+server-side and must not appear in the list (a duplicate is de-duplicated, not
+rejected). `title` may be omitted; blank titles are stored as NULL and the
+sidebar then computes the `Grupo DM` fallback name. An ineligible or unknown
+participant is reported as `404` without distinguishing missing, inactive, or
+cross-workspace users; an invalid list size, a non-UUID ID, or an over-long
+title is `400`. The participant cap is 50 including the caller and is checked
+before any membership look-up, so an oversized payload costs one comparison.
+Conversation and membership rows are written in a single transaction.
+
+All three routes require a valid Bearer access token and active session. Their
 per-user fixed-window limits are stored atomically in Valkey and shared across
-replicas: 30 searches and 10 get-or-create calls per 60 seconds, in independent
-namespaces. Valkey failure is fail-closed with `503`. Client-provided
-caller/workspace identities, participant lists, roles, and membership fields
-are not accepted.
+replicas: 30 searches, 10 get-or-create calls, and 5 group creations per 60
+seconds, in independent namespaces — exhausting the group budget does not
+consume the direct one. Valkey failure is fail-closed with `503`.
+Client-provided caller/workspace identities, roles, and membership fields are
+not accepted, and unknown JSON fields are rejected outright.
 
 ## Out of scope
 
