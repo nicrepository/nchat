@@ -12,6 +12,7 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import {
+  createGroupDM,
   deleteMessage,
   editMessage,
   favoriteMessage,
@@ -369,7 +370,11 @@ describe("fetchDMs", () => {
   // jsdom serves these tests from http://localhost:3000, so that is the origin
   // the same-origin policy is measured against.
   it("rejects every avatar URL that is not same-origin, keeping the rest of the identity", async () => {
-    const hostile = [
+    const hostile: unknown[] = [
+      42, // not a string at all
+      null,
+      "http://", // parses to an error, not to a URL
+      "http://user:pass@localhost:3000/a.png", // credentials on the page's own origin
       "javascript:alert(1)",
       "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
       "vbscript:msgbox(1)",
@@ -678,6 +683,49 @@ describe("direct DM contracts", () => {
       body: JSON.stringify({ other_user_id: "user-2" }),
       signal: controller.signal,
     });
+  });
+
+  it("creates a group with a trimmed title and never sends session-derived fields", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+    const controller = new AbortController();
+
+    await expect(createGroupDM(["user-2", "user-3"], "  Infra  ", controller.signal)).resolves.toBe(
+      "dm-group",
+    );
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dms/group", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ participant_user_ids: ["user-2", "user-3"], title: "Infra" }),
+      signal: controller.signal,
+    });
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    for (const forbidden of ["workspace_id", "caller_id", "actor_id", "created_by", "role"]) {
+      expect(init.body).not.toContain(forbidden);
+    }
+  });
+
+  it("omits the title entirely when it is blank so the server applies its own name", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+
+    for (const blank of ["", "   "]) {
+      mockAuthFetch.mockClear();
+      await createGroupDM(["user-2", "user-3"], blank);
+      const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+      expect(init.body).toBe(JSON.stringify({ participant_user_ids: ["user-2", "user-3"] }));
+    }
+  });
+
+  it("trims an emoji title without breaking a surrogate pair on the wire", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+    const emojiTitle = Array.from({ length: 120 }, () => "🙂").join("");
+
+    await createGroupDM(["user-2", "user-3"], `  ${emojiTitle}  `);
+
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    const sent = JSON.parse(init.body) as { title: string };
+    expect(sent.title).toBe(emojiTitle);
+    // The server measures runes: 120 code points must survive serialisation.
+    expect(Array.from(sent.title)).toHaveLength(120);
   });
 });
 
@@ -1401,6 +1449,18 @@ describe("fetchMentionCandidates", () => {
     const candidates = await fetchMentionCandidates("channel-1", "an");
 
     expect(candidates).toEqual([]);
+  });
+
+  it("fails safe to an empty list when a candidate is not an object", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { users: ["ana", null], channels: [] } });
+
+    expect(await fetchMentionCandidates("channel-1", "an")).toEqual([]);
+  });
+
+  it("fails safe to an empty list when the envelope itself is not an object", async () => {
+    mockAuthFetch.mockResolvedValue(null);
+
+    expect(await fetchMentionCandidates("channel-1", "an")).toEqual([]);
   });
 
   it("fails safe to an empty list when data is missing entirely", async () => {
