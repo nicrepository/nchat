@@ -491,6 +491,24 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         </p>
       )}
 
+      {/* ── New conversation CTA ──
+          Distinct control from "Novo canal": this one starts a DM or an ad-hoc
+          group, and the dialog behind it is where Pessoa/Grupo is chosen. The
+          accessible name is the visible text, so it does not depend on a
+          tooltip. Unavailable until the sidebar is ready because the dialog
+          needs the current user id to exclude the actor from the search. */}
+      <button
+        ref={newDMButtonRef}
+        type="button"
+        className="chat-sidebar__cta chat-sidebar__cta--conversation"
+        aria-haspopup="dialog"
+        disabled={state.status !== "ready"}
+        onClick={() => setNewDMOpen(true)}
+      >
+        <IconAdd />
+        Nova conversa
+      </button>
+
       {/* ── Nav ── */}
       <div className="chat-sidebar__nav" role="listbox" aria-label="Canais e mensagens diretas">
         {state.status === "loading" && <LoadingSkeleton />}
@@ -524,16 +542,6 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
             {/* DMs section */}
             <div className="chat-sidebar__section-label chat-sidebar__section-label--mt">
               <span>Mensagens diretas</span>
-              <button
-                ref={newDMButtonRef}
-                type="button"
-                className="chat-sidebar__section-action"
-                aria-label="Nova mensagem direta"
-                aria-haspopup="dialog"
-                onClick={() => setNewDMOpen(true)}
-              >
-                <IconAdd />
-              </button>
             </div>
             <DMList dms={state.dms} activeDMId={activeDMId} onSelect={handleDMSelect} />
           </>
