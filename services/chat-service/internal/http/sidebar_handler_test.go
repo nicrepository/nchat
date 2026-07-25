@@ -37,7 +37,7 @@ func (s *stubSidebarProvider) GetSidebar(_ context.Context, _ string) (service.S
 // sidebarRouter builds a test router wired with the given validator and stub.
 // allowAllSessionValidator accepts all sessions so tests focus on sidebar logic.
 func sidebarRouter(v *httpapi.TokenValidator, svc *stubSidebarProvider) http.Handler {
-	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil)
+	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil)
 }
 
 // authGet returns an authenticated GET request to RouteSidebar.
@@ -53,7 +53,7 @@ func authGet(t *testing.T) *http.Request {
 
 func TestSidebarHandler_NilService_Returns503(t *testing.T) {
 	v := makeTestValidator(t)
-	router := httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil)
+	router := httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil)
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, authGet(t))
 	if rr.Code != http.StatusServiceUnavailable {
@@ -631,5 +631,39 @@ func mustDecode(t *testing.T, rr *httptest.ResponseRecorder, v any) {
 	t.Helper()
 	if err := json.NewDecoder(rr.Body).Decode(v); err != nil {
 		t.Fatalf("decode response: %v; body: %s", err, rr.Body.String())
+	}
+}
+
+// The sidebar is where the UI learns whether the create-channel action is worth
+// offering. The flag must come from the service verbatim — false by default, so
+// a payload from a server that does not send it never reads as permission.
+func TestSidebarHandler_ExposesCanCreateChannel(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data service.SidebarData
+		want bool
+	}{
+		{name: "manager", data: service.SidebarData{CanCreateChannel: true}, want: true},
+		{name: "plain member", data: service.SidebarData{}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			v := makeTestValidator(t)
+			rr := httptest.NewRecorder()
+			sidebarRouter(v, &stubSidebarProvider{data: test.data}).ServeHTTP(rr, authGet(t))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rr.Code)
+			}
+			var body struct {
+				Data struct {
+					CanCreateChannel bool `json:"can_create_channel"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if body.Data.CanCreateChannel != test.want {
+				t.Fatalf("can_create_channel = %v, want %v", body.Data.CanCreateChannel, test.want)
+			}
+		})
 	}
 }

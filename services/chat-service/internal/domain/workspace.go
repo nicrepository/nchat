@@ -208,3 +208,14 @@ func CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
 func CanWriteChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
 	return CanReadChannel(wm, cm, ch)
 }
+
+// CanManageWorkspace reports whether a user holds workspace management rights —
+// the single predicate behind channel creation, update and archival, and the one
+// the sidebar advertises so the UI never invents its own rule. A nil or inactive
+// membership is never sufficient.
+func CanManageWorkspace(wm *WorkspaceMember) bool {
+	if wm == nil || wm.Status != MemberStatusActive {
+		return false
+	}
+	return wm.Role == WorkspaceRoleOwner || wm.Role == WorkspaceRoleAdmin
+}

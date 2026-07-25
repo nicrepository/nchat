@@ -35,7 +35,7 @@ const mentionSearchRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
@@ -112,6 +112,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("GET "+RouteChannelMentions, authMiddleware(
 		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchMentions)),
 	))
+	// Channel creation (RF-01). Registered only when wired, exactly like the DM
+	// routes, so a build without the handler answers 404 rather than a misleading
+	// 503 on a route that does not exist.
+	if channels != nil {
+		mux.Handle("POST "+RouteChannels, authMiddleware(http.HandlerFunc(channels.Create)))
+	}
 	if directMessages != nil {
 		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
 		mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))

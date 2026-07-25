@@ -475,3 +475,37 @@ func (c *capturingChannelStore) UpdateChannel(_ context.Context, _ storage.Updat
 func (c *capturingChannelStore) ArchiveChannel(_ context.Context, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
+
+// CanCreateChannel must be the same predicate CreateChannel enforces, derived
+// from the caller's workspace role. A plain member sees false, so the UI can say
+// why the action is unavailable instead of leaving a dead button behind.
+func TestSidebarService_CanCreateChannelFollowsWorkspaceRole(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		role domain.WorkspaceRole
+		want bool
+	}{
+		{name: "owner", role: domain.WorkspaceRoleOwner, want: true},
+		{name: "admin", role: domain.WorkspaceRoleAdmin, want: true},
+		{name: "member", role: domain.WorkspaceRoleMember, want: false},
+		{name: "guest", role: domain.WorkspaceRoleGuest, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			member := activeMember()
+			member.Role = test.role
+			svc := newSidebarService(
+				&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+				&sidebarFakeMemberStore{member: member},
+				&sidebarFakeChannelStore{accesses: []storage.VisibleChannelAccess{}},
+				&sidebarFakeDMStore{dms: nil},
+			)
+			data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if data.CanCreateChannel != test.want {
+				t.Fatalf("CanCreateChannel = %v, want %v", data.CanCreateChannel, test.want)
+			}
+		})
+	}
+}

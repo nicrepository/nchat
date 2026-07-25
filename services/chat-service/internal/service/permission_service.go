@@ -79,6 +79,5 @@ func (s *PermissionService) CanManageWorkspace(ctx context.Context, workspaceID,
 	if err != nil {
 		return false, fmt.Errorf("get workspace manager: %w", err)
 	}
-	return member.Status == domain.MemberStatusActive &&
-		(member.Role == domain.WorkspaceRoleOwner || member.Role == domain.WorkspaceRoleAdmin), nil
+	return domain.CanManageWorkspace(&member), nil
 }

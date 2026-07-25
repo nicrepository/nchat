@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ApiRequestError } from "../lib/api";
 import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
@@ -11,17 +12,36 @@ import type { Channel, DMCandidate, DirectDMResult, DMConversation } from "./cha
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
-const { mockFetchSidebarData, mockSearchDMCandidates, mockGetOrCreateDirectDM, mockCreateGroupDM } =
-  vi.hoisted(() => ({
-    mockFetchSidebarData:
-      vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
-    mockSearchDMCandidates:
-      vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
-    mockGetOrCreateDirectDM:
-      vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
-    mockCreateGroupDM:
-      vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
-  }));
+const {
+  mockFetchSidebarData,
+  mockSearchDMCandidates,
+  mockGetOrCreateDirectDM,
+  mockCreateGroupDM,
+  mockCreateChannel,
+} = vi.hoisted(() => ({
+  // canCreateChannel is optional here so the tests that predate RF-01 keep
+  // their fixtures; omitting it is exactly the "no permission" case.
+  mockFetchSidebarData: vi.fn<
+    () => Promise<{
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+      canCreateChannel?: boolean;
+    }>
+  >(),
+  mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
+  mockGetOrCreateDirectDM:
+    vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
+  mockCreateGroupDM:
+    vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+  mockCreateChannel:
+    vi.fn<
+      (
+        input: { slug: string; displayName: string; type: "public" | "private" },
+        signal?: AbortSignal,
+      ) => Promise<Channel>
+    >(),
+}));
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: () => mockFetchSidebarData(),
@@ -34,6 +54,10 @@ vi.mock("./chatApi", () => ({
     mockGetOrCreateDirectDM(userId, signal),
   createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
     mockCreateGroupDM(userIds, title, signal),
+  createChannel: (
+    input: { slug: string; displayName: string; type: "public" | "private" },
+    signal?: AbortSignal,
+  ) => mockCreateChannel(input, signal),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -527,6 +551,7 @@ describe("ChatSidebar — DMs", () => {
     const readyState = (avatarUrl: string) => ({
       status: "ready" as const,
       currentUserId: "user-a",
+      canCreateChannel: false,
       channels: [] as Channel[],
       dms: [
         {
@@ -1144,5 +1169,116 @@ describe("chatApi — no runtime fixture import", () => {
     const src = readFileSync(resolve(__dirname, "ChatSidebar.tsx"), "utf-8");
     expect(src).not.toMatch(/from\s+["'].*chatFixtures/);
     expect(src).not.toMatch(/import\s*\(["'].*chatFixtures/);
+  });
+});
+
+// ── Channel creation (RF-01 / BUG #386) ──────────────────────────────────────
+
+describe("ChatSidebar — channel creation", () => {
+  const readySidebar = (canCreateChannel: boolean) => ({
+    currentUserId: "user-1",
+    channels: SAMPLE_CHANNELS,
+    dms: SAMPLE_DMS,
+    canCreateChannel,
+  });
+
+  const ctaButton = () => screen.getByRole("button", { name: "Novo canal" });
+
+  it("keeps the CTA unavailable while the sidebar is still loading", async () => {
+    let resolveSidebar!: (value: ReturnType<typeof readySidebar>) => void;
+    mockFetchSidebarData.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSidebar = resolve;
+      }),
+    );
+    renderChat();
+
+    expect(await screen.findByTestId("chat-sidebar")).toBeInTheDocument();
+    expect(ctaButton()).toBeDisabled();
+    // No verdict has arrived yet, so the UI must not claim the user lacks
+    // permission — it only withholds the action.
+    expect(screen.queryByText(/somente administradores/i)).not.toBeInTheDocument();
+
+    resolveSidebar(readySidebar(true));
+    await waitFor(() => expect(ctaButton()).toBeEnabled());
+  });
+
+  it("enables the CTA only when the server says the user may create channels", async () => {
+    mockFetchSidebarData.mockResolvedValue(readySidebar(true));
+    renderChat();
+
+    await waitFor(() => expect(ctaButton()).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Adicionar canal" })).toBeEnabled();
+    expect(screen.queryByText(/somente administradores/i)).not.toBeInTheDocument();
+  });
+
+  it("explains why the CTA is unavailable to a user without permission", async () => {
+    mockFetchSidebarData.mockResolvedValue(readySidebar(false));
+    renderChat();
+
+    await waitFor(() => expect(ctaButton()).toBeDisabled());
+    const reason = screen.getByText(/somente administradores do workspace podem criar canais/i);
+    expect(reason).toBeInTheDocument();
+    // The reason is tied to the control, not just placed near it.
+    expect(ctaButton()).toHaveAttribute("aria-describedby", reason.id);
+    expect(screen.getByRole("button", { name: "Adicionar canal" })).toBeDisabled();
+  });
+
+  it("does not open the dialog for a user without permission", async () => {
+    mockFetchSidebarData.mockResolvedValue(readySidebar(false));
+    renderChat();
+
+    await waitFor(() => expect(ctaButton()).toBeDisabled());
+    fireEvent.click(ctaButton());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mockCreateChannel).not.toHaveBeenCalled();
+  });
+
+  it("creates a channel, navigates to it and refetches the canonical sidebar", async () => {
+    const created: Channel = { id: "novo", name: "Novo", type: "public", canWrite: true };
+    mockFetchSidebarData.mockResolvedValue(readySidebar(true));
+    mockCreateChannel.mockResolvedValue(created);
+    renderChat();
+
+    await waitFor(() => expect(ctaButton()).toBeEnabled());
+    const loadsBefore = mockFetchSidebarData.mock.calls.length;
+
+    fireEvent.click(ctaButton());
+    const dialog = await screen.findByRole("dialog", { name: /novo canal/i });
+
+    fireEvent.change(screen.getByLabelText(/nome do canal/i), { target: { value: "Novo" } });
+    // The list the user ends up seeing comes from the refetch, never from the
+    // creation response, so the new channel is added to what the server returns.
+    mockFetchSidebarData.mockResolvedValue({
+      ...readySidebar(true),
+      channels: [...SAMPLE_CHANNELS, created],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Criar canal" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(dialog).not.toBeInTheDocument();
+    expect(mockCreateChannel).toHaveBeenCalledTimes(1);
+    expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(loadsBefore);
+    expect(await screen.findByTestId("chat-channel")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: /canal novo/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the dialog open and shows the denial when the API refuses the creation", async () => {
+    mockFetchSidebarData.mockResolvedValue(readySidebar(true));
+    mockCreateChannel.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    renderChat();
+
+    await waitFor(() => expect(ctaButton()).toBeEnabled());
+    fireEvent.click(ctaButton());
+    await screen.findByRole("dialog", { name: /novo canal/i });
+
+    fireEvent.change(screen.getByLabelText(/nome do canal/i), { target: { value: "Novo" } });
+    fireEvent.click(screen.getByRole("button", { name: "Criar canal" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/permissão/i);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-channel")).not.toBeInTheDocument();
   });
 });

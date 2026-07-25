@@ -4,6 +4,7 @@ import { Link, useLocation, useNavigate } from "react-router";
 import "./ChatSidebar.css";
 import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
+import NewChannelDialog from "./NewChannelDialog";
 import NewDirectMessageDialog from "./NewDirectMessageDialog";
 
 /**
@@ -356,7 +357,14 @@ function safeDecodeURIComponent(segment: string): string {
 type SidebarState =
   | { status: "loading" }
   | { status: "error"; error: string }
-  | { status: "ready"; currentUserId: string; channels: Channel[]; dms: DMConversation[] };
+  | {
+      status: "ready";
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+      /** Server-derived; POST /api/chat/channels re-checks it on every call. */
+      canCreateChannel: boolean;
+    };
 
 interface ChatSidebarProps {
   state: SidebarState;
@@ -369,6 +377,9 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const [newDMOpen, setNewDMOpen] = useState(false);
   const newDMButtonRef = useRef<HTMLButtonElement>(null);
   const restoreNewDMFocusRef = useRef(false);
+  const [newChannelOpen, setNewChannelOpen] = useState(false);
+  const newChannelButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreNewChannelFocusRef = useRef(false);
 
   useEffect(() => {
     if (!newDMOpen && state.status === "ready" && restoreNewDMFocusRef.current) {
@@ -376,6 +387,13 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
       restoreNewDMFocusRef.current = false;
     }
   }, [newDMOpen, state.status]);
+
+  useEffect(() => {
+    if (!newChannelOpen && state.status === "ready" && restoreNewChannelFocusRef.current) {
+      newChannelButtonRef.current?.focus();
+      restoreNewChannelFocusRef.current = false;
+    }
+  }, [newChannelOpen, state.status]);
 
   // Derive active item from pathname: /chat/channel/:id or /chat/dm/:id
   // decodeURIComponent handles IDs that were encoded with encodeURIComponent on navigate.
@@ -386,6 +404,15 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
   const activeChannelId = activeType === "channel" ? activeId : undefined;
   const activeDMId = activeType === "dm" ? activeId : undefined;
+
+  const canCreateChannel = state.status === "ready" && state.canCreateChannel;
+  // Empty while loading: a hint that flashes "you may not" before the answer
+  // arrives would be a lie, and the button is already unavailable meanwhile.
+  const createChannelBlockedReason =
+    state.status === "ready" && !state.canCreateChannel
+      ? "Somente administradores do workspace podem criar canais."
+      : "";
+  const newChannelReasonId = "chat-sidebar-new-channel-reason";
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -406,6 +433,20 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
     retry();
   }
 
+  function closeNewChannel() {
+    restoreNewChannelFocusRef.current = true;
+    setNewChannelOpen(false);
+  }
+
+  // The created channel is opened straight away, but the sidebar list itself
+  // comes from the canonical refetch — never from the creation response — so
+  // what is listed is always what the server says the user may see.
+  function handleChannelCreated(id: string) {
+    closeNewChannel();
+    navigate(`/chat/channel/${encodeURIComponent(id)}`);
+    retry();
+  }
+
   return (
     <aside
       className="chat-sidebar"
@@ -423,18 +464,32 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         </div>
       </Link>
 
-      {/* ── New channel CTA ── */}
+      {/* ── New channel CTA ──
+          Enabled only once the sidebar has loaded AND the server said this user
+          may create channels. While loading there is no answer yet, so the
+          action stays out of reach rather than failing on click; when the answer
+          is "no", the reason is rendered next to the button instead of leaving a
+          dead control behind. None of this authorizes anything — the endpoint
+          re-checks the caller's role on every request. */}
       <button
+        ref={newChannelButtonRef}
         type="button"
         className="chat-sidebar__cta"
         aria-label="Novo canal"
-        disabled
-        aria-disabled="true"
-        title="Em breve"
+        aria-haspopup="dialog"
+        disabled={!canCreateChannel}
+        aria-disabled={!canCreateChannel}
+        aria-describedby={createChannelBlockedReason ? newChannelReasonId : undefined}
+        onClick={() => setNewChannelOpen(true)}
       >
         <IconAdd />
         Novo canal
       </button>
+      {createChannelBlockedReason && (
+        <p className="chat-sidebar__empty" id={newChannelReasonId}>
+          {createChannelBlockedReason}
+        </p>
+      )}
 
       {/* ── Nav ── */}
       <div className="chat-sidebar__nav" role="listbox" aria-label="Canais e mensagens diretas">
@@ -451,9 +506,11 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                 type="button"
                 className="chat-sidebar__section-action"
                 aria-label="Adicionar canal"
-                disabled
-                aria-disabled="true"
-                title="Em breve"
+                aria-haspopup="dialog"
+                disabled={!canCreateChannel}
+                aria-disabled={!canCreateChannel}
+                aria-describedby={createChannelBlockedReason ? newChannelReasonId : undefined}
+                onClick={() => setNewChannelOpen(true)}
               >
                 <IconAdd />
               </button>
@@ -510,6 +567,9 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
           </div>
         </Link>
       </div>
+      {newChannelOpen && canCreateChannel && (
+        <NewChannelDialog onClose={closeNewChannel} onCreated={handleChannelCreated} />
+      )}
       {newDMOpen && state.status === "ready" && (
         <NewDirectMessageDialog
           currentUserId={state.currentUserId}

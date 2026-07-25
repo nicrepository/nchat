@@ -8,10 +8,23 @@ import type { Channel, DMConversation } from "./chatTypes";
 type SidebarState =
   | { status: "loading" }
   | { status: "error"; error: string }
-  | { status: "ready"; currentUserId: string; channels: Channel[]; dms: DMConversation[] };
+  | {
+      status: "ready";
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+      /** Server-derived; the create endpoint remains authoritative. */
+      canCreateChannel: boolean;
+    };
 
 type Action =
-  | { type: "loaded"; currentUserId: string; channels: Channel[]; dms: DMConversation[] }
+  | {
+      type: "loaded";
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+      canCreateChannel: boolean;
+    }
   | { type: "error"; error: string }
   | { type: "reload" };
 
@@ -23,6 +36,7 @@ function reducer(_state: SidebarState, action: Action): SidebarState {
         currentUserId: action.currentUserId,
         channels: action.channels,
         dms: action.dms,
+        canCreateChannel: action.canCreateChannel,
       };
     case "error":
       return { status: "error", error: action.error };
@@ -41,8 +55,9 @@ export function useChatSidebar() {
     dispatch({ type: "reload" });
 
     fetchSidebarData()
-      .then(({ currentUserId, channels, dms }) => {
-        if (!cancelled) dispatch({ type: "loaded", currentUserId, channels, dms });
+      .then(({ currentUserId, channels, dms, canCreateChannel }) => {
+        if (!cancelled)
+          dispatch({ type: "loaded", currentUserId, channels, dms, canCreateChannel });
       })
       .catch((err: unknown) => {
         if (!cancelled) {

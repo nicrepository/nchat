@@ -12,6 +12,7 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import {
+  createChannel,
   createGroupDM,
   deleteMessage,
   editMessage,
@@ -645,6 +646,7 @@ describe("partial sidebar compatibility", () => {
       currentUserId: "user-1",
       channels: [],
       dms: [],
+      canCreateChannel: false,
     });
   });
 });
@@ -1792,5 +1794,69 @@ describe("fetchPins (RF-05)", () => {
   it("propagates errors from authenticatedFetch", async () => {
     mockAuthFetch.mockRejectedValue(new Error("boom"));
     await expect(fetchPins({ kind: "channel", id: "ch-1" })).rejects.toThrow("boom");
+  });
+});
+
+describe("createChannel", () => {
+  it("sends only caller-owned fields, normalizing the slug the way the server does", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "ch-1", slug: "infra", display_name: "Infraestrutura", type: "private" },
+    });
+    const controller = new AbortController();
+
+    await expect(
+      createChannel(
+        { slug: "  INFRA  ", displayName: "  Infraestrutura  ", type: "private" },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ id: "ch-1", name: "Infraestrutura", type: "private", canWrite: true });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "infra", display_name: "Infraestrutura", type: "private" }),
+      signal: controller.signal,
+    });
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    for (const forbidden of ["workspace_id", "created_by", "caller_id", "is_general", "position"]) {
+      expect(init.body).not.toContain(forbidden);
+    }
+  });
+
+  it("propagates the API status so the caller can tell a denial from a failure", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    await expect(
+      createChannel({ slug: "infra", displayName: "Infra", type: "public" }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("fetchSidebarData permission flag", () => {
+  const sidebarPayload = (canCreate: unknown) => ({
+    data: {
+      current_user_id: "user-1",
+      workspace: { id: "ws-1", name: "NIC", slug: "nic" },
+      channels: [],
+      dm_conversations: [],
+      ...(canCreate === undefined ? {} : { can_create_channel: canCreate }),
+    },
+  });
+
+  it("reports the server flag verbatim when it is a real boolean", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarPayload(true));
+    await expect(fetchSidebarData()).resolves.toMatchObject({ canCreateChannel: true });
+
+    mockAuthFetch.mockResolvedValue(sidebarPayload(false));
+    await expect(fetchSidebarData()).resolves.toMatchObject({ canCreateChannel: false });
+  });
+
+  // Anything that is not literally true means "no": a missing field on an older
+  // server, or a truthy-looking value from a hostile payload, must never read as
+  // permission.
+  it("treats an absent or non-boolean flag as no permission", async () => {
+    for (const value of [undefined, "true", 1, {}, null]) {
+      mockAuthFetch.mockResolvedValue(sidebarPayload(value));
+      await expect(fetchSidebarData()).resolves.toMatchObject({ canCreateChannel: false });
+    }
   });
 });
