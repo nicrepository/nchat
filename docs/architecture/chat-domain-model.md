@@ -190,10 +190,33 @@ Implemented service/storage operations:
   category, position, and public/private type;
 - archive non-general channels by setting `status='archived'`.
 
-CRUD management uses the minimal role rule for this MVP: active workspace
-`owner` and `admin` may create, update, or archive channels. `member`, `guest`,
-suspended, left, missing, and disabled-workspace callers are denied. Full RBAC
-(RF-74) remains out of scope.
+Channel **creation** takes active workspace membership and nothing else: every
+active member — `owner`, `admin`, `member` or `guest` — may create a channel, and
+the role is deliberately not consulted (BUG #393). Suspended, left, missing and
+disabled-workspace callers are denied. The authorization is not a check followed
+by a write: the pgx store inserts the channel with `INSERT ... SELECT` from a
+row-locked authorized context (`chat.workspaces` + `chat.workspace_members`), so
+a membership revoked concurrently leaves no row to insert from and no channel
+behind.
+
+Because a `GET /api/chat/sidebar` 200 already means an active membership, its
+`can_create_channel` field is now always `true` and is **deprecated**: it is kept
+only so clients that predate BUG #393 keep working during rollout, is never
+derived from the caller's role, and is ignored by the current UI, which offers
+"Nova conversa" as the single entry point. `POST /api/chat/channels` re-derives
+the decision from the session on every call.
+
+`display_name` is required, trimmed, and capped at 100 Unicode code points by
+`domain.NormalizeChannelDisplayName` — the one helper every write path uses
+(create, update, workspace bootstrap). The count is code points at all three
+layers: `Array.from().length` in the browser, `utf8.RuneCountInString` in Go,
+`char_length` in the `channels_display_name_length_check` constraint. The
+constraint is `NOT VALID`, so it governs new writes without the deploy depending
+on the state of existing rows.
+
+Channel **update** and **archive** remain management operations for this MVP:
+active workspace `owner` and `admin` only. Full RBAC (RF-74) remains out of
+scope.
 
 Public/private visibility rules are enforced by SQL in the pgx channel store:
 the query joins `chat.workspaces`, active `chat.workspace_members`, and

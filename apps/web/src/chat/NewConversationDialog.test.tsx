@@ -3,19 +3,32 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
-import type { DMCandidate, DirectDMResult } from "./chatTypes";
+import type { Channel, DMCandidate, DirectDMResult } from "./chatTypes";
 import { MAX_GROUP_MEMBERS } from "./dmGroupForm";
-import NewDirectMessageDialog from "./NewDirectMessageDialog";
+import NewConversationDialog from "./NewConversationDialog";
 
-const { mockSearchDMCandidates, mockGetOrCreateDirectDM, mockCreateGroupDM } = vi.hoisted(() => ({
-  mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
-  mockGetOrCreateDirectDM:
-    vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
-  mockCreateGroupDM:
-    vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
-}));
+const { mockSearchDMCandidates, mockGetOrCreateDirectDM, mockCreateGroupDM, mockCreateChannel } =
+  vi.hoisted(() => ({
+    mockSearchDMCandidates:
+      vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
+    mockGetOrCreateDirectDM:
+      vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
+    mockCreateGroupDM:
+      vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+    mockCreateChannel:
+      vi.fn<
+        (
+          input: { slug: string; displayName: string; type: "public" | "private" },
+          signal?: AbortSignal,
+        ) => Promise<Channel>
+      >(),
+  }));
 
 vi.mock("./chatApi", () => ({
+  createChannel: (
+    input: { slug: string; displayName: string; type: "public" | "private" },
+    signal?: AbortSignal,
+  ) => mockCreateChannel(input, signal),
   searchDMCandidates: (query: string, signal?: AbortSignal) =>
     mockSearchDMCandidates(query, signal),
   getOrCreateDirectDM: (userId: string, signal?: AbortSignal) =>
@@ -34,14 +47,15 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function renderDialog(overrides: Partial<ComponentProps<typeof NewDirectMessageDialog>> = {}) {
+function renderDialog(overrides: Partial<ComponentProps<typeof NewConversationDialog>> = {}) {
   const props = {
     currentUserId: "current-user",
     onClose: vi.fn(),
     onOpened: vi.fn(),
+    onChannelCreated: vi.fn(),
     ...overrides,
   };
-  render(<NewDirectMessageDialog {...props} />);
+  render(<NewConversationDialog {...props} />);
   return props;
 }
 
@@ -62,13 +76,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("NewDirectMessageDialog", () => {
+describe("NewConversationDialog", () => {
   it("renders an accessible focused search field and skips empty or short queries", async () => {
     renderDialog();
 
     const input = screen.getByRole("searchbox", { name: "Pesquisar pessoa" });
     expect(input).toHaveFocus();
-    expect(screen.getByRole("dialog", { name: "Nova mensagem" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Nova conversa" })).toBeInTheDocument();
 
     fireEvent.change(input, { target: { value: "a" } });
     await advanceSearch();
@@ -179,7 +193,7 @@ describe("NewDirectMessageDialog", () => {
     expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
     expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith("user-2", expect.any(AbortSignal));
     expect(screen.getByText("Abrindo…")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Fechar nova mensagem" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Fechar nova conversa" })).toBeDisabled();
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     expect(props.onClose).not.toHaveBeenCalled();
 
@@ -237,7 +251,7 @@ describe("NewDirectMessageDialog", () => {
     const props = renderDialog();
     const dialog = screen.getByRole("dialog");
     const input = screen.getByRole("searchbox");
-    const close = screen.getByRole("button", { name: "Fechar nova mensagem" });
+    const close = screen.getByRole("button", { name: "Fechar nova conversa" });
 
     expect(input).toHaveFocus();
     fireEvent.keyDown(dialog, { key: "Tab" });
@@ -258,7 +272,12 @@ describe("NewDirectMessageDialog", () => {
     mockGetOrCreateDirectDM.mockReturnValue(request.promise);
     const onOpened = vi.fn();
     const view = render(
-      <NewDirectMessageDialog currentUserId="current-user" onClose={vi.fn()} onOpened={onOpened} />,
+      <NewConversationDialog
+        currentUserId="current-user"
+        onClose={vi.fn()}
+        onOpened={onOpened}
+        onChannelCreated={vi.fn()}
+      />,
     );
 
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "jo" } });
@@ -351,7 +370,12 @@ it("ignores a failure that lands after the dialog was unmounted", async () => {
   mockSearchDMCandidates.mockResolvedValue([{ userId: "user-2", displayName: "Joana" }]);
   mockGetOrCreateDirectDM.mockReturnValue(request.promise);
   const view = render(
-    <NewDirectMessageDialog currentUserId="current-user" onClose={vi.fn()} onOpened={vi.fn()} />,
+    <NewConversationDialog
+      currentUserId="current-user"
+      onClose={vi.fn()}
+      onOpened={vi.fn()}
+      onChannelCreated={vi.fn()}
+    />,
   );
 
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "jo" } });
@@ -388,7 +412,7 @@ const groupCandidates: DMCandidate[] = [
   { userId: "user-4", displayName: "Rita" },
 ];
 
-describe("NewDirectMessageDialog — group mode", () => {
+describe("NewConversationDialog — group mode", () => {
   it("switches modes with accessible controls and keeps the 1:1 flow untouched", async () => {
     mockSearchDMCandidates.mockResolvedValue([groupCandidates[0]]);
     renderDialog();
@@ -497,7 +521,7 @@ describe("NewDirectMessageDialog — group mode", () => {
     const busy = screen.getByRole("button", { name: "Criando…" });
     expect(busy).toBeDisabled();
     expect(busy).toHaveAttribute("aria-busy", "true");
-    expect(screen.getByRole("button", { name: "Fechar nova mensagem" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Fechar nova conversa" })).toBeDisabled();
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     expect(props.onClose).not.toHaveBeenCalled();
 
@@ -583,6 +607,16 @@ describe("NewDirectMessageDialog — group mode", () => {
     expect(props.onOpened).toHaveBeenCalledTimes(1);
   });
 
+  // The cap rule itself is proved on toggleGroupMember in dmGroupForm.test.ts.
+  // What is left for the component is the boundary a user can see: the hint, and
+  // which rows the cap disables.
+  //
+  // Every query here is resolved once, before the selection exists. At the cap
+  // the dialog holds ~100 buttons — 50 result rows plus a chip each — and a
+  // getByRole("button", { name }) computes an accessible name for all of them;
+  // repeating that after the fill made the test slow enough to time out under
+  // coverage instrumentation. React keeps these nodes across re-renders, so the
+  // references taken up front stay the right ones.
   it("stops selecting past the participant cap without losing the current selection", async () => {
     const many = Array.from({ length: MAX_GROUP_MEMBERS + 1 }, (_, index) => ({
       userId: `user-${index}`,
@@ -594,30 +628,37 @@ describe("NewDirectMessageDialog — group mode", () => {
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "pessoa" } });
     await advanceSearch();
 
-    // Selecting is a functional state update, so filling the group in one batch
-    // is equivalent to 49 separate clicks and keeps the test fast.
     const rows = within(screen.getByRole("list", { name: "Pessoas encontradas" })).getAllByRole(
       "button",
     );
+    expect(rows).toHaveLength(MAX_GROUP_MEMBERS + 1);
+    const firstSelected = rows[0];
+    const overflow = rows[MAX_GROUP_MEMBERS];
+    const footer = screen.getByRole("dialog").querySelector("footer");
+    expect(footer).not.toBeNull();
+
+    // Selecting is a functional state update, so filling the group in one batch
+    // is equivalent to 49 separate clicks and keeps the test fast.
     await act(async () => {
       rows.slice(0, MAX_GROUP_MEMBERS).forEach((row) => row.click());
     });
 
     expect(
-      screen.getByText(`Limite de ${MAX_GROUP_MEMBERS} pessoas atingido.`),
+      within(footer!).getByText(`Limite de ${MAX_GROUP_MEMBERS} pessoas atingido.`),
     ).toBeInTheDocument();
-    const overflow = screen.getByRole("button", { name: `Pessoa ${MAX_GROUP_MEMBERS}` });
     expect(overflow).toBeDisabled();
+    expect(
+      within(screen.getByRole("list", { name: "Pessoas selecionadas" })).getAllByRole("button"),
+    ).toHaveLength(MAX_GROUP_MEMBERS);
 
     // An already selected row stays clickable, so the only way out of the cap is
     // removing someone — the selection is never silently rewritten.
-    const selectedRow = screen.getByRole("button", { name: "Pessoa 0" });
-    expect(selectedRow).toBeEnabled();
-    fireEvent.click(selectedRow);
+    expect(firstSelected).toBeEnabled();
+    fireEvent.click(firstSelected);
     expect(
-      screen.getByText(`${MAX_GROUP_MEMBERS - 1} de no mínimo 2 pessoas selecionadas.`),
+      within(footer!).getByText(`${MAX_GROUP_MEMBERS - 1} de no mínimo 2 pessoas selecionadas.`),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: `Pessoa ${MAX_GROUP_MEMBERS}` })).toBeEnabled();
+    expect(overflow).toBeEnabled();
   });
 
   it("renders a hostile group name as text", async () => {
@@ -664,5 +705,322 @@ describe("NewDirectMessageDialog — group mode", () => {
     const nameField = screen.getByLabelText("Nome do grupo (opcional)");
     fireEvent.change(nameField, { target: { value: "a".repeat(121) } });
     expect(nameField).toHaveValue("a".repeat(120));
+  });
+});
+
+// ── Channel mode (BUG #393) ───────────────────────────────────────────────────
+// Channel creation has no sidebar control of its own any more: it is the third
+// mode of this dialog, reachable by every authenticated member. Authorization is
+// never evaluated here — the endpoint answers, and a denial arrives as a status.
+
+const createdChannel: Channel = {
+  id: "ch-1",
+  name: "Infraestrutura",
+  type: "public",
+  canWrite: true,
+};
+
+const nameField = () => screen.getByLabelText(/nome do canal/i);
+const slugField = () => screen.getByLabelText(/identificador/i);
+const createChannelButton = () => screen.getByRole("button", { name: /criar canal/i });
+
+function renderChannelMode(overrides: Partial<ComponentProps<typeof NewConversationDialog>> = {}) {
+  const props = renderDialog(overrides);
+  fireEvent.click(screen.getByRole("radio", { name: "Canal" }));
+  return props;
+}
+
+/** Flushes the microtask queue without leaving the fake-timer clock behind. */
+async function settle() {
+  await act(async () => {
+    await Promise.resolve();
+  });
+}
+
+describe("NewConversationDialog — channel mode", () => {
+  it("offers Pessoa, Grupo and Canal from the single dialog", () => {
+    renderDialog();
+
+    expect(screen.getByRole("radio", { name: "Pessoa" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Grupo" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Canal" })).toBeInTheDocument();
+    // No admin-only wording anywhere in the flow.
+    expect(screen.queryByText(/somente administradores/i)).not.toBeInTheDocument();
+  });
+
+  it("swaps the people search for the channel form and focuses its first field", () => {
+    renderChannelMode();
+
+    expect(nameField()).toHaveFocus();
+    expect(screen.queryByRole("searchbox", { name: "Pesquisar pessoa" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Nova conversa" })).toBeInTheDocument();
+  });
+
+  it("does not search for people while the channel form is showing", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "jo" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Canal" }));
+    await advanceSearch();
+
+    expect(mockSearchDMCandidates).not.toHaveBeenCalled();
+  });
+
+  it("sends only the caller-owned fields and hands the new channel ID back", async () => {
+    mockCreateChannel.mockResolvedValue(createdChannel);
+    const props = renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infraestrutura" } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    expect(props.onChannelCreated).toHaveBeenCalledWith("ch-1");
+    expect(mockCreateChannel).toHaveBeenCalledTimes(1);
+    // Exactly the contract: no role, no actor, no workspace from the browser.
+    expect(mockCreateChannel.mock.calls[0][0]).toEqual({
+      slug: "infraestrutura",
+      displayName: "Infraestrutura",
+      type: "public",
+    });
+  });
+
+  it("derives the slug from the name until the user edits it, then leaves it alone", async () => {
+    mockCreateChannel.mockResolvedValue(createdChannel);
+    renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Operações Críticas" } });
+    expect(slugField()).toHaveValue("operacoes-criticas");
+
+    fireEvent.change(slugField(), { target: { value: "ops" } });
+    fireEvent.change(nameField(), { target: { value: "Outro nome" } });
+    expect(slugField()).toHaveValue("ops");
+
+    fireEvent.click(createChannelButton());
+    await settle();
+    expect(mockCreateChannel.mock.calls[0][0].slug).toBe("ops");
+  });
+
+  it("sends the selected channel type", async () => {
+    mockCreateChannel.mockResolvedValue({ ...createdChannel, type: "private" });
+    renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Diretoria" } });
+    fireEvent.click(screen.getByRole("radio", { name: /privado/i }));
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    expect(mockCreateChannel.mock.calls[0][0].type).toBe("private");
+  });
+
+  // The field caps nothing: the name goes to the server as typed, whatever its
+  // length or which plane its characters live in. Only the required-name rule
+  // stands between the user and a request.
+  // The name cap is a security bound, so the tests are about what the user can
+  // actually do with the field — not about which attributes it carries. The one
+  // attribute assertion is negative: maxLength must be absent, because the
+  // browser counts UTF-16 units and would silently halve a pasted emoji name.
+  it.each([
+    ["ascii", "a"],
+    ["emoji", "😀"],
+  ])("submits exactly the limit in %s and blocks one past it", async (_label, unit) => {
+    mockCreateChannel.mockResolvedValue(createdChannel);
+    renderChannelMode();
+    expect(nameField()).not.toHaveAttribute("maxlength");
+
+    const overLimit = unit.repeat(101);
+    fireEvent.change(nameField(), { target: { value: overLimit } });
+    fireEvent.change(slugField(), { target: { value: "infra" } });
+
+    // Nothing is taken from the user: the value stays whole and editable.
+    expect(nameField()).toHaveValue(overLimit);
+    expect(screen.getByRole("alert")).toHaveTextContent(/100 caracteres/);
+    expect(createChannelButton()).toBeDisabled();
+
+    // Shortening it clears the problem and re-enables submission.
+    const atLimit = unit.repeat(100);
+    fireEvent.change(nameField(), { target: { value: atLimit } });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(createChannelButton()).toBeEnabled();
+
+    fireEvent.click(createChannelButton());
+    await settle();
+    expect(mockCreateChannel).toHaveBeenCalledTimes(1);
+    expect(mockCreateChannel.mock.calls[0][0].displayName).toBe(atLimit);
+  });
+
+  it("keeps a pasted over-limit name intact instead of truncating it", async () => {
+    renderChannelMode();
+
+    const pasted = "a".repeat(60) + "😀".repeat(60);
+    fireEvent.paste(nameField(), {
+      clipboardData: { getData: () => pasted },
+    });
+    // JSDOM does not apply a paste to a controlled input on its own, so the
+    // resulting change is what the browser would dispatch next.
+    fireEvent.change(nameField(), { target: { value: pasted } });
+
+    expect(nameField()).toHaveValue(pasted);
+    expect(Array.from((nameField() as HTMLInputElement).value)).toHaveLength(120);
+    expect(screen.getByRole("alert")).toHaveTextContent(/100 caracteres/);
+    expect(createChannelButton()).toBeDisabled();
+
+    fireEvent.click(createChannelButton());
+    await settle();
+    expect(mockCreateChannel).not.toHaveBeenCalled();
+  });
+
+  it("associates the name error with the field for assistive technology", () => {
+    renderChannelMode();
+    fireEvent.change(nameField(), { target: { value: "😀".repeat(101) } });
+
+    const field = nameField();
+    const alert = screen.getByRole("alert");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAttribute("aria-describedby", alert.id);
+    expect(alert.id).not.toBe("");
+
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    expect(nameField()).toHaveAttribute("aria-invalid", "false");
+    expect(nameField()).not.toHaveAttribute("aria-describedby");
+  });
+
+  // Client validation is a courtesy; the server is the authority, and its
+  // refusal still has to reach the user.
+  it("still surfaces a server-side rejection of a name it considered valid", async () => {
+    mockCreateChannel.mockRejectedValue(new ApiRequestError(400, "bad_request", "invalid channel"));
+    renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infraestrutura" } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/revise o nome/i);
+    expect(mockCreateChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps submit unavailable until a name is typed", () => {
+    renderChannelMode();
+
+    expect(createChannelButton()).toBeDisabled();
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    expect(createChannelButton()).toBeEnabled();
+  });
+
+  it.each([
+    ["Geral", undefined, /reservado/i],
+    ["Infra", "-infra", /minúsculas/i],
+  ])("rejects %s locally without calling the API", async (name, slug, expected) => {
+    renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: name } });
+    if (slug !== undefined) fireEvent.change(slugField(), { target: { value: slug } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(expected);
+    expect(mockCreateChannel).not.toHaveBeenCalled();
+  });
+
+  // A denial, an expired session and an outage are different problems with
+  // different fixes, so each status reaches the user as its own wording.
+  it.each([
+    [403, /permissão/i],
+    [401, /sessão/i],
+    [409, /já existe/i],
+    [400, /revise/i],
+    [429, /aguarde/i],
+    [0, /conexão/i],
+  ])("explains status %i in its own terms", async (status, expected) => {
+    mockCreateChannel.mockRejectedValue(new ApiRequestError(status, "err", "server detail"));
+    const props = renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(expected);
+    // Server-provided text is never echoed back into the UI.
+    expect(alert).not.toHaveTextContent(/server detail/i);
+    expect(props.onChannelCreated).not.toHaveBeenCalled();
+  });
+
+  it("keeps the dialog open with the fields intact so a retry costs one click", async () => {
+    mockCreateChannel.mockRejectedValueOnce(new ApiRequestError(500, "err", "boom"));
+    const props = renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(nameField()).toHaveValue("Infra");
+
+    mockCreateChannel.mockResolvedValueOnce(createdChannel);
+    fireEvent.click(createChannelButton());
+    await settle();
+    expect(props.onChannelCreated).toHaveBeenCalledWith("ch-1");
+  });
+
+  it("sends exactly one request when the button is clicked repeatedly", async () => {
+    const pending = deferred<Channel>();
+    mockCreateChannel.mockReturnValue(pending.promise);
+    renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    fireEvent.click(createChannelButton());
+    fireEvent.click(createChannelButton());
+    fireEvent.click(createChannelButton());
+
+    expect(mockCreateChannel).toHaveBeenCalledTimes(1);
+    expect(createChannelButton()).toBeDisabled();
+    expect(createChannelButton()).toHaveAttribute("aria-busy", "true");
+
+    await act(async () => {
+      pending.resolve(createdChannel);
+      await pending.promise;
+    });
+  });
+
+  it("holds the dialog shut while a channel creation is in flight", async () => {
+    const pending = deferred<Channel>();
+    mockCreateChannel.mockReturnValue(pending.promise);
+    const props = renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    fireEvent.click(createChannelButton());
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Fechar nova conversa" })).toBeDisabled();
+    // The mode cannot be switched out from under an in-flight write either.
+    expect(screen.getByRole("radio", { name: "Pessoa" })).toBeDisabled();
+
+    await act(async () => {
+      pending.resolve(createdChannel);
+      await pending.promise;
+    });
+  });
+
+  it("closes on Escape without submitting", () => {
+    const props = renderChannelMode();
+
+    fireEvent.change(nameField(), { target: { value: "Infra" } });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    expect(props.onClose).toHaveBeenCalled();
+    expect(mockCreateChannel).not.toHaveBeenCalled();
+  });
+
+  it("returns to the people search when the mode goes back to Pessoa", async () => {
+    mockSearchDMCandidates.mockResolvedValue([{ userId: "user-2", displayName: "Joana Silva" }]);
+    renderChannelMode();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Pessoa" }));
+    const input = screen.getByRole("searchbox", { name: "Pesquisar pessoa" });
+    fireEvent.change(input, { target: { value: "jo" } });
+    await advanceSearch();
+
+    expect(screen.getByRole("button", { name: "Joana Silva" })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/nome do canal/i)).not.toBeInTheDocument();
   });
 });

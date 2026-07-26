@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,16 +19,8 @@ const {
   mockCreateGroupDM,
   mockCreateChannel,
 } = vi.hoisted(() => ({
-  // canCreateChannel is optional here so the tests that predate RF-01 keep
-  // their fixtures; omitting it is exactly the "no permission" case.
-  mockFetchSidebarData: vi.fn<
-    () => Promise<{
-      currentUserId: string;
-      channels: Channel[];
-      dms: DMConversation[];
-      canCreateChannel?: boolean;
-    }>
-  >(),
+  mockFetchSidebarData:
+    vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
   mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
@@ -551,7 +543,6 @@ describe("ChatSidebar — DMs", () => {
     const readyState = (avatarUrl: string) => ({
       status: "ready" as const,
       currentUserId: "user-a",
-      canCreateChannel: false,
       channels: [] as Channel[],
       dms: [
         {
@@ -691,8 +682,6 @@ describe("ChatSidebar — DMs", () => {
     const trigger = await screen.findByRole("button", { name: "Nova conversa" });
     expect(trigger).toHaveTextContent("Nova conversa");
     expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
-    // Channel creation keeps its own, separate control.
-    expect(screen.getByRole("button", { name: "Novo canal" })).not.toBe(trigger);
     expect(screen.queryByRole("button", { name: "Nova mensagem direta" })).not.toBeInTheDocument();
   });
 
@@ -710,7 +699,7 @@ describe("ChatSidebar — DMs", () => {
     expect(trigger).toHaveFocus();
     await user.keyboard("{Enter}");
 
-    expect(screen.getByRole("dialog", { name: "Nova mensagem" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Nova conversa" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Pessoa" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Grupo" })).toBeInTheDocument();
   });
@@ -751,10 +740,10 @@ describe("ChatSidebar — DMs", () => {
 
     const trigger = await screen.findByRole("button", { name: "Nova conversa" });
     await user.click(trigger);
-    expect(screen.getByRole("dialog", { name: "Nova mensagem" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Nova conversa" })).toBeInTheDocument();
     expect(screen.getByRole("searchbox", { name: "Pesquisar pessoa" })).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Fechar nova mensagem" }));
+    await user.click(screen.getByRole("button", { name: "Fechar nova conversa" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
   });
@@ -1236,113 +1225,111 @@ describe("chatApi — no runtime fixture import", () => {
   });
 });
 
-// ── Channel creation (RF-01 / BUG #386) ──────────────────────────────────────
+// ── Single creation entry point (BUG #393) ───────────────────────────────────
+// The sidebar offers one action, and it is available to every member the
+// sidebar loaded for — there is no role in this decision, on this side or in
+// what is sent to the server.
 
-describe("ChatSidebar — channel creation", () => {
-  const readySidebar = (canCreateChannel: boolean) => ({
+describe("ChatSidebar — single creation entry point", () => {
+  const readySidebar = () => ({
     currentUserId: "user-1",
     channels: SAMPLE_CHANNELS,
     dms: SAMPLE_DMS,
-    canCreateChannel,
   });
 
-  const ctaButton = () => screen.getByRole("button", { name: "Novo canal" });
+  it("offers only 'Nova conversa' — no separate channel controls, no admin-only notice", async () => {
+    mockFetchSidebarData.mockResolvedValue(readySidebar());
+    renderChat();
 
-  it("keeps the CTA unavailable while the sidebar is still loading", async () => {
-    let resolveSidebar!: (value: ReturnType<typeof readySidebar>) => void;
-    mockFetchSidebarData.mockReturnValue(
-      new Promise((resolve) => {
-        resolveSidebar = resolve;
-      }),
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Nova conversa" })).toBeEnabled(),
     );
-    renderChat();
-
-    expect(await screen.findByTestId("chat-sidebar")).toBeInTheDocument();
-    expect(ctaButton()).toBeDisabled();
-    // No verdict has arrived yet, so the UI must not claim the user lacks
-    // permission — it only withholds the action.
+    expect(screen.queryByRole("button", { name: "Novo canal" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Adicionar canal" })).not.toBeInTheDocument();
     expect(screen.queryByText(/somente administradores/i)).not.toBeInTheDocument();
-
-    resolveSidebar(readySidebar(true));
-    await waitFor(() => expect(ctaButton()).toBeEnabled());
+    // Exactly one control opens a creation dialog.
+    expect(screen.getAllByRole("button", { name: /nova conversa/i })).toHaveLength(1);
   });
 
-  it("enables the CTA only when the server says the user may create channels", async () => {
-    mockFetchSidebarData.mockResolvedValue(readySidebar(true));
+  it("lets any loaded member reach the channel option from the keyboard", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(readySidebar());
     renderChat();
 
-    await waitFor(() => expect(ctaButton()).toBeEnabled());
-    expect(screen.getByRole("button", { name: "Adicionar canal" })).toBeEnabled();
-    expect(screen.queryByText(/somente administradores/i)).not.toBeInTheDocument();
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    trigger.focus();
+    await user.keyboard("{Enter}");
+
+    const dialog = screen.getByRole("dialog", { name: "Nova conversa" });
+    expect(within(dialog).getByRole("radio", { name: "Pessoa" })).toBeEnabled();
+    expect(within(dialog).getByRole("radio", { name: "Grupo" })).toBeEnabled();
+    const channelOption = within(dialog).getByRole("radio", { name: "Canal" });
+    expect(channelOption).toBeEnabled();
+
+    await user.click(channelOption);
+    expect(within(dialog).getByLabelText(/nome do canal/i)).toBeInTheDocument();
   });
 
-  it("explains why the CTA is unavailable to a user without permission", async () => {
-    mockFetchSidebarData.mockResolvedValue(readySidebar(false));
-    renderChat();
-
-    await waitFor(() => expect(ctaButton()).toBeDisabled());
-    const reason = screen.getByText(/somente administradores do workspace podem criar canais/i);
-    expect(reason).toBeInTheDocument();
-    // The reason is tied to the control, not just placed near it.
-    expect(ctaButton()).toHaveAttribute("aria-describedby", reason.id);
-    expect(screen.getByRole("button", { name: "Adicionar canal" })).toBeDisabled();
-  });
-
-  it("does not open the dialog for a user without permission", async () => {
-    mockFetchSidebarData.mockResolvedValue(readySidebar(false));
-    renderChat();
-
-    await waitFor(() => expect(ctaButton()).toBeDisabled());
-    fireEvent.click(ctaButton());
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(mockCreateChannel).not.toHaveBeenCalled();
-  });
-
-  it("creates a channel, navigates to it and refetches the canonical sidebar", async () => {
+  it("creates a channel, opens it, refetches and lists it under Canais only", async () => {
+    const user = userEvent.setup();
     const created: Channel = { id: "novo", name: "Novo", type: "public", canWrite: true };
-    mockFetchSidebarData.mockResolvedValue(readySidebar(true));
+    mockFetchSidebarData.mockResolvedValue(readySidebar());
     mockCreateChannel.mockResolvedValue(created);
     renderChat();
 
-    await waitFor(() => expect(ctaButton()).toBeEnabled());
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
+    await user.click(screen.getByRole("radio", { name: "Canal" }));
     const loadsBefore = mockFetchSidebarData.mock.calls.length;
 
-    fireEvent.click(ctaButton());
-    const dialog = await screen.findByRole("dialog", { name: /novo canal/i });
-
     fireEvent.change(screen.getByLabelText(/nome do canal/i), { target: { value: "Novo" } });
-    // The list the user ends up seeing comes from the refetch, never from the
-    // creation response, so the new channel is added to what the server returns.
+    // What the user ends up seeing comes from the refetch, never from the
+    // creation response.
     mockFetchSidebarData.mockResolvedValue({
-      ...readySidebar(true),
+      ...readySidebar(),
       channels: [...SAMPLE_CHANNELS, created],
     });
-    fireEvent.click(screen.getByRole("button", { name: "Criar canal" }));
+    await user.click(screen.getByRole("button", { name: "Criar canal" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(dialog).not.toBeInTheDocument();
     expect(mockCreateChannel).toHaveBeenCalledTimes(1);
     expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(loadsBefore);
     expect(await screen.findByTestId("chat-channel")).toBeInTheDocument();
     await waitFor(() =>
-      expect(screen.getByRole("option", { name: /canal novo/i })).toBeInTheDocument(),
+      expect(screen.getByRole("option", { name: "Canal Novo" })).toBeInTheDocument(),
     );
+    // The new channel never lands among the direct messages.
+    expect(screen.queryByRole("option", { name: /mensagem direta com novo/i })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Grupo Novo" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Nova conversa" })).toHaveFocus();
   });
 
-  it("keeps the dialog open and shows the denial when the API refuses the creation", async () => {
-    mockFetchSidebarData.mockResolvedValue(readySidebar(true));
+  it("keeps the dialog open and shows the denial when the server refuses", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(readySidebar());
     mockCreateChannel.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
     renderChat();
 
-    await waitFor(() => expect(ctaButton()).toBeEnabled());
-    fireEvent.click(ctaButton());
-    await screen.findByRole("dialog", { name: /novo canal/i });
-
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
+    await user.click(screen.getByRole("radio", { name: "Canal" }));
     fireEvent.change(screen.getByLabelText(/nome do canal/i), { target: { value: "Novo" } });
-    fireEvent.click(screen.getByRole("button", { name: "Criar canal" }));
+    await user.click(screen.getByRole("button", { name: "Criar canal" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/permissão/i);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.queryByTestId("chat-channel")).not.toBeInTheDocument();
+  });
+
+  it("closes the dialog on Escape and restores focus to the trigger", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(readySidebar());
+    renderChat();
+
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    await user.click(trigger);
+    await user.click(screen.getByRole("radio", { name: "Canal" }));
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
   });
 });

@@ -49,14 +49,17 @@ func (s *WorkspaceService) CreateCategory(ctx context.Context, workspaceID, name
 // CreateChannel validates and creates a channel. The slug is normalized to lowercase.
 func (s *WorkspaceService) CreateChannel(ctx context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
 	input.Slug = strings.ToLower(strings.TrimSpace(input.Slug))
-	input.DisplayName = strings.TrimSpace(input.DisplayName)
 
 	if !slugRE.MatchString(input.Slug) {
 		return domain.Channel{}, fmt.Errorf("%w: slug must be lowercase alphanumeric with optional internal hyphens, no leading/trailing hyphens, max 63 chars", domain.ErrInvalidInput)
 	}
-	if input.DisplayName == "" {
-		return domain.Channel{}, fmt.Errorf("%w: display_name is required", domain.ErrInvalidInput)
+	// Same helper as ChannelService: this path also persists display_name, so it
+	// cannot be the one that skips the cap.
+	displayName, err := domain.NormalizeChannelDisplayName(input.DisplayName)
+	if err != nil {
+		return domain.Channel{}, err
 	}
+	input.DisplayName = displayName
 	if input.Type != domain.ChannelTypePublic && input.Type != domain.ChannelTypePrivate {
 		return domain.Channel{}, fmt.Errorf("%w: type must be public or private", domain.ErrInvalidInput)
 	}

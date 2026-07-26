@@ -1,6 +1,9 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	ErrNotFound                  = errors.New("not found")
@@ -29,4 +32,13 @@ var (
 	// ErrPinLimitReached is returned when a channel already holds the maximum
 	// number of pinned messages (RF-05 abuse ceiling).
 	ErrPinLimitReached = errors.New("pin limit reached")
+	// ErrChannelDisplayNameRequired and ErrChannelDisplayNameTooLong report the
+	// two ways a channel name fails NormalizeChannelDisplayName.
+	//
+	// Both wrap ErrInvalidInput so every existing errors.Is check keeps mapping
+	// them to the same validation status the endpoint already returns — the HTTP
+	// contract does not change, only which payloads reach it. Neither message
+	// repeats the rejected name.
+	ErrChannelDisplayNameRequired = fmt.Errorf("%w: display_name is required", ErrInvalidInput)
+	ErrChannelDisplayNameTooLong  = fmt.Errorf("%w: display_name must be %d characters or fewer", ErrInvalidInput, MaxChannelDisplayNameCodePoints)
 )

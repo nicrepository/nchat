@@ -646,7 +646,6 @@ describe("partial sidebar compatibility", () => {
       currentUserId: "user-1",
       channels: [],
       dms: [],
-      canCreateChannel: false,
     });
   });
 });
@@ -1831,32 +1830,35 @@ describe("createChannel", () => {
   });
 });
 
-describe("fetchSidebarData permission flag", () => {
-  const sidebarPayload = (canCreate: unknown) => ({
+describe("fetchSidebarData", () => {
+  const sidebarPayload = (extra: Record<string, unknown> = {}) => ({
     data: {
       current_user_id: "user-1",
       workspace: { id: "ws-1", name: "NIC", slug: "nic" },
       channels: [],
       dm_conversations: [],
-      ...(canCreate === undefined ? {} : { can_create_channel: canCreate }),
+      ...extra,
     },
   });
 
-  it("reports the server flag verbatim when it is a real boolean", async () => {
-    mockAuthFetch.mockResolvedValue(sidebarPayload(true));
-    await expect(fetchSidebarData()).resolves.toMatchObject({ canCreateChannel: true });
-
-    mockAuthFetch.mockResolvedValue(sidebarPayload(false));
-    await expect(fetchSidebarData()).resolves.toMatchObject({ canCreateChannel: false });
+  // The sidebar no longer advertises a create-channel capability (BUG #393):
+  // channel creation takes active membership, which a 200 here already implies,
+  // and POST /api/chat/channels decides on every call regardless. A leftover
+  // flag from an older server must not resurface as client-side state.
+  it("ignores a create-channel flag a server may still send", async () => {
+    for (const value of [true, false, "true", 1, {}, null]) {
+      mockAuthFetch.mockResolvedValue(sidebarPayload({ can_create_channel: value }));
+      const data = await fetchSidebarData();
+      expect(data).toEqual({ currentUserId: "user-1", channels: [], dms: [] });
+    }
   });
 
-  // Anything that is not literally true means "no": a missing field on an older
-  // server, or a truthy-looking value from a hostile payload, must never read as
-  // permission.
-  it("treats an absent or non-boolean flag as no permission", async () => {
-    for (const value of [undefined, "true", 1, {}, null]) {
-      mockAuthFetch.mockResolvedValue(sidebarPayload(value));
-      await expect(fetchSidebarData()).resolves.toMatchObject({ canCreateChannel: false });
-    }
+  it("returns the caller identity and the two lists", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarPayload());
+    await expect(fetchSidebarData()).resolves.toEqual({
+      currentUserId: "user-1",
+      channels: [],
+      dms: [],
+    });
   });
 });

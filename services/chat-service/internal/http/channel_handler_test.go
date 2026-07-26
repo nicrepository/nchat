@@ -107,8 +107,8 @@ func TestChannelHandler_Create_RejectsServerControlledFields(t *testing.T) {
 	}
 }
 
-// A denial keeps its own status: a member without the role must be able to tell
-// "you may not" from "it broke".
+// A denial keeps its own status: a caller the workspace refuses must be able to
+// tell "you may not" from "it broke".
 func TestChannelHandler_Create_MapsServiceErrors(t *testing.T) {
 	for _, test := range []struct {
 		name string
