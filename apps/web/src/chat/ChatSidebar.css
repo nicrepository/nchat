@@ -91,7 +91,8 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  margin: 0 6px 8px;
+  /* Bottom margin carries the gap the removed second CTA used to provide. */
+  margin: 0 6px 14px;
   transition: background 0.15s;
   cursor: pointer;
 }
@@ -110,19 +111,6 @@
 .chat-sidebar__cta:focus-visible {
   outline: 2px solid var(--cs-primary-soft);
   outline-offset: 2px;
-}
-
-/* Starting a conversation is a peer action to creating a channel, not a
-   competing primary one — same shape, quieter fill. */
-.chat-sidebar__cta--conversation {
-  background: transparent;
-  color: var(--cs-sidebar-text);
-  border: 1px solid var(--cs-sidebar-divider);
-  margin-bottom: 14px;
-}
-
-.chat-sidebar__cta--conversation:hover:not(:disabled) {
-  background: var(--cs-sidebar-hover);
 }
 
 /* ── Nav scrollable container ────────────────────────────────────────────────── */
@@ -166,32 +154,6 @@
 
 .chat-sidebar__section-label--mt {
   margin-top: 18px;
-}
-
-.chat-sidebar__section-action {
-  background: transparent;
-  border: none;
-  color: var(--cs-sidebar-muted);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  cursor: pointer;
-  padding: 0;
-  transition:
-    background 0.12s,
-    color 0.12s;
-}
-
-.chat-sidebar__section-action:hover:not(:disabled) {
-  background: var(--cs-sidebar-hover);
-  color: #fff;
-}
-
-.chat-sidebar__section-action:disabled {
-  cursor: not-allowed;
 }
 
 /* ── Nav items (channels) ────────────────────────────────────────────────────── */

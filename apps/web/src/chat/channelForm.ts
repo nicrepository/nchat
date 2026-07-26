@@ -13,6 +13,26 @@ export type ChannelFormType = "public" | "private";
 /** chat-service: slugRE caps a slug at 63 characters. */
 export const MAX_CHANNEL_SLUG_LENGTH = 63;
 
+/**
+ * chat-service: domain.MaxChannelDisplayNameCodePoints.
+ *
+ * Security resource cap. Counted in Unicode code points to match Go
+ * utf8.RuneCountInString and PostgreSQL char_length.
+ */
+export const MAX_CHANNEL_DISPLAY_NAME_CODE_POINTS = 100;
+
+/**
+ * Counts a string the way the server does.
+ *
+ * `String.length` counts UTF-16 units, so an emoji outside the BMP would score
+ * two and half a name of them would be refused that the server accepts. Spread
+ * iteration walks code points, which is what utf8.RuneCountInString and
+ * char_length both measure.
+ */
+export function channelDisplayNameLength(value: string): number {
+  return Array.from(value).length;
+}
+
 /** chat-service reserves this slug for the workspace's #geral channel. */
 export const RESERVED_CHANNEL_SLUG = "geral";
 
@@ -44,6 +64,23 @@ export function slugifyChannelName(displayName: string): string {
     .replace(/-+$/, "");
 }
 
+/**
+ * The channel-name rule on its own, mirroring domain.NormalizeChannelDisplayName.
+ *
+ * Separate from validateChannelForm so the form can show it while the user
+ * types, without also complaining about a slug they have not reached yet.
+ * Trimming happens before counting, exactly as the server does — surrounding
+ * whitespace must never be what pushes an acceptable name over.
+ */
+export function validateChannelDisplayName(displayName: string): string | null {
+  const trimmed = displayName.trim();
+  if (trimmed === "") return "Informe um nome para o canal.";
+  if (channelDisplayNameLength(trimmed) > MAX_CHANNEL_DISPLAY_NAME_CODE_POINTS) {
+    return `O nome do canal deve ter no máximo ${MAX_CHANNEL_DISPLAY_NAME_CODE_POINTS} caracteres.`;
+  }
+  return null;
+}
+
 export interface ChannelFormValues {
   displayName: string;
   slug: string;
@@ -57,7 +94,8 @@ export interface ChannelFormValues {
  * user retyping a valid-looking slug forever.
  */
 export function validateChannelForm({ displayName, slug }: ChannelFormValues): string | null {
-  if (displayName.trim() === "") return "Informe um nome para o canal.";
+  const nameMessage = validateChannelDisplayName(displayName);
+  if (nameMessage) return nameMessage;
   const normalized = slug.trim().toLowerCase();
   if (normalized === "") return "Informe um identificador para o canal.";
   if (normalized === RESERVED_CHANNEL_SLUG) return "O identificador “geral” é reservado.";

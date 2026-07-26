@@ -14,9 +14,17 @@ type SidebarData struct {
 	Workspace domain.Workspace
 	Channels  []SidebarChannel
 	DMs       []domain.DMConversationWithParticipantIDs
-	// CanCreateChannel mirrors the check POST /api/chat/channels performs. It
-	// exists so the UI can explain why the action is unavailable, never so the
-	// UI can decide: the endpoint re-derives it from the session on every call.
+	// CanCreateChannel is a deprecated compatibility field, retained only to
+	// keep feeding the sidebar's can_create_channel JSON key for clients that
+	// predate BUG #393. It is always true when this struct is returned: active
+	// workspace members can create channels, and reaching this point already
+	// proves an active membership in an active workspace, so the value carries
+	// no information and is never derived from the caller's role.
+	// POST /api/chat/channels decides for itself on every request.
+	//
+	// The formal Deprecated: marker lives on the JSON field it feeds, in
+	// sidebarResponseBody; putting it here too would only flag the single
+	// handler assignment that has to exist for the contract to be kept.
 	CanCreateChannel bool
 }
 
@@ -101,9 +109,11 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 	}
 
 	return SidebarData{
-		Workspace:        workspace,
-		Channels:         sidebarChannels,
-		DMs:              dms,
-		CanCreateChannel: domain.CanManageWorkspace(&member),
+		Workspace: workspace,
+		Channels:  sidebarChannels,
+		DMs:       dms,
+		// Constant by construction, not a role lookup: every path that reaches
+		// here has already proved the membership channel creation requires.
+		CanCreateChannel: true,
 	}, nil
 }

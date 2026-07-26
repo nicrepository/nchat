@@ -64,8 +64,11 @@ type sidebarResponseBody struct {
 	Workspace     sidebarWorkspaceJSON `json:"workspace"`
 	Channels      []sidebarChannelJSON `json:"channels"`
 	DMConvs       []sidebarDMJSON      `json:"dm_conversations"`
-	// CanCreateChannel is advisory UI state, not an authorization decision:
-	// POST /api/chat/channels checks the caller's role again for every request.
+	// Deprecated: retained for compatibility with older clients. Active
+	// workspace members can create channels (BUG #393), so a 200 here already
+	// implies true. Never omitempty — a client that predates the change reads a
+	// missing field as "no" and would hide an action the server allows. The
+	// current UI ignores it; POST /api/chat/channels remains authoritative.
 	CanCreateChannel bool `json:"can_create_channel"`
 }
 

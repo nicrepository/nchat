@@ -3,10 +3,13 @@ package service_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 func TestChannelService_CreatePublicChannel_ManagerSucceeds(t *testing.T) {
@@ -34,7 +37,7 @@ func TestChannelService_CreatePublicChannel_ManagerSucceeds(t *testing.T) {
 	if got.ID != "ch-public" || got.CreatedBy != "owner-1" {
 		t.Fatalf("unexpected channel: %+v", got)
 	}
-	if channels.createWithMemberCalls != 0 {
+	if channels.creatorMembershipSeeds != 0 {
 		t.Fatal("public channel creation must not fan out channel_members")
 	}
 	if channels.lastCreateInput.CreatedBy != "owner-1" || channels.lastCreateInput.IsGeneral {
@@ -67,26 +70,90 @@ func TestChannelService_CreatePrivateChannel_ManagerAddsCreatorMembership(t *tes
 	if got.ID != "ch-private" {
 		t.Fatalf("unexpected channel: %+v", got)
 	}
-	if channels.createWithMemberCalls != 1 || channels.lastCreateMemberUserID != "admin-1" {
-		t.Fatalf("private channel must add creator atomically, calls=%d user=%q", channels.createWithMemberCalls, channels.lastCreateMemberUserID)
+	if channels.creatorMembershipSeeds != 1 || channels.lastSeededMemberUserID != "admin-1" {
+		t.Fatalf("private channel must add creator atomically, calls=%d user=%q", channels.creatorMembershipSeeds, channels.lastSeededMemberUserID)
 	}
 }
 
-func TestChannelService_CreateChannel_MemberWithoutManageRoleDenied(t *testing.T) {
-	ms := newFakeMemberStore()
-	ms.workspaceMembers[wmKey("ws-1", "member-1")] = domain.WorkspaceMember{
-		WorkspaceID: "ws-1", UserID: "member-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
-	}
+// Creating a channel takes active membership, not a management role (BUG #393):
+// every active role reaches storage, and the creator recorded is the caller the
+// service was given — never anything the role could have influenced.
+func TestChannelService_CreateChannel_AnyActiveRoleSucceeds(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner,
+		domain.WorkspaceRoleAdmin,
+		domain.WorkspaceRoleMember,
+		domain.WorkspaceRoleGuest,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "caller-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "caller-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			channels := &fakeChannelStore{createdChannel: domain.Channel{
+				ID: "ch-1", WorkspaceID: "ws-1", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+			}}
 
-	_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), &fakeChannelStore{}, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+			got, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+				WorkspaceID: "ws-1",
+				CallerID:    "caller-1",
+				Slug:        "team",
+				DisplayName: "Team",
+				Type:        domain.ChannelTypePublic,
+			})
+			if err != nil {
+				t.Fatalf("CreateChannel: %v", err)
+			}
+			if got.ID != "ch-1" {
+				t.Fatalf("unexpected channel: %+v", got)
+			}
+			if channels.lastCreateInput.CreatedBy != "caller-1" || channels.lastCreateInput.IsGeneral {
+				t.Fatalf("service must own created_by/is_general, input=%+v", channels.lastCreateInput)
+			}
+		})
+	}
+}
+
+// A membership row belonging to another workspace never authorizes a creation
+// in this one, even when it is active and holds the highest role.
+func TestChannelService_CreateChannel_CrossWorkspaceMembershipDenied(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", "owner-2")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-2", UserID: "owner-2", Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive,
+	}
+	channels := &fakeChannelStore{}
+
+	_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
 		WorkspaceID: "ws-1",
-		CallerID:    "member-1",
+		CallerID:    "owner-2",
 		Slug:        "team",
 		DisplayName: "Team",
 		Type:        domain.ChannelTypePublic,
 	})
 	if !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if channels.lastCreateInput.Slug != "" {
+		t.Fatalf("denied caller must not reach storage, input=%+v", channels.lastCreateInput)
+	}
+}
+
+// Update and archive stay management operations; loosening creation must not
+// have loosened them.
+func TestChannelService_UpdateAndArchive_StillRequireManageRole(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", "member-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "member-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+	}
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), &fakeChannelStore{}, ms)
+
+	if _, err := svc.UpdateChannel(context.Background(), service.UpdateChannelInput{
+		WorkspaceID: "ws-1", CallerID: "member-1", ChannelID: "ch-1", DisplayName: "Team",
+	}); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("UpdateChannel: expected ErrForbidden, got %v", err)
+	}
+	if _, err := svc.ArchiveChannel(context.Background(), "ws-1", "ch-1", "member-1"); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("ArchiveChannel: expected ErrForbidden, got %v", err)
 	}
 }
 
@@ -660,3 +727,182 @@ func TestChannelService_ArchivedChannelExcludedFromRead(t *testing.T) {
 func intPtr(v int) *int { return &v }
 
 func stringPtr(v string) *string { return &v }
+
+// display_name is required, trimmed, and bounded at
+// domain.MaxChannelDisplayNameCodePoints — counted in code points, so an emoji
+// costs exactly what an ASCII letter costs. A rejected name is never persisted
+// and never echoed back: it can be tens of kilobytes of caller-controlled text.
+func TestChannelService_CreateChannel_DisplayNameValidation(t *testing.T) {
+	const maxCodePoints = domain.MaxChannelDisplayNameCodePoints
+	for _, test := range []struct {
+		name        string
+		displayName string
+		wantErr     error
+		wantStored  string
+	}{
+		{name: "empty", displayName: "", wantErr: domain.ErrChannelDisplayNameRequired},
+		{name: "whitespace only", displayName: "   \t\n ", wantErr: domain.ErrChannelDisplayNameRequired},
+		{
+			name:        "100 ascii",
+			displayName: strings.Repeat("a", maxCodePoints),
+			wantStored:  strings.Repeat("a", maxCodePoints),
+		},
+		{
+			name:        "101 ascii",
+			displayName: strings.Repeat("a", maxCodePoints+1),
+			wantErr:     domain.ErrChannelDisplayNameTooLong,
+		},
+		// 100 emoji are 400 UTF-8 bytes and 200 UTF-16 units; only a code-point
+		// count accepts them, which is what the database also does.
+		{
+			name:        "100 emoji",
+			displayName: strings.Repeat("😀", maxCodePoints),
+			wantStored:  strings.Repeat("😀", maxCodePoints),
+		},
+		{
+			name:        "101 emoji",
+			displayName: strings.Repeat("😀", maxCodePoints+1),
+			wantErr:     domain.ErrChannelDisplayNameTooLong,
+		},
+		{
+			name:        "mixed ascii and emoji at the limit",
+			displayName: strings.Repeat("a", 50) + strings.Repeat("😀", 50),
+			wantStored:  strings.Repeat("a", 50) + strings.Repeat("😀", 50),
+		},
+		{
+			name:        "mixed ascii and emoji one over",
+			displayName: strings.Repeat("a", 50) + strings.Repeat("😀", 51),
+			wantErr:     domain.ErrChannelDisplayNameTooLong,
+		},
+		// Trimming happens before counting, so padding never decides the outcome
+		// and the stored value carries no surrounding whitespace.
+		{
+			name:        "trimmed back to the limit",
+			displayName: "  " + strings.Repeat("a", maxCodePoints) + "\t",
+			wantStored:  strings.Repeat("a", maxCodePoints),
+		},
+		{
+			name:        "over the limit only once trimmed",
+			displayName: " " + strings.Repeat("😀", maxCodePoints+1) + " ",
+			wantErr:     domain.ErrChannelDisplayNameTooLong,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "member-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "member-1", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive,
+			}
+			channels := &fakeChannelStore{createdChannel: domain.Channel{ID: "ch-1", WorkspaceID: "ws-1"}}
+
+			_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+				WorkspaceID: "ws-1",
+				CallerID:    "member-1",
+				Slug:        "team",
+				DisplayName: test.displayName,
+				Type:        domain.ChannelTypePublic,
+			})
+			if test.wantErr == nil {
+				if err != nil {
+					t.Fatalf("CreateChannel: %v", err)
+				}
+				got := channels.lastCreateInput.DisplayName
+				if got != test.wantStored {
+					t.Fatalf("stored %d code points, want %d",
+						utf8.RuneCountInString(got), utf8.RuneCountInString(test.wantStored))
+				}
+				if utf8.RuneCountInString(got) > maxCodePoints {
+					t.Fatalf("stored name exceeds the cap: %d code points", utf8.RuneCountInString(got))
+				}
+				return
+			}
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			// Both sentinels stay mapped to the status the endpoint already
+			// returns; the HTTP contract does not move.
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("error = %v, want it to satisfy ErrInvalidInput", err)
+			}
+			if channels.lastCreateInput.DisplayName != "" || channels.lastCreateInput.Slug != "" {
+				t.Fatalf("invalid name reached storage: %+v", channels.lastCreateInput)
+			}
+			if trimmed := strings.TrimSpace(test.displayName); trimmed != "" && strings.Contains(err.Error(), trimmed) {
+				t.Fatal("error echoes the rejected value")
+			}
+		})
+	}
+}
+
+// Renaming obeys the same rule from the same helper: an update must not be the
+// way past a cap creation enforces.
+func TestChannelService_UpdateChannel_DisplayNameValidation(t *testing.T) {
+	const maxCodePoints = domain.MaxChannelDisplayNameCodePoints
+	newSvc := func() (*service.ChannelService, *fakeChannelStore) {
+		ms := newFakeMemberStore()
+		ms.workspaceMembers[wmKey("ws-1", "owner-1")] = domain.WorkspaceMember{
+			WorkspaceID: "ws-1", UserID: "owner-1", Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive,
+		}
+		channels := &fakeChannelStore{channel: domain.Channel{
+			ID: "ch-1", WorkspaceID: "ws-1", Slug: "team", DisplayName: "Team",
+			Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive,
+		}}
+		return service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms), channels
+	}
+
+	for _, test := range []struct {
+		name        string
+		displayName string
+		wantErr     error
+		wantStored  string
+	}{
+		{name: "whitespace only", displayName: "   ", wantErr: domain.ErrChannelDisplayNameRequired},
+		{name: "101 ascii", displayName: strings.Repeat("a", maxCodePoints+1), wantErr: domain.ErrChannelDisplayNameTooLong},
+		{name: "101 emoji", displayName: strings.Repeat("😀", maxCodePoints+1), wantErr: domain.ErrChannelDisplayNameTooLong},
+		{name: "100 ascii", displayName: strings.Repeat("a", maxCodePoints), wantStored: strings.Repeat("a", maxCodePoints)},
+		{name: "100 emoji", displayName: strings.Repeat("😀", maxCodePoints), wantStored: strings.Repeat("😀", maxCodePoints)},
+		{name: "trimmed", displayName: "  Infra  ", wantStored: "Infra"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			svc, channels := newSvc()
+			_, err := svc.UpdateChannel(context.Background(), service.UpdateChannelInput{
+				WorkspaceID: "ws-1", CallerID: "owner-1", ChannelID: "ch-1", DisplayName: test.displayName,
+			})
+			if test.wantErr == nil {
+				if err != nil {
+					t.Fatalf("UpdateChannel: %v", err)
+				}
+				if got := channels.lastUpdateInput.DisplayName; got != test.wantStored {
+					t.Fatalf("stored %d code points, want %d",
+						utf8.RuneCountInString(got), utf8.RuneCountInString(test.wantStored))
+				}
+				return
+			}
+			if !errors.Is(err, test.wantErr) || !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			if channels.lastUpdateInput.ChannelID != "" {
+				t.Fatalf("an invalid rename reached storage: %+v", channels.lastUpdateInput)
+			}
+		})
+	}
+}
+
+// The workspace bootstrap persists display_name too, so it must not be the path
+// that skips the cap.
+func TestWorkspaceService_CreateChannel_EnforcesDisplayNameCap(t *testing.T) {
+	channels := &fakeChannelStore{createdChannel: domain.Channel{ID: "ch-1"}}
+	svc := service.NewWorkspaceService(activeWorkspaceStore("ws-1"), channels)
+
+	_, err := svc.CreateChannel(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1",
+		Slug:        "team",
+		DisplayName: strings.Repeat("😀", domain.MaxChannelDisplayNameCodePoints+1),
+		Type:        domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrChannelDisplayNameTooLong) {
+		t.Fatalf("error = %v, want ErrChannelDisplayNameTooLong", err)
+	}
+	if channels.lastCreateInput.Slug != "" {
+		t.Fatalf("an oversized name reached storage: %+v", channels.lastCreateInput)
+	}
+}

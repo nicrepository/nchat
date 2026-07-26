@@ -29,6 +29,12 @@ type CreateChannelInput struct {
 	IsGeneral   bool
 	Position    int
 	CreatedBy   string
+	// EnsureCreatorMemberRole, when non-empty, adds CreatedBy to
+	// chat.channel_members in the same transaction as the channel insert, the
+	// way UpdateChannelInput.EnsureMemberUserID does for a public→private
+	// switch. Private channels need it so the creator can see what they made;
+	// public ones do not. Honoured by CreateChannelForActiveMember only.
+	EnsureCreatorMemberRole domain.ChannelRole
 }
 
 // UpdateChannelInput holds the complete mutable channel state to persist.
@@ -54,7 +60,13 @@ type VisibleChannelAccess struct {
 type ChannelStore interface {
 	CreateCategory(ctx context.Context, input CreateCategoryInput) (domain.ChannelCategory, error)
 	CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error)
-	CreateChannelWithMember(ctx context.Context, input CreateChannelInput, userID string, role domain.ChannelRole) (domain.Channel, error)
+	// CreateChannelForActiveMember creates a channel on behalf of input.CreatedBy,
+	// serialising the authorization decision with the write itself.
+	//
+	// Returns domain.ErrForbidden — without saying which condition failed — when
+	// the workspace is not active, or input.CreatedBy has no active membership in
+	// it at the moment of the INSERT.
+	CreateChannelForActiveMember(ctx context.Context, input CreateChannelInput) (domain.Channel, error)
 	GetCategoryByIDInWorkspace(ctx context.Context, workspaceID, id string) (domain.ChannelCategory, error)
 	GetChannelByID(ctx context.Context, id string) (domain.Channel, error)
 	// GetChannelByIDInWorkspace returns the channel only if it belongs to workspaceID.
@@ -99,27 +111,103 @@ func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannel
 	return createChannel(ctx, s.pool, input)
 }
 
-func (s *PGXChannelStore) CreateChannelWithMember(ctx context.Context, input CreateChannelInput, userID string, role domain.ChannelRole) (domain.Channel, error) {
+// CreateChannelForActiveMember is the authorization-bearing creation path used
+// by ChannelService (BUG #393).
+//
+// Channel creation takes an active membership in an active workspace, and both
+// are mutable: checking them and then inserting are two steps, and a membership
+// revoked in between would still get its channel. Here the check and the insert
+// are one statement — the INSERT draws its rows from an authorized context that
+// locks the workspace and the membership, so there is nothing to interleave.
+//
+// The locks are FOR SHARE rather than FOR UPDATE. Revoking a membership or
+// disabling a workspace is an UPDATE of a non-key column, which takes FOR NO KEY
+// UPDATE; that conflicts with FOR SHARE, so either one is serialised against a
+// creation in flight. Two concurrent creations, however, both take FOR SHARE and
+// do not block each other, which FOR UPDATE would have made them do for no
+// safety gained.
+//
+// Whichever side wins is a correct outcome: a revocation that commits first
+// makes the locked SELECT re-evaluate its predicate against the new row version,
+// find no active membership, and insert nothing; a creation that gets there
+// first completes and the revocation waits for the commit.
+//
+// workspace_id and created_by are read back out of the authorized context rather
+// than taken from the parameters, so the row can only ever record the workspace
+// and the actor the database itself authorized.
+func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
+	if input.CreatedBy == "" {
+		return domain.Channel{}, domain.ErrForbidden
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.Channel{}, fmt.Errorf("begin create channel with member: %w", err)
+		return domain.Channel{}, fmt.Errorf("begin create channel for active member: %w", err)
 	}
 	committed := false
 	defer func() {
 		if !committed {
+			// Rolled back on every failure below, including a failed secondary
+			// insert, so a denied or broken creation never leaves a channel or a
+			// half-populated membership behind.
 			_ = tx.Rollback(ctx)
 		}
 	}()
 
-	ch, err := createChannel(ctx, tx, input)
+	var categoryID *string
+	if input.CategoryID != "" {
+		categoryID = &input.CategoryID
+	}
+
+	var ch domain.Channel
+	err = tx.QueryRow(ctx, `
+		WITH authorized_context AS (
+			SELECT w.id AS workspace_id, wm.user_id
+			FROM chat.workspaces w
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = w.id
+			WHERE w.id = $1
+			  AND w.status = 'active'
+			  AND wm.user_id = $8
+			  AND wm.status = 'active'
+			FOR SHARE OF w, wm
+		)
+		INSERT INTO chat.channels
+			(workspace_id, category_id, slug, display_name, type, is_general, position, created_by)
+		SELECT ac.workspace_id, $2, $3, $4, $5, $6, $7, ac.user_id
+		FROM authorized_context ac
+		RETURNING id, workspace_id, COALESCE(category_id::text, ''), slug, display_name,
+		          type, status, is_general, position, COALESCE(created_by::text, ''),
+		          created_at, updated_at`,
+		input.WorkspaceID, categoryID, input.Slug, input.DisplayName,
+		string(input.Type), input.IsGeneral, input.Position, input.CreatedBy,
+	).Scan(
+		&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
+		(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
+		&ch.CreatedAt, &ch.UpdatedAt,
+	)
 	if err != nil {
-		return domain.Channel{}, err
+		// No row from the authorized context means no INSERT: the workspace was
+		// not active, or the membership was absent or no longer active. Which of
+		// them is deliberately not distinguished — the caller must not learn the
+		// workspace exists from a failure to create in it.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Channel{}, domain.ErrForbidden
+		}
+		if mapped := mapChannelWriteError(err); mapped != nil {
+			return domain.Channel{}, mapped
+		}
+		return domain.Channel{}, fmt.Errorf("create channel for active member: %w", err)
 	}
-	if err := addChannelMember(ctx, tx, ch.ID, userID, role); err != nil {
-		return domain.Channel{}, err
+
+	if input.EnsureCreatorMemberRole != "" {
+		if err := addChannelMember(ctx, tx, ch.ID, ch.CreatedBy, input.EnsureCreatorMemberRole); err != nil {
+			return domain.Channel{}, err
+		}
 	}
+
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Channel{}, fmt.Errorf("commit create channel with member: %w", err)
+		return domain.Channel{}, fmt.Errorf("commit create channel for active member: %w", err)
 	}
 	committed = true
 	return ch, nil

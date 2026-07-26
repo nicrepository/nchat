@@ -1,6 +1,7 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
+import ChannelCreationForm from "./ChannelCreationForm";
 import { ApiRequestError } from "../lib/api";
 import { createGroupDM, getOrCreateDirectDM, searchDMCandidates } from "./chatApi";
 import type { DMCandidate } from "./chatTypes";
@@ -14,7 +15,12 @@ import {
 const SEARCH_MIN_LENGTH = 2;
 const SEARCH_DEBOUNCE_MS = 150;
 
-type ConversationMode = "direct" | "group";
+/**
+ * The three things "Nova conversa" can start (BUG #393). Channel creation lives
+ * here rather than behind its own sidebar control so the workspace has a single
+ * entry point; the mode picks which canonical flow the dialog body runs.
+ */
+type ConversationMode = "direct" | "group" | "channel";
 
 /**
  * The one in-flight write, if any. A single value instead of a pair of booleans:
@@ -23,10 +29,11 @@ type ConversationMode = "direct" | "group";
  */
 type Submission = { kind: "idle" } | { kind: "direct"; userId: string } | { kind: "group" };
 
-interface NewDirectMessageDialogProps {
+interface NewConversationDialogProps {
   currentUserId: string;
   onClose: () => void;
   onOpened: (conversationId: string) => void;
+  onChannelCreated: (channelId: string) => void;
 }
 
 type SearchStatus = "idle" | "loading" | "ready" | "error";
@@ -100,6 +107,7 @@ function ConversationModeChoice({ mode, disabled, onChange }: ConversationModeCh
         [
           ["direct", "Pessoa"],
           ["group", "Grupo"],
+          ["channel", "Canal"],
         ] as const
       ).map(([value, label]) => (
         <label
@@ -178,11 +186,12 @@ function GroupSubmitFooter({ selectedCount, pending, disabled, onSubmit }: Group
   );
 }
 
-export default function NewDirectMessageDialog({
+export default function NewConversationDialog({
   currentUserId,
   onClose,
   onOpened,
-}: NewDirectMessageDialogProps) {
+  onChannelCreated,
+}: NewConversationDialogProps) {
   const [mode, setMode] = useState<ConversationMode>("direct");
   const [query, setQuery] = useState("");
   const [candidates, setCandidates] = useState<DMCandidate[]>([]);
@@ -195,6 +204,9 @@ export default function NewDirectMessageDialog({
   // and outside any store because they are meaningless once the modal closes.
   const [selected, setSelected] = useState<DMCandidate[]>([]);
   const [groupTitle, setGroupTitle] = useState("");
+  // Mirrors the channel form's own in-flight state so the shell — close button,
+  // backdrop, Escape, mode switch — treats it exactly like a DM submission.
+  const [channelPending, setChannelPending] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   // State updates are asynchronous, so `submission` cannot stop a second click
@@ -205,7 +217,10 @@ export default function NewDirectMessageDialog({
 
   const normalizedQuery = query.trim();
   const isGroup = mode === "group";
-  const busy = submission.kind !== "idle";
+  const isChannel = mode === "channel";
+  // One busy flag for the whole dialog: whichever write is running, the shell
+  // reacts the same way.
+  const busy = submission.kind !== "idle" || channelPending;
   const atCapacity = selected.length >= MAX_GROUP_MEMBERS;
 
   useEffect(() => {
@@ -218,6 +233,7 @@ export default function NewDirectMessageDialog({
   }, []);
 
   useEffect(() => {
+    if (isChannel) return;
     if (normalizedQuery.length < SEARCH_MIN_LENGTH) return;
 
     const controller = new AbortController();
@@ -243,10 +259,10 @@ export default function NewDirectMessageDialog({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [currentUserId, normalizedQuery, searchAttempt]);
+  }, [currentUserId, isChannel, normalizedQuery, searchAttempt]);
 
   function requestClose() {
-    if (!submittingRef.current) onClose();
+    if (!submittingRef.current && !channelPending) onClose();
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -285,6 +301,13 @@ export default function NewDirectMessageDialog({
     setMode(next);
     setOpenError("");
   }
+
+  const description =
+    mode === "group"
+      ? "Selecione pelo menos 2 pessoas do workspace para criar um grupo."
+      : mode === "channel"
+        ? "Canais públicos ficam visíveis para todo o workspace. Canais privados só aparecem para quem for adicionado."
+        : "Encontre uma pessoa do workspace para conversar.";
 
   /**
    * Runs the single write this dialog can make, whichever it is.
@@ -353,17 +376,13 @@ export default function NewDirectMessageDialog({
       >
         <header className="new-dm-dialog__header">
           <div>
-            <h2 id="new-dm-title">Nova mensagem</h2>
-            <p id="new-dm-description">
-              {isGroup
-                ? "Selecione pelo menos 2 pessoas do workspace para criar um grupo."
-                : "Encontre uma pessoa do workspace para conversar."}
-            </p>
+            <h2 id="new-dm-title">Nova conversa</h2>
+            <p id="new-dm-description">{description}</p>
           </div>
           <button
             type="button"
             className="new-dm-dialog__close"
-            aria-label="Fechar nova mensagem"
+            aria-label="Fechar nova conversa"
             disabled={busy}
             onClick={requestClose}
           >
@@ -375,124 +394,133 @@ export default function NewDirectMessageDialog({
 
         <ConversationModeChoice mode={mode} disabled={busy} onChange={changeMode} />
 
-        <div className="new-dm-dialog__search">
-          <label htmlFor="new-dm-search">Pesquisar pessoa</label>
-          <div className="new-dm-dialog__search-field">
-            <span className="material-symbols-outlined" aria-hidden="true">
-              search
-            </span>
-            <input
-              ref={searchInputRef}
-              id="new-dm-search"
-              type="search"
-              autoComplete="off"
-              maxLength={64}
-              placeholder="Digite um nome"
-              value={query}
-              onChange={(event) => {
-                const value = event.target.value;
-                setQuery(value);
-                setCandidates([]);
-                setSearchError("");
-                setSearchStatus(value.trim().length >= SEARCH_MIN_LENGTH ? "loading" : "idle");
-                setOpenError("");
-              }}
-            />
-          </div>
+        {isChannel && (
+          <ChannelCreationForm onCreated={onChannelCreated} onPendingChange={setChannelPending} />
+        )}
 
-          {isGroup && (
-            <>
-              <GroupMemberChips members={selected} disabled={busy} onRemove={toggleMember} />
+        {!isChannel && (
+          <>
+            <div className="new-dm-dialog__search">
+              <label htmlFor="new-dm-search">Pesquisar pessoa</label>
+              <div className="new-dm-dialog__search-field">
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  search
+                </span>
+                <input
+                  ref={searchInputRef}
+                  id="new-dm-search"
+                  type="search"
+                  autoComplete="off"
+                  maxLength={64}
+                  placeholder="Digite um nome"
+                  value={query}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setQuery(value);
+                    setCandidates([]);
+                    setSearchError("");
+                    setSearchStatus(value.trim().length >= SEARCH_MIN_LENGTH ? "loading" : "idle");
+                    setOpenError("");
+                  }}
+                />
+              </div>
 
-              <label className="new-dm-dialog__group-name" htmlFor="new-dm-group-name">
-                Nome do grupo (opcional)
-              </label>
-              {/* Truncation is by Unicode code point, the unit the server counts;
+              {isGroup && (
+                <>
+                  <GroupMemberChips members={selected} disabled={busy} onRemove={toggleMember} />
+
+                  <label className="new-dm-dialog__group-name" htmlFor="new-dm-group-name">
+                    Nome do grupo (opcional)
+                  </label>
+                  {/* Truncation is by Unicode code point, the unit the server counts;
                   the maxLength attribute would count UTF-16 units and cut an
                   emoji-heavy name in half of its allowance. */}
-              <input
-                id="new-dm-group-name"
-                type="text"
-                autoComplete="off"
-                placeholder="Ex.: Infraestrutura"
-                value={groupTitle}
-                disabled={busy}
-                onChange={(event) => setGroupTitle(limitGroupTitleInput(event.target.value))}
-              />
-            </>
-          )}
-        </div>
-
-        <div className="new-dm-dialog__results" aria-live="polite">
-          {searchStatus === "idle" && (
-            <p className="new-dm-dialog__hint">Digite pelo menos 2 caracteres.</p>
-          )}
-          {searchStatus === "loading" && (
-            <p className="new-dm-dialog__status" role="status">
-              Buscando pessoas…
-            </p>
-          )}
-          {searchStatus === "error" && (
-            <div className="new-dm-dialog__error" role="alert">
-              <span>{searchError}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setSearchStatus("loading");
-                  setSearchError("");
-                  setSearchAttempt((attempt) => attempt + 1);
-                }}
-              >
-                Tentar novamente
-              </button>
+                  <input
+                    id="new-dm-group-name"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="Ex.: Infraestrutura"
+                    value={groupTitle}
+                    disabled={busy}
+                    onChange={(event) => setGroupTitle(limitGroupTitleInput(event.target.value))}
+                  />
+                </>
+              )}
             </div>
-          )}
-          {searchStatus === "ready" && candidates.length === 0 && (
-            <p className="new-dm-dialog__status">Nenhuma pessoa encontrada.</p>
-          )}
-          {searchStatus === "ready" && candidates.length > 0 && (
-            <ul className="new-dm-dialog__list" aria-label="Pessoas encontradas">
-              {candidates.map((candidate) => {
-                const picked = selected.some((member) => member.userId === candidate.userId);
-                return (
-                  <li key={candidate.userId}>
-                    <button
-                      type="button"
-                      aria-pressed={isGroup ? picked : undefined}
-                      disabled={busy || (isGroup && atCapacity && !picked)}
-                      onClick={() =>
-                        isGroup ? toggleMember(candidate) : openConversation(candidate)
-                      }
-                    >
-                      <span className="new-dm-dialog__avatar" aria-hidden="true">
-                        {initials(candidate.displayName) || "?"}
-                      </span>
-                      <span>{candidate.displayName}</span>
-                      {submission.kind === "direct" && submission.userId === candidate.userId && (
-                        <span className="new-dm-dialog__opening" role="status">
-                          Abrindo…
-                        </span>
-                      )}
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-          {openError && (
-            <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">
-              {openError}
-            </p>
-          )}
-        </div>
 
-        {isGroup && (
-          <GroupSubmitFooter
-            selectedCount={selected.length}
-            pending={submission.kind === "group"}
-            disabled={selected.length < MIN_GROUP_MEMBERS || busy}
-            onSubmit={submitGroup}
-          />
+            <div className="new-dm-dialog__results" aria-live="polite">
+              {searchStatus === "idle" && (
+                <p className="new-dm-dialog__hint">Digite pelo menos 2 caracteres.</p>
+              )}
+              {searchStatus === "loading" && (
+                <p className="new-dm-dialog__status" role="status">
+                  Buscando pessoas…
+                </p>
+              )}
+              {searchStatus === "error" && (
+                <div className="new-dm-dialog__error" role="alert">
+                  <span>{searchError}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchStatus("loading");
+                      setSearchError("");
+                      setSearchAttempt((attempt) => attempt + 1);
+                    }}
+                  >
+                    Tentar novamente
+                  </button>
+                </div>
+              )}
+              {searchStatus === "ready" && candidates.length === 0 && (
+                <p className="new-dm-dialog__status">Nenhuma pessoa encontrada.</p>
+              )}
+              {searchStatus === "ready" && candidates.length > 0 && (
+                <ul className="new-dm-dialog__list" aria-label="Pessoas encontradas">
+                  {candidates.map((candidate) => {
+                    const picked = selected.some((member) => member.userId === candidate.userId);
+                    return (
+                      <li key={candidate.userId}>
+                        <button
+                          type="button"
+                          aria-pressed={isGroup ? picked : undefined}
+                          disabled={busy || (isGroup && atCapacity && !picked)}
+                          onClick={() =>
+                            isGroup ? toggleMember(candidate) : openConversation(candidate)
+                          }
+                        >
+                          <span className="new-dm-dialog__avatar" aria-hidden="true">
+                            {initials(candidate.displayName) || "?"}
+                          </span>
+                          <span>{candidate.displayName}</span>
+                          {submission.kind === "direct" &&
+                            submission.userId === candidate.userId && (
+                              <span className="new-dm-dialog__opening" role="status">
+                                Abrindo…
+                              </span>
+                            )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+              {openError && (
+                <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">
+                  {openError}
+                </p>
+              )}
+            </div>
+
+            {isGroup && (
+              <GroupSubmitFooter
+                selectedCount={selected.length}
+                pending={submission.kind === "group"}
+                disabled={selected.length < MIN_GROUP_MEMBERS || busy}
+                onSubmit={submitGroup}
+              />
+            )}
+          </>
         )}
       </div>
     </div>,

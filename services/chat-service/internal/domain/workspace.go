@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+	"unicode/utf8"
+)
 
 type WorkspaceStatus string
 
@@ -112,6 +116,33 @@ type Channel struct {
 	UpdatedAt   time.Time
 }
 
+// MaxChannelDisplayNameCodePoints bounds a channel's display name.
+//
+// Security resource cap. Counted in Unicode code points to match Go
+// utf8.RuneCountInString and PostgreSQL char_length.
+const MaxChannelDisplayNameCodePoints = 100
+
+// NormalizeChannelDisplayName trims a channel name and enforces the cap.
+//
+// The single rule behind every path that persists chat.channels.display_name —
+// creation, update and the workspace bootstrap — so no writer can be left with a
+// weaker one. Returns the value to store; never truncates, because silently
+// storing something other than what the caller sent is worse than refusing it.
+//
+// Neither error carries the offending value: a rejected name can be tens of
+// kilobytes of caller-controlled text, and it would otherwise reach every error
+// body and every log line that wraps it.
+func NormalizeChannelDisplayName(value string) (string, error) {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return "", ErrChannelDisplayNameRequired
+	}
+	if utf8.RuneCountInString(normalized) > MaxChannelDisplayNameCodePoints {
+		return "", ErrChannelDisplayNameTooLong
+	}
+	return normalized, nil
+}
+
 // WorkspaceMember represents a user's membership in a workspace.
 type WorkspaceMember struct {
 	WorkspaceID string
@@ -210,9 +241,9 @@ func CanWriteChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
 }
 
 // CanManageWorkspace reports whether a user holds workspace management rights —
-// the single predicate behind channel creation, update and archival, and the one
-// the sidebar advertises so the UI never invents its own rule. A nil or inactive
-// membership is never sufficient.
+// the single predicate behind channel update and archival, and behind workspace
+// settings. Channel *creation* is deliberately not one of them: it takes active
+// membership only (BUG #393). A nil or inactive membership is never sufficient.
 func CanManageWorkspace(wm *WorkspaceMember) bool {
 	if wm == nil || wm.Status != MemberStatusActive {
 		return false
