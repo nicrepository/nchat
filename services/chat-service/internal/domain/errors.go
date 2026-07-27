@@ -41,4 +41,26 @@ var (
 	// repeats the rejected name.
 	ErrChannelDisplayNameRequired = fmt.Errorf("%w: display_name is required", ErrInvalidInput)
 	ErrChannelDisplayNameTooLong  = fmt.Errorf("%w: display_name must be %d characters or fewer", ErrInvalidInput, MaxChannelDisplayNameCodePoints)
+	// The four ways a channel category name fails
+	// NormalizeChannelCategoryName (RF-17), and the two ways a category write
+	// conflicts with existing state.
+	//
+	// The name errors wrap ErrInvalidInput and the conflicts wrap ErrConflict, so
+	// each maps to the status the HTTP layer already returns for its family
+	// without a new branch. None of the messages repeats the rejected name.
+	ErrChannelCategoryNameRequired = fmt.Errorf("%w: name is required", ErrInvalidInput)
+	ErrChannelCategoryNameInvalid  = fmt.Errorf("%w: name must not contain control characters", ErrInvalidInput)
+	ErrChannelCategoryNameTooLong  = fmt.Errorf("%w: name must be %d characters or fewer", ErrInvalidInput, MaxChannelCategoryNameCodePoints)
+	ErrChannelCategoryNameReserved = fmt.Errorf("%w: %q is reserved for uncategorized channels", ErrInvalidInput, UncategorizedGroupName)
+	// ErrDuplicateChannelCategoryName reports a name already used by another
+	// category in the same workspace, compared case-insensitively. The collision
+	// is never silenced: the write fails and the caller is told.
+	ErrDuplicateChannelCategoryName = fmt.Errorf("%w: category name already in use", ErrConflict)
+	// ErrChannelCategoryLimitReached reports the per-workspace category ceiling.
+	ErrChannelCategoryLimitReached = fmt.Errorf("%w: workspace category limit reached", ErrConflict)
+	// ErrInvalidChannelCategoryOrder reports a reorder payload that is not
+	// exactly the workspace's category set: a duplicate ID, a missing one, or one
+	// belonging to another workspace. It says which rule was broken but never
+	// which IDs exist, so it cannot be used to enumerate another workspace.
+	ErrInvalidChannelCategoryOrder = fmt.Errorf("%w: order must list every category of the workspace exactly once", ErrInvalidInput)
 )

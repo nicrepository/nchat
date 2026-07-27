@@ -35,7 +35,7 @@ const mentionSearchRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
@@ -117,6 +117,19 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	// 503 on a route that does not exist.
 	if channels != nil {
 		mux.Handle("POST "+RouteChannels, authMiddleware(http.HandlerFunc(channels.Create)))
+	}
+	// RF-17 channel categories. Registered only when wired, like the channel and
+	// DM routes, so a build without the handler answers 404 on a route that does
+	// not exist rather than a misleading 503. The listing shares the read budget;
+	// the four mutations carry their own budget inside the handler.
+	if channelCategories != nil {
+		mux.Handle("GET "+RouteChannelCategories, authMiddleware(
+			msgListLimiter.Middleware(http.HandlerFunc(channelCategories.List)),
+		))
+		mux.Handle("POST "+RouteChannelCategories, authMiddleware(http.HandlerFunc(channelCategories.Create)))
+		mux.Handle("PUT "+RouteChannelCategoriesOrder, authMiddleware(http.HandlerFunc(channelCategories.Reorder)))
+		mux.Handle("PATCH "+RouteChannelCategory, authMiddleware(http.HandlerFunc(channelCategories.Rename)))
+		mux.Handle("DELETE "+RouteChannelCategory, authMiddleware(http.HandlerFunc(channelCategories.Delete)))
 	}
 	if directMessages != nil {
 		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))

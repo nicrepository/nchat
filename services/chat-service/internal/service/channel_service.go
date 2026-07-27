@@ -234,7 +234,25 @@ func (s *ChannelService) ArchiveChannel(ctx context.Context, workspaceID, channe
 }
 
 func (s *ChannelService) requireManagePermission(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
-	member, err := s.requireActiveWorkspaceMember(ctx, workspaceID, userID)
+	return requireWorkspaceManager(ctx, s.workspaces, s.members, workspaceID, userID)
+}
+
+func (s *ChannelService) requireActiveWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	return requireActiveWorkspaceMember(ctx, s.workspaces, s.members, workspaceID, userID)
+}
+
+// requireWorkspaceManager and requireActiveWorkspaceMember are package-level so
+// that every service in this package decides membership and management rights
+// from the same code. They were methods on ChannelService until RF-17 needed the
+// same two predicates for channel categories; copying an authorization predicate
+// is how the two copies eventually stop agreeing.
+//
+// Both return domain.ErrForbidden for every denial, and deliberately never
+// distinguish a missing workspace from a disabled one or from a caller who is not
+// a member: a caller with no business in a workspace must not learn from the
+// error whether it exists.
+func requireWorkspaceManager(ctx context.Context, workspaces storage.WorkspaceStore, members storage.MemberStore, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	member, err := requireActiveWorkspaceMember(ctx, workspaces, members, workspaceID, userID)
 	if err != nil {
 		return domain.WorkspaceMember{}, err
 	}
@@ -244,8 +262,8 @@ func (s *ChannelService) requireManagePermission(ctx context.Context, workspaceI
 	return member, nil
 }
 
-func (s *ChannelService) requireActiveWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
-	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+func requireActiveWorkspaceMember(ctx context.Context, workspaces storage.WorkspaceStore, members storage.MemberStore, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	workspace, err := workspaces.GetWorkspaceByID(ctx, workspaceID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return domain.WorkspaceMember{}, domain.ErrForbidden
@@ -256,7 +274,7 @@ func (s *ChannelService) requireActiveWorkspaceMember(ctx context.Context, works
 		return domain.WorkspaceMember{}, domain.ErrForbidden
 	}
 
-	member, err := s.members.GetWorkspaceMember(ctx, workspaceID, userID)
+	member, err := members.GetWorkspaceMember(ctx, workspaceID, userID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return domain.WorkspaceMember{}, domain.ErrForbidden

@@ -119,6 +119,7 @@ func New(cfg config.Config) (*App, error) {
 	var pinSvc *service.PinService
 	var permissionSvc *service.PermissionService
 	var channelSvc *service.ChannelService
+	var channelCategorySvc *service.ChannelCategoryService
 
 	var closeDB func()
 	databaseReady := false
@@ -150,6 +151,9 @@ func New(cfg config.Config) (*App, error) {
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
 			permissionSvc = service.NewPermissionService(memberStore, channelStore)
 			channelSvc = service.NewChannelService(workspaceStore, channelStore, memberStore)
+			// channelStore is both the category store and the visible-channel read
+			// side, so RF-17 groups channels through the same query the sidebar uses.
+			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
@@ -213,6 +217,13 @@ func New(cfg config.Config) (*App, error) {
 	if channelSvc != nil && reactionLimiter != nil {
 		channels = httpapi.NewChannelHandler(workspaceStore, channelSvc, reactionLimiter)
 	}
+	// Same reasoning for the category routes (RF-17): the writes must be
+	// throttled, so an unconfigured Valkey leaves them unregistered rather than
+	// exposed. The read route shares the handler and so is gated with them.
+	var channelCategories *httpapi.ChannelCategoryHandler
+	if channelCategorySvc != nil && reactionLimiter != nil {
+		channelCategories = httpapi.NewChannelCategoryHandler(workspaceStore, channelCategorySvc, reactionLimiter)
+	}
 	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
 
@@ -241,7 +252,7 @@ func New(cfg config.Config) (*App, error) {
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels),
+		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories),
 		TracingShutdown: shutdown,
 		hub:             hub,
 		presence:        presence,
