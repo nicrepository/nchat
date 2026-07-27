@@ -4,6 +4,10 @@ export const CURRENT_USER_ID = "e2e-author";
 export const CURRENT_USER_NAME = "E2E Autor";
 export const OTHER_USER_ID = "e2e-participant";
 export const OTHER_USER_NAME = "E2E Participante";
+export const GROUP_DM_ID = "e2e-dm-group";
+export const GROUP_DM_NAME = "E2E Grupo";
+export const OTHER_CHANNEL_ID = "e2e-channel-other";
+export const OTHER_CHANNEL_NAME = "Canal E2E";
 
 type TargetKind = "channel" | "dm";
 
@@ -151,8 +155,9 @@ export function quoteFrom(message: RawMessage): RawQuote {
 export function createScenario(options: MessagingScenarioOptions): MessagingScenario {
   const messagesByTarget = new Map<string, RawMessage[]>();
   messagesByTarget.set(targetKey(options.kind, options.targetId), [...options.messages]);
-  messagesByTarget.set(targetKey("channel", "e2e-channel-other"), []);
+  messagesByTarget.set(targetKey("channel", OTHER_CHANNEL_ID), []);
   messagesByTarget.set(targetKey("dm", "e2e-dm-other"), []);
+  messagesByTarget.set(targetKey("dm", GROUP_DM_ID), []);
 
   return {
     kind: options.kind,
@@ -235,9 +240,9 @@ export async function installMessagingMocks(
                     unread_count: 0,
                   },
                   {
-                    id: "e2e-channel-other",
+                    id: OTHER_CHANNEL_ID,
                     slug: "e2e-canal-secundario",
-                    display_name: "Canal E2E",
+                    display_name: OTHER_CHANNEL_NAME,
                     type: "public",
                     can_write: true,
                     unread_count: 0,
@@ -245,9 +250,9 @@ export async function installMessagingMocks(
                 ]
               : [
                   {
-                    id: "e2e-channel-other",
+                    id: OTHER_CHANNEL_ID,
                     slug: "e2e-canal",
-                    display_name: "Canal E2E",
+                    display_name: OTHER_CHANNEL_NAME,
                     type: "public",
                     can_write: true,
                     unread_count: 0,
@@ -258,6 +263,14 @@ export async function installMessagingMocks(
               id: scenario.kind === "dm" ? scenario.targetId : "e2e-dm-other",
               type: "direct",
               name: scenario.kind === "dm" ? scenario.targetName : OTHER_USER_NAME,
+              unread_count: 0,
+            },
+            // An ad-hoc group is always present so the sidebar fixture covers
+            // all three product categories (ISSUE #396).
+            {
+              id: GROUP_DM_ID,
+              type: "group",
+              name: GROUP_DM_NAME,
               unread_count: 0,
             },
           ],

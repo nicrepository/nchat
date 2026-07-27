@@ -1028,6 +1028,389 @@ describe("ChatSidebar — ad-hoc group creation", () => {
   });
 });
 
+// ── Section classification (ISSUE #396) ───────────────────────────────────────
+// Canais, Mensagens diretas and Grupos are distinct product categories. Each
+// item belongs to exactly one of them, decided by the canonical server-derived
+// discriminator — never by the label, the avatar or the participant count.
+
+describe("ChatSidebar — section classification", () => {
+  const PUBLIC_CHANNEL: Channel = { id: "geral", name: "geral", type: "public", canWrite: true };
+  const PRIVATE_CHANNEL: Channel = {
+    id: "projetos",
+    name: "projetos",
+    type: "private",
+    canWrite: true,
+  };
+  const DIRECT: DMConversation = {
+    id: "dm-1",
+    type: "1:1",
+    name: "Juliane Lino",
+    participants: [],
+  };
+  const GROUP: DMConversation = {
+    id: "dm-grp",
+    type: "group",
+    name: "Equipe Infra",
+    participants: [],
+  };
+
+  const mixedSidebar = () => ({
+    currentUserId: "user-a",
+    channels: [PUBLIC_CHANNEL, PRIVATE_CHANNEL],
+    dms: [DIRECT, GROUP],
+  });
+
+  /** Each section is a landmark named by its own heading. */
+  const section = (name: string) => screen.getByRole("region", { name });
+  const optionNamesIn = (name: string) =>
+    within(section(name))
+      .queryAllByRole("option")
+      .map((option) => option.getAttribute("aria-label"));
+
+  it("renders the three sections as headings, in product order", async () => {
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent);
+    expect(headings).toEqual(["Canais", "Mensagens diretas", "Grupos"]);
+    // Each section's list is labelled by its own heading, so a screen reader
+    // never has to guess which category a row belongs to.
+    expect(screen.getAllByRole("listbox").map((l) => l.getAttribute("aria-labelledby"))).toEqual([
+      screen.getByRole("heading", { name: "Canais" }).id,
+      screen.getByRole("heading", { name: "Mensagens diretas" }).id,
+      screen.getByRole("heading", { name: "Grupos" }).id,
+    ]);
+  });
+
+  it("keeps public and private channels in Canais only", async () => {
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(optionNamesIn("Canais")).toEqual(["Canal geral", "Canal privado projetos"]);
+    expect(optionNamesIn("Mensagens diretas")).not.toContain("Canal geral");
+    expect(optionNamesIn("Grupos")).not.toContain("Canal privado projetos");
+  });
+
+  it("keeps a 1:1 conversation in Mensagens diretas only", async () => {
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(optionNamesIn("Mensagens diretas")).toEqual(["Mensagem direta com Juliane Lino"]);
+    expect(optionNamesIn("Grupos")).not.toContain("Mensagem direta com Juliane Lino");
+  });
+
+  it("keeps an ad-hoc group in Grupos only", async () => {
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo Equipe Infra"]);
+    expect(optionNamesIn("Mensagens diretas")).not.toContain("Grupo Equipe Infra");
+  });
+
+  it("lists every item exactly once across the whole sidebar", async () => {
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    const all = [
+      ...optionNamesIn("Canais"),
+      ...optionNamesIn("Mensagens diretas"),
+      ...optionNamesIn("Grupos"),
+    ];
+    expect(all).toHaveLength(4);
+    expect(new Set(all).size).toBe(4);
+    // No row is duplicated in the accessibility tree either.
+    expect(screen.getAllByRole("option")).toHaveLength(4);
+  });
+
+  it("classifies on the discriminator, not on the displayed name", async () => {
+    // A group named like a person and a 1:1 named like a group: swapping them
+    // would be the classic "read the title and guess" bug.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        { id: "dm-1", type: "1:1", name: "Equipe Infra, Caio e Ana", participants: [] },
+        { id: "dm-grp", type: "group", name: "Juliane Lino", participants: [] },
+      ],
+    });
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com Equipe Infra, Caio e Ana",
+    ]);
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo Juliane Lino"]);
+  });
+
+  it("gives each empty section its own message and never presents it as a failure", async () => {
+    mockFetchSidebarData.mockResolvedValue({ currentUserId: "user-a", channels: [], dms: [] });
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(within(section("Canais")).getByText("Nenhum canal disponível.")).toBeInTheDocument();
+    expect(
+      within(section("Mensagens diretas")).getByText("Nenhuma mensagem direta."),
+    ).toBeInTheDocument();
+    expect(within(section("Grupos")).getByText("Nenhum grupo.")).toBeInTheDocument();
+    // An empty section is not an error and offers no retry.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /tentar novamente/i })).not.toBeInTheDocument();
+  });
+
+  it("shows an empty Grupos while Mensagens diretas has items, and vice versa", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [DIRECT],
+    });
+    const { unmount } = renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(optionNamesIn("Mensagens diretas")).toHaveLength(1);
+    expect(within(section("Grupos")).getByText("Nenhum grupo.")).toBeInTheDocument();
+    unmount();
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [GROUP],
+    });
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    expect(optionNamesIn("Grupos")).toHaveLength(1);
+    expect(
+      within(section("Mensagens diretas")).getByText("Nenhuma mensagem direta."),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no section at all while loading — nothing lands in the wrong category", async () => {
+    mockFetchSidebarData.mockReturnValue(new Promise(() => {}));
+    renderChat();
+
+    await screen.findByTestId("chat-sidebar");
+    expect(screen.getByRole("status", { name: /carregando/i })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Grupos" })).not.toBeInTheDocument();
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+  });
+
+  it("replaces the sections with a single retryable error, exposing no internals", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData
+      .mockRejectedValueOnce(new Error("pq: relation chat.dm_conversations does not exist"))
+      .mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Não foi possível carregar os canais.");
+    expect(alert).not.toHaveTextContent(/pq:|relation|dm_conversations/);
+    expect(screen.queryByRole("heading", { name: "Grupos" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /tentar novamente/i }));
+    await screen.findByRole("heading", { name: "Grupos" });
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo Equipe Infra"]);
+  });
+
+  it("keeps unread badges on their own item in each section", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [{ ...PUBLIC_CHANNEL, unreadCount: 3 }, PRIVATE_CHANNEL],
+      dms: [
+        { ...DIRECT, unreadCount: 7 },
+        { ...GROUP, unreadCount: 2 },
+      ],
+    });
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    const badgeOf = (label: string) =>
+      within(screen.getByRole("option", { name: label })).queryByLabelText(/não lidas/i)
+        ?.textContent;
+
+    expect(badgeOf("Canal geral")).toBe("3");
+    expect(badgeOf("Mensagem direta com Juliane Lino")).toBe("7");
+    expect(badgeOf("Grupo Equipe Infra")).toBe("2");
+    // A channel with no unread count shows no badge at all.
+    expect(badgeOf("Canal privado projetos")).toBeUndefined();
+  });
+
+  it("reaches items of all three sections by keyboard, with focus never trapped", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    trigger.focus();
+
+    const expected = [
+      "Canal geral",
+      "Canal privado projetos",
+      "Mensagem direta com Juliane Lino",
+      "Grupo Equipe Infra",
+    ];
+    for (const label of expected) {
+      await user.tab();
+      expect(screen.getByRole("option", { name: label })).toHaveFocus();
+    }
+
+    // Tab order continues past the last section into the footer.
+    await user.tab();
+    expect(screen.getByRole("option", { name: "Grupo Equipe Infra" })).not.toHaveFocus();
+  });
+
+  it("keeps the selected group selected across a refetch that rebuilds the list", async () => {
+    // Fresh objects with the same ids — what a refetch actually produces.
+    const stateWith = (dms: DMConversation[]) => ({
+      status: "ready" as const,
+      currentUserId: "user-a",
+      channels: [{ ...PUBLIC_CHANNEL }],
+      dms,
+    });
+    const tree = (dms: DMConversation[]) => (
+      <MemoryRouter initialEntries={["/chat/dm/dm-grp"]}>
+        <ChatSidebar state={stateWith(dms)} retry={() => {}} />
+      </MemoryRouter>
+    );
+
+    const { rerender } = render(tree([{ ...DIRECT }, { ...GROUP }]));
+    expect(screen.getByRole("option", { name: "Grupo Equipe Infra" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // Reordered and rebuilt: selection follows the id, not the position.
+    rerender(tree([{ ...GROUP }, { ...DIRECT }, { ...DIRECT, id: "dm-2", name: "Caio Almeida" }]));
+    expect(screen.getByRole("option", { name: "Grupo Equipe Infra" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(
+      screen.getByRole("option", { name: "Mensagem direta com Juliane Lino" }),
+    ).toHaveAttribute("aria-selected", "false");
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo Equipe Infra"]);
+  });
+
+  it("routes a selected group to the DM route, like any other conversation", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(mixedSidebar());
+    renderChat();
+
+    await user.click(await screen.findByRole("option", { name: "Grupo Equipe Infra" }));
+
+    await waitFor(() => expect(screen.getByTestId("chat-dm")).toBeInTheDocument());
+    expect(screen.getByRole("option", { name: "Grupo Equipe Infra" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+});
+
+// ── Post-creation placement (ISSUE #396) ──────────────────────────────────────
+// Each creation mode lands in its own section, and it lands there because the
+// canonical refetch put it there — never because the UI kept a parallel list.
+
+describe("ChatSidebar — post-creation placement", () => {
+  const sectionOptions = (name: string) =>
+    within(screen.getByRole("region", { name }))
+      .queryAllByRole("option")
+      .map((option) => option.getAttribute("aria-label"));
+
+  it("puts a newly created person in Mensagens diretas", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData
+      .mockResolvedValueOnce({ currentUserId: "current-user", channels: [], dms: [] })
+      .mockResolvedValue({
+        currentUserId: "current-user",
+        channels: [],
+        dms: [{ id: "dm-new", type: "1:1", name: "Juliane Lino", participants: [] }],
+      });
+    mockSearchDMCandidates.mockResolvedValue([{ userId: "juliane", displayName: "Juliane Lino" }]);
+    mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
+    renderChat();
+
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
+    await user.type(screen.getByRole("searchbox"), "ju");
+    await user.click(await screen.findByRole("button", { name: "Juliane Lino" }));
+
+    await waitFor(() =>
+      expect(sectionOptions("Mensagens diretas")).toEqual(["Mensagem direta com Juliane Lino"]),
+    );
+    expect(sectionOptions("Grupos")).toEqual([]);
+    expect(sectionOptions("Canais")).toEqual([]);
+  });
+
+  it("puts a newly created group in Grupos", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData
+      .mockResolvedValueOnce({ currentUserId: "current-user", channels: [], dms: [] })
+      .mockResolvedValue({
+        currentUserId: "current-user",
+        channels: [],
+        dms: [{ id: "dm-group-new", type: "group", name: "Equipe Infra", participants: [] }],
+      });
+    mockSearchDMCandidates.mockResolvedValue(GROUP_CANDIDATES);
+    mockCreateGroupDM.mockResolvedValue("dm-group-new");
+    renderChat();
+
+    await openGroupModeAndSelectBoth(user);
+    await user.click(screen.getByRole("button", { name: "Criar grupo" }));
+
+    await waitFor(() => expect(sectionOptions("Grupos")).toEqual(["Grupo Equipe Infra"]));
+    expect(sectionOptions("Mensagens diretas")).toEqual([]);
+    expect(sectionOptions("Canais")).toEqual([]);
+  });
+
+  it("puts a newly created channel in Canais", async () => {
+    const user = userEvent.setup();
+    const created: Channel = { id: "novo", name: "Novo", type: "public", canWrite: true };
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: [],
+      dms: [],
+    });
+    mockCreateChannel.mockResolvedValue(created);
+    renderChat();
+
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
+    await user.click(screen.getByRole("radio", { name: "Canal" }));
+    fireEvent.change(screen.getByLabelText(/nome do canal/i), { target: { value: "Novo" } });
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "current-user",
+      channels: [created],
+      dms: [],
+    });
+    await user.click(screen.getByRole("button", { name: "Criar canal" }));
+
+    await waitFor(() => expect(sectionOptions("Canais")).toEqual(["Canal Novo"]));
+    expect(sectionOptions("Mensagens diretas")).toEqual([]);
+    expect(sectionOptions("Grupos")).toEqual([]);
+  });
+
+  // BUG #393 regression: the legacy can_create_channel contract is server-side
+  // and the UI never gates on it. Splitting the sections must not reintroduce a
+  // client-side permission decision.
+  it("keeps all three creation modes available regardless of the legacy flag", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-1",
+      channels: SAMPLE_CHANNELS,
+      dms: SAMPLE_DMS,
+    });
+    renderChat();
+
+    await user.click(await screen.findByRole("button", { name: "Nova conversa" }));
+    const dialog = screen.getByRole("dialog", { name: "Nova conversa" });
+    for (const mode of ["Pessoa", "Grupo", "Canal"]) {
+      expect(within(dialog).getByRole("radio", { name: mode })).toBeEnabled();
+    }
+  });
+});
+
 // ── Active state ──────────────────────────────────────────────────────────────
 
 describe("ChatSidebar — active selection", () => {
