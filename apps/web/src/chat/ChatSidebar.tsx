@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
-import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
+import { partitionDMs, type Channel, type CurrentUser, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
 
@@ -228,15 +228,48 @@ function ErrorState({ onRetry }: ErrorStateProps) {
   );
 }
 
+// ── Section shell ─────────────────────────────────────────────────────────────
+
+interface SectionProps {
+  /** Stable id; the heading owns it and each list is labelled by it. */
+  labelId: string;
+  title: string;
+  /** Only the first section sits flush against the CTA above it. */
+  spaced?: boolean;
+  children: React.ReactNode;
+}
+
+/**
+ * One sidebar category: a real heading plus its list.
+ *
+ * The listbox lives inside each list component rather than here so that an
+ * empty section renders its message *instead of* an options container — an
+ * empty `role="listbox"` with a paragraph inside is not a valid one.
+ */
+function Section({ labelId, title, spaced, children }: SectionProps) {
+  return (
+    <section className="chat-sidebar__section" aria-labelledby={labelId}>
+      <h2
+        id={labelId}
+        className={`chat-sidebar__section-label${spaced ? " chat-sidebar__section-label--mt" : ""}`}
+      >
+        {title}
+      </h2>
+      {children}
+    </section>
+  );
+}
+
 // ── Channel list ──────────────────────────────────────────────────────────────
 
 interface ChannelListProps {
   channels: Channel[];
   activeChannelId: string | undefined;
   onSelect: (id: string) => void;
+  labelId: string;
 }
 
-function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) {
+function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelListProps) {
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -246,7 +279,7 @@ function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) 
   }
 
   return (
-    <>
+    <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
         return (
@@ -277,29 +310,32 @@ function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) 
           </button>
         );
       })}
-    </>
+    </div>
   );
 }
 
-// ── DM list ───────────────────────────────────────────────────────────────────
+// ── DM / group list ───────────────────────────────────────────────────────────
 
 interface DMListProps {
+  /** Already narrowed to a single canonical category by partitionDMs. */
   dms: DMConversation[];
   activeDMId: string | undefined;
   onSelect: (id: string) => void;
+  labelId: string;
+  emptyMessage: string;
 }
 
-function DMList({ dms, activeDMId, onSelect }: DMListProps) {
+function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProps) {
   if (dms.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
-        Nenhuma mensagem direta.
+        {emptyMessage}
       </p>
     );
   }
 
   return (
-    <>
+    <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {dms.map((dm) => {
         const isActive = dm.id === activeDMId;
         const isGroup = dm.type === "group";
@@ -343,7 +379,7 @@ function DMList({ dms, activeDMId, onSelect }: DMListProps) {
           </button>
         );
       })}
-    </>
+    </div>
   );
 }
 
@@ -375,6 +411,12 @@ interface ChatSidebarProps {
   retry: () => void;
 }
 
+// Static because the sidebar is mounted once per app; each heading owns the id
+// its section's listbox is labelled by.
+const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
+const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
+const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
+
 export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -400,6 +442,10 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
   const activeChannelId = activeType === "channel" ? activeId : undefined;
   const activeDMId = activeType === "dm" ? activeId : undefined;
+
+  // Derived on every render from the canonical list, so a refetch that reorders
+  // or replaces items cannot leave a stale copy behind in either section.
+  const { directs, groups } = partitionDMs(state.status === "ready" ? state.dms : []);
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -466,29 +512,48 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         Nova conversa
       </button>
 
-      {/* ── Nav ── */}
-      <div className="chat-sidebar__nav" role="listbox" aria-label="Canais e mensagens diretas">
+      {/* ── Nav ──
+          Three product categories, three sections. Channels come from their own
+          canonical list; 1:1 conversations and ad-hoc groups are split from the
+          single DM list by the server-derived discriminator, so a conversation
+          cannot show up twice or land in the wrong section. Nothing is
+          classified while loading or on error: the sections only exist once the
+          canonical data does. */}
+      <div className="chat-sidebar__nav">
         {state.status === "loading" && <LoadingSkeleton />}
 
         {state.status === "error" && <ErrorState onRetry={retry} />}
 
         {state.status === "ready" && (
           <>
-            {/* Channels section */}
-            <div className="chat-sidebar__section-label">
-              <span>Canais</span>
-            </div>
-            <ChannelList
-              channels={state.channels}
-              activeChannelId={activeChannelId}
-              onSelect={handleChannelSelect}
-            />
+            <Section labelId={CHANNELS_LABEL_ID} title="Canais">
+              <ChannelList
+                channels={state.channels}
+                activeChannelId={activeChannelId}
+                onSelect={handleChannelSelect}
+                labelId={CHANNELS_LABEL_ID}
+              />
+            </Section>
 
-            {/* DMs section */}
-            <div className="chat-sidebar__section-label chat-sidebar__section-label--mt">
-              <span>Mensagens diretas</span>
-            </div>
-            <DMList dms={state.dms} activeDMId={activeDMId} onSelect={handleDMSelect} />
+            <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
+              <DMList
+                dms={directs}
+                activeDMId={activeDMId}
+                onSelect={handleDMSelect}
+                labelId={DIRECTS_LABEL_ID}
+                emptyMessage="Nenhuma mensagem direta."
+              />
+            </Section>
+
+            <Section labelId={GROUPS_LABEL_ID} title="Grupos" spaced>
+              <DMList
+                dms={groups}
+                activeDMId={activeDMId}
+                onSelect={handleDMSelect}
+                labelId={GROUPS_LABEL_ID}
+                emptyMessage="Nenhum grupo."
+              />
+            </Section>
           </>
         )}
       </div>

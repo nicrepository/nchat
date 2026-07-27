@@ -478,6 +478,27 @@ describe("fetchDMs", () => {
     expect(dms[0].type).toBe("group");
   });
 
+  // The discriminator is a closed set ('direct' | 'group', enforced by a CHECK
+  // constraint on chat.dm_conversations.type). A value outside it can only come
+  // from a corrupted or hostile payload; the conversation is still one the
+  // server authorized, so it is kept and read as 1:1 — the section that grants
+  // nothing extra — rather than dropped or promoted to a group.
+  it("reads any non-group type as 1:1 instead of dropping the conversation", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "dm-unknown", type: "broadcast", name: "Desconhecida" },
+          { id: "dm-missing", name: "Sem tipo" },
+          { id: "dm-case", type: "GROUP", name: "Maiúsculas" },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms.map((dm) => dm.id)).toEqual(["dm-unknown", "dm-missing", "dm-case"]);
+    expect(dms.every((dm) => dm.type === "1:1")).toBe(true);
+  });
+
   it("returns empty array when dm_conversations list is empty", async () => {
     mockAuthFetch.mockResolvedValue(sidebarResponse({ dms: [] }));
     const dms = await fetchDMs();
