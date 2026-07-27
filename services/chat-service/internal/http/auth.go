@@ -19,6 +19,10 @@ type ctxKey int
 const (
 	ctxKeyUserID    ctxKey = iota
 	ctxKeySessionID        // carries the JWT "sid" claim
+	// ctxKeyWorkspaceID carries the canonical workspace of the request, resolved
+	// server-side by AntiSpamGuard.Middleware. It is only ever set behind
+	// BearerAuth + RequireActiveSession, and never from a client-supplied value.
+	ctxKeyWorkspaceID
 )
 
 var uuidRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -40,6 +44,14 @@ func GetContextUserID(r *http.Request) string {
 func GetContextSessionID(r *http.Request) string {
 	sid, _ := r.Context().Value(ctxKeySessionID).(string)
 	return sid
+}
+
+// contextWorkspaceID returns the canonical workspace resolved for this request,
+// or "" when no middleware resolved one. Callers must treat "" as "resolve it
+// yourself", never as a licence to pick a workspace.
+func contextWorkspaceID(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyWorkspaceID).(string)
+	return id
 }
 
 // chatAccessClaims holds the minimal JWT claims required by chat-service.

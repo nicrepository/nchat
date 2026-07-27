@@ -169,7 +169,7 @@ func newCategoryRouteEnv(
 	return categoryRouteEnv{
 		router: httpapi.NewRouter(
 			sidebarTestConfig(), nil, httpapi.ReadinessState{}, makeTestValidator(t), sessions,
-			httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, handler,
+			httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, handler, nil,
 		),
 		categories: categories,
 	}
@@ -692,7 +692,7 @@ func TestChannelCategoryRoute_OrderIsNotTreatedAsACategoryID(t *testing.T) {
 func TestChannelCategoryRoute_UnwiredHandlerLeavesRoutesUnregistered(t *testing.T) {
 	router := httpapi.NewRouter(
 		sidebarTestConfig(), nil, httpapi.ReadinessState{}, makeTestValidator(t), allowAllSessionValidator{},
-		httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil,
+		httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil,
 	)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, categoryRequest(http.MethodGet, httpapi.RouteChannelCategories, categoryRouteToken(t), ""))
