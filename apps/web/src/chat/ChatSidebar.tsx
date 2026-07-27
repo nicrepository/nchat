@@ -162,6 +162,13 @@ function Avatar({ initials, src, color = "purple", status, size = "sm" }: Avatar
 function GroupAvatars({ dm }: { dm: DMConversation }) {
   const first = dm.participants[0];
   const second = dm.participants[1];
+  // The sidebar payload carries no participants (chatApi maps them to []), so
+  // without this every group reserved the avatar slot and left it empty
+  // (BUG #395). The group name is already on the row, so its initials come from
+  // the same canonical rule the 1:1 rows use — no second rule, no empty space.
+  if (!first) {
+    return <Avatar initials={initialsFrom(dm.name)} color={avatarColorFor(dm.id)} size="sm" />;
+  }
   return (
     <span className="chat-sidebar__group-avatars" aria-hidden="true">
       {first && (
