@@ -20,8 +20,16 @@ const msgListRateLimit = 30
 // a separate budget prevents realtime recovery from degrading scroll/listing.
 const msgGetSingleRateLimit = 120
 
-// msgPostRateLimit is the maximum number of message-send requests an authenticated
+// msgPostRateLimit is the maximum number of write requests an authenticated
 // user may make per minute across all channels and DMs.
+//
+// Since RF-19 (issue #419) this no longer governs message *sends*: those go
+// through AntiSpamGuard, whose budget is the workspace's configurable policy
+// and whose counter is shared across replicas. It still guards the other writes
+// below (delete, favorite, workspace settings), which are not the subject of
+// RF-19. domain.DefaultMessageRateLimitPerMinute carries this same value
+// forward as the send default, so nothing changed for an unconfigured
+// workspace.
 const msgPostRateLimit = 60
 
 // messageForwardRateLimit isolates forwards from ordinary message writes.
@@ -35,7 +43,7 @@ const mentionSearchRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler, antiSpam *AntiSpamGuard) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
@@ -85,6 +93,27 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	pinActionLimiter := NewUserRateLimiter(pinActionRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
 
+	// RF-19 (issue #419): every route that creates a message goes through
+	// sendLimit, so there is exactly one place a send can be admitted from and
+	// no second entry point to bypass. The WebSocket is not one of them —
+	// Hub.handleClientMessage accepts subscribe/unsubscribe/ping/reaction_toggle
+	// and has no send frame, so message creation is HTTP-only.
+	//
+	// The guard also resolves each request's canonical workspace server-side and
+	// publishes it in the request context, so the workspace a send is counted
+	// against is the same one the handler writes to.
+	//
+	// When the guard is absent (Valkey unconfigured, so the shared counter does
+	// not exist) sends answer 503. Falling back to the in-process msgPostLimiter
+	// would hand every replica its own full budget — the cross-instance bypass
+	// RF-19 exists to close — so the routes refuse rather than degrade quietly.
+	sendLimit := func(h http.Handler) http.Handler {
+		if antiSpam == nil {
+			return antiSpamUnavailable()
+		}
+		return antiSpam.Middleware(h)
+	}
+
 	// Static, non-sensitive configuration; authentication still prevents adding
 	// a new public API surface.
 	mux.Handle("GET "+RouteAllowedReactionEmojis, authMiddleware(
@@ -96,11 +125,16 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListChannelMessages)),
 	))
 	mux.Handle("POST "+RouteChannelMessages, authMiddleware(
-		msgPostLimiter.Middleware(http.HandlerFunc(messages.CreateChannelMessage)),
+		sendLimit(http.HandlerFunc(messages.CreateChannelMessage)),
 	))
+	// A forward creates a message, so it spends the anti-spam budget like any
+	// other send. Its own tighter budget stays on top: RF-19 makes the general
+	// limit configurable, it does not raise the dedicated forward cap.
 	mux.Handle("POST "+RouteChannelMessageForward, authMiddleware(
 		newForwardMetrics(metrics).Middleware(
-			messageForwardLimiter.Middleware(http.HandlerFunc(messages.ForwardChannelMessage)),
+			messageForwardLimiter.Middleware(
+				sendLimit(http.HandlerFunc(messages.ForwardChannelMessage)),
+			),
 		),
 	))
 	mux.Handle("GET "+RouteChannelMessage, authMiddleware(
@@ -142,7 +176,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ListDMMessages)),
 	))
 	mux.Handle("POST "+RouteDMMessages, authMiddleware(
-		msgPostLimiter.Middleware(http.HandlerFunc(messages.CreateDMMessage)),
+		sendLimit(http.HandlerFunc(messages.CreateDMMessage)),
 	))
 	mux.Handle("GET "+RouteDMMessage, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetDMMessage)),
@@ -162,6 +196,17 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	))
 	mux.Handle("PATCH "+RouteWorkspaceSettings, authMiddleware(
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceEditWindow)),
+	))
+
+	// RF-19 anti-spam policy (issue #419). Administrative reads and writes carry
+	// the ordinary read/write budgets so the endpoints cannot be hammered, and
+	// authorization is enforced inside the handlers — registration here grants
+	// nothing on its own.
+	mux.Handle("GET "+RouteWorkspaceAntiSpam, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetWorkspaceAntiSpam)),
+	))
+	mux.Handle("PATCH "+RouteWorkspaceAntiSpam, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceAntiSpam)),
 	))
 
 	// Favorite endpoints (RF-06): per-user private bookmarks. The list endpoint

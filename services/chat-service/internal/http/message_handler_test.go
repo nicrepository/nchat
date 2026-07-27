@@ -112,12 +112,38 @@ type fakeWorkspaceSettingsStore struct {
 	calls       int
 	lastSeconds *int
 	err         error
+
+	// RF-19 anti-spam fields.
+	stored       int
+	lastRateUser string
+	lastRate     int
+	rateCalls    int
+	getErr       error
+	rateErr      error
 }
 
 func (f *fakeWorkspaceSettingsStore) UpdateEditWindow(_ context.Context, workspaceID, _ string, seconds *int) (domain.Workspace, error) {
 	f.calls++
 	f.lastSeconds = seconds
 	return domain.Workspace{ID: workspaceID, EditWindowSeconds: seconds}, f.err
+}
+
+func (f *fakeWorkspaceSettingsStore) GetWorkspaceByID(_ context.Context, id string) (domain.Workspace, error) {
+	if f.getErr != nil {
+		return domain.Workspace{}, f.getErr
+	}
+	return domain.Workspace{ID: id, MessageRateLimitPerMinute: f.stored}, nil
+}
+
+func (f *fakeWorkspaceSettingsStore) UpdateMessageRateLimit(_ context.Context, workspaceID, userID string, perMinute int) (domain.Workspace, error) {
+	f.rateCalls++
+	f.lastRateUser = userID
+	if f.rateErr != nil {
+		return domain.Workspace{}, f.rateErr
+	}
+	f.lastRate = perMinute
+	f.stored = perMinute
+	return domain.Workspace{ID: workspaceID, MessageRateLimitPerMinute: perMinute}, nil
 }
 
 func (f *fakeMentionProvider) SearchMentions(_ context.Context, in service.SearchMentionsInput) (service.SearchMentionsOutput, error) {

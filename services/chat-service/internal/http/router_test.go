@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,7 +39,7 @@ func (rejectRouterSessionValidator) ValidateActiveSession(_ context.Context, _, 
 }
 
 func TestHealthzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteHealthz, nil))
@@ -100,14 +101,14 @@ func newFullyWiredRouter(t *testing.T) http.Handler {
 		routerTestValidator(t), allowRouterSessionValidator{},
 		NewSidebarHandler(readySidebarStub{}),
 		NewMessageHandler(readyWorkspacesStub{}, readyMessagesStub{}, nil),
-		stubWSHandler(), nil, nil, nil)
+		stubWSHandler(), nil, nil, nil, nil)
 }
 
 // TestReadyzContract: a partially initialized instance (no DB-backed
 // services, no validators) must never report Ready — Kubernetes keeps it out
 // of the Endpoints and the previous pod continues serving.
 func TestReadyzContract(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -163,7 +164,7 @@ func TestReadyzDatabaseUpWithInvalidJWT(t *testing.T) {
 	state := ReadinessState{Database: true}
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), state,
 		nil, nil,
-		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -187,7 +188,7 @@ func TestReadyzUnreadyWithoutSessionValidator(t *testing.T) {
 		routerTestValidator(t), nil,
 		NewSidebarHandler(readySidebarStub{}),
 		NewMessageHandler(readyWorkspacesStub{}, readyMessagesStub{}, nil),
-		stubWSHandler(), nil, nil, nil)
+		stubWSHandler(), nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -204,7 +205,7 @@ func TestReadyzUnreadyWithoutSessionValidator(t *testing.T) {
 func TestReadyzUnreadyWithoutDatabase(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{TokenValidator: true, SessionValidator: true},
 		routerTestValidator(t), allowRouterSessionValidator{},
-		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -226,7 +227,7 @@ func TestReadyzNilWSHandlerNeverReportsWebSocketPass(t *testing.T) {
 		routerTestValidator(t), allowRouterSessionValidator{},
 		NewSidebarHandler(readySidebarStub{}),
 		NewMessageHandler(readyWorkspacesStub{}, readyMessagesStub{}, nil),
-		nil, nil, nil, nil)
+		nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -244,7 +245,7 @@ func TestReadyzUnwiredHandlersDowngradeChecksButNotDatabase(t *testing.T) {
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), fullyReadyState(),
 		routerTestValidator(t), allowRouterSessionValidator{},
 		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil),
-		stubWSHandler(), nil, nil, nil)
+		stubWSHandler(), nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
@@ -274,7 +275,7 @@ func TestReadyzRejectsDatabaseBackedChatWithoutReactionLimiterConfig(t *testing.
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteVersion, nil))
@@ -297,7 +298,7 @@ func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
 		t.Fatalf("new token validator: %v", err)
 	}
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator, allowRouterSessionValidator{},
-		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+		NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteAllowedReactionEmojis, nil))
@@ -308,7 +309,7 @@ func TestAllowedReactionEmojisRouteRequiresAuthentication(t *testing.T) {
 }
 
 func TestMethodAndNotFoundBehavior(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -340,7 +341,7 @@ func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
 	}
 	router := NewRouter(
 		testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
-		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil,
+		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil,
 	)
 	path := "/api/chat/channels/22222222-2222-2222-2222-222222222222/mentions?q=a"
 
@@ -369,7 +370,7 @@ func TestDMContractRoutesRequireAuthentication(t *testing.T) {
 	}
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
-		NewDMHandler(nil, nil, nil), nil, nil)
+		NewDMHandler(nil, nil, nil), nil, nil, nil)
 	for _, request := range []*http.Request{
 		httptest.NewRequest(http.MethodGet, RouteDMCandidates+"?query=an", nil),
 		httptest.NewRequest(http.MethodPost, RouteDMConversations, strings.NewReader(`{"other_user_id":"55555555-5555-5555-5555-555555555555"}`)),
@@ -402,7 +403,7 @@ func TestDMContractRoutesRejectInvalidTokenAndRevokedSession(t *testing.T) {
 			}
 			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 				test.sessions, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
-				NewDMHandler(nil, nil, nil), nil, nil)
+				NewDMHandler(nil, nil, nil), nil, nil, nil)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, test.request)
 			if response.Code != http.StatusUnauthorized || strings.Contains(response.Body.String(), "session") {
@@ -439,7 +440,7 @@ func TestDMContractRoutesAreRegisteredOnlyWithHandler(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
-				allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, test.handler, nil, nil)
+				allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, test.handler, nil, nil, nil)
 			for _, route := range routes {
 				t.Run(route.name, func(t *testing.T) {
 					response := httptest.NewRecorder()
@@ -464,7 +465,7 @@ func TestDMGroupRouteIsPOSTOnly(t *testing.T) {
 	}
 	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
-		NewDMHandler(nil, nil, nil), nil, nil)
+		NewDMHandler(nil, nil, nil), nil, nil, nil)
 
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, routerGETRequest(t, RouteDMGroupConversations))
@@ -563,7 +564,7 @@ func testConfig() config.Config {
 }
 
 func TestMetricsRouteReturns200(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
+	router := NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, nil, nil, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
 	response := httptest.NewRecorder()
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteMetrics, nil))
@@ -591,7 +592,7 @@ func TestNewRouter_NilWSHandlerReturns503AfterAuth(t *testing.T) {
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
 		nil,
-		nil, nil, nil,
+		nil, nil, nil, nil,
 	)
 
 	req := httptest.NewRequest(http.MethodGet, RouteWS, nil)
@@ -660,7 +661,7 @@ func newRouterForRateLimit(t *testing.T) http.Handler {
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
 		nil,
-		nil, nil, nil,
+		nil, nil, nil, nil,
 	)
 }
 
@@ -692,7 +693,7 @@ func routerGETRequest(t *testing.T, url string) *http.Request {
 // called it will panic because the services are nil. A panic here means the
 // test fails with a clear signal that the rate limiter is not working.
 func TestNewRouter_PostChannelMessage_Returns429AfterBudgetExhausted(t *testing.T) {
-	router := newRouterForRateLimit(t)
+	router := newRouterWithAntiSpam(t, "ws-1", msgPostRateLimit)
 	url := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
 
 	// Exhaust the full budget. All requests will return 500 (nil service panics
@@ -723,7 +724,7 @@ func TestNewRouter_PostChannelMessage_Returns429AfterBudgetExhausted(t *testing.
 // TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted verifies the same
 // guarantee for POST /api/chat/dm/{conversationID}/messages.
 func TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted(t *testing.T) {
-	router := newRouterForRateLimit(t)
+	router := newRouterWithAntiSpam(t, "ws-1", msgPostRateLimit)
 	url := "/api/chat/dm/22222222-2222-2222-2222-222222222222/messages"
 
 	for i := range msgPostRateLimit {
@@ -745,7 +746,8 @@ func TestNewRouter_PostDMMessage_Returns429AfterBudgetExhausted(t *testing.T) {
 }
 
 func TestNewRouter_ForwardMessagesUseDedicatedPerUserRateLimit(t *testing.T) {
-	router := newRouterForRateLimit(t)
+	// A send budget wide enough that the dedicated forward cap is what bites.
+	router := newRouterWithAntiSpam(t, "ws-1", domain.MaxMessageRateLimitPerMinute)
 	forwardURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/forward"
 	for i := range messageForwardRateLimit {
 		recorder := httptest.NewRecorder()
@@ -776,8 +778,13 @@ func TestNewRouter_ForwardMessagesUseDedicatedPerUserRateLimit(t *testing.T) {
 	}
 }
 
-func TestNewRouter_MessageCreationDoesNotConsumeForwardingBudget(t *testing.T) {
-	router := newRouterForRateLimit(t)
+// RF-19 (issue #419): forwarding creates a message, so it draws on the same
+// send budget as an ordinary create. Before RF-19 the two budgets were
+// independent, which let a user who had exhausted the send limit keep producing
+// messages through the forward route. Forwarding keeps its own tighter cap on
+// top; this asserts only that it cannot be used to escape the send limit.
+func TestNewRouter_ForwardingSharesTheMessageSendBudget(t *testing.T) {
+	router := newRouterWithAntiSpam(t, "ws-1", msgPostRateLimit)
 	createURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
 	for range msgPostRateLimit {
 		recorder := httptest.NewRecorder()
@@ -787,8 +794,8 @@ func TestNewRouter_MessageCreationDoesNotConsumeForwardingBudget(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, routerPOSTRequest(t,
 		"/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/forward"))
-	if recorder.Code == http.StatusTooManyRequests {
-		t.Fatal("ordinary message-create budget must not consume forwarding budget")
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("exhausted send budget must also block forwarding, got %d", recorder.Code)
 	}
 }
 
@@ -923,7 +930,7 @@ func newRouterWithWS(t *testing.T, wsHandler http.Handler) http.Handler {
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
 		wsHandler,
-		nil, nil, nil,
+		nil, nil, nil, nil,
 	)
 }
 
@@ -1015,7 +1022,7 @@ func TestChannelCreateRouteRequiresAuthAndHandler(t *testing.T) {
 	build := func(channels *ChannelHandler) http.Handler {
 		return NewRouter(testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 			allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil,
-			NewDMHandler(nil, nil, nil), channels, nil)
+			NewDMHandler(nil, nil, nil), channels, nil, nil)
 	}
 
 	t.Run("unauthenticated", func(t *testing.T) {
@@ -1051,4 +1058,170 @@ func TestChannelCreateRouteRequiresAuthAndHandler(t *testing.T) {
 			t.Fatalf("status = %d, want 404", response.Code)
 		}
 	})
+}
+
+// ── RF-19 anti-spam wiring (issue #419) ──────────────────────────────────────
+
+// newRouterWithAntiSpam builds a router whose send routes are guarded by a real
+// AntiSpamGuard resolving workspaceID and reading the given per-minute policy.
+func newRouterWithAntiSpam(t *testing.T, workspaceID string, perMinute int) http.Handler {
+	t.Helper()
+	return newRouterWithGuard(t, newRouterAntiSpamGuard(t, workspaceID, perMinute, newCountingLimiter()))
+}
+
+func newRouterAntiSpamGuard(t *testing.T, workspaceID string, perMinute int, limiter antiSpamLimiter) *AntiSpamGuard {
+	t.Helper()
+	guard, _ := newTestGuard(t,
+		&stubWorkspaceResolver{id: workspaceID},
+		newStubPolicySource().set(workspaceID, perMinute),
+		limiter,
+	)
+	return guard
+}
+
+func newRouterWithGuard(t *testing.T, guard *AntiSpamGuard) http.Handler {
+	t.Helper()
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	return NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		ReadinessState{},
+		validator,
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		NewMessageHandler(nil, nil, nil),
+		nil,
+		nil, nil, nil,
+		guard,
+	)
+}
+
+// Every route that creates a message must draw on the configured policy, not on
+// the compiled-in send budget. Channels and DMs share one budget per user.
+func TestNewRouter_AllSendPathsUseTheConfiguredAntiSpamPolicy(t *testing.T) {
+	const policy = 3
+	channelURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+	dmURL := "/api/chat/dm/33333333-3333-3333-3333-333333333333/messages"
+	forwardURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/forward"
+
+	for _, exhaust := range []string{channelURL, dmURL, forwardURL} {
+		t.Run(exhaust, func(t *testing.T) {
+			router := newRouterWithAntiSpam(t, "ws-1", policy)
+			for range policy {
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, routerPOSTRequest(t, exhaust))
+				if recorder.Code == http.StatusTooManyRequests {
+					t.Fatal("a message within the policy was rejected")
+				}
+			}
+			// The budget is spent: every other send path must also be blocked,
+			// so none of them can be used to route around the limit.
+			for _, blocked := range []string{channelURL, dmURL, forwardURL} {
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, routerPOSTRequest(t, blocked))
+				if recorder.Code != http.StatusTooManyRequests {
+					t.Fatalf("%s was not blocked after the budget was spent: %d", blocked, recorder.Code)
+				}
+				if got := recorder.Header().Get("Retry-After"); got != "60" {
+					t.Fatalf("expected Retry-After 60 on %s, got %q", blocked, got)
+				}
+			}
+		})
+	}
+}
+
+// The configured policy replaces the compiled-in msgPostRateLimit for sends: a
+// policy above it must not be silently capped by the old constant.
+func TestNewRouter_AntiSpamPolicyReplacesTheCompiledInSendBudget(t *testing.T) {
+	router := newRouterWithAntiSpam(t, "ws-1", msgPostRateLimit+20)
+	url := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+
+	for i := range msgPostRateLimit + 20 {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, routerPOSTRequest(t, url))
+		if recorder.Code == http.StatusTooManyRequests {
+			t.Fatalf("message %d rejected below the configured policy", i+1)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t, url))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 past the configured policy, got %d", recorder.Code)
+	}
+}
+
+// Non-send writes keep their own budgets: RF-19 governs message sending, not
+// every write in the service.
+func TestNewRouter_AntiSpamDoesNotGovernNonSendWrites(t *testing.T) {
+	router := newRouterWithAntiSpam(t, "ws-1", 1)
+	channelURL := "/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t, channelURL))
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t, channelURL))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected the send budget to be spent, got %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t,
+		"/api/chat/messages/22222222-2222-2222-2222-222222222222/favorite"))
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatal("the send budget must not block favoriting")
+	}
+}
+
+// Without a guard the shared Valkey counter does not exist, so the send routes
+// refuse. They must not degrade to the in-process msgPostLimiter: that would
+// give every replica its own full budget and reopen the cross-instance bypass
+// RF-19 closes.
+func TestNewRouter_SendRoutesRefuseWhenTheDistributedGuardIsAbsent(t *testing.T) {
+	router := newRouterForRateLimit(t)
+	// attempts stays under messageForwardRateLimit so the forward route's own
+	// dedicated cap never answers first, while still going well past the old
+	// in-process send budget's first request — a local fallback would have
+	// admitted every one of these.
+	attempts := messageForwardRateLimit
+	sendURLs := []string{
+		"/api/chat/channels/11111111-1111-1111-1111-111111111111/messages",
+		"/api/chat/dm/33333333-3333-3333-3333-333333333333/messages",
+		"/api/chat/channels/11111111-1111-1111-1111-111111111111/messages/forward",
+	}
+
+	for _, url := range sendURLs {
+		for i := range attempts {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, routerPOSTRequest(t, url))
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("%s request %d: expected 503, got %d", url, i+1, recorder.Code)
+			}
+		}
+	}
+}
+
+// When the canonical workspace cannot be resolved the send is refused rather
+// than charged to some other workspace.
+func TestNewRouter_SendRoutesRefuseWhenTheWorkspaceCannotBeResolved(t *testing.T) {
+	limiter := newCountingLimiter()
+	guard, _ := newTestGuard(t,
+		&stubWorkspaceResolver{err: errors.New("connection refused")},
+		newStubPolicySource().set("ws-1", 60),
+		limiter,
+	)
+	router := newRouterWithGuard(t, guard)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPOSTRequest(t,
+		"/api/chat/channels/11111111-1111-1111-1111-111111111111/messages"))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", recorder.Code)
+	}
+	if got := limiter.count("send_message:ws-1", routerTestUserID); got != 0 {
+		t.Fatalf("the send was charged to a workspace it was not attributed to: %d", got)
+	}
 }

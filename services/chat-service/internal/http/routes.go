@@ -35,5 +35,10 @@ const (
 	RouteMessage                = "/api/chat/messages/{messageID}"
 	RouteMessageEditHistory     = "/api/chat/messages/{messageID}/history"
 	RouteWorkspaceSettings      = "/api/v1/workspaces/{workspaceID}/settings"
-	RouteWS                     = "/api/chat/ws"
+	// RF-19 anti-spam policy (issue #419). Unlike the /api/chat routes this one
+	// names its workspace, following the sibling settings route above: the
+	// handler never trusts that ID, it checks the caller administers exactly
+	// that workspace and the UPDATE re-checks it atomically.
+	RouteWorkspaceAntiSpam = "/api/v1/workspaces/{workspaceID}/anti-spam"
+	RouteWS                = "/api/chat/ws"
 )
