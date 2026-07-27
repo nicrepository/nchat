@@ -10,6 +10,10 @@ var ErrSubscribeForbidden = errors.New("subscribe forbidden")
 // ErrHubShutdown is returned by Hub.Subscribe when the hub is shutting down.
 var ErrHubShutdown = errors.New("hub is shutting down")
 
+// ErrClientNotRegistered indicates that an authorization result arrived after
+// the exact WebSocket client was removed or replaced in the hub.
+var ErrClientNotRegistered = errors.New("client not registered")
+
 // ErrBusClosed is returned by BroadcastBus.Subscribe when the bus is already closed.
 var ErrBusClosed = errors.New("bus is closed")
 

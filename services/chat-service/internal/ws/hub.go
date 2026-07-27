@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"regexp"
 	"sync"
@@ -16,6 +17,18 @@ import (
 // broadcast delivery. If the check exceeds this duration the event is not
 // delivered to that client for this broadcast.
 const broadcastAuthTimeout = 3 * time.Second
+
+// subscriptionAuthTimeout bounds the canonical message-visibility lookup for
+// a client subscribe. It matches the existing per-recipient fan-out timeout.
+const subscriptionAuthTimeout = 3 * time.Second
+
+// broadcastWorkerCount bounds concurrent fan-out authorization without letting
+// one slow recipient stall every other room on this Hub instance.
+const broadcastWorkerCount = 4
+
+// broadcastWorkerQueueCapacity preserves the existing bounded capacity for
+// each partition without introducing an unbounded per-target queue.
+const broadcastWorkerQueueCapacity = 256
 
 // sourceInstanceIDMaxLen is the maximum allowed length for SourceInstanceID in
 // remote events. Bounded to prevent memory waste from malformed payloads.
@@ -55,6 +68,13 @@ type subscribeReq struct {
 	resp       chan error // buffered(1); hub writes result, caller reads
 }
 
+type revokeSubscriptionReq struct {
+	ctx    context.Context
+	client *Client
+	key    string
+	resp   chan error // buffered(1); hub writes result, caller reads
+}
+
 // broadcastReq is an internal request to deliver an event.
 type broadcastReq struct {
 	event Event
@@ -62,6 +82,11 @@ type broadcastReq struct {
 	// done is closed by the hub after the broadcast is fully processed.
 	// It is non-nil only when the caller requires synchronization (e.g., tests).
 	done chan struct{}
+}
+
+type broadcastSubscription struct {
+	client     *Client
+	generation uint64
 }
 
 // HubOption is a functional option for NewHub.
@@ -108,7 +133,9 @@ func WithPresence(p *PresenceTracker) HubOption {
 //
 // All internal state (clients, subs, clientSubs) is protected by mu. Helpers
 // that read or mutate those maps are mutex-safe and must not hold mu while
-// performing auth checks, connection I/O, or outbound queue operations.
+// performing auth checks or connection I/O. The final broadcast enqueue is a
+// non-blocking channel send performed under mu so it is atomic with subscription
+// revocation.
 type Hub struct {
 	authorizer SubscriptionAuthorizer
 	bus        BroadcastBus
@@ -120,19 +147,25 @@ type Hub struct {
 	reactionHandler ReactionHandler
 	reactionLimiter ReactionLimiter
 
-	register    chan registerReq
-	unregister  chan *Client
-	subReq      chan subscribeReq
-	bcast       chan broadcastReq
-	remoteBcast chan broadcastReq // events received from the distributed bus
-	quit        chan struct{}
-	done        chan struct{}
+	register        chan registerReq
+	unregister      chan *Client
+	subReq          chan subscribeReq
+	revokeReq       chan revokeSubscriptionReq
+	bcast           chan broadcastReq
+	remoteBcast     chan broadcastReq // events received from the distributed bus
+	quit            chan struct{}
+	done            chan struct{}
+	broadcastDone   chan struct{}
+	broadcastWG     sync.WaitGroup
+	broadcastQueues []chan broadcastReq
 
 	mu sync.RWMutex
 
-	clients    map[string]*Client             // clientID → client
-	subs       map[string]map[string]struct{} // targetKey.String() → set of clientIDs
-	clientSubs map[string]map[string]struct{} // clientID → set of targetKey strings
+	clients                    map[string]*Client             // clientID → client
+	subs                       map[string]map[string]struct{} // targetKey.String() → set of clientIDs
+	clientSubs                 map[string]map[string]struct{} // clientID → set of targetKey strings
+	subscriptionGenerations    map[string]map[string]uint64   // clientID → targetKey → generation
+	nextSubscriptionGeneration uint64
 }
 
 // NewHub creates a Hub and starts its background goroutine.
@@ -154,21 +187,24 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 	logger = normalizeLogger(logger)
 	busCtx, busCancel := context.WithCancel(context.Background())
 	h := &Hub{
-		authorizer:  authorizer,
-		bus:         bus,
-		instanceID:  instanceID,
-		logger:      logger,
-		busCancel:   busCancel,
-		register:    make(chan registerReq, 64),
-		unregister:  make(chan *Client, 64),
-		subReq:      make(chan subscribeReq, 64),
-		bcast:       make(chan broadcastReq, 256),
-		remoteBcast: make(chan broadcastReq, 256),
-		quit:        make(chan struct{}),
-		done:        make(chan struct{}),
-		clients:     make(map[string]*Client),
-		subs:        make(map[string]map[string]struct{}),
-		clientSubs:  make(map[string]map[string]struct{}),
+		authorizer:              authorizer,
+		bus:                     bus,
+		instanceID:              instanceID,
+		logger:                  logger,
+		busCancel:               busCancel,
+		register:                make(chan registerReq, 64),
+		unregister:              make(chan *Client, 64),
+		subReq:                  make(chan subscribeReq, 64),
+		revokeReq:               make(chan revokeSubscriptionReq, 64),
+		bcast:                   make(chan broadcastReq, 256),
+		remoteBcast:             make(chan broadcastReq, 256),
+		quit:                    make(chan struct{}),
+		done:                    make(chan struct{}),
+		broadcastDone:           make(chan struct{}),
+		clients:                 make(map[string]*Client),
+		subs:                    make(map[string]map[string]struct{}),
+		clientSubs:              make(map[string]map[string]struct{}),
+		subscriptionGenerations: make(map[string]map[string]uint64),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -177,6 +213,7 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 		logger.Warn("ws: bus subscribe failed; remote broadcast disabled", "error", err)
 	}
 	go h.run()
+	h.startBroadcastWorkers()
 	return h
 }
 
@@ -233,9 +270,26 @@ func (h *Hub) Unregister(c *Client) {
 // Returns ErrSubscribeForbidden if access is denied (non-enumerating).
 // Blocks until the hub processes the request or ctx is cancelled.
 func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, targetID string) error {
+	key := targetKey{workspaceID: c.workspaceID, targetType: targetType, targetID: targetID}.String()
+	authCtx, cancel := context.WithTimeout(ctx, subscriptionAuthTimeout)
+	stopClientCancellation := context.AfterFunc(c.ctx, cancel)
+	defer func() {
+		stopClientCancellation()
+		cancel()
+	}()
+	allowed, err := h.authorizer.CanAccess(authCtx, c.userID, c.workspaceID, targetType, targetID)
+	if err != nil {
+		_ = h.RevokeSubscription(ctx, c, key)
+		return fmt.Errorf("authorization check: %w", err)
+	}
+	if !allowed {
+		_ = h.RevokeSubscription(ctx, c, key)
+		return ErrSubscribeForbidden
+	}
+
 	resp := make(chan error, 1)
 	req := subscribeReq{
-		ctx:        ctx,
+		ctx:        authCtx,
 		client:     c,
 		targetType: targetType,
 		targetID:   targetID,
@@ -243,6 +297,26 @@ func (h *Hub) Subscribe(ctx context.Context, c *Client, targetType TargetType, t
 	}
 	select {
 	case h.subReq <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-h.quit:
+		return ErrHubShutdown
+	}
+	select {
+	case err := <-resp:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-h.quit:
+		return ErrHubShutdown
+	}
+}
+
+func (h *Hub) RevokeSubscription(ctx context.Context, c *Client, key string) error {
+	resp := make(chan error, 1)
+	req := revokeSubscriptionReq{ctx: ctx, client: c, key: key, resp: resp}
+	select {
+	case h.revokeReq <- req:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-h.quit:
@@ -418,6 +492,7 @@ func (h *Hub) Shutdown() {
 	h.busCancel()
 	close(h.quit)
 	<-h.done
+	<-h.broadcastDone
 	h.bus.Close() // stop subscriber goroutines; idempotent
 }
 
@@ -453,12 +528,16 @@ func (h *Hub) run() {
 			// resp is buffered(1); send never blocks.
 			req.resp <- err
 
-		case req := <-h.bcast:
-			h.handleBroadcast(req)
-
-		case req := <-h.remoteBcast:
-			// Remote events from the bus: deliver locally only; no re-publish.
-			h.handleBroadcast(req)
+		case req := <-h.revokeReq:
+			if err := req.ctx.Err(); err != nil {
+				req.resp <- err
+				continue
+			}
+			if !h.revokeSubscription(req.client, req.key) {
+				req.resp <- ErrClientNotRegistered
+				continue
+			}
+			req.resp <- nil
 
 		case <-h.quit:
 			// clearClients removes all clients from hub state and returns a snapshot.
@@ -473,6 +552,86 @@ func (h *Hub) run() {
 			return
 		}
 	}
+}
+
+func (h *Hub) startBroadcastWorkers() {
+	h.broadcastQueues = make([]chan broadcastReq, broadcastWorkerCount)
+	h.broadcastWG.Add(broadcastWorkerCount + 1)
+	for index := range broadcastWorkerCount {
+		queue := make(chan broadcastReq, broadcastWorkerQueueCapacity)
+		h.broadcastQueues[index] = queue
+		go h.runBroadcastWorker(queue)
+	}
+	go h.runBroadcastDispatcher()
+	go func() {
+		h.broadcastWG.Wait()
+		close(h.broadcastDone)
+	}()
+}
+
+// runBroadcastDispatcher defines broadcast order as the sequence in which this
+// goroutine receives local and remote events. A stable hash sends every event
+// for the same complete targetKey to the same sequential worker queue.
+func (h *Hub) runBroadcastDispatcher() {
+	defer h.broadcastWG.Done()
+	for {
+		select {
+		case req := <-h.bcast:
+			if !h.dispatchBroadcast(req) {
+				return
+			}
+		case req := <-h.remoteBcast:
+			if !h.dispatchBroadcast(req) {
+				return
+			}
+		case <-h.quit:
+			return
+		}
+	}
+}
+
+func (h *Hub) dispatchBroadcast(req broadcastReq) bool {
+	partition := broadcastPartition(broadcastTargetKey(req.event), len(h.broadcastQueues))
+	select {
+	case h.broadcastQueues[partition] <- req:
+		return true
+	case <-h.quit:
+		return false
+	}
+}
+
+// runBroadcastWorker processes one partition sequentially. Authorization stays
+// outside Hub.run and Hub.mu, while different partitions execute in parallel.
+func (h *Hub) runBroadcastWorker(queue <-chan broadcastReq) {
+	defer h.broadcastWG.Done()
+	for {
+		select {
+		case <-h.quit:
+			return
+		default:
+		}
+
+		select {
+		case req := <-queue:
+			h.handleBroadcast(req)
+		case <-h.quit:
+			return
+		}
+	}
+}
+
+func broadcastTargetKey(event Event) string {
+	return targetKey{
+		workspaceID: event.WorkspaceID,
+		targetType:  event.TargetType,
+		targetID:    event.TargetID,
+	}.String()
+}
+
+func broadcastPartition(key string, partitionCount int) int {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(key))
+	return int(hasher.Sum32() % uint32(partitionCount))
 }
 
 // handleRemoteBusEvent is called by the BroadcastBus Subscribe handler.
@@ -695,6 +854,7 @@ func (h *Hub) addClient(c *Client) bool {
 	}
 	h.clients[c.id] = c
 	h.clientSubs[c.id] = make(map[string]struct{})
+	h.subscriptionGenerations[c.id] = make(map[string]uint64)
 	return true
 }
 
@@ -703,7 +863,7 @@ func (h *Hub) removeClient(c *Client) *Client {
 	defer h.mu.Unlock()
 
 	removed, ok := h.clients[c.id]
-	if !ok {
+	if !ok || removed != c {
 		return nil
 	}
 	delete(h.clients, c.id)
@@ -716,6 +876,7 @@ func (h *Hub) removeClient(c *Client) *Client {
 		}
 	}
 	delete(h.clientSubs, c.id)
+	delete(h.subscriptionGenerations, c.id)
 	return removed
 }
 
@@ -731,40 +892,33 @@ func (h *Hub) clearClients() []*Client {
 	h.clients = make(map[string]*Client)
 	h.subs = make(map[string]map[string]struct{})
 	h.clientSubs = make(map[string]map[string]struct{})
+	h.subscriptionGenerations = make(map[string]map[string]uint64)
 	return clients
 }
 
-// handleSubscribe processes a subscription request.
-// Authorization is checked outside h.mu because it can perform storage I/O.
+// handleSubscribe applies an already-authorized subscription request.
 func (h *Hub) handleSubscribe(req subscribeReq) error {
 	c := req.client
-	h.mu.RLock()
-	_, registered := h.clients[c.id]
-	h.mu.RUnlock()
-	if !registered {
-		return fmt.Errorf("client not registered")
-	}
-
-	// Authorization uses only the server-asserted client identity.
-	ok, err := h.authorizer.CanAccess(req.ctx, c.userID, c.workspaceID, req.targetType, req.targetID)
-	if err != nil {
-		return fmt.Errorf("authorization check: %w", err)
-	}
-	if !ok {
-		return ErrSubscribeForbidden
-	}
-
 	key := targetKey{workspaceID: c.workspaceID, targetType: req.targetType, targetID: req.targetID}.String()
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if _, registered := h.clients[c.id]; !registered {
-		return fmt.Errorf("client not registered")
+	if err := req.ctx.Err(); err != nil {
+		return err
+	}
+	registeredClient, registered := h.clients[c.id]
+	if !registered || registeredClient != c {
+		return ErrClientNotRegistered
 	}
 	// The target set is created lazily on first subscription; clientSubs is
 	// initialized by addClient before a client can subscribe.
 	if h.subs[key] == nil {
 		h.subs[key] = make(map[string]struct{})
+	}
+	if _, subscribed := h.clientSubs[c.id][key]; !subscribed {
+		h.nextSubscriptionGeneration++
+		h.subscriptionGenerations[c.id][key] = h.nextSubscriptionGeneration
 	}
 	h.subs[key][c.id] = struct{}{}
 	h.clientSubs[c.id][key] = struct{}{}
@@ -784,37 +938,35 @@ func (h *Hub) handleSubscribe(req subscribeReq) error {
 //   - any auth error          → skip delivery for this client; subscription kept.
 //     A transient DB error must not unsubscribe an authorized client.
 //
-// It snapshots subscribers under h.mu, then performs auth checks and enqueue
-// operations without holding h.mu.
+// It snapshots subscribers under h.mu, then performs auth checks without the
+// lock. The final state validation and non-blocking enqueue are atomic with
+// unsubscribe/revocation under h.mu.
 func (h *Hub) handleBroadcast(req broadcastReq) {
 	if req.done != nil {
 		defer close(req.done)
 	}
 
-	key := targetKey{
-		workspaceID: req.event.WorkspaceID,
-		targetType:  req.event.TargetType,
-		targetID:    req.event.TargetID,
-	}.String()
+	key := broadcastTargetKey(req.event)
 
-	clients := h.broadcastSnapshot(key)
-	if len(clients) == 0 {
+	subscriptions := h.broadcastSnapshot(key)
+	if len(subscriptions) == 0 {
 		return
 	}
 
-	for _, c := range clients {
-		if !h.isSubscribed(c.id, key) {
+	for _, subscription := range subscriptions {
+		c := subscription.client
+		if !h.subscriptionIsCurrent(subscription, key) {
 			continue
 		}
 
 		// Re-check authorization before delivery using a fresh bounded context.
 		// Using context.Background() (not the caller's context) ensures that a
 		// cancelled publish context does not affect the auth check or revocation.
-		authCtx, cancel := context.WithTimeout(context.Background(), broadcastAuthTimeout)
+		authCtx, cancel := context.WithTimeout(c.ctx, broadcastAuthTimeout)
 		allowed, authErr := h.authorizer.CanAccess(authCtx, c.userID, c.workspaceID, req.event.TargetType, req.event.TargetID)
-		cancel()
 
 		if authErr != nil {
+			cancel()
 			// Transient error: skip delivery but keep subscription.
 			// The client remains subscribed; the next broadcast will retry.
 			h.logger.WarnContext(context.Background(), "ws: auth re-check error on broadcast; skipping delivery",
@@ -825,8 +977,9 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 		}
 
 		if !allowed {
+			cancel()
 			// Definitive revocation: access denied with no error.
-			h.revokeSubscription(c.id, key)
+			_ = h.RevokeSubscription(context.Background(), c, key)
 			h.logger.DebugContext(context.Background(), "ws: subscription revoked on broadcast",
 				"user_id", c.userID,
 				"target_type", string(req.event.TargetType),
@@ -834,12 +987,15 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 			continue
 		}
 
-		if !c.enqueue(req.data) {
+		_, outboxFull := h.enqueueAuthorizedBroadcast(authCtx, subscription, key, req.data)
+		cancel()
+		if outboxFull {
 			// Outbox full: slow client. Drop connection and clean up.
 			h.logger.WarnContext(context.Background(), "ws: dropping slow client",
 				"user_id", c.userID,
 			)
-			h.dropClient(c)
+			h.Unregister(c)
+			c.close()
 		}
 	}
 }
@@ -873,7 +1029,7 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 		return h.Subscribe(ctx, c, msg.TargetType, msg.TargetID)
 	case ClientMessageTypeUnsubscribe:
 		key := targetKey{workspaceID: c.workspaceID, targetType: msg.TargetType, targetID: msg.TargetID}.String()
-		h.revokeSubscription(c.id, key)
+		return h.RevokeSubscription(ctx, c, key)
 	case ClientMessageTypePing:
 		// Activity already recorded above; nothing else to do.
 	case ClientMessageTypeReactionToggle:
@@ -925,7 +1081,7 @@ func validateReactionToggle(msg ClientMessage) error {
 	return nil
 }
 
-func (h *Hub) broadcastSnapshot(key string) []*Client {
+func (h *Hub) broadcastSnapshot(key string) []broadcastSubscription {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -934,40 +1090,78 @@ func (h *Hub) broadcastSnapshot(key string) []*Client {
 		return nil
 	}
 
-	clients := make([]*Client, 0, len(subs))
+	subscriptions := make([]broadcastSubscription, 0, len(subs))
 	for clientID := range subs {
-		if c, ok := h.clients[clientID]; ok {
-			clients = append(clients, c)
+		c, registered := h.clients[clientID]
+		generation, generated := h.subscriptionGenerations[clientID][key]
+		if registered && generated {
+			subscriptions = append(subscriptions, broadcastSubscription{client: c, generation: generation})
 		}
 	}
-	return clients
+	return subscriptions
 }
 
-func (h *Hub) revokeSubscription(clientID, key string) {
+func (h *Hub) revokeSubscription(client *Client, key string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	registered, ok := h.clients[client.id]
+	if !ok || registered != client {
+		return false
+	}
 
 	if set, ok := h.subs[key]; ok {
-		delete(set, clientID)
+		delete(set, client.id)
 		if len(set) == 0 {
 			delete(h.subs, key)
 		}
 	}
-	if clientSubs, ok := h.clientSubs[clientID]; ok {
+	if clientSubs, ok := h.clientSubs[client.id]; ok {
 		delete(clientSubs, key)
 	}
+	if generations, ok := h.subscriptionGenerations[client.id]; ok {
+		delete(generations, key)
+	}
+	return true
 }
 
-func (h *Hub) isSubscribed(clientID, key string) bool {
+func (h *Hub) subscriptionIsCurrent(subscription broadcastSubscription, key string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	if _, ok := h.clients[clientID]; !ok {
+	return h.subscriptionIsCurrentLocked(subscription, key)
+}
+
+func (h *Hub) subscriptionIsCurrentLocked(subscription broadcastSubscription, key string) bool {
+	c := subscription.client
+	if c == nil || h.clients[c.id] != c {
 		return false
 	}
-	if clientSubs, ok := h.clientSubs[clientID]; ok {
-		_, ok = clientSubs[key]
-		return ok
+	if _, ok := h.subs[key][c.id]; !ok {
+		return false
 	}
-	return false
+	if _, ok := h.clientSubs[c.id][key]; !ok {
+		return false
+	}
+	return h.subscriptionGenerations[c.id][key] == subscription.generation
+}
+
+// enqueueAuthorizedBroadcast makes the final subscription validation and the
+// non-blocking outbox enqueue atomic with unsubscribe, revocation, unregister,
+// and connection replacement. It never performs storage access or network I/O.
+func (h *Hub) enqueueAuthorizedBroadcast(
+	ctx context.Context,
+	subscription broadcastSubscription,
+	key string,
+	data []byte,
+) (enqueued bool, outboxFull bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if ctx.Err() != nil || h.isShuttingDown() || !h.subscriptionIsCurrentLocked(subscription, key) {
+		return false, false
+	}
+	if !subscription.client.enqueue(data) {
+		return false, true
+	}
+	return true, false
 }

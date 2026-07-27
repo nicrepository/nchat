@@ -176,7 +176,7 @@ func New(cfg config.Config) (*App, error) {
 	var authorizer ws.SubscriptionAuthorizer = ws.NopAuthorizer{}
 	var wsWorkspaces ws.WorkspaceResolver
 	if workspaceStore != nil {
-		authorizer = ws.NewServiceAuthorizer(permissionSvc, dmStore)
+		authorizer = ws.NewServiceAuthorizer(channelStore, dmStore)
 		wsWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 	}
 	var bus ws.BroadcastBus = ws.NopBus{}

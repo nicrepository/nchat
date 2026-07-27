@@ -12,6 +12,20 @@ func TestDecodeClientMessage_RejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestDecodeClientMessage_SubscribeRejectsClientControlledIdentityAndAliasIDs(t *testing.T) {
+	for _, payload := range []string{
+		`{"type":"subscribe","target_type":"channel","target_id":"ch-1","user_id":"attacker"}`,
+		`{"type":"subscribe","target_type":"channel","target_id":"ch-1","workspace_id":"other"}`,
+		`{"type":"subscribe","target_type":"channel","target_id":"ch-1","room_id":"other"}`,
+		`{"type":"subscribe","target_type":"channel","target_id":"ch-1","channel_id":"other"}`,
+		`{"type":"subscribe","target_type":"dm","target_id":"dm-1","conversation_id":"other"}`,
+	} {
+		if _, err := decodeClientMessage([]byte(payload)); err == nil {
+			t.Fatalf("client-controlled identity or alias ID must be rejected: %s", payload)
+		}
+	}
+}
+
 func TestHandleReactionClientError_RateLimitIsStructuredAndHandled(t *testing.T) {
 	c := newClient("client-1", "user-1", "workspace-1", &fakeSender{})
 	if !handleReactionClientError(c, ErrReactionRateLimited) {

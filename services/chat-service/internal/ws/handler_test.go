@@ -30,6 +30,21 @@ type fakeWorkspaceResolver struct {
 	err error
 }
 
+type blockingAllowAuthorizer struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingAllowAuthorizer) CanAccess(ctx context.Context, _, _ string, _ TargetType, _ string) (bool, error) {
+	close(a.started)
+	select {
+	case <-a.release:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
 func (f *fakeWorkspaceResolver) GetDefaultWorkspaceID(_ context.Context) (string, error) {
 	return f.id, f.err
 }
@@ -203,6 +218,568 @@ func dialWS(t *testing.T, srv *httptest.Server) *websocket.Conn {
 	}
 	t.Cleanup(func() { _ = conn.CloseNow() })
 	return conn
+}
+
+type subscribeAcknowledgement struct {
+	Type       string     `json:"type"`
+	Operation  string     `json:"operation"`
+	TargetType TargetType `json:"target_type"`
+	TargetID   string     `json:"target_id"`
+}
+
+func readSubscribeAcknowledgement(t *testing.T, ctx context.Context, conn *websocket.Conn) ([]byte, subscribeAcknowledgement) {
+	t.Helper()
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read subscribe acknowledgement: %v", err)
+	}
+	var acknowledgement subscribeAcknowledgement
+	if err := json.Unmarshal(data, &acknowledgement); err != nil {
+		t.Fatalf("decode subscribe acknowledgement: %v", err)
+	}
+	return data, acknowledgement
+}
+
+func TestNormalizeSubscriptionTarget_CanonicalizesAcceptedUUIDRepresentations(t *testing.T) {
+	const canonicalID = "550e8400-e29b-41d4-a716-446655440000"
+	tests := []struct {
+		name     string
+		targetID string
+	}{
+		{name: "canonical", targetID: canonicalID},
+		{name: "uppercase", targetID: "550E8400-E29B-41D4-A716-446655440000"},
+		{name: "without hyphens", targetID: "550e8400e29b41d4a716446655440000"},
+		{name: "braced", targetID: "{550e8400-e29b-41d4-a716-446655440000}"},
+		{name: "external spaces", targetID: " 550e8400-e29b-41d4-a716-446655440000\t"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, err := normalizeSubscriptionTarget(ClientMessage{
+				Type:       ClientMessageTypeSubscribe,
+				TargetType: TargetTypeChannel,
+				TargetID:   tt.targetID,
+			})
+			if err != nil {
+				t.Fatalf("normalize subscription target: %v", err)
+			}
+			if target.targetType != TargetTypeChannel || target.targetID != canonicalID {
+				t.Fatalf("unexpected normalized target: %+v", target)
+			}
+		})
+	}
+}
+
+func TestServeWS_EquivalentTargetIDUsesCanonicalAuthorizationRoomAckAndEvents(t *testing.T) {
+	const (
+		workspaceID       = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		userID            = "user-canonical-target"
+		canonicalTargetID = "550e8400-e29b-41d4-a716-446655440000"
+		uppercaseTargetID = "550E8400-E29B-41D4-A716-446655440000"
+	)
+	auth := &fakeAuthorizer{}
+	auth.setAccess(userID, workspaceID, TargetTypeChannel, canonicalTargetID, true)
+	hub := NewHub(auth, slog.Default(), NopBus{}, "canonical-target-instance")
+	defer hub.Shutdown()
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	conn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	subscribe, err := json.Marshal(ClientMessage{
+		Type:       ClientMessageTypeSubscribe,
+		TargetType: TargetTypeChannel,
+		TargetID:   uppercaseTargetID,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+
+	_, acknowledgement := readSubscribeAcknowledgement(t, ctx, conn)
+	if acknowledgement.Type != "subscribed" || acknowledgement.TargetID != canonicalTargetID {
+		t.Fatalf("unexpected canonical acknowledgement: %+v", acknowledgement)
+	}
+	if got := auth.lastTargetID(); got != canonicalTargetID {
+		t.Fatalf("authorizer received target ID %q, want %q", got, canonicalTargetID)
+	}
+
+	canonicalKey := targetKey{
+		workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: canonicalTargetID,
+	}.String()
+	nonCanonicalKey := targetKey{
+		workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: uppercaseTargetID,
+	}.String()
+	if !hubHasSubscriptionTarget(hub, canonicalKey) {
+		t.Fatal("canonical room key was not registered")
+	}
+	if hubHasSubscriptionTarget(hub, nonCanonicalKey) {
+		t.Fatal("original non-canonical room key must not appear in hub state")
+	}
+
+	localMessageID := "11111111-1111-4111-8111-111111111111"
+	hub.PublishMessageCreated(ctx, workspaceID, TargetTypeChannel, canonicalTargetID, MessagePayload{ID: localMessageID})
+	_, localData, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read local canonical event: %v", err)
+	}
+	var localEvent Event
+	if err := json.Unmarshal(localData, &localEvent); err != nil {
+		t.Fatalf("decode local canonical event: %v", err)
+	}
+	if localEvent.TargetID != canonicalTargetID || localEvent.MessageID != localMessageID {
+		t.Fatalf("unexpected local event: %+v", localEvent)
+	}
+
+	hub.handleRemoteBusEvent(Event{
+		SchemaVersion:    CurrentEventSchemaVersion,
+		Type:             EventTypeMessageCreated,
+		WorkspaceID:      workspaceID,
+		TargetType:       TargetTypeChannel,
+		TargetID:         canonicalTargetID,
+		MessageID:        "22222222-2222-4222-8222-222222222222",
+		EventID:          "33333333-3333-4333-8333-333333333333",
+		SourceInstanceID: "remote-instance",
+		CreatedAt:        time.Now().UTC(),
+	})
+	_, remoteData, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read remote canonical event: %v", err)
+	}
+	var remoteEvent Event
+	if err := json.Unmarshal(remoteData, &remoteEvent); err != nil {
+		t.Fatalf("decode remote canonical event: %v", err)
+	}
+	if remoteEvent.TargetID != canonicalTargetID {
+		t.Fatalf("unexpected remote event target: %+v", remoteEvent)
+	}
+}
+
+func TestServeWS_EquivalentTargetIDsShareOneRoomAndReceiveSameEvent(t *testing.T) {
+	const (
+		workspaceID       = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		userID            = "user-shared-canonical-room"
+		canonicalTargetID = "550e8400-e29b-41d4-a716-446655440000"
+		uppercaseTargetID = "550E8400-E29B-41D4-A716-446655440000"
+	)
+	auth := &fakeAuthorizer{}
+	auth.setAccess(userID, workspaceID, TargetTypeChannel, canonicalTargetID, true)
+	hub := NewHub(auth, slog.Default(), NopBus{}, "shared-canonical-room")
+	defer hub.Shutdown()
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	canonicalConn := dialWS(t, srv)
+	equivalentConn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	writeSubscribe := func(conn *websocket.Conn, targetID string) {
+		t.Helper()
+		data, err := json.Marshal(ClientMessage{
+			Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: targetID,
+		})
+		if err != nil {
+			t.Fatalf("marshal subscribe: %v", err)
+		}
+		if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+			t.Fatalf("write subscribe: %v", err)
+		}
+		_, acknowledgement := readSubscribeAcknowledgement(t, ctx, conn)
+		if acknowledgement.TargetID != canonicalTargetID {
+			t.Fatalf("ack target = %q, want canonical %q", acknowledgement.TargetID, canonicalTargetID)
+		}
+	}
+
+	writeSubscribe(canonicalConn, canonicalTargetID)
+	writeSubscribe(equivalentConn, uppercaseTargetID)
+
+	key := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: canonicalTargetID}.String()
+	nonCanonicalKey := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: uppercaseTargetID}.String()
+	hub.mu.RLock()
+	roomCount := len(hub.subs)
+	subscriberCount := len(hub.subs[key])
+	_, hasNonCanonicalRoom := hub.subs[nonCanonicalKey]
+	hub.mu.RUnlock()
+	if roomCount != 1 || subscriberCount != 2 || hasNonCanonicalRoom {
+		t.Fatalf("equivalent IDs split room state: rooms=%d subscribers=%d nonCanonical=%v", roomCount, subscriberCount, hasNonCanonicalRoom)
+	}
+
+	messageID := "11111111-1111-4111-8111-111111111111"
+	hub.PublishMessageCreated(ctx, workspaceID, TargetTypeChannel, canonicalTargetID, MessagePayload{ID: messageID})
+	for name, conn := range map[string]*websocket.Conn{"canonical": canonicalConn, "equivalent": equivalentConn} {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("%s client read event: %v", name, err)
+		}
+		var event Event
+		if err := json.Unmarshal(data, &event); err != nil {
+			t.Fatalf("%s client decode event: %v", name, err)
+		}
+		if event.TargetID != canonicalTargetID || event.MessageID != messageID {
+			t.Fatalf("%s client received unexpected event: %+v", name, event)
+		}
+	}
+}
+
+func TestServeWS_EquivalentSubscribeIsIdempotentAndUnsubscribeUsesCanonicalRoom(t *testing.T) {
+	const (
+		workspaceID       = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		userID            = "user-idempotent-canonical-room"
+		canonicalTargetID = "550e8400-e29b-41d4-a716-446655440000"
+		uppercaseTargetID = "550E8400-E29B-41D4-A716-446655440000"
+	)
+	for _, order := range []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{name: "canonical then equivalent", first: canonicalTargetID, second: uppercaseTargetID},
+		{name: "equivalent then canonical", first: uppercaseTargetID, second: canonicalTargetID},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			auth := &fakeAuthorizer{}
+			auth.setAccess(userID, workspaceID, TargetTypeChannel, canonicalTargetID, true)
+			hub := NewHub(auth, slog.Default(), NopBus{}, "idempotent-canonical-room")
+			defer hub.Shutdown()
+			srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+			conn := dialWS(t, srv)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			write := func(messageType ClientMessageType, targetID string) {
+				t.Helper()
+				data, err := json.Marshal(ClientMessage{
+					Type: messageType, TargetType: TargetTypeChannel, TargetID: targetID,
+				})
+				if err != nil {
+					t.Fatalf("marshal subscription command: %v", err)
+				}
+				if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+					t.Fatalf("write subscription command: %v", err)
+				}
+			}
+
+			write(ClientMessageTypeSubscribe, order.first)
+			readSubscribeAcknowledgement(t, ctx, conn)
+			write(ClientMessageTypeSubscribe, order.second)
+			readSubscribeAcknowledgement(t, ctx, conn)
+
+			key := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: canonicalTargetID}.String()
+			hub.mu.RLock()
+			roomCount := len(hub.subs)
+			subscriberCount := len(hub.subs[key])
+			clientRoomCounts := make([]int, 0, len(hub.clientSubs))
+			for _, subscriptions := range hub.clientSubs {
+				clientRoomCounts = append(clientRoomCounts, len(subscriptions))
+			}
+			hub.mu.RUnlock()
+			if roomCount != 1 || subscriberCount != 1 || len(clientRoomCounts) != 1 || clientRoomCounts[0] != 1 {
+				t.Fatalf("equivalent resubscribe duplicated state: rooms=%d subscribers=%d clientRooms=%v", roomCount, subscriberCount, clientRoomCounts)
+			}
+
+			write(ClientMessageTypeUnsubscribe, uppercaseTargetID)
+			eventually(t, func() bool { return !hubHasSubscriptionTarget(hub, key) }, testIOTimeout,
+				"equivalent unsubscribe should remove canonical subscription")
+		})
+	}
+}
+
+func TestServeWS_SubscribeDenied_ReturnsGenericErrorAndNoRoomEvents(t *testing.T) {
+	const (
+		workspaceID = "ws-room-auth"
+		userID      = "user-room-auth"
+		channelID   = "11111111-1111-4111-8111-111111111111"
+	)
+
+	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-room-auth")
+	defer hub.Shutdown()
+
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	conn := dialWS(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+
+	subscribe, err := json.Marshal(ClientMessage{
+		Type:       ClientMessageTypeSubscribe,
+		TargetType: TargetTypeChannel,
+		TargetID:   channelID,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read subscribe denial: %v", err)
+	}
+	var response clientErrorResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatalf("decode subscribe denial: %v", err)
+	}
+	if response.Type != "error" || response.Operation != "subscribe" || response.Code != "room_access_denied" {
+		t.Fatalf("unexpected subscribe denial: %+v", response)
+	}
+
+	key := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: channelID}.String()
+	if hubHasSubscriptionTarget(hub, key) {
+		t.Fatal("denied client must not be registered in the room")
+	}
+
+	hub.PublishMessageCreated(context.Background(), workspaceID, TargetTypeChannel, channelID, MessagePayload{ID: "message-private"})
+
+	noEventCtx, noEventCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer noEventCancel()
+	if _, _, err := conn.Read(noEventCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("denied socket must receive no room events, got: %v", err)
+	}
+}
+
+func TestServeWS_SubscribeDeniedThenAllowedOnSameSocket(t *testing.T) {
+	const (
+		workspaceID = "ws-denied-then-allowed"
+		userID      = "user-denied-then-allowed"
+		deniedID    = "66666666-6666-4666-8666-666666666666"
+		allowedID   = "77777777-7777-4777-8777-777777777777"
+	)
+	auth := &fakeAuthorizer{}
+	auth.setAccess(userID, workspaceID, TargetTypeChannel, allowedID, true)
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-denied-then-allowed")
+	defer hub.Shutdown()
+
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	conn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+
+	writeSubscribe := func(targetID string) {
+		t.Helper()
+		data, err := json.Marshal(ClientMessage{
+			Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: targetID,
+		})
+		if err != nil {
+			t.Fatalf("marshal subscribe: %v", err)
+		}
+		if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+			t.Fatalf("write subscribe: %v", err)
+		}
+	}
+
+	writeSubscribe(deniedID)
+	_, denial, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read denial: %v", err)
+	}
+	var response clientErrorResponse
+	if err := json.Unmarshal(denial, &response); err != nil {
+		t.Fatalf("decode denial: %v", err)
+	}
+	if response.Operation != "subscribe" || response.Code != "room_access_denied" {
+		t.Fatalf("unexpected denial: %+v", response)
+	}
+
+	writeSubscribe(allowedID)
+	_, acknowledgement := readSubscribeAcknowledgement(t, ctx, conn)
+	if acknowledgement.Type != "subscribed" || acknowledgement.Operation != "subscribe" ||
+		acknowledgement.TargetType != TargetTypeChannel || acknowledgement.TargetID != allowedID {
+		t.Fatalf("unexpected subscribe acknowledgement: %+v", acknowledgement)
+	}
+	allowedKey := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: allowedID}.String()
+	eventually(t, func() bool { return hubHasSubscriptionTarget(hub, allowedKey) }, testIOTimeout, "allowed room subscription")
+	hub.PublishMessageCreated(context.Background(), workspaceID, TargetTypeChannel, allowedID, MessagePayload{
+		ID: "88888888-8888-4888-8888-888888888888",
+	})
+
+	_, eventData, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read allowed room event: %v", err)
+	}
+	var event Event
+	if err := json.Unmarshal(eventData, &event); err != nil {
+		t.Fatalf("decode allowed room event: %v", err)
+	}
+	if event.Type != EventTypeMessageCreated || event.TargetID != allowedID {
+		t.Fatalf("unexpected allowed room event: %+v", event)
+	}
+}
+
+func TestServeWS_RepeatedSubscribeAuthorizationErrorFailsClosed(t *testing.T) {
+	const (
+		workspaceID = "ws-room-error"
+		userID      = "user-room-error"
+		dmID        = "22222222-2222-4222-8222-222222222222"
+	)
+
+	auth := &fakeAuthorizer{}
+	auth.setErr(userID, workspaceID, TargetTypeDM, dmID, errors.New("database unavailable"))
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-room-error")
+	defer hub.Shutdown()
+
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	conn := dialWS(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	subscribe, err := json.Marshal(ClientMessage{
+		Type: ClientMessageTypeSubscribe, TargetType: TargetTypeDM, TargetID: dmID,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+
+	for attempt := 0; attempt < DefaultHandlerConfig().MaxInvalidMessages+1; attempt++ {
+		if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+			t.Fatalf("write subscribe attempt %d: %v", attempt, err)
+		}
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read subscribe denial attempt %d: %v", attempt, err)
+		}
+		var response clientErrorResponse
+		if err := json.Unmarshal(data, &response); err != nil {
+			t.Fatalf("decode subscribe denial attempt %d: %v", attempt, err)
+		}
+		if response.Type != "error" || response.Operation != "subscribe" || response.Code != "room_subscription_unavailable" {
+			t.Fatalf("attempt %d returned %+v", attempt, response)
+		}
+		if strings.Contains(string(data), "database unavailable") {
+			t.Fatalf("technical details leaked in subscribe response: %s", data)
+		}
+	}
+
+	key := targetKey{workspaceID: workspaceID, targetType: TargetTypeDM, targetID: dmID}.String()
+	if hubHasSubscriptionTarget(hub, key) {
+		t.Fatal("authorization errors must never create a room subscription")
+	}
+}
+
+func TestValidateSubscribe(t *testing.T) {
+	validTargetID := "33333333-3333-4333-8333-333333333333"
+	tests := []struct {
+		name string
+		msg  ClientMessage
+	}{
+		{name: "wrong message type", msg: ClientMessage{Type: ClientMessageTypePing, TargetType: TargetTypeChannel, TargetID: validTargetID}},
+		{name: "missing target type", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetID: validTargetID}},
+		{name: "blank target type", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetType: TargetType("   "), TargetID: validTargetID}},
+		{name: "unknown target type", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetType: TargetType("thread"), TargetID: validTargetID}},
+		{name: "missing target id", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel}},
+		{name: "blank target id", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: "   "}},
+		{name: "invalid target id", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetType: TargetTypeDM, TargetID: "not-a-uuid"}},
+		{name: "unexpected reaction fields", msg: ClientMessage{Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: validTargetID, MessageID: validTargetID}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateSubscribe(tt.msg); err == nil {
+				t.Fatal("expected invalid subscribe payload")
+			}
+		})
+	}
+
+	for _, targetType := range []TargetType{TargetTypeChannel, TargetTypeDM} {
+		if err := validateSubscribe(ClientMessage{
+			Type:       ClientMessageTypeSubscribe,
+			TargetType: targetType,
+			TargetID:   validTargetID,
+		}); err != nil {
+			t.Fatalf("valid %s subscribe rejected: %v", targetType, err)
+		}
+	}
+}
+
+func TestServeWS_InvalidSubscribeDoesNotAuthorizeAndConsumesInvalidBudget(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-invalid-subscribe")
+	defer hub.Shutdown()
+
+	cfg := DefaultHandlerConfig()
+	cfg.MaxInvalidMessages = 2
+	srv := newTestWSServerWithConfig(
+		t,
+		hub,
+		&fakeWorkspaceResolver{id: "ws-invalid-subscribe"},
+		"user-invalid-subscribe",
+		cfg,
+	)
+	conn := dialWS(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+	invalid := []byte(`{"type":"subscribe","target_type":"channel","target_id":"not-a-uuid"}`)
+	for attempt := 0; attempt < cfg.MaxInvalidMessages; attempt++ {
+		if err := conn.Write(ctx, websocket.MessageText, invalid); err != nil {
+			break
+		}
+	}
+
+	_, _, err := conn.Read(ctx)
+	if err == nil {
+		t.Fatal("expected invalid subscribe flood to close the connection")
+	}
+	if status := websocket.CloseStatus(err); status != websocket.StatusPolicyViolation {
+		t.Fatalf("expected policy violation close status, got %v from %v", status, err)
+	}
+	if got := auth.callCount(); got != 0 {
+		t.Fatalf("invalid subscribe must not call authorizer/storage, got %d calls", got)
+	}
+	hub.mu.RLock()
+	clientSubCount := 0
+	for _, subscriptions := range hub.clientSubs {
+		clientSubCount += len(subscriptions)
+	}
+	hub.mu.RUnlock()
+	if clientSubCount != 0 {
+		t.Fatalf("invalid subscribe must not add room subscriptions, got %d", clientSubCount)
+	}
+}
+
+func TestServeWS_SubscribeDenialDoesNotConsumeInvalidBudget(t *testing.T) {
+	const targetID = "55555555-5555-4555-8555-555555555555"
+	auth := &fakeAuthorizer{}
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-denial-budget")
+	defer hub.Shutdown()
+
+	cfg := DefaultHandlerConfig()
+	cfg.MaxInvalidMessages = 1
+	srv := newTestWSServerWithConfig(
+		t,
+		hub,
+		&fakeWorkspaceResolver{id: "ws-denial-budget"},
+		"user-denial-budget",
+		cfg,
+	)
+	conn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+
+	subscribe, err := json.Marshal(ClientMessage{
+		Type:       ClientMessageTypeSubscribe,
+		TargetType: TargetTypeChannel,
+		TargetID:   targetID,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+			t.Fatalf("write denied subscribe %d: %v", attempt, err)
+		}
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("denial %d unexpectedly closed the connection: %v", attempt, err)
+		}
+		var response clientErrorResponse
+		if err := json.Unmarshal(data, &response); err != nil {
+			t.Fatalf("decode denial %d: %v", attempt, err)
+		}
+		if response.Operation != "subscribe" || response.Code != "room_access_denied" {
+			t.Fatalf("unexpected denial %d: %+v", attempt, response)
+		}
+	}
 }
 
 func realisticAccessTokenSubprotocol(t *testing.T) string {
@@ -431,8 +1008,9 @@ func TestServeWS_InvalidSubprotocolTokenReturns400(t *testing.T) {
 // We verify the side-effect: a subscribe message causes the client to be
 // subscribed to the target in the hub.
 func TestServeWS_ReadLoop_CallsHandleClientMessage(t *testing.T) {
+	const channelID = "44444444-4444-4444-8444-444444444444"
 	auth := &fakeAuthorizer{}
-	auth.setAccess("user-b", "ws-2", TargetTypeChannel, "chan-1", true)
+	auth.setAccess("user-b", "ws-2", TargetTypeChannel, channelID, true)
 
 	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-inst2")
 	defer hub.Shutdown()
@@ -458,7 +1036,7 @@ func TestServeWS_ReadLoop_CallsHandleClientMessage(t *testing.T) {
 	msg := ClientMessage{
 		Type:       ClientMessageTypeSubscribe,
 		TargetType: TargetTypeChannel,
-		TargetID:   "chan-1",
+		TargetID:   channelID,
 	}
 	data, _ := json.Marshal(msg)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -467,7 +1045,20 @@ func TestServeWS_ReadLoop_CallsHandleClientMessage(t *testing.T) {
 		t.Fatalf("send subscribe: %v", err)
 	}
 
-	key := targetKey{workspaceID: "ws-2", targetType: TargetTypeChannel, targetID: "chan-1"}.String()
+	rawAcknowledgement, acknowledgement := readSubscribeAcknowledgement(t, ctx, conn)
+	if acknowledgement.Type != "subscribed" || acknowledgement.Operation != "subscribe" {
+		t.Fatalf("unexpected subscribe acknowledgement: %+v", acknowledgement)
+	}
+	if acknowledgement.TargetType != TargetTypeChannel || acknowledgement.TargetID != channelID {
+		t.Fatalf("acknowledgement target mismatch: %+v", acknowledgement)
+	}
+	for _, sensitiveField := range []string{"workspace_id", "user_id", "room_name", "members", "role"} {
+		if strings.Contains(string(rawAcknowledgement), sensitiveField) {
+			t.Fatalf("subscribe acknowledgement leaked %q: %s", sensitiveField, rawAcknowledgement)
+		}
+	}
+
+	key := targetKey{workspaceID: "ws-2", targetType: TargetTypeChannel, targetID: channelID}.String()
 	eventually(t, func() bool {
 		hub.mu.RLock()
 		defer hub.mu.RUnlock()
@@ -480,6 +1071,170 @@ func TestServeWS_ReadLoop_CallsHandleClientMessage(t *testing.T) {
 	}, 2*time.Second, "subscribe side-effect: client subscribed to channel")
 
 	_ = conn.CloseNow()
+}
+
+func TestServeWS_RepeatedAuthorizedSubscribeAcknowledgesWithoutDuplicateState(t *testing.T) {
+	const (
+		workspaceID = "ws-idempotent-ack"
+		userID      = "user-idempotent-ack"
+		channelID   = "99999999-9999-4999-8999-999999999999"
+	)
+	auth := &fakeAuthorizer{}
+	auth.setAccess(userID, workspaceID, TargetTypeChannel, channelID, true)
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-idempotent-ack")
+	defer hub.Shutdown()
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	conn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	subscribe, err := json.Marshal(ClientMessage{
+		Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: channelID,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+			t.Fatalf("write subscribe %d: %v", attempt, err)
+		}
+		_, acknowledgement := readSubscribeAcknowledgement(t, ctx, conn)
+		if acknowledgement.Type != "subscribed" || acknowledgement.TargetID != channelID {
+			t.Fatalf("unexpected acknowledgement %d: %+v", attempt, acknowledgement)
+		}
+	}
+
+	key := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: channelID}.String()
+	hub.mu.RLock()
+	subscriberCount := len(hub.subs[key])
+	clientRoomCount := 0
+	for _, subscriptions := range hub.clientSubs {
+		clientRoomCount += len(subscriptions)
+	}
+	hub.mu.RUnlock()
+	if subscriberCount != 1 || clientRoomCount != 1 {
+		t.Fatalf("idempotent subscribe duplicated state: subscribers=%d client_rooms=%d", subscriberCount, clientRoomCount)
+	}
+}
+
+func TestServeWS_ClientRemovedDuringAuthorizationReceivesNoAcknowledgement(t *testing.T) {
+	const (
+		workspaceID = "ws-removed-during-auth"
+		userID      = "user-removed-during-auth"
+		channelID   = "99999999-9999-4999-8999-999999999999"
+	)
+	auth := &blockingAllowAuthorizer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-auth.release:
+		default:
+			close(auth.release)
+		}
+	}()
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-removed-during-auth")
+	defer hub.Shutdown()
+
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	conn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+
+	subscribe, err := json.Marshal(ClientMessage{
+		Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: channelID,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+
+	select {
+	case <-auth.started:
+	case <-ctx.Done():
+		t.Fatal("authorizer was not called")
+	}
+
+	hub.mu.RLock()
+	var client *Client
+	for _, registered := range hub.clients {
+		client = registered
+		break
+	}
+	hub.mu.RUnlock()
+	if client == nil {
+		t.Fatal("expected registered websocket client")
+	}
+	hub.Unregister(client)
+	eventually(t, func() bool { return !hubHasClient(hub, client.id) }, testIOTimeout, "real client unregister")
+	close(auth.release)
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer readCancel()
+	if _, data, readErr := conn.Read(readCtx); readErr == nil {
+		var acknowledgement subscribeAcknowledgement
+		if json.Unmarshal(data, &acknowledgement) == nil && acknowledgement.Type == "subscribed" {
+			t.Fatalf("removed client must not receive subscribe acknowledgement: %+v", acknowledgement)
+		}
+	}
+
+	key := targetKey{workspaceID: workspaceID, targetType: TargetTypeChannel, targetID: channelID}.String()
+	if hubHasSubscriptionTarget(hub, key) {
+		t.Fatal("removed client must not be registered in the room")
+	}
+}
+
+func TestServeWS_SlowAuthorizationDoesNotBlockAnotherClientsAcknowledgement(t *testing.T) {
+	const (
+		workspaceID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		userID      = "user-concurrent-subscribe"
+		slowID      = "11111111-1111-4111-8111-111111111111"
+		readyID     = "22222222-2222-4222-8222-222222222222"
+	)
+	auth := newBlockingTargetAuthorizer(slowID)
+	defer auth.unblock()
+	hub := NewHub(auth, slog.Default(), NopBus{}, "concurrent-client-subscribe")
+	defer hub.Shutdown()
+	srv := newTestWSServer(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID)
+	slowConn := dialWS(t, srv)
+	readyConn := dialWS(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+	defer cancel()
+
+	writeSubscribe := func(conn *websocket.Conn, targetID string) {
+		t.Helper()
+		data, err := json.Marshal(ClientMessage{
+			Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: targetID,
+		})
+		if err != nil {
+			t.Fatalf("marshal subscribe: %v", err)
+		}
+		if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+			t.Fatalf("write subscribe: %v", err)
+		}
+	}
+
+	writeSubscribe(slowConn, slowID)
+	select {
+	case <-auth.started:
+	case <-ctx.Done():
+		t.Fatal("slow authorization did not start")
+	}
+
+	writeSubscribe(readyConn, readyID)
+	_, readyAcknowledgement := readSubscribeAcknowledgement(t, ctx, readyConn)
+	if readyAcknowledgement.TargetID != readyID {
+		t.Fatalf("other client acknowledgement = %+v", readyAcknowledgement)
+	}
+
+	auth.unblock()
+	_, slowAcknowledgement := readSubscribeAcknowledgement(t, ctx, slowConn)
+	if slowAcknowledgement.TargetID != slowID {
+		t.Fatalf("slow client acknowledgement = %+v", slowAcknowledgement)
+	}
 }
 
 // TestServeWS_ReadLoopExit_CancelsPumps verifies that when the client closes

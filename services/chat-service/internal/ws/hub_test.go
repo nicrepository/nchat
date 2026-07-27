@@ -53,6 +53,94 @@ type fakeAuthorizer struct {
 	mu      sync.RWMutex
 	entries map[string]bool
 	errs    map[string]error
+	calls   int
+	targets []string
+}
+
+type blockingTargetAuthorizer struct {
+	blockedTarget string
+	started       chan struct{}
+	release       chan struct{}
+	startedOnce   sync.Once
+	releaseOnce   sync.Once
+}
+
+type blockingDenyAuthorizer struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type orderedBroadcastAuthorizer struct {
+	mu            sync.Mutex
+	calls         int
+	firstStarted  chan struct{}
+	releaseFirst  chan struct{}
+	secondStarted chan struct{}
+	releaseOnce   sync.Once
+}
+
+func (a *orderedBroadcastAuthorizer) release() {
+	a.releaseOnce.Do(func() { close(a.releaseFirst) })
+}
+
+func newOrderedBroadcastAuthorizer() *orderedBroadcastAuthorizer {
+	return &orderedBroadcastAuthorizer{
+		firstStarted:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+}
+
+func (a *orderedBroadcastAuthorizer) CanAccess(ctx context.Context, _, _ string, _ TargetType, _ string) (bool, error) {
+	a.mu.Lock()
+	a.calls++
+	call := a.calls
+	a.mu.Unlock()
+
+	switch call {
+	case 1:
+		close(a.firstStarted)
+		select {
+		case <-a.releaseFirst:
+			return true, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	case 2:
+		close(a.secondStarted)
+	}
+	return true, nil
+}
+
+func (a *blockingDenyAuthorizer) CanAccess(_ context.Context, _, _ string, _ TargetType, _ string) (bool, error) {
+	close(a.started)
+	<-a.release
+	return false, nil
+}
+
+func newBlockingTargetAuthorizer(blockedTarget string) *blockingTargetAuthorizer {
+	return &blockingTargetAuthorizer{
+		blockedTarget: blockedTarget,
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+}
+
+func (a *blockingTargetAuthorizer) CanAccess(ctx context.Context, _, _ string, _ TargetType, targetID string) (bool, error) {
+	if targetID != a.blockedTarget {
+		return true, nil
+	}
+	a.startedOnce.Do(func() { close(a.started) })
+	select {
+	case <-a.release:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+func (a *blockingTargetAuthorizer) unblock() {
+	a.releaseOnce.Do(func() { close(a.release) })
 }
 
 func (a *fakeAuthorizer) setAccess(userID, workspaceID string, tt TargetType, targetID string, allowed bool) {
@@ -78,13 +166,30 @@ func (a *fakeAuthorizer) setErr(userID, workspaceID string, tt TargetType, targe
 }
 
 func (a *fakeAuthorizer) CanAccess(_ context.Context, userID, workspaceID string, tt TargetType, targetID string) (bool, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls++
+	a.targets = append(a.targets, targetID)
 	k := fakeAuthKey(userID, workspaceID, tt, targetID)
 	if err, ok := a.errs[k]; ok {
 		return false, err
 	}
 	return a.entries[k], nil
+}
+
+func (a *fakeAuthorizer) lastTargetID() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.targets) == 0 {
+		return ""
+	}
+	return a.targets[len(a.targets)-1]
+}
+
+func (a *fakeAuthorizer) callCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.calls
 }
 
 func fakeAuthKey(userID, workspaceID string, tt TargetType, targetID string) string {
@@ -97,15 +202,16 @@ func newTestLogger() *slog.Logger { return slog.Default() }
 // Tests call handleSubscribe, handleBroadcast, and dropClient directly.
 func newTestHub(auth SubscriptionAuthorizer) *Hub {
 	return &Hub{
-		authorizer:  auth,
-		bus:         NopBus{},
-		instanceID:  "test-instance",
-		busCancel:   func() {},
-		logger:      newTestLogger(),
-		remoteBcast: make(chan broadcastReq, 256),
-		clients:     make(map[string]*Client),
-		subs:        make(map[string]map[string]struct{}),
-		clientSubs:  make(map[string]map[string]struct{}),
+		authorizer:              auth,
+		bus:                     NopBus{},
+		instanceID:              "test-instance",
+		busCancel:               func() {},
+		logger:                  newTestLogger(),
+		remoteBcast:             make(chan broadcastReq, 256),
+		clients:                 make(map[string]*Client),
+		subs:                    make(map[string]map[string]struct{}),
+		clientSubs:              make(map[string]map[string]struct{}),
+		subscriptionGenerations: make(map[string]map[string]uint64),
 	}
 }
 
@@ -122,6 +228,13 @@ func registerInRunningHub(t *testing.T, h *Hub, c *Client) {
 	if !h.Register(c) {
 		t.Fatalf("register client %q: hub rejected registration", c.id)
 	}
+}
+
+func newRunningTestHub(t *testing.T, auth SubscriptionAuthorizer) *Hub {
+	t.Helper()
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "running-test-instance")
+	t.Cleanup(hub.Shutdown)
+	return hub
 }
 
 func hubHasClient(h *Hub, clientID string) bool {
@@ -141,6 +254,13 @@ func hubHasClientSubs(h *Hub, clientID string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	_, ok := h.clientSubs[clientID]
+	return ok
+}
+
+func hubHasClientSubscription(h *Hub, clientID, key string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.clientSubs[clientID][key]
 	return ok
 }
 
@@ -169,6 +289,26 @@ func makeEvent(workspaceID string, tt TargetType, targetID, messageID string) (E
 	}
 	data, _ := json.Marshal(evt)
 	return evt, data
+}
+
+func enqueueBroadcastForTest(t *testing.T, h *Hub, evt Event, data []byte) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data, done: done}:
+	case <-time.After(testIOTimeout):
+		t.Fatal("timed out enqueueing broadcast")
+	}
+	return done
+}
+
+func waitForBroadcast(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(testIOTimeout):
+		t.Fatal("timed out waiting for broadcast")
+	}
 }
 
 // eventually polls condition until it returns true or timeout elapses.
@@ -215,6 +355,646 @@ func TestHub_Register_TracksClient(t *testing.T) {
 	}
 	if !hubHasClientSubs(h, "c1") {
 		t.Fatal("clientSubs entry should exist after register")
+	}
+}
+
+func TestHub_SlowSubscribeAuthorizationDoesNotBlockRegister(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "slow-subscribe-register")
+	defer hub.Shutdown()
+	defer auth.unblock()
+
+	clientA := newClient("client-a", "user-a", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, clientA)
+	subscribeResult := make(chan error, 1)
+	go func() {
+		subscribeResult <- hub.Subscribe(context.Background(), clientA, TargetTypeChannel, "slow-room")
+	}()
+
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow authorizer did not start")
+	}
+
+	clientB := newClient("client-b", "user-b", "workspace", &fakeSender{})
+	registerResult := make(chan bool, 1)
+	go func() { registerResult <- hub.Register(clientB) }()
+	select {
+	case registered := <-registerResult:
+		if !registered {
+			t.Fatal("hub rejected client B while client A authorization was pending")
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("register was blocked by another client's authorization")
+	}
+
+	auth.unblock()
+	select {
+	case err := <-subscribeResult:
+		if err != nil {
+			t.Fatalf("client A subscribe failed after authorization release: %v", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("client A subscribe did not finish after authorization release")
+	}
+}
+
+func TestHub_ClientCloseCancelsPendingSubscribeAuthorization(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "cancel-slow-subscribe")
+	defer hub.Shutdown()
+	defer auth.unblock()
+
+	client := newClient("client-a", "user-a", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	result := make(chan error, 1)
+	go func() {
+		result <- hub.Subscribe(context.Background(), client, TargetTypeChannel, "slow-room")
+	}()
+
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow authorizer did not start")
+	}
+	client.close()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected client close cancellation, got: %v", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("client close did not cancel pending authorization")
+	}
+}
+
+func TestHub_ShutdownCancelsPendingSubscribeAuthorization(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "shutdown-slow-subscribe")
+	defer auth.unblock()
+
+	client := newClient("client-a", "user-a", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	result := make(chan error, 1)
+	go func() {
+		result <- hub.Subscribe(context.Background(), client, TargetTypeChannel, "slow-room")
+	}()
+
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow authorizer did not start")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		hub.Shutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrHubShutdown) {
+			t.Fatalf("pending subscribe after shutdown = %v, want cancellation", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("hub shutdown did not cancel pending authorization")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(testIOTimeout):
+		t.Fatal("hub shutdown did not finish after canceling authorization")
+	}
+}
+
+func TestHub_SlowSubscribeAuthorizationDoesNotBlockBroadcast(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "slow-subscribe-broadcast")
+	defer hub.Shutdown()
+	defer auth.unblock()
+
+	clientB := newClient("client-b", "user-b", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, clientB)
+	if err := hub.Subscribe(context.Background(), clientB, TargetTypeChannel, "ready-room"); err != nil {
+		t.Fatalf("subscribe client B: %v", err)
+	}
+
+	clientA := newClient("client-a", "user-a", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, clientA)
+	subscribeResult := make(chan error, 1)
+	go func() {
+		subscribeResult <- hub.Subscribe(context.Background(), clientA, TargetTypeChannel, "slow-room")
+	}()
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow authorizer did not start")
+	}
+
+	hub.PublishMessageCreated(
+		context.Background(),
+		"workspace",
+		TargetTypeChannel,
+		"ready-room",
+		MessagePayload{ID: "message-for-b"},
+	)
+	select {
+	case data := <-clientB.outbox:
+		var event Event
+		if err := json.Unmarshal(data, &event); err != nil {
+			t.Fatalf("decode broadcast for client B: %v", err)
+		}
+		if event.TargetID != "ready-room" || event.MessageID != "message-for-b" {
+			t.Fatalf("unexpected broadcast for client B: %+v", event)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast was blocked by another client's authorization")
+	}
+
+	auth.unblock()
+	select {
+	case err := <-subscribeResult:
+		if err != nil {
+			t.Fatalf("client A subscribe failed after release: %v", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("client A subscribe did not finish after release")
+	}
+}
+
+func TestHub_SlowBroadcastAuthorizationDoesNotBlockCoordinator(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("broadcast-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "slow-broadcast-auth")
+	defer hub.Shutdown()
+	defer auth.unblock()
+
+	recipient := newClient("recipient", "recipient-user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, recipient)
+	if err := hub.handleSubscribe(subscribeReq{
+		ctx:        context.Background(),
+		client:     recipient,
+		targetType: TargetTypeChannel,
+		targetID:   "broadcast-room",
+		resp:       make(chan error, 1),
+	}); err != nil {
+		t.Fatalf("apply pre-authorized recipient subscription: %v", err)
+	}
+
+	hub.PublishMessageCreated(
+		context.Background(),
+		"workspace",
+		TargetTypeChannel,
+		"broadcast-room",
+		MessagePayload{ID: "message-during-slow-auth"},
+	)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast authorizer did not start")
+	}
+
+	newcomer := newClient("newcomer", "new-user", "workspace", &fakeSender{})
+	registerResult := make(chan bool, 1)
+	go func() { registerResult <- hub.Register(newcomer) }()
+	select {
+	case registered := <-registerResult:
+		if !registered {
+			t.Fatal("hub rejected newcomer during broadcast authorization")
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("coordinator was blocked by broadcast authorization")
+	}
+
+	auth.unblock()
+	select {
+	case <-recipient.outbox:
+	case <-time.After(testIOTimeout):
+		t.Fatal("recipient did not receive broadcast after authorization release")
+	}
+}
+
+func TestHub_BroadcastDoesNotDeliverAfterCompletedUnsubscribe(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("room")
+	hub := newRunningTestHub(t, auth)
+	defer auth.unblock()
+
+	client := newClient("client", "user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	mustSubscribe(t, hub, client, TargetTypeChannel, "room")
+
+	evt, data := makeEvent("workspace", TargetTypeChannel, "room", "message")
+	done := enqueueBroadcastForTest(t, hub, evt, data)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast authorization did not start")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeUnsubscribe, TargetType: TargetTypeChannel, TargetID: "room",
+	})
+	if err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	key := targetKey{workspaceID: "workspace", targetType: TargetTypeChannel, targetID: "room"}.String()
+	if hubHasSubscription(hub, key, client.id) || hubHasClientSubscription(hub, client.id, key) {
+		t.Fatal("unsubscribe returned before removing both subscription indexes")
+	}
+
+	auth.unblock()
+	waitForBroadcast(t, done)
+	if got := len(client.outbox); got != 0 {
+		t.Fatalf("broadcast delivered %d event(s) after unsubscribe completed", got)
+	}
+	if hubHasSubscription(hub, key, client.id) || hubHasClientSubscription(hub, client.id, key) {
+		t.Fatal("late authorization restored an unsubscribed room")
+	}
+}
+
+func TestHub_BroadcastDoesNotDeliverAfterCompletedRevocation(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("room")
+	hub := newRunningTestHub(t, auth)
+	defer auth.unblock()
+
+	client := newClient("client", "user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	mustSubscribe(t, hub, client, TargetTypeChannel, "room")
+	key := targetKey{workspaceID: "workspace", targetType: TargetTypeChannel, targetID: "room"}.String()
+
+	evt, data := makeEvent("workspace", TargetTypeChannel, "room", "message")
+	done := enqueueBroadcastForTest(t, hub, evt, data)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast authorization did not start")
+	}
+
+	if err := hub.RevokeSubscription(context.Background(), client, key); err != nil {
+		t.Fatalf("revoke subscription: %v", err)
+	}
+	auth.unblock()
+	waitForBroadcast(t, done)
+
+	if got := len(client.outbox); got != 0 {
+		t.Fatalf("broadcast delivered %d event(s) after revocation completed", got)
+	}
+	if hubHasSubscription(hub, key, client.id) || hubHasClientSubscription(hub, client.id, key) {
+		t.Fatal("late authorization restored a revoked room")
+	}
+}
+
+func TestHub_BroadcastDoesNotDeliverAfterUnregister(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("room")
+	hub := newRunningTestHub(t, auth)
+	defer auth.unblock()
+
+	client := newClient("client", "user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	mustSubscribe(t, hub, client, TargetTypeChannel, "room")
+	key := targetKey{workspaceID: "workspace", targetType: TargetTypeChannel, targetID: "room"}.String()
+
+	evt, data := makeEvent("workspace", TargetTypeChannel, "room", "message")
+	done := enqueueBroadcastForTest(t, hub, evt, data)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast authorization did not start")
+	}
+
+	hub.Unregister(client)
+	eventually(t, func() bool { return !hubHasClient(hub, client.id) }, testIOTimeout,
+		"unregister during broadcast authorization")
+	auth.unblock()
+	waitForBroadcast(t, done)
+
+	if got := len(client.outbox); got != 0 {
+		t.Fatalf("broadcast delivered %d event(s) to unregistered client", got)
+	}
+	if hubHasClient(hub, client.id) || hubHasSubscriptionTarget(hub, key) || hubHasClientSubs(hub, client.id) {
+		t.Fatal("late authorization restored unregistered client state")
+	}
+}
+
+func TestHub_BroadcastFromRemovedClientDoesNotReachReplacement(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("room")
+	hub := newRunningTestHub(t, auth)
+	defer auth.unblock()
+
+	oldClient := newClient("shared-id", "old-user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, oldClient)
+	mustSubscribe(t, hub, oldClient, TargetTypeChannel, "room")
+
+	evt, data := makeEvent("workspace", TargetTypeChannel, "room", "message")
+	done := enqueueBroadcastForTest(t, hub, evt, data)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast authorization did not start")
+	}
+
+	hub.Unregister(oldClient)
+	eventually(t, func() bool { return !hubHasClient(hub, oldClient.id) }, testIOTimeout,
+		"old client unregister during broadcast authorization")
+	replacement := newClient(oldClient.id, "new-user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, replacement)
+
+	auth.unblock()
+	waitForBroadcast(t, done)
+
+	if got := len(oldClient.outbox); got != 0 {
+		t.Fatalf("old client received %d stale event(s)", got)
+	}
+	if got := len(replacement.outbox); got != 0 {
+		t.Fatalf("replacement client received %d event(s) from old authorization", got)
+	}
+	if got := hubGetClient(hub, replacement.id); got != replacement {
+		t.Fatal("late broadcast changed the replacement connection")
+	}
+}
+
+func TestHub_BroadcastGenerationDoesNotCrossUnsubscribeResubscribe(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("room")
+	hub := newRunningTestHub(t, auth)
+	defer auth.unblock()
+
+	client := newClient("client", "user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	mustSubscribe(t, hub, client, TargetTypeChannel, "room")
+	key := targetKey{workspaceID: "workspace", targetType: TargetTypeChannel, targetID: "room"}.String()
+
+	evt, data := makeEvent("workspace", TargetTypeChannel, "room", "message")
+	done := enqueueBroadcastForTest(t, hub, evt, data)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("broadcast authorization did not start")
+	}
+
+	if err := hub.RevokeSubscription(context.Background(), client, key); err != nil {
+		t.Fatalf("revoke old generation: %v", err)
+	}
+	mustSubscribe(t, hub, client, TargetTypeChannel, "room")
+	auth.unblock()
+	waitForBroadcast(t, done)
+
+	if got := len(client.outbox); got != 0 {
+		t.Fatalf("old broadcast generation delivered %d event(s) to new subscription", got)
+	}
+	if !hubHasSubscription(hub, key, client.id) || !hubHasClientSubscription(hub, client.id, key) {
+		t.Fatal("new subscription generation should remain active")
+	}
+}
+
+func TestHub_SlowBroadcastAuthorizationDoesNotBlockAnotherBroadcast(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := newRunningTestHub(t, auth)
+	defer auth.unblock()
+	slowKey := broadcastTargetKey(Event{WorkspaceID: "workspace", TargetType: TargetTypeChannel, TargetID: "slow-room"})
+	readyRoom := ""
+	for candidate := 0; candidate < 100; candidate++ {
+		targetID := fmt.Sprintf("ready-room-%d", candidate)
+		readyKey := broadcastTargetKey(Event{WorkspaceID: "workspace", TargetType: TargetTypeChannel, TargetID: targetID})
+		if broadcastPartition(slowKey, broadcastWorkerCount) != broadcastPartition(readyKey, broadcastWorkerCount) {
+			readyRoom = targetID
+			break
+		}
+	}
+	if readyRoom == "" {
+		t.Fatal("could not find a target in a different broadcast partition")
+	}
+
+	slowClient := newClient("slow-client", "slow-user", "workspace", &fakeSender{})
+	readyClient := newClient("ready-client", "ready-user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, slowClient)
+	registerInRunningHub(t, hub, readyClient)
+	mustSubscribe(t, hub, slowClient, TargetTypeChannel, "slow-room")
+	mustSubscribe(t, hub, readyClient, TargetTypeChannel, readyRoom)
+
+	slowEvent, slowData := makeEvent("workspace", TargetTypeChannel, "slow-room", "slow-message")
+	slowDone := enqueueBroadcastForTest(t, hub, slowEvent, slowData)
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow broadcast authorization did not start")
+	}
+
+	readyEvent, readyData := makeEvent("workspace", TargetTypeChannel, readyRoom, "ready-message")
+	readyDone := enqueueBroadcastForTest(t, hub, readyEvent, readyData)
+	select {
+	case data := <-readyClient.outbox:
+		var event Event
+		if err := json.Unmarshal(data, &event); err != nil {
+			t.Fatalf("decode ready event: %v", err)
+		}
+		if event.MessageID != "ready-message" {
+			t.Fatalf("ready client received unexpected event: %+v", event)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("another broadcast was blocked by slow authorization")
+	}
+	waitForBroadcast(t, readyDone)
+
+	auth.unblock()
+	waitForBroadcast(t, slowDone)
+}
+
+func TestHub_BroadcastsForSameTargetPreserveDispatcherOrder(t *testing.T) {
+	auth := newOrderedBroadcastAuthorizer()
+	hub := newRunningTestHub(t, auth)
+	t.Cleanup(auth.release)
+
+	client := newClient("client", "user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	mustSubscribe(t, hub, client, TargetTypeChannel, "ordered-room")
+
+	firstEvent, firstData := makeEvent("workspace", TargetTypeChannel, "ordered-room", "message-1")
+	firstDone := enqueueBroadcastForTest(t, hub, firstEvent, firstData)
+	select {
+	case <-auth.firstStarted:
+	case <-time.After(testIOTimeout):
+		t.Fatal("first event authorization did not start")
+	}
+
+	secondEvent, secondData := makeEvent("workspace", TargetTypeChannel, "ordered-room", "message-2")
+	secondDone := enqueueBroadcastForTest(t, hub, secondEvent, secondData)
+	thirdEvent, thirdData := makeEvent("workspace", TargetTypeChannel, "ordered-room", "message-3")
+	thirdDone := enqueueBroadcastForTest(t, hub, thirdEvent, thirdData)
+
+	select {
+	case <-auth.secondStarted:
+		t.Fatal("second event authorization started before the first event completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := len(client.outbox); got != 0 {
+		t.Fatalf("delivered %d event(s) while the first event was still blocked", got)
+	}
+
+	auth.release()
+	waitForBroadcast(t, firstDone)
+	select {
+	case <-auth.secondStarted:
+	case <-time.After(testIOTimeout):
+		t.Fatal("second event authorization did not start after the first completed")
+	}
+	waitForBroadcast(t, secondDone)
+	waitForBroadcast(t, thirdDone)
+
+	messageIDs := make([]string, 0, 3)
+	for range 3 {
+		select {
+		case data := <-client.outbox:
+			var event Event
+			if err := json.Unmarshal(data, &event); err != nil {
+				t.Fatalf("decode delivered event: %v", err)
+			}
+			messageIDs = append(messageIDs, event.MessageID)
+		case <-time.After(testIOTimeout):
+			t.Fatal("timed out waiting for ordered delivery")
+		}
+	}
+	if fmt.Sprint(messageIDs) != "[message-1 message-2 message-3]" {
+		t.Fatalf("delivery order = %v, want [message-1 message-2 message-3]", messageIDs)
+	}
+}
+
+func TestBroadcastPartitionUsesCompleteStableTargetKey(t *testing.T) {
+	channelEvent := Event{WorkspaceID: "workspace", TargetType: TargetTypeChannel, TargetID: "same-id"}
+	dmEvent := Event{WorkspaceID: "workspace", TargetType: TargetTypeDM, TargetID: "same-id"}
+	channelKey := broadcastTargetKey(channelEvent)
+
+	if channelKey == broadcastTargetKey(dmEvent) {
+		t.Fatal("channel and DM with the same textual ID must have distinct target keys")
+	}
+	if first, second := broadcastPartition(channelKey, broadcastWorkerCount), broadcastPartition(channelKey, broadcastWorkerCount); first != second {
+		t.Fatalf("same target partition changed from %d to %d", first, second)
+	}
+}
+
+func TestHub_SlowSubscribeAuthorizationDoesNotBlockAnotherSubscribe(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "slow-subscribe-other-subscribe")
+	defer hub.Shutdown()
+	defer auth.unblock()
+
+	clientA := newClient("client-a", "user-a", "workspace", &fakeSender{})
+	clientB := newClient("client-b", "user-b", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, clientA)
+	registerInRunningHub(t, hub, clientB)
+	resultA := make(chan error, 1)
+	go func() {
+		resultA <- hub.Subscribe(context.Background(), clientA, TargetTypeChannel, "slow-room")
+	}()
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow authorizer did not start")
+	}
+
+	resultB := make(chan error, 1)
+	go func() {
+		resultB <- hub.Subscribe(context.Background(), clientB, TargetTypeChannel, "ready-room")
+	}()
+	select {
+	case err := <-resultB:
+		if err != nil {
+			t.Fatalf("client B subscribe failed: %v", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("client B subscribe was blocked by client A authorization")
+	}
+
+	auth.unblock()
+	select {
+	case err := <-resultA:
+		if err != nil {
+			t.Fatalf("client A subscribe failed after release: %v", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("client A subscribe did not finish after release")
+	}
+}
+
+func TestHub_UnregisterIsProcessedDuringPendingAuthorization(t *testing.T) {
+	auth := newBlockingTargetAuthorizer("slow-room")
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "unregister-during-subscribe")
+	defer hub.Shutdown()
+	defer auth.unblock()
+
+	client := newClient("client-a", "user-a", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, client)
+	result := make(chan error, 1)
+	go func() {
+		result <- hub.Subscribe(context.Background(), client, TargetTypeChannel, "slow-room")
+	}()
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("slow authorizer did not start")
+	}
+
+	hub.Unregister(client)
+	eventually(t, func() bool { return !hubHasClient(hub, client.id) }, testIOTimeout, "real unregister during authorization")
+	if hubHasClientSubs(hub, client.id) {
+		t.Fatal("unregister must remove clientSubs before authorization finishes")
+	}
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("late authorization result must not register removed client")
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("pending authorization did not stop after unregister closed the client")
+	}
+
+	key := targetKey{workspaceID: "workspace", targetType: TargetTypeChannel, targetID: "slow-room"}.String()
+	if hubHasSubscriptionTarget(hub, key) {
+		t.Fatal("late authorization result created a room for removed client")
+	}
+}
+
+func TestHub_LateDenialFromRemovedClientDoesNotRevokeReplacement(t *testing.T) {
+	auth := &blockingDenyAuthorizer{started: make(chan struct{}), release: make(chan struct{})}
+	hub := newRunningTestHub(t, auth)
+	oldClient := newClient("shared-client-id", "old-user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, oldClient)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- hub.Subscribe(context.Background(), oldClient, TargetTypeChannel, "room")
+	}()
+
+	select {
+	case <-auth.started:
+	case <-time.After(testIOTimeout):
+		t.Fatal("old client authorization did not start")
+	}
+
+	hub.Unregister(oldClient)
+	eventually(t, func() bool { return !hubHasClient(hub, oldClient.id) }, testIOTimeout,
+		"old client unregister should be processed")
+
+	replacement := newClient(oldClient.id, "new-user", "workspace", &fakeSender{})
+	registerInRunningHub(t, hub, replacement)
+	key := targetKey{workspaceID: replacement.workspaceID, targetType: TargetTypeChannel, targetID: "room"}.String()
+	mustSubscribe(t, hub, replacement, TargetTypeChannel, "room")
+
+	close(auth.release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrSubscribeForbidden) {
+			t.Fatalf("late authorization result = %v, want forbidden", err)
+		}
+	case <-time.After(testIOTimeout):
+		t.Fatal("late denial did not finish")
+	}
+
+	if got := hubGetClient(hub, replacement.id); got != replacement {
+		t.Fatal("late result changed the replacement client")
+	}
+	if !hubHasSubscription(hub, key, replacement.id) {
+		t.Fatal("late denial from old connection revoked replacement subscription")
 	}
 }
 
@@ -331,20 +1111,79 @@ func TestHub_Subscribe_Denied_ReturnsForbidden(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	// No access set → denied
 
+	h := newRunningTestHub(t, auth)
+	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
+	registerInRunningHub(t, h, c)
+
+	err := h.Subscribe(context.Background(), c, TargetTypeChannel, "ch-private")
+	if !errors.Is(err, ErrSubscribeForbidden) {
+		t.Fatalf("expected ErrSubscribeForbidden, got: %v", err)
+	}
+	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-private"}.String()
+	if hubHasSubscriptionTarget(h, key) {
+		t.Fatal("denied subscribe must not create a room subscription")
+	}
+}
+
+func TestHub_Subscribe_AuthorizerErrorFailsClosed(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setErr("user-1", "ws-1", TargetTypeChannel, "ch-private", errors.New("database unavailable"))
+
+	h := newRunningTestHub(t, auth)
+	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
+	registerInRunningHub(t, h, c)
+
+	err := h.Subscribe(context.Background(), c, TargetTypeChannel, "ch-private")
+	if err == nil {
+		t.Fatal("authorization storage error must fail closed")
+	}
+	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-private"}.String()
+	if hubHasSubscriptionTarget(h, key) {
+		t.Fatal("authorization storage error must not create a room subscription")
+	}
+}
+
+func TestHub_Subscribe_RepeatedAuthorizedJoinIsIdempotent(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
+
 	h := newTestHub(auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 
-	req := subscribeReq{
-		ctx:        context.Background(),
-		client:     c,
-		targetType: TargetTypeChannel,
-		targetID:   "ch-private",
-		resp:       make(chan error, 1),
+	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
+	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
+
+	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
+	h.mu.RLock()
+	subscriberCount := len(h.subs[key])
+	clientRoomCount := len(h.clientSubs[c.id])
+	h.mu.RUnlock()
+	if subscriberCount != 1 || clientRoomCount != 1 {
+		t.Fatalf("repeated subscribe must remain idempotent: subscribers=%d client rooms=%d", subscriberCount, clientRoomCount)
 	}
-	err := h.handleSubscribe(req)
+}
+
+func TestHub_Subscribe_ReauthorizationDeniedRevokesExistingRoom(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
+
+	h := newRunningTestHub(t, auth)
+	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
+	registerInRunningHub(t, h, c)
+	if err := h.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1"); err != nil {
+		t.Fatalf("initial subscribe: %v", err)
+	}
+
+	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", false)
+	err := h.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1")
 	if !errors.Is(err, ErrSubscribeForbidden) {
-		t.Fatalf("expected ErrSubscribeForbidden, got: %v", err)
+		t.Fatalf("removed member must be denied on resubscribe, got: %v", err)
+	}
+
+	key := targetKey{workspaceID: "ws-1", targetType: TargetTypeChannel, targetID: "ch-1"}.String()
+	if hubHasSubscriptionTarget(h, key) {
+		t.Fatal("denied reauthorization must revoke the existing room subscription")
 	}
 }
 
@@ -364,18 +1203,11 @@ func TestHub_Subscribe_DM_Allowed(t *testing.T) {
 }
 
 func TestHub_Subscribe_DM_NotMember_Denied(t *testing.T) {
-	h := newTestHub(&fakeAuthorizer{})
+	h := newRunningTestHub(t, &fakeAuthorizer{})
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(t, h, c)
+	registerInRunningHub(t, h, c)
 
-	req := subscribeReq{
-		ctx:        context.Background(),
-		client:     c,
-		targetType: TargetTypeDM,
-		targetID:   "dm-1",
-		resp:       make(chan error, 1),
-	}
-	if err := h.handleSubscribe(req); !errors.Is(err, ErrSubscribeForbidden) {
+	if err := h.Subscribe(context.Background(), c, TargetTypeDM, "dm-1"); !errors.Is(err, ErrSubscribeForbidden) {
 		t.Fatalf("expected ErrSubscribeForbidden for DM non-member, got: %v", err)
 	}
 }
@@ -383,18 +1215,11 @@ func TestHub_Subscribe_DM_NotMember_Denied(t *testing.T) {
 func TestHub_Subscribe_PrivateChannel_NonMember_Denied_NonEnumerating(t *testing.T) {
 	// Private channel non-member must get ErrSubscribeForbidden, not ErrNotFound,
 	// so callers cannot enumerate whether the channel exists.
-	h := newTestHub(&fakeAuthorizer{})
+	h := newRunningTestHub(t, &fakeAuthorizer{})
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
-	registerInHub(t, h, c)
+	registerInRunningHub(t, h, c)
 
-	req := subscribeReq{
-		ctx:        context.Background(),
-		client:     c,
-		targetType: TargetTypeChannel,
-		targetID:   "ch-private",
-		resp:       make(chan error, 1),
-	}
-	err := h.handleSubscribe(req)
+	err := h.Subscribe(context.Background(), c, TargetTypeChannel, "ch-private")
 	if !errors.Is(err, ErrSubscribeForbidden) {
 		t.Fatalf("private channel non-member must get ErrSubscribeForbidden, not %v", err)
 	}
@@ -424,7 +1249,7 @@ func TestHub_Broadcast_DeliversToSubscriber(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
@@ -442,7 +1267,7 @@ func TestHub_Broadcast_DoesNotDeliverToUnsubscribed(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	// Client is registered but NOT subscribed to ch-1.
@@ -459,7 +1284,7 @@ func TestHub_Broadcast_AuthRevoked_AfterSubscribe_NoDelivery(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
 	registerInHub(t, h, c)
@@ -489,7 +1314,7 @@ func TestHub_Broadcast_StaleDMMembership_NoDelivery(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeDM, "dm-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeDM, "dm-1")
@@ -506,7 +1331,7 @@ func TestHub_Broadcast_StaleDMMembership_NoDelivery(t *testing.T) {
 }
 
 func TestHub_Broadcast_NoSubscribers_NoOp(t *testing.T) {
-	h := newTestHub(&fakeAuthorizer{})
+	h := newRunningTestHub(t, &fakeAuthorizer{})
 	evt, data := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-1")
 	// Must not panic or error.
 	h.handleBroadcast(broadcastReq{event: evt, data: data})
@@ -516,7 +1341,7 @@ func TestHub_Broadcast_SlowClient_DropsConnection(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	snd := &fakeSender{}
 	c := newClient("c1", "user-1", "ws-1", snd)
 	registerInHub(t, h, c)
@@ -533,9 +1358,8 @@ func TestHub_Broadcast_SlowClient_DropsConnection(t *testing.T) {
 	evt, data := makeEvent("ws-1", TargetTypeChannel, "ch-1", "msg-overflow")
 	h.handleBroadcast(broadcastReq{event: evt, data: data})
 
-	if hubHasClient(h, "c1") {
-		t.Fatal("slow client should be removed from hub after overflow")
-	}
+	eventually(t, func() bool { return !hubHasClient(h, "c1") }, testIOTimeout,
+		"slow client should be removed from hub after overflow")
 	if !snd.isClosed() {
 		t.Fatal("slow client connection should be closed after overflow")
 	}
@@ -551,7 +1375,7 @@ func TestHub_Broadcast_SlowClient_HubNotBlocked(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
@@ -580,7 +1404,7 @@ func TestHub_Broadcast_MultipleSubscribers_OnlyAuthorized(t *testing.T) {
 	auth.setAccess("allowed", "ws-1", TargetTypeChannel, "ch-1", true)
 	// "denied" user has no access set.
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 
 	sndA := &fakeSender{}
 	cA := newClient("cA", "allowed", "ws-1", sndA)
@@ -611,7 +1435,7 @@ func TestHub_MessageUpdated_DeliveredOnlyToAuthorizedChannelMembers(t *testing.T
 	auth := &fakeAuthorizer{}
 	auth.setAccess("member", "ws-1", TargetTypeChannel, "ch-1", true)
 	auth.setAccess("removed", "ws-1", TargetTypeChannel, "ch-1", true)
-	hub := newTestHub(auth)
+	hub := newRunningTestHub(t, auth)
 
 	member := newClient("member-client", "member", "ws-1", &fakeSender{})
 	removed := newClient("removed-client", "removed", "ws-1", &fakeSender{})
@@ -749,18 +1573,11 @@ func TestHub_Subscribe_CrossWorkspace_DeniedByServerIdentity(t *testing.T) {
 	// Access is granted only for ws-1; client is in ws-2.
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-2", &fakeSender{}) // client is in ws-2
-	registerInHub(t, h, c)
+	registerInRunningHub(t, h, c)
 
-	req := subscribeReq{
-		ctx:        context.Background(),
-		client:     c,
-		targetType: TargetTypeChannel,
-		targetID:   "ch-1",
-		resp:       make(chan error, 1),
-	}
-	err := h.handleSubscribe(req)
+	err := h.Subscribe(context.Background(), c, TargetTypeChannel, "ch-1")
 	if !errors.Is(err, ErrSubscribeForbidden) {
 		t.Fatalf("cross-workspace subscription must be denied, got: %v", err)
 	}
@@ -820,7 +1637,7 @@ func TestHub_ConcurrentBroadcastAndUnregister_NoRace(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	clients := make([]*Client, 64)
 	for i := range clients {
 		c := newClient(fmt.Sprintf("c%d", i), "user-1", "ws-1", &fakeSender{})
@@ -884,7 +1701,7 @@ func TestHub_Broadcast_AuthError_SkipsDeliveryKeepsSubscription(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
@@ -912,7 +1729,7 @@ func TestHub_Broadcast_AuthError_ThenRecovery_Delivers(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")
@@ -940,7 +1757,7 @@ func TestHub_Broadcast_TransientAuthError_KeepsSubscription(t *testing.T) {
 	auth := &fakeAuthorizer{}
 	auth.setAccess("user-1", "ws-1", TargetTypeChannel, "ch-1", true)
 
-	h := newTestHub(auth)
+	h := newRunningTestHub(t, auth)
 	c := newClient("c1", "user-1", "ws-1", &fakeSender{})
 	registerInHub(t, h, c)
 	mustSubscribe(t, h, c, TargetTypeChannel, "ch-1")

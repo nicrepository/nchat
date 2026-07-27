@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -296,14 +297,44 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			}
 			continue
 		}
+		if msg.Type == ClientMessageTypeSubscribe || msg.Type == ClientMessageTypeUnsubscribe {
+			target, validationErr := normalizeSubscriptionTarget(msg)
+			if validationErr != nil {
+				if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: invalid subscribe message") {
+					return
+				}
+				continue
+			}
+			msg.TargetType = target.targetType
+			msg.TargetID = target.targetID
+		}
 
 		if msgErr := hub.handleClientMessage(ctx, c, msg); msgErr != nil {
 			if handleReactionClientError(c, msgErr) {
 				continue
 			}
+			if msg.Type == ClientMessageTypeSubscribe {
+				if c.ctx.Err() != nil || ctx.Err() != nil || errors.Is(msgErr, ErrClientNotRegistered) {
+					return
+				}
+				if logger != nil && !errors.Is(msgErr, ErrSubscribeForbidden) {
+					logger.WarnContext(ctx, "ws: subscribe authorization failed",
+						"client_id", clientID,
+						"target_type", string(msg.TargetType),
+						"error", msgErr,
+					)
+				}
+				handleSubscribeClientError(c, msgErr)
+				continue
+			}
 			if handleInvalidInboundMessage(ctx, conn, logger, clientID, &invalidCount, cfg.MaxInvalidMessages, "ws: handleClientMessage error") {
 				return
 			}
+			continue
+		}
+		if msg.Type == ClientMessageTypeSubscribe && !handleSubscribeClientSuccess(c, msg) {
+			hub.Unregister(c)
+			return
 		}
 	}
 }
@@ -324,8 +355,68 @@ func decodeClientMessage(data []byte) (ClientMessage, error) {
 
 type clientErrorResponse struct {
 	Type       string `json:"type"`
+	Operation  string `json:"operation,omitempty"`
 	Code       string `json:"code"`
 	RetryAfter int    `json:"retry_after,omitempty"`
+}
+
+type subscribeSuccessResponse struct {
+	Type       string     `json:"type"`
+	Operation  string     `json:"operation"`
+	TargetType TargetType `json:"target_type"`
+	TargetID   string     `json:"target_id"`
+}
+
+type subscriptionTarget struct {
+	targetType TargetType
+	targetID   string
+}
+
+func normalizeSubscriptionTarget(msg ClientMessage) (subscriptionTarget, error) {
+	if msg.Type != ClientMessageTypeSubscribe && msg.Type != ClientMessageTypeUnsubscribe {
+		return subscriptionTarget{}, fmt.Errorf("ws: subscription: invalid message type")
+	}
+	if msg.TargetType != TargetTypeChannel && msg.TargetType != TargetTypeDM {
+		return subscriptionTarget{}, fmt.Errorf("ws: subscription: unsupported target_type")
+	}
+	if msg.MessageID != "" || msg.Emoji != "" {
+		return subscriptionTarget{}, fmt.Errorf("ws: subscription: unexpected fields")
+	}
+	rawTargetID := strings.TrimSpace(msg.TargetID)
+	if rawTargetID == "" {
+		return subscriptionTarget{}, fmt.Errorf("ws: subscription: target_id required")
+	}
+	parsedID, err := uuid.Parse(rawTargetID)
+	if err != nil {
+		return subscriptionTarget{}, fmt.Errorf("ws: subscription: invalid target_id format")
+	}
+	return subscriptionTarget{targetType: msg.TargetType, targetID: parsedID.String()}, nil
+}
+
+func handleSubscribeClientSuccess(c *Client, msg ClientMessage) bool {
+	data, err := json.Marshal(subscribeSuccessResponse{
+		Type:       "subscribed",
+		Operation:  "subscribe",
+		TargetType: msg.TargetType,
+		TargetID:   msg.TargetID,
+	})
+	return err == nil && c.enqueue(data)
+}
+
+func handleSubscribeClientError(c *Client, subscribeErr error) {
+	code := "room_subscription_unavailable"
+	if errors.Is(subscribeErr, ErrSubscribeForbidden) {
+		code = "room_access_denied"
+	}
+	data, err := json.Marshal(clientErrorResponse{Type: "error", Operation: "subscribe", Code: code})
+	if err == nil {
+		c.enqueue(data)
+	}
+}
+
+func validateSubscribe(msg ClientMessage) error {
+	_, err := normalizeSubscriptionTarget(msg)
+	return err
 }
 
 // handleReactionClientError classifies expected reaction outcomes so they do
