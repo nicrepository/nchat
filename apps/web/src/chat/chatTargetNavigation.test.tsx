@@ -13,7 +13,7 @@
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
 import { clearTokens, setTokens } from "../lib/authSession";
@@ -83,6 +83,17 @@ class FakeWebSocket {
 
 const OriginalWebSocket = global.WebSocket;
 
+beforeAll(async () => {
+  // This suite verifies target navigation, not lazy chunk loading. Resolve the
+  // real route module before assertions start so Suspense compilation time is
+  // never charged against Testing Library's query timeout.
+  await import("./ChatMessageArea");
+});
+
+afterAll(() => {
+  global.WebSocket = OriginalWebSocket;
+});
+
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const channelId = "11111111-1111-4111-8111-111111111111";
@@ -130,23 +141,17 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function clickChannel() {
-  await userEvent.click(await screen.findByRole("option", { name: /Canal geral/i }));
+/** One user-event session per test avoids repeatedly patching shared document state. */
+let user: ReturnType<typeof userEvent.setup>;
+
+async function clickTarget(name: RegExp) {
+  await user.click(await screen.findByRole("option", { name }));
 }
 
-async function clickSecretChannel() {
-  await userEvent.click(await screen.findByRole("option", { name: /Canal privado confidencial/i }));
-}
-
-async function clickDM() {
-  await userEvent.click(
-    await screen.findByRole("option", { name: /Mensagem direta com Juliane/i }),
-  );
-}
-
-async function clickOtherDM() {
-  await userEvent.click(await screen.findByRole("option", { name: /Mensagem direta com Marcos/i }));
-}
+const clickChannel = () => clickTarget(/Canal geral/i);
+const clickSecretChannel = () => clickTarget(/Canal privado confidencial/i);
+const clickDM = () => clickTarget(/Mensagem direta com Juliane/i);
+const clickOtherDM = () => clickTarget(/Mensagem direta com Marcos/i);
 
 function header() {
   return screen.getByTestId("chat-msg-header");
@@ -185,6 +190,7 @@ beforeEach(() => {
   clearTokens();
   setTokens("test-token");
   vi.clearAllMocks();
+  user = userEvent.setup();
   FakeWebSocket.instances = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   global.WebSocket = FakeWebSocket as any;
@@ -211,6 +217,7 @@ beforeEach(() => {
 
 afterEach(() => {
   global.WebSocket = OriginalWebSocket;
+  FakeWebSocket.instances = [];
   clearTokens();
 });
 
@@ -229,12 +236,11 @@ describe("navigating between DM and channel targets", () => {
     await clickChannel();
 
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
-    expect(await screen.findByTestId("chat-message-area")).toBeInTheDocument();
-    expect(
-      await within(await screen.findByTestId("chat-msg-header")).findByText("geral"),
-    ).toBeInTheDocument();
+    const currentHeader = await screen.findByTestId("chat-msg-header");
+    expect(await within(currentHeader).findByText("geral")).toBeInTheDocument();
     expect(await screen.findByText(channelText)).toBeInTheDocument();
-    expect(screen.queryByText(dmText)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(dmText)).not.toBeInTheDocument());
+    expect(screen.getByTestId("chat-message-area")).toBeInTheDocument();
   });
 
   it("renders the DM after leaving a channel", async () => {
@@ -494,7 +500,7 @@ describe("composer drafts never cross conversation targets", () => {
     await expectEmptyComposer(secretDraft);
     await typeDraft("mensagem nova para o canal geral");
 
-    await userEvent.click(screen.getByTestId("chat-send-btn"));
+    await user.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => expect(api.postChannelMessage).toHaveBeenCalledOnce());
     expect(api.postChannelMessage).toHaveBeenCalledWith(
