@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
 
@@ -605,87 +606,6 @@ func TestPGXChannelStore_GetVisibleChannelBySlug_NotFoundForHiddenChannel(t *tes
 	}
 }
 
-func TestPGXChannelStore_CreateChannelWithMember_BeginError(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	mock.ExpectBegin().WillReturnError(errors.New("begin failed"))
-
-	store := storage.NewPGXChannelStore(mock)
-	_, err = store.CreateChannelWithMember(context.Background(), storage.CreateChannelInput{
-		WorkspaceID: "ws-1", Slug: "private", DisplayName: "Private", Type: domain.ChannelTypePrivate,
-	}, "owner-1", domain.ChannelRoleMember)
-	if err == nil {
-		t.Fatal("expected begin error")
-	}
-}
-
-func TestPGXChannelStore_CreateChannelWithMember_CommitsChannelAndMembership(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	now := time.Now()
-	mock.ExpectBegin()
-	mock.ExpectQuery(`INSERT INTO chat.channels`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "private", "Private", "private", false, 0, pgxmock.AnyArg()).
-		WillReturnRows(pgxmock.NewRows(channelCols()).
-			AddRow("ch-private", "ws-1", "", "private", "Private", "private", "active", false, 0, "owner-1", now, now))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-private", "owner-1", "member").
-		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectCommit()
-
-	store := storage.NewPGXChannelStore(mock)
-	ch, err := store.CreateChannelWithMember(context.Background(), storage.CreateChannelInput{
-		WorkspaceID: "ws-1", Slug: "private", DisplayName: "Private", Type: domain.ChannelTypePrivate, CreatedBy: "owner-1",
-	}, "owner-1", domain.ChannelRoleMember)
-	if err != nil {
-		t.Fatalf("CreateChannelWithMember: %v", err)
-	}
-	if ch.ID != "ch-private" {
-		t.Fatalf("unexpected channel: %+v", ch)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-func TestPGXChannelStore_CreateChannelWithMember_RollsBackWhenMembershipFails(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("pgxmock: %v", err)
-	}
-	defer mock.Close()
-
-	now := time.Now()
-	mock.ExpectBegin()
-	mock.ExpectQuery(`INSERT INTO chat.channels`).
-		WithArgs("ws-1", pgxmock.AnyArg(), "private", "Private", "private", false, 0, pgxmock.AnyArg()).
-		WillReturnRows(pgxmock.NewRows(channelCols()).
-			AddRow("ch-private", "ws-1", "", "private", "Private", "private", "active", false, 0, "owner-1", now, now))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-private", "owner-1", "member").
-		WillReturnError(errors.New("insert membership failed"))
-	mock.ExpectRollback()
-
-	store := storage.NewPGXChannelStore(mock)
-	_, err = store.CreateChannelWithMember(context.Background(), storage.CreateChannelInput{
-		WorkspaceID: "ws-1", Slug: "private", DisplayName: "Private", Type: domain.ChannelTypePrivate, CreatedBy: "owner-1",
-	}, "owner-1", domain.ChannelRoleMember)
-	if err == nil {
-		t.Fatal("expected membership error")
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
 func TestPGXChannelStore_UpdateChannel_WorkspaceBound(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -936,5 +856,268 @@ func TestPGXChannelStore_ArchiveChannel_ConstraintErrorMapsDomain(t *testing.T) 
 	_, err = store.ArchiveChannel(context.Background(), "ws-1", "ch-1")
 	if !errors.Is(err, domain.ErrDuplicateSlug) {
 		t.Fatalf("expected mapped domain error, got %v", err)
+	}
+}
+
+// authorizedContextArgs matches the eight placeholders of the authorized-context
+// INSERT; the individual values are asserted where they matter.
+func authorizedContextArgs() []any {
+	args := make([]any, 8)
+	for i := range args {
+		args[i] = pgxmock.AnyArg()
+	}
+	return args
+}
+
+// ── CreateChannelForActiveMember ──────────────────────────────────────────────
+//
+// These cover the transactional shape against a mocked pool, deterministically
+// and without a database. The authorization semantics themselves — that the
+// locked SELECT and the INSERT cannot be interleaved by a concurrent revocation
+// — cannot be mocked and are proved against real PostgreSQL in
+// channel_store_postgres_test.go.
+
+func TestPGXChannelStore_CreateChannelForActiveMember_PublicCommitsWithoutMembership(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`WITH authorized_context`).
+		WithArgs("ws-1", pgxmock.AnyArg(), "infra", "Infra", "public", false, 0, "user-1").
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "infra", "Infra", "public", "active", false, 0, "user-1", now, now))
+	mock.ExpectCommit()
+
+	ch, err := storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+		Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("CreateChannelForActiveMember: %v", err)
+	}
+	if ch.ID != "ch-1" || ch.CreatedBy != "user-1" {
+		t.Fatalf("unexpected channel: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_CreateChannelForActiveMember_PrivateSeedsCreatorInSameTx(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`WITH authorized_context`).
+		WithArgs(authorizedContextArgs()...).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "infra", "Infra", "private", "active", false, 0, "user-1", now, now))
+	// The membership uses the created_by the database returned, not the input.
+	mock.ExpectExec(`INSERT INTO chat.channel_members`).
+		WithArgs("ch-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	if _, err := storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+		Type: domain.ChannelTypePrivate, CreatedBy: "user-1",
+		EnsureCreatorMemberRole: domain.ChannelRoleMember,
+	}); err != nil {
+		t.Fatalf("CreateChannelForActiveMember: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// No row from the authorized context is a denial, not an internal error, and the
+// transaction is rolled back rather than left open.
+func TestPGXChannelStore_CreateChannelForActiveMember_NoAuthorizedContextIsForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`WITH authorized_context`).WithArgs(authorizedContextArgs()...).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	_, err = storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+		Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want ErrForbidden", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// An actorless call cannot be authorized by any row, so it is refused before a
+// connection is even taken.
+func TestPGXChannelStore_CreateChannelForActiveMember_RequiresAnActor(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	_, err = storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want ErrForbidden", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_CreateChannelForActiveMember_MapsConstraintViolations(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		constraint string
+		want       error
+	}{
+		{name: "duplicate slug", constraint: "channels_workspace_slug_unique", want: domain.ErrDuplicateSlug},
+		{name: "second general", constraint: "idx_channels_one_general_per_workspace", want: domain.ErrGeneralChannelExists},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(`WITH authorized_context`).
+				WithArgs(authorizedContextArgs()...).
+				WillReturnError(&pgconn.PgError{Code: "23505", ConstraintName: test.constraint})
+			mock.ExpectRollback()
+
+			_, err = storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+				WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+				Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+			})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// A failing secondary insert must not leave the channel behind: the whole
+// transaction is rolled back.
+func TestPGXChannelStore_CreateChannelForActiveMember_MemberInsertFailureRollsBack(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`WITH authorized_context`).
+		WithArgs(authorizedContextArgs()...).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "infra", "Infra", "private", "active", false, 0, "user-1", now, now))
+	mock.ExpectExec(`INSERT INTO chat.channel_members`).
+		WithArgs("ch-1", "user-1", "member").
+		WillReturnError(errors.New("boom"))
+	mock.ExpectRollback()
+
+	if _, err := storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+		Type: domain.ChannelTypePrivate, CreatedBy: "user-1",
+		EnsureCreatorMemberRole: domain.ChannelRoleMember,
+	}); err == nil {
+		t.Fatal("expected the member insert failure to surface")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXChannelStore_CreateChannelForActiveMember_BeginAndCommitFailures(t *testing.T) {
+	t.Run("begin", func(t *testing.T) {
+		mock, err := pgxmock.NewPool()
+		if err != nil {
+			t.Fatalf("pgxmock: %v", err)
+		}
+		defer mock.Close()
+		mock.ExpectBegin().WillReturnError(errors.New("no connection"))
+
+		if _, err := storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+			WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+			Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+		}); err == nil {
+			t.Fatal("expected the begin failure to surface")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		mock, err := pgxmock.NewPool()
+		if err != nil {
+			t.Fatalf("pgxmock: %v", err)
+		}
+		defer mock.Close()
+		now := time.Now()
+		mock.ExpectBegin()
+		mock.ExpectQuery(`WITH authorized_context`).
+			WithArgs(authorizedContextArgs()...).
+			WillReturnRows(pgxmock.NewRows(channelCols()).
+				AddRow("ch-1", "ws-1", "", "infra", "Infra", "public", "active", false, 0, "user-1", now, now))
+		mock.ExpectCommit().WillReturnError(errors.New("commit lost"))
+		mock.ExpectRollback()
+
+		if _, err := storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+			WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+			Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+		}); err == nil {
+			t.Fatal("expected the commit failure to surface")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+}
+
+// An unexpected database error is not laundered into a denial.
+func TestPGXChannelStore_CreateChannelForActiveMember_UnknownErrorIsNotForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`WITH authorized_context`).WithArgs(authorizedContextArgs()...).WillReturnError(errors.New("connection reset"))
+	mock.ExpectRollback()
+
+	_, err = storage.NewPGXChannelStore(mock).CreateChannelForActiveMember(context.Background(), storage.CreateChannelInput{
+		WorkspaceID: "ws-1", Slug: "infra", DisplayName: "Infra",
+		Type: domain.ChannelTypePublic, CreatedBy: "user-1",
+	})
+	if err == nil || errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want a non-forbidden failure", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }

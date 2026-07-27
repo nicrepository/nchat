@@ -62,8 +62,6 @@ interface SidebarResponse {
   workspace: { id: string; name: string; slug: string };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
-  /** Absent on servers that predate RF-01 channel creation; absent means "no". */
-  can_create_channel?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -226,19 +224,11 @@ export async function fetchSidebarData(): Promise<{
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
-  canCreateChannel: boolean;
 }> {
   const sidebar = await fetchSidebar();
   const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
   const dms = (sidebar.dm_conversations ?? []).map(mapSidebarDM);
-  return {
-    currentUserId: sidebar.current_user_id ?? "",
-    channels,
-    dms,
-    // Strict equality, so anything but a literal true — absent field, string,
-    // number — reads as "not allowed". The endpoint decides regardless.
-    canCreateChannel: sidebar.can_create_channel === true,
-  };
+  return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
 }
 
 export async function searchDMCandidates(
@@ -305,11 +295,12 @@ export async function createGroupDM(
  *
  * Only the three caller-owned fields are sent: the workspace, the creator, the
  * general flag and the position are derived from the session server-side, and
- * the endpoint rejects a body that carries them. The slug is trimmed and
- * lowercased here because the server does the same before matching it against
- * its pattern — this is shaping, never a check. Permission is not consulted on
- * this side at all: a caller without the workspace role gets a 403, which the
- * dialog surfaces as such rather than as a generic failure.
+ * the endpoint rejects a body that carries them. No role, actor or workspace is
+ * ever sent from the browser. The slug is trimmed and lowercased here because
+ * the server does the same before matching it against its pattern — this is
+ * shaping, never a check. Authorization is not consulted on this side at all: a
+ * caller the server refuses gets a 403, which the dialog surfaces as such rather
+ * than as a generic failure.
  */
 export async function createChannel(
   input: { slug: string; displayName: string; type: "public" | "private" },

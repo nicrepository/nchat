@@ -2,10 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
-import type { Channel, CurrentUser, DMConversation } from "./chatTypes";
+import { partitionDMs, type Channel, type CurrentUser, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
-import NewChannelDialog from "./NewChannelDialog";
-import NewDirectMessageDialog from "./NewDirectMessageDialog";
+import NewConversationDialog from "./NewConversationDialog";
 
 /**
  * Placeholder user shown in the sidebar footer.
@@ -163,6 +162,13 @@ function Avatar({ initials, src, color = "purple", status, size = "sm" }: Avatar
 function GroupAvatars({ dm }: { dm: DMConversation }) {
   const first = dm.participants[0];
   const second = dm.participants[1];
+  // The sidebar payload carries no participants (chatApi maps them to []), so
+  // without this every group reserved the avatar slot and left it empty
+  // (BUG #395). The group name is already on the row, so its initials come from
+  // the same canonical rule the 1:1 rows use — no second rule, no empty space.
+  if (!first) {
+    return <Avatar initials={initialsFrom(dm.name)} color={avatarColorFor(dm.id)} size="sm" />;
+  }
   return (
     <span className="chat-sidebar__group-avatars" aria-hidden="true">
       {first && (
@@ -222,15 +228,48 @@ function ErrorState({ onRetry }: ErrorStateProps) {
   );
 }
 
+// ── Section shell ─────────────────────────────────────────────────────────────
+
+interface SectionProps {
+  /** Stable id; the heading owns it and each list is labelled by it. */
+  labelId: string;
+  title: string;
+  /** Only the first section sits flush against the CTA above it. */
+  spaced?: boolean;
+  children: React.ReactNode;
+}
+
+/**
+ * One sidebar category: a real heading plus its list.
+ *
+ * The listbox lives inside each list component rather than here so that an
+ * empty section renders its message *instead of* an options container — an
+ * empty `role="listbox"` with a paragraph inside is not a valid one.
+ */
+function Section({ labelId, title, spaced, children }: SectionProps) {
+  return (
+    <section className="chat-sidebar__section" aria-labelledby={labelId}>
+      <h2
+        id={labelId}
+        className={`chat-sidebar__section-label${spaced ? " chat-sidebar__section-label--mt" : ""}`}
+      >
+        {title}
+      </h2>
+      {children}
+    </section>
+  );
+}
+
 // ── Channel list ──────────────────────────────────────────────────────────────
 
 interface ChannelListProps {
   channels: Channel[];
   activeChannelId: string | undefined;
   onSelect: (id: string) => void;
+  labelId: string;
 }
 
-function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) {
+function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelListProps) {
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -240,7 +279,7 @@ function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) 
   }
 
   return (
-    <>
+    <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
         return (
@@ -271,29 +310,32 @@ function ChannelList({ channels, activeChannelId, onSelect }: ChannelListProps) 
           </button>
         );
       })}
-    </>
+    </div>
   );
 }
 
-// ── DM list ───────────────────────────────────────────────────────────────────
+// ── DM / group list ───────────────────────────────────────────────────────────
 
 interface DMListProps {
+  /** Already narrowed to a single canonical category by partitionDMs. */
   dms: DMConversation[];
   activeDMId: string | undefined;
   onSelect: (id: string) => void;
+  labelId: string;
+  emptyMessage: string;
 }
 
-function DMList({ dms, activeDMId, onSelect }: DMListProps) {
+function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProps) {
   if (dms.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
-        Nenhuma mensagem direta.
+        {emptyMessage}
       </p>
     );
   }
 
   return (
-    <>
+    <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {dms.map((dm) => {
         const isActive = dm.id === activeDMId;
         const isGroup = dm.type === "group";
@@ -337,7 +379,7 @@ function DMList({ dms, activeDMId, onSelect }: DMListProps) {
           </button>
         );
       })}
-    </>
+    </div>
   );
 }
 
@@ -362,8 +404,6 @@ type SidebarState =
       currentUserId: string;
       channels: Channel[];
       dms: DMConversation[];
-      /** Server-derived; POST /api/chat/channels re-checks it on every call. */
-      canCreateChannel: boolean;
     };
 
 interface ChatSidebarProps {
@@ -371,29 +411,27 @@ interface ChatSidebarProps {
   retry: () => void;
 }
 
+// Static because the sidebar is mounted once per app; each heading owns the id
+// its section's listbox is labelled by.
+const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
+const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
+const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
+
 export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [newDMOpen, setNewDMOpen] = useState(false);
-  const newDMButtonRef = useRef<HTMLButtonElement>(null);
-  const restoreNewDMFocusRef = useRef(false);
-  const [newChannelOpen, setNewChannelOpen] = useState(false);
-  const newChannelButtonRef = useRef<HTMLButtonElement>(null);
-  const restoreNewChannelFocusRef = useRef(false);
+  // One dialog, one trigger, one piece of open state: two of them could be open
+  // at once, and there is nothing left for a second one to do (BUG #393).
+  const [newConversationOpen, setNewConversationOpen] = useState(false);
+  const newConversationButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef(false);
 
   useEffect(() => {
-    if (!newDMOpen && state.status === "ready" && restoreNewDMFocusRef.current) {
-      newDMButtonRef.current?.focus();
-      restoreNewDMFocusRef.current = false;
+    if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
+      newConversationButtonRef.current?.focus();
+      restoreFocusRef.current = false;
     }
-  }, [newDMOpen, state.status]);
-
-  useEffect(() => {
-    if (!newChannelOpen && state.status === "ready" && restoreNewChannelFocusRef.current) {
-      newChannelButtonRef.current?.focus();
-      restoreNewChannelFocusRef.current = false;
-    }
-  }, [newChannelOpen, state.status]);
+  }, [newConversationOpen, state.status]);
 
   // Derive active item from pathname: /chat/channel/:id or /chat/dm/:id
   // decodeURIComponent handles IDs that were encoded with encodeURIComponent on navigate.
@@ -405,14 +443,9 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const activeChannelId = activeType === "channel" ? activeId : undefined;
   const activeDMId = activeType === "dm" ? activeId : undefined;
 
-  const canCreateChannel = state.status === "ready" && state.canCreateChannel;
-  // Empty while loading: a hint that flashes "you may not" before the answer
-  // arrives would be a lie, and the button is already unavailable meanwhile.
-  const createChannelBlockedReason =
-    state.status === "ready" && !state.canCreateChannel
-      ? "Somente administradores do workspace podem criar canais."
-      : "";
-  const newChannelReasonId = "chat-sidebar-new-channel-reason";
+  // Derived on every render from the canonical list, so a refetch that reorders
+  // or replaces items cannot leave a stale copy behind in either section.
+  const { directs, groups } = partitionDMs(state.status === "ready" ? state.dms : []);
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -422,27 +455,23 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
     navigate(`/chat/dm/${encodeURIComponent(id)}`);
   }
 
-  function closeNewDM() {
-    restoreNewDMFocusRef.current = true;
-    setNewDMOpen(false);
+  function closeNewConversation() {
+    restoreFocusRef.current = true;
+    setNewConversationOpen(false);
   }
 
   function handleDMOpened(id: string) {
-    closeNewDM();
+    closeNewConversation();
     navigate(`/chat/dm/${encodeURIComponent(id)}`);
     retry();
   }
 
-  function closeNewChannel() {
-    restoreNewChannelFocusRef.current = true;
-    setNewChannelOpen(false);
-  }
-
   // The created channel is opened straight away, but the sidebar list itself
   // comes from the canonical refetch — never from the creation response — so
-  // what is listed is always what the server says the user may see.
+  // what is listed is always what the server says the user may see, and a new
+  // channel lands in "Canais" because that is where the refetch puts it.
   function handleChannelCreated(id: string) {
-    closeNewChannel();
+    closeNewConversation();
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
     retry();
   }
@@ -464,86 +493,67 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         </div>
       </Link>
 
-      {/* ── New channel CTA ──
-          Enabled only once the sidebar has loaded AND the server said this user
-          may create channels. While loading there is no answer yet, so the
-          action stays out of reach rather than failing on click; when the answer
-          is "no", the reason is rendered next to the button instead of leaving a
-          dead control behind. None of this authorizes anything — the endpoint
-          re-checks the caller's role on every request. */}
+      {/* ── New conversation CTA ──
+          The sidebar's single creation entry point: the dialog behind it is
+          where Pessoa/Grupo/Canal is chosen. The accessible name is the visible
+          text, so it does not depend on a tooltip. Unavailable until the sidebar
+          is ready because the dialog needs the current user id to exclude the
+          actor from the search — never because of a role, which the server alone
+          evaluates and which channel creation does not consider at all. */}
       <button
-        ref={newChannelButtonRef}
+        ref={newConversationButtonRef}
         type="button"
         className="chat-sidebar__cta"
-        aria-label="Novo canal"
-        aria-haspopup="dialog"
-        disabled={!canCreateChannel}
-        aria-disabled={!canCreateChannel}
-        aria-describedby={createChannelBlockedReason ? newChannelReasonId : undefined}
-        onClick={() => setNewChannelOpen(true)}
-      >
-        <IconAdd />
-        Novo canal
-      </button>
-      {createChannelBlockedReason && (
-        <p className="chat-sidebar__empty" id={newChannelReasonId}>
-          {createChannelBlockedReason}
-        </p>
-      )}
-
-      {/* ── New conversation CTA ──
-          Distinct control from "Novo canal": this one starts a DM or an ad-hoc
-          group, and the dialog behind it is where Pessoa/Grupo is chosen. The
-          accessible name is the visible text, so it does not depend on a
-          tooltip. Unavailable until the sidebar is ready because the dialog
-          needs the current user id to exclude the actor from the search. */}
-      <button
-        ref={newDMButtonRef}
-        type="button"
-        className="chat-sidebar__cta chat-sidebar__cta--conversation"
         aria-haspopup="dialog"
         disabled={state.status !== "ready"}
-        onClick={() => setNewDMOpen(true)}
+        onClick={() => setNewConversationOpen(true)}
       >
         <IconAdd />
         Nova conversa
       </button>
 
-      {/* ── Nav ── */}
-      <div className="chat-sidebar__nav" role="listbox" aria-label="Canais e mensagens diretas">
+      {/* ── Nav ──
+          Three product categories, three sections. Channels come from their own
+          canonical list; 1:1 conversations and ad-hoc groups are split from the
+          single DM list by the server-derived discriminator, so a conversation
+          cannot show up twice or land in the wrong section. Nothing is
+          classified while loading or on error: the sections only exist once the
+          canonical data does. */}
+      <div className="chat-sidebar__nav">
         {state.status === "loading" && <LoadingSkeleton />}
 
         {state.status === "error" && <ErrorState onRetry={retry} />}
 
         {state.status === "ready" && (
           <>
-            {/* Channels section */}
-            <div className="chat-sidebar__section-label">
-              <span>Canais</span>
-              <button
-                type="button"
-                className="chat-sidebar__section-action"
-                aria-label="Adicionar canal"
-                aria-haspopup="dialog"
-                disabled={!canCreateChannel}
-                aria-disabled={!canCreateChannel}
-                aria-describedby={createChannelBlockedReason ? newChannelReasonId : undefined}
-                onClick={() => setNewChannelOpen(true)}
-              >
-                <IconAdd />
-              </button>
-            </div>
-            <ChannelList
-              channels={state.channels}
-              activeChannelId={activeChannelId}
-              onSelect={handleChannelSelect}
-            />
+            <Section labelId={CHANNELS_LABEL_ID} title="Canais">
+              <ChannelList
+                channels={state.channels}
+                activeChannelId={activeChannelId}
+                onSelect={handleChannelSelect}
+                labelId={CHANNELS_LABEL_ID}
+              />
+            </Section>
 
-            {/* DMs section */}
-            <div className="chat-sidebar__section-label chat-sidebar__section-label--mt">
-              <span>Mensagens diretas</span>
-            </div>
-            <DMList dms={state.dms} activeDMId={activeDMId} onSelect={handleDMSelect} />
+            <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
+              <DMList
+                dms={directs}
+                activeDMId={activeDMId}
+                onSelect={handleDMSelect}
+                labelId={DIRECTS_LABEL_ID}
+                emptyMessage="Nenhuma mensagem direta."
+              />
+            </Section>
+
+            <Section labelId={GROUPS_LABEL_ID} title="Grupos" spaced>
+              <DMList
+                dms={groups}
+                activeDMId={activeDMId}
+                onSelect={handleDMSelect}
+                labelId={GROUPS_LABEL_ID}
+                emptyMessage="Nenhum grupo."
+              />
+            </Section>
           </>
         )}
       </div>
@@ -575,14 +585,12 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
           </div>
         </Link>
       </div>
-      {newChannelOpen && canCreateChannel && (
-        <NewChannelDialog onClose={closeNewChannel} onCreated={handleChannelCreated} />
-      )}
-      {newDMOpen && state.status === "ready" && (
-        <NewDirectMessageDialog
+      {newConversationOpen && state.status === "ready" && (
+        <NewConversationDialog
           currentUserId={state.currentUserId}
-          onClose={closeNewDM}
+          onClose={closeNewConversation}
           onOpened={handleDMOpened}
+          onChannelCreated={handleChannelCreated}
         />
       )}
     </aside>

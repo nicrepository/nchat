@@ -59,8 +59,10 @@ type createChannelResponse struct {
 //
 // It carries transport concerns only — authentication, rate limiting, body shape
 // and the server-side workspace lookup. The slug rules, the reserved "geral"
-// name, the channel type and, above all, the owner/admin requirement live in
-// ChannelService, which is the single authority for them.
+// name, the channel type, the display-name bound and the authorization itself
+// live below: any caller with a valid token, a live session, an active
+// membership and an active workspace may create a channel, whatever their role
+// (BUG #393), and the storage layer settles that atomically with the write.
 func (h *ChannelHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if h.workspaces == nil || h.channels == nil || h.limiter == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
@@ -119,8 +121,9 @@ func (h *ChannelHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 // writeCreateChannelError keeps a denial legible. Unlike DM creation — where a
 // 404 hides whether a given user exists — there is no identity to protect here,
-// so a caller without the role gets a plain 403 and the UI can say why instead
-// of showing a generic failure.
+// so a caller whose membership or workspace is no longer active gets a plain 403
+// and the UI can say why instead of showing a generic failure. Which of the two
+// it was stays unsaid; that distinction is the workspace's business.
 func writeCreateChannelError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidInput):

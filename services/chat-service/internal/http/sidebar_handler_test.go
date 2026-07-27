@@ -37,7 +37,7 @@ func (s *stubSidebarProvider) GetSidebar(_ context.Context, _ string) (service.S
 // sidebarRouter builds a test router wired with the given validator and stub.
 // allowAllSessionValidator accepts all sessions so tests focus on sidebar logic.
 func sidebarRouter(v *httpapi.TokenValidator, svc *stubSidebarProvider) http.Handler {
-	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil)
+	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
 }
 
 // authGet returns an authenticated GET request to RouteSidebar.
@@ -53,7 +53,7 @@ func authGet(t *testing.T) *http.Request {
 
 func TestSidebarHandler_NilService_Returns503(t *testing.T) {
 	v := makeTestValidator(t)
-	router := httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil)
+	router := httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil)
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, authGet(t))
 	if rr.Code != http.StatusServiceUnavailable {
@@ -634,35 +634,42 @@ func mustDecode(t *testing.T, rr *httptest.ResponseRecorder, v any) {
 	}
 }
 
-// The sidebar is where the UI learns whether the create-channel action is worth
-// offering. The flag must come from the service verbatim — false by default, so
-// a payload from a server that does not send it never reads as permission.
-func TestSidebarHandler_ExposesCanCreateChannel(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		data service.SidebarData
-		want bool
-	}{
-		{name: "manager", data: service.SidebarData{CanCreateChannel: true}, want: true},
-		{name: "plain member", data: service.SidebarData{}, want: false},
+// The deprecated can_create_channel flag must survive in the JSON contract so a
+// client that predates BUG #393 keeps working during rollout. It is emitted
+// unconditionally (never omitempty) and is true whenever the sidebar is
+// returned, whatever role the caller holds.
+func TestSidebarHandler_KeepsDeprecatedCanCreateChannelTrue(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner,
+		domain.WorkspaceRoleAdmin,
+		domain.WorkspaceRoleMember,
+		domain.WorkspaceRoleGuest,
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		t.Run(string(role), func(t *testing.T) {
 			v := makeTestValidator(t)
+			// The service sets the flag by construction; the role only proves the
+			// handler does not reintroduce a rule of its own on top of it.
+			data := service.SidebarData{
+				Workspace:        domain.Workspace{ID: "ws-1", Slug: "default", Status: domain.WorkspaceStatusActive},
+				CanCreateChannel: true,
+			}
 			rr := httptest.NewRecorder()
-			sidebarRouter(v, &stubSidebarProvider{data: test.data}).ServeHTTP(rr, authGet(t))
+			sidebarRouter(v, &stubSidebarProvider{data: data}).ServeHTTP(rr, authGet(t))
 			if rr.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200", rr.Code)
 			}
 			var body struct {
-				Data struct {
-					CanCreateChannel bool `json:"can_create_channel"`
-				} `json:"data"`
+				Data map[string]json.RawMessage `json:"data"`
 			}
 			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			if body.Data.CanCreateChannel != test.want {
-				t.Fatalf("can_create_channel = %v, want %v", body.Data.CanCreateChannel, test.want)
+			raw, ok := body.Data["can_create_channel"]
+			if !ok {
+				t.Fatalf("can_create_channel absent from payload: %s", rr.Body.String())
+			}
+			if string(raw) != "true" {
+				t.Fatalf("can_create_channel = %s, want true", raw)
 			}
 		})
 	}

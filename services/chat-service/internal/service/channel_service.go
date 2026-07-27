@@ -58,8 +58,20 @@ func NewChannelService(workspaces storage.WorkspaceStore, channels storage.Chann
 
 // CreateChannel creates a public or private channel in an active workspace.
 // Private channels add the creator as a channel member in the storage transaction.
+//
+// Creating a channel takes active workspace membership and nothing more (BUG
+// #393): the role is deliberately not consulted, so a plain member and an owner
+// take the same path. Update and archive remain management operations. The
+// membership is read server-side from the caller bound by the auth middleware,
+// so a role or an actor claimed by the client changes nothing here.
+//
+// The authoritative decision is CreateChannelForActiveMember's, which locks the
+// workspace and the membership and inserts from them in one statement. The check
+// below is the same predicate, not a second one: it exists so a caller with no
+// business in this workspace is refused before the input validation can tell
+// them whether a category ID exists in it.
 func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
-	if _, err := s.requireManagePermission(ctx, input.WorkspaceID, input.CallerID); err != nil {
+	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
 		return domain.Channel{}, err
 	}
 
@@ -88,10 +100,13 @@ func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelI
 		Position:    input.Position,
 		CreatedBy:   input.CallerID,
 	}
+	// A private channel nobody belongs to is invisible to its own creator, so
+	// the membership is part of the same transaction rather than a follow-up
+	// write that could fail on its own.
 	if input.Type == domain.ChannelTypePrivate {
-		return s.channels.CreateChannelWithMember(ctx, createInput, input.CallerID, domain.ChannelRoleMember)
+		createInput.EnsureCreatorMemberRole = domain.ChannelRoleMember
 	}
-	return s.channels.CreateChannel(ctx, createInput)
+	return s.channels.CreateChannelForActiveMember(ctx, createInput)
 }
 
 // ListChannels returns channels visible to callerID in workspaceID.
@@ -164,10 +179,13 @@ func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelI
 		next.Slug = slug
 	}
 	if input.DisplayName != "" {
-		next.DisplayName = strings.TrimSpace(input.DisplayName)
-		if next.DisplayName == "" {
-			return domain.Channel{}, fmt.Errorf("%w: display_name is required", domain.ErrInvalidInput)
+		// The same rule as creation, from the same helper: a rename must not be
+		// the way past a cap the create path enforces.
+		displayName, err := domain.NormalizeChannelDisplayName(input.DisplayName)
+		if err != nil {
+			return domain.Channel{}, err
 		}
+		next.DisplayName = displayName
 	}
 	if input.CategoryID != nil {
 		categoryID := strings.TrimSpace(*input.CategoryID)
@@ -216,7 +234,25 @@ func (s *ChannelService) ArchiveChannel(ctx context.Context, workspaceID, channe
 }
 
 func (s *ChannelService) requireManagePermission(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
-	member, err := s.requireActiveWorkspaceMember(ctx, workspaceID, userID)
+	return requireWorkspaceManager(ctx, s.workspaces, s.members, workspaceID, userID)
+}
+
+func (s *ChannelService) requireActiveWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	return requireActiveWorkspaceMember(ctx, s.workspaces, s.members, workspaceID, userID)
+}
+
+// requireWorkspaceManager and requireActiveWorkspaceMember are package-level so
+// that every service in this package decides membership and management rights
+// from the same code. They were methods on ChannelService until RF-17 needed the
+// same two predicates for channel categories; copying an authorization predicate
+// is how the two copies eventually stop agreeing.
+//
+// Both return domain.ErrForbidden for every denial, and deliberately never
+// distinguish a missing workspace from a disabled one or from a caller who is not
+// a member: a caller with no business in a workspace must not learn from the
+// error whether it exists.
+func requireWorkspaceManager(ctx context.Context, workspaces storage.WorkspaceStore, members storage.MemberStore, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	member, err := requireActiveWorkspaceMember(ctx, workspaces, members, workspaceID, userID)
 	if err != nil {
 		return domain.WorkspaceMember{}, err
 	}
@@ -226,8 +262,8 @@ func (s *ChannelService) requireManagePermission(ctx context.Context, workspaceI
 	return member, nil
 }
 
-func (s *ChannelService) requireActiveWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
-	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+func requireActiveWorkspaceMember(ctx context.Context, workspaces storage.WorkspaceStore, members storage.MemberStore, workspaceID, userID string) (domain.WorkspaceMember, error) {
+	workspace, err := workspaces.GetWorkspaceByID(ctx, workspaceID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return domain.WorkspaceMember{}, domain.ErrForbidden
@@ -238,7 +274,7 @@ func (s *ChannelService) requireActiveWorkspaceMember(ctx context.Context, works
 		return domain.WorkspaceMember{}, domain.ErrForbidden
 	}
 
-	member, err := s.members.GetWorkspaceMember(ctx, workspaceID, userID)
+	member, err := members.GetWorkspaceMember(ctx, workspaceID, userID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return domain.WorkspaceMember{}, domain.ErrForbidden
@@ -267,12 +303,12 @@ func (s *ChannelService) requireCategoryInWorkspace(ctx context.Context, workspa
 
 func normalizeChannelFields(slug, displayName string) (string, string, error) {
 	slug = strings.ToLower(strings.TrimSpace(slug))
-	displayName = strings.TrimSpace(displayName)
 	if !slugRE.MatchString(slug) {
 		return "", "", fmt.Errorf("%w: slug must be lowercase alphanumeric with optional internal hyphens, no leading/trailing hyphens, max 63 chars", domain.ErrInvalidInput)
 	}
-	if displayName == "" {
-		return "", "", fmt.Errorf("%w: display_name is required", domain.ErrInvalidInput)
+	displayName, err := domain.NormalizeChannelDisplayName(displayName)
+	if err != nil {
+		return "", "", err
 	}
 	return slug, displayName, nil
 }

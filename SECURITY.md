@@ -106,6 +106,28 @@ acesso usada para leitura de mensagens (RF-04), sem RBAC adicional.
 Decisao de produto registrada em 2026-07-08 (issue #105), substituindo
 a suposicao original de acesso restrito a Moderador/Admin.
 
+## Autorizacao para categorias de canais
+
+Criar, renomear, reordenar e excluir categoria de canal (RF-17) exige
+papel ativo de `owner` ou `admin` no workspace -- o mesmo gate ja usado
+para update/archive de canal e para workspace settings, exposto como
+`domain.CanManageChannelCategories`. Usuario comum e Guest recebem 403.
+Ler a listagem agrupada e aberto a qualquer membro ativo e nao amplia
+acesso a canal: os canais de cada grupo vem da mesma politica SQL de
+leitura usada pelo sidebar.
+
+O RF-17 foi especificado como "Admin e Moderador". Nao existe papel de
+moderador em nivel de workspace neste schema:
+`chat.workspace_members.role` aceita apenas
+`owner/admin/member/guest`, e `moderator` existe somente em
+`chat.channel_members`, como papel por canal. Tratar "modera algum
+canal" como "pode reestruturar a sidebar do workspace" seria escalacao
+de privilegio, e criar um papel de workspace que nenhum endpoint
+atribui seria codigo morto alargando uma constraint de seguranca fora
+do escopo da tarefa. `CanManageChannelCategories` e a costura nomeada
+para incluir um papel real de moderacao de workspace quando o RF-74
+criar um. Mesma forma de divergencia registrada acima para RF-05.
+
 ## Regras para uploads
 
 - Definir limite de tamanho.

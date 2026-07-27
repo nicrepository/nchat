@@ -48,6 +48,28 @@ export interface DMConversation {
   unreadCount?: number;
 }
 
+/**
+ * Splits the canonical DM list into the two sidebar sections it feeds.
+ *
+ * The only input is `type`, the server-derived discriminator persisted as
+ * `chat.dm_conversations.type` (CHECK IN ('direct','group')) — never the title,
+ * the avatar, the initials or how many participants happen to be visible.
+ * A single pass pushing each conversation into exactly one bucket is what makes
+ * "every item in exactly one section, none duplicated, none dropped" a property
+ * of the construction rather than of two filters agreeing with each other.
+ */
+export function partitionDMs(dms: DMConversation[]): {
+  directs: DMConversation[];
+  groups: DMConversation[];
+} {
+  const directs: DMConversation[] = [];
+  const groups: DMConversation[] = [];
+  for (const dm of dms) {
+    (dm.type === "group" ? groups : directs).push(dm);
+  }
+  return { directs, groups };
+}
+
 export interface DMCandidate {
   userId: string;
   displayName: string;

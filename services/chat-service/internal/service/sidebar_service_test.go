@@ -78,9 +78,6 @@ func (f *sidebarFakeChannelStore) CreateCategory(_ context.Context, _ storage.Cr
 func (f *sidebarFakeChannelStore) CreateChannel(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
-func (f *sidebarFakeChannelStore) CreateChannelWithMember(_ context.Context, _ storage.CreateChannelInput, _ string, _ domain.ChannelRole) (domain.Channel, error) {
-	return domain.Channel{}, nil
-}
 func (f *sidebarFakeChannelStore) GetCategoryByIDInWorkspace(_ context.Context, _, _ string) (domain.ChannelCategory, error) {
 	return domain.ChannelCategory{}, nil
 }
@@ -439,7 +436,7 @@ func (c *capturingChannelStore) CreateCategory(_ context.Context, _ storage.Crea
 func (c *capturingChannelStore) CreateChannel(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
-func (c *capturingChannelStore) CreateChannelWithMember(_ context.Context, _ storage.CreateChannelInput, _ string, _ domain.ChannelRole) (domain.Channel, error) {
+func (c *capturingChannelStore) CreateChannelForActiveMember(_ context.Context, _ storage.CreateChannelInput) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
 func (c *capturingChannelStore) GetCategoryByIDInWorkspace(_ context.Context, _, _ string) (domain.ChannelCategory, error) {
@@ -476,23 +473,19 @@ func (c *capturingChannelStore) ArchiveChannel(_ context.Context, _, _ string) (
 	return domain.Channel{}, nil
 }
 
-// CanCreateChannel must be the same predicate CreateChannel enforces, derived
-// from the caller's workspace role. A plain member sees false, so the UI can say
-// why the action is unavailable instead of leaving a dead button behind.
-func TestSidebarService_CanCreateChannelFollowsWorkspaceRole(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		role domain.WorkspaceRole
-		want bool
-	}{
-		{name: "owner", role: domain.WorkspaceRoleOwner, want: true},
-		{name: "admin", role: domain.WorkspaceRoleAdmin, want: true},
-		{name: "member", role: domain.WorkspaceRoleMember, want: false},
-		{name: "guest", role: domain.WorkspaceRoleGuest, want: false},
+// CanCreateChannel is a compatibility field, not a role lookup: every active
+// role sees true, because a returned sidebar already proves the only condition
+// channel creation has (BUG #393).
+func TestSidebarService_CanCreateChannelIsTrueForEveryActiveRole(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner,
+		domain.WorkspaceRoleAdmin,
+		domain.WorkspaceRoleMember,
+		domain.WorkspaceRoleGuest,
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		t.Run(string(role), func(t *testing.T) {
 			member := activeMember()
-			member.Role = test.role
+			member.Role = role
 			svc := newSidebarService(
 				&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
 				&sidebarFakeMemberStore{member: member},
@@ -503,8 +496,8 @@ func TestSidebarService_CanCreateChannelFollowsWorkspaceRole(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if data.CanCreateChannel != test.want {
-				t.Fatalf("CanCreateChannel = %v, want %v", data.CanCreateChannel, test.want)
+			if !data.CanCreateChannel {
+				t.Fatalf("CanCreateChannel = false for active %s, want true", role)
 			}
 		})
 	}

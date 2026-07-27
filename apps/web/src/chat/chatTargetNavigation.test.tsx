@@ -141,7 +141,15 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-/** One user-event session per test avoids repeatedly patching shared document state. */
+/**
+ * The one user-event session for the current test, created in beforeEach.
+ *
+ * userEvent's direct API (`userEvent.click(...)`) runs a full setup() per call —
+ * re-patching the document, the clipboard and the pointer state every time. With
+ * this app mounted that is measurable, and it was part of what pushed these
+ * tests near the timeout under coverage instrumentation. One session per test
+ * keeps the interactions identical and pays the setup once.
+ */
 let user: ReturnType<typeof userEvent.setup>;
 
 async function clickTarget(name: RegExp) {
@@ -217,6 +225,9 @@ beforeEach(() => {
 
 afterEach(() => {
   global.WebSocket = OriginalWebSocket;
+
+  // FakeWebSocket.instances is static, so a socket a previous test opened would
+  // otherwise still be reachable from the next one's assertions.
   FakeWebSocket.instances = [];
   clearTokens();
 });
@@ -235,11 +246,20 @@ describe("navigating between DM and channel targets", () => {
 
     await clickChannel();
 
+    // The route, the header and the timeline settle on three separate updates —
+    // the click, the router's, and the channel fetch resolving. Each is awaited
+    // on its own observable outcome, and only then is the DM's absence checked:
+    // asserting it right after the last findBy would be asserting on whichever
+    // render happened to have landed first.
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
-    const currentHeader = await screen.findByTestId("chat-msg-header");
-    expect(await within(currentHeader).findByText("geral")).toBeInTheDocument();
+
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(await within(header).findByText("geral")).toBeInTheDocument();
+
     expect(await screen.findByText(channelText)).toBeInTheDocument();
+
     await waitFor(() => expect(screen.queryByText(dmText)).not.toBeInTheDocument());
+
     expect(screen.getByTestId("chat-message-area")).toBeInTheDocument();
   });
 
