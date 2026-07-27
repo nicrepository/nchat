@@ -102,6 +102,120 @@ func TestChatMigration_DownRemovesGeneralChannelTriggers(t *testing.T) {
 	}
 }
 
+// RF-17. chat.channel_categories and chat.channels.category_id already existed;
+// what 000017 has to add is everything that bounds a category row, plus the index
+// the composite FK's referencing side never had.
+func TestChatMigration_BoundsChannelCategoryNameAndPosition(t *testing.T) {
+	migration := readChatMigration(t, "000017_channel_category_constraints.up.sql")
+	for _, expected := range []string{
+		"CONSTRAINT channel_categories_name_length_check",
+		"CHECK (char_length(btrim(name)) BETWEEN 1 AND 60)",
+		"CONSTRAINT channel_categories_name_trimmed_check",
+		"CHECK (name = btrim(name))",
+		"CONSTRAINT channel_categories_name_no_control_check",
+		"CHECK (name !~ '[[:cntrl:]]')",
+		"CONSTRAINT channel_categories_name_not_reserved_check",
+		"CHECK (lower(btrim(name)) <> 'geral')",
+		"CONSTRAINT channel_categories_position_range_check",
+		"CHECK (position >= 0 AND position <= 100000)",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("channel category migration missing %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_EnforcesChannelCategoryNameUniquePerWorkspace(t *testing.T) {
+	migration := readChatMigration(t, "000017_channel_category_constraints.up.sql")
+	for _, expected := range []string{
+		"CREATE UNIQUE INDEX channel_categories_workspace_name_uidx",
+		"ON chat.channel_categories (workspace_id, lower(btrim(name)))",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("channel category migration missing %q", expected)
+		}
+	}
+}
+
+func TestChatMigration_AddsChannelCategoryIndexesAndDropsTheRedundantOne(t *testing.T) {
+	migration := readChatMigration(t, "000017_channel_category_constraints.up.sql")
+	for _, expected := range []string{
+		"CREATE INDEX channel_categories_workspace_position_idx",
+		"ON chat.channel_categories (workspace_id, position)",
+		// The referencing side of channels_workspace_category_fk: without it a
+		// category delete scans every channel to apply ON DELETE SET NULL.
+		"CREATE INDEX idx_channels_workspace_category",
+		"ON chat.channels (workspace_id, category_id)",
+		"WHERE category_id IS NOT NULL",
+		// Fully covered by the composite index above.
+		"DROP INDEX IF EXISTS chat.idx_channel_categories_workspace",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("channel category migration missing %q", expected)
+		}
+	}
+}
+
+// The rollback must cost no row: bounds come off, categories and channels stay.
+func TestChatMigration_ChannelCategoryDownPreservesRowsAndRestoresIndex(t *testing.T) {
+	migration := readChatMigration(t, "000017_channel_category_constraints.down.sql")
+	for _, expected := range []string{
+		"DROP INDEX IF EXISTS chat.idx_channels_workspace_category",
+		"DROP INDEX IF EXISTS chat.channel_categories_workspace_position_idx",
+		"DROP INDEX IF EXISTS chat.channel_categories_workspace_name_uidx",
+		"DROP CONSTRAINT IF EXISTS channel_categories_position_range_check",
+		"DROP CONSTRAINT IF EXISTS channel_categories_name_not_reserved_check",
+		"DROP CONSTRAINT IF EXISTS channel_categories_name_no_control_check",
+		"DROP CONSTRAINT IF EXISTS channel_categories_name_trimmed_check",
+		"DROP CONSTRAINT IF EXISTS channel_categories_name_length_check",
+		// Restores what the up migration replaced.
+		"CREATE INDEX IF NOT EXISTS idx_channel_categories_workspace",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("channel category rollback missing %q", expected)
+		}
+	}
+	for _, forbidden := range []string{
+		"DROP TABLE",
+		"DELETE FROM",
+		"UPDATE chat.channels",
+		"DROP COLUMN",
+	} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("channel category rollback must not contain %q", forbidden)
+		}
+	}
+	if strings.Contains(strings.ToUpper(migration), "DROP SCHEMA") ||
+		strings.Contains(strings.ToUpper(migration), "CASCADE") {
+		t.Fatal("channel category rollback must not drop the schema or cascade")
+	}
+}
+
+// The invariants RF-17 depends on but does not introduce: they were established in
+// 000001 and 000002 and must keep holding, since the delete path relies on the
+// FK clearing category_id rather than on a statement of its own.
+func TestChatMigration_ChannelCategoryAssociationStaysWorkspaceBoundAndPreservesChannels(t *testing.T) {
+	migration := readChatMigration(t, "000002_chat_enforce_channel_workspace_isolation.up.sql")
+	for _, expected := range []string{
+		"FOREIGN KEY (workspace_id, category_id)",
+		"REFERENCES chat.channel_categories (workspace_id, id)",
+		"ON DELETE SET NULL (category_id)",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("category association invariant lost: %q", expected)
+		}
+	}
+	// category_id is nullable in 000001, so a channel with no category is valid
+	// and every pre-existing channel stays readable after 000017.
+	schema := readChatMigration(t, "000001_chat_domain_schema.up.sql")
+	if !strings.Contains(schema, "category_id  UUID        REFERENCES chat.channel_categories (id)") {
+		t.Fatal("chat.channels.category_id must remain nullable")
+	}
+	if strings.Contains(schema, "category_id  UUID        NOT NULL") {
+		t.Fatal("chat.channels.category_id must not be NOT NULL")
+	}
+}
+
 func TestChatMigration_AddsDMConversationTables(t *testing.T) {
 	migration := readChatMigration(t, "000003_chat_dm_conversations.up.sql")
 	for _, expected := range []string{
