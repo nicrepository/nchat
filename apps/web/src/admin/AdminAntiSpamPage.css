@@ -1,0 +1,128 @@
+/* Admin anti-spam page (RF-19) — reuses the tokens the users page established */
+
+.admin-antispam__page-head {
+  margin-bottom: 20px;
+}
+
+.admin-antispam__title {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--color-ink);
+  margin: 0 0 4px;
+  letter-spacing: -0.01em;
+}
+
+.admin-antispam__subtitle {
+  font-size: 14px;
+  color: var(--color-muted);
+  margin: 0;
+}
+
+.admin-antispam__card {
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 560px;
+}
+
+.admin-antispam__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.admin-antispam__label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.admin-antispam__hint {
+  font-size: 13px;
+  color: var(--color-muted);
+  margin: 0;
+}
+
+.admin-antispam__input {
+  width: 160px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  font-size: 14px;
+  color: var(--color-ink);
+  background: var(--color-surface, #fff);
+}
+
+.admin-antispam__input:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+.admin-antispam__input[aria-invalid="true"] {
+  border-color: var(--color-danger, #dc2626);
+}
+
+.admin-antispam__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
+.admin-antispam__submit {
+  display: inline-flex;
+  align-items: center;
+  padding: 9px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--color-primary);
+  color: #fff;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: opacity 0.12s;
+}
+
+.admin-antispam__submit:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.admin-antispam__message {
+  font-size: 13px;
+  margin: 0;
+}
+
+.admin-antispam__message--error {
+  color: var(--color-danger, #dc2626);
+}
+
+.admin-antispam__message--success {
+  color: var(--color-success, #15803d);
+}
+
+.admin-antispam__skeleton {
+  height: 38px;
+  width: 160px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #eef0f3 25%, #f6f7f9 37%, #eef0f3 63%);
+  background-size: 400% 100%;
+  animation: admin-antispam-shimmer 1.2s ease-in-out infinite;
+}
+
+@keyframes admin-antispam-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-antispam__skeleton {
+    animation: none;
+  }
+}

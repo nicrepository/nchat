@@ -13,6 +13,7 @@ import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
 import ProfilePage from "./profile/ProfilePage";
 
+const AdminAntiSpamPage = lazy(() => import("./admin/AdminAntiSpamPage"));
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
 const LiveKitSpikePage = import.meta.env.DEV
@@ -92,6 +93,20 @@ export default function App() {
           element={
             <RequireAuth>
               <AdminUsersPage />
+            </RequireAuth>
+          }
+        />
+        {/* RF-19 (issue #419). RequireAuth is the same session gate the other
+            admin route uses; the admin-only data behind this page is authorized
+            server-side, so reaching the route without the role shows errors
+            rather than the policy. */}
+        <Route
+          path="/admin/anti-spam"
+          element={
+            <RequireAuth>
+              <Suspense fallback={null}>
+                <AdminAntiSpamPage />
+              </Suspense>
             </RequireAuth>
           }
         />

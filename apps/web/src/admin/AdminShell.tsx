@@ -94,12 +94,16 @@ function IconBell() {
 
 // ── Admin tab config ────────────────────────────────────────────────────────
 
-export type AdminTab = "overview" | "users" | "channels" | "audit";
+export type AdminTab = "overview" | "users" | "channels" | "anti-spam" | "audit";
 
-const ADMIN_TABS: { id: AdminTab; label: string }[] = [
+// href is set only for tabs backed by a real page; the rest render as disabled
+// placeholders. Hiding or disabling a tab is navigation, not authorization —
+// each page's data is guarded server-side.
+const ADMIN_TABS: { id: AdminTab; label: string; href?: string }[] = [
   { id: "overview", label: "Visão geral" },
-  { id: "users", label: "Usuários" },
+  { id: "users", label: "Usuários", href: "/admin/users" },
   { id: "channels", label: "Canais" },
+  { id: "anti-spam", label: "Anti-spam", href: "/admin/anti-spam" },
   { id: "audit", label: "Auditoria" },
 ];
 
@@ -176,11 +180,11 @@ export default function AdminShell({ activeTab, children }: AdminShellProps) {
           <div className="admin-tabnav__items" role="tablist">
             {ADMIN_TABS.map((tab) => {
               const isActive = activeTab === tab.id;
-              const isAvailable = tab.id === "users";
+              const isAvailable = tab.href !== undefined;
               return (
                 <a
                   key={tab.id}
-                  href={isAvailable ? "/admin/users" : undefined}
+                  href={tab.href}
                   className={`admin-tabnav__item${isActive ? " admin-tabnav__item--active" : ""}${!isAvailable && !isActive ? " admin-tabnav__item--unavailable" : ""}`}
                   role="tab"
                   aria-selected={isActive}
