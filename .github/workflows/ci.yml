@@ -212,6 +212,9 @@ jobs:
       - name: Check local gateway config
         run: pnpm gateway:config-check
 
+      - name: Check web security headers
+        run: pnpm web:security-headers-check
+
       - name: Check TLS config
         run: pnpm tls:config-check
 
