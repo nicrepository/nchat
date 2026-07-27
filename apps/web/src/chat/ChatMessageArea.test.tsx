@@ -3243,6 +3243,24 @@ describe("ChatMessageArea — no runtime fixture import", () => {
 // ── Route decoding ────────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — route decoding", () => {
+  it("uses the canonical UUID identity for REST and target-scoped data", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const canonical = "550e8400-e29b-41d4-a716-446655440000";
+
+    renderChannelArea("550E8400-E29B-41D4-A716-446655440000");
+
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalled());
+    expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+      canonical,
+      undefined,
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchPins).toHaveBeenCalledWith(
+      { kind: "channel", id: canonical },
+      expect.any(AbortSignal),
+    );
+  });
+
   it("decodes percent-encoded channel ID correctly", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 

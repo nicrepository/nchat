@@ -25,6 +25,7 @@ import type {
   WSMessagePayload,
   WSPinUpdatedEvent,
   WSReactionUpdatedEvent,
+  WSSubscribedEvent,
 } from "./useChatWebSocket";
 import { useMessages } from "./useMessages";
 import type { Message, MessagePage } from "./chatTypes";
@@ -36,6 +37,8 @@ let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = nu
 let capturedOnMessageUpdated: ((evt: WSMessageUpdatedEvent) => void) | null = null;
 let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
 let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
+let capturedOnSubscriptionError: ((evt: WSClientErrorEvent) => void) | null = null;
+let capturedOnSubscribed: ((evt: WSSubscribedEvent) => void) | null = null;
 let capturedOnPinUpdated: ((evt: WSPinUpdatedEvent) => void) | null = null;
 const mockToggleReaction = vi.fn(() => true);
 
@@ -46,6 +49,8 @@ vi.mock("./useChatWebSocket", () => ({
     onReactionUpdated,
     onPinUpdated,
     onReactionError,
+    onSubscriptionError,
+    onSubscribed,
   }: {
     kind: string;
     targetId: string;
@@ -54,12 +59,16 @@ vi.mock("./useChatWebSocket", () => ({
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
     onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
     onReactionError?: (evt: WSClientErrorEvent) => void;
+    onSubscriptionError?: (evt: WSClientErrorEvent) => void;
+    onSubscribed?: (evt: WSSubscribedEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
     capturedOnMessageUpdated = onMessageUpdated ?? null;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
     capturedOnPinUpdated = onPinUpdated ?? null;
     capturedOnReactionError = onReactionError ?? null;
+    capturedOnSubscriptionError = onSubscriptionError ?? null;
+    capturedOnSubscribed = onSubscribed ?? null;
     return { toggleReaction: mockToggleReaction };
   },
 }));
@@ -238,6 +247,8 @@ beforeEach(() => {
   capturedOnMessageUpdated = null;
   capturedOnReactionUpdated = null;
   capturedOnReactionError = null;
+  capturedOnSubscriptionError = null;
+  capturedOnSubscribed = null;
   capturedOnPinUpdated = null;
   vi.clearAllMocks();
 });
@@ -604,6 +615,54 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
     expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
+  });
+
+  it("maps subscribe errors to realtime state without showing a reaction failure", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnSubscriptionError?.({
+        type: "error",
+        operation: "subscribe",
+        code: "room_access_denied",
+      }),
+    );
+
+    expect(result.current.state.realtimeError).toMatch(/tempo real/i);
+    expect(result.current.state.actionError).toBeNull();
+  });
+
+  it("clears a technical realtime error when the current subscription is confirmed", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnSubscriptionError?.({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+      }),
+    );
+    expect(result.current.state.realtimeError).toMatch(/tempo real/i);
+
+    act(() =>
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+
+    expect(result.current.state.realtimeError).toBeNull();
+    expect(result.current.state.actionError).toBeNull();
   });
 
   it("reverts pending optimistic reactions when the server reports a reaction error", async () => {

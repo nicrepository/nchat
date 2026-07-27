@@ -20,6 +20,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import { getAccessToken } from "../lib/authSession";
+import { normalizeChatTargetId } from "./chatTargetId";
 
 const CHAT_WS_URL =
   (import.meta.env.VITE_CHAT_WS_URL as string | undefined) ??
@@ -27,6 +28,7 @@ const CHAT_WS_URL =
 
 const RECONNECT_BASE_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 2_000;
+const MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS = 3;
 const CHAT_WS_SUBPROTOCOL = "nchat.v1";
 
 export interface WSMessagePayload {
@@ -153,8 +155,16 @@ export interface WSPinUpdatedEvent {
 
 export interface WSClientErrorEvent {
   type: "error";
+  operation?: string;
   code: string;
   retry_after?: number;
+}
+
+export interface WSSubscribedEvent {
+  type: "subscribed";
+  operation: "subscribe";
+  target_type: "channel" | "dm";
+  target_id: string;
 }
 
 interface UseChatWebSocketOptions {
@@ -165,6 +175,8 @@ interface UseChatWebSocketOptions {
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
+  onSubscriptionError?: (event: WSClientErrorEvent) => void;
+  onSubscribed?: (event: WSSubscribedEvent) => void;
 }
 
 export interface ChatWebSocketActions {
@@ -179,13 +191,18 @@ export function useChatWebSocket({
   onReactionUpdated,
   onPinUpdated,
   onReactionError,
+  onSubscriptionError,
+  onSubscribed,
 }: UseChatWebSocketOptions): ChatWebSocketActions {
+  const normalizedTargetId = normalizeChatTargetId(targetId);
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
   const onPinRef = useRef(onPinUpdated);
   const onReactionErrorRef = useRef(onReactionError);
+  const onSubscriptionErrorRef = useRef(onSubscriptionError);
+  const onSubscribedRef = useRef(onSubscribed);
   const socketRef = useRef<WebSocket | null>(null);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
@@ -193,6 +210,8 @@ export function useChatWebSocket({
     onReactionRef.current = onReactionUpdated;
     onPinRef.current = onPinUpdated;
     onReactionErrorRef.current = onReactionError;
+    onSubscriptionErrorRef.current = onSubscriptionError;
+    onSubscribedRef.current = onSubscribed;
   });
 
   const toggleReaction = useCallback((messageId: string, emoji: string) => {
@@ -203,18 +222,58 @@ export function useChatWebSocket({
   }, []);
 
   useEffect(() => {
-    if (!targetId) return;
+    if (!normalizedTargetId) return;
 
     const targetType: "channel" | "dm" = kind === "channel" ? "channel" : "dm";
     let closed = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
+    let subscriptionRecoveryTimer: number | null = null;
     let reconnectAttempt = 0;
+    let subscriptionRecoveryAttempts = 0;
 
     const clearReconnectTimer = () => {
       if (reconnectTimer === null) return;
       window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    };
+
+    const clearSubscriptionRecoveryTimer = () => {
+      if (subscriptionRecoveryTimer === null) return;
+      window.clearTimeout(subscriptionRecoveryTimer);
+      subscriptionRecoveryTimer = null;
+    };
+
+    const sendSubscribe = (socket: WebSocket) => {
+      if (closed || ws !== socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(
+        JSON.stringify({
+          type: "subscribe",
+          target_type: targetType,
+          target_id: normalizedTargetId,
+        }),
+      );
+    };
+
+    const scheduleSubscriptionRecovery = (socket: WebSocket) => {
+      if (
+        closed ||
+        ws !== socket ||
+        socket.readyState !== WebSocket.OPEN ||
+        subscriptionRecoveryTimer !== null ||
+        subscriptionRecoveryAttempts >= MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS
+      ) {
+        return;
+      }
+      const delay = Math.min(
+        RECONNECT_BASE_DELAY_MS * 2 ** subscriptionRecoveryAttempts,
+        RECONNECT_MAX_DELAY_MS,
+      );
+      subscriptionRecoveryAttempts += 1;
+      subscriptionRecoveryTimer = window.setTimeout(() => {
+        subscriptionRecoveryTimer = null;
+        sendSubscribe(socket);
+      }, delay);
     };
 
     const scheduleReconnect = () => {
@@ -253,9 +312,7 @@ export function useChatWebSocket({
       socket.onopen = () => {
         if (closed || ws !== socket) return;
         reconnectAttempt = 0;
-        socket.send(
-          JSON.stringify({ type: "subscribe", target_type: targetType, target_id: targetId }),
-        );
+        sendSubscribe(socket);
       };
 
       socket.onmessage = (event: MessageEvent<unknown>) => {
@@ -268,20 +325,45 @@ export function useChatWebSocket({
         }
         if (!data || typeof data !== "object") return;
         const d = data as Record<string, unknown>;
+        const incomingTargetId =
+          typeof d["target_id"] === "string" ? normalizeChatTargetId(d["target_id"]) : "";
+        const normalizedData = incomingTargetId ? { ...d, target_id: incomingTargetId } : d;
+        if (
+          d["type"] === "subscribed" &&
+          d["operation"] === "subscribe" &&
+          d["target_type"] === targetType &&
+          incomingTargetId === normalizedTargetId
+        ) {
+          clearSubscriptionRecoveryTimer();
+          subscriptionRecoveryAttempts = 0;
+          onSubscribedRef.current?.(normalizedData as unknown as WSSubscribedEvent);
+          return;
+        }
         if (d["type"] === "error" && typeof d["code"] === "string") {
-          onReactionErrorRef.current?.(d as unknown as WSClientErrorEvent);
+          const clientError = d as unknown as WSClientErrorEvent;
+          if (d["operation"] === "subscribe") {
+            onSubscriptionErrorRef.current?.(clientError);
+            if (
+              d["code"] === "room_subscription_unavailable" &&
+              socket.readyState === WebSocket.OPEN
+            ) {
+              scheduleSubscriptionRecovery(socket);
+            }
+            return;
+          }
+          onReactionErrorRef.current?.(clientError);
           return;
         }
         // Filter: only process events for the active target.
-        if (d["target_type"] !== targetType || d["target_id"] !== targetId) return;
+        if (d["target_type"] !== targetType || incomingTargetId !== normalizedTargetId) return;
         if (d["type"] === "message.created") {
-          onMessageRef.current(d as unknown as WSMessageCreatedEvent);
-        } else if (d["type"] === "message.updated" && isMessageUpdatedEvent(d)) {
-          onMessageUpdatedRef.current?.(d);
+          onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
+        } else if (d["type"] === "message.updated" && isMessageUpdatedEvent(normalizedData)) {
+          onMessageUpdatedRef.current?.(normalizedData);
         } else if (d["type"] === "reaction.updated") {
-          onReactionRef.current?.(d as unknown as WSReactionUpdatedEvent);
+          onReactionRef.current?.(normalizedData as unknown as WSReactionUpdatedEvent);
         } else if (d["type"] === "pin.updated") {
-          onPinRef.current?.(d as unknown as WSPinUpdatedEvent);
+          onPinRef.current?.(normalizedData as unknown as WSPinUpdatedEvent);
         }
       };
 
@@ -292,6 +374,7 @@ export function useChatWebSocket({
 
       socket.onclose = () => {
         if (closed || ws !== socket) return;
+        clearSubscriptionRecoveryTimer();
         scheduleReconnect();
       };
     };
@@ -301,6 +384,7 @@ export function useChatWebSocket({
     return () => {
       closed = true;
       clearReconnectTimer();
+      clearSubscriptionRecoveryTimer();
       if (ws) {
         const socket = ws;
         ws = null;
@@ -311,7 +395,7 @@ export function useChatWebSocket({
               JSON.stringify({
                 type: "unsubscribe",
                 target_type: targetType,
-                target_id: targetId,
+                target_id: normalizedTargetId,
               }),
             );
           } catch {
@@ -325,7 +409,7 @@ export function useChatWebSocket({
         socket.close();
       }
     };
-  }, [kind, targetId]);
+  }, [kind, normalizedTargetId]);
 
   return { toggleReaction };
 }
