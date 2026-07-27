@@ -197,6 +197,50 @@ func TestDMHandler_GetOrCreateDirect_RequiresAuthenticationAndJSONContentType(t 
 	}
 }
 
+// The browser must send a media type this endpoint parses as application/json.
+// A duplicated header ("application/json, application/json") is what a client
+// that merges its content type twice ends up sending, and it is a rejection —
+// the accepted forms stay exactly application/json, with or without parameters.
+func TestDMHandler_GetOrCreateDirect_AcceptsOnlyJSONMediaType(t *testing.T) {
+	body := `{"other_user_id":"` + dmOtherUserID + `"}`
+	tests := []struct {
+		name        string
+		contentType string
+		want        int
+	}{
+		{name: "json", contentType: "application/json", want: http.StatusOK},
+		{name: "json with charset", contentType: "application/json; charset=utf-8", want: http.StatusOK},
+		{name: "missing", contentType: "", want: http.StatusUnsupportedMediaType},
+		{name: "text plain", contentType: "text/plain", want: http.StatusUnsupportedMediaType},
+		{name: "octet stream", contentType: "application/octet-stream", want: http.StatusUnsupportedMediaType},
+		{name: "duplicated json", contentType: "application/json, application/json", want: http.StatusUnsupportedMediaType},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeDMProvider{createOutput: service.CreateDirectConversationOutput{
+				Conversation: domain.DMConversation{ID: dmConversationID}, Created: true,
+			}}
+			request := requestWithUser(http.MethodPost, httpapi.RouteDMConversations, strings.NewReader(body))
+			if test.contentType != "" {
+				request.Header.Set("Content-Type", test.contentType)
+			}
+			recorder := httptest.NewRecorder()
+			dmTestHandler(provider).GetOrCreateDirect(recorder, request)
+
+			if recorder.Code != test.want {
+				t.Fatalf("status = %d, want %d (body=%s)", recorder.Code, test.want, recorder.Body.String())
+			}
+			wantCalls := 0
+			if test.want == http.StatusOK {
+				wantCalls = 1
+			}
+			if provider.createCalls != wantCalls {
+				t.Fatalf("createCalls = %d, want %d", provider.createCalls, wantCalls)
+			}
+		})
+	}
+}
+
 func TestDMHandler_GetOrCreateDirect_RejectsMalformedUnknownAndInvalidUUID(t *testing.T) {
 	for _, test := range []struct {
 		name string
