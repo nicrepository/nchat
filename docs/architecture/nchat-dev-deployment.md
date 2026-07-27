@@ -89,6 +89,7 @@ aprovados. DNS é permitido somente a workloads que resolvem Services/hosts atua
 | relay aberto/SSRF no coturn     | autenticação, ranges privados/reservados negados e uma exceção canônica |
 | supply chain CI                 | Actions por SHA; Kustomize/controller com versão e checksum fixos       |
 | XSS/clickjacking no web         | CSP sem `unsafe-eval`, frame denial e headers defensivos do nginx       |
+| CSP duplicada/contraditória     | CSP única no nginx, validada por `web:security-headers-check`           |
 
 No coturn, `allowed-peer-ip` prevalece sobre um `denied-peer-ip` sobreposto. A única
 exceção renderizada é `NCHAT_DEV_NODE_IP`, usado pelo LiveKit. Como coturn e LiveKit
@@ -96,6 +97,14 @@ compartilham `hostNetwork`, essa permissão identifica o host inteiro, não o pr
 LiveKit; esse é um risco residual conhecido. As portas de mídia não podem ser
 expostas à WAN. O hardening futuro é separar LiveKit e coturn em IPs ou nós dedicados
 e então remover a exceção do host compartilhado.
+
+A CSP tem uma única fonte versionada: `infra/docker/web/nginx.conf`. Nem o Traefik,
+nem o Ingress, nem os serviços Go emitem `Content-Security-Policy`, e o repositório
+não emite `Content-Security-Policy-Report-Only` — duas políticas divergentes foram a
+causa do issue #388. `connect-src` fica em `'self' wss://$host`, cobrindo REST e
+WebSocket same-origin sem liberar esquema inteiro. Cloudflare Rocket Loader e Web
+Analytics injetam scripts que a política nega por construção; desativá-los é ação
+operacional na zona, descrita na seção 17.1 do runbook `nchat-dev-server.md`.
 
 ## Imagens e atualização
 

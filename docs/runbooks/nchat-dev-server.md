@@ -951,6 +951,66 @@ kubectl auth can-i --as=nchat-dev-deployer \
 Resultados esperados do RBAC: `yes` para `patch deployments`, `no` para
 `get secrets`.
 
+### 17.1 Headers de segurança e CSP (issue #388)
+
+O repositório emite **uma única** CSP, no nginx do web
+(`infra/docker/web/nginx.conf`). Qualquer segunda política — em especial
+`Content-Security-Policy-Report-Only` — vem de camada operacional fora do Git
+(Traefik/Ingress fora do overlay, ou Cloudflare) e precisa ser removida lá.
+
+```bash
+# [notebook]
+bash scripts/ci/web-security-headers-check.sh "https://${NCHAT_DEV_HOST}"
+
+# Inspeção manual dos headers da resposta inicial:
+curl -sS -o /dev/null -D - "https://${NCHAT_DEV_HOST}/" |
+  grep -i '^content-security-policy'
+```
+
+Esperado: exatamente uma linha `content-security-policy:` e **nenhuma**
+`content-security-policy-report-only:`.
+
+Ações operacionais obrigatórias, fora do repositório (zona Cloudflare de
+`nchat-dev`; a resposta traz `server: cloudflare`):
+
+1. **Desativar JavaScript Detections** (Security → Bots). O Cloudflare injeta no
+   `<body>` um script **inline** que faz o bootstrap de
+   `/cdn-cgi/challenge-platform/scripts/jsd/main.js` — é ele que dispara "blocked
+   an inline script because it violates script-src 'self'". Não há como
+   autorizá-lo: o conteúdo inline muda a cada resposta (parâmetros `r` e `t`), o
+   que inviabiliza hash, e o Cloudflare não insere nonce. Liberar exigiria
+   `'unsafe-inline'`, o que a política de segurança proíbe. **Desativar é a
+   única saída.**
+2. **Desativar Web Analytics/Browser Insights**. O Cloudflare injeta
+   `https://static.cloudflareinsights.com/beacon.min.js/...`, bloqueado por
+   `script-src 'self'`. O ambiente dev não depende dele. Se o produto decidir
+   mantê-lo, a única alteração aceita é acrescentar
+   `https://static.cloudflareinsights.com` ao `script-src` do nginx — nunca
+   `'unsafe-inline'` nem curinga.
+
+**Sobre a CSP Report-Only do issue #388**: sondagens diretas do host (inclusive
+com User-Agent de navegador) retornam **um** header `content-security-policy` e
+**nenhum** `content-security-policy-report-only`; não há `<meta http-equiv>` de
+CSP no HTML e nenhum `Middleware` do repositório define headers. Ou seja, a
+política Report-Only com `script-src 'unsafe-inline' 'unsafe-eval'` e
+`connect-src 'none'` não vem da origem nesse caminho. Antes de caçá-la na
+infraestrutura, reproduza em Firefox e Brave **com extensões desabilitadas** e em
+janela limpa — extensões e o Brave Shields injetam CSP Report-Only própria. Se
+persistir sem extensões, verifique nesta ordem:
+
+```bash
+# [notebook]
+curl -sS -o /dev/null -D - "https://${NCHAT_DEV_HOST}/" | grep -i 'report-only'
+
+# [srv-apps-01]
+# Nenhum Middleware do repositório define headers; qualquer contentSecurityPolicy
+# aqui é resíduo operacional a remover.
+kubectl get middleware -A -o yaml | grep -i -n 'contentSecurityPolicy' || true
+```
+
+E, no painel Cloudflare, as Transform Rules / Managed Transforms de response
+header da zona.
+
 Para diagnóstico de política, identifique primeiro os labels do pod e depois confira
 somente a política daquele fluxo; não desative o default-deny nem crie egress amplo.
 
