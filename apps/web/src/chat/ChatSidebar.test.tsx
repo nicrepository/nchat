@@ -384,6 +384,103 @@ describe("ChatSidebar — DMs", () => {
     });
   });
 
+  // BUG #395 — the sidebar payload never carries participants, so a group must
+  // still show an avatar built from its own visible name.
+  it("shows the group initials when the sidebar sends no participants", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Grupo Equipe Infra" });
+    expect(option.textContent).toContain("EI");
+  });
+
+  it("shows a single initial for a one-word group name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-grp", type: "group", name: "Infra", participants: [] }],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Grupo Infra" });
+    expect(option.textContent).toContain("I");
+  });
+
+  it("ignores surrounding whitespace in a group name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-grp", type: "group", name: "  Equipe Infra  ", participants: [] }],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Grupo Equipe Infra" });
+    expect(option.textContent).toContain("EI");
+  });
+
+  it("keeps accented group initials legible", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-grp", type: "group", name: "Órgão Ágil", participants: [] }],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Grupo Órgão Ágil" });
+    expect(option.textContent).toContain("ÓÁ");
+  });
+
+  it("falls back to a placeholder initial when a group has no usable name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [
+        { id: "dm-empty", type: "group", name: "", participants: [] },
+        { id: "dm-blank", type: "group", name: "   ", participants: [] },
+      ],
+    });
+    renderChat();
+
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
+    for (const option of screen.getAllByRole("option")) {
+      expect(option.textContent).toContain("?");
+    }
+  });
+
+  it("keeps the group avatar decorative and the row labelled by the full name", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Grupo Equipe Infra" });
+    const avatar = option.querySelector("[aria-hidden='true']");
+    expect(avatar).not.toBeNull();
+    expect(avatar?.textContent).toBe("EI");
+    // The initials are hidden from the accessible name, so "EI" is not announced
+    // on top of "Equipe Infra".
+    expect(screen.queryByRole("option", { name: /EI/ })).toBeNull();
+  });
+
+  it("still composes participant avatars when a group carries participants", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: SAMPLE_DMS,
+    });
+    renderChat();
+
+    const option = await screen.findByRole("option", { name: "Grupo Equipe Infra" });
+    expect(option.textContent).toContain("JL");
+    expect(option.textContent).toContain("CA");
+  });
+
   it("shows the counterpart avatar in a 1:1 DM", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "user-a",
