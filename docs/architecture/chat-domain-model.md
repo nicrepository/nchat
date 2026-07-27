@@ -7,8 +7,9 @@
 
 Migrations: `migrations/chat/000001_chat_domain_schema`,
 `migrations/chat/000002_chat_enforce_channel_workspace_isolation`,
-`migrations/chat/000003_chat_dm_conversations`, and
-`migrations/chat/000004_chat_messages`
+`migrations/chat/000003_chat_dm_conversations`,
+`migrations/chat/000004_chat_messages`, and
+`migrations/chat/000017_channel_category_constraints`
 Schema: `chat`
 
 ## Table summary
@@ -47,12 +48,19 @@ Seed uses `ON CONFLICT (id) DO NOTHING` — idempotent on repeated migration run
 
 ### channel_categories
 
-| Column       | Type | Notes                     |
-| ------------ | ---- | ------------------------- |
-| id           | uuid | PK                        |
-| workspace_id | uuid | FK → workspaces (CASCADE) |
-| name         | text |                           |
-| position     | int  | Sort order, DEFAULT 0     |
+| Column       | Type        | Notes                                                     |
+| ------------ | ----------- | --------------------------------------------------------- |
+| id           | uuid        | PK                                                        |
+| workspace_id | uuid        | FK → workspaces (CASCADE); also UNIQUE (workspace_id, id) |
+| name         | text        | 1..60 chars, trimmed, no control chars, `Geral` reserved  |
+| position     | int         | Sort order, 0..100000, server-derived                     |
+| created_at   | timestamptz |                                                           |
+| updated_at   | timestamptz |                                                           |
+
+UNIQUE `(workspace_id, lower(btrim(name)))` — one category name per workspace,
+case-insensitively; the same name in two workspaces is allowed. Index
+`(workspace_id, position)` serves the ordered listing. See
+"Channel categories (RF-17)".
 
 ### channels
 
@@ -238,6 +246,124 @@ transaction so the caller does not lose access.
 Categories remain workspace-bound: `category_id` is accepted only when the
 category belongs to the same workspace, and the composite FK remains the
 database backstop. Duplicate slugs map to `ErrDuplicateSlug`.
+
+## Channel categories (RF-17)
+
+Migration: `migrations/chat/000017_channel_category_constraints`.
+
+`chat.channel_categories` and `chat.channels.category_id` have existed since
+000001, and 000002 already made the association workspace-bound with a composite
+FK. What 000017 adds is everything that bounds a category row — the name rules,
+the position range, the case-insensitive uniqueness per workspace, the ordered
+listing index — plus `idx_channels_workspace_category`, the referencing-side index
+the composite FK never had. Without it, deleting a category made
+`ON DELETE SET NULL` scan every channel.
+
+Those constraints are added **validated**, not `NOT VALID` as in 000016: no code
+path had ever inserted into this table, since its only writer was never wired to a
+service or a handler. A unique index cannot be `NOT VALID` in any case, so a
+partially validated migration would only have looked safer.
+
+### "Geral" is a virtual group, not a row
+
+Channels with `category_id IS NULL` are grouped under **Geral**. There is no
+`Geral` row, no synthetic UUID standing in for one, and no per-workspace
+bootstrap. The name is reserved case-insensitively, in
+`domain.NormalizeChannelCategoryName` and again in
+`channel_categories_name_not_reserved_check`, so a persisted category can never be
+confused with the virtual one.
+
+The listing distinguishes them explicitly: a persisted group carries
+`kind:"category"` with `id` and `position`; the virtual group carries
+`kind:"uncategorized"` and no `id` at all. It is always the first group and is
+always present, so the response shape never varies.
+
+The seeded `#geral` **channel** is a different object that happens to share the
+word: an ordinary channel with no category, which therefore appears inside this
+group.
+
+### Ordering
+
+`position` is the explicit sort key, scoped to the workspace and always
+server-derived — `COALESCE(MAX(position) + 1, 0)` on create, the payload ordinal
+on reorder. It is deliberately **not** unique: uniqueness would force retry loops
+on create and temporary offsets on every reorder. The listing order is
+`position, lower(name), id`, so two categories that tie still produce one stable
+order for every reader.
+
+Reordering submits the workspace's **complete** category set, each ID once. That
+makes the result a total order rather than a patch whose outcome depends on what
+the caller omitted, and it bounds the payload at
+`domain.MaxCategoriesPerWorkspace` (100), which is also the per-workspace ceiling
+on creation. The store runs it in one transaction: authorize and lock the
+workspace and membership `FOR SHARE`, lock the category rows `FOR UPDATE` (this is
+what serialises two concurrent reorders, and a concurrent create or delete),
+verify the set against the locked rows, then one
+`UPDATE ... FROM unnest(...) WITH ORDINALITY`. A duplicate ID, a missing one and
+one from another workspace are all the same error, so the response cannot be used
+to probe another workspace.
+
+### Authorization
+
+Reading is open to any active workspace member, guests included, and **cannot
+widen channel access**: the channels in each group come from
+`ListVisibleChannelAccessByUser` — the same single SQL policy `/api/chat/sidebar`
+reads through — and are only grouped in memory. Two queries total regardless of
+the number of categories; there is no per-category fetch.
+
+Creating, renaming, reordering and deleting take active workspace `owner` or
+`admin`, via `domain.CanManageChannelCategories`. The service checks it, and every
+statement re-derives it from `chat.workspace_members` in the same statement as the
+write, the way `UpdateEditWindow` does. Every mutation is scoped by
+`workspace_id` together with `category_id`; none ever runs on a bare category ID.
+
+RF-17 was specified as "Admin and Moderator". There is no workspace-level
+moderator in this schema — `chat.workspace_members.role` is
+owner/admin/member/guest, and `moderator` exists only on `chat.channel_members` as
+a per-channel role. The divergence and its reasoning are recorded in
+`SECURITY.md`.
+
+### Deletion
+
+Deleting a category never deletes a channel. The channels that referenced it
+become uncategorized and appear under **Geral** on the next listing, and the
+database does that as part of the same `DELETE` through the composite FK's
+`ON DELETE SET NULL (category_id)` — so there is no window in which a channel
+points at a category that is gone, and the invariant survives writers that never
+go through this store. Deleting a category that does not exist is a 404, not a
+silent success.
+
+### HTTP contract
+
+No route carries a workspace segment: the workspace is resolved server-side from
+the authenticated session, like every other chat route. `position`, `id`,
+timestamps and any actor or role field are absent from every request body, and the
+decoder rejects unknown fields, so nothing a client sends can claim a privilege or
+redirect an operation at another workspace.
+
+| Method   | Path                                 | Who           | Success |
+| -------- | ------------------------------------ | ------------- | ------- |
+| `GET`    | `/api/chat/channel-categories`       | active member | 200     |
+| `POST`   | `/api/chat/channel-categories`       | owner ∣ admin | 201     |
+| `PATCH`  | `/api/chat/channel-categories/{id}`  | owner ∣ admin | 200     |
+| `PUT`    | `/api/chat/channel-categories/order` | owner ∣ admin | 200     |
+| `DELETE` | `/api/chat/channel-categories/{id}`  | owner ∣ admin | 204     |
+
+Bodies: `POST`/`PATCH` take `{"name": "..."}`; `PUT .../order` takes
+`{"category_ids": ["..."]}`. All four mutations share one rate-limit budget (20
+per user per minute) so a caller cannot spend a separate allowance per operation,
+and the routes are registered only when the limiter is configured — an
+unthrottled write route is left unregistered rather than exposed.
+
+Errors: 400 invalid name, malformed body, unknown field, non-UUID ID or invalid
+order; 401 no usable session; 403 not a manager, or a workspace the caller has no
+membership in; 404 category not in the caller's workspace — the same answer as one
+that does not exist anywhere, so the status cannot be used to enumerate; 409
+duplicate name or workspace ceiling reached; 415 wrong content type; 429 over
+budget. No response carries SQL text, a constraint name or the rejected value.
+
+`GET /api/chat/sidebar` is unchanged. The grouped listing is additive, so the
+frontend task can adopt it without a migration of the existing contract.
 
 `#geral` is immutable through CRUD. The service rejects attempts to create a
 regular channel with slug `geral`, rejects any update/archive of the general

@@ -81,6 +81,7 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 		"000013_message_edit_history.up.sql",
 		"000014_cross_channel_message_reference.up.sql",
 		"000015_message_forward_idempotency.up.sql",
+		"000017_channel_category_constraints.up.sql",
 	} {
 		if _, err := conn.Exec(ctx, readChatMigration(t, name)); err != nil {
 			t.Fatalf("apply %s: %v", name, err)
@@ -258,6 +259,162 @@ func TestChatMigrations_PostgreSQLInvariants(t *testing.T) {
 			INSERT INTO chat.channels (workspace_id, category_id, slug, display_name, type)
 			VALUES ('20000000-0000-0000-0000-000000000001', $1, 'cross-category', 'Cross Category', 'public')`, categoryID)
 		requirePostgresConstraint(t, err, "channels_workspace_category_fk")
+	})
+
+	// RF-17 channel categories, against the real database. The static test asserts
+	// the migration says these things; these assert PostgreSQL enforces them.
+	t.Run("channel category name is bounded, trimmed and control-free", func(t *testing.T) {
+		const workspaceID = "00000000-0000-0000-0000-000000000001"
+		// A value can violate more than one of the name constraints — "   " is both
+		// untrimmed and empty once trimmed — and PostgreSQL does not promise which
+		// it reports. Each case therefore lists every constraint that would be a
+		// correct rejection; what must not happen is the row being accepted.
+		for _, invalid := range []struct {
+			name        string
+			value       string
+			constraints []string
+		}{
+			{name: "empty", value: "", constraints: []string{"channel_categories_name_length_check"}},
+			{name: "whitespace only", value: "   ", constraints: []string{
+				"channel_categories_name_length_check", "channel_categories_name_trimmed_check",
+			}},
+			{name: "untrimmed", value: " Projetos", constraints: []string{"channel_categories_name_trimmed_check"}},
+			{name: "too long", value: strings.Repeat("a", 61), constraints: []string{"channel_categories_name_length_check"}},
+			{name: "control character", value: "Proj\netos", constraints: []string{"channel_categories_name_no_control_check"}},
+		} {
+			t.Run(invalid.name+" is rejected", func(t *testing.T) {
+				_, err := conn.Exec(ctx, `
+					INSERT INTO chat.channel_categories (workspace_id, name)
+					VALUES ($1, $2)`, workspaceID, invalid.value)
+				requireOnePostgresConstraint(t, err, invalid.constraints)
+			})
+		}
+
+		// 60 code points of a multi-byte character: the cap counts characters, so
+		// an accented name gets the whole allowance instead of half of it.
+		accented := strings.Repeat("á", 60)
+		var id string
+		if err := conn.QueryRow(ctx, `
+			INSERT INTO chat.channel_categories (workspace_id, name)
+			VALUES ($1, $2) RETURNING id`, workspaceID, accented).Scan(&id); err != nil {
+			t.Fatalf("60 accented characters must fit: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `DELETE FROM chat.channel_categories WHERE id = $1`, id); err != nil {
+			t.Fatalf("cleanup accented category: %v", err)
+		}
+	})
+
+	t.Run("Geral is reserved for the virtual group", func(t *testing.T) {
+		const workspaceID = "00000000-0000-0000-0000-000000000001"
+		for _, value := range []string{"Geral", "geral", "GERAL"} {
+			_, err := conn.Exec(ctx, `
+				INSERT INTO chat.channel_categories (workspace_id, name)
+				VALUES ($1, $2)`, workspaceID, value)
+			requirePostgresConstraint(t, err, "channel_categories_name_not_reserved_check")
+		}
+	})
+
+	t.Run("negative position is rejected", func(t *testing.T) {
+		_, err := conn.Exec(ctx, `
+			INSERT INTO chat.channel_categories (workspace_id, name, position)
+			VALUES ('00000000-0000-0000-0000-000000000001', 'Negative', -1)`)
+		requirePostgresConstraint(t, err, "channel_categories_position_range_check")
+	})
+
+	t.Run("category name is unique per workspace, case-insensitively, but not across them", func(t *testing.T) {
+		const (
+			workspaceA = "00000000-0000-0000-0000-000000000001"
+			workspaceB = "80000000-0000-0000-0000-000000000001"
+		)
+		t.Cleanup(func() {
+			if _, err := conn.Exec(context.Background(), `DELETE FROM chat.channel_categories WHERE workspace_id IN ($1, $2)`, workspaceA, workspaceB); err != nil {
+				t.Errorf("cleanup unique-name categories: %v", err)
+			}
+			if _, err := conn.Exec(context.Background(), `DELETE FROM chat.workspaces WHERE id = $1`, workspaceB); err != nil {
+				t.Errorf("cleanup unique-name workspace: %v", err)
+			}
+		})
+
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO chat.channel_categories (workspace_id, name)
+			VALUES ($1, 'Projetos')`, workspaceA); err != nil {
+			t.Fatalf("insert first category: %v", err)
+		}
+		_, err := conn.Exec(ctx, `
+			INSERT INTO chat.channel_categories (workspace_id, name)
+			VALUES ($1, 'projetos')`, workspaceA)
+		requirePostgresConstraint(t, err, "channel_categories_workspace_name_uidx")
+
+		// One statement per Exec: pgx prepares any statement carrying parameters, and
+		// a prepared statement cannot hold multiple commands. The workspace and its
+		// mandatory #geral channel go in one transaction because the deferred
+		// constraint trigger from 000002 requires them to commit together.
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin workspace B: %v", err)
+		}
+		for _, statement := range []string{
+			`INSERT INTO chat.workspaces (id, slug, name) VALUES ($1, 'category-unique-b', 'Category Unique B')`,
+			`INSERT INTO chat.channels (workspace_id, slug, display_name, type, is_general) VALUES ($1, 'geral', 'Geral', 'public', true)`,
+			`INSERT INTO chat.channel_categories (workspace_id, name) VALUES ($1, 'Projetos')`,
+		} {
+			if _, err := tx.Exec(ctx, statement, workspaceB); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("the same name in another workspace must be allowed: %v", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("the same name in another workspace must be allowed: %v", err)
+		}
+	})
+
+	t.Run("deleting a category preserves its channels and uncategorizes them", func(t *testing.T) {
+		const (
+			workspaceID = "00000000-0000-0000-0000-000000000001"
+			channelID   = "81000000-0000-0000-0000-000000000001"
+		)
+		t.Cleanup(func() {
+			if _, err := conn.Exec(context.Background(), `DELETE FROM chat.channels WHERE id = $1`, channelID); err != nil {
+				t.Errorf("cleanup uncategorized channel: %v", err)
+			}
+			if _, err := conn.Exec(context.Background(), `DELETE FROM chat.channel_categories WHERE workspace_id = $1`, workspaceID); err != nil {
+				t.Errorf("cleanup category: %v", err)
+			}
+		})
+
+		var categoryID string
+		if err := conn.QueryRow(ctx, `
+			INSERT INTO chat.channel_categories (workspace_id, name)
+			VALUES ($1, 'Para Remover') RETURNING id`, workspaceID).Scan(&categoryID); err != nil {
+			t.Fatalf("insert category: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO chat.channels (id, workspace_id, category_id, slug, display_name, type)
+			VALUES ($1, $2, $3, 'in-category', 'In Category', 'public')`,
+			channelID, workspaceID, categoryID); err != nil {
+			t.Fatalf("insert categorized channel: %v", err)
+		}
+
+		if _, err := conn.Exec(ctx, `DELETE FROM chat.channel_categories WHERE id = $1`, categoryID); err != nil {
+			t.Fatalf("delete category: %v", err)
+		}
+
+		// The channel must still be there, and uncategorized — which is what puts
+		// it in the virtual "Geral" group on the next listing. The FK's
+		// ON DELETE SET NULL does this, not a statement of the store's.
+		var status string
+		var categoryIsNull bool
+		if err := conn.QueryRow(ctx, `
+			SELECT status, category_id IS NULL FROM chat.channels WHERE id = $1`,
+			channelID).Scan(&status, &categoryIsNull); err != nil {
+			t.Fatalf("deleting a category must not delete its channels: %v", err)
+		}
+		if status != "active" {
+			t.Fatalf("channel status = %q, want active", status)
+		}
+		if !categoryIsNull {
+			t.Fatal("channel must be uncategorized after its category is deleted")
+		}
 	})
 
 	t.Run("workspace cannot commit without general channel", func(t *testing.T) {
@@ -748,6 +905,27 @@ func requirePostgresConstraint(t *testing.T, err error, constraint string) {
 	if pgErr.ConstraintName != constraint {
 		t.Fatalf("expected constraint %s, got %s (%v)", constraint, pgErr.ConstraintName, err)
 	}
+}
+
+// requireOnePostgresConstraint is requirePostgresConstraint for a value that
+// several constraints would each correctly reject. PostgreSQL does not promise
+// which one it reports, so any of them satisfies the assertion — but the statement
+// must still have been rejected.
+func requireOnePostgresConstraint(t *testing.T, err error, constraints []string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected one of %v to reject statement", constraints)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected PostgreSQL error for one of %v, got %v", constraints, err)
+	}
+	for _, constraint := range constraints {
+		if pgErr.ConstraintName == constraint {
+			return
+		}
+	}
+	t.Fatalf("expected one of %v, got %s (%v)", constraints, pgErr.ConstraintName, err)
 }
 
 func assertChannelIDs(t *testing.T, channels []domain.Channel, expected map[string]bool) {

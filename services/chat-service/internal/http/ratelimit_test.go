@@ -431,7 +431,7 @@ func TestUserRateLimiter_Middleware_DoesNotBreakAuthorization(t *testing.T) {
 		NewSidebarHandler(nil),
 		NewMessageHandler(nil, nil, nil),
 		nil,
-		nil, nil,
+		nil, nil, nil,
 	)
 
 	// Initial load (no cursor) — Middleware now applies to all list requests.
