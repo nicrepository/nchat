@@ -241,7 +241,29 @@ function renderAt(path: string) {
 
 describe("navigating between DM and channel targets", () => {
   it("renders the channel after leaving a DM", async () => {
+    const initialDMPage = deferred<MessagePage>();
+    api.fetchDMMessages.mockImplementation((conversationId: string) => {
+      if (conversationId !== dmId) throw new Error(`Unexpected DM target: ${conversationId}`);
+      return initialDMPage.promise;
+    });
+
     renderAt(`/chat/dm/${dmId}`);
+
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
+
+    const dmHeader = await screen.findByTestId("chat-msg-header");
+    expect(await within(dmHeader).findByText("Juliane")).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(api.fetchDMMessages).toHaveBeenCalledWith(dmId, undefined, expect.any(AbortSignal)),
+    );
+    expect(screen.getByLabelText("Carregando mensagens")).toBeInTheDocument();
+
+    await act(async () => {
+      initialDMPage.resolve(page([message("m-dm", dmText)]));
+      await initialDMPage.promise;
+    });
+
     expect(await screen.findByText(dmText)).toBeInTheDocument();
 
     await clickChannel();
