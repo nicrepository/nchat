@@ -194,6 +194,25 @@ func TestNewDataKeyReturnsDistinctKeys(t *testing.T) {
 
 // --- content stream -----------------------------------------------------
 
+// TestContentRoundTripAcrossSizes checks the envelope at every boundary the
+// chunking has: empty, one byte, either side of a chunk, and several chunks.
+//
+// It asserts structure and round-trip, never "the ciphertext does not contain
+// the plaintext". That search is not a confidentiality property: for a short
+// plaintext the same byte values occur naturally in the magic, the base nonce,
+// the ciphertext and the GCM tag without anything having leaked. This test used
+// to make that assertion and failed in CI on the one-byte case; measured over
+// 20000 runs of the real encryptor it reported a false failure 10.41% of the
+// time at one byte and 0.04% at two, purely because a 29-byte envelope is very
+// likely to contain any given single byte.
+//
+// Confidentiality and integrity are carried by the tests that can actually
+// fail deterministically when the construction is wrong:
+// TestDecryptRejectsWrongDataKey, TestDecryptRejectsTamperedCiphertext,
+// TestDecryptRejectsTruncation, TestDecryptRejectsReorderedDuplicatedAndRemovedChunks,
+// TestDecryptRejectsSubstitutionFromAnotherAttachment and
+// TestChunksInsideOneObjectUseDistinctNonces. A forged or misdirected chunk
+// gets past those with probability 2^-128, not 1 in 10.
 func TestContentRoundTripAcrossSizes(t *testing.T) {
 	sizes := []int{
 		0,
@@ -209,13 +228,27 @@ func TestContentRoundTripAcrossSizes(t *testing.T) {
 			dataKey := newTestDataKey(t)
 			plaintext := randomBytes(t, size)
 
+			// encrypt fails the test on error, so reaching here means the
+			// envelope was produced.
 			ciphertext := encrypt(t, plaintext, dataKey, id)
-			if size > 0 && bytes.Contains(ciphertext, plaintext) {
-				t.Fatal("ciphertext must not contain the plaintext")
+
+			if len(ciphertext) == 0 {
+				t.Fatal("encrypting produced no envelope")
+			}
+			// Deliberately a whole-value comparison and not a substring search:
+			// see the note above this test for why searching for the plaintext
+			// inside the ciphertext is not a valid confidentiality assertion.
+			if bytes.Equal(ciphertext, plaintext) {
+				t.Fatal("the envelope must not be the plaintext")
 			}
 			if int64(len(ciphertext)) != crypto.CiphertextSize(int64(size)) {
 				t.Fatalf("expected ciphertext size %d, got %d",
 					crypto.CiphertextSize(int64(size)), len(ciphertext))
+			}
+			// The envelope is framed and versioned rather than raw bytes, at
+			// every size including the smallest.
+			if !bytes.HasPrefix(ciphertext, []byte("NCF1")) {
+				t.Fatalf("envelope does not start with the version magic: %x", ciphertext[:min(4, len(ciphertext))])
 			}
 
 			got, err := decrypt(t, ciphertext, dataKey, id)
