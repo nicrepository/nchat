@@ -1,18 +1,209 @@
 package app
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/nicrepository/nchat/services/file-service/internal/config"
+	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/storage"
 )
 
-func TestNewCreatesApp(t *testing.T) {
-	cfg := config.Config{ServiceName: "file-service", Env: "test", Port: 8083, ReadHeaderTimeoutSeconds: 5}
-	app := New(cfg)
-	if app == nil || app.Logger == nil || app.Handler == nil {
-		t.Fatalf("expected initialized app, got %+v", app)
+func randomBase64Key(t *testing.T) string {
+	t.Helper()
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		t.Fatalf("generate key: %v", err)
 	}
-	if app.Config != cfg {
-		t.Fatalf("expected config %+v, got %+v", cfg, app.Config)
+	return base64.StdEncoding.EncodeToString(key)
+}
+
+func healthOnlyConfig() config.Config {
+	return config.Config{
+		ServiceName: "file-service", Env: "test", Port: 8083,
+		ReadHeaderTimeoutSeconds: 5,
+	}
+}
+
+func uploadsEnabledConfig(t *testing.T) config.Config {
+	t.Helper()
+	cfg := healthOnlyConfig()
+	cfg.UploadsEnabled = true
+	cfg.MaxUploadBytes = domain.DefaultMaxUploadBytes
+	cfg.DatabaseURL = "postgres://nchat@localhost:5432/nchat"
+	cfg.DBConnectTimeoutSeconds = 5
+	cfg.AuthJWTHMACSecret = strings.Repeat("s", 32)
+	cfg.AuthJWTIssuer = "nchat-auth"
+	cfg.AuthJWTAudience = "nchat-api"
+	cfg.EncryptionMasterKey = randomBase64Key(t)
+	cfg.SeaweedFSFilerURL = "http://seaweedfs-filer:8888"
+	cfg.SeaweedFSTimeoutSeconds = 30
+	cfg.MalwareScanRequired = true
+	return cfg
+}
+
+type stubPool struct{ closed bool }
+
+func (p *stubPool) QueryRow(context.Context, string, ...any) pgx.Row { return nil }
+func (p *stubPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (p *stubPool) Ping(context.Context) error { return nil }
+func (p *stubPool) Close()                     { p.closed = true }
+
+func openStub(pool *stubPool) func(context.Context, string, int) (storage.Pool, error) {
+	return func(context.Context, string, int) (storage.Pool, error) { return pool, nil }
+}
+
+func noopShutdown(context.Context) error { return nil }
+
+func TestNewBuildsAHealthOnlyServiceByDefault(t *testing.T) {
+	cfg := healthOnlyConfig()
+	application, err := newApp(cfg, appDependencies{tracingShutdown: noopShutdown})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if application.Logger == nil || application.Handler == nil {
+		t.Fatalf("expected an initialized app, got %+v", application)
+	}
+	if application.Config != cfg {
+		t.Fatalf("expected config %+v, got %+v", cfg, application.Config)
+	}
+
+	response := httptest.NewRecorder()
+	application.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected a healthy service, got %d", response.Code)
+	}
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+func TestNewRefusesAnInvalidConfiguration(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.EncryptionMasterKey = ""
+
+	if _, err := newApp(cfg, appDependencies{tracingShutdown: noopShutdown}); err == nil {
+		t.Fatal("a service with uploads enabled must not start without a master key")
+	}
+}
+
+func TestNewRefusesAWeakJWTSecret(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.AuthJWTHMACSecret = "short"
+
+	if _, err := newApp(cfg, appDependencies{tracingShutdown: noopShutdown}); err == nil {
+		t.Fatal("a weak JWT secret must stop start-up")
+	}
+}
+
+func TestNewWiresTheAttachmentRoutesWhenUploadsAreEnabled(t *testing.T) {
+	pool := &stubPool{}
+	application, err := newApp(uploadsEnabledConfig(t), appDependencies{
+		openDB: openStub(pool), tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Without credentials the route must answer 401, not the 503 a disabled
+	// feature returns: that difference proves the wiring took effect.
+	response := httptest.NewRecorder()
+	application.Handler.ServeHTTP(response,
+		httptest.NewRequest(http.MethodGet, "/attachments/00000000-0000-4000-8000-000000000000", nil))
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 from a wired route, got %d: %s", response.Code, response.Body.String())
+	}
+
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if !pool.closed {
+		t.Fatal("shutdown must close the connection pool")
+	}
+}
+
+func TestNewFailsWhenTheDatabaseIsUnreachable(t *testing.T) {
+	dbErr := errors.New("dial tcp db-primary.internal:5432: connection refused")
+	_, err := newApp(uploadsEnabledConfig(t), appDependencies{
+		openDB: func(context.Context, string, int) (storage.Pool, error) {
+			return nil, dbErr
+		},
+		tracingShutdown: noopShutdown,
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "db-primary.internal") {
+		t.Fatal("the DSN and driver text must never reach the start-up error")
+	}
+}
+
+func TestNewFailsWithoutADatabaseOpener(t *testing.T) {
+	if _, err := newApp(uploadsEnabledConfig(t), appDependencies{tracingShutdown: noopShutdown}); err == nil {
+		t.Fatal("expected an error when no database opener is wired")
+	}
+}
+
+func TestNewFailsOnAnUnusableStorageClient(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	// Validate() accepts a zero timeout because Load() never produces one; the
+	// store refuses it anyway, so the two checks stay independent.
+	cfg.SeaweedFSTimeoutSeconds = 0
+
+	if _, err := newApp(cfg, appDependencies{
+		openDB: openStub(&stubPool{}), tracingShutdown: noopShutdown,
+	}); err == nil {
+		t.Fatal("expected an error for an unusable storage timeout")
+	}
+}
+
+func TestShutdownIsIdempotent(t *testing.T) {
+	pool := &stubPool{}
+	application, err := newApp(uploadsEnabledConfig(t), appDependencies{
+		openDB: openStub(pool), tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+
+	var nilApp *App
+	if err := nilApp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("nil shutdown: %v", err)
+	}
+}
+
+func TestShutdownPropagatesTracingErrors(t *testing.T) {
+	tracingErr := errors.New("exporter failed")
+	application, err := newApp(healthOnlyConfig(), appDependencies{
+		tracingShutdown: func(context.Context) error { return tracingErr },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := application.Shutdown(context.Background()); !errors.Is(err, tracingErr) {
+		t.Fatalf("expected the tracing error, got %v", err)
+	}
+}
+
+func TestShutdownTracingHelperToleratesNil(t *testing.T) {
+	if err := shutdownTracing(nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
