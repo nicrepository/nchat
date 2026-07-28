@@ -13,9 +13,9 @@ import (
 )
 
 // RF-19 admin contract tests (issue #419) for
-// GET|PATCH /api/v1/workspaces/{workspaceID}/anti-spam.
+// GET|PATCH /api/chat/workspaces/{workspaceID}/anti-spam.
 
-const antiSpamPath = "/api/v1/workspaces/" + testWorkspaceID + "/anti-spam"
+const antiSpamPath = "/api/chat/workspaces/" + testWorkspaceID + "/anti-spam"
 
 // antiSpamHandler builds a handler wired to the settings store and authorizer
 // under test, with the anti-spam path parameter already set as the router's

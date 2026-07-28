@@ -5,17 +5,20 @@
 > **Scope:** the per-user message rate limit, made configurable per workspace.
 > RF-20 (automatic flood detection on identical messages) is **not** implemented.
 
-Base URL resolved at runtime via `VITE_CHAT_WORKSPACE_API_BASE_URL`
-(default: `/api/v1/workspaces`).
+Base URL resolved at runtime via `VITE_CHAT_API_BASE_URL` (default:
+`/api/chat`), the same base the rest of the chat API uses. The endpoints live
+under that prefix because it is the only one the gateways forward to
+chat-service: Traefik local and every k8s overlay route `/api/chat`,
+`/api/auth`, `/api/admin`, … and nothing under `/api/v1`.
 
 ---
 
 ## Endpoints
 
-| Method | Path                                     | Auth                                          |
-| ------ | ---------------------------------------- | --------------------------------------------- |
-| GET    | `/v1/workspaces/{workspaceID}/anti-spam` | Bearer JWT + active session + workspace admin |
-| PATCH  | `/v1/workspaces/{workspaceID}/anti-spam` | Bearer JWT + active session + workspace admin |
+| Method | Path                                           | Auth                                          |
+| ------ | ---------------------------------------------- | --------------------------------------------- |
+| GET    | `/api/chat/workspaces/{workspaceID}/anti-spam` | Bearer JWT + active session + workspace admin |
+| PATCH  | `/api/chat/workspaces/{workspaceID}/anti-spam` | Bearer JWT + active session + workspace admin |
 
 Both verbs require the caller to be an **active `owner` or `admin` of the
 workspace named in the path**. The path ID is never trusted: the handler checks

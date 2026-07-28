@@ -49,7 +49,7 @@ describe("fetchAntiSpamPolicy", () => {
     const policy = await fetchAntiSpamPolicy("ws-1");
 
     expect(mockAuthFetch).toHaveBeenCalledWith(
-      "/api/v1/workspaces/ws-1/anti-spam",
+      "/api/chat/workspaces/ws-1/anti-spam",
       expect.objectContaining({ method: "GET" }),
     );
     expect(policy).toEqual({ workspaceId: "ws-1", messagesPerMinute: 45, min: 1, max: 600 });
@@ -79,7 +79,7 @@ describe("updateAntiSpamPolicy", () => {
     await updateAntiSpamPolicy("a/b", 30);
 
     expect(mockAuthFetch).toHaveBeenCalledWith(
-      "/api/v1/workspaces/a%2Fb/anti-spam",
+      "/api/chat/workspaces/a%2Fb/anti-spam",
       expect.anything(),
     );
   });
