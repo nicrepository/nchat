@@ -1,0 +1,922 @@
+package httpapi_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"net/textproto"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/nicrepository/nchat/libs/go/platform/httputil"
+	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
+	"github.com/nicrepository/nchat/services/file-service/internal/config"
+	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
+	"github.com/nicrepository/nchat/services/file-service/internal/service"
+)
+
+const (
+	testUserID    = "22222222-2222-4222-8222-222222222222"
+	testSessionID = "11111111-1111-4111-8111-111111111111"
+	testChannelID = "33333333-3333-4333-8333-333333333333"
+	testDMID      = "66666666-6666-4666-8666-666666666666"
+)
+
+// --- fakes --------------------------------------------------------------
+
+// staticValidator accepts one opaque token, so route tests exercise the
+// handler rather than JWT parsing (covered separately in auth_test.go).
+type staticValidator struct {
+	token string
+	err   error
+}
+
+func (v staticValidator) ValidateAccessToken(raw string) (httpapi.Principal, error) {
+	if v.err != nil {
+		return httpapi.Principal{}, v.err
+	}
+	if raw != v.token {
+		return httpapi.Principal{}, errors.New("invalid token")
+	}
+	return httpapi.Principal{
+		UserID: testUserID, SessionID: testSessionID,
+		AccessExpiresAt: time.Now().Add(time.Hour),
+	}, nil
+}
+
+type fakeUseCases struct {
+	mu sync.Mutex
+
+	ready bool
+
+	uploadView service.AttachmentView
+	uploadErr  error
+	uploadCall service.UploadInput
+	uploadBody []byte
+
+	metadataView service.AttachmentView
+	metadataErr  error
+
+	download    service.Download
+	downloadErr error
+	lastInput   service.AttachmentAuthInput
+}
+
+func (f *fakeUseCases) Upload(_ context.Context, input service.UploadInput) (service.AttachmentView, error) {
+	// Always drain the content: the real service streams it, so a body error
+	// must surface here exactly as it would in production.
+	body, readErr := io.ReadAll(input.Content)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.uploadCall, f.uploadBody = input, body
+	if readErr != nil {
+		return service.AttachmentView{}, readErr
+	}
+	if f.uploadErr != nil {
+		return service.AttachmentView{}, f.uploadErr
+	}
+	return f.uploadView, nil
+}
+
+func (f *fakeUseCases) Metadata(_ context.Context, input service.AttachmentAuthInput) (service.AttachmentView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastInput = input
+	if f.metadataErr != nil {
+		return service.AttachmentView{}, f.metadataErr
+	}
+	return f.metadataView, nil
+}
+
+func (f *fakeUseCases) Download(_ context.Context, input service.AttachmentAuthInput) (service.Download, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastInput = input
+	if f.downloadErr != nil {
+		return service.Download{}, f.downloadErr
+	}
+	return f.download, nil
+}
+
+func (f *fakeUseCases) Ready() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ready
+}
+
+func (f *fakeUseCases) call() service.UploadInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.uploadCall
+}
+
+func (f *fakeUseCases) body() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]byte(nil), f.uploadBody...)
+}
+
+// --- harness ------------------------------------------------------------
+
+const testToken = "test-access-token"
+
+func enabledConfig() config.Config {
+	return config.Config{
+		ServiceName: "file-service", Env: "test", Port: 8083,
+		ReadHeaderTimeoutSeconds: 5,
+		UploadsEnabled:           true,
+		MaxUploadBytes:           domain.DefaultMaxUploadBytes,
+	}
+}
+
+func newTestRouter(t *testing.T, useCases *fakeUseCases, cfg config.Config) http.Handler {
+	t.Helper()
+	limiter := httpapi.NewUserRateLimiter(1000, time.Minute)
+	t.Cleanup(limiter.Stop)
+	return httpapi.NewRouter(cfg, platformlog.New("file-service", "test"), httpapi.RouterDependencies{
+		TokenValidator: staticValidator{token: testToken},
+		Attachments:    useCases,
+		RateLimiter:    limiter,
+	})
+}
+
+func readyUseCases() *fakeUseCases {
+	return &fakeUseCases{
+		ready: true,
+		uploadView: service.AttachmentView{
+			ID: uuid.NewString(), Filename: "report.pdf",
+			ContentType: "application/pdf", Size: 12,
+			Status: string(domain.StatusPendingScan), DestinationKind: "channel",
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+}
+
+// multipartBody builds a body with the given file parts.
+func multipartBody(t *testing.T, parts ...filePart) (io.Reader, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	for _, part := range parts {
+		headers := textproto.MIMEHeader{}
+		headers.Set("Content-Disposition", part.disposition())
+		if part.contentType != "" {
+			headers.Set("Content-Type", part.contentType)
+		}
+		w, err := writer.CreatePart(headers)
+		if err != nil {
+			t.Fatalf("create part: %v", err)
+		}
+		if _, err := w.Write(part.content); err != nil {
+			t.Fatalf("write part: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return &buf, writer.FormDataContentType()
+}
+
+type filePart struct {
+	field       string
+	filename    string
+	contentType string
+	content     []byte
+}
+
+func (p filePart) disposition() string {
+	if p.filename == "" {
+		return `form-data; name="` + p.field + `"`
+	}
+	return `form-data; name="` + p.field + `"; filename="` + p.filename + `"`
+}
+
+func fileOf(content string) filePart {
+	return filePart{field: "file", filename: "report.pdf", contentType: "application/pdf", content: []byte(content)}
+}
+
+func uploadRequest(t *testing.T, path string, parts ...filePart) *http.Request {
+	t.Helper()
+	body, contentType := multipartBody(t, parts...)
+	request := httptest.NewRequest(http.MethodPost, path, body)
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	return request
+}
+
+func channelUploadPath(id string) string { return "/channels/" + id + "/attachments" }
+func dmUploadPath(id string) string      { return "/dm/" + id + "/attachments" }
+
+func errorCode(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	var envelope httputil.Envelope
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if envelope.Error == nil {
+		t.Fatalf("expected an error envelope, got %s", response.Body.String())
+	}
+	return envelope.Error.Code
+}
+
+// --- upload -------------------------------------------------------------
+
+func TestUploadToChannelSucceeds(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID), fileOf("hello world")))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
+	}
+	call := useCases.call()
+	if call.Destination.Kind != domain.DestinationKindChannel || call.Destination.ID != testChannelID {
+		t.Fatalf("unexpected destination %+v", call.Destination)
+	}
+	if call.UserID != testUserID || call.SessionID != testSessionID {
+		t.Fatal("the principal must come from the validated token, never from the body")
+	}
+	if call.Filename != "report.pdf" || call.DeclaredMIME != "application/pdf" {
+		t.Fatalf("unexpected part metadata %+v", call)
+	}
+	if string(useCases.body()) != "hello world" {
+		t.Fatalf("unexpected streamed body %q", useCases.body())
+	}
+}
+
+func TestUploadToDMSucceeds(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, dmUploadPath(testDMID), fileOf("dm attachment")))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
+	}
+	if useCases.call().Destination.Kind != domain.DestinationKindDM {
+		t.Fatalf("unexpected destination kind %q", useCases.call().Destination.Kind)
+	}
+}
+
+// The response must never carry the storage key, the workspace wiring or any
+// crypto material.
+func TestUploadResponseExposesOnlyTheClientProjection(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID), fileOf("hello")))
+
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	allowed := map[string]bool{
+		"id": true, "filename": true, "contentType": true,
+		"size": true, "status": true, "destinationKind": true, "createdAt": true,
+	}
+	for field := range envelope.Data {
+		if !allowed[field] {
+			t.Fatalf("unexpected field %q in the upload response", field)
+		}
+	}
+	body := response.Body.String()
+	for _, leak := range []string{"nchat/attachments", "wrapped", "dek", "seaweed", "fid"} {
+		if strings.Contains(strings.ToLower(body), leak) {
+			t.Fatalf("response leaks %q: %s", leak, body)
+		}
+	}
+}
+
+func TestUploadRequiresAuthentication(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{name: "no header", header: ""},
+		{name: "wrong scheme", header: "Basic " + testToken},
+		{name: "empty bearer", header: "Bearer "},
+		{name: "invalid token", header: "Bearer nope"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := uploadRequest(t, channelUploadPath(testChannelID), fileOf("x"))
+			request.Header.Del("Authorization")
+			if tt.header != "" {
+				request.Header.Set("Authorization", tt.header)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d", response.Code)
+			}
+		})
+	}
+}
+
+func TestUploadRejectsAnInvalidDestinationID(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	for _, path := range []string{
+		channelUploadPath("not-a-uuid"),
+		dmUploadPath("00000000"),
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, uploadRequest(t, path, fileOf("x")))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %s, got %d", path, response.Code)
+		}
+	}
+}
+
+func TestUploadRejectsNonMultipartBodies(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+
+	tests := []struct {
+		name        string
+		contentType string
+	}{
+		{name: "json", contentType: "application/json"},
+		{name: "missing boundary", contentType: "multipart/form-data"},
+		{name: "empty", contentType: ""},
+		{name: "malformed", contentType: "multipart/form-data; boundary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost,
+				channelUploadPath(testChannelID), strings.NewReader(`{"a":1}`))
+			request.Header.Set("Authorization", "Bearer "+testToken)
+			if tt.contentType != "" {
+				request.Header.Set("Content-Type", tt.contentType)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("expected 415, got %d", response.Code)
+			}
+		})
+	}
+}
+
+func TestUploadRejectsAMissingOrWrongFilePart(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+
+	tests := []struct {
+		name  string
+		parts []filePart
+	}{
+		{name: "no parts at all"},
+		{name: "wrong field name", parts: []filePart{{field: "attachment", filename: "a.txt", content: []byte("x")}}},
+		{name: "plain form field", parts: []filePart{{field: "file", content: []byte("x")}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID), tt.parts...))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+// The second file is detected while the first is still streaming, so the
+// service can compensate instead of leaving a stored object behind.
+func TestUploadRejectsMoreThanOneFile(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID),
+		fileOf("first"),
+		filePart{field: "file", filename: "second.pdf", content: []byte("second")},
+	))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", response.Code, response.Body.String())
+	}
+	if errorCode(t, response) != httputil.ErrCodeBadRequest {
+		t.Fatalf("unexpected error code %q", errorCode(t, response))
+	}
+}
+
+func TestUploadRejectsATrailingFormField(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID),
+		fileOf("first"),
+		filePart{field: "workspaceId", content: []byte("another-workspace")},
+	))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+// A body without Content-Length, and one that lies about it, must both be
+// bounded by the byte cap rather than by the header.
+func TestUploadIsBoundedRegardlessOfContentLength(t *testing.T) {
+	cfg := enabledConfig()
+	cfg.MaxUploadBytes = 1024
+	router := newTestRouter(t, readyUseCases(), cfg)
+
+	tests := []struct {
+		name          string
+		contentLength int64
+	}{
+		{name: "absent", contentLength: -1},
+		{name: "understated", contentLength: 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := uploadRequest(t, channelUploadPath(testChannelID),
+				fileOf(strings.Repeat("a", 64*1024)))
+			request.ContentLength = tt.contentLength
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code == http.StatusCreated {
+				t.Fatal("an over-sized body must never be accepted")
+			}
+		})
+	}
+}
+
+func TestUploadMapsServiceErrorsToSanitisedStatuses(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		want     int
+		wantCode string
+	}{
+		{name: "empty file", err: domain.ErrEmptyFile, want: http.StatusBadRequest, wantCode: httputil.ErrCodeBadRequest},
+		{name: "too many files", err: domain.ErrTooManyFiles, want: http.StatusBadRequest, wantCode: httputil.ErrCodeBadRequest},
+		{name: "too large", err: domain.ErrTooLarge, want: http.StatusRequestEntityTooLarge, wantCode: "payload_too_large"},
+		{name: "unauthorized", err: domain.ErrUnauthorized, want: http.StatusUnauthorized, wantCode: httputil.ErrCodeUnauthorized},
+		{name: "invisible destination", err: domain.ErrNotFound, want: http.StatusNotFound, wantCode: httputil.ErrCodeNotFound},
+		{name: "storage down", err: domain.ErrUnavailable, want: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+		{name: "database down", err: errors.New("pq: connection refused to db-primary.internal"), want: http.StatusInternalServerError, wantCode: httputil.ErrCodeInternal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useCases := readyUseCases()
+			useCases.uploadErr = tt.err
+			router := newTestRouter(t, useCases, enabledConfig())
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID), fileOf("x")))
+
+			if response.Code != tt.want {
+				t.Fatalf("expected %d, got %d: %s", tt.want, response.Code, response.Body.String())
+			}
+			if got := errorCode(t, response); got != tt.wantCode {
+				t.Fatalf("expected code %q, got %q", tt.wantCode, got)
+			}
+			if strings.Contains(response.Body.String(), "db-primary.internal") {
+				t.Fatal("the underlying error must never reach the client")
+			}
+		})
+	}
+}
+
+func TestUploadIsRateLimitedPerUser(t *testing.T) {
+	limiter := httpapi.NewUserRateLimiter(1, time.Minute)
+	t.Cleanup(limiter.Stop)
+	router := httpapi.NewRouter(enabledConfig(), platformlog.New("file-service", "test"),
+		httpapi.RouterDependencies{
+			TokenValidator: staticValidator{token: testToken},
+			Attachments:    readyUseCases(),
+			RateLimiter:    limiter,
+		})
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, uploadRequest(t, channelUploadPath(testChannelID), fileOf("x")))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected the first upload to pass, got %d", first.Code)
+	}
+
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, uploadRequest(t, channelUploadPath(testChannelID), fileOf("x")))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", second.Code)
+	}
+	if second.Header().Get("Retry-After") == "" {
+		t.Fatal("expected a Retry-After header")
+	}
+}
+
+// --- metadata -----------------------------------------------------------
+
+func TestGetMetadataReturnsTheProjection(t *testing.T) {
+	id := uuid.NewString()
+	useCases := readyUseCases()
+	useCases.metadataView = service.AttachmentView{
+		ID: id, Filename: "report.pdf", ContentType: "application/pdf",
+		Size: 42, Status: string(domain.StatusPendingScan), DestinationKind: "channel",
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	request := httptest.NewRequest(http.MethodGet, "/attachments/"+id, nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), string(domain.StatusPendingScan)) {
+		t.Fatal("the scan state must be visible to the client")
+	}
+}
+
+func TestGetMetadataRequiresAuthentication(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	request := httptest.NewRequest(http.MethodGet, "/attachments/"+uuid.NewString(), nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
+	}
+}
+
+func TestGetMetadataHidesInvisibleAttachments(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.metadataErr = domain.ErrNotFound
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	request := httptest.NewRequest(http.MethodGet, "/attachments/"+uuid.NewString(), nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", response.Code)
+	}
+}
+
+// --- download -----------------------------------------------------------
+
+func downloadRequest(t *testing.T, id string) *http.Request {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, "/attachments/"+id+"/content", nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	return request
+}
+
+func TestDownloadServesTheContentWithSafeHeaders(t *testing.T) {
+	id := uuid.NewString()
+	payload := []byte("decrypted attachment payload")
+	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: "relatório final.pdf", ContentType: "application/pdf",
+		Size: int64(len(payload)), Content: io.NopCloser(bytes.NewReader(payload)),
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, downloadRequest(t, id))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if !bytes.Equal(response.Body.Bytes(), payload) {
+		t.Fatal("unexpected body")
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/pdf" {
+		t.Fatalf("unexpected content type %q", got)
+	}
+	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("expected nosniff, got %q", got)
+	}
+	if got := response.Header().Get("Accept-Ranges"); got != "none" {
+		t.Fatalf("expected Accept-Ranges none, got %q", got)
+	}
+	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
+		t.Fatalf("unexpected content length %q", got)
+	}
+
+	disposition := response.Header().Get("Content-Disposition")
+	if !strings.HasPrefix(disposition, "attachment;") {
+		t.Fatalf("content must never be served inline, got %q", disposition)
+	}
+	if !strings.Contains(disposition, `filename="relat_rio final.pdf"`) {
+		t.Fatalf("expected an ASCII fallback, got %q", disposition)
+	}
+	if !strings.Contains(disposition, "filename*=UTF-8''") {
+		t.Fatalf("expected an RFC 5987 parameter, got %q", disposition)
+	}
+	if useCases.lastInput.AttachmentID != id {
+		t.Fatalf("unexpected attachment id %q", useCases.lastInput.AttachmentID)
+	}
+}
+
+// Active content is never rendered in the API origin: the disposition and the
+// nosniff header hold whatever the detected type is.
+func TestDownloadNeverServesActiveContentInline(t *testing.T) {
+	for _, contentType := range []string{"text/html; charset=utf-8", "image/svg+xml", "application/javascript"} {
+		t.Run(contentType, func(t *testing.T) {
+			useCases := readyUseCases()
+			payload := []byte("<script>alert(1)</script>")
+			useCases.download = service.Download{
+				Filename: "payload.html", ContentType: contentType,
+				Size: int64(len(payload)), Content: io.NopCloser(bytes.NewReader(payload)),
+			}
+			router := newTestRouter(t, useCases, enabledConfig())
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+			if !strings.HasPrefix(response.Header().Get("Content-Disposition"), "attachment;") {
+				t.Fatal("active content must be forced to download")
+			}
+			if response.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Fatal("nosniff must be present")
+			}
+		})
+	}
+}
+
+func TestDownloadEscapesAQuotedFilename(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: `evil";attachment;x=".pdf`, ContentType: "application/pdf",
+		Size: 1, Content: io.NopCloser(strings.NewReader("x")),
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+	disposition := response.Header().Get("Content-Disposition")
+	if strings.Count(disposition, `"`) != 2 {
+		t.Fatalf("the quoted fallback must not be breakable: %q", disposition)
+	}
+}
+
+func TestDownloadFallsBackWhenTheFilenameHasNoASCII(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: "relatório", ContentType: "application/pdf",
+		Size: 1, Content: io.NopCloser(strings.NewReader("x")),
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+	if !strings.Contains(response.Header().Get("Content-Disposition"), "filename*=UTF-8''") {
+		t.Fatalf("unexpected disposition %q", response.Header().Get("Content-Disposition"))
+	}
+}
+
+func TestDownloadRejectsRangeRequests(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	request := downloadRequest(t, uuid.NewString())
+	request.Header.Set("Range", "bytes=0-99")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("expected 416, got %d", response.Code)
+	}
+	if errorCode(t, response) != "range_not_supported" {
+		t.Fatalf("unexpected code %q", errorCode(t, response))
+	}
+	if response.Header().Get("Accept-Ranges") != "none" {
+		t.Fatal("expected Accept-Ranges none")
+	}
+}
+
+func TestDownloadMapsServiceErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		want     int
+		wantCode string
+	}{
+		{name: "pending scan", err: domain.ErrNotDownloadable, want: http.StatusConflict, wantCode: "file_not_scanned"},
+		{name: "not visible", err: domain.ErrNotFound, want: http.StatusNotFound, wantCode: httputil.ErrCodeNotFound},
+		{name: "session expired", err: domain.ErrUnauthorized, want: http.StatusUnauthorized, wantCode: httputil.ErrCodeUnauthorized},
+		{name: "storage down", err: domain.ErrUnavailable, want: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+		{name: "unexpected", err: errors.New("seaweedfs-filer:8888 refused the connection"), want: http.StatusInternalServerError, wantCode: httputil.ErrCodeInternal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useCases := readyUseCases()
+			useCases.downloadErr = tt.err
+			router := newTestRouter(t, useCases, enabledConfig())
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+			if response.Code != tt.want {
+				t.Fatalf("expected %d, got %d", tt.want, response.Code)
+			}
+			if got := errorCode(t, response); got != tt.wantCode {
+				t.Fatalf("expected code %q, got %q", tt.wantCode, got)
+			}
+			if strings.Contains(response.Body.String(), "seaweedfs-filer") {
+				t.Fatal("storage topology must never reach the client")
+			}
+		})
+	}
+}
+
+// A stream that fails integrity mid-response must not be completed as if it
+// were valid: the body stays short of the declared length.
+func TestDownloadAbortsWhenTheStreamFails(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: "report.pdf", ContentType: "application/pdf", Size: 100,
+		Content: io.NopCloser(&failingReader{
+			data: []byte("partial"), err: errors.New("ciphertext authentication failed"),
+		}),
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+	if int64(response.Body.Len()) >= 100 {
+		t.Fatal("a failed stream must not produce a complete body")
+	}
+}
+
+func TestDownloadRequiresAuthentication(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	request := httptest.NewRequest(http.MethodGet, "/attachments/"+uuid.NewString()+"/content", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
+	}
+}
+
+// --- feature gating -----------------------------------------------------
+
+func TestAttachmentRoutesAreUnavailableWhileUploadsAreDisabled(t *testing.T) {
+	cfg := enabledConfig()
+	cfg.UploadsEnabled = false
+	router := newTestRouter(t, readyUseCases(), cfg)
+
+	requests := []*http.Request{
+		uploadRequest(t, channelUploadPath(testChannelID), fileOf("x")),
+		uploadRequest(t, dmUploadPath(testDMID), fileOf("x")),
+		httptest.NewRequest(http.MethodGet, "/attachments/"+uuid.NewString(), nil),
+		downloadRequest(t, uuid.NewString()),
+	}
+	for _, request := range requests {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 for %s, got %d", request.URL.Path, response.Code)
+		}
+		if errorCode(t, response) != "service_unavailable" {
+			t.Fatalf("unexpected code %q", errorCode(t, response))
+		}
+	}
+}
+
+func TestAttachmentRoutesAreUnavailableWhenDependenciesAreMissing(t *testing.T) {
+	notReady := &fakeUseCases{ready: false}
+	router := newTestRouter(t, notReady, enabledConfig())
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID), fileOf("x")))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", response.Code)
+	}
+}
+
+func TestAttachmentRoutesAreUnavailableWithoutATokenValidator(t *testing.T) {
+	router := httpapi.NewRouter(enabledConfig(), platformlog.New("file-service", "test"),
+		httpapi.RouterDependencies{Attachments: readyUseCases()})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID), fileOf("x")))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", response.Code)
+	}
+}
+
+// Each attachment route is registered for exactly one method. Another method
+// falls through to the service's catch-all, which answers a JSON 404 — the
+// same behaviour every other route in this service has — and, crucially, never
+// reaches a handler.
+func TestAttachmentRoutesRejectTheWrongMethod(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	tests := []struct{ method, path string }{
+		{method: http.MethodGet, path: channelUploadPath(testChannelID)},
+		{method: http.MethodPut, path: dmUploadPath(testDMID)},
+		{method: http.MethodDelete, path: "/attachments/" + uuid.NewString()},
+		{method: http.MethodPost, path: "/attachments/" + uuid.NewString() + "/content"},
+	}
+	for _, tt := range tests {
+		request := httptest.NewRequest(tt.method, tt.path, nil)
+		request.Header.Set("Authorization", "Bearer "+testToken)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for %s %s, got %d", tt.method, tt.path, response.Code)
+		}
+		if errorCode(t, response) != httputil.ErrCodeNotFound {
+			t.Fatalf("unexpected code %q", errorCode(t, response))
+		}
+	}
+	if useCases.call().Filename != "" {
+		t.Fatal("no handler may run for an unrouted method")
+	}
+}
+
+func TestNewRouterToleratesANilLogger(t *testing.T) {
+	router := httpapi.NewRouter(enabledConfig(), nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, httpapi.RouteHealthz, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+}
+
+type failingReader struct {
+	data []byte
+	err  error
+	read int
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.read >= len(r.data) {
+		return 0, r.err
+	}
+	n := copy(p, r.data[r.read:])
+	r.read += n
+	return n, nil
+}
+
+// A filename is display metadata, but it still ends up inside a header. The
+// ext-value encoding must make it impossible for one to add a parameter of its
+// own or to close the ext-value early.
+func TestDownloadFilenameCannotInjectHeaderParameters(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+	}{
+		{name: "semicolon", filename: "a;filename=evil.exe"},
+		{name: "apostrophe", filename: "it's a report.pdf"},
+		{name: "comma", filename: "a,b.pdf"},
+		{name: "equals", filename: "a=b.pdf"},
+		{name: "space", filename: "two words.pdf"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useCases := readyUseCases()
+			useCases.download = service.Download{
+				Filename: tt.filename, ContentType: "application/pdf",
+				Size: 1, Content: io.NopCloser(strings.NewReader("x")),
+			}
+			router := newTestRouter(t, useCases, enabledConfig())
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+			disposition := response.Header().Get("Content-Disposition")
+			_, extValue, found := strings.Cut(disposition, "filename*=UTF-8''")
+			if !found {
+				t.Fatalf("missing ext-value in %q", disposition)
+			}
+			for _, forbidden := range []string{";", "'", ",", "=", " ", `"`} {
+				if strings.Contains(extValue, forbidden) {
+					t.Fatalf("ext-value %q must not contain %q", extValue, forbidden)
+				}
+			}
+			// The header must still parse as exactly one disposition with two
+			// parameters, whatever the filename was.
+			if strings.Count(disposition, ";") != 2 {
+				t.Fatalf("filename injected a parameter: %q", disposition)
+			}
+		})
+	}
+}
