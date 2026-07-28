@@ -1225,3 +1225,156 @@ func TestNewRouter_SendRoutesRefuseWhenTheWorkspaceCannotBeResolved(t *testing.T
 		t.Fatalf("the send was charged to a workspace it was not attributed to: %d", got)
 	}
 }
+
+// ── RF-19 anti-spam admin route (issue #419) ─────────────────────────────────
+//
+// The endpoint is only reachable at all if it sits under a prefix the gateways
+// forward to chat-service. These tests pin the served path, so moving it back
+// under an unrouted prefix fails here rather than in the browser.
+
+const routerAntiSpamURL = "/api/chat/workspaces/11111111-1111-1111-1111-111111111111/anti-spam"
+
+// newRouterWithAntiSpamAdmin builds a router whose message handler is wired for
+// the workspace policy endpoints, with CanManageWorkspace answering `allowed`.
+func newRouterWithAntiSpamAdmin(t *testing.T, allowed bool) http.Handler {
+	t.Helper()
+	var authorizer workspaceSettingsAuthorizer = guardAllowAuthorizer{}
+	if !allowed {
+		authorizer = guardDenyAuthorizer{}
+	}
+	messages := NewMessageHandler(nil, nil, nil).
+		WithEditing(&guardSettingsStub{perMinute: 45}, authorizer, nil)
+	return NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		ReadinessState{},
+		routerTestValidator(t),
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		messages,
+		nil, nil, nil, nil, nil,
+	)
+}
+
+type guardDenyAuthorizer struct{}
+
+func (guardDenyAuthorizer) CanManageWorkspace(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+// decodeDataEnvelope reads the `data` object every policy response carries.
+func decodeDataEnvelope(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var body struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Data == nil {
+		t.Fatalf("expected a data envelope, got %s", recorder.Body.String())
+	}
+	return body.Data
+}
+
+func routerPATCHRequest(t *testing.T, url, body string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPatch, url, strings.NewReader(body))
+	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func TestNewRouter_AntiSpamAdminRouteServesGetAndPatch(t *testing.T) {
+	router := newRouterWithAntiSpamAdmin(t, true)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerGETRequest(t, routerAntiSpamURL))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET: expected 200, got %d", recorder.Code)
+	}
+	data := decodeDataEnvelope(t, recorder)
+	if got := data["message_rate_limit_per_minute"].(float64); got != 45 {
+		t.Fatalf("GET: expected the stored policy 45, got %v", got)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPATCHRequest(t, routerAntiSpamURL,
+		`{"message_rate_limit_per_minute":30}`))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PATCH: expected 200, got %d", recorder.Code)
+	}
+	if got := decodeDataEnvelope(t, recorder)["message_rate_limit_per_minute"].(float64); got != 30 {
+		t.Fatalf("PATCH: expected the new policy 30, got %v", got)
+	}
+}
+
+// Authentication is enforced by the router's own middleware, before the
+// handler's authorization check gets a chance to run.
+func TestNewRouter_AntiSpamAdminRouteRequiresAuthentication(t *testing.T) {
+	router := newRouterWithAntiSpamAdmin(t, true)
+
+	for _, method := range []string{http.MethodGet, http.MethodPatch} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(method, routerAntiSpamURL, nil))
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s without a token: expected 401, got %d", method, recorder.Code)
+		}
+	}
+}
+
+// Moving the path must not have dropped the admin gate: an authenticated
+// non-admin is still refused on both verbs.
+func TestNewRouter_AntiSpamAdminRouteKeepsTheAdminCheck(t *testing.T) {
+	router := newRouterWithAntiSpamAdmin(t, false)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerGETRequest(t, routerAntiSpamURL))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("GET as a non-admin: expected 403, got %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPATCHRequest(t, routerAntiSpamURL,
+		`{"message_rate_limit_per_minute":30}`))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("PATCH as a non-admin: expected 403, got %d", recorder.Code)
+	}
+}
+
+// The old /api/v1 path was never reachable through the gateways; it is not kept
+// as an alias, so it must answer 404 rather than linger as a second entry point.
+func TestNewRouter_AntiSpamAdminRouteIsNotServedUnderTheOldPrefix(t *testing.T) {
+	router := newRouterWithAntiSpamAdmin(t, true)
+	const old = "/api/v1/workspaces/11111111-1111-1111-1111-111111111111/anti-spam"
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerGETRequest(t, old))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("GET on the old path: expected 404, got %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, routerPATCHRequest(t, old, `{"message_rate_limit_per_minute":30}`))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("PATCH on the old path: expected 404, got %d", recorder.Code)
+	}
+}
+
+// The new segment sits under the same prefix as the rest of the chat API, so it
+// must not shadow any sibling route.
+func TestNewRouter_AntiSpamAdminRouteDoesNotShadowOtherChatRoutes(t *testing.T) {
+	router := newRouterWithAntiSpamAdmin(t, true)
+
+	for _, url := range []string{
+		"/api/chat/workspaces",
+		"/api/chat/workspaces/11111111-1111-1111-1111-111111111111",
+		"/api/chat/workspaces/11111111-1111-1111-1111-111111111111/settings",
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, routerGETRequest(t, url))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s: expected 404, got %d", url, recorder.Code)
+		}
+	}
+}

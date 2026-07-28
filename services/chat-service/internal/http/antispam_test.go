@@ -852,7 +852,7 @@ func (guardAllowAuthorizer) CanManageWorkspace(context.Context, string, string) 
 
 func patchAntiSpamPolicy(t *testing.T, handler *MessageHandler, workspaceID, body string) int {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPatch, "/api/v1/workspaces/"+workspaceID+"/anti-spam",
+	request := httptest.NewRequest(http.MethodPatch, "/api/chat/workspaces/"+workspaceID+"/anti-spam",
 		strings.NewReader(body))
 	request = request.WithContext(context.WithValue(request.Context(), ctxKeyUserID,
 		"44444444-4444-4444-4444-444444444444"))
