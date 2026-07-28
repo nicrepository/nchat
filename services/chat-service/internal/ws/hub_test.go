@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -868,6 +870,49 @@ func TestBroadcastPartitionUsesCompleteStableTargetKey(t *testing.T) {
 	}
 	if first, second := broadcastPartition(channelKey, broadcastWorkerCount), broadcastPartition(channelKey, broadcastWorkerCount); first != second {
 		t.Fatalf("same target partition changed from %d to %d", first, second)
+	}
+}
+
+func TestBroadcastPartitionReturnsStableIndexWithinRange(t *testing.T) {
+	const key = "workspace\x00channel\x00room"
+
+	for partitionCount := 1; partitionCount <= 16; partitionCount++ {
+		first := broadcastPartition(key, partitionCount)
+		second := broadcastPartition(key, partitionCount)
+		if first < 0 || first >= partitionCount {
+			t.Fatalf("broadcastPartition(%q, %d) = %d, want index in [0, %d)", key, partitionCount, first, partitionCount)
+		}
+		if second != first {
+			t.Fatalf("broadcastPartition(%q, %d) changed from %d to %d", key, partitionCount, first, second)
+		}
+	}
+
+	if got := broadcastPartition(key, 1); got != 0 {
+		t.Fatalf("broadcastPartition(%q, 1) = %d, want 0", key, got)
+	}
+}
+
+func TestBroadcastPartitionRejectsInvalidPartitionCount(t *testing.T) {
+	invalidCounts := []int{0, -1}
+	if strconv.IntSize > 32 {
+		invalidCounts = append(invalidCounts, int(math.MaxInt32)*2+2)
+	}
+
+	const wantPanic = "ws: broadcast partition count must be between 1 and 4294967295"
+	for _, partitionCount := range invalidCounts {
+		t.Run(fmt.Sprintf("partition_count_%d", partitionCount), func(t *testing.T) {
+			var recovered any
+			func() {
+				defer func() {
+					recovered = recover()
+				}()
+				broadcastPartition("key", partitionCount)
+			}()
+
+			if recovered != wantPanic {
+				t.Fatalf("panic = %v, want %q", recovered, wantPanic)
+			}
+		})
 	}
 }
 

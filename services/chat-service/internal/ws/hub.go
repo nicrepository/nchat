@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"regexp"
 	"sync"
 	"time"
@@ -629,9 +630,14 @@ func broadcastTargetKey(event Event) string {
 }
 
 func broadcastPartition(key string, partitionCount int) int {
+	if partitionCount <= 0 || int64(partitionCount) > math.MaxUint32 {
+		panic("ws: broadcast partition count must be between 1 and 4294967295")
+	}
+
+	safePartitionCount := uint32(partitionCount)
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(key))
-	return int(hasher.Sum32() % uint32(partitionCount))
+	return int(hasher.Sum32() % safePartitionCount)
 }
 
 // handleRemoteBusEvent is called by the BroadcastBus Subscribe handler.
