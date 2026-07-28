@@ -42,6 +42,8 @@ type Client struct {
 	workspaceID string
 	outbox      chan []byte
 	snd         sender
+	ctx         context.Context
+	cancel      context.CancelFunc
 	closeOnce   sync.Once
 }
 
@@ -49,12 +51,15 @@ type Client struct {
 // id must be a server-generated opaque identifier (e.g., UUID).
 // userID and workspaceID must be extracted from the authenticated request context.
 func newClient(id, userID, workspaceID string, snd sender) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
 		id:          id,
 		userID:      userID,
 		workspaceID: workspaceID,
 		outbox:      make(chan []byte, outboxSize),
 		snd:         snd,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -72,6 +77,7 @@ func (c *Client) enqueue(data []byte) bool {
 // close terminates the client's connection exactly once.
 func (c *Client) close() {
 	c.closeOnce.Do(func() {
+		c.cancel()
 		c.snd.Close()
 	})
 }

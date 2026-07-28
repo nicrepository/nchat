@@ -184,7 +184,7 @@ func New(cfg config.Config) (*App, error) {
 	// the same workspace by construction rather than by two similar lookups.
 	var canonicalWorkspaces *appWSWorkspaceResolver
 	if workspaceStore != nil {
-		authorizer = ws.NewServiceAuthorizer(permissionSvc, dmStore)
+		authorizer = ws.NewServiceAuthorizer(channelStore, dmStore)
 		canonicalWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 		wsWorkspaces = canonicalWorkspaces
 	}

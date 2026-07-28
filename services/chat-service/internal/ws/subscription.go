@@ -28,23 +28,23 @@ func (NopAuthorizer) CanAccess(_ context.Context, _, _ string, _ TargetType, _ s
 	return false, nil
 }
 
-// channelReadChecker is the subset of PermissionService used by serviceAuthorizer.
-// Using an interface here keeps the ws package decoupled from the concrete service type.
-type channelReadChecker interface {
-	CanRead(ctx context.Context, workspaceID, channelID, userID string) (bool, error)
+// channelVisibilityChecker is the exact channel visibility check used by
+// MessageService before reading or creating channel messages.
+type channelVisibilityChecker interface {
+	GetVisibleChannelByID(ctx context.Context, workspaceID, channelID, userID string) (domain.Channel, error)
 }
 
 // serviceAuthorizer is the production SubscriptionAuthorizer.
 //
-// Channel access is resolved via channelReadChecker (backed by PermissionService),
-// which enforces active workspace membership and, for private channels, active
-// channel membership. SQL visibility is the authoritative source of truth.
+// Channel access is resolved via GetVisibleChannelByID, the same storage check
+// used by MessageService. It enforces active workspace membership and, for
+// private channels, channel membership in one non-enumerating SQL query.
 //
 // DM access is resolved via DMStore.GetVisibleConversationByID, which enforces
 // active workspace membership and active DM membership in a single SQL query.
 // The method returns ErrNotFound for inaccessible conversations (non-enumerating).
 type serviceAuthorizer struct {
-	channels channelReadChecker
+	channels channelVisibilityChecker
 	dms      storage.DMStore
 }
 
@@ -54,7 +54,7 @@ type serviceAuthorizer struct {
 // github.com/coder/websocket is imported and used by ServeWS (see handler.go).
 // coder/websocket (formerly nhooyr.io/websocket) was chosen because it is
 // actively maintained, pure Go (no CGO), context-native, and supports WASM.
-func NewServiceAuthorizer(channels channelReadChecker, dms storage.DMStore) SubscriptionAuthorizer {
+func NewServiceAuthorizer(channels channelVisibilityChecker, dms storage.DMStore) SubscriptionAuthorizer {
 	return &serviceAuthorizer{channels: channels, dms: dms}
 }
 
@@ -69,7 +69,14 @@ func NewServiceAuthorizer(channels channelReadChecker, dms storage.DMStore) Subs
 func (a *serviceAuthorizer) CanAccess(ctx context.Context, userID, workspaceID string, targetType TargetType, targetID string) (bool, error) {
 	switch targetType {
 	case TargetTypeChannel:
-		return a.channels.CanRead(ctx, workspaceID, targetID, userID)
+		_, err := a.channels.GetVisibleChannelByID(ctx, workspaceID, targetID, userID)
+		if errors.Is(err, domain.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return true, nil
 
 	case TargetTypeDM:
 		_, err := a.dms.GetVisibleConversationByID(ctx, workspaceID, targetID, userID)

@@ -86,20 +86,23 @@ func (f *fakeBus) lastPublished() (Event, bool) {
 // newBusTestHub creates a Hub with the given bus and a known instanceID.
 func newBusTestHub(auth SubscriptionAuthorizer, bus BroadcastBus) *Hub {
 	h := &Hub{
-		authorizer:  auth,
-		bus:         bus,
-		instanceID:  "instance-A",
-		logger:      newTestLogger(),
-		register:    make(chan registerReq, 64),
-		unregister:  make(chan *Client, 64),
-		subReq:      make(chan subscribeReq, 64),
-		bcast:       make(chan broadcastReq, 256),
-		remoteBcast: make(chan broadcastReq, 256),
-		quit:        make(chan struct{}),
-		done:        make(chan struct{}),
-		clients:     make(map[string]*Client),
-		subs:        make(map[string]map[string]struct{}),
-		clientSubs:  make(map[string]map[string]struct{}),
+		authorizer:              auth,
+		bus:                     bus,
+		instanceID:              "instance-A",
+		logger:                  newTestLogger(),
+		register:                make(chan registerReq, 64),
+		unregister:              make(chan *Client, 64),
+		subReq:                  make(chan subscribeReq, 64),
+		revokeReq:               make(chan revokeSubscriptionReq, 64),
+		bcast:                   make(chan broadcastReq, 256),
+		remoteBcast:             make(chan broadcastReq, 256),
+		quit:                    make(chan struct{}),
+		done:                    make(chan struct{}),
+		broadcastDone:           make(chan struct{}),
+		clients:                 make(map[string]*Client),
+		subs:                    make(map[string]map[string]struct{}),
+		clientSubs:              make(map[string]map[string]struct{}),
+		subscriptionGenerations: make(map[string]map[string]uint64),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.busCancel = cancel
@@ -107,6 +110,7 @@ func newBusTestHub(auth SubscriptionAuthorizer, bus BroadcastBus) *Hub {
 		panic("newBusTestHub: bus.Subscribe failed: " + err.Error())
 	}
 	go h.run()
+	h.startBroadcastWorkers()
 	return h
 }
 

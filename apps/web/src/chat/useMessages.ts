@@ -138,7 +138,8 @@ type Action =
   | { type: "favorite_error"; error: string }
   | { type: "reaction_optimistic"; messageId: string; emoji: string }
   | { type: "reaction_revert"; messageId: string; error: string }
-  | { type: "ws_fetch_error"; error: string };
+  | { type: "ws_fetch_error"; error: string }
+  | { type: "ws_subscription_ready" };
 
 /** Applies a local toggle to a message's reaction list, mirroring server semantics for count/reactedByMe. */
 function toggleOptimisticReaction(
@@ -433,6 +434,8 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       return { ...state, actionError: action.error };
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
+    case "ws_subscription_ready":
+      return { ...state, realtimeError: null };
     case "reaction_error": {
       // Server-level errors (rate limit, feature unavailable) aren't scoped to a
       // single message, so every optimistic toggle still in flight is reverted.
@@ -1150,6 +1153,20 @@ export function useMessages({
     });
   }, []);
 
+  const handleSubscriptionError = useCallback((event: WSClientErrorEvent) => {
+    dispatch({
+      type: "ws_fetch_error",
+      error:
+        event.code === "room_access_denied"
+          ? "Não foi possível acessar as atualizações em tempo real desta conversa."
+          : realtimeFallbackErrorMessage,
+    });
+  }, []);
+
+  const handleSubscribed = useCallback(() => {
+    dispatch({ type: "ws_subscription_ready" });
+  }, []);
+
   // RF-05: keep the pin callback in a ref so it never restarts the socket.
   const onPinUpdatedRef = useRef(onPinUpdated);
   useLayoutEffect(() => {
@@ -1171,6 +1188,8 @@ export function useMessages({
     onReactionUpdated: handleReactionUpdated,
     onPinUpdated: handlePinUpdated,
     onReactionError: handleReactionError,
+    onSubscriptionError: handleSubscriptionError,
+    onSubscribed: handleSubscribed,
   });
 
   const toggleReaction = useCallback(

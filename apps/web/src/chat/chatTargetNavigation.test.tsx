@@ -13,7 +13,7 @@
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
 import { clearTokens, setTokens } from "../lib/authSession";
@@ -82,6 +82,17 @@ class FakeWebSocket {
 }
 
 const OriginalWebSocket = global.WebSocket;
+
+beforeAll(async () => {
+  // This suite verifies target navigation, not lazy chunk loading. Resolve the
+  // real route module before assertions start so Suspense compilation time is
+  // never charged against Testing Library's query timeout.
+  await import("./ChatMessageArea");
+});
+
+afterAll(() => {
+  global.WebSocket = OriginalWebSocket;
+});
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -214,6 +225,7 @@ beforeEach(() => {
 
 afterEach(() => {
   global.WebSocket = OriginalWebSocket;
+
   // FakeWebSocket.instances is static, so a socket a previous test opened would
   // otherwise still be reachable from the next one's assertions.
   FakeWebSocket.instances = [];
@@ -229,7 +241,29 @@ function renderAt(path: string) {
 
 describe("navigating between DM and channel targets", () => {
   it("renders the channel after leaving a DM", async () => {
+    const initialDMPage = deferred<MessagePage>();
+    api.fetchDMMessages.mockImplementation((conversationId: string) => {
+      if (conversationId !== dmId) throw new Error(`Unexpected DM target: ${conversationId}`);
+      return initialDMPage.promise;
+    });
+
     renderAt(`/chat/dm/${dmId}`);
+
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
+
+    const dmHeader = await screen.findByTestId("chat-msg-header");
+    expect(await within(dmHeader).findByText("Juliane")).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(api.fetchDMMessages).toHaveBeenCalledWith(dmId, undefined, expect.any(AbortSignal)),
+    );
+    expect(screen.getByLabelText("Carregando mensagens")).toBeInTheDocument();
+
+    await act(async () => {
+      initialDMPage.resolve(page([message("m-dm", dmText)]));
+      await initialDMPage.promise;
+    });
+
     expect(await screen.findByText(dmText)).toBeInTheDocument();
 
     await clickChannel();
@@ -240,10 +274,14 @@ describe("navigating between DM and channel targets", () => {
     // asserting it right after the last findBy would be asserting on whichever
     // render happened to have landed first.
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
+
     const header = await screen.findByTestId("chat-msg-header");
     expect(await within(header).findByText("geral")).toBeInTheDocument();
+
     expect(await screen.findByText(channelText)).toBeInTheDocument();
+
     await waitFor(() => expect(screen.queryByText(dmText)).not.toBeInTheDocument());
+
     expect(screen.getByTestId("chat-message-area")).toBeInTheDocument();
   });
 

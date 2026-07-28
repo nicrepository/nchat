@@ -24,6 +24,7 @@ import { useLocation, useNavigate, useOutletContext, useParams } from "react-rou
 
 import "./ChatMessageArea.css";
 import type { ChatOutletContext } from "./ChatShell";
+import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
 import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
@@ -768,7 +769,7 @@ interface ChatMessageAreaProps {
 export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const params = useParams<{ id: string }>();
   const rawId = params.id ?? "";
-  const targetId = safeDecodeURIComponent(rawId);
+  const targetId = normalizeChatTargetId(safeDecodeURIComponent(rawId));
   const location = useLocation();
   const navigate = useNavigate();
   const focusMessageId = new URLSearchParams(location.search).get("message") ?? "";
