@@ -682,7 +682,7 @@ func (h *MessageHandler) authorizeWorkspaceAdmin(w http.ResponseWriter, r *http.
 	return workspaceID, userID, true
 }
 
-// GetWorkspaceAntiSpam handles GET /api/v1/workspaces/{workspaceID}/anti-spam.
+// GetWorkspaceAntiSpam handles GET /api/chat/workspaces/{workspaceID}/anti-spam.
 func (h *MessageHandler) GetWorkspaceAntiSpam(w http.ResponseWriter, r *http.Request) {
 	workspaceID, _, ok := h.authorizeWorkspaceAdmin(w, r)
 	if !ok {
@@ -696,7 +696,7 @@ func (h *MessageHandler) GetWorkspaceAntiSpam(w http.ResponseWriter, r *http.Req
 	httputil.WriteJSON(w, http.StatusOK, antiSpamResponse(workspace))
 }
 
-// UpdateWorkspaceAntiSpam handles PATCH /api/v1/workspaces/{workspaceID}/anti-spam.
+// UpdateWorkspaceAntiSpam handles PATCH /api/chat/workspaces/{workspaceID}/anti-spam.
 //
 // Validation runs before authorization is spent on a write, but after the
 // membership check, so an unprivileged caller learns nothing about which values

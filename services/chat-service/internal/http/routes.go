@@ -35,10 +35,13 @@ const (
 	RouteMessage                = "/api/chat/messages/{messageID}"
 	RouteMessageEditHistory     = "/api/chat/messages/{messageID}/history"
 	RouteWorkspaceSettings      = "/api/v1/workspaces/{workspaceID}/settings"
-	// RF-19 anti-spam policy (issue #419). Unlike the /api/chat routes this one
-	// names its workspace, following the sibling settings route above: the
-	// handler never trusts that ID, it checks the caller administers exactly
+	// RF-19 anti-spam policy (issue #419). It lives under /api/chat because that
+	// is the only prefix the gateways forward to chat-service (Traefik local and
+	// every k8s overlay route /api/chat, /api/auth, /api/admin, …, never
+	// /api/v1), so the sibling settings route above is unreachable from a
+	// browser. Unlike the other /api/chat routes this one names its workspace:
+	// the handler never trusts that ID, it checks the caller administers exactly
 	// that workspace and the UPDATE re-checks it atomically.
-	RouteWorkspaceAntiSpam = "/api/v1/workspaces/{workspaceID}/anti-spam"
+	RouteWorkspaceAntiSpam = "/api/chat/workspaces/{workspaceID}/anti-spam"
 	RouteWS                = "/api/chat/ws"
 )

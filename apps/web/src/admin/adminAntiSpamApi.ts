@@ -13,8 +13,10 @@
 
 import { authenticatedFetch } from "../lib/authClient";
 
+// /api/chat is the only prefix the gateways forward to chat-service, so the
+// workspace endpoints share it with the rest of the service's API.
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
-const WORKSPACE_BASE = import.meta.env.VITE_CHAT_WORKSPACE_API_BASE_URL ?? "/api/v1/workspaces";
+const WORKSPACE_BASE = `${CHAT_BASE}/workspaces`;
 
 export interface AntiSpamPolicy {
   workspaceId: string;
