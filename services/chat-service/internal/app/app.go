@@ -179,9 +179,14 @@ func New(cfg config.Config) (*App, error) {
 	presence := ws.NewPresenceTracker(defaultPresenceAwayTimeout)
 	var authorizer ws.SubscriptionAuthorizer = ws.NopAuthorizer{}
 	var wsWorkspaces ws.WorkspaceResolver
+	// Held concretely as well: the same adapter is the canonical workspace
+	// resolver for the RF-19 guard, so WebSocket sessions and HTTP sends bind to
+	// the same workspace by construction rather than by two similar lookups.
+	var canonicalWorkspaces *appWSWorkspaceResolver
 	if workspaceStore != nil {
 		authorizer = ws.NewServiceAuthorizer(channelStore, dmStore)
-		wsWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
+		canonicalWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
+		wsWorkspaces = canonicalWorkspaces
 	}
 	var bus ws.BroadcastBus = ws.NopBus{}
 	if cfg.ValkeyWSBroadcastEnabled {
@@ -203,8 +208,27 @@ func New(cfg config.Config) (*App, error) {
 			options = append(options, ws.WithReactionHandler(&reactionHandlerAdapter{service: reactionSvc}), ws.WithReactionLimiter(limiter))
 		}
 	}
+	// RF-19 (issue #419): the configurable per-workspace send limit. It reuses
+	// the same Lua/Valkey limiter as reactions and edits — no second rate
+	// limiting mechanism — so it exists only when that limiter does. When it is
+	// nil the send routes answer 503 rather than degrading to a per-process
+	// limiter, which would restore the cross-instance bypass RF-19 closes.
+	//
+	// The guard is given three distinct things on purpose: who decides the
+	// workspace (canonicalWorkspaces), where the policy for a given workspace ID
+	// is read (workspaceStore), and what counts (reactionLimiter). It has no
+	// notion of a default workspace of its own.
+	//
+	// The nil checks are on the concrete pointers, not inside the constructor: a
+	// nil *ws.ValkeyReactionLimiter assigned to an interface parameter is a
+	// non-nil interface holding a nil pointer, so a check there would pass and
+	// the guard would panic on its first send.
+	var antiSpam *httpapi.AntiSpamGuard
+	if canonicalWorkspaces != nil && workspaceStore != nil && reactionLimiter != nil {
+		antiSpam = httpapi.NewAntiSpamGuard(canonicalWorkspaces, workspaceStore, reactionLimiter)
+	}
 	if workspaceStore != nil {
-		messageHandler = messageHandler.WithEditing(workspaceStore, permissionSvc, reactionLimiter)
+		messageHandler = messageHandler.WithEditing(workspaceStore, permissionSvc, reactionLimiter).WithAntiSpam(antiSpam)
 	}
 	var directMessages *httpapi.DMHandler
 	if dmSvc != nil {
@@ -252,7 +276,7 @@ func New(cfg config.Config) (*App, error) {
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories),
+		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam),
 		TracingShutdown: shutdown,
 		hub:             hub,
 		presence:        presence,
@@ -291,7 +315,8 @@ func wsHandlerConfig(cfg config.Config) ws.HandlerConfig {
 	}
 }
 
-// appWSWorkspaceResolver adapts storage.PGXWorkspaceStore to ws.WorkspaceResolver.
+// appWSWorkspaceResolver adapts storage.PGXWorkspaceStore to ws.WorkspaceResolver
+// and to the canonical workspace resolver the RF-19 anti-spam guard consumes.
 // The workspace ID is always resolved server-side; client-provided IDs are never accepted.
 type appWSWorkspaceResolver struct {
 	store interface {
@@ -305,6 +330,19 @@ func (r *appWSWorkspaceResolver) GetDefaultWorkspaceID(ctx context.Context) (str
 		return "", err
 	}
 	return workspace.ID, nil
+}
+
+// ResolveWorkspaceID is the single server-side answer to "which workspace does
+// this authenticated request belong to", shared by the WebSocket session bind
+// and by the anti-spam guard so the two cannot disagree.
+//
+// In this MVP the chat surface is one workspace: no chat route carries a
+// workspace segment, and every handler (messages, DMs, channels, categories,
+// sidebar) resolves it the same way. That makes this resolution canonical, not
+// a fallback — when workspace-scoped routing arrives, only this method changes
+// and the guard, its cache and its counter keys follow automatically.
+func (r *appWSWorkspaceResolver) ResolveWorkspaceID(ctx context.Context) (string, error) {
+	return r.GetDefaultWorkspaceID(ctx)
 }
 
 // hubBroadcaster adapts ws.Hub to service.MessageEventPublisher.

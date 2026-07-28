@@ -69,11 +69,22 @@ type MessageHandler struct {
 	settings       storage.WorkspaceSettingsStore
 	settingsAuth   workspaceSettingsAuthorizer
 	editLimiter    editRateLimiter
+	// antiSpam is the RF-19 guard, held only so a policy update can invalidate
+	// its cache. Nil is safe: Invalidate is a no-op and the guard's TTL still
+	// picks the new value up.
+	antiSpam *AntiSpamGuard
 }
 
 // WithEditing enables message editing/history and workspace edit-window settings.
 func (h *MessageHandler) WithEditing(settings storage.WorkspaceSettingsStore, auth workspaceSettingsAuthorizer, limiter editRateLimiter) *MessageHandler {
 	h.settings, h.settingsAuth, h.editLimiter = settings, auth, limiter
+	return h
+}
+
+// WithAntiSpam enables the RF-19 admin endpoints to invalidate the policy cache
+// of the guard enforcing the limit in this process (issue #419).
+func (h *MessageHandler) WithAntiSpam(guard *AntiSpamGuard) *MessageHandler {
+	h.antiSpam = guard
 	return h
 }
 
@@ -225,6 +236,15 @@ type updateEditWindowRequest struct {
 	EditWindowSeconds json.RawMessage `json:"edit_window_seconds"`
 }
 
+// updateAntiSpamRequest is the RF-19 admin payload. The single field is decoded
+// as RawMessage so "absent" is distinguishable from "null" and so a non-integer
+// (string, decimal, object) is a validation failure here rather than a silent
+// zero from encoding/json. Unknown fields are rejected by decodeStrictJSON, so
+// nothing else in the body can reach the workspace row.
+type updateAntiSpamRequest struct {
+	MessageRateLimitPerMinute json.RawMessage `json:"message_rate_limit_per_minute"`
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 // checkDeps returns false and writes 503 if either dependency is nil.
@@ -244,8 +264,17 @@ func (h *MessageHandler) checkMentionDeps(w http.ResponseWriter) bool {
 	return true
 }
 
-// resolveWorkspaceID resolves the default workspace and returns its ID.
+// resolveWorkspaceID returns the workspace this request operates on.
+//
+// When a middleware has already resolved the canonical workspace server-side —
+// which AntiSpamGuard.Middleware does on every send route — that value is
+// reused. Reusing it is not an optimisation only: it is what guarantees the
+// workspace a message is rate-limited against and the workspace it is written
+// to are the same one, with no second lookup that could answer differently.
 func (h *MessageHandler) resolveWorkspaceID(ctx context.Context, w http.ResponseWriter) (string, bool) {
+	if id := contextWorkspaceID(ctx); id != "" {
+		return id, true
+	}
 	ws, err := h.workspaces.GetDefaultWorkspace(ctx)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
@@ -595,6 +624,116 @@ func (h *MessageHandler) UpdateWorkspaceEditWindow(w http.ResponseWriter, r *htt
 	httputil.WriteJSON(w, http.StatusOK, map[string]any{
 		"workspace_id": workspace.ID, "edit_window_seconds": workspace.EditWindowSeconds,
 	})
+}
+
+// ── RF-19 anti-spam policy (issue #419) ──────────────────────────────────────
+
+// antiSpamJSON is the response body for both the GET and the PATCH. The bounds
+// are returned alongside the value so the admin UI renders and validates
+// against the server's numbers instead of restating them as its own truth.
+type antiSpamJSON struct {
+	WorkspaceID               string `json:"workspace_id"`
+	MessageRateLimitPerMinute int    `json:"message_rate_limit_per_minute"`
+	Min                       int    `json:"min"`
+	Max                       int    `json:"max"`
+}
+
+func antiSpamResponse(workspace domain.Workspace) antiSpamJSON {
+	return antiSpamJSON{
+		WorkspaceID:               workspace.ID,
+		MessageRateLimitPerMinute: domain.EffectiveMessageRateLimitPerMinute(workspace.MessageRateLimitPerMinute),
+		Min:                       domain.MinMessageRateLimitPerMinute,
+		Max:                       domain.MaxMessageRateLimitPerMinute,
+	}
+}
+
+// authorizeWorkspaceAdmin resolves the caller and confirms they administer the
+// workspace named in the path. Shared by the anti-spam GET and PATCH so both
+// verbs are gated identically — a readable-but-not-writable split here would
+// leak a workspace's policy to any authenticated member of any workspace.
+//
+// A caller who is not an admin, and a caller who administers some *other*
+// workspace, both get the same 403: the response never distinguishes "you lack
+// the role" from "that workspace is not yours", so the endpoint cannot be used
+// to probe which workspace IDs exist.
+func (h *MessageHandler) authorizeWorkspaceAdmin(w http.ResponseWriter, r *http.Request) (workspaceID, userID string, ok bool) {
+	if h.settings == nil || h.settingsAuth == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "workspace settings not available")
+		return "", "", false
+	}
+	workspaceID = r.PathValue("workspaceID")
+	if !validateTargetID(w, workspaceID, "workspace_id") {
+		return "", "", false
+	}
+	userID = GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return "", "", false
+	}
+	allowed, err := h.settingsAuth.CanManageWorkspace(r.Context(), workspaceID, userID)
+	if err != nil {
+		mapServiceError(w, err)
+		return "", "", false
+	}
+	if !allowed {
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+		return "", "", false
+	}
+	return workspaceID, userID, true
+}
+
+// GetWorkspaceAntiSpam handles GET /api/v1/workspaces/{workspaceID}/anti-spam.
+func (h *MessageHandler) GetWorkspaceAntiSpam(w http.ResponseWriter, r *http.Request) {
+	workspaceID, _, ok := h.authorizeWorkspaceAdmin(w, r)
+	if !ok {
+		return
+	}
+	workspace, err := h.settings.GetWorkspaceByID(r.Context(), workspaceID)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, antiSpamResponse(workspace))
+}
+
+// UpdateWorkspaceAntiSpam handles PATCH /api/v1/workspaces/{workspaceID}/anti-spam.
+//
+// Validation runs before authorization is spent on a write, but after the
+// membership check, so an unprivileged caller learns nothing about which values
+// the field accepts. The store applies the same RBAC predicate atomically with
+// the UPDATE, so this handler's check is defence in depth rather than the only
+// gate.
+func (h *MessageHandler) UpdateWorkspaceAntiSpam(w http.ResponseWriter, r *http.Request) {
+	workspaceID, userID, ok := h.authorizeWorkspaceAdmin(w, r)
+	if !ok {
+		return
+	}
+	var req updateAntiSpamRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	if req.MessageRateLimitPerMinute == nil {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request body")
+		return
+	}
+	var perMinute int
+	// json.Unmarshal into int rejects strings, decimals, booleans, null and
+	// values that overflow int64; the bounds check rejects 0, negatives and
+	// anything outside the policy range. The database CHECK repeats both.
+	if err := json.Unmarshal(req.MessageRateLimitPerMinute, &perMinute); err != nil ||
+		!domain.ValidMessageRateLimitPerMinute(perMinute) {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid message_rate_limit_per_minute")
+		return
+	}
+	workspace, err := h.settings.UpdateMessageRateLimit(r.Context(), workspaceID, userID, perMinute)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	// Drop this instance's cached policy so the next message is counted against
+	// the new limit without waiting out the TTL.
+	h.antiSpam.Invalidate(workspace.ID)
+	httputil.WriteJSON(w, http.StatusOK, antiSpamResponse(workspace))
 }
 
 // ── Channel endpoints ─────────────────────────────────────────────────────────
