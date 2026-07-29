@@ -21,6 +21,7 @@ concurrency:
 jobs:
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,6 +40,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
       - name: Check web formatting
         run: pnpm format:check:web
 
@@ -50,6 +54,9 @@ jobs:
 
       - name: Test web
         run: pnpm test:web
+
+      - name: Test web E2E
+        run: pnpm test:e2e:web
 
       - name: Test web coverage
         run: pnpm test:coverage:web
