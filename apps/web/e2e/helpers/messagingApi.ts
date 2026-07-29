@@ -8,8 +8,36 @@ export const GROUP_DM_ID = "e2e-dm-group";
 export const GROUP_DM_NAME = "E2E Grupo";
 export const OTHER_CHANNEL_ID = "e2e-channel-other";
 export const OTHER_CHANNEL_NAME = "Canal E2E";
+// Extra fixture candidates so a new ad-hoc group (which needs the caller plus
+// at least two others) can be created without inventing IDs per spec file.
+export const SECOND_CANDIDATE_ID = "e2e-candidate-two";
+export const SECOND_CANDIDATE_NAME = "E2E Candidata Dois";
+export const THIRD_CANDIDATE_ID = "e2e-candidate-three";
+export const THIRD_CANDIDATE_NAME = "E2E Candidata Três";
 
 type TargetKind = "channel" | "dm";
+type ConversationAccessGuard = (targetId: string) => boolean;
+
+interface SidebarChannelFixture {
+  id: string;
+  slug: string;
+  display_name: string;
+  type: "public" | "private";
+  can_write: boolean;
+  unread_count: number;
+}
+
+interface SidebarDMFixture {
+  id: string;
+  type: "direct" | "group";
+  name: string;
+  unread_count: number;
+}
+
+export interface DMCandidateFixture {
+  userId: string;
+  displayName: string;
+}
 
 interface RawMessage {
   id: string;
@@ -58,10 +86,13 @@ interface RawQuote {
 
 interface MessagingScenarioOptions {
   kind: TargetKind;
+  conversationType?: SidebarDMFixture["type"];
   targetId: string;
   targetName: string;
   messages: RawMessage[];
   editWindowExpiredIds?: string[];
+  /** People returned by GET /dm-candidates, used by "nova conversa" specs. */
+  dmCandidates?: DMCandidateFixture[];
 }
 
 interface PatchRequest {
@@ -97,11 +128,25 @@ export interface MessagingScenario {
     }>;
     patches: PatchRequest[];
     deletes: string[];
+    favorites: Array<{ messageId: string; action: "add" | "remove" }>;
+    pins: Array<{ messageId: string; targetId: string; action: "add" | "remove" }>;
+    reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
+    dmCreates: Array<{ otherUserId: string }>;
+    groupCreates: Array<{ participantUserIds: string[]; title: string }>;
   };
   forwardedByIdempotencyKey: Map<
     string,
     { destinationChannelId: string; sourceMessageId: string; message: RawMessage }
   >;
+  // Mutable sidebar fixture. Starts with the same defaults the sidebar route
+  // always served; DM/group creation mocks append to it so a post-creation
+  // refetch (ChatSidebar's retry()) reflects the new conversation.
+  sidebarChannels: SidebarChannelFixture[];
+  sidebarDMs: SidebarDMFixture[];
+  // Candidates returned by GET /dm-candidates.
+  dmCandidates: DMCandidateFixture[];
+  // Pinned message IDs per "kind:targetId" key.
+  pinnedIds: Map<string, Set<string>>;
 }
 
 export function uniqueId(testInfo: TestInfo, suffix: string): string {
@@ -155,17 +200,87 @@ export function quoteFrom(message: RawMessage): RawQuote {
 export function createScenario(options: MessagingScenarioOptions): MessagingScenario {
   const messagesByTarget = new Map<string, RawMessage[]>();
   messagesByTarget.set(targetKey(options.kind, options.targetId), [...options.messages]);
-  messagesByTarget.set(targetKey("channel", OTHER_CHANNEL_ID), []);
-  messagesByTarget.set(targetKey("dm", "e2e-dm-other"), []);
-  messagesByTarget.set(targetKey("dm", GROUP_DM_ID), []);
+  // These defaults exist so every scenario has a full three-category sidebar
+  // fixture (ISSUE #396) even when the primary target above is the DM/channel
+  // under test — guarded so a scenario built *around* one of these ids (e.g. a
+  // spec exercising the ad-hoc group directly) never has its own messages
+  // clobbered back to empty.
+  for (const [kind, id] of [
+    ["channel", OTHER_CHANNEL_ID],
+    ["dm", "e2e-dm-other"],
+    ["dm", GROUP_DM_ID],
+  ] as const) {
+    const key = targetKey(kind, id);
+    if (!messagesByTarget.has(key)) messagesByTarget.set(key, []);
+  }
+
+  const sidebarChannels: SidebarChannelFixture[] =
+    options.kind === "channel"
+      ? [
+          {
+            id: options.targetId,
+            slug: "e2e-canal",
+            display_name: options.targetName,
+            type: "public",
+            can_write: true,
+            unread_count: 0,
+          },
+          {
+            id: OTHER_CHANNEL_ID,
+            slug: "e2e-canal-secundario",
+            display_name: OTHER_CHANNEL_NAME,
+            type: "public",
+            can_write: true,
+            unread_count: 0,
+          },
+        ]
+      : [
+          {
+            id: OTHER_CHANNEL_ID,
+            slug: "e2e-canal",
+            display_name: OTHER_CHANNEL_NAME,
+            type: "public",
+            can_write: true,
+            unread_count: 0,
+          },
+        ];
+  const conversationType =
+    options.kind === "dm" ? (options.conversationType ?? "direct") : undefined;
+  const directDM: SidebarDMFixture =
+    options.kind === "dm" && conversationType === "direct"
+      ? { id: options.targetId, type: "direct", name: options.targetName, unread_count: 0 }
+      : { id: "e2e-dm-other", type: "direct", name: OTHER_USER_NAME, unread_count: 0 };
+  const groupDM: SidebarDMFixture =
+    options.kind === "dm" && conversationType === "group"
+      ? { id: options.targetId, type: "group", name: options.targetName, unread_count: 0 }
+      : { id: GROUP_DM_ID, type: "group", name: GROUP_DM_NAME, unread_count: 0 };
+  const sidebarDMs =
+    directDM.id === groupDM.id
+      ? [conversationType === "group" ? groupDM : directDM]
+      : [directDM, groupDM];
 
   return {
     kind: options.kind,
     targetId: options.targetId,
     targetName: options.targetName,
     messagesByTarget,
-    requests: { channelPosts: [], dmPosts: [], forwards: [], patches: [], deletes: [] },
+    requests: {
+      channelPosts: [],
+      dmPosts: [],
+      forwards: [],
+      patches: [],
+      deletes: [],
+      favorites: [],
+      pins: [],
+      reactions: [],
+      dmCreates: [],
+      groupCreates: [],
+    },
     forwardedByIdempotencyKey: new Map(),
+    sidebarChannels,
+    sidebarDMs,
+    dmCandidates: options.dmCandidates ?? [{ userId: OTHER_USER_ID, displayName: OTHER_USER_NAME }],
+    pinnedIds: new Map(),
   };
 }
 
@@ -184,43 +299,287 @@ export function messagesFor(
   return emptyMessages;
 }
 
+export async function emitMessageCreated(
+  page: Page,
+  scenario: MessagingScenario,
+  options: {
+    kind: TargetKind;
+    targetId: string;
+    message: RawMessage;
+    eventId?: string;
+  },
+) {
+  const messages = messagesFor(scenario, options.kind, options.targetId);
+  if (!messages.some((message) => message.id === options.message.id)) {
+    messages.push(options.message);
+  }
+  const event = {
+    schema_version: 1,
+    type: "message.created",
+    workspace_id: "e2e-workspace",
+    target_type: options.kind,
+    target_id: options.targetId,
+    message_id: options.message.id,
+    event_id: options.eventId ?? `${options.message.id}-event`,
+    created_at: options.message.created_at,
+    payload: {
+      id: options.message.id,
+      workspace_id: "e2e-workspace",
+      ...(options.kind === "channel"
+        ? { channel_id: options.targetId }
+        : { dm_conversation_id: options.targetId }),
+      sender_id: options.message.sender_id,
+      sender_display_name: options.message.sender_display_name,
+      kind: options.message.kind,
+      body_text: options.message.body_text ?? "",
+      body_format: options.message.body_format,
+      status: options.message.status,
+      is_removed: options.message.is_removed,
+      created_at: options.message.created_at,
+      updated_at: options.message.updated_at,
+      edited_at: options.message.edited_at,
+      deleted_at: options.message.deleted_at,
+      quoted: options.message.quoted,
+      is_forwarded: options.message.is_forwarded,
+    },
+  };
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate((messageCreatedEvent) => {
+    (
+      window as unknown as {
+        __e2eEmitMessageCreated: (event: typeof messageCreatedEvent) => void;
+      }
+    ).__e2eEmitMessageCreated(messageCreatedEvent);
+  }, event);
+}
+
 export async function installMessagingMocks(
   page: Page,
   scenario: MessagingScenario,
-  options: { editWindowExpiredIds?: string[] } = {},
+  options: { editWindowExpiredIds?: string[]; forbiddenTargetIds?: string[] } = {},
 ) {
   const expired = new Set(options.editWindowExpiredIds ?? []);
+  const forbidden = new Set(options.forbiddenTargetIds ?? []);
+  function assertConversationAccess(targetId: string): boolean {
+    return !forbidden.has(targetId);
+  }
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
     origin: "http://localhost:5173",
   });
+  await installWebSocketMock(page, scenario, assertConversationAccess);
+  await installSidebarMocks(page, scenario);
+  await installInteractionMocks(page, scenario, assertConversationAccess);
+  await installConversationMocks(page, scenario);
+  await installMessageMocks(page, scenario, expired, assertConversationAccess);
+}
 
-  await page.addInitScript((accessToken) => {
-    sessionStorage.setItem("nchat_at", accessToken);
+async function installWebSocketMock(
+  page: Page,
+  scenario: MessagingScenario,
+  assertConversationAccess: ConversationAccessGuard,
+) {
+  // Reaction toggles travel over the WebSocket, not REST (RF-08). The fake
+  // socket below calls back into this exposed function so a toggle mutates
+  // the same scenario state the REST message routes read, and a reload sees
+  // the persisted reaction exactly like the real server would produce it.
+  await page.exposeFunction(
+    "__e2eToggleReaction",
+    (
+      messageId: string,
+      emoji: string,
+    ): { added: boolean; reactions: RawMessage["reactions"] } | undefined => {
+      const location = findMessageLocation(scenario, messageId);
+      if (!location || !assertConversationAccess(location.targetId)) return undefined;
+      const reactions = location.message.reactions;
+      const index = reactions.findIndex((reaction) => reaction.emoji === emoji);
+      let updated: RawMessage["reactions"];
+      let added: boolean;
+      if (index === -1) {
+        updated = [...reactions, { emoji, count: 1, reacted_by_me: true }];
+        added = true;
+      } else if (reactions[index].reacted_by_me) {
+        added = false;
+        updated =
+          reactions[index].count <= 1
+            ? reactions.filter((_, i) => i !== index)
+            : reactions.map((reaction, i) =>
+                i === index
+                  ? { ...reaction, count: reaction.count - 1, reacted_by_me: false }
+                  : reaction,
+              );
+      } else {
+        added = true;
+        updated = reactions.map((reaction, i) =>
+          i === index ? { ...reaction, count: reaction.count + 1, reacted_by_me: true } : reaction,
+        );
+      }
+      location.messages[location.index] = { ...location.message, reactions: updated };
+      scenario.requests.reactions.push({ messageId, emoji, added });
+      return { added, reactions: updated };
+    },
+  );
 
-    class StableWebSocket {
-      static readonly CONNECTING = 0;
-      static readonly OPEN = 1;
-      static readonly CLOSING = 2;
-      static readonly CLOSED = 3;
-      readonly readyState = StableWebSocket.OPEN;
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      onclose: ((event: CloseEvent) => void) | null = null;
+  await page.addInitScript(
+    (args) => {
+      const { accessToken, targetKind, targetId, currentUserId, allowedTargets } = args;
+      sessionStorage.setItem("nchat_at", accessToken);
+      const allowed = new Set(allowedTargets);
+      const sockets = new Set<StableWebSocket>();
 
-      constructor() {
-        setTimeout(() => this.onopen?.(new Event("open")), 0);
+      class StableWebSocket {
+        static readonly CONNECTING = 0;
+        static readonly OPEN = 1;
+        static readonly CLOSING = 2;
+        static readonly CLOSED = 3;
+        readonly readyState = StableWebSocket.OPEN;
+        onopen: ((event: Event) => void) | null = null;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onerror: ((event: Event) => void) | null = null;
+        onclose: ((event: CloseEvent) => void) | null = null;
+        readonly subscriptions = new Set<string>();
+
+        constructor() {
+          sockets.add(this);
+          setTimeout(() => this.onopen?.(new Event("open")), 0);
+        }
+
+        send(data: string) {
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            return;
+          }
+          if (parsed["type"] === "subscribe" || parsed["type"] === "unsubscribe") {
+            const kind = parsed["target_type"];
+            const id = parsed["target_id"];
+            if ((kind !== "channel" && kind !== "dm") || typeof id !== "string") return;
+            const key = `${kind}:${id}`;
+            if (parsed["type"] === "unsubscribe") {
+              this.subscriptions.delete(key);
+              return;
+            }
+            if (!allowed.has(key)) {
+              queueMicrotask(() =>
+                this.onmessage?.(
+                  new MessageEvent("message", {
+                    data: JSON.stringify({
+                      type: "error",
+                      operation: "subscribe",
+                      code: "room_access_denied",
+                      target_type: kind,
+                      target_id: id,
+                    }),
+                  }),
+                ),
+              );
+              return;
+            }
+            this.subscriptions.add(key);
+            queueMicrotask(() =>
+              this.onmessage?.(
+                new MessageEvent("message", {
+                  data: JSON.stringify({
+                    type: "subscribed",
+                    operation: "subscribe",
+                    target_type: kind,
+                    target_id: id,
+                  }),
+                }),
+              ),
+            );
+            return;
+          }
+          if (parsed["type"] !== "reaction.toggle") return;
+          const messageId = parsed["message_id"] as string;
+          const emoji = parsed["emoji"] as string;
+          void (
+            window as unknown as {
+              __e2eToggleReaction: (
+                messageId: string,
+                emoji: string,
+              ) => Promise<
+                { added: boolean; reactions: Array<{ emoji: string; count: number }> } | undefined
+              >;
+            }
+          )
+            .__e2eToggleReaction(messageId, emoji)
+            .then((result) => {
+              if (!result) return;
+              this.onmessage?.(
+                new MessageEvent("message", {
+                  data: JSON.stringify({
+                    type: "reaction.updated",
+                    target_type: targetKind,
+                    target_id: targetId,
+                    message_id: messageId,
+                    reaction: {
+                      message_id: messageId,
+                      actor_user_id: currentUserId,
+                      emoji,
+                      added: result.added,
+                      reactions: result.reactions,
+                    },
+                  }),
+                }),
+              );
+            });
+        }
+
+        close() {
+          sockets.delete(this);
+          this.onclose?.(new CloseEvent("close"));
+        }
       }
 
-      send() {}
-      close() {
-        this.onclose?.(new CloseEvent("close"));
-      }
-    }
+      (
+        window as unknown as {
+          __e2eEmitMessageCreated: (event: { target_type: string; target_id: string }) => void;
+        }
+      ).__e2eEmitMessageCreated = (event) => {
+        const key = `${event.target_type}:${event.target_id}`;
+        for (const socket of sockets) {
+          if (!socket.subscriptions.has(key)) continue;
+          socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify(event) }));
+        }
+      };
+      (
+        window as unknown as {
+          __e2eHasSubscription: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription = (kind, targetId) => {
+        const key = `${kind}:${targetId}`;
+        return [...sockets].some((socket) => socket.subscriptions.has(key));
+      };
 
-    window.WebSocket = StableWebSocket as unknown as typeof WebSocket;
-  }, `e2e-at-${scenario.targetId}`);
+      window.WebSocket = StableWebSocket as unknown as typeof WebSocket;
+    },
+    {
+      accessToken: `e2e-at-${scenario.targetId}`,
+      targetKind: scenario.kind,
+      targetId: scenario.targetId,
+      currentUserId: CURRENT_USER_ID,
+      allowedTargets: [
+        ...scenario.sidebarChannels
+          .filter((channel) => assertConversationAccess(channel.id))
+          .map((channel) => `channel:${channel.id}`),
+        ...scenario.sidebarDMs
+          .filter((dm) => assertConversationAccess(dm.id))
+          .map((dm) => `dm:${dm.id}`),
+      ],
+    },
+  );
+}
 
+async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   await page.route("**/api/chat/sidebar", (route) =>
     route.fulfill({
       status: 200,
@@ -228,57 +587,19 @@ export async function installMessagingMocks(
       body: JSON.stringify({
         data: {
           current_user_id: CURRENT_USER_ID,
-          channels:
-            scenario.kind === "channel"
-              ? [
-                  {
-                    id: scenario.targetId,
-                    slug: "e2e-canal",
-                    display_name: scenario.targetName,
-                    type: "public",
-                    can_write: true,
-                    unread_count: 0,
-                  },
-                  {
-                    id: OTHER_CHANNEL_ID,
-                    slug: "e2e-canal-secundario",
-                    display_name: OTHER_CHANNEL_NAME,
-                    type: "public",
-                    can_write: true,
-                    unread_count: 0,
-                  },
-                ]
-              : [
-                  {
-                    id: OTHER_CHANNEL_ID,
-                    slug: "e2e-canal",
-                    display_name: OTHER_CHANNEL_NAME,
-                    type: "public",
-                    can_write: true,
-                    unread_count: 0,
-                  },
-                ],
-          dm_conversations: [
-            {
-              id: scenario.kind === "dm" ? scenario.targetId : "e2e-dm-other",
-              type: "direct",
-              name: scenario.kind === "dm" ? scenario.targetName : OTHER_USER_NAME,
-              unread_count: 0,
-            },
-            // An ad-hoc group is always present so the sidebar fixture covers
-            // all three product categories (ISSUE #396).
-            {
-              id: GROUP_DM_ID,
-              type: "group",
-              name: GROUP_DM_NAME,
-              unread_count: 0,
-            },
-          ],
+          channels: scenario.sidebarChannels,
+          dm_conversations: scenario.sidebarDMs,
         },
       }),
     }),
   );
+}
 
+async function installInteractionMocks(
+  page: Page,
+  scenario: MessagingScenario,
+  assertConversationAccess: ConversationAccessGuard,
+) {
   await page.route("**/api/chat/reactions/allowed-emojis", (route) =>
     route.fulfill({
       status: 200,
@@ -287,14 +608,143 @@ export async function installMessagingMocks(
     }),
   );
 
-  await page.route("**/api/chat/**/pins", (route) =>
-    route.fulfill({
+  await page.route("**/api/chat/messages/*/favorite", async (route) => {
+    const request = route.request();
+    const messageId = decodeMessageId(request.url(), 2);
+    if (!messageId) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const location = findMessageLocation(scenario, messageId);
+    if (location && !assertConversationAccess(location.targetId)) {
+      await route.fulfill({ status: 403 });
+      return;
+    }
+    if (request.method() === "POST") {
+      scenario.requests.favorites.push({ messageId, action: "add" });
+      if (!location) {
+        await route.fulfill({ status: 404 });
+        return;
+      }
+      location.messages[location.index] = { ...location.message, is_favorited: true };
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    if (request.method() === "DELETE") {
+      scenario.requests.favorites.push({ messageId, action: "remove" });
+      if (location) {
+        location.messages[location.index] = { ...location.message, is_favorited: false };
+      }
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.route("**/api/chat/channels/*/messages/*/pin", (route) =>
+    handlePinToggleRoute(route, scenario, "channel", assertConversationAccess),
+  );
+  await page.route("**/api/chat/dm/*/messages/*/pin", (route) =>
+    handlePinToggleRoute(route, scenario, "dm", assertConversationAccess),
+  );
+  await page.route("**/api/chat/channels/*/pins", (route) =>
+    handleListPinsRoute(route, scenario, "channel", assertConversationAccess),
+  );
+  await page.route("**/api/chat/dm/*/pins", (route) =>
+    handleListPinsRoute(route, scenario, "dm", assertConversationAccess),
+  );
+}
+
+async function installConversationMocks(page: Page, scenario: MessagingScenario) {
+  await page.route("**/api/chat/dm-candidates**", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ data: { pins: [], total_count: 0 } }),
-    }),
-  );
+      body: JSON.stringify({
+        data: {
+          candidates: scenario.dmCandidates.map((candidate) => ({
+            user_id: candidate.userId,
+            display_name: candidate.displayName,
+          })),
+        },
+      }),
+    });
+  });
 
+  await page.route("**/api/chat/dms", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const raw = (await request.postDataJSON()) as { other_user_id?: string };
+    const otherUserId = raw.other_user_id ?? "";
+    scenario.requests.dmCreates.push({ otherUserId });
+    const candidate = scenario.dmCandidates.find((c) => c.userId === otherUserId);
+    if (!candidate) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const conversationId = `e2e-dm-with-${otherUserId}`;
+    if (!scenario.sidebarDMs.some((dm) => dm.id === conversationId)) {
+      scenario.sidebarDMs.push({
+        id: conversationId,
+        type: "direct",
+        name: candidate.displayName,
+        unread_count: 0,
+      });
+    }
+    if (!scenario.messagesByTarget.has(targetKey("dm", conversationId))) {
+      scenario.messagesByTarget.set(targetKey("dm", conversationId), []);
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { conversation_id: conversationId, created: true } }),
+    });
+  });
+
+  await page.route("**/api/chat/dms/group", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const raw = (await request.postDataJSON()) as {
+      participant_user_ids?: string[];
+      title?: string;
+    };
+    const participantUserIds = raw.participant_user_ids ?? [];
+    scenario.requests.groupCreates.push({ participantUserIds, title: raw.title ?? "" });
+    const unknown = participantUserIds.some(
+      (userId) => !scenario.dmCandidates.some((c) => c.userId === userId),
+    );
+    if (unknown) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const conversationId = `e2e-group-${scenario.requests.groupCreates.length}`;
+    const name = raw.title?.trim() || "Grupo sem nome";
+    scenario.sidebarDMs.push({ id: conversationId, type: "group", name, unread_count: 0 });
+    scenario.messagesByTarget.set(targetKey("dm", conversationId), []);
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { conversation_id: conversationId } }),
+    });
+  });
+}
+
+async function installMessageMocks(
+  page: Page,
+  scenario: MessagingScenario,
+  expired: Set<string>,
+  assertConversationAccess: ConversationAccessGuard,
+) {
   await page.route("**/api/chat/messages/*/history?*", (route) => {
     const messageId = decodeMessageId(route.request().url(), 2);
     const message = messageId ? findMessageLocation(scenario, messageId)?.message : undefined;
@@ -330,6 +780,18 @@ export async function installMessagingMocks(
     const location = findMessageLocation(scenario, messageId);
 
     if (request.method() === "PATCH") {
+      if (!location) {
+        await route.fulfill({ status: 404 });
+        return;
+      }
+      if (!assertConversationAccess(location.targetId)) {
+        await route.fulfill({ status: 403 });
+        return;
+      }
+      if (location.message.sender_id !== CURRENT_USER_ID) {
+        await route.fulfill({ status: 403 });
+        return;
+      }
       const raw = (await request.postDataJSON()) as Record<string, unknown>;
       scenario.requests.patches.push({
         messageId,
@@ -339,11 +801,6 @@ export async function installMessagingMocks(
         body_format: raw.body_format,
         raw,
       });
-
-      if (!location) {
-        await route.fulfill({ status: 404 });
-        return;
-      }
 
       if (
         typeof raw.body !== "string" ||
@@ -387,11 +844,19 @@ export async function installMessagingMocks(
     }
 
     if (request.method() === "DELETE") {
-      scenario.requests.deletes.push(messageId);
       if (!location) {
         await route.fulfill({ status: 404 });
         return;
       }
+      if (!assertConversationAccess(location.targetId)) {
+        await route.fulfill({ status: 403 });
+        return;
+      }
+      if (location.message.sender_id !== CURRENT_USER_ID) {
+        await route.fulfill({ status: 403 });
+        return;
+      }
+      scenario.requests.deletes.push(messageId);
       const previous = location.message;
       const deleted = makeMessage({
         ...previous,
@@ -412,19 +877,19 @@ export async function installMessagingMocks(
   });
 
   await page.route("**/api/chat/channels/*/messages/*", async (route) => {
-    await handleSingleTargetMessageRoute(route, scenario, "channel");
+    await handleSingleTargetMessageRoute(route, scenario, "channel", assertConversationAccess);
   });
 
   await page.route("**/api/chat/dm/*/messages/*", async (route) => {
-    await handleSingleTargetMessageRoute(route, scenario, "dm");
+    await handleSingleTargetMessageRoute(route, scenario, "dm", assertConversationAccess);
   });
 
   await page.route("**/api/chat/channels/*/messages", async (route) => {
-    await handleTargetMessagesRoute(route, scenario, "channel");
+    await handleTargetMessagesRoute(route, scenario, "channel", assertConversationAccess);
   });
 
   await page.route("**/api/chat/dm/*/messages", async (route) => {
-    await handleTargetMessagesRoute(route, scenario, "dm");
+    await handleTargetMessagesRoute(route, scenario, "dm", assertConversationAccess);
   });
 
   await page.route("**/api/chat/channels/*/messages/forward", async (route) => {
@@ -438,17 +903,25 @@ export async function installMessagingMocks(
       await route.fulfill({ status: 404 });
       return;
     }
+    if (!assertConversationAccess(target.targetId)) {
+      await route.fulfill({ status: 403 });
+      return;
+    }
+    const source = sourceMessageId ? findMessageLocation(scenario, sourceMessageId) : undefined;
+    if (!source || source.message.is_removed) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    if (!assertConversationAccess(source.targetId)) {
+      await route.fulfill({ status: 403 });
+      return;
+    }
     scenario.requests.forwards.push({
       destinationChannelId: target.targetId,
       sourceMessageId,
       idempotencyKey,
       raw,
     });
-    const source = sourceMessageId ? findMessageLocation(scenario, sourceMessageId) : undefined;
-    if (!source || source.message.is_removed) {
-      await route.fulfill({ status: 404 });
-      return;
-    }
     if (idempotencyKey) {
       const replay = scenario.forwardedByIdempotencyKey.get(idempotencyKey);
       if (replay) {
@@ -513,10 +986,15 @@ async function handleSingleTargetMessageRoute(
   route: Route,
   scenario: MessagingScenario,
   routeKind: TargetKind,
+  assertConversationAccess: ConversationAccessGuard,
 ) {
   const target = parseMessagesTarget(route.request().url(), routeKind);
   const messageId = decodeMessageId(route.request().url(), 1);
   const location = messageId ? findMessageLocation(scenario, messageId) : undefined;
+  if (target && !assertConversationAccess(target.targetId)) {
+    await route.fulfill({ status: 404 });
+    return;
+  }
   if (
     route.request().method() !== "GET" ||
     !target ||
@@ -534,10 +1012,17 @@ async function handleTargetMessagesRoute(
   route: Route,
   scenario: MessagingScenario,
   routeKind: TargetKind,
+  assertConversationAccess: ConversationAccessGuard,
 ) {
   const request = route.request();
   const target = parseMessagesTarget(request.url(), routeKind);
   if (!target) {
+    await route.fulfill({ status: 404 });
+    return;
+  }
+  // Mirrors the server: a non-participant gets the same 404 as a missing
+  // conversation, never a 403 that would confirm the target exists.
+  if (!assertConversationAccess(target.targetId)) {
     await route.fulfill({ status: 404 });
     return;
   }
@@ -641,6 +1126,93 @@ function parseMessagesTarget(
   return targetId ? { kind: expectedKind, targetId: decodeURIComponent(targetId) } : undefined;
 }
 
+function parsePinsListTarget(url: string, expectedKind: TargetKind): string | undefined {
+  const path = new URL(url).pathname.split("/").filter(Boolean);
+  const collection = expectedKind === "channel" ? "channels" : "dm";
+  const collectionIndex = path.indexOf(collection);
+  if (collectionIndex === -1 || path[collectionIndex + 2] !== "pins") {
+    return undefined;
+  }
+  const targetId = path[collectionIndex + 1];
+  return targetId ? decodeURIComponent(targetId) : undefined;
+}
+
+async function handlePinToggleRoute(
+  route: Route,
+  scenario: MessagingScenario,
+  kind: TargetKind,
+  assertConversationAccess: ConversationAccessGuard,
+) {
+  const request = route.request();
+  const target = parseMessagesTarget(request.url(), kind);
+  const messageId = decodeMessageId(request.url(), 2);
+  if (!target || !messageId) {
+    await route.fulfill({ status: 404 });
+    return;
+  }
+  if (!assertConversationAccess(target.targetId)) {
+    await route.fulfill({ status: 403 });
+    return;
+  }
+  const location = findMessageLocation(scenario, messageId);
+  if (!location || location.kind !== kind || location.targetId !== target.targetId) {
+    await route.fulfill({ status: 404 });
+    return;
+  }
+  const key = targetKey(kind, target.targetId);
+  const pinned = scenario.pinnedIds.get(key) ?? new Set<string>();
+  scenario.pinnedIds.set(key, pinned);
+
+  if (request.method() === "POST") {
+    scenario.requests.pins.push({ messageId, targetId: target.targetId, action: "add" });
+    pinned.add(messageId);
+    await route.fulfill({ status: 204 });
+    return;
+  }
+  if (request.method() === "DELETE") {
+    scenario.requests.pins.push({ messageId, targetId: target.targetId, action: "remove" });
+    pinned.delete(messageId);
+    await route.fulfill({ status: 204 });
+    return;
+  }
+  await route.fallback();
+}
+
+async function handleListPinsRoute(
+  route: Route,
+  scenario: MessagingScenario,
+  kind: TargetKind,
+  assertConversationAccess: ConversationAccessGuard,
+) {
+  if (route.request().method() !== "GET") {
+    await route.fallback();
+    return;
+  }
+  const targetId = parsePinsListTarget(route.request().url(), kind);
+  if (!targetId) {
+    await route.fallback();
+    return;
+  }
+  if (!assertConversationAccess(targetId)) {
+    await route.fulfill({ status: 403 });
+    return;
+  }
+  const pinnedIds = scenario.pinnedIds.get(targetKey(kind, targetId)) ?? new Set<string>();
+  const messages = messagesFor(scenario, kind, targetId);
+  const pins = messages
+    .filter((message) => pinnedIds.has(message.id))
+    .map((message) => ({
+      message,
+      pinned_by_user_id: CURRENT_USER_ID,
+      pinned_at: "2026-07-15T12:06:00.000Z",
+    }));
+  await route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ data: { pins, total_count: pins.length } }),
+  });
+}
+
 function decodeMessageId(url: string, trailingSegments: number): string | undefined {
   const path = new URL(url).pathname.split("/").filter(Boolean);
   const messageIndex = path.indexOf("messages");
@@ -687,6 +1259,11 @@ export function messageBubble(page: Page, messageId: string): Locator {
 export async function revealActions(page: Page, messageId: string): Promise<Locator> {
   const bubble = messageBubble(page, messageId);
   await expect(bubble).toBeVisible();
+  // Playwright tracks a virtual mouse position across page.reload(): se o
+  // cursor já estiver nas coordenadas do bubble (mesmo layout), hover() não
+  // dispara um mousemove real e o onMouseEnter do React nunca é chamado.
+  // Mover para longe primeiro garante um movimento real em qualquer cenário.
+  await page.mouse.move(0, 0);
   await bubble.hover();
   return bubble;
 }
