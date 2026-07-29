@@ -167,9 +167,15 @@ export interface WSSubscribedEvent {
   target_id: string;
 }
 
+export interface WSSubscriptionTarget {
+  kind: "channel" | "dm";
+  targetId: string;
+}
+
 interface UseChatWebSocketOptions {
   kind: "channel" | "dm";
   targetId: string;
+  additionalTargets?: readonly WSSubscriptionTarget[];
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
@@ -183,9 +189,25 @@ export interface ChatWebSocketActions {
   toggleReaction: (messageId: string, emoji: string) => boolean;
 }
 
+interface SubscriptionControl {
+  generation: number;
+  socket: WebSocket;
+  expected: Map<string, WSSubscriptionTarget>;
+  pending: Set<string>;
+  confirmed: Set<string>;
+  primaryAcknowledgement: WSSubscribedEvent | null;
+  attempts: number;
+  timer: number | null;
+}
+
+function subscriptionTargetKey({ kind, targetId }: WSSubscriptionTarget): string {
+  return `${kind}:${targetId}`;
+}
+
 export function useChatWebSocket({
   kind,
   targetId,
+  additionalTargets,
   onMessageCreated,
   onMessageUpdated,
   onReactionUpdated,
@@ -195,6 +217,21 @@ export function useChatWebSocket({
   onSubscribed,
 }: UseChatWebSocketOptions): ChatWebSocketActions {
   const normalizedTargetId = normalizeChatTargetId(targetId);
+  const seenTargets = new Set<string>();
+  const subscriptionTargets = [
+    { kind, targetId: normalizedTargetId },
+    ...(additionalTargets ?? []).map(({ kind: targetKind, targetId: additionalTargetId }) => ({
+      kind: targetKind,
+      targetId: normalizeChatTargetId(additionalTargetId),
+    })),
+  ].filter(({ kind: targetKind, targetId: subscriptionTargetId }) => {
+    const key = `${targetKind}:${subscriptionTargetId}`;
+    if (!subscriptionTargetId || seenTargets.has(key)) return false;
+    seenTargets.add(key);
+    return true;
+  });
+  const subscriptionSignature = JSON.stringify(subscriptionTargets);
+  const primaryTargetSignature = JSON.stringify(subscriptionTargets[0] ?? null);
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
@@ -204,6 +241,9 @@ export function useChatWebSocket({
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
   const socketRef = useRef<WebSocket | null>(null);
+  const desiredTargetsRef = useRef(subscriptionTargets);
+  const subscriptionControlRef = useRef<SubscriptionControl | null>(null);
+  const connectionGenerationRef = useRef(0);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
     onMessageUpdatedRef.current = onMessageUpdated;
@@ -213,6 +253,9 @@ export function useChatWebSocket({
     onSubscriptionErrorRef.current = onSubscriptionError;
     onSubscribedRef.current = onSubscribed;
   });
+  useLayoutEffect(() => {
+    desiredTargetsRef.current = JSON.parse(subscriptionSignature) as WSSubscriptionTarget[];
+  }, [subscriptionSignature]);
 
   const toggleReaction = useCallback((messageId: string, emoji: string) => {
     const socket = socketRef.current;
@@ -222,15 +265,13 @@ export function useChatWebSocket({
   }, []);
 
   useEffect(() => {
-    if (!normalizedTargetId) return;
-
-    const targetType: "channel" | "dm" = kind === "channel" ? "channel" : "dm";
+    const primaryTarget = JSON.parse(primaryTargetSignature) as WSSubscriptionTarget | null;
+    if (!primaryTarget) return;
+    const primaryTargetKey = subscriptionTargetKey(primaryTarget);
     let closed = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
-    let subscriptionRecoveryTimer: number | null = null;
     let reconnectAttempt = 0;
-    let subscriptionRecoveryAttempts = 0;
 
     const clearReconnectTimer = () => {
       if (reconnectTimer === null) return;
@@ -238,41 +279,66 @@ export function useChatWebSocket({
       reconnectTimer = null;
     };
 
-    const clearSubscriptionRecoveryTimer = () => {
-      if (subscriptionRecoveryTimer === null) return;
-      window.clearTimeout(subscriptionRecoveryTimer);
-      subscriptionRecoveryTimer = null;
+    const currentSubscriptionControl = (socket: WebSocket) => {
+      const control = subscriptionControlRef.current;
+      return !closed && ws === socket && control?.socket === socket ? control : null;
     };
 
-    const sendSubscribe = (socket: WebSocket) => {
-      if (closed || ws !== socket || socket.readyState !== WebSocket.OPEN) return;
-      socket.send(
-        JSON.stringify({
-          type: "subscribe",
-          target_type: targetType,
-          target_id: normalizedTargetId,
-        }),
-      );
+    const clearSubscriptionRecoveryTimer = (control: SubscriptionControl | null) => {
+      if (!control || control.timer === null) return;
+      window.clearTimeout(control.timer);
+      control.timer = null;
+    };
+
+    const completeSubscriptionRecovery = (control: SubscriptionControl) => {
+      if (control.pending.size > 0) return false;
+      clearSubscriptionRecoveryTimer(control);
+      control.attempts = 0;
+      return true;
+    };
+
+    const sendSubscribe = (socket: WebSocket, targetKeys?: Iterable<string>) => {
+      const control = currentSubscriptionControl(socket);
+      if (!control || socket.readyState !== WebSocket.OPEN) return;
+      const keys = targetKeys ?? control.expected.keys();
+      for (const key of keys) {
+        const target = control.expected.get(key);
+        if (!target) continue;
+        socket.send(
+          JSON.stringify({
+            type: "subscribe",
+            target_type: target.kind,
+            target_id: target.targetId,
+          }),
+        );
+      }
     };
 
     const scheduleSubscriptionRecovery = (socket: WebSocket) => {
+      const control = currentSubscriptionControl(socket);
       if (
-        closed ||
-        ws !== socket ||
+        !control ||
         socket.readyState !== WebSocket.OPEN ||
-        subscriptionRecoveryTimer !== null ||
-        subscriptionRecoveryAttempts >= MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS
+        control.timer !== null ||
+        control.attempts >= MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS
       ) {
         return;
       }
+      if (control.pending.size === 0) {
+        control.confirmed.clear();
+        control.primaryAcknowledgement = null;
+        for (const key of control.expected.keys()) control.pending.add(key);
+      }
       const delay = Math.min(
-        RECONNECT_BASE_DELAY_MS * 2 ** subscriptionRecoveryAttempts,
+        RECONNECT_BASE_DELAY_MS * 2 ** control.attempts,
         RECONNECT_MAX_DELAY_MS,
       );
-      subscriptionRecoveryAttempts += 1;
-      subscriptionRecoveryTimer = window.setTimeout(() => {
-        subscriptionRecoveryTimer = null;
-        sendSubscribe(socket);
+      control.attempts += 1;
+      control.timer = window.setTimeout(() => {
+        const activeControl = currentSubscriptionControl(socket);
+        if (!activeControl || activeControl.generation !== control.generation) return;
+        activeControl.timer = null;
+        sendSubscribe(socket, activeControl.pending);
       }, delay);
     };
 
@@ -308,15 +374,45 @@ export function useChatWebSocket({
 
       ws = socket;
       socketRef.current = socket;
+      const generation = ++connectionGenerationRef.current;
+      const initialExpected = new Map(
+        desiredTargetsRef.current.map((target) => [subscriptionTargetKey(target), target]),
+      );
+      subscriptionControlRef.current = {
+        generation,
+        socket,
+        expected: initialExpected,
+        pending: new Set(initialExpected.keys()),
+        confirmed: new Set(),
+        primaryAcknowledgement: null,
+        attempts: 0,
+        timer: null,
+      };
 
       socket.onopen = () => {
         if (closed || ws !== socket) return;
         reconnectAttempt = 0;
+        const expected = new Map(
+          desiredTargetsRef.current.map((target) => [subscriptionTargetKey(target), target]),
+        );
+        const control: SubscriptionControl = {
+          generation,
+          socket,
+          expected,
+          pending: new Set(expected.keys()),
+          confirmed: new Set(),
+          primaryAcknowledgement: null,
+          attempts: 0,
+          timer: null,
+        };
+        clearSubscriptionRecoveryTimer(subscriptionControlRef.current);
+        subscriptionControlRef.current = control;
         sendSubscribe(socket);
       };
 
       socket.onmessage = (event: MessageEvent<unknown>) => {
-        if (closed || ws !== socket) return;
+        const control = currentSubscriptionControl(socket);
+        if (!control || control.generation !== generation) return;
         let data: unknown;
         try {
           data = JSON.parse(event.data as string);
@@ -327,16 +423,24 @@ export function useChatWebSocket({
         const d = data as Record<string, unknown>;
         const incomingTargetId =
           typeof d["target_id"] === "string" ? normalizeChatTargetId(d["target_id"]) : "";
+        const incomingTargetType =
+          d["target_type"] === "channel" || d["target_type"] === "dm" ? d["target_type"] : "";
+        const incomingTargetKey = `${incomingTargetType}:${incomingTargetId}`;
         const normalizedData = incomingTargetId ? { ...d, target_id: incomingTargetId } : d;
         if (
           d["type"] === "subscribed" &&
           d["operation"] === "subscribe" &&
-          d["target_type"] === targetType &&
-          incomingTargetId === normalizedTargetId
+          control.expected.has(incomingTargetKey)
         ) {
-          clearSubscriptionRecoveryTimer();
-          subscriptionRecoveryAttempts = 0;
-          onSubscribedRef.current?.(normalizedData as unknown as WSSubscribedEvent);
+          const acknowledgement = normalizedData as unknown as WSSubscribedEvent;
+          const wasPending = control.pending.delete(incomingTargetKey);
+          control.confirmed.add(incomingTargetKey);
+          if (incomingTargetKey === primaryTargetKey) {
+            control.primaryAcknowledgement = acknowledgement;
+          }
+          if (wasPending && completeSubscriptionRecovery(control)) {
+            onSubscribedRef.current?.(control.primaryAcknowledgement ?? acknowledgement);
+          }
           return;
         }
         if (d["type"] === "error" && typeof d["code"] === "string") {
@@ -354,11 +458,14 @@ export function useChatWebSocket({
           onReactionErrorRef.current?.(clientError);
           return;
         }
-        // Filter: only process events for the active target.
-        if (d["target_type"] !== targetType || incomingTargetId !== normalizedTargetId) return;
+        if (!control.expected.has(incomingTargetKey)) return;
         if (d["type"] === "message.created") {
           onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
-        } else if (d["type"] === "message.updated" && isMessageUpdatedEvent(normalizedData)) {
+          return;
+        }
+        // Mutating actions remain scoped to the primary target.
+        if (incomingTargetKey !== primaryTargetKey) return;
+        if (d["type"] === "message.updated" && isMessageUpdatedEvent(normalizedData)) {
           onMessageUpdatedRef.current?.(normalizedData);
         } else if (d["type"] === "reaction.updated") {
           onReactionRef.current?.(normalizedData as unknown as WSReactionUpdatedEvent);
@@ -374,7 +481,9 @@ export function useChatWebSocket({
 
       socket.onclose = () => {
         if (closed || ws !== socket) return;
-        clearSubscriptionRecoveryTimer();
+        const control = currentSubscriptionControl(socket);
+        clearSubscriptionRecoveryTimer(control);
+        if (subscriptionControlRef.current === control) subscriptionControlRef.current = null;
         scheduleReconnect();
       };
     };
@@ -384,20 +493,26 @@ export function useChatWebSocket({
     return () => {
       closed = true;
       clearReconnectTimer();
-      clearSubscriptionRecoveryTimer();
+      const control = subscriptionControlRef.current;
+      clearSubscriptionRecoveryTimer(control);
       if (ws) {
         const socket = ws;
         ws = null;
         socketRef.current = null;
+        if (subscriptionControlRef.current?.socket === socket) {
+          subscriptionControlRef.current = null;
+        }
         if (socket.readyState === WebSocket.OPEN) {
           try {
-            socket.send(
-              JSON.stringify({
-                type: "unsubscribe",
-                target_type: targetType,
-                target_id: normalizedTargetId,
-              }),
-            );
+            for (const target of control?.expected.values() ?? desiredTargetsRef.current) {
+              socket.send(
+                JSON.stringify({
+                  type: "unsubscribe",
+                  target_type: target.kind,
+                  target_id: target.targetId,
+                }),
+              );
+            }
           } catch {
             // Ignore send errors during cleanup.
           }
@@ -409,7 +524,49 @@ export function useChatWebSocket({
         socket.close();
       }
     };
-  }, [kind, normalizedTargetId]);
+  }, [primaryTargetSignature]);
+
+  useEffect(() => {
+    const control = subscriptionControlRef.current;
+    if (!control || control.socket.readyState !== WebSocket.OPEN) return;
+
+    const targets = JSON.parse(subscriptionSignature) as WSSubscriptionTarget[];
+    const nextTargets = new Map(targets.map((target) => [subscriptionTargetKey(target), target]));
+    const hadPendingTargets = control.pending.size > 0;
+    for (const [key, target] of control.expected) {
+      if (nextTargets.has(key)) continue;
+      control.expected.delete(key);
+      control.pending.delete(key);
+      control.confirmed.delete(key);
+      control.socket.send(
+        JSON.stringify({
+          type: "unsubscribe",
+          target_type: target.kind,
+          target_id: target.targetId,
+        }),
+      );
+    }
+    for (const [key, target] of nextTargets) {
+      if (control.expected.has(key)) continue;
+      control.expected.set(key, target);
+      control.pending.add(key);
+      control.socket.send(
+        JSON.stringify({
+          type: "subscribe",
+          target_type: target.kind,
+          target_id: target.targetId,
+        }),
+      );
+    }
+    if (control.pending.size === 0) {
+      if (control.timer !== null) window.clearTimeout(control.timer);
+      control.timer = null;
+      control.attempts = 0;
+      if (hadPendingTargets && control.primaryAcknowledgement) {
+        onSubscribedRef.current?.(control.primaryAcknowledgement);
+      }
+    }
+  }, [subscriptionSignature]);
 
   return { toggleReaction };
 }
