@@ -25,7 +25,7 @@ interface RequireAuthProps {
 
 export default function RequireAuth({ children }: RequireAuthProps) {
   const [authState, setAuthState] = useState<AuthState>(initialAuthState);
-  const refreshStarted = useRef(false);
+  const refreshPromise = useRef<ReturnType<typeof refresh> | null>(null);
   const location = useLocation();
 
   useEffect(() => {
@@ -35,12 +35,13 @@ export default function RequireAuth({ children }: RequireAuthProps) {
   }, []);
 
   useEffect(() => {
-    if (authState !== "checking" || refreshStarted.current) return;
+    if (authState !== "checking") return;
 
-    refreshStarted.current = true;
+    const pendingRefresh = refreshPromise.current ?? refresh();
+    refreshPromise.current = pendingRefresh;
     let cancelled = false;
 
-    refresh()
+    pendingRefresh
       .then(({ accessToken }) => {
         if (cancelled) return;
         setTokens(accessToken);
