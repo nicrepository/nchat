@@ -52,6 +52,11 @@ if sed -n '/nchat-chat-https:/,/nchat-files:/p' "$TRAEFIK_DYNAMIC_CONFIG" | grep
   exit 1
 fi
 
+# Issue #425: validates that the local gateway, every Kubernetes overlay, the
+# Go router and the frontend agree on the /api/auth contract. Runs before the
+# Docker-dependent checks below, which exit early when Docker is absent.
+bash "$ROOT_DIR/scripts/ci/auth-route-contract-check.sh"
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker not found; skipping Docker-based gateway config validation."
   echo "Gateway config check passed."
