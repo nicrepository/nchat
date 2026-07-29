@@ -4,6 +4,7 @@ package httpapi_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,10 +24,19 @@ type fakeInviteManager struct {
 	acceptErr    error
 	createGot    domain.AdminInviteInput
 	acceptGot    domain.AcceptInviteInput
+
+	bootstrapGot   domain.BootstrapInviteInput
+	bootstrapCalls int
 }
 
 func (f *fakeInviteManager) CreateInvite(_ context.Context, input domain.AdminInviteInput) (domain.InviteResult, error) {
 	f.createGot = input
+	return f.createResult, f.createErr
+}
+
+func (f *fakeInviteManager) CreateBootstrapInvite(_ context.Context, input domain.BootstrapInviteInput) (domain.InviteResult, error) {
+	f.bootstrapGot = input
+	f.bootstrapCalls++
 	return f.createResult, f.createErr
 }
 
@@ -35,11 +45,26 @@ func (f *fakeInviteManager) AcceptInvite(_ context.Context, input domain.AcceptI
 	return f.acceptResult, f.acceptErr
 }
 
+// Issue #425: the handler reads its workspace and actor from the context the
+// guard chain builds. These direct-handler tests exercise it in isolation, so
+// they stand in for the guard.
+const (
+	inviteRetryAfterSeconds = 600
+	handlerWorkspaceID      = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+	handlerActorID          = "3f1c2d4e-5a6b-4c8d-9e0f-1a2b3c4d5e6f"
+)
+
+func adminInviteRequest(body io.Reader) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthAdminInvites, body)
+	req.Header.Set("Content-Type", "application/json")
+	return httpapi.WithAdminContext(req, handlerWorkspaceID, handlerActorID)
+}
+
 func TestAdminCreateInviteSuccessReturnsSafeSummary(t *testing.T) {
 	svc := &fakeInviteManager{createResult: domain.InviteResult{ID: "invite-1", Email: "user@example.com", CreatedAt: time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)}}
-	handler := httpapi.AdminCreateInvite(svc)
+	handler := httpapi.AdminCreateInvite(svc, inviteRetryAfterSeconds)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User","full_name":"User Full"}`))
+	req := adminInviteRequest(strings.NewReader(`{"email":"user@example.com","display_name":"User","full_name":"User Full"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -57,9 +82,9 @@ func TestAdminCreateInviteSuccessReturnsSafeSummary(t *testing.T) {
 
 func TestAdminCreateInviteDuplicateOrPendingReturns409(t *testing.T) {
 	for _, err := range []error{domain.ErrDuplicateEmail, domain.ErrInviteAlreadyPending} {
-		handler := httpapi.AdminCreateInvite(&fakeInviteManager{createErr: err})
+		handler := httpapi.AdminCreateInvite(&fakeInviteManager{createErr: err}, inviteRetryAfterSeconds)
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
+		req := adminInviteRequest(strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
 
 		handler.ServeHTTP(rec, req)
 
@@ -70,9 +95,9 @@ func TestAdminCreateInviteDuplicateOrPendingReturns409(t *testing.T) {
 }
 
 func TestAdminCreateInviteOutboxUnavailableReturns503(t *testing.T) {
-	handler := httpapi.AdminCreateInvite(&fakeInviteManager{createErr: domain.ErrEmailOutboxUnavailable})
+	handler := httpapi.AdminCreateInvite(&fakeInviteManager{createErr: domain.ErrEmailOutboxUnavailable}, inviteRetryAfterSeconds)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
+	req := adminInviteRequest(strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
 
 	handler.ServeHTTP(rec, req)
 
@@ -93,6 +118,8 @@ func TestAdminCreateInviteGuardRejectsMissingOrWrongToken(t *testing.T) {
 	cfg.AdminBootstrapToken = "expected-credential"
 	router = httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, &fakeInviteManager{}, nil, nil, nil, nil, nil)
 	rec = httptest.NewRecorder()
+	// Deliberately the bootstrap route, not the browser one: this asserts the
+	// bootstrap-token guard still rejects a wrong token.
 	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAdminInvites, strings.NewReader(`{"email":"user@example.com","display_name":"User"}`))
 	req.Header.Set("X-NChat-Admin-Token", "wrong-credential")
 	router.ServeHTTP(rec, req)
@@ -192,7 +219,7 @@ func TestAuthAcceptInviteRouterRateLimitsPublicEndpoint(t *testing.T) {
 }
 
 func TestAuthInviteHandlersUnavailableReturn503(t *testing.T) {
-	for _, handler := range []http.Handler{httpapi.AdminCreateInvite(nil), httpapi.AuthAcceptInvite(nil)} {
+	for _, handler := range []http.Handler{httpapi.AdminCreateInvite(nil, inviteRetryAfterSeconds), httpapi.AuthAcceptInvite(nil)} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthInvitesAccept, strings.NewReader(`{}`))
 		handler.ServeHTTP(rec, req)

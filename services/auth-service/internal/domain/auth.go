@@ -79,17 +79,55 @@ type ResetPasswordInput struct {
 }
 
 // AdminInviteInput carries admin-created email invite data.
+//
+// WorkspaceID and ActorID are authority, not data: both are derived from the
+// caller's session by the HTTP guard and neither is representable in the
+// request body. An invite is meaningless without them — it is what decides the
+// membership the invited person receives — so CreateInvite rejects an input
+// missing either rather than falling back to a default workspace.
 type AdminInviteInput struct {
+	WorkspaceID string
+	ActorID     string
 	Email       string
 	DisplayName string
 	FullName    string
 }
 
+// BootstrapInviteIssuer is the ActorID of an invite created through the
+// bootstrap credential rather than by a signed-in administrator.
+//
+// It is the empty string on purpose, and the meaning is explicit rather than
+// incidental: there is no human actor, so auth.user_invites.invited_by_user_id
+// is stored as NULL. That NULL is the audit record — "issued by the bootstrap
+// credential, before this workspace had an administrator" — and it is not
+// reachable from any browser request, because every session-scoped path fills
+// ActorID from the JWT subject and CreateInvite rejects an empty one.
+const BootstrapInviteIssuer = ""
+
+// BootstrapInviteInput is the payload of a bootstrap invite. It carries no
+// workspace and no actor: both are decided server-side, which is what stops the
+// bootstrap credential from being pointed at an arbitrary tenant.
+type BootstrapInviteInput struct {
+	Email       string
+	DisplayName string
+	FullName    string
+}
+
+// InviteRateLimit bounds how many invites one actor may create in one
+// workspace inside a rolling window. Counted in the database rather than in
+// process memory so the budget holds across replicas.
+type InviteRateLimit struct {
+	MaxPerWindow  int
+	WindowMinutes int
+}
+
 // InviteResult is the safe invite metadata returned after admin invite creation.
+// It carries no token or hash — those never leave the outbox handoff.
 type InviteResult struct {
-	ID        string
-	Email     string
-	CreatedAt time.Time
+	ID          string
+	Email       string
+	WorkspaceID string
+	CreatedAt   time.Time
 }
 
 // AcceptInviteInput carries the public invite acceptance payload.

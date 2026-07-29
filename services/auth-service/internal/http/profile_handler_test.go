@@ -45,6 +45,9 @@ func (routerUsersUnused) CreateUser(context.Context, domain.CreateUserInput) (do
 func (routerUsersUnused) UpdateUserStatus(context.Context, string, string, string) (domain.User, error) {
 	return domain.User{}, nil
 }
+func (routerUsersUnused) GetAdminWorkspaceID(context.Context, string) (string, error) {
+	return "", domain.ErrForbidden
+}
 
 func profileRouter(t *testing.T, reader *stubProfileReader) http.Handler {
 	t.Helper()

@@ -56,3 +56,43 @@ func TestTargetAwareRateLimiterCapsBucketsByEvictingOldest(t *testing.T) {
 		t.Fatal("expected oldest target bucket to be evicted")
 	}
 }
+
+// ── Hourly limiter (issue #425) ────────────────────────────────────────────
+
+// The invite IP ceiling is stated per hour. Reusing the per-minute constructor
+// would have made 30/hour into 30/minute — a sixty-fold weaker control.
+func TestNewHourlyEndpointRateLimiter_AllowsTheWholeHourlyBudgetThenBlocks(t *testing.T) {
+	limiter := NewHourlyEndpointRateLimiter(5, nil)
+
+	for i := 0; i < 5; i++ {
+		if !limiter.allow("198.51.100.7") {
+			t.Fatalf("request %d of the hourly budget must be allowed", i+1)
+		}
+	}
+	if limiter.allow("198.51.100.7") {
+		t.Fatal("the request past the hourly budget must be rejected")
+	}
+}
+
+// Budgets are per key: one caller exhausting theirs must not block another.
+func TestNewHourlyEndpointRateLimiter_IsolatesKeys(t *testing.T) {
+	limiter := NewHourlyEndpointRateLimiter(1, nil)
+
+	if !limiter.allow("198.51.100.7") {
+		t.Fatal("first caller must be allowed")
+	}
+	if limiter.allow("198.51.100.7") {
+		t.Fatal("first caller must now be over budget")
+	}
+	if !limiter.allow("203.0.113.9") {
+		t.Fatal("a different caller must have its own budget")
+	}
+}
+
+func TestNewHourlyEndpointRateLimiter_NonPositiveFallsBackToDefault(t *testing.T) {
+	if limiter := NewHourlyEndpointRateLimiter(0, nil); limiter == nil {
+		t.Fatal("expected a limiter even for a non-positive budget")
+	} else if !limiter.allow("198.51.100.7") {
+		t.Fatal("the fallback budget must allow a first request")
+	}
+}

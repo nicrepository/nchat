@@ -173,8 +173,12 @@ Substituir `<ADMIN_BOOTSTRAP_TOKEN>` pelo valor do secret de staging (nunca hard
 **Objetivo:** demonstrar o fluxo RF-46 — admin cria convite → usuário ativa conta.
 
 > ⚠️ **Dependência de email:** Igual à recuperação de senha.
-> **Requer `ADMIN_BOOTSTRAP_TOKEN`:** A criação do convite usa o endpoint bootstrap,
-> que **não** é acessível pelo browser. Use o script CLI abaixo antes do demo.
+> **Endpoint de inicialização (issue #433):** o passo abaixo usa
+> `POST /admin/invites`, que só funciona enquanto o workspace ainda **não** tem
+> owner/admin ativo. Exige `ADMIN_BOOTSTRAP_TOKEN` **e**
+> `AUTH_BOOTSTRAP_WORKSPACE_ID` configurados; sem os dois responde `503`.
+> O workspace vem da configuração (nunca do payload) e o emissor é registrado
+> como identidade de sistema (`invited_by_user_id` nulo).
 
 **Passo 1 — Criar convite (CLI, pré-demo):**
 
@@ -402,24 +406,24 @@ Resposta esperada: 204.
 
 ## Resultados esperados por fluxo
 
-| Fluxo               | Endpoint principal                    | Resposta esperada               |
-| ------------------- | ------------------------------------- | ------------------------------- |
-| Login manual        | `POST /auth/login`                    | 200 com tokens + user           |
-| Logout              | `POST /auth/logout`                   | 204                             |
-| Forgot password     | `POST /auth/password/forgot`          | 202                             |
-| Reset password      | `POST /auth/password/reset`           | 204                             |
-| Criar convite (CLI) | `POST /admin/invites`                 | 201 com invite id               |
-| Aceitar convite     | `POST /auth/invites/accept`           | 201 com user id                 |
-| SSO login           | `GET /auth/oidc/keycloak/login`       | 302 → Keycloak                  |
-| SSO callback        | `GET /auth/oidc/keycloak/callback`    | 302 → `/oidc-callback`          |
-| SSO exchange        | `POST /auth/oidc/keycloak/exchange`   | 200 com tokens + user           |
-| Refresh             | `POST /auth/refresh`                  | 200 com novos tokens            |
-| Listar sessões      | `GET /auth/me/sessions`               | 200 com array                   |
-| Revogar sessão      | `DELETE /auth/me/sessions/{id}`       | 204                             |
-| Revogar todas       | `DELETE /auth/me/sessions`            | 204                             |
-| Listar dispositivos | `GET /auth/me/devices`                | 200 com array                   |
-| Revogar dispositivo | `DELETE /auth/me/devices/{id}`        | 204                             |
-| Admin users (tela)  | `GET /admin/users` (não implementado) | estado vazio ou erro (esperado) |
+| Fluxo               | Endpoint principal                    | Resposta esperada                 |
+| ------------------- | ------------------------------------- | --------------------------------- |
+| Login manual        | `POST /auth/login`                    | 200 com tokens + user             |
+| Logout              | `POST /auth/logout`                   | 204                               |
+| Forgot password     | `POST /auth/password/forgot`          | 202                               |
+| Reset password      | `POST /auth/password/reset`           | 204                               |
+| Convite bootstrap   | `POST /admin/invites`                 | 201 antes do 1º admin; 503 depois |
+| Aceitar convite     | `POST /auth/invites/accept`           | 201 com user id                   |
+| SSO login           | `GET /auth/oidc/keycloak/login`       | 302 → Keycloak                    |
+| SSO callback        | `GET /auth/oidc/keycloak/callback`    | 302 → `/oidc-callback`            |
+| SSO exchange        | `POST /auth/oidc/keycloak/exchange`   | 200 com tokens + user             |
+| Refresh             | `POST /auth/refresh`                  | 200 com novos tokens              |
+| Listar sessões      | `GET /auth/me/sessions`               | 200 com array                     |
+| Revogar sessão      | `DELETE /auth/me/sessions/{id}`       | 204                               |
+| Revogar todas       | `DELETE /auth/me/sessions`            | 204                               |
+| Listar dispositivos | `GET /auth/me/devices`                | 200 com array                     |
+| Revogar dispositivo | `DELETE /auth/me/devices/{id}`        | 204                               |
+| Admin users (tela)  | `GET /admin/users` (não implementado) | estado vazio ou erro (esperado)   |
 
 ---
 

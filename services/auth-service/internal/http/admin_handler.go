@@ -36,6 +36,15 @@ type userResponse struct {
 	CreatedAt       string  `json:"created_at"`
 }
 
+// adminEndpointUnavailable is what the workspace administration routes serve
+// when the service booted without a database, token manager or session store.
+// It refuses rather than falling through to an unguarded handler.
+func adminEndpointUnavailable() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeUnavailable, "admin endpoint unavailable: database not configured")
+	})
+}
+
 // AdminCreateUser handles POST /admin/users.
 // Returns 503 if users service is nil (database not configured).
 func AdminCreateUser(users service.UserCreator) http.Handler {

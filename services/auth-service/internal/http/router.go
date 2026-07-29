@@ -83,12 +83,46 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAdminUsers, httputil.MethodNotAllowed(http.MethodPost,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateUser(users)),
 	))
+	inviteRetryAfterSeconds := cfg.AuthInviteRateLimitWindowMinutes * 60
 	mux.Handle(RouteAdminInvites, httputil.MethodNotAllowed(http.MethodPost,
-		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateInvite(invites)),
+		AdminBootstrapGuard(cfg.AdminBootstrapToken)(BootstrapCreateInvite(invites, inviteRetryAfterSeconds)),
 	))
 	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
 	))
+
+	// Browser-callable workspace administration. Unlike the bootstrap routes
+	// above, this authenticates a real session and authorizes against the
+	// caller's workspace membership, which is what makes the workspace and the
+	// actor on an invite server-derived rather than client-supplied.
+	//
+	// The guard chain is only assembled when every part of it exists. A
+	// missing token manager, session store or user service leaves the
+	// unguarded handler out of reach: the routes serve a refusal instead,
+	// which is what stops a partially-wired pod from exposing user data. Same
+	// shape as the /auth/me wiring below.
+	adminInvitesHandler := adminEndpointUnavailable()
+	if tokens != nil && users != nil && sessions != nil {
+		requireActive := RequireActiveSession(sessions)
+		requireAdmin := RequireWorkspaceAdmin(users)
+
+		// Invite creation carries two limits. The authoritative one is per
+		// (actor, workspace) and is counted in PostgreSQL inside the creating
+		// transaction, so it holds across replicas and cannot be raced — see
+		// storage.inviteBudgetExhaustedTx. This one is the complementary IP
+		// ceiling, reusing the same in-process limiter the other auth
+		// endpoints use; being per-process it is a coarse ceiling only, never
+		// the control the workspace budget provides.
+		//
+		// It sits inside the guard chain rather than in front of it so an
+		// unauthenticated request is rejected by BearerAuth first and cannot
+		// consume another tenant's IP budget.
+		inviteIPLimiter := NewHourlyEndpointRateLimiter(cfg.AuthInviteRateLimitPerIPPerHour, trustedProxyCIDRs)
+		adminInvitesHandler = BearerAuth(tokens)(requireActive(requireAdmin(
+			inviteIPLimiter.Middleware(AdminCreateInvite(invites, inviteRetryAfterSeconds)),
+		)))
+	}
+	mux.Handle(RouteAuthAdminInvites, httputil.MethodNotAllowed(http.MethodPost, adminInvitesHandler))
 	profileHandler := GetMyProfile(users)
 	if tokens != nil && users != nil {
 		requireActive := RequireActiveSession(sessions)

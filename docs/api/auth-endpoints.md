@@ -30,8 +30,95 @@ Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
 | 15  | DELETE | `/auth/me/devices/{device_id}`   | Bearer JWT + active session            | RF-53        |
 | 16  | PATCH  | `/auth/me/devices/{device_id}`   | Bearer JWT + active session            | RF-53        |
 | 17  | POST   | `/admin/users`                   | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
-| 18  | POST   | `/admin/invites`                 | Bootstrap-only (`X-NChat-Admin-Token`) | RF-46        |
+| 18  | POST   | `/admin/invites`                 | Bootstrap-only, initialization window  | RF-46        |
 | 19  | PATCH  | `/admin/users/{id}/status`       | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
+| 21  | POST   | `/auth/admin/invites`            | Bearer JWT + session + workspace admin | RF-46, RF-74 |
+
+---
+
+## Workspace-scoped invitations (issue #433)
+
+`POST /auth/admin/invites` is the browser-callable invite endpoint. It is
+guarded by `BearerAuth` → `RequireActiveSession` → `RequireWorkspaceAdmin`, in
+that order.
+
+`RequireWorkspaceAdmin` derives both the actor and the workspace server-side:
+the actor is the JWT subject, and the workspace is the one where that actor
+holds an **active** `owner` or `admin` membership in an **active** workspace
+(`chat.workspace_members`). No workspace identifier is accepted from the path,
+query, body or headers — the route carries none.
+
+| Condition                               | Status |
+| --------------------------------------- | ------ |
+| Missing/invalid token                   | `401`  |
+| Revoked or expired session              | `401`  |
+| Authenticated, administers no workspace | `403`  |
+| Service booted without a database       | `503`  |
+
+### `POST /auth/admin/invites`
+
+Creates an invite **bound to the caller's workspace**. Body: `email`,
+`display_name`, optional `full_name`. Any other field — including `role` or
+`workspace_id` — is ignored at decode time, so the endpoint cannot be used to
+grant privileges or to target another tenant.
+
+Responses: `201` (bare object `{id, email, created_at}`, matching the existing
+bootstrap invite contract), `400` invalid payload or e-mail, `409` conflict,
+`429` rate limited (with `Retry-After`), `503` e-mail handoff disabled.
+
+`409` is deliberately one code for three causes — the address already belongs
+to a member of this workspace, an invite is already pending for it here, or the
+partial unique index rejected a race. Distinguishing them would report whether
+an address is present in a workspace the caller may not administer.
+
+#### Workspace binding
+
+`auth.user_invites.workspace_id` (migration `auth/000008`, foreign key added in
+`chat/000019`) records the issuing workspace, and `invited_by_user_id` records
+the issuing admin. Both come from the session.
+
+Accepting an invite runs as one transaction: it locks the invite row
+`FOR UPDATE`, resolves or creates the global identity for the address, writes a
+`chat.workspace_members` row for **the invite's** workspace with role `member`,
+joins the workspace's `#geral` channel, and marks the invite accepted. A failure
+at any step rolls the whole thing back, so there is no state where an invite is
+consumed without a membership, or a membership exists while the token is still
+reusable.
+
+Identity stays global — one address is one account, with memberships in as many
+workspaces as invited it. Accepting an invite for an address that already has an
+account adds the membership and **does not** touch the existing password: the
+submitted password is only used when the acceptance creates the account.
+
+Consequences worth stating:
+
+- Two workspaces can invite the same address independently; neither blocks the
+  other, and the pending-invite uniqueness is per workspace.
+- An admin of workspace A can never produce a membership in workspace B.
+- Re-accepting an already-consumed token is rejected; a concurrent double
+  accept produces exactly one membership.
+
+#### Rate limiting
+
+| Control               | Scope             | Default       | Env var                                                                     |
+| --------------------- | ----------------- | ------------- | --------------------------------------------------------------------------- |
+| Authoritative budget  | actor × workspace | 10 per 10 min | `AUTH_INVITE_RATE_LIMIT_PER_ACTOR`, `AUTH_INVITE_RATE_LIMIT_WINDOW_MINUTES` |
+| Complementary ceiling | client IP         | 30 per hour   | `AUTH_INVITE_RATE_LIMIT_PER_IP_PER_HOUR`                                    |
+
+The authoritative budget is counted in PostgreSQL inside the creating
+transaction, under an advisory lock keyed by `(workspace, actor)`, so it holds
+across replicas and cannot be raced. The IP ceiling reuses the in-process
+limiter the other auth endpoints use and is a coarse complement only — it is
+per-process and does not survive multiple replicas.
+
+Values outside their permitted range fall back to the default rather than being
+clamped, so a typo cannot silently weaken the control.
+
+On rejection: `429`, `Retry-After` set to the window, and **nothing persisted** —
+no invite row, no outbox entry, therefore no e-mail. The invitee's address is
+never a rate-limit key, so nobody can be locked out by having someone else's
+invites throttled. The limiter runs after authentication and authorization, so
+an unauthorized caller is refused with `403` without consuming any budget.
 
 ---
 
@@ -789,8 +876,39 @@ and `device_fingerprint_hash` are never returned.
 
 **Auth requirement:** Bootstrap-only — `X-NChat-Admin-Token: <token>` header
 
-> ⚠️ Same bootstrap-only restriction as `/admin/users`.
-> Requires email handoff service to be configured (503 otherwise).
+> ⚠️ **Initialization only (issue #433).** This route exists to break a
+> chicken-and-egg: no HTTP route creates a workspace membership except invite
+> acceptance, so a fresh deployment has no owner/admin and every
+> session-scoped admin route answers `403`. Once the workspace has an active
+> owner or admin, use `POST /auth/admin/invites` instead — this one starts
+> refusing.
+>
+> It is **disabled unless both** `ADMIN_BOOTSTRAP_TOKEN` and
+> `AUTH_BOOTSTRAP_WORKSPACE_ID` are set. Requires email handoff (503 otherwise).
+
+**Server-side authority.** Neither the workspace nor the issuer is expressible
+in the request:
+
+| Value        | Source                                                                     |
+| ------------ | -------------------------------------------------------------------------- |
+| Workspace    | `AUTH_BOOTSTRAP_WORKSPACE_ID` — configuration only, never a lookup or body |
+| Issuer       | System identity; stored as `invited_by_user_id = NULL`                     |
+| Invitee role | Fixed `member` on acceptance, as for any invite                            |
+
+A `workspace_id`, `actor_id` or `role` in the body is discarded at decode time.
+
+**Lifecycle.** Refused with `503` when: not configured, or the target workspace
+already has an active owner/admin. Both report the same message and neither
+reveals which workspace or who administers it. A failure to determine that
+state is also a refusal — it fails closed rather than reopening the window.
+
+**Rate limit.** Same budget as the authenticated route, counted in PostgreSQL.
+Bootstrap invites share one budget per workspace, because they share one
+(NULL) issuer.
+
+**Operational disablement.** Unset `AUTH_BOOTSTRAP_WORKSPACE_ID` (or
+`ADMIN_BOOTSTRAP_TOKEN`) once the first administrator exists. The lifecycle
+check already refuses at that point, so unsetting is defence in depth.
 
 **Request body:**
 

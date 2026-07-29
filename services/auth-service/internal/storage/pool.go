@@ -18,3 +18,13 @@ type Pool interface {
 type queryer interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
+
+// txQueryer is the subset of pgx.Tx used by the helpers that make up a
+// multi-statement transaction. Taking it as a parameter is deliberate: it
+// forces every such helper to be handed the transaction it runs in, so none can
+// quietly open its own or reach for the pool. Committing and rolling back stay
+// with the function that began the transaction.
+type txQueryer interface {
+	queryer
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}

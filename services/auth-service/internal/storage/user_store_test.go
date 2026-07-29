@@ -561,3 +561,68 @@ func TestPGXUserStore_SuspendOIDCExchangeLifecycle(t *testing.T) {
 		}
 	})
 }
+
+// ── Workspace administration (issue #425) ──────────────────────────────────
+
+// The resolver is the tenant boundary for the admin API: it must ask only for
+// memberships that are active, in an active workspace, and carry an
+// administrative role. A caller matching none of that is forbidden, not empty.
+func TestPGXUserStore_GetAdminWorkspaceID_Success(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("actor-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	store := storage.NewPGXUserStore(mock)
+	workspaceID, err := store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	if err != nil {
+		t.Fatalf("GetAdminWorkspaceID: %v", err)
+	}
+	if workspaceID != "ws-1" {
+		t.Fatalf("expected ws-1, got %q", workspaceID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXUserStore_GetAdminWorkspaceID_NoAdminMembershipIsForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("member-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetAdminWorkspaceID(context.Background(), "member-1")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for a non-admin, got %v", err)
+	}
+}
+
+func TestPGXUserStore_GetAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("actor-1").
+		WillReturnError(errors.New("connection refused"))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	if err == nil || errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("an infrastructure failure must not read as forbidden, got %v", err)
+	}
+}

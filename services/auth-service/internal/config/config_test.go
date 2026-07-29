@@ -363,3 +363,85 @@ func TestValidateOIDCRequiresRelativeFrontendCallbackPath(t *testing.T) {
 		})
 	}
 }
+
+// ── Invite rate limit bounds (issue #425) ──────────────────────────────────
+
+func TestLoad_InviteRateLimitDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.AuthInviteRateLimitPerActor != 10 {
+		t.Fatalf("expected 10 invites per actor, got %d", cfg.AuthInviteRateLimitPerActor)
+	}
+	if cfg.AuthInviteRateLimitWindowMinutes != 10 {
+		t.Fatalf("expected a 10 minute window, got %d", cfg.AuthInviteRateLimitWindowMinutes)
+	}
+	if cfg.AuthInviteRateLimitPerIPPerHour != 30 {
+		t.Fatalf("expected 30 invites per IP per hour, got %d", cfg.AuthInviteRateLimitPerIPPerHour)
+	}
+}
+
+func TestLoad_InviteRateLimitAcceptsValuesInRange(t *testing.T) {
+	t.Setenv("AUTH_INVITE_RATE_LIMIT_PER_ACTOR", "25")
+	t.Setenv("AUTH_INVITE_RATE_LIMIT_WINDOW_MINUTES", "60")
+	t.Setenv("AUTH_INVITE_RATE_LIMIT_PER_IP_PER_HOUR", "100")
+
+	cfg := Load()
+
+	if cfg.AuthInviteRateLimitPerActor != 25 || cfg.AuthInviteRateLimitWindowMinutes != 60 || cfg.AuthInviteRateLimitPerIPPerHour != 100 {
+		t.Fatalf("expected the configured limits, got %+v", cfg)
+	}
+}
+
+// Out-of-range values fall back to the default. Accepting them would let a
+// typo disable a control; clamping would hide the mistake.
+func TestLoad_InviteRateLimitRejectsOutOfRangeValues(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		key   string
+		value string
+		want  func(Config) int
+		def   int
+	}{
+		{"actor zero", "AUTH_INVITE_RATE_LIMIT_PER_ACTOR", "0", func(c Config) int { return c.AuthInviteRateLimitPerActor }, 10},
+		{"actor negative", "AUTH_INVITE_RATE_LIMIT_PER_ACTOR", "-5", func(c Config) int { return c.AuthInviteRateLimitPerActor }, 10},
+		{"actor above max", "AUTH_INVITE_RATE_LIMIT_PER_ACTOR", "100000", func(c Config) int { return c.AuthInviteRateLimitPerActor }, 10},
+		{"window zero", "AUTH_INVITE_RATE_LIMIT_WINDOW_MINUTES", "0", func(c Config) int { return c.AuthInviteRateLimitWindowMinutes }, 10},
+		{"window above max", "AUTH_INVITE_RATE_LIMIT_WINDOW_MINUTES", "5000", func(c Config) int { return c.AuthInviteRateLimitWindowMinutes }, 10},
+		{"ip zero", "AUTH_INVITE_RATE_LIMIT_PER_IP_PER_HOUR", "0", func(c Config) int { return c.AuthInviteRateLimitPerIPPerHour }, 30},
+		{"ip above max", "AUTH_INVITE_RATE_LIMIT_PER_IP_PER_HOUR", "999999", func(c Config) int { return c.AuthInviteRateLimitPerIPPerHour }, 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			if got := tc.want(Load()); got != tc.def {
+				t.Fatalf("expected fallback %d, got %d", tc.def, got)
+			}
+		})
+	}
+}
+
+// ── Bootstrap workspace (issue #425) ───────────────────────────────────────
+
+// Empty by default: enabling a route guarded by a pre-shared credential must be
+// an explicit operator decision, not something a deployment inherits.
+func TestLoad_BootstrapWorkspaceDisabledByDefault(t *testing.T) {
+	if got := Load().AuthBootstrapWorkspaceID; got != "" {
+		t.Fatalf("expected the bootstrap workspace to be unset by default, got %q", got)
+	}
+}
+
+func TestLoad_BootstrapWorkspaceIsTrimmed(t *testing.T) {
+	t.Setenv("AUTH_BOOTSTRAP_WORKSPACE_ID", "  00000000-0000-0000-0000-000000000001  ")
+
+	if got := Load().AuthBootstrapWorkspaceID; got != "00000000-0000-0000-0000-000000000001" {
+		t.Fatalf("expected the trimmed workspace id, got %q", got)
+	}
+}
+
+// Whitespace-only is not a configured workspace.
+func TestLoad_BootstrapWorkspaceBlankStaysDisabled(t *testing.T) {
+	t.Setenv("AUTH_BOOTSTRAP_WORKSPACE_ID", "   ")
+
+	if got := Load().AuthBootstrapWorkspaceID; got != "" {
+		t.Fatalf("expected a blank value to leave the bootstrap disabled, got %q", got)
+	}
+}

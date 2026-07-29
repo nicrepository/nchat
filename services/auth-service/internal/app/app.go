@@ -120,7 +120,13 @@ func New(cfg config.Config) (*App, error) {
 		auth = service.NewAuthService(tokens, storage.NewPGXSessionStore(pool))
 		login = service.NewLoginService(tokens, storage.NewPGXLoginStore(pool, service.VerifyPassword, service.RunDummyPasswordVerification))
 		password = service.NewPasswordResetService(tokens, storage.NewPGXPasswordResetStore(pool), service.WithPasswordResetOutboxEncryptor(emailOutboxEncryptor))
-		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool), service.WithInviteOutboxEncryptor(emailOutboxEncryptor))
+		invites = service.NewInviteService(tokens, storage.NewPGXInviteStore(pool),
+			service.WithInviteOutboxEncryptor(emailOutboxEncryptor),
+			service.WithInviteRateLimit(domain.InviteRateLimit{
+				MaxPerWindow:  cfg.AuthInviteRateLimitPerActor,
+				WindowMinutes: cfg.AuthInviteRateLimitWindowMinutes,
+			}),
+			service.WithBootstrapWorkspace(cfg.AuthBootstrapWorkspaceID))
 		loginAttempts = service.NewLoginAttemptsService(storage.NewPGXLoginAttemptsStore(pool))
 		deviceSessions = service.NewDeviceSessionService(storage.NewPGXDeviceSessionStore(pool))
 	}

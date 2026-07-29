@@ -73,6 +73,28 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDR
 	}
 }
 
+// NewHourlyEndpointRateLimiter builds the same token bucket with an hourly
+// budget instead of a per-minute one.
+//
+// Invite creation is measured per hour (issue #425): a per-minute figure low
+// enough to bound abuse would reject an admin onboarding a handful of people
+// in one sitting. The bucket refills at limitPerHour/60 tokens per minute and
+// starts full, so the whole hourly allowance may be spent at once and then
+// recovers gradually.
+//
+// The same in-memory caveat as NewTokenEndpointRateLimiter applies: this is a
+// per-process ceiling, complementary to a limit that actually holds across
+// replicas — never the primary control.
+func NewHourlyEndpointRateLimiter(limitPerHour int, trustedProxyCIDRs []*net.IPNet) *tokenEndpointRateLimiter {
+	if limitPerHour <= 0 {
+		limitPerHour = fallbackTokenEndpointRateLimitPerMinute
+	}
+	limiter := NewTokenEndpointRateLimiter(limitPerHour, limitPerHour, trustedProxyCIDRs)
+	limiter.limitPerMinute = float64(limitPerHour) / 60.0
+	limiter.burst = float64(limitPerHour)
+	return limiter
+}
+
 func (l *tokenEndpointRateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !l.allow(httputil.ClientIP(r, l.trustedProxyCIDRs)) {

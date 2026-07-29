@@ -29,6 +29,17 @@ type SelfProfileReader interface {
 	GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error)
 }
 
+// WorkspaceAdminResolver answers "which workspace does this caller
+// administer?" — the question that turns a session into authority.
+//
+// It is what lets the administrative endpoints derive the workspace and the
+// actor entirely server-side, instead of trusting either from the request.
+type WorkspaceAdminResolver interface {
+	// GetAdminWorkspaceID returns the workspace the caller administers, or
+	// ErrForbidden when they administer none.
+	GetAdminWorkspaceID(ctx context.Context, userID string) (string, error)
+}
+
 // UserAdmin is the combined interface used by the auth HTTP handlers. It also
 // carries the self-profile read so the router can serve GET /auth/me from the
 // same user service without a new constructor parameter.
@@ -36,6 +47,7 @@ type UserAdmin interface {
 	UserCreator
 	UserStatusManager
 	SelfProfileReader
+	WorkspaceAdminResolver
 }
 
 // UserService implements UserCreator and UserStatusManager.
@@ -96,4 +108,13 @@ func (s *UserService) UpdateUserStatus(ctx context.Context, callerID, targetID, 
 		return domain.User{}, domain.ErrForbidden
 	}
 	return s.store.UpdateUserStatus(ctx, targetID, newStatus)
+}
+
+// GetAdminWorkspaceID returns the workspace userID administers.
+//
+// The lookup is delegated unchanged: the authorization lives in the SQL, where
+// it holds atomically with the read, rather than in a check here that a later
+// caller could skip.
+func (s *UserService) GetAdminWorkspaceID(ctx context.Context, userID string) (string, error) {
+	return s.store.GetAdminWorkspaceID(ctx, userID)
 }
