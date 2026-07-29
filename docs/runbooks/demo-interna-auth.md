@@ -361,65 +361,86 @@ Resposta esperada: 204.
 
 ---
 
-### 8. Tela de usuários admin — fundação e status
+### 8. Tela de usuários admin — listagem e paginação
 
-**Objetivo:** demonstrar a tela de admin (`/admin/users`) e o estado atual da fundação de status.
+**Objetivo:** demonstrar a administração de usuários pelo browser: listar os
+usuários do workspace e paginar.
+
+**Pré-requisito:** a conta de demonstração precisa ser `owner` ou `admin` **do
+workspace**. Um `member` ou `guest` recebe `403` — isso faz parte da demo.
+
+**Contratos usados nesta tela**
+
+| Camada          | Caminho                                           |
+| --------------- | ------------------------------------------------- |
+| Browser         | `GET /api/auth/admin/users?limit=50[&cursor=...]` |
+| Gateway/Ingress | reescreve `/api/auth/<resto>` → `/auth/<resto>`   |
+| auth-service    | `GET /auth/admin/users`                           |
 
 **Fluxo:**
 
-1. Fazer login com conta que tenha acesso à rota `/admin` (qualquer usuário autenticado no MVP).
-2. Navegar para `/admin/users`.
-3. A tela chama `GET /api/admin/users` (Bearer JWT), mas esse endpoint **não está implementado
-   no backend atual**. Dependendo da resposta (404 ou 405), a página mostrará o estado vazio
-   ("Nenhum usuário disponível") ou o estado de erro. Ambos os estados fazem parte da demo.
-4. Mostrar filtros (Todos / Ativos / Suspensos) e busca por nome/email.
-5. Mostrar badges de status (Ativo / Suspenso) e origem (manual / oidc) no layout da tabela.
-6. Mostrar que os botões **Suspender / Ativar** estão desabilitados (`disabled`, `aria-disabled="true"`).
+1. Fazer login com uma conta `owner`/`admin` do workspace.
+2. Navegar para `/admin/users`. A tabela carrega a primeira página (50 usuários).
+3. Mostrar filtros (Todos / Ativos / Suspensos) e busca por nome/email.
+4. Mostrar badges de status (Ativo / Suspenso) e origem (manual / oidc).
+5. Se houver mais de 50 usuários, mostrar **Carregar mais usuários** e o aviso
+   de que os filtros consideram apenas o que já foi carregado.
+6. Fazer login com um `member` e repetir o passo 2 para ver o `403`.
 
 **O que explicar:**
 
-- `GET /admin/users` não está implementado no backend. A tela demonstra o shell de
-  administração, o layout da tabela, os filtros e a busca — não dados reais do servidor.
-- Não usar `curl` com `X-NChat-Admin-Token` para "preencher" a lista na demo; isso contornaria
-  a limitação correta e exigiria expor o token bootstrap no browser.
-- A mutação de status (`PATCH /admin/users/{id}/status`) existe no backend,
-  mas está protegida pelo `X-NChat-Admin-Token` (bootstrap guard), que **não é seguro para uso
-  no browser**. Os botões ficam desabilitados até que um guard JWT/RBAC de admin (RF-74)
-  seja implementado.
-- Filtros "Admins" e "Convites pendentes" mostram estado vazio — dados de role/invite
-  não são retornados pelo endpoint atual.
-- O botão **"Convidar usuário"** também está desabilitado no frontend (funcionalidade não
-  disponível nesta versão da tela).
+- A listagem é **paginada** (`limit` padrão 50, máximo 100, cursor opaco). Um
+  endpoint sem limite permitiria a qualquer administrador forçar o serviço a
+  materializar todos os membros do workspace.
+- O workspace vem da sessão. A requisição não carrega `workspace_id`, e um
+  cursor de outro workspace é recusado com `400` genérico.
+- Erro de API nunca aparece como "Nenhum usuário disponível": `401`, `403`,
+  `429` e falhas de rede/servidor têm estados distintos, com **Tentar
+  novamente** quando repetir puder ajudar.
+- Falha ao carregar uma página seguinte **preserva** as linhas já exibidas e
+  não repete a requisição sozinha. Uma página que chega depois de um recarregar
+  é descartada, em vez de misturar duas listas.
+- Os botões **Suspender / Ativar** continuam desabilitados: a mutação de status
+  (`PATCH /admin/users/{id}/status`) ainda está protegida pelo
+  `X-NChat-Admin-Token`, que não é seguro no browser, e aguarda o guard de RBAC
+  do RF-74.
+- Filtros "Admins" e "Convites pendentes" mostram estado vazio — a listagem não
+  retorna papel nem convites pendentes.
+
+> ⚠️ **Convidar usuário depende da issue #433.** O botão e o formulário existem
+> nesta branch e chamam `POST /api/auth/admin/invites`, mas esse endpoint é
+> entregue pela branch da issue #433 (ciclo seguro de convites). Enquanto #433
+> não estiver integrada, o envio responde `404` e a tela mostra o erro
+> correspondente. A listagem — o `404` que originou a issue #425 — funciona de
+> forma independente.
 
 **Resultado esperado:**
 
-- Tela renderiza o shell de admin com tabela, filtros e busca.
-- Como `GET /admin/users` não está implementado no backend, a página exibe estado vazio
-  ("Nenhum usuário disponível") ou estado de erro — ambos são comportamentos corretos para a demo.
-- Botões de ação permanecem desabilitados — não há click handler.
+- `owner`/`admin` vê os usuários do workspace, paginados.
+- `member`/`guest` recebe `403` e vê o estado de permissão negada.
 
 ---
 
 ## Resultados esperados por fluxo
 
-| Fluxo               | Endpoint principal                    | Resposta esperada               |
-| ------------------- | ------------------------------------- | ------------------------------- |
-| Login manual        | `POST /auth/login`                    | 200 com tokens + user           |
-| Logout              | `POST /auth/logout`                   | 204                             |
-| Forgot password     | `POST /auth/password/forgot`          | 202                             |
-| Reset password      | `POST /auth/password/reset`           | 204                             |
-| Criar convite (CLI) | `POST /admin/invites`                 | 201 com invite id               |
-| Aceitar convite     | `POST /auth/invites/accept`           | 201 com user id                 |
-| SSO login           | `GET /auth/oidc/keycloak/login`       | 302 → Keycloak                  |
-| SSO callback        | `GET /auth/oidc/keycloak/callback`    | 302 → `/oidc-callback`          |
-| SSO exchange        | `POST /auth/oidc/keycloak/exchange`   | 200 com tokens + user           |
-| Refresh             | `POST /auth/refresh`                  | 200 com novos tokens            |
-| Listar sessões      | `GET /auth/me/sessions`               | 200 com array                   |
-| Revogar sessão      | `DELETE /auth/me/sessions/{id}`       | 204                             |
-| Revogar todas       | `DELETE /auth/me/sessions`            | 204                             |
-| Listar dispositivos | `GET /auth/me/devices`                | 200 com array                   |
-| Revogar dispositivo | `DELETE /auth/me/devices/{id}`        | 204                             |
-| Admin users (tela)  | `GET /admin/users` (não implementado) | estado vazio ou erro (esperado) |
+| Fluxo               | Endpoint principal                  | Resposta esperada          |
+| ------------------- | ----------------------------------- | -------------------------- |
+| Login manual        | `POST /auth/login`                  | 200 com tokens + user      |
+| Logout              | `POST /auth/logout`                 | 204                        |
+| Forgot password     | `POST /auth/password/forgot`        | 202                        |
+| Reset password      | `POST /auth/password/reset`         | 204                        |
+| Criar convite (CLI) | `POST /admin/invites`               | 201 com invite id          |
+| Aceitar convite     | `POST /auth/invites/accept`         | 201 com user id            |
+| SSO login           | `GET /auth/oidc/keycloak/login`     | 302 → Keycloak             |
+| SSO callback        | `GET /auth/oidc/keycloak/callback`  | 302 → `/oidc-callback`     |
+| SSO exchange        | `POST /auth/oidc/keycloak/exchange` | 200 com tokens + user      |
+| Refresh             | `POST /auth/refresh`                | 200 com novos tokens       |
+| Listar sessões      | `GET /auth/me/sessions`             | 200 com array              |
+| Revogar sessão      | `DELETE /auth/me/sessions/{id}`     | 204                        |
+| Revogar todas       | `DELETE /auth/me/sessions`          | 204                        |
+| Listar dispositivos | `GET /auth/me/devices`              | 200 com array              |
+| Revogar dispositivo | `DELETE /auth/me/devices/{id}`      | 204                        |
+| Admin users (tela)  | `GET /api/auth/admin/users`         | 200 com página de usuários |
 
 ---
 
@@ -429,7 +450,6 @@ Resposta esperada: 204.
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `must_change_password` flow não implementado              | Login com `must_change_password: true` mostra aviso e impede sessão; não redireciona para troca de senha real |
 | Tela de sessões/dispositivos não implementada no frontend | Revogação só via `curl` / API direta                                                                          |
-| `GET /admin/users` não implementado no backend            | Tela admin mostra estado vazio ou erro; não exibe lista real de usuários                                      |
 | Mutação de status de usuário não disponível no browser    | Botões desabilitados; requer `X-NChat-Admin-Token` via CLI                                                    |
 | Convite pelo browser não disponível                       | Botão "Convidar usuário" desabilitado; requer CLI                                                             |
 | Filtros "Admins" e "Convites pendentes" sem dados         | API não retorna dados de role/invite na listagem                                                              |
@@ -444,7 +464,7 @@ Resposta esperada: 204.
 > deixar claro que estão fora do escopo atual.
 
 - ❌ **Full RBAC** — não implementado. Não há papéis de admin diferenciados por JWT.
-- ❌ **RF-75 — admin browser flow completo** — não implementado. A tela existe em forma de fundação.
+- ⚠️ **RF-75 — admin browser flow completo** — parcial: a listagem paginada funciona pelo browser; a mutação de status e o convite ainda não (convite depende da issue #433).
 - ❌ **Azure AD / Google Workspace SSO** — não implementados. Keycloak é o único provedor.
 - ❌ **Troca obrigatória de senha** (`must_change_password`) — fluxo de UI não implementado.
 - ❌ **Notificação de novo dispositivo** (RF-54) — não implementado.

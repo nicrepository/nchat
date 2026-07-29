@@ -5,7 +5,25 @@
 > **not** implemented. Keycloak is the current and only SSO entry point.
 
 Base URL resolved at runtime via `VITE_AUTH_API_BASE_URL` (default: `/api/auth`).
-Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
+Browser-callable admin endpoints use `VITE_ADMIN_API_BASE_URL`
+(default: `/api/auth/admin`).
+
+> **Gateway note (issue #425).** `/api/admin` is routed to `admin-service`,
+> which serves no user endpoints — a client aiming there gets `404`. Every
+> browser-callable route on this service sits under `/auth/*`, and the gateways
+> rewrite `/api/auth/<rest>` to `/auth/<rest>` before the request reaches the
+> pod:
+>
+> | Layer                             | Rule                                                               |
+> | --------------------------------- | ------------------------------------------------------------------ |
+> | Local Traefik                     | `rewrite-auth-api-prefix` in `infra/traefik/local/dynamic.yml`     |
+> | k3s-dev / k3s-staging / nchat-dev | `Middleware auth-api-prefix`, referenced by the Ingress annotation |
+>
+> All four use the same `replacePathRegex` (`^/api/auth/(.*)` → `/auth/${1}`).
+> `scripts/ci/auth-route-contract-check.sh` renders every overlay and fails if
+> a middleware is missing, an overlay diverges, the backend adds an `/api/`
+> alias, or the frontend base drifts. Health probes are unaffected: Kubernetes
+> probes the pod directly on `/healthz`.
 
 ---
 
@@ -32,6 +50,90 @@ Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
 | 17  | POST   | `/admin/users`                   | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
 | 18  | POST   | `/admin/invites`                 | Bootstrap-only (`X-NChat-Admin-Token`) | RF-46        |
 | 19  | PATCH  | `/admin/users/{id}/status`       | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
+| 20  | GET    | `/auth/admin/users`              | Bearer JWT + session + workspace admin | RF-74        |
+
+---
+
+## Workspace user administration (issue #425)
+
+`GET /auth/admin/users` is what the **Configurações → Usuários** screen calls.
+It is guarded by `BearerAuth` → `RequireActiveSession` → `RequireWorkspaceAdmin`,
+in that order.
+
+`RequireWorkspaceAdmin` derives the workspace server-side: it is the one where
+the JWT subject holds an **active** `owner` or `admin` membership in an
+**active** workspace (`chat.workspace_members`). No workspace identifier is
+accepted from the path, query, body or headers — the route carries none.
+
+| Condition                               | Status |
+| --------------------------------------- | ------ |
+| Missing/invalid token                   | `401`  |
+| Revoked or expired session              | `401`  |
+| Authenticated, administers no workspace | `403`  |
+| Service booted without a database       | `503`  |
+
+### `GET /auth/admin/users`
+
+Lists one page of the caller's workspace. Members who left are excluded;
+suspended ones are included so they can be reactivated. Soft-deleted accounts
+never appear.
+
+**Query parameters**
+
+| Name     | Default | Rules                                                                      |
+| -------- | ------- | -------------------------------------------------------------------------- |
+| `limit`  | `50`    | 1–100. Above 100 is clamped to 100; `0`, negative or non-numeric is `400`. |
+| `cursor` | —       | Opaque token from a previous `next_cursor`. Invalid ⇒ `400`.               |
+
+The limit is bounded because an unpaginated listing lets any administrator
+force the service to materialise and serialise every member of a workspace
+(CWE-400). At most `limit + 1` rows are ever read — the extra row is what
+decides `has_more` without a second query.
+
+**Response — 200**
+
+```json
+{
+  "data": {
+    "data": [
+      {
+        "id": "…",
+        "email": "alice@example.com",
+        "display_name": "Alice",
+        "full_name": "Alice Andrade",
+        "status": "active",
+        "auth_source": "manual",
+        "created_at": "2026-01-15T10:00:00Z"
+      }
+    ],
+    "pagination": { "limit": 50, "next_cursor": "…", "has_more": true }
+  }
+}
+```
+
+The outer `data` is the service-wide envelope; the inner block mirrors the
+shape `GET /auth/me/login-attempts` already publishes, so the API has one
+pagination contract rather than two. `has_more` is redundant with
+`next_cursor` and is sent anyway so a client need not encode the rule that an
+empty cursor means the end; the two always agree.
+
+`full_name` is omitted when unset. No password hash, token, session, avatar,
+external subject, sort key or workspace identifier is returned.
+
+**Ordering and cursor.** Rows are ordered by
+`lower(coalesce(nullif(display_name, ''), email))` then by `id`. The `id`
+tiebreak makes the order total — without it two identical display names have
+an undefined relative position and a keyset cursor silently skips or repeats
+rows. Resumption uses a row-value comparison rather than `OFFSET`, so page N
+costs the same as page 1 and concurrent inserts cannot shift the window.
+
+The cursor is base64url of a versioned JSON object carrying the workspace, the
+sort key and the user id. It is opaque, not a capability: it names a position
+in a list the caller is already authorized to read. A cursor with an unknown
+version, an unknown field, or another workspace is rejected with a generic
+`400` — the message never says which, so a cursor cannot be used to probe for
+another tenant. A tampered cursor cannot widen the query either: the workspace
+filter comes from the session on every request, independently of the cursor.
 
 ---
 
