@@ -32,6 +32,15 @@ type UserStore interface {
 	// It is idempotent: clearing an already-empty avatar returns "" with no
 	// error, as long as the user exists and is active.
 	ClearAvatarURL(ctx context.Context, userID string) (previous string, err error)
+	// GetAdminWorkspaceID returns the workspace userID administers. It is the
+	// only source of workspace identity for the admin endpoints: nothing the
+	// browser sends reaches it. ErrForbidden when the caller administers no
+	// active workspace, which is also the answer for a plain member or guest.
+	GetAdminWorkspaceID(ctx context.Context, userID string) (string, error)
+	// ListWorkspaceUsers returns at most limit members of workspaceID, ordered
+	// deterministically and resuming after cursor when one is given. The caller
+	// must have obtained workspaceID from GetAdminWorkspaceID.
+	ListWorkspaceUsers(ctx context.Context, workspaceID string, limit int, cursor *domain.WorkspaceUserCursor) ([]domain.WorkspaceUser, error)
 }
 
 // PGXUserStore implements UserStore using a pgx connection pool.
@@ -283,4 +292,107 @@ func (s *PGXUserStore) swapAvatarURL(ctx context.Context, userID string, newValu
 		return "", nil
 	}
 	return *previous, nil
+}
+
+// GetAdminWorkspaceID resolves the workspace userID administers.
+//
+// This is the workspace-scoping decision for the whole admin API, taken from
+// the caller's own membership row and nothing else. The three conditions are
+// each load-bearing: the role check is the authorization (a member or guest
+// matches no row and gets ErrForbidden), the membership status check keeps a
+// suspended or departed admin out, and the workspace status check keeps an
+// archived workspace from being administered.
+//
+// A caller who administers several workspaces resolves to the oldest
+// membership, which is stable across calls, so the list and any follow-up
+// mutation always agree on one workspace.
+func (s *PGXUserStore) GetAdminWorkspaceID(ctx context.Context, userID string) (string, error) {
+	var workspaceID string
+	err := s.pool.QueryRow(ctx, `
+		SELECT wm.workspace_id::text
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		WHERE wm.user_id = $1::uuid
+		  AND wm.status = 'active'
+		  AND wm.role IN ('owner', 'admin')
+		ORDER BY wm.joined_at, wm.workspace_id
+		LIMIT 1`,
+		userID,
+	).Scan(&workspaceID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrForbidden
+		}
+		return "", fmt.Errorf("get admin workspace: %w", err)
+	}
+	return workspaceID, nil
+}
+
+// workspaceUserSortKey is the ordering expression, written once and reused by
+// the SELECT list, the WHERE clause and the ORDER BY. Repeating it by hand in
+// three places is how a keyset paginator starts skipping or repeating rows.
+const workspaceUserSortKey = `lower(coalesce(nullif(u.display_name, ''), u.email::text))`
+
+// ListWorkspaceUsers returns one page of the members of workspaceID.
+//
+// The join against chat.workspace_members is the tenant boundary: rows are
+// reachable only through a membership of the workspace passed in, so there is
+// no result set that spans workspaces even if auth.users holds accounts from
+// several — and no cursor value can widen it, because the workspace filter is
+// a separate, always-present predicate.
+//
+// Ordering is (sort key, id). The id tiebreak is what makes the order total:
+// two people with the same display name would otherwise have an undefined
+// relative position, and a keyset cursor over an unstable order silently skips
+// or repeats rows between pages.
+//
+// Resumption uses a row-value comparison rather than OFFSET, so page N costs
+// the same as page 1 and concurrent inserts cannot shift the window.
+//
+// Members who left are excluded; suspended ones are not, because deciding
+// whether to reactivate them is what the screen exists for. Soft-deleted
+// accounts never appear.
+func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID string, limit int, cursor *domain.WorkspaceUserCursor) ([]domain.WorkspaceUser, error) {
+	var cursorSortKey, cursorUserID any
+	if cursor != nil {
+		cursorSortKey = cursor.SortKey
+		cursorUserID = cursor.UserID
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.email::text, u.display_name, COALESCE(u.full_name, ''),
+		       u.status, u.auth_source, u.created_at,
+		       `+workspaceUserSortKey+` AS sort_key
+		FROM chat.workspace_members wm
+		JOIN auth.users u
+		  ON u.id = wm.user_id AND u.deleted_at IS NULL
+		WHERE wm.workspace_id = $1::uuid
+		  AND wm.status <> 'left'
+		  AND (
+		        $2::text IS NULL
+		     OR (`+workspaceUserSortKey+`, u.id::text) > ($2::text, $3::text)
+		      )
+		ORDER BY `+workspaceUserSortKey+`, u.id
+		LIMIT $4`,
+		workspaceID, cursorSortKey, cursorUserID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace users: %w", err)
+	}
+	defer rows.Close()
+
+	users := make([]domain.WorkspaceUser, 0)
+	for rows.Next() {
+		var u domain.WorkspaceUser
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.FullName,
+			&u.Status, &u.AuthSource, &u.CreatedAt, &u.SortKey); err != nil {
+			return nil, fmt.Errorf("scan workspace user: %w", err)
+		}
+		users = append(users, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspace users: %w", err)
+	}
+	return users, nil
 }

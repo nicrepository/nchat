@@ -89,6 +89,24 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
 	))
+
+	// Browser-callable workspace administration. Unlike the bootstrap routes
+	// above, this authenticates a real session and authorizes against the
+	// caller's workspace membership, which is what makes the workspace and the
+	// actor on an invite server-derived rather than client-supplied.
+	//
+	// The guard chain is only assembled when every part of it exists. A
+	// missing token manager, session store or user service leaves the
+	// unguarded handler out of reach: the routes serve a refusal instead,
+	// which is what stops a partially-wired pod from exposing user data. Same
+	// shape as the /auth/me wiring below.
+	adminUsersHandler := adminEndpointUnavailable()
+	if tokens != nil && users != nil && sessions != nil {
+		requireActive := RequireActiveSession(sessions)
+		requireAdmin := RequireWorkspaceAdmin(users)
+		adminUsersHandler = BearerAuth(tokens)(requireActive(requireAdmin(AdminListWorkspaceUsers(users))))
+	}
+	mux.Handle(RouteAuthAdminUsers, httputil.MethodNotAllowed(http.MethodGet, adminUsersHandler))
 	profileHandler := GetMyProfile(users)
 	if tokens != nil && users != nil {
 		requireActive := RequireActiveSession(sessions)

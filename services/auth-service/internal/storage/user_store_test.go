@@ -561,3 +561,227 @@ func TestPGXUserStore_SuspendOIDCExchangeLifecycle(t *testing.T) {
 		}
 	})
 }
+
+// ── Workspace administration (issue #425) ──────────────────────────────────
+
+// The resolver is the tenant boundary for the admin API: it must ask only for
+// memberships that are active, in an active workspace, and carry an
+// administrative role. A caller matching none of that is forbidden, not empty.
+func TestPGXUserStore_GetAdminWorkspaceID_Success(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("actor-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	store := storage.NewPGXUserStore(mock)
+	workspaceID, err := store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	if err != nil {
+		t.Fatalf("GetAdminWorkspaceID: %v", err)
+	}
+	if workspaceID != "ws-1" {
+		t.Fatalf("expected ws-1, got %q", workspaceID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXUserStore_GetAdminWorkspaceID_NoAdminMembershipIsForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("member-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetAdminWorkspaceID(context.Background(), "member-1")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for a non-admin, got %v", err)
+	}
+}
+
+func TestPGXUserStore_GetAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("actor-1").
+		WillReturnError(errors.New("connection refused"))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	if err == nil || errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("an infrastructure failure must not read as forbidden, got %v", err)
+	}
+}
+
+// ── Workspace user listing, keyset paginated (issues #425, #433) ───────────
+
+func workspaceUserRows() *pgxmock.Rows {
+	created := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
+	return pgxmock.NewRows([]string{
+		"id", "email", "display_name", "full_name", "status", "auth_source", "created_at", "sort_key",
+	}).
+		AddRow("u1", "alice@example.com", "Alice", "Alice Andrade", "active", "manual", created, "alice").
+		AddRow("u2", "bob@example.com", "Bob", "", "suspended", "oidc", created, "bob")
+}
+
+// The listing must be scoped by the workspace it was given and by nothing
+// else — that argument is what keeps one workspace's admin out of another's
+// member list. A nil cursor passes NULL, which the query's `$2 IS NULL` branch
+// turns into "start from the beginning".
+func TestPGXUserStore_ListWorkspaceUsers_FirstPageScopesToWorkspace(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", nil, nil, 51).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	users, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, nil)
+	if err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(users))
+	}
+	if users[0].Email != "alice@example.com" || users[0].FullName != "Alice Andrade" {
+		t.Fatalf("unexpected first row: %+v", users[0])
+	}
+	// The sort key travels with the row so the cursor resumes from exactly the
+	// position PostgreSQL ordered by.
+	if users[0].SortKey != "alice" || users[1].SortKey != "bob" {
+		t.Fatalf("expected sort keys to be carried out, got %q/%q", users[0].SortKey, users[1].SortKey)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A cursor resumes after (sortKey, id) — a row-value comparison, not OFFSET,
+// so page N costs the same as page 1 and concurrent inserts cannot shift it.
+func TestPGXUserStore_ListWorkspaceUsers_CursorResumesAfterPosition(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`\(lower\(coalesce.*u\.id::text\) > \(\$2::text, \$3::text\)`).
+		WithArgs("ws-1", "alice", "u1", 51).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.ListWorkspaceUsers(context.Background(), "ws-1", 51, &domain.WorkspaceUserCursor{
+		Version: 1, WorkspaceID: "ws-1", SortKey: "alice", UserID: "u1",
+	})
+	if err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The id tiebreak is what makes the order total: two people with the same
+// display name would otherwise have an undefined relative position, and a
+// keyset cursor over an unstable order silently skips or repeats rows.
+func TestPGXUserStore_ListWorkspaceUsers_OrdersDeterministicallyWithIDTiebreak(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`ORDER BY lower\(coalesce\(nullif\(u\.display_name, ''\), u\.email::text\)\), u\.id`).
+		WithArgs("ws-1", nil, nil, 51).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, nil); err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The limit is applied by the database, not by trimming in Go: the whole point
+// is never to materialise more than one page plus the lookahead row.
+func TestPGXUserStore_ListWorkspaceUsers_AppliesLimitInSQL(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`LIMIT \$4`).
+		WithArgs("ws-1", nil, nil, 11).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 11, nil); err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// An empty workspace yields an empty slice, never nil: the handler serialises
+// it straight to JSON, and null would reach the client as a distinct value.
+func TestPGXUserStore_ListWorkspaceUsers_EmptyIsNonNilSlice(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-empty", nil, nil, 51).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "full_name", "status", "auth_source", "created_at", "sort_key",
+		}))
+
+	store := storage.NewPGXUserStore(mock)
+	users, err := store.ListWorkspaceUsers(context.Background(), "ws-empty", 51, nil)
+	if err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if users == nil || len(users) != 0 {
+		t.Fatalf("expected a non-nil empty slice, got %v", users)
+	}
+}
+
+func TestPGXUserStore_ListWorkspaceUsers_QueryErrorIsReturned(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", nil, nil, 51).
+		WillReturnError(errors.New("relation does not exist"))
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, nil); err == nil {
+		t.Fatal("expected an error when the query fails")
+	}
+}
