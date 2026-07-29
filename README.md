@@ -417,7 +417,7 @@ Os servicos Go seguem uma estrutura interna padronizada:
 | -------------------- | -----------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | auth-service         |         8081 | /healthz, /readyz, /version, /auth/login, /auth/refresh, /auth/logout, /auth/password/forgot, /auth/password/reset, /admin/invites, /auth/invites/accept, /auth/me/login-attempts, /auth/me/sessions, /auth/me/devices, /auth/oidc/keycloak/login, /auth/oidc/keycloak/callback, /auth/oidc/keycloak/exchange |
 | chat-service         |         8082 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
-| file-service         |         8083 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
+| file-service         |         8083 | /healthz, /readyz, /version, POST /channels/{channelID}/attachments, POST /dm/{conversationID}/attachments, GET /attachments/{attachmentID}, GET /attachments/{attachmentID}/content                                                                                                                          |
 | notification-service |         8084 | /healthz, /readyz, /version (SMTP worker opt-in)                                                                                                                                                                                                                                                              |
 | admin-service        |         8085 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
 | search-service       |         8086 | /healthz, /readyz, /version                                                                                                                                                                                                                                                                                   |
@@ -426,6 +426,11 @@ Os servicos Go seguem uma estrutura interna padronizada:
 O endpoint de token do media-service e somente preparacao tecnica para chamadas da
 V1.0. Contrato, autorizacao, TTL e configuracao:
 [docs/api/media-livekit-token.md](docs/api/media-livekit-token.md).
+
+As rotas de anexo do file-service (RF-30/RF-32/RF-33) ficam atras de
+`FILE_UPLOADS_ENABLED` e respondem 503 enquanto o recurso estiver desligado.
+Contrato, autorizacao, limites, estados de scan e envelope encryption:
+[docs/api/file-attachments.md](docs/api/file-attachments.md).
 
 ## Auth data model
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -18,10 +19,16 @@ import (
 // Metrics are recorded only when cfg.MetricsEnabled is true.
 // Spans are created only when cfg.TracingEnabled is true.
 // Authorization, Cookie and request bodies are never recorded.
+//
+// Requests are attributed to their route template, never to the raw path.
+// Routes carry client-controlled segments (channel, conversation and
+// attachment ids), and this middleware runs before authentication, so labelling
+// by path would let an unauthenticated caller mint an unbounded number of
+// Prometheus series and span names simply by varying an id. The template is
+// only known after the router has matched, so recording happens on the way out.
 func HTTPMiddleware(cfg Config, m *Metrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			path := r.URL.Path
 			start := time.Now()
 
 			if cfg.MetricsEnabled && m != nil && m.inFlight != nil {
@@ -29,35 +36,52 @@ func HTTPMiddleware(cfg Config, m *Metrics) func(http.Handler) http.Handler {
 				defer m.inFlight.WithLabelValues(cfg.ServiceName).Dec()
 			}
 
-			ctx := r.Context()
 			var span trace.Span
 			if cfg.TracingEnabled {
-				ctx, span = otel.Tracer(cfg.ServiceName).Start(ctx, fmt.Sprintf("%s %s", r.Method, path))
-				span.SetAttributes(
-					attribute.String("http.method", r.Method),
-					attribute.String("http.route", path),
-					attribute.String("service.name", cfg.ServiceName),
-				)
-				defer span.End()
+				var ctx = r.Context()
+				// The span opens before the route is known, so it starts under a
+				// name that carries no path at all and is renamed on the way out.
+				ctx, span = otel.Tracer(cfg.ServiceName).Start(ctx, r.Method)
 				r = r.WithContext(ctx)
 			}
 
 			rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			// Deferred so an early return or a panic further down still records
+			// the request under a bounded route rather than being lost.
+			defer func() {
+				route := RouteTemplate(r)
+				status := strconv.Itoa(rw.statusCode)
+				recordRequestMetrics(cfg, m, r.Method, route, status, time.Since(start))
+				finishRequestSpan(cfg, span, r.Method, route, status)
+			}()
+
 			next.ServeHTTP(rw, r)
-
-			status := fmt.Sprintf("%d", rw.statusCode)
-			elapsed := time.Since(start).Seconds()
-
-			if cfg.MetricsEnabled && m != nil && m.requestsTotal != nil {
-				m.requestsTotal.WithLabelValues(cfg.ServiceName, r.Method, path, status).Inc()
-				m.requestDuration.WithLabelValues(cfg.ServiceName, r.Method, path, status).Observe(elapsed)
-			}
-
-			if cfg.TracingEnabled && span != nil {
-				span.SetAttributes(attribute.String("http.status_code", status))
-			}
 		})
 	}
+}
+
+func recordRequestMetrics(cfg Config, m *Metrics, method, route, status string, elapsed time.Duration) {
+	if !cfg.MetricsEnabled || m == nil || m.requestsTotal == nil {
+		return
+	}
+	// The counter and the histogram share the same normalised template so the
+	// two always describe the same set of series.
+	m.requestsTotal.WithLabelValues(cfg.ServiceName, method, route, status).Inc()
+	m.requestDuration.WithLabelValues(cfg.ServiceName, method, route, status).Observe(elapsed.Seconds())
+}
+
+func finishRequestSpan(cfg Config, span trace.Span, method, route, status string) {
+	if !cfg.TracingEnabled || span == nil {
+		return
+	}
+	span.SetName(method + " " + route)
+	span.SetAttributes(
+		attribute.String("http.method", method),
+		attribute.String("http.route", route),
+		attribute.String("http.status_code", status),
+		attribute.String("service.name", cfg.ServiceName),
+	)
+	span.End()
 }
 
 // responseWriter wraps http.ResponseWriter to capture the response status code.

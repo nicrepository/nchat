@@ -137,6 +137,14 @@ criar um. Mesma forma de divergencia registrada acima para RF-05.
 - Executar scan assincrono com ClamAV.
 - Bloquear download ate aprovacao do scan.
 
+O bloqueio de download ate a aprovacao do scan e controlado por
+`FILE_MALWARE_SCAN_REQUIRED` no file-service, cujo default e `true`. O valor
+`false` existe apenas para ambiente de desenvolvimento sem scanner e e
+recusado na inicializacao quando `APP_ENV` nao e um valor de desenvolvimento
+(`development`, `dev`, `local`, `test`, `nchat-dev`). A verificacao falha
+fechada: um `APP_ENV` desconhecido e tratado como ambiente implantado. Ver
+`docs/api/file-attachments.md`.
+
 ## Processo para vulnerabilidade Critical/High
 
 1. Criar issue restrita.

@@ -48,20 +48,27 @@ func NewMetrics(cfg Config) *Metrics {
 		return m
 	}
 
+	// The "route" label carries the router's route template, never a request
+	// path: a path contains client-controlled ids and would make the series
+	// count unbounded. It replaces the earlier "path" label, which held the raw
+	// path. Nothing consumed that label — the provisioned dashboard and the
+	// runbook queries aggregate by service and status only — so the rename
+	// carries no compatibility cost, and keeping both would have exported the
+	// same information twice.
 	m.requestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "nchat_http_requests_total",
-			Help: "Total HTTP requests by service, method, path and status.",
+			Help: "Total HTTP requests by service, method, route template and status.",
 		},
-		[]string{"service", "method", "path", "status"},
+		[]string{"service", "method", "route", "status"},
 	)
 	m.requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "nchat_http_request_duration_seconds",
-			Help:    "HTTP request duration in seconds.",
+			Help:    "HTTP request duration in seconds by service, method, route template and status.",
 			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"service", "method", "path", "status"},
+		[]string{"service", "method", "route", "status"},
 	)
 	m.inFlight = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
