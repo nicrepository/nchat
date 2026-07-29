@@ -16,6 +16,7 @@ import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
   type WSMessageUpdatedEvent,
+  type WSSubscriptionTarget,
 } from "./useChatWebSocket";
 
 // ── Mock WebSocket ────────────────────────────────────────────────────────────
@@ -72,6 +73,25 @@ function subscriptionCount(socket: FakeWebSocket): number {
   return socket.sentMessages.filter((message) => {
     const parsed = JSON.parse(message) as { type?: string };
     return parsed.type === "subscribe";
+  }).length;
+}
+
+function subscriptionCountFor(
+  socket: FakeWebSocket,
+  targetType: "channel" | "dm",
+  targetId: string,
+): number {
+  return socket.sentMessages.filter((message) => {
+    const parsed = JSON.parse(message) as {
+      type?: string;
+      target_type?: string;
+      target_id?: string;
+    };
+    return (
+      parsed.type === "subscribe" &&
+      parsed.target_type === targetType &&
+      parsed.target_id === targetId
+    );
   }).length;
 }
 
@@ -381,6 +401,209 @@ describe("useChatWebSocket", () => {
     expect(subscriptionCount(socket)).toBe(1);
     expect(onSubscribed).toHaveBeenCalledOnce();
     expect(onReactionError).not.toHaveBeenCalled();
+  });
+
+  it("keeps recovery pending for A when B acknowledges first", () => {
+    vi.useFakeTimers();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      socket.simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+      });
+      socket.simulateMessage(subscribed("dm", "dm-b"));
+      vi.advanceTimersByTime(250);
+    });
+
+    expect(subscriptionCountFor(socket, "channel", "ch-a")).toBe(2);
+    expect(subscriptionCountFor(socket, "dm", "dm-b")).toBe(1);
+
+    act(() => {
+      socket.simulateMessage(subscribed("channel", "ch-a"));
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(subscriptionCount(socket)).toBe(3);
+  });
+
+  it("tracks acknowledgements out of order and completes only after A", () => {
+    vi.useFakeTimers();
+    const onSubscribed = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+        onSubscribed,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      socket.simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+      });
+      socket.simulateMessage(subscribed("dm", "dm-b"));
+    });
+    expect(onSubscribed).not.toHaveBeenCalled();
+
+    act(() => {
+      socket.simulateMessage(subscribed("channel", "ch-a"));
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(onSubscribed).toHaveBeenCalledOnce();
+    expect(subscriptionCount(socket)).toBe(2);
+  });
+
+  it("does not complete the cycle when the primary target acknowledges before B", () => {
+    vi.useFakeTimers();
+    const onSubscribed = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+        onSubscribed,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => socket.simulateMessage(subscribed("channel", "ch-a")));
+    expect(onSubscribed).not.toHaveBeenCalled();
+
+    act(() => {
+      socket.simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+      });
+      vi.advanceTimersByTime(250);
+    });
+    expect(subscriptionCountFor(socket, "channel", "ch-a")).toBe(1);
+    expect(subscriptionCountFor(socket, "dm", "dm-b")).toBe(2);
+
+    act(() => {
+      socket.simulateMessage(subscribed("dm", "dm-b"));
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(onSubscribed).toHaveBeenCalledOnce();
+    expect(onSubscribed).toHaveBeenCalledWith(subscribed("channel", "ch-a"));
+    expect(subscriptionCount(socket)).toBe(3);
+  });
+
+  it("ignores a delayed acknowledgement from an older connection generation", () => {
+    vi.useFakeTimers();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+      }),
+    );
+    const oldSocket = FakeWebSocket.instances[0];
+    act(() => oldSocket.simulateOpen());
+    const delayedHandler = oldSocket.onmessage;
+
+    act(() => {
+      oldSocket.close();
+      vi.advanceTimersByTime(250);
+    });
+    const currentSocket = FakeWebSocket.instances[1];
+    act(() => currentSocket.simulateOpen());
+    act(() => {
+      currentSocket.simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+      });
+      delayedHandler?.(
+        new MessageEvent("message", {
+          data: JSON.stringify(subscribed("channel", "ch-a")),
+        }),
+      );
+      currentSocket.simulateMessage(subscribed("dm", "dm-b"));
+      vi.advanceTimersByTime(250);
+    });
+
+    expect(subscriptionCountFor(currentSocket, "channel", "ch-a")).toBe(2);
+    expect(subscriptionCountFor(currentSocket, "dm", "dm-b")).toBe(1);
+  });
+
+  it("updates additional targets on the current socket without duplicates or orphan timers", () => {
+    vi.useFakeTimers();
+    const targetB: WSSubscriptionTarget = { kind: "dm", targetId: "dm-b" };
+    const targetC: WSSubscriptionTarget = { kind: "channel", targetId: "ch-c" };
+    const { rerender, unmount } = renderHook(
+      ({ additionalTargets }: { additionalTargets: WSSubscriptionTarget[] }) =>
+        useChatWebSocket({
+          kind: "channel",
+          targetId: "ch-a",
+          additionalTargets,
+          onMessageCreated: vi.fn(),
+        }),
+      { initialProps: { additionalTargets: [targetB] } },
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    expect(subscriptionCount(socket)).toBe(2);
+    act(() => {
+      socket.simulateMessage(subscribed("channel", "ch-a"));
+      socket.simulateMessage(subscribed("dm", "dm-b"));
+    });
+
+    act(() => rerender({ additionalTargets: [targetB, targetC] }));
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(subscriptionCountFor(socket, "channel", "ch-a")).toBe(1);
+    expect(subscriptionCountFor(socket, "dm", "dm-b")).toBe(1);
+    expect(subscriptionCountFor(socket, "channel", "ch-c")).toBe(1);
+
+    act(() => {
+      socket.simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+      });
+      rerender({ additionalTargets: [targetB] });
+    });
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(
+      socket.sentMessages
+        .map((message) => JSON.parse(message))
+        .filter(
+          (message) =>
+            message.type === "unsubscribe" &&
+            message.target_type === "channel" &&
+            message.target_id === "ch-c",
+        ),
+    ).toHaveLength(1);
+    expect(subscriptionCount(socket)).toBe(3);
+
+    const commandCount = socket.sentMessages.length;
+    act(() => rerender({ additionalTargets: [{ ...targetB }] }));
+    expect(socket.sentMessages).toHaveLength(commandCount);
+
+    unmount();
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
   });
 
   it.each([
