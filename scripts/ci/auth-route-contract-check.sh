@@ -57,11 +57,13 @@ EXPECTED_REGEX = "^/api/auth/(.*)"
 EXPECTED_REPLACEMENT = "/auth/${1}"
 
 # The contract, stated once. Every layer below is checked against this.
+# The routes this check names explicitly. Keep it to a couple of representative
+# paths — the exhaustive check is derived from routes.go below, so this list
+# does not have to be updated every time a route is added, and does not
+# accidentally assert a route that belongs to a different change.
 CONTRACT = {
     "/api/auth/admin/users": "/auth/admin/users",
-    "/api/auth/admin/invites": "/auth/admin/invites",
     "/api/auth/login": "/auth/login",
-    "/api/auth/invites/accept": "/auth/invites/accept",
 }
 # Paths that must survive the middleware untouched: the annotation applies to
 # every router the shared Ingress generates, so a regex that is too broad would
@@ -187,6 +189,18 @@ for internal in CONTRACT.values():
 for alias in declared:
     if alias.startswith("/api/"):
         errors.append(f"auth-service router must not alias the public prefix: {alias}")
+
+# Every /auth/* route the router actually registers must be reachable through
+# the public prefix. Deriving this from routes.go rather than restating it
+# keeps the check exhaustive as routes come and go, and keeps it honest about
+# which branch it is running on.
+if distinct:
+    regex, replacement = next(iter(distinct))
+    for internal in sorted(r for r in declared if r.startswith("/auth/")):
+        public = "/api" + internal
+        got = rewrite(public, regex, replacement)
+        if got != internal:
+            errors.append(f"registered route {internal} is unreachable: {public} -> {got!r}")
 
 # The frontend must aim at the public contract, not at the internal path and
 # not at /api/admin (which is routed to admin-service and has no user routes).
