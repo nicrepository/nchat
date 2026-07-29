@@ -46,29 +46,45 @@ type WorkspaceUser struct {
 	Status      string
 	AuthSource  string
 	CreatedAt   time.Time
-	// SortKey is the value the listing is ordered by. It is carried out of the
-	// query rather than recomputed in Go so the cursor resumes from exactly the
-	// position the database ordered by, even for names whose lowercasing
-	// differs between PostgreSQL's collation and Go's.
-	SortKey string
 }
 
 // WorkspaceUserCursor is the keyset position of the workspace user listing.
 //
-// It carries its workspace so a cursor minted for one tenant is detectably not
-// usable in another. That check is defence in depth, not the boundary: the
-// query always filters by the workspace resolved from the session, so even an
-// accepted foreign cursor could only skip rows, never reveal another tenant's.
+// It names the last row of the previous page and nothing else. Deliberately it
+// does *not* carry the sort key: the sort key is the display name or, when that
+// is empty, the e-mail address — so putting it in the cursor put an
+// administrator's e-mail into a query string, and from there into gateway
+// access logs (CWE-532). The position is instead re-derived server-side from
+// UserID, which costs one primary-key lookup per page.
+//
+// What remains is two identifiers the caller already holds: their own workspace
+// and a user inside it. It carries its workspace so a cursor minted for one
+// tenant is detectably not usable in another — defence in depth, not the
+// boundary, since the query always filters by the workspace resolved from the
+// session.
 type WorkspaceUserCursor struct {
 	Version     int    `json:"v"`
 	WorkspaceID string `json:"workspaceId"`
-	SortKey     string `json:"sortKey"`
 	UserID      string `json:"userId"`
 }
 
 // WorkspaceUserCursorVersion is the only cursor layout this build accepts.
 // A cursor from a future version is rejected rather than guessed at.
 const WorkspaceUserCursorVersion = 1
+
+// WorkspaceUserCursorMaxEncodedBytes caps the encoded cursor before it is
+// decoded at all. The value is client-controlled, so a length check has to come
+// before any allocation or parsing; a legitimate cursor is well under 200 bytes.
+const WorkspaceUserCursorMaxEncodedBytes = 512
+
+// WorkspaceUserAnchor is the ordering position of the row a cursor points at.
+// Found is false when that row is no longer a member of the workspace, which
+// makes the cursor unusable rather than silently empty.
+type WorkspaceUserAnchor struct {
+	SortKey string
+	UserID  string
+	Found   bool
+}
 
 // WorkspaceUserPageLimits bound how many rows one page may carry.
 const (

@@ -101,12 +101,33 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	// which is what stops a partially-wired pod from exposing user data. Same
 	// shape as the /auth/me wiring below.
 	adminUsersHandler := adminEndpointUnavailable()
+	adminInvitesHandler := adminEndpointUnavailable()
 	if tokens != nil && users != nil && sessions != nil {
 		requireActive := RequireActiveSession(sessions)
 		requireAdmin := RequireWorkspaceAdmin(users)
-		adminUsersHandler = BearerAuth(tokens)(requireActive(requireAdmin(AdminListWorkspaceUsers(users))))
+
+		// The listing is read-only but not free: each page sorts the
+		// workspace's members, so an authenticated administrator could drive
+		// unbounded work by paging in a loop. The per-caller budget bounds how
+		// often that can happen. It is in-process, which is effective at the
+		// single replica this service runs today and a coarse ceiling beyond
+		// that — the durable fix for the per-page cost is an index, which
+		// needs a migration and is out of this branch's scope.
+		listReadLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, trustedProxyCIDRs)
+		adminUsersHandler = BearerAuth(tokens)(requireActive(requireAdmin(
+			listReadLimiter.Middleware(AdminListWorkspaceUsers(users)),
+		)))
+
+		// The browser invite endpoint. It shares the guard chain above, so the
+		// caller is a verified owner/admin of a real workspace rather than a
+		// holder of the shared bootstrap token. What the invite is *scoped to*
+		// is a separate change (issue #433); registering and guarding the route
+		// is what this one owes, and without it the screen's invite button
+		// answers 404 in every environment.
+		adminInvitesHandler = BearerAuth(tokens)(requireActive(requireAdmin(AdminCreateInvite(invites))))
 	}
 	mux.Handle(RouteAuthAdminUsers, httputil.MethodNotAllowed(http.MethodGet, adminUsersHandler))
+	mux.Handle(RouteAuthAdminInvites, httputil.MethodNotAllowed(http.MethodPost, adminInvitesHandler))
 	profileHandler := GetMyProfile(users)
 	if tokens != nil && users != nil {
 		requireActive := RequireActiveSession(sessions)

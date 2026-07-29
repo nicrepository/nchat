@@ -17,6 +17,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { getAccessToken, onAuthChange } from "../lib/authSession";
 import {
   ADMIN_USERS_PAGE_SIZE,
   type AdminErrorKind,
@@ -88,6 +89,47 @@ export function useAdminUsers(): AdminUsersQuery {
 
   /** True when this response is still the one the UI is waiting for. */
   const isCurrent = (generation: number) => generation === generationRef.current;
+
+  /**
+   * A session change also ends the current generation.
+   *
+   * Reload was not the only way the list could become the wrong list. Logging
+   * out and back in as somebody else — or switching workspace — leaves this
+   * screen mounted, so a request issued under the previous session could still
+   * resolve and call setState. The rows it carries are the previous
+   * workspace's, which is administrative PII for a tenant the current session
+   * may have no business seeing.
+   *
+   * Tokens are the observable proxy for "who is logged in": authSession
+   * notifies on every set and clear. On any change the in-flight work is
+   * invalidated and the table is emptied, then refetched only if a session
+   * remains. Clearing rather than keeping is deliberate — the safe state after
+   * an identity change is "nothing", not "the previous tenant's rows".
+   */
+  useEffect(() => {
+    let token = getAccessToken();
+    return onAuthChange(() => {
+      const next = getAccessToken();
+      if (next === token) return;
+      token = next;
+
+      generationRef.current += 1;
+      initialControllerRef.current?.abort();
+      loadMoreControllerRef.current?.abort();
+      loadMoreControllerRef.current = null;
+
+      setNextCursor(null);
+      setHasMore(false);
+      setLoadingMore(false);
+      setLoadMoreError(null);
+      setState({ kind: "loading" });
+      // Refetch only while signed in. After a logout there is nothing to fetch
+      // and the effect would just produce a 401.
+      if (next !== null) {
+        setReloadToken((n) => n + 1);
+      }
+    });
+  }, []);
 
   useEffect(() => {
     const generation = generationRef.current;

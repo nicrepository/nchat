@@ -361,21 +361,22 @@ Resposta esperada: 204.
 
 ---
 
-### 8. Tela de usuários admin — listagem e paginação
+### 8. Tela de usuários admin — listagem, paginação e convite
 
 **Objetivo:** demonstrar a administração de usuários pelo browser: listar os
-usuários do workspace e paginar.
+usuários do workspace, paginar e convidar.
 
 **Pré-requisito:** a conta de demonstração precisa ser `owner` ou `admin` **do
 workspace**. Um `member` ou `guest` recebe `403` — isso faz parte da demo.
 
 **Contratos usados nesta tela**
 
-| Camada          | Caminho                                           |
-| --------------- | ------------------------------------------------- |
-| Browser         | `GET /api/auth/admin/users?limit=50[&cursor=...]` |
-| Gateway/Ingress | reescreve `/api/auth/<resto>` → `/auth/<resto>`   |
-| auth-service    | `GET /auth/admin/users`                           |
+| Camada          | Caminho                                             |
+| --------------- | --------------------------------------------------- |
+| Browser         | `GET /api/auth/admin/users?limit=50[&cursor=...]`   |
+| Browser         | `POST /api/auth/admin/invites`                      |
+| Gateway/Ingress | reescreve `/api/auth/<resto>` → `/auth/<resto>`     |
+| auth-service    | `GET /auth/admin/users`, `POST /auth/admin/invites` |
 
 **Fluxo:**
 
@@ -385,7 +386,8 @@ workspace**. Um `member` ou `guest` recebe `403` — isso faz parte da demo.
 4. Mostrar badges de status (Ativo / Suspenso) e origem (manual / oidc).
 5. Se houver mais de 50 usuários, mostrar **Carregar mais usuários** e o aviso
    de que os filtros consideram apenas o que já foi carregado.
-6. Fazer login com um `member` e repetir o passo 2 para ver o `403`.
+6. Clicar em **Convidar usuário**, preencher e-mail e nome, e enviar.
+7. Fazer login com um `member` e repetir o passo 2 para ver o `403`.
 
 **O que explicar:**
 
@@ -400,6 +402,11 @@ workspace**. Um `member` ou `guest` recebe `403` — isso faz parte da demo.
 - Falha ao carregar uma página seguinte **preserva** as linhas já exibidas e
   não repete a requisição sozinha. Uma página que chega depois de um recarregar
   é descartada, em vez de misturar duas listas.
+- O convite usa `POST /api/auth/admin/invites`, protegido pela mesma cadeia
+  sessão + owner/admin da listagem. Após o envio a tela recarrega a **primeira**
+  página pela fonte canônica; o convidado só aparece depois de aceitar.
+- Trocar de sessão (logout/login) com a tela aberta descarta qualquer resposta
+  em voo e limpa a tabela — dados do workspace anterior não reaparecem.
 - Os botões **Suspender / Ativar** continuam desabilitados: a mutação de status
   (`PATCH /admin/users/{id}/status`) ainda está protegida pelo
   `X-NChat-Admin-Token`, que não é seguro no browser, e aguarda o guard de RBAC
@@ -407,17 +414,16 @@ workspace**. Um `member` ou `guest` recebe `403` — isso faz parte da demo.
 - Filtros "Admins" e "Convites pendentes" mostram estado vazio — a listagem não
   retorna papel nem convites pendentes.
 
-> ⚠️ **Convidar usuário depende da issue #433.** O botão e o formulário existem
-> nesta branch e chamam `POST /api/auth/admin/invites`, mas esse endpoint é
-> entregue pela branch da issue #433 (ciclo seguro de convites). Enquanto #433
-> não estiver integrada, o envio responde `404` e a tela mostra o erro
-> correspondente. A listagem — o `404` que originou a issue #425 — funciona de
-> forma independente.
+> **Escopo do convite.** Esta branch entrega a rota e sua proteção. Vincular o
+> convite ao workspace emissor e criar a membership no aceite é a issue #433;
+> até lá o aceite cria a conta sem membership, como já ocorre em
+> `POST /admin/invites`.
 
 **Resultado esperado:**
 
 - `owner`/`admin` vê os usuários do workspace, paginados.
 - `member`/`guest` recebe `403` e vê o estado de permissão negada.
+- Convite válido retorna `201` e a tela recarrega pela fonte canônica.
 
 ---
 
@@ -464,7 +470,7 @@ workspace**. Um `member` ou `guest` recebe `403` — isso faz parte da demo.
 > deixar claro que estão fora do escopo atual.
 
 - ❌ **Full RBAC** — não implementado. Não há papéis de admin diferenciados por JWT.
-- ⚠️ **RF-75 — admin browser flow completo** — parcial: a listagem paginada funciona pelo browser; a mutação de status e o convite ainda não (convite depende da issue #433).
+- ⚠️ **RF-75 — admin browser flow completo** — parcial: listagem paginada e convite funcionam pelo browser; a mutação de status ainda não (RF-74).
 - ❌ **Azure AD / Google Workspace SSO** — não implementados. Keycloak é o único provedor.
 - ❌ **Troca obrigatória de senha** (`must_change_password`) — fluxo de UI não implementado.
 - ❌ **Notificação de novo dispositivo** (RF-54) — não implementado.

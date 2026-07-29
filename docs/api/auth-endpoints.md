@@ -51,6 +51,7 @@ Browser-callable admin endpoints use `VITE_ADMIN_API_BASE_URL`
 | 18  | POST   | `/admin/invites`                 | Bootstrap-only (`X-NChat-Admin-Token`) | RF-46        |
 | 19  | PATCH  | `/admin/users/{id}/status`       | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
 | 20  | GET    | `/auth/admin/users`              | Bearer JWT + session + workspace admin | RF-74        |
+| 21  | POST   | `/auth/admin/invites`            | Bearer JWT + session + workspace admin | RF-46, RF-74 |
 
 ---
 
@@ -127,13 +128,51 @@ an undefined relative position and a keyset cursor silently skips or repeats
 rows. Resumption uses a row-value comparison rather than `OFFSET`, so page N
 costs the same as page 1 and concurrent inserts cannot shift the window.
 
-The cursor is base64url of a versioned JSON object carrying the workspace, the
-sort key and the user id. It is opaque, not a capability: it names a position
-in a list the caller is already authorized to read. A cursor with an unknown
-version, an unknown field, or another workspace is rejected with a generic
-`400` — the message never says which, so a cursor cannot be used to probe for
-another tenant. A tampered cursor cannot widen the query either: the workspace
-filter comes from the session on every request, independently of the cursor.
+The cursor is base64url of a versioned JSON object carrying **only** the
+workspace id and the id of the last row of the previous page. It deliberately
+does not carry the sort key: that value is a display name or, when that is
+empty, an e-mail address, so including it put administrative PII into a query
+string and from there into gateway access logs. The ordering position is
+re-derived server-side from the row id, at the cost of one primary-key lookup
+per page.
+
+Validation is total and its failures are indistinguishable. Rejected with a
+generic `400`: a token over 512 bytes (checked before any decode, since the
+value is client-controlled), invalid base64, unparseable JSON, an unknown
+field, a version other than the current one, an id that is not a UUID, a
+workspace other than the session's, and a row that has since left the workspace
+— the last one being "the position is unknown", not "there are no more
+results". The message never says which, so a cursor cannot be used to probe for
+another tenant.
+
+The cursor is not a capability and holds nothing secret: both values are
+identifiers the caller already has. A tampered cursor cannot widen the query —
+the workspace filter comes from the session on every request, independently of
+the cursor — so at most it moves the caller's position within the workspace
+they already administer.
+
+**Read budget.** The listing is rate limited per caller. Each page sorts the
+workspace's members, so paging in a loop is the way to make a read endpoint
+expensive; the budget bounds how often that can happen. The durable fix for the
+per-page cost is an index on the ordering expression, which needs a migration
+and is therefore not part of this change.
+
+### `POST /auth/admin/invites`
+
+Creates an invite. Body: `email`, `display_name`, optional `full_name`.
+
+Shares the guard chain above, so the caller is a verified `owner`/`admin` of a
+real workspace rather than a holder of the shared bootstrap token. Responses:
+`201` `{id, email, created_at}`, `400` invalid payload or e-mail, `409`
+duplicate e-mail or an invite already pending, `429` rate limited, `503` when
+the database or the e-mail handoff is unavailable. The response never carries
+the invite token — it reaches the invitee only through the encrypted outbox
+handoff.
+
+> **Scope note.** This change registers and guards the route. Binding an invite
+> to the issuing workspace, and creating the membership when it is accepted, is
+> issue #433; until that lands an accepted invite creates an account with no
+> workspace membership, exactly as `POST /admin/invites` does today.
 
 ---
 

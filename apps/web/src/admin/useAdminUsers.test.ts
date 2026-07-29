@@ -10,6 +10,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
+import { _resetListeners, clearTokens, setTokens } from "../lib/authSession";
 import type { AdminUser } from "./adminUsersApi";
 import { useAdminUsers } from "./useAdminUsers";
 
@@ -56,6 +57,9 @@ const RELOADED = [user("b1")];
 
 beforeEach(() => {
   mockListAdminUsers.mockReset();
+  _resetListeners();
+  sessionStorage.clear();
+  setTokens("session-A");
 });
 
 /** Renders the hook with a first page already loaded and a next page available. */
@@ -239,5 +243,138 @@ describe("useAdminUsers — normal paging", () => {
     await waitFor(() => expect(result.current.loadMoreError).toBeNull());
 
     expect(result.current.state).toEqual({ kind: "success", users: [...FIRST, user("c1")] });
+  });
+});
+
+describe("useAdminUsers — unmount", () => {
+  // The hook aborts on unmount; without a test, a regression in that cleanup
+  // would pass unnoticed.
+  it("applies nothing after unmounting with both requests pending", async () => {
+    const slowFirst = deferred<ReturnType<typeof pageOf>>();
+    mockListAdminUsers.mockReturnValueOnce(slowFirst.promise);
+    const { result, unmount } = renderHook(() => useAdminUsers());
+
+    const before = result.current.state;
+    unmount();
+
+    // Resolving after unmount must not throw, warn, or update anything.
+    await act(async () => {
+      slowFirst.resolve(pageOf(FIRST, "cursor-1"));
+      await slowFirst.promise;
+    });
+
+    expect(result.current.state).toEqual(before);
+  });
+
+  it("applies nothing when a pending loadMore resolves after unmount", async () => {
+    const stale = deferred<ReturnType<typeof pageOf>>();
+    const { result, unmount } = await renderWithFirstPage();
+
+    mockListAdminUsers.mockReturnValueOnce(stale.promise);
+    act(() => result.current.loadMore());
+
+    const before = result.current.state;
+    unmount();
+
+    await act(async () => {
+      stale.resolve(pageOf(STALE_SECOND, "cursor-stale"));
+      await stale.promise;
+    });
+
+    expect(result.current.state).toEqual(before);
+  });
+
+  it("swallows a rejection that arrives after unmount", async () => {
+    const stale = deferred<ReturnType<typeof pageOf>>();
+    const { result, unmount } = await renderWithFirstPage();
+
+    mockListAdminUsers.mockReturnValueOnce(stale.promise);
+    act(() => result.current.loadMore());
+    unmount();
+
+    await act(async () => {
+      stale.reject(new ApiRequestError(500, "internal_error", "boom"));
+      await stale.promise.catch(() => undefined);
+    });
+
+    expect(result.current.loadMoreError).toBeNull();
+  });
+});
+
+describe("useAdminUsers — session change", () => {
+  // The listing is administrative PII scoped to a workspace. A response issued
+  // under the previous session must never land in the table after the identity
+  // behind that session has changed.
+  it("discards a page issued before a re-login as someone else", async () => {
+    const slowFirst = deferred<ReturnType<typeof pageOf>>();
+    mockListAdminUsers.mockReturnValueOnce(slowFirst.promise);
+    const { result } = renderHook(() => useAdminUsers());
+
+    // Session A's request is in flight; the operator logs out and back in.
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(RELOADED, null));
+    act(() => {
+      clearTokens();
+      setTokens("session-B");
+    });
+
+    // Session A's page arrives late.
+    await act(async () => {
+      slowFirst.resolve(pageOf(FIRST, "cursor-1"));
+      await slowFirst.promise;
+    });
+
+    await waitFor(() => {
+      expect(result.current.state).toEqual({ kind: "success", users: RELOADED });
+    });
+    // Nothing from the previous session's workspace is on screen.
+    expect(result.current.state).not.toEqual({ kind: "success", users: FIRST });
+  });
+
+  it("discards a pending loadMore when the session changes", async () => {
+    const stale = deferred<ReturnType<typeof pageOf>>();
+    const { result } = await renderWithFirstPage();
+
+    mockListAdminUsers.mockReturnValueOnce(stale.promise);
+    act(() => result.current.loadMore());
+
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(RELOADED, null));
+    act(() => {
+      clearTokens();
+      setTokens("session-B");
+    });
+
+    await act(async () => {
+      stale.resolve(pageOf(STALE_SECOND, "cursor-stale"));
+      await stale.promise;
+    });
+
+    await waitFor(() => {
+      expect(result.current.state).toEqual({ kind: "success", users: RELOADED });
+    });
+    expect(result.current.loadMoreError).toBeNull();
+  });
+
+  // After a logout there is no session to fetch under: the table is emptied and
+  // no request is issued.
+  it("clears the table on logout without refetching", async () => {
+    const { result } = await renderWithFirstPage();
+    const callsBefore = mockListAdminUsers.mock.calls.length;
+
+    act(() => clearTokens());
+
+    expect(result.current.state).toEqual({ kind: "loading" });
+    expect(result.current.hasMore).toBe(false);
+    expect(mockListAdminUsers.mock.calls.length).toBe(callsBefore);
+  });
+
+  // Re-notifying with the same token is not an identity change.
+  it("ignores an auth notification that does not change the token", async () => {
+    const { result } = await renderWithFirstPage();
+    const callsBefore = mockListAdminUsers.mock.calls.length;
+
+    act(() => setTokens("session-A"));
+
+    expect(result.current.state).toEqual({ kind: "success", users: FIRST });
+    expect(mockListAdminUsers.mock.calls.length).toBe(callsBefore);
   });
 });

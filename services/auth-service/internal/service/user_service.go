@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
@@ -135,8 +136,11 @@ func (s *UserService) GetAdminWorkspaceID(ctx context.Context, userID string) (s
 //
 // base64url without padding, because the value travels in a query string and
 // the standard alphabet's "+" and "/" would need escaping. It is encoding, not
-// protection: the cursor is not a capability and carries nothing secret — it
-// names a position in a list the caller is already authorized to read.
+// protection, and it does not need to be: the token carries no secret and no
+// personal data — only the caller's own workspace and the id of a user inside
+// it. Tampering can at most move the caller's position within the workspace
+// they already administer, because the workspace filter is applied server-side
+// on every request regardless of the cursor.
 func encodeWorkspaceUserCursor(c domain.WorkspaceUserCursor) (string, error) {
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -157,6 +161,12 @@ func decodeWorkspaceUserCursor(cursorStr, workspaceID string) (*domain.Workspace
 	if cursorStr == "" {
 		return nil, nil
 	}
+	// Length first, before any decode or allocation: the value is entirely
+	// client-controlled, and a megabyte of base64 must cost a comparison rather
+	// than a parse.
+	if len(cursorStr) > domain.WorkspaceUserCursorMaxEncodedBytes {
+		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
+	}
 	raw, err := base64.RawURLEncoding.DecodeString(cursorStr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
@@ -169,11 +179,25 @@ func decodeWorkspaceUserCursor(cursorStr, workspaceID string) (*domain.Workspace
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
 	}
-	if c.Version != domain.WorkspaceUserCursorVersion || c.UserID == "" || c.WorkspaceID != workspaceID {
+	// Every field that the cursor's meaning depends on is checked. A cursor
+	// missing any of them is not a partially usable position — it is not a
+	// position at all, and must fail predictably rather than reach the query and
+	// produce an incoherent page.
+	if c.Version != domain.WorkspaceUserCursorVersion {
+		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
+	}
+	if !isUUID(c.UserID) || !isUUID(c.WorkspaceID) || c.WorkspaceID != workspaceID {
 		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
 	}
 	return &c, nil
 }
+
+// workspaceUserCursorUUID matches the canonical textual UUID form. Validating
+// shape here keeps a malformed identifier out of the ::uuid casts downstream,
+// where it would surface as a database error rather than a 400.
+var workspaceUserCursorUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func isUUID(s string) bool { return workspaceUserCursorUUID.MatchString(s) }
 
 // ListWorkspaceUsers returns one page of workspaceID's members.
 //
@@ -200,7 +224,24 @@ func (s *UserService) ListWorkspaceUsers(ctx context.Context, workspaceID string
 		return nil, "", err
 	}
 
-	users, err := s.store.ListWorkspaceUsers(ctx, workspaceID, limit+1, cursor)
+	// The cursor names a row; the position of that row is read from the
+	// database rather than carried in the token, so no display name or e-mail
+	// travels in the query string. A row that has since left the workspace has
+	// no position, which makes the cursor invalid rather than silently empty.
+	var anchor *domain.WorkspaceUserAnchor
+	if cursor != nil {
+		resolved, err := s.store.GetWorkspaceUserAnchor(ctx, workspaceID, cursor.UserID)
+		if err != nil {
+			return nil, "", err
+		}
+		if !resolved.Found {
+			return nil, "", fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
+		}
+		resolved.UserID = cursor.UserID
+		anchor = &resolved
+	}
+
+	users, err := s.store.ListWorkspaceUsers(ctx, workspaceID, limit+1, anchor)
 	if err != nil {
 		return nil, "", err
 	}
@@ -214,7 +255,6 @@ func (s *UserService) ListWorkspaceUsers(ctx context.Context, workspaceID string
 	next, err := encodeWorkspaceUserCursor(domain.WorkspaceUserCursor{
 		Version:     domain.WorkspaceUserCursorVersion,
 		WorkspaceID: workspaceID,
-		SortKey:     last.SortKey,
 		UserID:      last.ID,
 	})
 	if err != nil {

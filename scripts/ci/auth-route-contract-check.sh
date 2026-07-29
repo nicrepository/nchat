@@ -63,6 +63,7 @@ EXPECTED_REPLACEMENT = "/auth/${1}"
 # accidentally assert a route that belongs to a different change.
 CONTRACT = {
     "/api/auth/admin/users": "/auth/admin/users",
+    "/api/auth/admin/invites": "/auth/admin/invites",
     "/api/auth/login": "/auth/login",
 }
 # Paths that must survive the middleware untouched: the annotation applies to

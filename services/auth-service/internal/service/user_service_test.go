@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,10 @@ type fakeStore struct {
 	workspaceUsersErr error
 	gotWorkspaceID    string
 	gotLimit          int
-	gotCursor         *domain.WorkspaceUserCursor
+	gotAnchor         *domain.WorkspaceUserAnchor
+	anchorNotFound    bool
+	anchorErr         error
+	gotAnchorUserID   string
 
 	adminWorkspaceID  string
 	adminWorkspaceErr error
@@ -54,11 +58,21 @@ func (f *fakeStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProf
 	return domain.SelfProfile{}, nil
 }
 
-func (f *fakeStore) ListWorkspaceUsers(_ context.Context, workspaceID string, limit int, cursor *domain.WorkspaceUserCursor) ([]domain.WorkspaceUser, error) {
+func (f *fakeStore) ListWorkspaceUsers(_ context.Context, workspaceID string, limit int, anchor *domain.WorkspaceUserAnchor) ([]domain.WorkspaceUser, error) {
 	f.gotWorkspaceID = workspaceID
 	f.gotLimit = limit
-	f.gotCursor = cursor
+	f.gotAnchor = anchor
 	return f.workspaceUsers, f.workspaceUsersErr
+}
+
+// The anchor lookup replaces the sort key the cursor used to carry. Default is
+// "found", so the paging tests do not each have to opt in.
+func (f *fakeStore) GetWorkspaceUserAnchor(_ context.Context, _, userID string) (domain.WorkspaceUserAnchor, error) {
+	f.gotAnchorUserID = userID
+	if f.anchorErr != nil {
+		return domain.WorkspaceUserAnchor{}, f.anchorErr
+	}
+	return domain.WorkspaceUserAnchor{SortKey: "anchor-sort-key", Found: !f.anchorNotFound}, nil
 }
 
 func (f *fakeStore) GetAdminWorkspaceID(_ context.Context, userID string) (string, error) {
@@ -350,11 +364,20 @@ func TestUserService_GetAdminWorkspaceID_ForbiddenPropagates(t *testing.T) {
 
 const testWorkspaceID = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
 
+// A cursor now carries UUIDs only, and they are shape-checked.
+const anchorUserID = "3f1c2d4e-5a6b-4c8d-9e0f-1a2b3c4d5e6f"
+
+// Ids are real UUIDs: auth.users.id is a UUID column, and the cursor now
+// shape-checks the identifier it carries, so a fixture using "u01" would be
+// testing a value production never produces.
+func listUserID(i int) string {
+	return fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+}
+
 func listUsers(n int) []domain.WorkspaceUser {
 	out := make([]domain.WorkspaceUser, 0, n)
 	for i := 0; i < n; i++ {
-		id := fmt.Sprintf("u%02d", i)
-		out = append(out, domain.WorkspaceUser{ID: id, DisplayName: id, SortKey: id})
+		out = append(out, domain.WorkspaceUser{ID: listUserID(i), DisplayName: fmt.Sprintf("u%02d", i)})
 	}
 	return out
 }
@@ -406,8 +429,8 @@ func TestUserService_ListWorkspaceUsers_FullPageTrimsAndEmitsCursor(t *testing.T
 	if len(users) != 3 {
 		t.Fatalf("expected the extra row trimmed, got %d", len(users))
 	}
-	if users[2].ID != "u02" {
-		t.Fatalf("expected the page to end at u02, got %q", users[2].ID)
+	if users[2].ID != listUserID(2) {
+		t.Fatalf("expected the page to end at the third user, got %q", users[2].ID)
 	}
 	if next == "" {
 		t.Fatal("expected a cursor when another page exists")
@@ -422,8 +445,13 @@ func TestUserService_ListWorkspaceUsers_FullPageTrimsAndEmitsCursor(t *testing.T
 	if err := json.Unmarshal(raw, &c); err != nil {
 		t.Fatalf("cursor must be JSON: %v", err)
 	}
-	if c.Version != domain.WorkspaceUserCursorVersion || c.UserID != "u02" || c.SortKey != "u02" {
+	if c.Version != domain.WorkspaceUserCursorVersion || c.UserID != listUserID(2) {
 		t.Fatalf("unexpected cursor: %+v", c)
+	}
+	// The cursor must not carry the ordering value: it is a display name or an
+	// e-mail, and it would end up in a query string and in access logs.
+	if strings.Contains(string(raw), "sortKey") || strings.Contains(string(raw), "@") {
+		t.Fatalf("cursor must not carry the sort key or any address: %s", raw)
 	}
 	if c.WorkspaceID != testWorkspaceID {
 		t.Fatalf("cursor must carry its workspace, got %q", c.WorkspaceID)
@@ -442,8 +470,12 @@ func TestUserService_ListWorkspaceUsers_AcceptsItsOwnCursor(t *testing.T) {
 	if _, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next); err != nil {
 		t.Fatalf("second page: %v", err)
 	}
-	if store.gotCursor == nil || store.gotCursor.UserID != "u02" {
-		t.Fatalf("expected the decoded cursor to reach the store, got %+v", store.gotCursor)
+	if store.gotAnchor == nil || store.gotAnchor.UserID != listUserID(2) {
+		t.Fatalf("expected the resolved anchor to reach the store, got %+v", store.gotAnchor)
+	}
+	// The position came from the anchor lookup, not from the token.
+	if store.gotAnchorUserID != listUserID(2) {
+		t.Fatalf("expected the anchor to be resolved for the last row, got %q", store.gotAnchorUserID)
 	}
 }
 
@@ -462,11 +494,11 @@ func TestUserService_ListWorkspaceUsers_RejectsBadCursors(t *testing.T) {
 	}{
 		{"not base64", "!!!not-base64!!!"},
 		{"not json", base64.RawURLEncoding.EncodeToString([]byte("nope"))},
-		{"unknown version", valid(domain.WorkspaceUserCursor{Version: 99, WorkspaceID: testWorkspaceID, UserID: "u1"})},
-		{"zero version", valid(domain.WorkspaceUserCursor{WorkspaceID: testWorkspaceID, UserID: "u1"})},
+		{"unknown version", valid(domain.WorkspaceUserCursor{Version: 99, WorkspaceID: testWorkspaceID, UserID: anchorUserID})},
+		{"zero version", valid(domain.WorkspaceUserCursor{WorkspaceID: testWorkspaceID, UserID: anchorUserID})},
 		{"missing user id", valid(domain.WorkspaceUserCursor{Version: 1, WorkspaceID: testWorkspaceID})},
-		{"another workspace", valid(domain.WorkspaceUserCursor{Version: 1, WorkspaceID: otherWorkspace, UserID: "u1"})},
-		{"unknown field", base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"workspaceId":"` + testWorkspaceID + `","userId":"u1","admin":true}`))},
+		{"another workspace", valid(domain.WorkspaceUserCursor{Version: 1, WorkspaceID: otherWorkspace, UserID: anchorUserID})},
+		{"unknown field", base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"workspaceId":"` + testWorkspaceID + `","userId":"` + anchorUserID + `","admin":true}`))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &fakeStore{workspaceUsers: listUsers(2)}
@@ -525,5 +557,107 @@ func TestUserService_ListWorkspaceUsers_StoreErrorPropagates(t *testing.T) {
 
 	if _, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 10, ""); err == nil {
 		t.Fatal("expected the store error to propagate")
+	}
+}
+
+// ── Cursor hardening (issue #425 review) ───────────────────────────────────
+
+// The cursor is entirely client-controlled, so an oversized one must cost a
+// length comparison — not a base64 decode and a JSON parse.
+func TestUserService_ListWorkspaceUsers_OversizedCursorRejectedBeforeStore(t *testing.T) {
+	store := &fakeStore{workspaceUsers: listUsers(2)}
+	svc := service.NewUserService(store)
+
+	oversized := strings.Repeat("A", domain.WorkspaceUserCursorMaxEncodedBytes+1)
+
+	_, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 10, oversized)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if store.gotLimit != 0 || store.gotAnchorUserID != "" {
+		t.Fatal("an oversized cursor must not reach the store at all")
+	}
+}
+
+// A cursor exactly at the cap is still parsed — the limit rejects abuse, not
+// legitimate tokens, which are well under it.
+func TestUserService_ListWorkspaceUsers_CursorAtSizeLimitIsStillParsed(t *testing.T) {
+	store := &fakeStore{workspaceUsers: listUsers(2)}
+	svc := service.NewUserService(store)
+
+	atLimit := strings.Repeat("A", domain.WorkspaceUserCursorMaxEncodedBytes)
+
+	// Rejected for being unparseable, not for its length — either way it is a
+	// 400, but the point is that the size gate did not short-circuit it.
+	if _, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 10, atLimit); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+// The row a cursor names may have left the workspace between pages. That is not
+// "no more results" — the position is unknown, so the cursor is unusable.
+func TestUserService_ListWorkspaceUsers_MissingAnchorIsInvalidCursor(t *testing.T) {
+	store := &fakeStore{workspaceUsers: listUsers(4)}
+	svc := service.NewUserService(store)
+
+	_, next, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, "")
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+
+	store.anchorNotFound = true
+	store.gotLimit = 0
+	_, _, err = svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput for a vanished anchor, got %v", err)
+	}
+	if store.gotLimit != 0 {
+		t.Fatal("an unresolvable anchor must not reach the listing query")
+	}
+}
+
+func TestUserService_ListWorkspaceUsers_AnchorLookupErrorPropagates(t *testing.T) {
+	store := &fakeStore{workspaceUsers: listUsers(4)}
+	svc := service.NewUserService(store)
+
+	_, next, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, "")
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+
+	store.anchorErr = errors.New("connection refused")
+	_, _, err = svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next)
+	if err == nil || errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("an infrastructure failure must not read as a bad cursor, got %v", err)
+	}
+}
+
+// A malformed identifier must be refused here rather than reaching a ::uuid
+// cast, where it would surface as a database error instead of a 400.
+func TestUserService_ListWorkspaceUsers_RejectsNonUUIDIdentifiers(t *testing.T) {
+	encode := func(c domain.WorkspaceUserCursor) string {
+		raw, _ := json.Marshal(c)
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	for _, tc := range []struct {
+		name   string
+		cursor domain.WorkspaceUserCursor
+	}{
+		{"user id not a uuid", domain.WorkspaceUserCursor{Version: 1, WorkspaceID: testWorkspaceID, UserID: "u1"}},
+		{"user id empty", domain.WorkspaceUserCursor{Version: 1, WorkspaceID: testWorkspaceID}},
+		{"workspace not a uuid", domain.WorkspaceUserCursor{Version: 1, WorkspaceID: "ws", UserID: anchorUserID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{workspaceUsers: listUsers(2)}
+			svc := service.NewUserService(store)
+
+			_, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 10, encode(tc.cursor))
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("expected ErrInvalidInput, got %v", err)
+			}
+			if store.gotAnchorUserID != "" {
+				t.Fatal("a malformed identifier must not reach the store")
+			}
+		})
 	}
 }

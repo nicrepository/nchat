@@ -62,9 +62,9 @@ func sampleWorkspaceUsers() []domain.WorkspaceUser {
 	created := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
 	return []domain.WorkspaceUser{
 		{ID: "u1", Email: "alice@example.com", DisplayName: "Alice", FullName: "Alice Andrade",
-			Status: "active", AuthSource: "manual", CreatedAt: created, SortKey: "alice"},
+			Status: "active", AuthSource: "manual", CreatedAt: created},
 		{ID: "u2", Email: "bob@example.com", DisplayName: "Bob",
-			Status: "suspended", AuthSource: "oidc", CreatedAt: created, SortKey: "bob"},
+			Status: "suspended", AuthSource: "oidc", CreatedAt: created},
 	}
 }
 
@@ -581,5 +581,172 @@ func TestAdminListWorkspaceUsers_WithoutGuardRefuses(t *testing.T) {
 	}
 	if users.listCalls != 0 {
 		t.Fatal("an unscoped listing must never reach the repository")
+	}
+}
+
+// ── Browser invite route (issue #425 review, finding 1) ────────────────────
+//
+// The screen's invite button posts to /api/auth/admin/invites, which the
+// gateway rewrites to /auth/admin/invites. That internal route was not
+// registered, so the button answered 404 in every environment. These tests pin
+// the route, its method and its guard chain.
+
+// inviteManagerStub is the develop-shaped InviteManager: it records what it was
+// asked to create. What the invite is scoped to is issue #433's concern; this
+// branch owes the route and its guard.
+type inviteManagerStub struct {
+	got   domain.AdminInviteInput
+	calls int
+	err   error
+}
+
+func (s *inviteManagerStub) CreateInvite(_ context.Context, input domain.AdminInviteInput) (domain.InviteResult, error) {
+	s.got = input
+	s.calls++
+	if s.err != nil {
+		return domain.InviteResult{}, s.err
+	}
+	return domain.InviteResult{ID: "inv-1", Email: input.Email, CreatedAt: time.Now()}, nil
+}
+
+func (s *inviteManagerStub) AcceptInvite(_ context.Context, _ domain.AcceptInviteInput) (domain.AcceptInviteResult, error) {
+	return domain.AcceptInviteResult{}, nil
+}
+
+func (s *inviteManagerStub) EmailHandoffAvailable() bool { return true }
+
+func inviteRouter(t *testing.T, users *workspaceAdminStub, invites *inviteManagerStub) http.Handler {
+	t.Helper()
+	return NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		users, nil, nil, nil, invites, nil, routerSessionStub{}, nil, nil, nil)
+}
+
+// The regression this finding names: the route must exist, not 404.
+func TestBrowserInvite_RouteIsRegisteredAndReachable(t *testing.T) {
+	users := &workspaceAdminStub{workspaceID: adminWorkspaceID}
+	invites := &inviteManagerStub{}
+	rec := httptest.NewRecorder()
+
+	inviteRouter(t, users, invites).ServeHTTP(rec,
+		adminRequest(t, http.MethodPost, RouteAuthAdminInvites, `{"email":"new@example.com","display_name":"New"}`))
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("the browser invite route must be registered, not 404")
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if invites.calls != 1 || invites.got.Email != "new@example.com" {
+		t.Fatalf("unexpected invite input: %+v", invites.got)
+	}
+}
+
+func TestBrowserInvite_RejectsWrongMethod(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	inviteRouter(t, &workspaceAdminStub{workspaceID: adminWorkspaceID}, &inviteManagerStub{}).
+		ServeHTTP(rec, adminRequest(t, http.MethodGet, RouteAuthAdminInvites, ""))
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+// It shares the listing's guard chain: a session is required, and it must
+// belong to a workspace administrator.
+func TestBrowserInvite_RequiresSessionAndWorkspaceAdmin(t *testing.T) {
+	t.Run("no session", func(t *testing.T) {
+		invites := &inviteManagerStub{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, RouteAuthAdminInvites,
+			strings.NewReader(`{"email":"new@example.com","display_name":"New"}`))
+		req.Header.Set("Content-Type", "application/json")
+
+		inviteRouter(t, &workspaceAdminStub{workspaceID: adminWorkspaceID}, invites).ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		if invites.calls != 0 {
+			t.Fatal("an unauthenticated caller must not create an invite")
+		}
+	})
+
+	t.Run("revoked session", func(t *testing.T) {
+		invites := &inviteManagerStub{}
+		router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+			&workspaceAdminStub{workspaceID: adminWorkspaceID}, nil, nil, nil, invites, nil,
+			routerSessionStub{validateErr: domain.ErrInvalidToken}, nil, nil, nil)
+		rec := httptest.NewRecorder()
+
+		router.ServeHTTP(rec, adminRequest(t, http.MethodPost, RouteAuthAdminInvites, `{"email":"a@b.com","display_name":"A"}`))
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		if invites.calls != 0 {
+			t.Fatal("a revoked session must not create an invite")
+		}
+	})
+
+	// member and guest alike administer no workspace.
+	for _, role := range []string{"member", "guest"} {
+		t.Run(role, func(t *testing.T) {
+			invites := &inviteManagerStub{}
+			rec := httptest.NewRecorder()
+
+			inviteRouter(t, &workspaceAdminStub{workspaceErr: domain.ErrForbidden}, invites).ServeHTTP(rec,
+				adminRequest(t, http.MethodPost, RouteAuthAdminInvites, `{"email":"a@b.com","display_name":"A"}`))
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for %s, got %d", role, rec.Code)
+			}
+			if invites.calls != 0 {
+				t.Fatalf("%s must not create an invite", role)
+			}
+		})
+	}
+}
+
+// The bootstrap sibling keeps its own guard: a browser session is not a
+// substitute for the bootstrap token, and vice versa.
+func TestBrowserInvite_BootstrapRouteStillRequiresItsToken(t *testing.T) {
+	invites := &inviteManagerStub{}
+	rec := httptest.NewRecorder()
+
+	inviteRouter(t, &workspaceAdminStub{workspaceID: adminWorkspaceID}, invites).ServeHTTP(rec,
+		adminRequest(t, http.MethodPost, RouteAdminInvites, `{"email":"a@b.com","display_name":"A"}`))
+
+	if rec.Code == http.StatusCreated {
+		t.Fatal("a session must not create an invite through the bootstrap route")
+	}
+	if invites.calls != 0 {
+		t.Fatal("bootstrap route must not reach the invite service without its token")
+	}
+}
+
+func TestBrowserInvite_ResponseCarriesNoToken(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	inviteRouter(t, &workspaceAdminStub{workspaceID: adminWorkspaceID}, &inviteManagerStub{}).
+		ServeHTTP(rec, adminRequest(t, http.MethodPost, RouteAuthAdminInvites, `{"email":"new@example.com","display_name":"New"}`))
+
+	body := strings.ToLower(rec.Body.String())
+	for _, forbidden := range []string{"token", "hash", "password", "secret"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("invite response must not expose %q: %s", forbidden, rec.Body.String())
+		}
+	}
+}
+
+func TestBrowserInvite_UnwiredServiceReturns503(t *testing.T) {
+	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
+		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, adminRequest(t, http.MethodPost, RouteAuthAdminInvites, `{"email":"a@b.com","display_name":"A"}`))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
 	}
 }

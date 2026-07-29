@@ -632,10 +632,10 @@ func TestPGXUserStore_GetAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
 func workspaceUserRows() *pgxmock.Rows {
 	created := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
 	return pgxmock.NewRows([]string{
-		"id", "email", "display_name", "full_name", "status", "auth_source", "created_at", "sort_key",
+		"id", "email", "display_name", "full_name", "status", "auth_source", "created_at",
 	}).
-		AddRow("u1", "alice@example.com", "Alice", "Alice Andrade", "active", "manual", created, "alice").
-		AddRow("u2", "bob@example.com", "Bob", "", "suspended", "oidc", created, "bob")
+		AddRow("u1", "alice@example.com", "Alice", "Alice Andrade", "active", "manual", created).
+		AddRow("u2", "bob@example.com", "Bob", "", "suspended", "oidc", created)
 }
 
 // The listing must be scoped by the workspace it was given and by nothing
@@ -664,11 +664,6 @@ func TestPGXUserStore_ListWorkspaceUsers_FirstPageScopesToWorkspace(t *testing.T
 	if users[0].Email != "alice@example.com" || users[0].FullName != "Alice Andrade" {
 		t.Fatalf("unexpected first row: %+v", users[0])
 	}
-	// The sort key travels with the row so the cursor resumes from exactly the
-	// position PostgreSQL ordered by.
-	if users[0].SortKey != "alice" || users[1].SortKey != "bob" {
-		t.Fatalf("expected sort keys to be carried out, got %q/%q", users[0].SortKey, users[1].SortKey)
-	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}
@@ -688,9 +683,7 @@ func TestPGXUserStore_ListWorkspaceUsers_CursorResumesAfterPosition(t *testing.T
 		WillReturnRows(workspaceUserRows())
 
 	store := storage.NewPGXUserStore(mock)
-	_, err = store.ListWorkspaceUsers(context.Background(), "ws-1", 51, &domain.WorkspaceUserCursor{
-		Version: 1, WorkspaceID: "ws-1", SortKey: "alice", UserID: "u1",
-	})
+	_, err = store.ListWorkspaceUsers(context.Background(), "ws-1", 51, &domain.WorkspaceUserAnchor{SortKey: "alice", UserID: "u1", Found: true})
 	if err != nil {
 		t.Fatalf("ListWorkspaceUsers: %v", err)
 	}
