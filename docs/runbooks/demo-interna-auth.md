@@ -490,8 +490,10 @@ curl -s -X POST \
 
 **Remover conta de convite de teste** (se criada):
 
-Use `PATCH /admin/users/{id}/status` com `status: "suspended"` via CLI para
-desativar a conta sem deletá-la (hard-delete não implementado no MVP).
+Não há endpoint HTTP de suspensão: as rotas administrativas globais de usuário
+foram removidas. Desative a conta diretamente no banco (`auth.users.status`) ou
+revogue as sessões via `DELETE /auth/me/sessions` na própria conta de teste;
+hard-delete não está implementado no MVP.
 
 **Após limpeza:** verificar que nenhuma sessão ativa permanece para as contas de teste.
 

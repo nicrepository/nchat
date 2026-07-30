@@ -80,26 +80,29 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAuthOIDCKeycloakLogin, httputil.MethodNotAllowed(http.MethodGet, oidcLoginHandler))
 	mux.Handle(RouteAuthOIDCKeycloakCallback, httputil.MethodNotAllowed(http.MethodGet, oidcCallbackHandler))
 	mux.Handle(RouteAuthOIDCKeycloakExchange, httputil.MethodNotAllowed(http.MethodPost, oidcExchangeHandler))
-	// Every route behind the bootstrap credential is wrapped by the attempt
-	// limiter *outside* the guard, so budget is spent before the credential is
-	// compared. All three share one budget per IP: they authenticate the same
-	// secret, so letting an attacker spend a separate allowance on each would
-	// simply treble the guesses.
+	// The one and only route the bootstrap credential reaches. It is wrapped by
+	// the attempt limiter *outside* the guard, so budget is spent before the
+	// credential is compared.
+	//
+	// POST /admin/users and PATCH /admin/users/{id}/status used to sit here too.
+	// They created and suspended global identities, and — unlike this route —
+	// neither consulted the bootstrap lifecycle, so a leaked credential kept
+	// full reach over every account in the deployment long after the workspace
+	// had an owner. They are not registered anywhere now: unregistered means
+	// 404, which is also the honest answer, since nothing about the service's
+	// history is any caller's business.
+	//
+	// Bootstrapping therefore has exactly one path: issue a bootstrap_owner
+	// invite here, accept it, and the first owner closes the window.
 	limitBootstrapAttempts := RateLimitBootstrapAttempts(BootstrapRateLimitConfig{
 		Recorder:          bootstrapAttempts,
 		Attempts:          cfg.AuthBootstrapRateLimitAttempts,
 		Window:            time.Duration(cfg.AuthBootstrapRateLimitWindowMinutes) * time.Minute,
 		TrustedProxyCIDRs: trustedProxyCIDRs,
 	})
-	mux.Handle(RouteAdminUsers, httputil.MethodNotAllowed(http.MethodPost,
-		limitBootstrapAttempts(AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateUser(users))),
-	))
 	inviteRetryAfterSeconds := cfg.AuthInviteRateLimitWindowMinutes * 60
 	mux.Handle(RouteAdminInvites, httputil.MethodNotAllowed(http.MethodPost,
 		limitBootstrapAttempts(AdminBootstrapGuard(cfg.AdminBootstrapToken)(BootstrapCreateInvite(invites, inviteRetryAfterSeconds))),
-	))
-	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
-		limitBootstrapAttempts(AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users))),
 	))
 
 	// Browser-callable workspace administration. Unlike the bootstrap routes

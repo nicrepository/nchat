@@ -343,89 +343,139 @@ func TestMetricsRouteReturns200(t *testing.T) {
 	}
 }
 
-func TestAdminUsersDisabledWithNoToken(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, RouteAdminUsers, nil))
-	// testConfig has no ADMIN_BOOTSTRAP_TOKEN => 503
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503, got %d", rec.Code)
-	}
-}
+// ── Removed global bootstrap routes ────────────────────────────────────────
+//
+// POST /admin/users and PATCH /admin/users/{id}/status used to sit behind the
+// bootstrap credential. They created and suspended *global* identities and,
+// unlike /admin/invites, neither consulted the bootstrap lifecycle — so a
+// leaked pre-shared credential kept reach over every account in the deployment
+// forever. They are unregistered, not guarded: 404 for everyone, in every
+// lifecycle state, which also declines to confirm they ever existed.
 
-func TestAdminUsersMethodNotAllowed(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, RouteAdminUsers, nil))
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405, got %d", rec.Code)
-	}
-}
-
-// ── PATCH /admin/users/{id}/status router-level tests ─────────────────────
-
-func TestAdminUserStatus_NoToken_Returns503(t *testing.T) {
-	// testConfig has no ADMIN_BOOTSTRAP_TOKEN → token is empty → guard returns 503
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when no bootstrap token configured, got %d — %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestAdminUserStatus_WrongToken_Returns401(t *testing.T) {
+// bootstrapLifecycleState is what distinguishes "before the first owner" from
+// "after it": the invite manager's answer to a bootstrap creation attempt.
+// Both must give the same 404 on the removed routes.
+func routerWithBootstrapCredential(t *testing.T, invites service.InviteManager) http.Handler {
+	t.Helper()
 	cfg := testConfig()
 	cfg.AdminBootstrapToken = "correct-token"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-NChat-Admin-Token", "wrong-token")
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for wrong bootstrap token, got %d — %s", rec.Code, rec.Body.String())
+	return NewRouter(cfg, platformlog.New("auth-service", "test"),
+		&recordingUserAdmin{}, nil, nil, nil, invites, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
+}
+
+// recordingUserAdmin fails the test if a removed route ever reaches the user
+// service: a 404 that still created an identity would be worse than the route
+// being present.
+type recordingUserAdmin struct {
+	routerUsersUnused
+	stubProfileReader
+}
+
+func (r *recordingUserAdmin) CreateUser(context.Context, domain.CreateUserInput) (domain.User, error) {
+	panic("removed route must never reach user creation")
+}
+
+func (r *recordingUserAdmin) UpdateUserStatus(context.Context, string, string, string) (domain.User, error) {
+	panic("removed route must never reach a status change")
+}
+
+func TestRemovedAdminUserRoutes_AlwaysReturn404(t *testing.T) {
+	// The credential is correct throughout: the point is that a *valid*
+	// credential no longer opens these doors either.
+	for _, lifecycle := range []struct {
+		name    string
+		invites service.InviteManager
+	}{
+		// Bootstrap still open: creating an invite would succeed.
+		{name: "before initialization", invites: &inviteStub{result: domain.InviteResult{ID: "inv-1"}}},
+		// Bootstrap closed by the first owner.
+		{name: "after initialization", invites: &inviteStub{err: domain.ErrBootstrapUnavailable}},
+	} {
+		t.Run(lifecycle.name, func(t *testing.T) {
+			router := routerWithBootstrapCredential(t, lifecycle.invites)
+
+			for _, tt := range []struct {
+				name   string
+				method string
+				path   string
+				token  string
+			}{
+				{name: "create user without credential", method: http.MethodPost, path: "/admin/users"},
+				{name: "create user with wrong credential", method: http.MethodPost, path: "/admin/users", token: "wrong-token"},
+				{name: "create user with valid credential", method: http.MethodPost, path: "/admin/users", token: "correct-token"},
+				{name: "create user with trailing slash", method: http.MethodPost, path: "/admin/users/", token: "correct-token"},
+				{name: "create user via GET", method: http.MethodGet, path: "/admin/users", token: "correct-token"},
+				{name: "status without credential", method: http.MethodPatch, path: "/admin/users/user-1/status"},
+				{name: "status with wrong credential", method: http.MethodPatch, path: "/admin/users/user-1/status", token: "wrong-token"},
+				{name: "status with valid credential", method: http.MethodPatch, path: "/admin/users/user-1/status", token: "correct-token"},
+				{name: "status with trailing slash", method: http.MethodPatch, path: "/admin/users/user-1/status/", token: "correct-token"},
+				{name: "status for an unknown user", method: http.MethodPatch, path: "/admin/users/00000000-0000-4000-8000-000000000000/status", token: "correct-token"},
+				{name: "status via GET", method: http.MethodGet, path: "/admin/users/user-1/status", token: "correct-token"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(`{"email":"x@example.com","display_name":"X","status":"suspended"}`))
+					req.Header.Set("Content-Type", "application/json")
+					if tt.token != "" {
+						req.Header.Set("X-NChat-Admin-Token", tt.token)
+					}
+					rec := httptest.NewRecorder()
+
+					router.ServeHTTP(rec, req)
+
+					if rec.Code != http.StatusNotFound {
+						t.Fatalf("expected 404, got %d — %s", rec.Code, rec.Body.String())
+					}
+					// A 405 or 503 would confirm the path is known to the
+					// router, which is exactly what an unregistered route must
+					// not do.
+					if body := rec.Body.String(); strings.Contains(body, "admin") {
+						t.Fatalf("the refusal must not describe an admin endpoint: %s", body)
+					}
+				})
+			}
+		})
 	}
 }
 
-func TestAdminUserStatus_BearerOnly_Returns401(t *testing.T) {
-	// Only a Bearer JWT (no admin token) must be rejected
+// The removed routes must not consume the bootstrap guessing budget either:
+// they are not bootstrap surface at all, so an attacker cannot use them to
+// exhaust the allowance for the route that remains.
+func TestRemovedAdminUserRoutes_DoNotReachTheBootstrapLimiter(t *testing.T) {
+	recorder := newCountingRecorder()
 	cfg := testConfig()
 	cfg.AdminBootstrapToken = "correct-token"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer some.jwt.token")
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for bearer-only request, got %d — %s", rec.Code, rec.Body.String())
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"),
+		&recordingUserAdmin{}, nil, nil, nil, &inviteStub{}, nil, nil, nil, nil, nil, recorder)
+
+	for _, path := range []string{"/admin/users", "/admin/users/user-1/status"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Header.Set("X-NChat-Admin-Token", "correct-token")
+		router.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	if recorder.calls != 0 {
+		t.Fatalf("an unregistered route must not reach the limiter, got %d calls", recorder.calls)
 	}
 }
 
-func TestAdminUserStatus_MethodNotAllowed_Returns405(t *testing.T) {
-	router := NewRouter(testConfig(), platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/users/user-1/status", nil))
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405 for GET on status route, got %d", rec.Code)
-	}
-}
+// The surviving bootstrap route is untouched by the removal.
+func TestBootstrapInviteRouteSurvivesRemoval(t *testing.T) {
+	invites := &inviteStub{result: domain.InviteResult{ID: "inv-1", Email: "first@example.com"}}
+	router := routerWithBootstrapCredential(t, invites)
 
-func TestAdminUserStatus_NoService_Returns503(t *testing.T) {
-	// Service nil + correct token → 503 (service unavailable from handler)
-	cfg := testConfig()
-	cfg.AdminBootstrapToken = "correct-token"
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, allowAllBootstrapAttempts{})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1/status", strings.NewReader(`{"status":"suspended"}`))
+	req := httptest.NewRequest(http.MethodPost, RouteAdminInvites,
+		strings.NewReader(`{"email":"first@example.com","display_name":"First"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-NChat-Admin-Token", "correct-token")
+	rec := httptest.NewRecorder()
+
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when service nil, got %d — %s", rec.Code, rec.Body.String())
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected the bootstrap invite route to keep working, got %d — %s", rec.Code, rec.Body.String())
+	}
+	if invites.bootstrapCalls != 1 {
+		t.Fatalf("expected the bootstrap command to run once, got %d", invites.bootstrapCalls)
 	}
 }
 

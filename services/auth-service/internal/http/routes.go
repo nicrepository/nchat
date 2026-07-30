@@ -4,7 +4,6 @@ const (
 	RouteHealthz                  = "/healthz"
 	RouteReadyz                   = "/readyz"
 	RouteVersion                  = "/version"
-	RouteAdminUsers               = "/admin/users"
 	RouteAdminInvites             = "/admin/invites"
 	RouteAuthRefresh              = "/auth/refresh"
 	RouteAuthLogout               = "/auth/logout"
@@ -23,9 +22,17 @@ const (
 	RouteAuthOIDCKeycloakLogin    = "/auth/oidc/keycloak/login"
 	RouteAuthOIDCKeycloakCallback = "/auth/oidc/keycloak/callback"
 	RouteAuthOIDCKeycloakExchange = "/auth/oidc/keycloak/exchange"
-	RouteAdminUserStatus          = "/admin/users/{id}/status"
 	// Authenticated workspace-admin invitation endpoint. Its sibling
 	// RouteAdminInvites above is the initialization-only route, reachable with
 	// the bootstrap credential until the workspace has its first owner.
+	//
+	// RouteAdminInvites is the *only* route the bootstrap credential reaches.
+	// It once had two siblings — POST /admin/users and PATCH
+	// /admin/users/{id}/status — which created and suspended global identities
+	// and, unlike this one, never consulted the bootstrap lifecycle: they
+	// stayed reachable with the pre-shared credential long after the workspace
+	// had an owner. They are gone rather than guarded, because bootstrapping
+	// needs exactly one door and every additional one is a standing risk with
+	// no remaining purpose.
 	RouteAuthAdminInvites = "/auth/admin/invites"
 )

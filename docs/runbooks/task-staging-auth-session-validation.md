@@ -52,8 +52,11 @@ cannot be automated without human interaction.
 
 ## Test Account Setup
 
-1. Create dedicated accounts via `POST /admin/users` using the admin bootstrap token
-   (bootstrap step only — the bootstrap token is never used in browser or frontend paths).
+1. Create dedicated accounts by invitation: `POST /admin/invites` with the admin
+   bootstrap token while the workspace is still uninitialized, or
+   `POST /auth/admin/invites` with a workspace-admin session afterwards. Accept
+   the invite at `POST /auth/invites/accept` to complete the account.
+   (The bootstrap token is never used in browser or frontend paths.)
 2. Email local-part must start with `nchat-smoke-` or `nchat-test-` (e.g. `nchat-smoke-auth@example.test`).
    Alternatively, set `STAGING_TEST_ACCOUNT_DOMAIN` to an allowed test domain.
 3. Both the naming/domain policy AND exact confirmation (`STAGING_TEST_ACCOUNT_CONFIRM`) are required.

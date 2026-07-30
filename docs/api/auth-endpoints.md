@@ -29,9 +29,7 @@ Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
 | 14  | GET    | `/auth/me/devices`               | Bearer JWT + active session            | RF-52, RF-53 |
 | 15  | DELETE | `/auth/me/devices/{device_id}`   | Bearer JWT + active session            | RF-53        |
 | 16  | PATCH  | `/auth/me/devices/{device_id}`   | Bearer JWT + active session            | RF-53        |
-| 17  | POST   | `/admin/users`                   | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
 | 18  | POST   | `/admin/invites`                 | Bootstrap-only, initialization window  | RF-46        |
-| 19  | PATCH  | `/admin/users/{id}/status`       | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
 | 21  | POST   | `/auth/admin/invites`            | Bearer JWT + session + workspace admin | RF-46        |
 
 ---
@@ -863,57 +861,6 @@ and `device_fingerprint_hash` are never returned.
 
 ---
 
-### 17. POST /admin/users
-
-**Purpose:** Create a user account with an initial password (bootstrap/admin tooling use only).
-
-**Auth requirement:** Bootstrap-only — `X-NChat-Admin-Token: <token>` header
-
-> ⚠️ **Not browser-callable.** The `X-NChat-Admin-Token` must never be used in
-> browser or frontend runtime code. Use CLI / server-to-server / CI tooling only.
-> Returns 503 when `ADMIN_BOOTSTRAP_TOKEN` env var is not set.
-
-**Request body:**
-
-```json
-{
-  "email": "<user@example.com>",
-  "display_name": "<Display Name>",
-  "full_name": "<Full Legal Name>",
-  "initial_password": "<initial_password>",
-  "must_change_password": true
-}
-```
-
-`full_name` is optional. `must_change_password` defaults to `false`
-(set `true` to force password change on first login).
-
-**Response — 201 Created:**
-
-```json
-{
-  "id": "<uuid>",
-  "email": "<user@example.com>",
-  "display_name": "<Display Name>",
-  "full_name": "<Full Legal Name>",
-  "status": "active",
-  "auth_source": "manual",
-  "email_verified_at": "2025-01-01T00:00:00Z",
-  "created_at": "2025-01-01T00:00:00Z"
-}
-```
-
-**Common errors:**
-
-| Code                  | HTTP | Condition                                            |
-| --------------------- | ---- | ---------------------------------------------------- |
-| `unauthorized`        | 401  | Missing or wrong `X-NChat-Admin-Token`               |
-| `conflict`            | 409  | Email already registered                             |
-| `bad_request`         | 400  | Malformed JSON or password policy violation          |
-| `service_unavailable` | 503  | `ADMIN_BOOTSTRAP_TOKEN` not set or DB not configured |
-
----
-
 ### 18. POST /admin/invites
 
 **Purpose:** Create an invite for a new user. Triggers invite email delivery. RF-46.
@@ -929,6 +876,31 @@ and `device_fingerprint_hash` are never returned.
 >
 > It is **disabled unless both** `ADMIN_BOOTSTRAP_TOKEN` and
 > `AUTH_BOOTSTRAP_WORKSPACE_ID` are set. Requires email handoff (503 otherwise).
+
+**This is the only route the bootstrap credential reaches.** It used to have two
+siblings — `POST /admin/users` and `PATCH /admin/users/{id}/status` — which
+created and suspended **global** identities and, unlike this route, never
+consulted the bootstrap lifecycle: a leaked credential kept reach over every
+account in the deployment indefinitely. They are **removed**, not guarded, and
+now answer `404` for everyone in every lifecycle state. Bootstrapping has
+exactly one door, and it closes.
+
+**Canonical bootstrap sequence:**
+
+1. Generate a strong credential and set `ADMIN_BOOTSTRAP_TOKEN` together with
+   `AUTH_BOOTSTRAP_WORKSPACE_ID` (see the credential policy above; the service
+   refuses to start on a weak or half-configured pair).
+2. `POST /admin/invites` with the invitee's `email` and `display_name`. The
+   invite is issued as `bootstrap_owner`, into the configured workspace, by a
+   system identity — none of which is expressible in the request.
+3. The invitee accepts it at `POST /auth/invites/accept`.
+4. Acceptance creates the workspace's **first `owner`** membership.
+5. That closes the window: this route now answers `503`, and any other pending
+   `bootstrap_owner` invite for the workspace is revoked in the same
+   transaction.
+6. Everything afterwards goes through the authenticated, workspace-scoped API —
+   `POST /auth/admin/invites` — which derives its actor and workspace from the
+   session. Unset `ADMIN_BOOTSTRAP_TOKEN` once step 4 is done.
 
 **Credential policy.** `ADMIN_BOOTSTRAP_TOKEN` must be exactly 32 random bytes
 encoded as unpadded Base64URL — 43 characters, one canonical format. Generate
@@ -971,9 +943,8 @@ The counter lives in PostgreSQL (`auth.bootstrap_auth_attempts`, migration
 `auth/000009`), keyed by `bootstrap-admin-token:<client-ip>` — never by the
 credential, which would give each guess its own budget. Being in the database
 rather than in process memory is the point: an attacker must not get one budget
-per replica, nor a fresh one on restart. `/admin/users`, `/admin/invites` and
-`/admin/users/{id}/status` share one budget per IP, because they authenticate
-the same secret.
+per replica, nor a fresh one on restart. `/admin/invites` is the only route the
+credential reaches, so it is the only one spending this budget.
 
 Consequences:
 
@@ -1068,53 +1039,6 @@ their own values on invite acceptance.
 **RF mapping:** RF-46 (invite-based registration)
 
 ---
-
-### 19. PATCH /admin/users/{id}/status
-
-**Purpose:** Activate (`active`) or suspend (`suspended`) a user account. Foundation/bootstrap only.
-
-**Auth requirement:** Bootstrap-only — `X-NChat-Admin-Token: <token>` header
-
-> ⚠️ **Not browser-callable.** The status mutation buttons in `AdminUsersPage.tsx`
-> are intentionally `disabled` until a browser-safe JWT/RBAC admin guard (RF-74)
-> replaces this bootstrap guard. Self-deactivation prevention is also deferred to
-> that future guard.
-
-**Path parameter:** `id` — UUID of the user to update.
-
-**Request body:**
-
-```json
-{
-  "status": "suspended"
-}
-```
-
-Permitted values: `"active"` or `"suspended"`.
-
-**Response — 200 OK:**
-
-```json
-{
-  "id": "<uuid>",
-  "email": "<user@example.com>",
-  "display_name": "<Display Name>",
-  "status": "suspended",
-  "auth_source": "manual",
-  "email_verified_at": "2025-01-01T00:00:00Z",
-  "created_at": "2025-01-01T00:00:00Z"
-}
-```
-
-**Common errors:**
-
-| Code                  | HTTP | Condition                                            |
-| --------------------- | ---- | ---------------------------------------------------- |
-| `unauthorized`        | 401  | Missing or wrong `X-NChat-Admin-Token`               |
-| `not_found`           | 404  | User not found                                       |
-| `invalid_transition`  | 422  | Transition not allowed by domain rules               |
-| `invalid_status`      | 422  | Value is not `active` or `suspended`                 |
-| `service_unavailable` | 503  | `ADMIN_BOOTSTRAP_TOKEN` not set or DB not configured |
 
 ---
 

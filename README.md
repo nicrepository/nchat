@@ -444,12 +444,17 @@ tokens, and policy settings.
 
 ## Admin user creation
 
-`POST /admin/users` allows an admin to create a manual user with an Argon2id-hashed password.
+Accounts are created by invitation, never by a direct admin call. The
+bootstrap credential can issue exactly one kind of thing — an invite — and only
+until the workspace has its first owner.
 
-- Implements: RF-45 (cadastro manual pelo admin)
-- Endpoint: `POST /admin/users` (auth-service, port 8081)
-- Guard: `X-NChat-Admin-Token` header (temporary bootstrap token, not final RBAC)
-- Runbook: [docs/runbooks/task-23-admin-manual-user-create.md](docs/runbooks/task-23-admin-manual-user-create.md)
+- Implements: RF-45 (cadastro manual pelo admin), RF-46 (invite-based registration)
+- Bootstrap: `POST /admin/invites` (auth-service, port 8081), guarded by the
+  `X-NChat-Admin-Token` header and rate limited per IP. Accepting the invite
+  creates the workspace's first `owner` and closes the bootstrap window.
+- Afterwards: `POST /auth/admin/invites`, authenticated by session and scoped to
+  the caller's workspace.
+- Reference: [docs/api/auth-endpoints.md](docs/api/auth-endpoints.md)
 
 ## Email/password login
 
