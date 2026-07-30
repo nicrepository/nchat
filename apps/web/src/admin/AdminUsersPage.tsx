@@ -1,8 +1,30 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+
+import { getSessionGeneration, isAuthenticated, onAuthChange } from "../lib/authSession";
 
 import "./AdminUsersPage.css";
 import AdminShell from "./AdminShell";
-import { type AdminUser, listAdminUsers } from "./adminUsersApi";
+import {
+  type AdminErrorKind,
+  type AdminUser,
+  classifyAdminError,
+  createAdminInvite,
+} from "./adminUsersApi";
+import {
+  FILTER_CHIPS,
+  type FilterChip,
+  filterAdminUsers,
+  sortAdminUsersForDisplay,
+} from "./adminUsersFilter";
+import { type AdminUsersState, useAdminUsers } from "./useAdminUsers";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -175,11 +197,47 @@ function EmptyState() {
 
 // ── Error state ────────────────────────────────────────────────────────────
 
-function ErrorState() {
+/**
+ * Each failure gets its own wording. Presenting a 403 as a connection problem —
+ * or, as this screen used to, presenting any failure as "no users" — sends the
+ * admin looking in the wrong place.
+ */
+const ERROR_COPY: Record<AdminErrorKind, { title: string; sub: string; retryable: boolean }> = {
+  unauthorized: {
+    title: "Sua sessão expirou",
+    sub: "Entre novamente para gerenciar os usuários do workspace.",
+    retryable: false,
+  },
+  forbidden: {
+    title: "Você não tem permissão para ver os usuários",
+    sub: "Esta área é restrita a administradores do workspace.",
+    retryable: false,
+  },
+  "rate-limited": {
+    title: "Muitas solicitações",
+    sub: "Aguarde alguns instantes antes de tentar novamente.",
+    // No retry button: offering one invites the user to hammer a limit that is
+    // already refusing them.
+    retryable: false,
+  },
+  error: {
+    title: "Não foi possível carregar os usuários",
+    sub: "Verifique sua conexão ou tente novamente em instantes.",
+    retryable: true,
+  },
+};
+
+interface ErrorStateProps {
+  kind: AdminErrorKind;
+  onRetry: () => void;
+}
+
+function ErrorState({ kind, onRetry }: ErrorStateProps) {
+  const copy = ERROR_COPY[kind];
   return (
     <tr>
       <td colSpan={6}>
-        <div className="admin-users__error">
+        <div className="admin-users__error" role="alert">
           <div className="admin-users__error-icon" aria-hidden="true">
             <svg
               viewBox="0 0 24 24"
@@ -194,10 +252,13 @@ function ErrorState() {
               <line x1="12" y1="17" x2="12.01" y2="17" />
             </svg>
           </div>
-          <p className="admin-users__error-title">Não foi possível carregar os usuários</p>
-          <p className="admin-users__error-sub">
-            Verifique sua conexão ou tente novamente em instantes.
-          </p>
+          <p className="admin-users__error-title">{copy.title}</p>
+          <p className="admin-users__error-sub">{copy.sub}</p>
+          {copy.retryable && (
+            <button type="button" className="admin-users__retry-btn" onClick={onRetry}>
+              Tentar novamente
+            </button>
+          )}
         </div>
       </td>
     </tr>
@@ -247,18 +308,6 @@ function UserRows({ users }: UserRowsProps) {
   );
 }
 
-// ── Filter chip types ───────────────────────────────────────────────────────
-
-type FilterChip = "all" | "active" | "suspended" | "admins" | "invites";
-
-const CHIPS: { id: FilterChip; label: string }[] = [
-  { id: "all", label: "Todos" },
-  { id: "active", label: "Ativos" },
-  { id: "suspended", label: "Suspensos" },
-  { id: "admins", label: "Admins" },
-  { id: "invites", label: "Convites pendentes" },
-];
-
 // ── Invite icon (SVG) ──────────────────────────────────────────────────────
 
 function IconPersonAdd() {
@@ -301,61 +350,258 @@ function IconSearch() {
   );
 }
 
-// ── Page ───────────────────────────────────────────────────────────────────
+// ── Invite dialog ──────────────────────────────────────────────────────────
 
-type PageState = { kind: "loading" } | { kind: "error" } | { kind: "success"; users: AdminUser[] };
+interface InviteDialogProps {
+  onClose: () => void;
+  onInvited: () => void;
+}
 
-export default function AdminUsersPage() {
-  const [state, setState] = useState<PageState>({ kind: "loading" });
-  const [activeFilter, setActiveFilter] = useState<FilterChip>("all");
-  const [search, setSearch] = useState("");
+/** Maps a failed invite to user-facing copy. Server messages are never shown
+ * verbatim: they may carry detail that does not belong on screen. */
+function inviteErrorMessage(kind: AdminErrorKind): string {
+  switch (kind) {
+    case "forbidden":
+      return "Você não tem permissão para convidar usuários.";
+    case "unauthorized":
+      return "Sua sessão expirou. Entre novamente para convidar usuários.";
+    case "rate-limited":
+      return "Muitos convites enviados. Aguarde alguns instantes e tente novamente.";
+    default:
+      return "Não foi possível enviar o convite. Tente novamente.";
+  }
+}
 
+/**
+ * Minimal invite form. It collects an e-mail and a display name and nothing
+ * else — notably no role, because granting privileges is not something this
+ * screen may do and the endpoint would ignore the field anyway.
+ */
+function InviteDialog({ onClose, onInvited }: InviteDialogProps) {
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleId = useId();
+  const emailId = useId();
+  const nameId = useId();
+  const errorId = useId();
+  const emailRef = useRef<HTMLInputElement>(null);
+
+  // Focus lands on the first field so a keyboard user is not stranded at the
+  // top of the page after the dialog opens.
   useEffect(() => {
-    let cancelled = false;
-
-    listAdminUsers()
-      .then((users) => {
-        if (!cancelled) setState({ kind: "success", users });
-      })
-      .catch(() => {
-        if (!cancelled) setState({ kind: "error" });
-      });
-
-    return () => {
-      cancelled = true;
-    };
+    emailRef.current?.focus();
   }, []);
 
-  const filteredUsers = useMemo(() => {
-    if (state.kind !== "success") return [];
-    let users = state.users;
-    if (activeFilter === "active") {
-      users = users.filter((u) => u.status.toLowerCase() === "active");
-    } else if (activeFilter === "suspended") {
-      users = users.filter((u) => u.status.toLowerCase() === "suspended");
-    } else if (activeFilter === "admins" || activeFilter === "invites") {
-      // No role or invite data available from API; show empty
-      users = [];
-    }
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      users = users.filter(
-        (u) => u.displayName.toLowerCase().includes(q) || u.email.toLowerCase().includes(q),
-      );
-    }
-    return users;
-  }, [state, activeFilter, search]);
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    // Guarding on `submitting` is what makes a double click one invite: the
+    // button is also disabled, but a form can still be submitted with Enter.
+    if (submitting) return;
 
-  let tableBody: React.ReactNode;
-  if (state.kind === "loading") {
-    tableBody = <SkeletonRows />;
-  } else if (state.kind === "error") {
-    tableBody = <ErrorState />;
-  } else if (filteredUsers.length === 0) {
-    tableBody = <EmptyState />;
-  } else {
-    tableBody = <UserRows users={filteredUsers} />;
+    const trimmedEmail = email.trim();
+    const trimmedName = displayName.trim();
+    if (!trimmedEmail || !trimmedName) {
+      setError("Informe e-mail e nome de exibição.");
+      return;
+    }
+    // Shape check only, for immediate feedback. The server validates and
+    // normalises the address, and that is what decides.
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      setError("Informe um e-mail válido.");
+      return;
+    }
+
+    setSubmitting(true);
+    setError(null);
+    try {
+      await createAdminInvite({ email: trimmedEmail, displayName: trimmedName });
+      onInvited();
+    } catch (err) {
+      // The server message is not shown verbatim: it may carry detail that does
+      // not belong on screen.
+      // The dialog never resubmits on its own. A 429 in particular is reported
+      // and left to the operator: an automatic retry would spend the budget
+      // that is already exhausted.
+      const kind = classifyAdminError(err);
+      setError(inviteErrorMessage(kind));
+      setSubmitting(false);
+    }
   }
+
+  return (
+    <div className="admin-users__modal-backdrop">
+      <div className="admin-users__modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+        <h2 className="admin-users__modal-title" id={titleId}>
+          Convidar usuário
+        </h2>
+        <form onSubmit={handleSubmit} noValidate>
+          <div className="admin-users__field">
+            <label className="admin-users__label" htmlFor={emailId}>
+              E-mail
+            </label>
+            <input
+              id={emailId}
+              ref={emailRef}
+              className="admin-users__input"
+              type="email"
+              value={email}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                setError(null);
+              }}
+              disabled={submitting}
+              aria-describedby={error ? errorId : undefined}
+              aria-invalid={error ? true : undefined}
+            />
+          </div>
+          <div className="admin-users__field">
+            <label className="admin-users__label" htmlFor={nameId}>
+              Nome de exibição
+            </label>
+            <input
+              id={nameId}
+              className="admin-users__input"
+              type="text"
+              value={displayName}
+              onChange={(e) => {
+                setDisplayName(e.target.value);
+                setError(null);
+              }}
+              disabled={submitting}
+              aria-describedby={error ? errorId : undefined}
+              aria-invalid={error ? true : undefined}
+            />
+          </div>
+
+          {error && (
+            <p className="admin-users__modal-error" id={errorId} role="alert">
+              {error}
+            </p>
+          )}
+
+          <div className="admin-users__modal-actions">
+            <button
+              type="button"
+              className="admin-users__modal-cancel"
+              onClick={onClose}
+              disabled={submitting}
+            >
+              Cancelar
+            </button>
+            <button type="submit" className="admin-users__modal-submit" disabled={submitting}>
+              {submitting ? "Enviando…" : "Enviar convite"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ── Page ───────────────────────────────────────────────────────────────────
+
+/**
+ * Chooses the table body for the current query state.
+ *
+ * Split out of the component so the state-to-view mapping is one readable
+ * expression rather than an if/else chain interleaved with rendering. The empty
+ * state is reachable only from `success`, which is what makes it mean what it
+ * says.
+ */
+function TableBody({
+  state,
+  users,
+  onRetry,
+}: {
+  state: AdminUsersState;
+  users: AdminUser[];
+  onRetry: () => void;
+}) {
+  if (state.kind === "loading") return <SkeletonRows />;
+  if (state.kind === "error") return <ErrorState kind={state.error} onRetry={onRetry} />;
+  if (users.length === 0) return <EmptyState />;
+  return <UserRows users={users} />;
+}
+
+/**
+ * The scope key for the current session, or `null` when there is none.
+ *
+ * Read outside React, so `useSyncExternalStore` can compare it. Two calls with
+ * nothing changed in between build an equal string, which is what React needs
+ * — a fresh object would loop, a fresh string of the same value does not.
+ *
+ * The workspace segment is a constant because this screen has no workspace
+ * picker: the server resolves the workspace from the session itself
+ * (`GetAdminWorkspaceID`), and the browser never names one. The segment is
+ * present so that adding a picker later changes this line and nothing else.
+ */
+function readSessionScopeKey(): string | null {
+  if (!isAuthenticated()) return null;
+  return `session:${getSessionGeneration()}:workspace:current`;
+}
+
+/**
+ * Identifies whose data the admin table is showing.
+ *
+ * The app has no auth Context — `authSession` is the module every authenticated
+ * screen already reads — so the subscription lives here, in the component, and
+ * the hook receives a plain value. That is the point: the hook stays a function
+ * of its arguments and its tests never touch shared state.
+ *
+ * The key is the session *generation*, not the token and not mere presence.
+ * Presence was not enough: `setTokens` replacing session A with session B
+ * leaves a token present throughout, so a presence key never changes and A's
+ * rows stay on screen under B's identity. The token itself is not usable
+ * either — it rotates on every silent refresh, and it is a credential, which
+ * has no business being a cache key.
+ *
+ * The generation costs a refetch when a silent refresh rotates the token, since
+ * a rotation is indistinguishable here from a re-login. That is the deliberate
+ * trade: one extra request on an already-failed request's retry path, in
+ * exchange for never rendering one session's users to another.
+ *
+ * The key carries no token, address, name or secret — only a counter.
+ */
+function useSessionScopeKey(): string | null {
+  return useSyncExternalStore(onAuthChange, readSessionScopeKey, () => null);
+}
+
+export default function AdminUsersPage() {
+  const sessionScopeKey = useSessionScopeKey();
+  const { state, reload, loadMore, loadingMore, loadMoreError, hasMore } =
+    useAdminUsers(sessionScopeKey);
+  const [activeFilter, setActiveFilter] = useState<FilterChip>("all");
+  const [search, setSearch] = useState("");
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const inviteButtonRef = useRef<HTMLButtonElement>(null);
+
+  const closeInvite = useCallback(() => {
+    setInviteOpen(false);
+    inviteButtonRef.current?.focus();
+  }, []);
+
+  const handleInvited = useCallback(() => {
+    // An invite is not a user: it creates an invitation the recipient has yet
+    // to accept, so no row is fabricated here. The list is refetched and shows
+    // whatever the server actually has.
+    setNotice("Convite enviado.");
+    closeInvite();
+    reload();
+  }, [closeInvite, reload]);
+
+  const filteredUsers = useMemo(
+    () =>
+      state.kind === "success"
+        ? // Sorted here, not in the hook: the hook's array is the sequence the
+          // server paged through, and the cursor is derived from its last row.
+          // Reordering it there would eventually page from the wrong place.
+          sortAdminUsersForDisplay(filterAdminUsers(state.users, activeFilter, search))
+        : [],
+    [state, activeFilter, search],
+  );
 
   return (
     <AdminShell activeTab="users">
@@ -369,14 +615,20 @@ export default function AdminUsersPage() {
         <button
           className="admin-users__invite-btn"
           type="button"
-          disabled
-          aria-disabled="true"
-          title="Funcionalidade não disponível nesta versão"
+          ref={inviteButtonRef}
+          onClick={() => {
+            setNotice(null);
+            setInviteOpen(true);
+          }}
         >
           <IconPersonAdd />
           Convidar usuário
         </button>
       </div>
+
+      <p className="admin-users__notice" role="status" aria-live="polite">
+        {notice}
+      </p>
 
       <div className="admin-users__toolbar">
         <div className="admin-users__search-wrap">
@@ -391,7 +643,7 @@ export default function AdminUsersPage() {
           />
         </div>
         <div className="admin-users__chips" role="group" aria-label="Filtrar usuários">
-          {CHIPS.map((chip) => (
+          {FILTER_CHIPS.map((chip) => (
             <button
               key={chip.id}
               type="button"
@@ -404,6 +656,10 @@ export default function AdminUsersPage() {
           ))}
         </div>
       </div>
+
+      {state.kind === "success" && hasMore && (
+        <p className="admin-users__filter-note">Os filtros consideram os usuários já carregados.</p>
+      )}
 
       <div className="admin-users__table-wrap">
         <table
@@ -425,9 +681,32 @@ export default function AdminUsersPage() {
               <th scope="col">Ações</th>
             </tr>
           </thead>
-          <tbody>{tableBody}</tbody>
+          <tbody>
+            <TableBody state={state} users={filteredUsers} onRetry={reload} />
+          </tbody>
         </table>
       </div>
+
+      {state.kind === "success" && hasMore && (
+        <div className="admin-users__load-more">
+          <button
+            type="button"
+            className="admin-users__load-more-btn"
+            onClick={loadMore}
+            disabled={loadingMore}
+            aria-busy={loadingMore || undefined}
+          >
+            {loadingMore ? "Carregando mais usuários…" : "Carregar mais usuários"}
+          </button>
+          {loadMoreError && (
+            <p className="admin-users__load-more-error" role="alert">
+              {ERROR_COPY[loadMoreError].title}
+            </p>
+          )}
+        </div>
+      )}
+
+      {inviteOpen && <InviteDialog onClose={closeInvite} onInvited={handleInvited} />}
     </AdminShell>
   );
 }

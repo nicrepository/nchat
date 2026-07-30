@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -560,4 +561,356 @@ func TestPGXUserStore_SuspendOIDCExchangeLifecycle(t *testing.T) {
 			t.Fatalf("activation unexpectedly touched oidc_exchange_codes: %v", err)
 		}
 	})
+}
+
+// ── Workspace administration (issue #425) ──────────────────────────────────
+
+// The resolver is the tenant boundary for the admin API: it must ask only for
+// memberships that are active, in an active workspace, and carry an
+// administrative role. A caller matching none of that is forbidden, not empty.
+func TestPGXUserStore_GetAdminWorkspaceID_Success(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("actor-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	store := storage.NewPGXUserStore(mock)
+	workspaceID, err := store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	if err != nil {
+		t.Fatalf("GetAdminWorkspaceID: %v", err)
+	}
+	if workspaceID != "ws-1" {
+		t.Fatalf("expected ws-1, got %q", workspaceID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXUserStore_GetAdminWorkspaceID_NoAdminMembershipIsForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("member-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetAdminWorkspaceID(context.Background(), "member-1")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for a non-admin, got %v", err)
+	}
+}
+
+func TestPGXUserStore_GetAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("actor-1").
+		WillReturnError(errors.New("connection refused"))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	if err == nil || errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("an infrastructure failure must not read as forbidden, got %v", err)
+	}
+}
+
+// ── Workspace user listing, keyset paginated (issues #425, #433) ───────────
+
+func workspaceUserRows() *pgxmock.Rows {
+	created := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
+	return pgxmock.NewRows([]string{
+		"id", "email", "display_name", "full_name", "status", "auth_source", "created_at",
+	}).
+		AddRow("u1", "alice@example.com", "Alice", "Alice Andrade", "active", "manual", created).
+		AddRow("u2", "bob@example.com", "Bob", "", "suspended", "oidc", created)
+}
+
+// The listing must be scoped by the workspace it was given and by nothing
+// else — that argument is what keeps one workspace's admin out of another's
+// member list. An empty cursor passes NULL, which the query's `$2 IS NULL`
+// branch turns into "start from the beginning".
+func TestPGXUserStore_ListWorkspaceUsers_FirstPageScopesToWorkspace(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", nil, 51).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	users, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, "")
+	if err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(users))
+	}
+	if users[0].Email != "alice@example.com" || users[0].FullName != "Alice Andrade" {
+		t.Fatalf("unexpected first row: %+v", users[0])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A cursor resumes strictly after a user id — a range predicate, not OFFSET, so
+// page N costs the same as page 1 and concurrent inserts cannot shift it.
+func TestPGXUserStore_ListWorkspaceUsers_CursorResumesAfterUserID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`wm\.user_id > \$2::uuid`).
+		WithArgs("ws-1", "u1", 51).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, "u1"); err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The limit is applied by the database, not by trimming in Go: the whole point
+// is never to materialise more than one page plus the lookahead row.
+func TestPGXUserStore_ListWorkspaceUsers_AppliesLimitInSQL(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`LIMIT \$3`).
+		WithArgs("ws-1", nil, 11).
+		WillReturnRows(workspaceUserRows())
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 11, ""); err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// An empty workspace yields an empty slice, never nil: the handler serialises
+// it straight to JSON, and null would reach the client as a distinct value.
+func TestPGXUserStore_ListWorkspaceUsers_EmptyIsNonNilSlice(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-empty", nil, 51).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "full_name", "status", "auth_source", "created_at",
+		}))
+
+	store := storage.NewPGXUserStore(mock)
+	users, err := store.ListWorkspaceUsers(context.Background(), "ws-empty", 51, "")
+	if err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if users == nil || len(users) != 0 {
+		t.Fatalf("expected a non-nil empty slice, got %v", users)
+	}
+}
+
+// A row that does not match the expected shape is a programming error, not an
+// empty page: it must surface rather than silently truncate the listing.
+func TestPGXUserStore_ListWorkspaceUsers_ScanErrorIsReturned(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", nil, 51).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "email", "display_name", "full_name", "status", "auth_source", "created_at",
+		}).AddRow("u1", "alice@example.com", "Alice", "", "active", "manual", "not-a-timestamp"))
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, ""); err == nil {
+		t.Fatal("expected a scan failure to surface")
+	}
+}
+
+// A failure that only appears once iteration finishes — a connection dropped
+// mid-stream — must not be reported as a short but successful page.
+func TestPGXUserStore_ListWorkspaceUsers_IterationErrorIsReturned(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", nil, 51).
+		WillReturnRows(workspaceUserRows().RowError(1, errors.New("connection reset")))
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, ""); err == nil {
+		t.Fatal("expected an iteration failure to surface")
+	}
+}
+
+func TestPGXUserStore_ListWorkspaceUsers_QueryErrorIsReturned(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", nil, 51).
+		WillReturnError(errors.New("relation does not exist"))
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, ""); err == nil {
+		t.Fatal("expected an error when the query fails")
+	}
+}
+
+// ── The listing query is index-shaped, asserted on the SQL itself ──────────
+//
+// The tests above pin behaviour, which a query can satisfy while still sorting
+// the whole tenant on every page. These pin the statement's shape, because the
+// cost is a property of the text: an ordering the index cannot answer is not
+// visible in any result, only in the plan.
+//
+// This project has no PostgreSQL fixture in unit tests, so no EXPLAIN is run
+// here and none is claimed. What is checked is the premise EXPLAIN would rest
+// on — that filter, resumption and ordering all name (workspace_id, user_id),
+// the primary key of chat.workspace_members, and that no expression stands
+// between the ordering and that index.
+
+// captureListSQL runs one listing and returns the SQL the store actually sent.
+func captureListSQL(t *testing.T, afterUserID string) string {
+	t.Helper()
+	var captured string
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(
+		pgxmock.QueryMatcherFunc(func(_, actualSQL string) error {
+			captured = actualSQL
+			return nil
+		}),
+	))
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	// The matcher above accepts any statement; the arguments are equally
+	// irrelevant here, because this fixture exists to read the SQL back.
+	mock.ExpectQuery("").
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(workspaceUserRows())
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, afterUserID); err != nil {
+		t.Fatalf("ListWorkspaceUsers: %v", err)
+	}
+	if captured == "" {
+		t.Fatal("no SQL captured")
+	}
+	return captured
+}
+
+// clauseBetween returns the part of sql from the first `start` up to the first
+// following `end`, so an assertion can name a clause rather than the statement.
+func clauseBetween(t *testing.T, sql, start, end string) string {
+	t.Helper()
+	lowered := strings.ToLower(sql)
+	from := strings.Index(lowered, strings.ToLower(start))
+	if from < 0 {
+		t.Fatalf("clause %q not found in:\n%s", start, sql)
+	}
+	rest := lowered[from:]
+	to := strings.Index(rest, strings.ToLower(end))
+	if to < 0 {
+		return sql[from:]
+	}
+	return sql[from : from+to]
+}
+
+// The ordering is the whole finding: lower(coalesce(...)) cannot be served by
+// any index on this schema, so every page sorted the entire membership before
+// returning fifty rows. Ordering by the bare key column is what makes the page
+// cost its own rows.
+func TestPGXUserStore_ListWorkspaceUsers_OrdersByIndexedColumnOnly(t *testing.T) {
+	orderBy := clauseBetween(t, captureListSQL(t, ""), "ORDER BY", "LIMIT")
+
+	if !strings.Contains(orderBy, "wm.user_id") {
+		t.Fatalf("ordering must name the indexed column, got %q", orderBy)
+	}
+	for _, forbidden := range []string{"lower", "coalesce", "nullif", "display_name", "email"} {
+		if strings.Contains(strings.ToLower(orderBy), forbidden) {
+			t.Fatalf("ordering must not use %q — it is not index-backed: %q", forbidden, orderBy)
+		}
+	}
+}
+
+// Filter and resumption must both name the primary key's columns, in its order,
+// so one range scan of (workspace_id, user_id) answers the page.
+func TestPGXUserStore_ListWorkspaceUsers_FiltersAndResumesOnPrimaryKey(t *testing.T) {
+	where := clauseBetween(t, captureListSQL(t, "u1"), "WHERE", "ORDER BY")
+
+	if !strings.Contains(where, "wm.workspace_id = $1") {
+		t.Fatalf("the workspace filter must be a plain equality on the key column: %q", where)
+	}
+	if !strings.Contains(where, "wm.user_id > $2") {
+		t.Fatalf("resumption must be a range predicate on the key column: %q", where)
+	}
+	for _, forbidden := range []string{"lower(", "coalesce("} {
+		if strings.Contains(strings.ToLower(where), forbidden) {
+			t.Fatalf("the predicate must stay sargable, found %q in %q", forbidden, where)
+		}
+	}
+}
+
+// OFFSET is the failure mode keyset pagination exists to avoid: it makes the
+// server walk and discard every skipped row, so the last page costs the most.
+func TestPGXUserStore_ListWorkspaceUsers_NeverUsesOffset(t *testing.T) {
+	for _, after := range []string{"", "u1"} {
+		sql := strings.ToLower(captureListSQL(t, after))
+		if strings.Contains(sql, "offset") {
+			t.Fatalf("the listing must not use OFFSET:\n%s", sql)
+		}
+	}
+}
+
+// No textual sort key is selected, computed or compared anywhere in the
+// statement. Its absence is what keeps a display name or an e-mail out of the
+// cursor, and out of the query strings and access logs the cursor travels in.
+func TestPGXUserStore_ListWorkspaceUsers_CarriesNoTextualSortKey(t *testing.T) {
+	sql := strings.ToLower(captureListSQL(t, "u1"))
+
+	for _, forbidden := range []string{"sort_key", "sortkey", "lower("} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("the listing must carry no textual sort key, found %q:\n%s", forbidden, sql)
+		}
+	}
 }

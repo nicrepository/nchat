@@ -5,7 +5,25 @@
 > **not** implemented. Keycloak is the current and only SSO entry point.
 
 Base URL resolved at runtime via `VITE_AUTH_API_BASE_URL` (default: `/api/auth`).
-Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
+Browser-callable admin endpoints use `VITE_ADMIN_API_BASE_URL`
+(default: `/api/auth/admin`).
+
+> **Gateway note (issue #425).** `/api/admin` is routed to `admin-service`,
+> which serves no user endpoints — a client aiming there gets `404`. Every
+> browser-callable route on this service sits under `/auth/*`, and the gateways
+> rewrite `/api/auth/<rest>` to `/auth/<rest>` before the request reaches the
+> pod:
+>
+> | Layer                             | Rule                                                               |
+> | --------------------------------- | ------------------------------------------------------------------ |
+> | Local Traefik                     | `rewrite-auth-api-prefix` in `infra/traefik/local/dynamic.yml`     |
+> | k3s-dev / k3s-staging / nchat-dev | `Middleware auth-api-prefix`, referenced by the Ingress annotation |
+>
+> All four use the same `replacePathRegex` (`^/api/auth/(.*)` → `/auth/${1}`).
+> `scripts/ci/auth-route-contract-check.sh` renders every overlay and fails if
+> a middleware is missing, an overlay diverges, the backend adds an `/api/`
+> alias, or the frontend base drifts. Health probes are unaffected: Kubernetes
+> probes the pod directly on `/healthz`.
 
 ---
 
@@ -32,6 +50,135 @@ Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
 | 17  | POST   | `/admin/users`                   | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
 | 18  | POST   | `/admin/invites`                 | Bootstrap-only (`X-NChat-Admin-Token`) | RF-46        |
 | 19  | PATCH  | `/admin/users/{id}/status`       | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
+| 20  | GET    | `/auth/admin/users`              | Bearer JWT + session + workspace admin | RF-74        |
+| 21  | POST   | `/auth/admin/invites`            | Bearer JWT + session + workspace admin | RF-46, RF-74 |
+
+---
+
+## Workspace user administration (issue #425)
+
+`GET /auth/admin/users` is what the **Configurações → Usuários** screen calls.
+It is guarded by `BearerAuth` → `RequireActiveSession` → `RequireWorkspaceAdmin`,
+in that order.
+
+`RequireWorkspaceAdmin` derives the workspace server-side: it is the one where
+the JWT subject holds an **active** `owner` or `admin` membership in an
+**active** workspace (`chat.workspace_members`). No workspace identifier is
+accepted from the path, query, body or headers — the route carries none.
+
+| Condition                               | Status |
+| --------------------------------------- | ------ |
+| Missing/invalid token                   | `401`  |
+| Revoked or expired session              | `401`  |
+| Authenticated, administers no workspace | `403`  |
+| Service booted without a database       | `503`  |
+
+### `GET /auth/admin/users`
+
+Lists one page of the caller's workspace. Members who left are excluded;
+suspended ones are included so they can be reactivated. Soft-deleted accounts
+never appear.
+
+**Query parameters**
+
+| Name     | Default | Rules                                                                      |
+| -------- | ------- | -------------------------------------------------------------------------- |
+| `limit`  | `50`    | 1–100. Above 100 is clamped to 100; `0`, negative or non-numeric is `400`. |
+| `cursor` | —       | Opaque token from a previous `next_cursor`. Invalid ⇒ `400`.               |
+
+The limit is bounded because an unpaginated listing lets any administrator
+force the service to materialise and serialise every member of a workspace
+(CWE-400). At most `limit + 1` rows are ever read — the extra row is what
+decides `has_more` without a second query.
+
+**Response — 200**
+
+```json
+{
+  "data": {
+    "data": [
+      {
+        "id": "…",
+        "email": "alice@example.com",
+        "display_name": "Alice",
+        "full_name": "Alice Andrade",
+        "status": "active",
+        "auth_source": "manual",
+        "created_at": "2026-01-15T10:00:00Z"
+      }
+    ],
+    "pagination": { "limit": 50, "next_cursor": "…", "has_more": true }
+  }
+}
+```
+
+The outer `data` is the service-wide envelope; the inner block mirrors the
+shape `GET /auth/me/login-attempts` already publishes, so the API has one
+pagination contract rather than two. `has_more` is redundant with
+`next_cursor` and is sent anyway so a client need not encode the rule that an
+empty cursor means the end; the two always agree.
+
+`full_name` is omitted when unset. No password hash, token, session, avatar,
+external subject, sort key or workspace identifier is returned.
+
+**Ordering and cursor.** Rows are ordered by `user_id` ascending, and by
+nothing else. That is the second column of the primary key of
+`workspace_members`, so the workspace filter, the resumption and the sort are
+all answered by one range scan of `(workspace_id, user_id)` — a page costs its
+own rows. Being the primary key it is already unique, so the order is total with
+no tiebreak, which is what stops a keyset cursor from skipping or repeating rows
+between pages. Resumption is a range predicate rather than `OFFSET`, so page N
+costs the same as page 1 and concurrent inserts cannot shift the window.
+
+This is not a presentation order. Ordering by name would be, but no index can
+serve `lower(coalesce(nullif(display_name, ''), email))`, so it made every page
+sort the workspace's entire membership before returning fifty rows — cost
+growing with the tenant while the response stayed the same size. **Clients that
+present these rows to a person should sort the rows they have client-side**; the
+web admin table does exactly that, and warns that its filters apply to the pages
+loaded so far.
+
+The cursor is base64url of a versioned JSON object carrying **only** the
+workspace id and the id of the last row of the previous page. It carries no sort
+key because there is no longer one to carry — which also settles what used to be
+a disclosure problem, since the old sort key was a display name or an e-mail
+address and would have travelled in a query string and from there into gateway
+access logs.
+
+Validation is total and its failures are indistinguishable. Rejected with a
+generic `400`: a token over 512 bytes (checked before any decode, since the
+value is client-controlled), invalid base64, unparseable JSON, an unknown
+field, a version other than the current one, an id that is not a UUID, and a
+workspace other than the session's. The message never says which, so a cursor
+cannot be used to probe for another tenant.
+
+A cursor naming a member who has since left the workspace stays valid: the id
+is still a position to resume after, and that member is simply absent from the
+results. Ids are ordered independently of who currently holds a membership, so
+paging continues rather than breaking mid-list.
+
+The cursor is not a capability and holds nothing secret: both values are
+identifiers the caller already has. A tampered cursor cannot widen the query —
+the workspace filter comes from the session on every request, independently of
+the cursor — so at most it moves the caller's position within the workspace
+they already administer.
+
+### `POST /auth/admin/invites`
+
+Creates an invite. Body: `email`, `display_name`, optional `full_name`.
+
+Shares the guard chain above, so the caller is a verified `owner`/`admin` of a
+real workspace rather than a holder of the shared bootstrap token. Responses:
+`201` `{id, email, created_at}`, `400` invalid payload or e-mail, `409`
+duplicate e-mail or an invite already pending, `503` when the database or the
+e-mail handoff is unavailable. The response never carries
+the invite token — it reaches the invitee only through the encrypted outbox
+handoff.
+
+> **Scope note.** This change registers and guards the route. Binding an invite
+> to the issuing workspace, and creating the membership when it is accepted, is
+> issue #433; until that lands an accepted invite creates an account with no
+> workspace membership, exactly as `POST /admin/invites` does today.
 
 ---
 

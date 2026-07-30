@@ -32,6 +32,58 @@ type SelfProfile struct {
 	AvatarURL   string
 }
 
+// WorkspaceUser is one row of the workspace user administration list.
+//
+// It is deliberately narrower than User: it carries exactly the fields the
+// admin table renders and nothing else. No password hash, token, session,
+// external subject or soft-delete marker is representable here, so a future
+// change to the query cannot leak one through this type.
+type WorkspaceUser struct {
+	ID          string
+	Email       string
+	DisplayName string
+	FullName    string
+	Status      string
+	AuthSource  string
+	CreatedAt   time.Time
+}
+
+// WorkspaceUserCursor is the keyset position of the workspace user listing.
+//
+// It names the last row of the previous page and nothing else. It carries no
+// sort key, because there is no longer a sort key to carry: the listing orders
+// by user id, so the id *is* the position. That also settles what used to be a
+// disclosure problem — the old ordering was on display name or e-mail, and a
+// cursor carrying it put an administrator's address into a query string and
+// from there into gateway access logs (CWE-532).
+//
+// What remains is two identifiers the caller already holds: their own workspace
+// and a user inside it. It carries its workspace so a cursor minted for one
+// tenant is detectably not usable in another — defence in depth, not the
+// boundary, since the query always filters by the workspace resolved from the
+// session.
+type WorkspaceUserCursor struct {
+	Version     int    `json:"v"`
+	WorkspaceID string `json:"workspaceId"`
+	UserID      string `json:"userId"`
+}
+
+// WorkspaceUserCursorVersion is the only cursor layout this build accepts.
+// A cursor from a future version is rejected rather than guessed at.
+const WorkspaceUserCursorVersion = 1
+
+// WorkspaceUserCursorMaxEncodedBytes caps the encoded cursor before it is
+// decoded at all. The value is client-controlled, so a length check has to come
+// before any allocation or parsing; a legitimate cursor is well under 200 bytes.
+const WorkspaceUserCursorMaxEncodedBytes = 512
+
+// WorkspaceUserPageLimits bound how many rows one page may carry.
+const (
+	WorkspaceUserPageDefaultLimit = 50
+	WorkspaceUserPageMinLimit     = 1
+	WorkspaceUserPageMaxLimit     = 100
+)
+
 type PolicySettings struct {
 	MinPasswordLength            int
 	RequireUppercase             bool

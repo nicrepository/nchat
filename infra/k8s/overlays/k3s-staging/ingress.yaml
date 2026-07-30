@@ -12,6 +12,10 @@ metadata:
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
     traefik.ingress.kubernetes.io/router.tls.options: nchat-staging-tls-options@kubernetescrd
+    # Issue #425: see the identical rule in the k3s-dev overlay. auth-service
+    # registers /auth/*, so /api/auth/* must be rewritten before it reaches the
+    # pod or every auth route answers 404.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-staging-auth-api-prefix@kubernetescrd
 spec:
   ingressClassName: traefik
   tls:
@@ -78,3 +82,21 @@ spec:
                 name: media-service
                 port:
                   number: 8087
+---
+# Rewrites the public /api/auth/<rest> contract onto the /auth/<rest> paths the
+# auth-service router actually registers (issue #425). Kept identical across
+# every overlay and to the local Traefik gateway so the contract is one rule,
+# not three. Paths that do not start with /api/auth/ are left unchanged.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/auth/(.*)"
+    replacement: "/auth/${1}"

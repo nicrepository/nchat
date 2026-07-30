@@ -89,6 +89,34 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
 		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
 	))
+
+	// Browser-callable workspace administration. Unlike the bootstrap routes
+	// above, this authenticates a real session and authorizes against the
+	// caller's workspace membership, which is what makes the workspace and the
+	// actor on an invite server-derived rather than client-supplied.
+	//
+	// The guard chain is only assembled when every part of it exists. A
+	// missing token manager, session store or user service leaves the
+	// unguarded handler out of reach: the routes serve a refusal instead,
+	// which is what stops a partially-wired pod from exposing user data. Same
+	// shape as the /auth/me wiring below.
+	adminUsersHandler := adminEndpointUnavailable()
+	adminInvitesHandler := adminEndpointUnavailable()
+	if tokens != nil && users != nil && sessions != nil {
+		requireActive := RequireActiveSession(sessions)
+		requireAdmin := RequireWorkspaceAdmin(users)
+		adminUsersHandler = BearerAuth(tokens)(requireActive(requireAdmin(AdminListWorkspaceUsers(users))))
+
+		// The browser invite endpoint. It shares the guard chain above, so the
+		// caller is a verified owner/admin of a real workspace rather than a
+		// holder of the shared bootstrap token. What the invite is *scoped to*
+		// is a separate change (issue #433); registering and guarding the route
+		// is what this one owes, and without it the screen's invite button
+		// answers 404 in every environment.
+		adminInvitesHandler = BearerAuth(tokens)(requireActive(requireAdmin(AdminCreateInvite(invites))))
+	}
+	mux.Handle(RouteAuthAdminUsers, httputil.MethodNotAllowed(http.MethodGet, adminUsersHandler))
+	mux.Handle(RouteAuthAdminInvites, httputil.MethodNotAllowed(http.MethodPost, adminInvitesHandler))
 	profileHandler := GetMyProfile(users)
 	if tokens != nil && users != nil {
 		requireActive := RequireActiveSession(sessions)

@@ -13,8 +13,9 @@ import (
 type ctxKey int
 
 const (
-	ctxKeyUserID    ctxKey = iota
-	ctxKeySessionID        // carries AccessClaims.SessionID ("sid"); "" if absent
+	ctxKeyUserID      ctxKey = iota
+	ctxKeySessionID          // carries AccessClaims.SessionID ("sid"); "" if absent
+	ctxKeyWorkspaceID        // carries the workspace RequireWorkspaceAdmin resolved
 )
 
 // GetContextSessionID returns the session ID injected by BearerAuth, or "" if absent.

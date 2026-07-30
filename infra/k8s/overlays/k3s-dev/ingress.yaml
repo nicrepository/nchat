@@ -10,6 +10,12 @@ metadata:
     app.kubernetes.io/component: platform
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web
+    # Issue #425: auth-service registers /auth/*, not /api/auth/*. Without this
+    # the public /api/auth/... paths reach the pod verbatim and every auth route
+    # answers 404 from the router's catch-all. Mirrors rewrite-auth-api-prefix
+    # in infra/traefik/local/dynamic.yml. The regex is anchored to /api/auth/,
+    # so the other paths on this Ingress pass through untouched.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-auth-api-prefix@kubernetescrd
 spec:
   ingressClassName: traefik
   rules:
@@ -72,3 +78,21 @@ spec:
                 name: media-service
                 port:
                   number: 8087
+---
+# Rewrites the public /api/auth/<rest> contract onto the /auth/<rest> paths the
+# auth-service router actually registers (issue #425). Kept identical across
+# every overlay and to the local Traefik gateway so the contract is one rule,
+# not three. Paths that do not start with /api/auth/ are left unchanged.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/auth/(.*)"
+    replacement: "/auth/${1}"
