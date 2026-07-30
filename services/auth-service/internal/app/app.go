@@ -62,11 +62,23 @@ func (a *App) Shutdown(ctx context.Context) error {
 //   - DATABASE_URL absent: configuration choice, not a transient failure —
 //     the process stays alive and /readyz reports 503.
 //   - Invalid JWT config: the process stays alive and /readyz reports 503.
+//   - Invalid bootstrap config: fail fast, for the reason on
+//     config.ErrBootstrapMisconfigured.
 //
 // In every degraded state the pod never becomes Ready, so the Service sends
 // it no traffic.
 func New(cfg config.Config) (*App, error) {
 	logger := platformlog.New(cfg.ServiceName, cfg.Env)
+
+	// Before anything is opened or dialled: a weak bootstrap credential is not
+	// a degraded dependency to be reported on /readyz, it is a deployment that
+	// must not exist. Returning here exits the process non-zero with nothing
+	// started, and the error carries no part of the credential.
+	if err := cfg.ValidateBootstrap(); err != nil {
+		logger.Error("bootstrap configuration rejected; refusing to start", "reason", "invalid_bootstrap_config")
+		return nil, err
+	}
+
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
 

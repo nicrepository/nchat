@@ -406,3 +406,47 @@ func validOIDCConfig() config.Config {
 		OIDCScopes:               "openid email profile",
 	}
 }
+
+// A weak bootstrap credential is not a degraded dependency to be reported on
+// /readyz: it is a deployment whose strongest secret is guessable, so New
+// refuses before anything is opened and the process exits non-zero.
+func TestNewWithWeakBootstrapToken_FailsFast(t *testing.T) {
+	cfg := config.Config{
+		ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5,
+		AdminBootstrapToken:      "changeme",
+		AuthBootstrapWorkspaceID: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+	}
+
+	app, err := New(cfg)
+
+	if !errors.Is(err, config.ErrBootstrapMisconfigured) {
+		t.Fatalf("expected ErrBootstrapMisconfigured, got %v", err)
+	}
+	if app != nil {
+		t.Fatal("a rejected bootstrap configuration must not yield a running app")
+	}
+	if strings.Contains(err.Error(), "changeme") {
+		t.Fatalf("the startup failure must not echo the credential: %v", err)
+	}
+}
+
+// The unconfigured case is not an error: the service starts and the bootstrap
+// route keeps failing closed exactly as before.
+func TestNewWithoutBootstrapConfiguration_Starts(t *testing.T) {
+	cfg := config.Config{ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5}
+
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("an unconfigured bootstrap must not block startup: %v", err)
+	}
+	t.Cleanup(func() { _ = app.Shutdown(context.Background()) })
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/invites", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected the bootstrap route to stay disabled, got %d", rec.Code)
+	}
+}

@@ -930,6 +930,34 @@ and `device_fingerprint_hash` are never returned.
 > It is **disabled unless both** `ADMIN_BOOTSTRAP_TOKEN` and
 > `AUTH_BOOTSTRAP_WORKSPACE_ID` are set. Requires email handoff (503 otherwise).
 
+**Credential policy.** `ADMIN_BOOTSTRAP_TOKEN` must be exactly 32 random bytes
+encoded as unpadded Base64URL — 43 characters, one canonical format. Generate
+one with:
+
+```sh
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+```
+
+The configuration has exactly three valid states, checked at **startup**, not
+per request:
+
+| `ADMIN_BOOTSTRAP_TOKEN` | `AUTH_BOOTSTRAP_WORKSPACE_ID` | Outcome                                 |
+| ----------------------- | ----------------------------- | --------------------------------------- |
+| unset                   | unset                         | starts; endpoint disabled (503)         |
+| valid                   | valid UUID                    | starts; endpoint live until first owner |
+| anything else           | anything else                 | **service refuses to start**            |
+
+Refused at startup: a token that is not 43 Base64URL characters, does not
+decode to 32 bytes, carries leading or trailing whitespace, is a repeated
+character (`AAAA…` is valid Base64URL for 32 zero bytes), or contains a known
+placeholder marker such as `changeme`, `secret`, `admin`, `bootstrap`, `token`
+or `example`. A token without a workspace, or a workspace without a token, is
+also refused — both halves fail closed at runtime, so a half-configured
+deployment would look enabled and answer 503 forever.
+
+The credential never appears in a log line, an error message, a trace or a
+metric label, and no hash of it is recorded either.
+
 **Server-side authority.** Neither the workspace nor the issuer is expressible
 in the request:
 

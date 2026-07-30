@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
@@ -443,5 +444,120 @@ func TestLoad_BootstrapWorkspaceBlankStaysDisabled(t *testing.T) {
 
 	if got := Load().AuthBootstrapWorkspaceID; got != "" {
 		t.Fatalf("expected a blank value to leave the bootstrap disabled, got %q", got)
+	}
+}
+
+// ── Bootstrap credential policy ────────────────────────────────────────────
+//
+// The bootstrap credential can mint an invite that confers ownership of a
+// workspace, so it is held to the same 32-byte standard as the JWT secret and
+// checked at startup rather than per request. These cases pin the three states
+// the configuration may be in, and that no rejection ever echoes the value.
+
+const (
+	// 32 zero-ish bytes is not used anywhere: this is a syntactically valid,
+	// non-degenerate 43-character Base64URL sample for tests only.
+	validBootstrapToken = "k7Hq2VfLpZ9xR4dNwT8yUgB3sC6mJeA1oQ5iX0vYnFo"
+	validBootstrapWS    = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+)
+
+func bootstrapConfig(token, workspaceID string) Config {
+	return Config{AdminBootstrapToken: token, AuthBootstrapWorkspaceID: workspaceID}
+}
+
+// Sanity check on the fixture itself: a test that silently used a malformed
+// sample would pass every rejection case for the wrong reason.
+func TestValidateBootstrap_FixtureIsAWellFormedToken(t *testing.T) {
+	if len(validBootstrapToken) != bootstrapTokenEncodedLength {
+		t.Fatalf("fixture must be %d characters, got %d", bootstrapTokenEncodedLength, len(validBootstrapToken))
+	}
+}
+
+func TestValidateBootstrap_AbsentTokenAndWorkspaceIsDisabledNotAnError(t *testing.T) {
+	if err := bootstrapConfig("", "").ValidateBootstrap(); err != nil {
+		t.Fatalf("an unconfigured bootstrap must start the service, got %v", err)
+	}
+	if bootstrapConfig("", "").BootstrapEnabled() {
+		t.Fatal("an unconfigured bootstrap must not report as enabled")
+	}
+}
+
+func TestValidateBootstrap_ValidTokenAndWorkspaceStarts(t *testing.T) {
+	cfg := bootstrapConfig(validBootstrapToken, validBootstrapWS)
+	if err := cfg.ValidateBootstrap(); err != nil {
+		t.Fatalf("a fully configured bootstrap must start, got %v", err)
+	}
+	if !cfg.BootstrapEnabled() {
+		t.Fatal("a configured bootstrap must report as enabled")
+	}
+}
+
+// Every rejection below must fail startup, and none may put the value it
+// rejected into the message — that is what keeps a credential out of the logs
+// of whatever collects the crash.
+func TestValidateBootstrap_RejectsWeakOrMalformedTokens(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{name: "too short", token: "k7Hq2VfLpZ9xR4dNw"},
+		{name: "one character short", token: validBootstrapToken[:bootstrapTokenEncodedLength-1]},
+		{name: "one character long", token: validBootstrapToken + "z"},
+		{name: "not base64url", token: "k7Hq2VfLpZ9xR4dNwT8yUgB3sC6mJeA1oQ5iX0vYn!o"},
+		{name: "standard base64 alphabet", token: "k7Hq2VfLpZ9xR4dNwT8yUgB3sC6mJeA1oQ5iX0vYn+o"},
+		{name: "padded", token: "k7Hq2VfLpZ9xR4dNwT8yUgB3sC6mJeA1oQ5iX0vYnFo="},
+		// 22 characters of Base64URL decode to 16 bytes, not 32.
+		{name: "decodes to fewer than 32 bytes", token: "k7Hq2VfLpZ9xR4dNwT8yUg"},
+		// 64 characters decode to 48 bytes.
+		{name: "decodes to more than 32 bytes", token: strings.Repeat("k7Hq2VfLpZ9xR4dNwT8yUgB3sC6mJeA1", 2)},
+		{name: "leading whitespace", token: " " + validBootstrapToken},
+		{name: "trailing whitespace", token: validBootstrapToken + "\n"},
+		{name: "whitespace only", token: "   "},
+		// Valid Base64URL for 32 zero bytes: structurally perfect, no entropy.
+		{name: "repeated characters", token: strings.Repeat("A", bootstrapTokenEncodedLength)},
+		{name: "known weak value", token: "changeme"},
+		{name: "weak value padded to length", token: "changeme-changeme-changeme-changeme-changem"},
+		{name: "placeholder marker", token: "placeholder-abcdefghijklmnopqrstuvwxyz01234"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := bootstrapConfig(tt.token, validBootstrapWS).ValidateBootstrap()
+			if !errors.Is(err, ErrBootstrapMisconfigured) {
+				t.Fatalf("expected ErrBootstrapMisconfigured, got %v", err)
+			}
+			if trimmed := strings.TrimSpace(tt.token); trimmed != "" && strings.Contains(err.Error(), trimmed) {
+				t.Fatalf("the rejection must not echo the credential: %v", err)
+			}
+		})
+	}
+}
+
+// Half a configuration is refused rather than quietly disabled: both halves
+// fail closed at runtime, so the deployment would answer 503 forever while
+// looking enabled.
+func TestValidateBootstrap_RejectsPartialConfiguration(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		token       string
+		workspaceID string
+	}{
+		{name: "token without workspace", token: validBootstrapToken, workspaceID: ""},
+		{name: "workspace without token", token: "", workspaceID: validBootstrapWS},
+		{name: "workspace is not a uuid", token: validBootstrapToken, workspaceID: "not-a-uuid"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := bootstrapConfig(tt.token, tt.workspaceID).ValidateBootstrap(); !errors.Is(err, ErrBootstrapMisconfigured) {
+				t.Fatalf("expected ErrBootstrapMisconfigured, got %v", err)
+			}
+		})
+	}
+}
+
+// The credential is read verbatim: trimming it here would accept a value whose
+// exact bytes differ from what the operator will send in the header.
+func TestLoad_BootstrapTokenIsNotTrimmed(t *testing.T) {
+	t.Setenv("ADMIN_BOOTSTRAP_TOKEN", " "+validBootstrapToken)
+
+	if got := Load().AdminBootstrapToken; got != " "+validBootstrapToken {
+		t.Fatalf("expected the raw value to survive Load, got %q", got)
 	}
 }
