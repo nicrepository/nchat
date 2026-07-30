@@ -93,7 +93,7 @@ func New(cfg config.Config) (*App, error) {
 	// Left nil when there is no database. The limiter fails closed on a nil
 	// recorder, so the bootstrap routes refuse rather than run their credential
 	// check unbounded.
-	var bootstrapAttempts httpapi.BootstrapAttemptRecorder
+	var bootstrapAttempts httpapi.SharedRateLimitStore
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), dbBootstrapTimeout)
 		openedPool, dbErr := openDBWithRetry(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, logger)

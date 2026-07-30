@@ -13,6 +13,7 @@ import (
 
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
+	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
 // The bootstrap credential can mint an invite conferring workspace ownership,
@@ -45,6 +46,28 @@ func (r *countingRecorder) RecordAttempt(_ context.Context, key string, limit in
 	}
 	r.counts[key]++
 	return r.counts[key] <= limit, nil
+}
+
+// Allow lets the same fake stand in for the shared store the router takes.
+// Namespaced keys are counted separately, which is what the per-namespace
+// isolation tests rely on.
+func (r *countingRecorder) Allow(_ context.Context, req storage.DistributedRateLimitRequest) (storage.DistributedRateLimitResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.err != nil {
+		return storage.DistributedRateLimitResult{}, r.err
+	}
+	key := req.Subject
+	if req.Namespace != "" {
+		key = req.Namespace + ":" + req.Subject
+	}
+	r.lastKey = key
+	r.counts[key]++
+	if r.counts[key] <= req.Limit {
+		return storage.DistributedRateLimitResult{Allowed: true}, nil
+	}
+	return storage.DistributedRateLimitResult{RetryAfter: req.Window}, nil
 }
 
 func (r *countingRecorder) attempts(key string) int {

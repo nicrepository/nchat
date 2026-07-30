@@ -13,7 +13,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, avatars AvatarManager, avatarReader AvatarReader, bootstrapAttempts BootstrapAttemptRecorder, oidcManagers ...service.OIDCManager) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, avatars AvatarManager, avatarReader AvatarReader, bootstrapAttempts SharedRateLimitStore, oidcManagers ...service.OIDCManager) http.Handler {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
@@ -121,19 +121,25 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 		requireAdmin := RequireWorkspaceAdmin(users)
 
 		// Invite creation carries two limits. The authoritative one is per
-		// (actor, workspace) and is counted in PostgreSQL inside the creating
-		// transaction, so it holds across replicas and cannot be raced — see
-		// storage.inviteBudgetExhaustedTx. This one is the complementary IP
-		// ceiling, reusing the same in-process limiter the other auth
-		// endpoints use; being per-process it is a coarse ceiling only, never
-		// the control the workspace budget provides.
+		// (actor, workspace), counted in PostgreSQL inside the creating
+		// transaction — see storage.inviteBudgetExhaustedTx. This is the
+		// complementary per-IP ceiling, and it is counted in PostgreSQL too:
+		// the in-process bucket it replaced gave each replica its own budget
+		// and a fresh one on restart, so the advertised ceiling was whatever
+		// the deployment happened to be scaled to.
 		//
 		// It sits inside the guard chain rather than in front of it so an
 		// unauthenticated request is rejected by BearerAuth first and cannot
 		// consume another tenant's IP budget.
-		inviteIPLimiter := NewHourlyEndpointRateLimiter(cfg.AuthInviteRateLimitPerIPPerHour, trustedProxyCIDRs)
+		inviteIPLimiter := RateLimitByClientIP(DistributedIPRateLimitConfig{
+			Limiter:           bootstrapAttempts,
+			Namespace:         adminInviteIPLimiterNamespace,
+			Limit:             cfg.AuthInviteRateLimitPerIPPerHour,
+			Window:            time.Hour,
+			TrustedProxyCIDRs: trustedProxyCIDRs,
+		})
 		adminInvitesHandler = BearerAuth(tokens)(requireActive(requireAdmin(
-			inviteIPLimiter.Middleware(AdminCreateInvite(invites, inviteRetryAfterSeconds)),
+			inviteIPLimiter(AdminCreateInvite(invites, inviteRetryAfterSeconds)),
 		)))
 	}
 	mux.Handle(RouteAuthAdminInvites, httputil.MethodNotAllowed(http.MethodPost, adminInvitesHandler))

@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
 // WithAdminContext returns r carrying the workspace and actor that
@@ -30,9 +32,17 @@ func (AllowAllBootstrapAttemptsForTest) RecordAttempt(context.Context, string, i
 	return true, nil
 }
 
+func (AllowAllBootstrapAttemptsForTest) Allow(context.Context, storage.DistributedRateLimitRequest) (storage.DistributedRateLimitResult, error) {
+	return storage.DistributedRateLimitResult{Allowed: true}, nil
+}
+
 // allowAllBootstrapAttempts is the same thing for in-package tests.
 type allowAllBootstrapAttempts struct{}
 
 func (allowAllBootstrapAttempts) RecordAttempt(context.Context, string, int, time.Duration) (bool, error) {
 	return true, nil
+}
+
+func (allowAllBootstrapAttempts) Allow(context.Context, storage.DistributedRateLimitRequest) (storage.DistributedRateLimitResult, error) {
+	return storage.DistributedRateLimitResult{Allowed: true}, nil
 }
