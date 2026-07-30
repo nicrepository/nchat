@@ -29,6 +29,7 @@ type fakeInviteStore struct {
 	createTokenHash string
 	createPayload   string
 	createExpiresAt time.Time
+	createNow       time.Time
 	createLimit     domain.InviteRateLimit
 
 	acceptTokenHash    string
@@ -46,7 +47,8 @@ func (f *fakeInviteStore) GetPolicySettings(_ context.Context) (domain.PolicySet
 	return f.policy, nil
 }
 
-func (f *fakeInviteStore) CreateInvite(_ context.Context, input domain.AdminInviteInput, tokenHash string, expiresAt time.Time, encryptedPayload string, limit domain.InviteRateLimit) (domain.InviteResult, error) {
+func (f *fakeInviteStore) CreateInvite(_ context.Context, input domain.AdminInviteInput, tokenHash string, now, expiresAt time.Time, encryptedPayload string, limit domain.InviteRateLimit) (domain.InviteResult, error) {
+	f.createNow = now
 	f.createCalls++
 	f.createInput = input
 	f.createEmail = input.Email
@@ -509,5 +511,39 @@ func TestInviteKind_MembershipRole(t *testing.T) {
 		if got := tt.kind.MembershipRole(); got != tt.want {
 			t.Fatalf("kind %q: expected role %q, got %q", tt.kind, tt.want, got)
 		}
+	}
+}
+
+// ── Canonical instant ──────────────────────────────────────────────────────
+//
+// The store judges "already lapsed" and the service computes "expires at" from
+// one reading of the clock. Two readings would let a row land between them and
+// be treated as neither.
+
+func TestInviteService_CreateInvitePassesOneInstantForExpiryAndTTL(t *testing.T) {
+	store := &fakeInviteStore{
+		policy:       domain.PolicySettings{MinPasswordLength: 8, InviteTokenTTLHours: 72},
+		createResult: domain.InviteResult{ID: "invite-1"},
+	}
+	svc := service.NewInviteService(newTestTokenManager(t, strings.Repeat("n", 32)), store,
+		service.WithInviteOutboxEncryptor(newTestEmailOutboxEncryptor(t)))
+
+	before := time.Now().UTC()
+	if _, err := svc.CreateInvite(context.Background(), domain.AdminInviteInput{
+		WorkspaceID: testWorkspaceID, ActorID: testActorID,
+		Email: "user@example.com", DisplayName: "User",
+	}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	after := time.Now().UTC()
+
+	if store.createNow.Before(before) || store.createNow.After(after) {
+		t.Fatalf("the canonical instant must be read during the call, got %v", store.createNow)
+	}
+	// The new expiry is that same instant plus the policy TTL, exactly.
+	wantExpiry := store.createNow.Add(72 * time.Hour)
+	if !store.createExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("expiry must be derived from the canonical instant: got %v, want %v",
+			store.createExpiresAt, wantExpiry)
 	}
 }

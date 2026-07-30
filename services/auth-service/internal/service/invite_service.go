@@ -28,7 +28,10 @@ type InviteStore interface {
 	// authenticated endpoint can do the job and the bootstrap credential is
 	// refused.
 	WorkspaceHasAdmin(ctx context.Context, workspaceID string) (bool, error)
-	CreateInvite(ctx context.Context, input domain.AdminInviteInput, tokenHash string, expiresAt time.Time, encryptedPayload string, limit domain.InviteRateLimit) (domain.InviteResult, error)
+	// now is the caller's canonical instant: the store uses it both to retire
+	// invites whose TTL has elapsed and to judge whether one is still active,
+	// and expiresAt is derived from that same instant.
+	CreateInvite(ctx context.Context, input domain.AdminInviteInput, tokenHash string, now, expiresAt time.Time, encryptedPayload string, limit domain.InviteRateLimit) (domain.InviteResult, error)
 	AcceptInviteTx(ctx context.Context, tokenHash, displayName, fullName, passwordHash string) (domain.AcceptInviteResult, error)
 }
 
@@ -180,7 +183,12 @@ func (s *InviteService) issueInvite(ctx context.Context, input domain.AdminInvit
 		return domain.InviteResult{}, err
 	}
 	tokenHash := s.tokens.HashInviteToken(rawToken)
-	expiresAt := time.Now().UTC().Add(time.Duration(inviteTTLHours) * time.Hour)
+	// One reading of the clock for the whole operation. The store uses it to
+	// decide which invites have lapsed, and the new invite's expiry is derived
+	// from the same instant, so "already expired" and "expires at" can never be
+	// judged against two slightly different nows.
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Duration(inviteTTLHours) * time.Hour)
 	encryptedPayload, err := s.emailOutbox.Encrypt(emailcrypto.Plaintext{
 		Kind:       "invite",
 		Token:      rawToken,
@@ -199,7 +207,7 @@ func (s *InviteService) issueInvite(ctx context.Context, input domain.AdminInvit
 		DisplayName: displayName,
 		FullName:    fullName,
 		Kind:        input.Kind,
-	}, tokenHash, expiresAt, encryptedPayload, s.rateLimit)
+	}, tokenHash, now, expiresAt, encryptedPayload, s.rateLimit)
 }
 
 // WithBootstrapWorkspace sets the workspace bootstrap invites are issued into.

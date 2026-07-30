@@ -91,8 +91,11 @@ func memberExistsInWorkspaceTx(ctx context.Context, q queryer, workspaceID, emai
 // activeInviteExistsInWorkspaceTx reports whether a pending invite for email is
 // outstanding *in this workspace*. Scoped, for the same reason as above: a
 // pending invite from workspace A must not block workspace B.
-func activeInviteExistsInWorkspaceTx(ctx context.Context, q queryer, workspaceID, email string) (bool, error) {
+func activeInviteExistsInWorkspaceTx(ctx context.Context, q queryer, workspaceID, email string, now time.Time) (bool, error) {
 	var exists int
+	// now is the caller's canonical instant, not the server's now(): the same
+	// value decides which rows expirePendingInvitesTx just retired, so a row
+	// cannot fall between the two clocks and be neither expired nor active.
 	err := q.QueryRow(ctx, `
 		SELECT 1 FROM auth.user_invites
 		WHERE workspace_id = $1::uuid
@@ -100,9 +103,9 @@ func activeInviteExistsInWorkspaceTx(ctx context.Context, q queryer, workspaceID
 		  AND status = 'pending'
 		  AND accepted_at IS NULL
 		  AND revoked_at IS NULL
-		  AND expires_at > now()
+		  AND expires_at > $3
 		LIMIT 1`,
-		workspaceID, email,
+		workspaceID, email, now,
 	).Scan(&exists)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -155,11 +158,19 @@ func inviteBudgetExhaustedTx(ctx context.Context, q queryer, workspaceID, actorI
 // that workspace, which is what keeps one workspace's admin from observing or
 // obstructing another's onboarding.
 //
-// Order matters. The advisory lock is taken first so the budget check, the
-// duplicate checks and the insert are one atomic decision; the budget is spent
+// Order matters, and every step below the lock depends on it:
+//
+//	lock → expire lapsed invites → check for an active one → insert → outbox → commit
+//
+// The advisory lock is taken first so the budget check, the retirement, the
+// duplicate checks and the insert are one atomic decision. The budget is spent
 // before any row or outbox entry is written, so a rejected request leaves no
 // invite, no outbox entry and therefore no e-mail.
-func (s *PGXInviteStore) CreateInvite(ctx context.Context, input domain.AdminInviteInput, tokenHash string, expiresAt time.Time, encryptedPayload string, limit domain.InviteRateLimit) (domain.InviteResult, error) {
+//
+// now is the caller's canonical instant, shared with the expiresAt derived from
+// it. Reading the clock again here would let a row sit between two readings and
+// be judged neither lapsed nor live.
+func (s *PGXInviteStore) CreateInvite(ctx context.Context, input domain.AdminInviteInput, tokenHash string, now, expiresAt time.Time, encryptedPayload string, limit domain.InviteRateLimit) (domain.InviteResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.InviteResult{}, fmt.Errorf("begin tx: %w", err)
@@ -169,7 +180,12 @@ func (s *PGXInviteStore) CreateInvite(ctx context.Context, input domain.AdminInv
 	if err := reserveInviteSlotTx(ctx, tx, input, limit); err != nil {
 		return domain.InviteResult{}, err
 	}
-	if err := assertInviteAllowedTx(ctx, tx, input.WorkspaceID, input.Email); err != nil {
+	// Under the lock, and before the check that would otherwise reject on a row
+	// that is only nominally pending.
+	if err := expirePendingInvitesTx(ctx, tx, input.WorkspaceID, input.Email, now); err != nil {
+		return domain.InviteResult{}, err
+	}
+	if err := assertInviteAllowedTx(ctx, tx, input.WorkspaceID, input.Email, now); err != nil {
 		return domain.InviteResult{}, err
 	}
 
@@ -234,7 +250,7 @@ func reserveInviteSlotTx(ctx context.Context, q txQueryer, input domain.AdminInv
 // workspace, or already has an invite outstanding here. Both questions are
 // per-workspace, which is what keeps one tenant from observing or obstructing
 // another's onboarding.
-func assertInviteAllowedTx(ctx context.Context, q queryer, workspaceID, email string) error {
+func assertInviteAllowedTx(ctx context.Context, q queryer, workspaceID, email string, now time.Time) error {
 	member, err := memberExistsInWorkspaceTx(ctx, q, workspaceID, email)
 	if err != nil {
 		return err
@@ -243,12 +259,53 @@ func assertInviteAllowedTx(ctx context.Context, q queryer, workspaceID, email st
 		return domain.ErrAlreadyMember
 	}
 
-	pending, err := activeInviteExistsInWorkspaceTx(ctx, q, workspaceID, email)
+	pending, err := activeInviteExistsInWorkspaceTx(ctx, q, workspaceID, email, now)
 	if err != nil {
 		return err
 	}
 	if pending {
 		return domain.ErrInviteAlreadyPending
+	}
+	return nil
+}
+
+// expirePendingInvitesTx retires invites for this (workspace, address) whose
+// TTL has run out, so a new one can be issued.
+//
+// It exists because two rules disagreed about what "pending" means. The service
+// treats a row as usable only while expires_at is in the future, but the partial
+// unique index is keyed on status alone, so a timed-out row kept occupying the
+// slot: re-inviting an address whose invite had simply lapsed failed with a
+// conflict, and nothing short of manual intervention cleared it. Moving the row
+// to its true state is what reconciles them — after this, the only row left
+// pending for the pair is one that really is.
+//
+// Deliberately narrow. It touches exactly the (workspace, address) being
+// invited, and only rows that are still pending and already past their TTL:
+// accepted, revoked and live invites are untouched, as is every other workspace
+// and address. This is not a sweep — a global cleanup would make one admin's
+// invitation rewrite unrelated tenants' rows.
+//
+// It must run inside the caller's transaction and after the (workspace, email)
+// advisory lock, so the retire/check/insert sequence is one atomic decision.
+// Zero rows updated is the ordinary case and not an error.
+func expirePendingInvitesTx(ctx context.Context, q txQueryer, workspaceID, email string, now time.Time) error {
+	// expires_at <= now, not <: at exactly the boundary the TTL has elapsed,
+	// and activeInviteExistsInWorkspaceTx uses `> now` for the same instant, so
+	// the two together partition the rows with no gap and no overlap.
+	if _, err := q.Exec(ctx, `
+		UPDATE auth.user_invites
+		SET status     = 'expired',
+		    updated_at = $3
+		WHERE workspace_id = $1::uuid
+		  AND email = $2
+		  AND status = 'pending'
+		  AND accepted_at IS NULL
+		  AND revoked_at IS NULL
+		  AND expires_at <= $3`,
+		workspaceID, email, now,
+	); err != nil {
+		return fmt.Errorf("expire stale invites: %w", err)
 	}
 	return nil
 }

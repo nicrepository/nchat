@@ -34,6 +34,21 @@ const (
 // unlimited disables the budget, which skips the counting queries entirely.
 var unlimited = domain.InviteRateLimit{}
 
+// inviteNow is the canonical instant a creating transaction is judged against:
+// the store uses it to retire lapsed invites and to decide whether one is still
+// active. Fixed here so the scripted expectations can match on it.
+const lockSeparatorForTest = "\x1f"
+
+var inviteNow = time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+// expectExpireStaleInvites scripts the retirement that now runs under the
+// (workspace, email) lock, before the duplicate checks.
+func expectExpireStaleInvites(mock pgxmock.PgxPoolIface) {
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+}
+
 // uniqueViolation is the PostgreSQL error the partial unique index raises when
 // a second pending invite for the same (workspace, email) is inserted.
 func uniqueViolation() error {
@@ -56,11 +71,12 @@ func expectInviteCreateGuards(mock pgxmock.PgxPoolIface) {
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs(inviteEmailLockKey).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectExpireStaleInvites(mock)
 	mock.ExpectQuery(`JOIN chat\.workspace_members`).
 		WithArgs(inviteWorkspaceID, inviteEmail).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`FROM auth\.user_invites`).
-		WithArgs(inviteWorkspaceID, inviteEmail).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
 		WillReturnError(pgx.ErrNoRows)
 }
 
@@ -74,6 +90,7 @@ func expectInviteBudgetPass(mock pgxmock.PgxPoolIface) {
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`SELECT count\(\*\)`).WithArgs(inviteActorID, inviteWorkspaceID, 10).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(0))
+	expectExpireStaleInvites(mock)
 }
 
 func inviteInsertRows(createdAt time.Time) *pgxmock.Rows {
@@ -104,7 +121,7 @@ func TestPGXInviteStore_CreateInviteInsertsInviteAndEncryptedOutbox(t *testing.T
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	result, err := store.CreateInvite(context.Background(), inviteInput(), "hashed-invite-value", expiresAt, encryptedInvitePayload, unlimited)
+	result, err := store.CreateInvite(context.Background(), inviteInput(), "hashed-invite-value", inviteNow, expiresAt, encryptedInvitePayload, unlimited)
 	if err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}
@@ -136,11 +153,12 @@ func TestPGXInviteStore_CreateInviteScopesGuardsToWorkspace(t *testing.T) {
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs(inviteEmailLockKey).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectExpireStaleInvites(mock)
 	mock.ExpectQuery(`JOIN chat\.workspace_members`).
 		WithArgs(inviteWorkspaceID, inviteEmail).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`FROM auth\.user_invites`).
-		WithArgs(inviteWorkspaceID, inviteEmail).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
 		WithArgs(inviteWorkspaceID, inviteActorID, inviteEmail, "hash", expiresAt, string(domain.InviteKindMember)).
@@ -151,7 +169,7 @@ func TestPGXInviteStore_CreateInviteScopesGuardsToWorkspace(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", expiresAt, encryptedInvitePayload, unlimited); err != nil {
+	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, expiresAt, encryptedInvitePayload, unlimited); err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -179,7 +197,7 @@ func TestPGXInviteStore_CreateInviteLockKeyIncludesWorkspace(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	if _, err := store.CreateInvite(context.Background(), input, "hash", expiresAt, encryptedInvitePayload, unlimited); err == nil {
+	if _, err := store.CreateInvite(context.Background(), input, "hash", inviteNow, expiresAt, encryptedInvitePayload, unlimited); err == nil {
 		t.Fatal("expected the scripted lock failure")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -198,13 +216,14 @@ func TestPGXInviteStore_CreateInviteRejectsExistingMember(t *testing.T) {
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs(inviteEmailLockKey).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectExpireStaleInvites(mock)
 	mock.ExpectQuery(`JOIN chat\.workspace_members`).
 		WithArgs(inviteWorkspaceID, inviteEmail).
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", time.Now().Add(time.Hour), encryptedInvitePayload, unlimited)
+	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload, unlimited)
 	if !errors.Is(err, domain.ErrAlreadyMember) {
 		t.Fatalf("expected ErrAlreadyMember, got %v", err)
 	}
@@ -224,16 +243,17 @@ func TestPGXInviteStore_CreateInviteRejectsPendingInviteInSameWorkspace(t *testi
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs(inviteEmailLockKey).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectExpireStaleInvites(mock)
 	mock.ExpectQuery(`JOIN chat\.workspace_members`).
 		WithArgs(inviteWorkspaceID, inviteEmail).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`FROM auth\.user_invites`).
-		WithArgs(inviteWorkspaceID, inviteEmail).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", time.Now().Add(time.Hour), encryptedInvitePayload, unlimited)
+	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload, unlimited)
 	if !errors.Is(err, domain.ErrInviteAlreadyPending) {
 		t.Fatalf("expected ErrInviteAlreadyPending, got %v", err)
 	}
@@ -265,15 +285,16 @@ func TestPGXInviteStore_CreateInviteCountsBudgetPerActorAndWorkspace(t *testing.
 	mock.ExpectQuery(`SELECT count\(\*\)`).
 		WithArgs(inviteActorID, inviteWorkspaceID, 10).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(4))
+	expectExpireStaleInvites(mock)
 	mock.ExpectQuery(`JOIN chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
-	mock.ExpectQuery(`FROM auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`FROM auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", expiresAt, encryptedInvitePayload, limit); err != nil {
+	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, expiresAt, encryptedInvitePayload, limit); err != nil {
 		t.Fatalf("CreateInvite below the limit must succeed: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -303,7 +324,7 @@ func TestPGXInviteStore_CreateInviteOverBudgetWritesNothing(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", time.Now().Add(time.Hour), encryptedInvitePayload, limit)
+	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload, limit)
 	if !errors.Is(err, domain.ErrInviteRateLimited) {
 		t.Fatalf("expected ErrInviteRateLimited, got %v", err)
 	}
@@ -337,7 +358,7 @@ func TestPGXInviteStore_CreateInviteBudgetKeyIsPerWorkspaceAndActor(t *testing.T
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	_, err = store.CreateInvite(context.Background(), input, "hash", time.Now().Add(time.Hour), encryptedInvitePayload,
+	_, err = store.CreateInvite(context.Background(), input, "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload,
 		domain.InviteRateLimit{MaxPerWindow: 5, WindowMinutes: 10})
 	if err == nil || errors.Is(err, domain.ErrInviteRateLimited) {
 		t.Fatalf("expected the scripted count failure, got %v", err)
@@ -364,7 +385,7 @@ func TestPGXInviteStore_CreateInviteSkipsBudgetWhenDisabled(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", time.Now().Add(time.Hour), encryptedInvitePayload, unlimited); err != nil {
+	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload, unlimited); err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -387,7 +408,7 @@ func TestPGXInviteStore_CreateInviteMapsUniqueViolationToPending(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", time.Now().Add(time.Hour), encryptedInvitePayload, unlimited)
+	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload, unlimited)
 	if !errors.Is(err, domain.ErrInviteAlreadyPending) {
 		t.Fatalf("expected ErrInviteAlreadyPending, got %v", err)
 	}
@@ -683,7 +704,7 @@ func TestPGXInviteStore_CreateInviteGuardQueryErrors(t *testing.T) {
 			mock.ExpectBegin()
 			expectInviteBudgetPass(mock)
 			mock.ExpectQuery(`JOIN chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
-			mock.ExpectQuery(`FROM auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("query failed"))
+			mock.ExpectQuery(`FROM auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("query failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "budget count", setup: func(mock pgxmock.PgxPoolIface) {
@@ -704,7 +725,7 @@ func TestPGXInviteStore_CreateInviteGuardQueryErrors(t *testing.T) {
 			defer mock.Close()
 			tt.setup(mock)
 			store := storage.NewPGXInviteStore(mock)
-			_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", time.Now().Add(time.Hour), encryptedInvitePayload,
+			_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload,
 				domain.InviteRateLimit{MaxPerWindow: 5, WindowMinutes: 10})
 			if err == nil {
 				t.Fatal("expected error")
@@ -760,7 +781,7 @@ func TestPGXInviteStore_CreateInviteErrors(t *testing.T) {
 			defer mock.Close()
 			tt.setup(mock)
 			store := storage.NewPGXInviteStore(mock)
-			_, err = store.CreateInvite(context.Background(), inviteInput(), "hashed-invite-value", expiresAt, encryptedInvitePayload, unlimited)
+			_, err = store.CreateInvite(context.Background(), inviteInput(), "hashed-invite-value", inviteNow, expiresAt, encryptedInvitePayload, unlimited)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -960,7 +981,7 @@ func TestPGXInviteStore_CreateInviteStoresNullIssuerForBootstrap(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	if _, err := store.CreateInvite(context.Background(), input, "hash", expiresAt, encryptedInvitePayload, unlimited); err != nil {
+	if _, err := store.CreateInvite(context.Background(), input, "hash", inviteNow, expiresAt, encryptedInvitePayload, unlimited); err != nil {
 		t.Fatalf("CreateInvite: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -995,7 +1016,7 @@ func TestPGXInviteStore_CreateInviteBudgetBindsForBootstrapIssuer(t *testing.T) 
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
-	_, err = store.CreateInvite(context.Background(), input, "hash", time.Now().Add(time.Hour), encryptedInvitePayload, limit)
+	_, err = store.CreateInvite(context.Background(), input, "hash", inviteNow, time.Now().Add(time.Hour), encryptedInvitePayload, limit)
 	if !errors.Is(err, domain.ErrInviteRateLimited) {
 		t.Fatalf("expected ErrInviteRateLimited for an exhausted bootstrap budget, got %v", err)
 	}
@@ -1206,4 +1227,224 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ── Reinvite after expiry ──────────────────────────────────────────────────
+//
+// The service treated an invite as usable only while expires_at was ahead, but
+// the partial unique index keys on status alone. A lapsed row therefore kept
+// occupying the slot and re-inviting the address failed with a conflict that no
+// amount of waiting cleared. The store now retires those rows, under the same
+// lock, before the check that would reject on them.
+
+// expectReinviteThroughOutbox scripts a creation that survives the guards and
+// writes both rows, with the retirement reporting n rows updated.
+func expectReinviteThroughOutbox(mock pgxmock.PgxPoolIface, expired int64) {
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(inviteEmailLockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnResult(pgxmock.NewResult("UPDATE", expired))
+	mock.ExpectQuery(`JOIN chat\.workspace_members`).
+		WithArgs(inviteWorkspaceID, inviteEmail).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`FROM auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(inviteInsertRows(time.Now()))
+	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+}
+
+// The retirement runs under the lock and before the duplicate checks, so the
+// row it retires cannot be the one that rejects the request.
+func TestPGXInviteStore_CreateInviteExpiresLapsedInviteBeforeInserting(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	expectReinviteThroughOutbox(mock, 1)
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited); err != nil {
+		t.Fatalf("re-inviting after a lapsed invite must succeed: %v", err)
+	}
+	// pgxmock is ordered, so this also asserts the sequence: lock, retire,
+	// check, insert, outbox, commit.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A live invite is not retired — the UPDATE matches nothing — and the pending
+// check still rejects, writing no second invite and no second outbox row.
+func TestPGXInviteStore_CreateInviteStillRejectsWhileInviteIsLive(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(inviteEmailLockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	mock.ExpectQuery(`JOIN chat\.workspace_members`).
+		WithArgs(inviteWorkspaceID, inviteEmail).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`FROM auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
+	// No INSERT and no outbox are scripted: reaching either fails this test.
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	_, err = store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited)
+	if !errors.Is(err, domain.ErrInviteAlreadyPending) {
+		t.Fatalf("expected ErrInviteAlreadyPending, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The retirement is scoped to one (workspace, address) pair. A global sweep
+// would let one admin's invitation rewrite unrelated tenants' rows.
+func TestPGXInviteStore_CreateInviteExpiryIsScopedToWorkspaceAndEmail(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	input := inviteInput()
+	input.WorkspaceID = inviteOtherWorkspaceID
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(inviteOtherWorkspaceID + lockSeparatorForTest + inviteEmail).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// The workspace and address reaching the UPDATE are this request's, never
+	// a wildcard.
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs(inviteOtherWorkspaceID, inviteEmail, inviteNow).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	mock.ExpectQuery(`JOIN chat\.workspace_members`).
+		WithArgs(inviteOtherWorkspaceID, inviteEmail).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`FROM auth\.user_invites`).
+		WithArgs(inviteOtherWorkspaceID, inviteEmail, inviteNow).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(inviteInsertRows(time.Now()))
+	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.CreateInvite(context.Background(), input, "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A failure anywhere after the retirement rolls it back with everything else:
+// an invite must never be retired by a request that then failed to replace it.
+func TestPGXInviteStore_CreateInviteRollsBackExpiryOnLaterFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(mock pgxmock.PgxPoolIface)
+	}{
+		{name: "expiry itself fails", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(inviteEmailLockKey).
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectExec(`UPDATE auth\.user_invites`).
+				WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+				WillReturnError(errors.New("update failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "invite insert fails", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(inviteEmailLockKey).
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectExec(`UPDATE auth\.user_invites`).
+				WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+				WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+			mock.ExpectQuery(`JOIN chat\.workspace_members`).
+				WithArgs(inviteWorkspaceID, inviteEmail).
+				WillReturnError(pgx.ErrNoRows)
+			mock.ExpectQuery(`FROM auth\.user_invites`).
+				WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+				WillReturnError(pgx.ErrNoRows)
+			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+				WillReturnError(errors.New("insert failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "outbox fails", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			expectReinviteThroughOutboxUpToInsert(mock)
+			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+				WillReturnError(errors.New("outbox failed"))
+			mock.ExpectRollback()
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			tt.setup(mock)
+
+			store := storage.NewPGXInviteStore(mock)
+			if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited); err == nil {
+				t.Fatal("expected error")
+			}
+			// The scripted rollback is the assertion: no commit is scripted, so
+			// committing would fail the expectations.
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+func expectReinviteThroughOutboxUpToInsert(mock pgxmock.PgxPoolIface) {
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(inviteEmailLockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectQuery(`JOIN chat\.workspace_members`).
+		WithArgs(inviteWorkspaceID, inviteEmail).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`FROM auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, inviteEmail, inviteNow).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(inviteInsertRows(time.Now()))
 }

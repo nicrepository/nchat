@@ -594,7 +594,7 @@ func TestCreateInvite_RequiresAnExistingWorkspace(t *testing.T) {
 	if _, err := store.CreateInvite(ctx, domain.AdminInviteInput{
 		WorkspaceID: pgWorkspaceAbsent, ActorID: "", Email: "orphan@example.test",
 		DisplayName: "Orphan", Kind: domain.InviteKindMember,
-	}, "orphan-token-hash", time.Now().Add(48*time.Hour), `{"k":"v"}`, domain.InviteRateLimit{}); err == nil {
+	}, "orphan-token-hash", time.Now().UTC(), time.Now().Add(48*time.Hour), `{"k":"v"}`, domain.InviteRateLimit{}); err == nil {
 		t.Fatal("an invite into a workspace that does not exist must be refused")
 	}
 
