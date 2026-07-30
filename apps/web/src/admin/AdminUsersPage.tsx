@@ -8,7 +8,7 @@ import {
   useSyncExternalStore,
 } from "react";
 
-import { getAccessToken, onAuthChange } from "../lib/authSession";
+import { getSessionGeneration, isAuthenticated, onAuthChange } from "../lib/authSession";
 
 import "./AdminUsersPage.css";
 import AdminShell from "./AdminShell";
@@ -521,6 +521,23 @@ function TableBody({
 }
 
 /**
+ * The scope key for the current session, or `null` when there is none.
+ *
+ * Read outside React, so `useSyncExternalStore` can compare it. Two calls with
+ * nothing changed in between build an equal string, which is what React needs
+ * — a fresh object would loop, a fresh string of the same value does not.
+ *
+ * The workspace segment is a constant because this screen has no workspace
+ * picker: the server resolves the workspace from the session itself
+ * (`GetAdminWorkspaceID`), and the browser never names one. The segment is
+ * present so that adding a picker later changes this line and nothing else.
+ */
+function readSessionScopeKey(): string | null {
+  if (!isAuthenticated()) return null;
+  return `session:${getSessionGeneration()}:workspace:current`;
+}
+
+/**
  * Identifies whose data the admin table is showing.
  *
  * The app has no auth Context — `authSession` is the module every authenticated
@@ -528,19 +545,22 @@ function TableBody({
  * the hook receives a plain value. That is the point: the hook stays a function
  * of its arguments and its tests never touch shared state.
  *
- * The key is presence, not the token. The token rotates on every silent
- * refresh, so keying on it would blank the table mid-session for no reason.
- * Presence is stable across refresh and still changes across a real identity
- * change, because every login path clears the session first (LoginPage) and
- * every logout clears it outright — so switching user always passes through
- * `null`, which is what invalidates.
+ * The key is the session *generation*, not the token and not mere presence.
+ * Presence was not enough: `setTokens` replacing session A with session B
+ * leaves a token present throughout, so a presence key never changes and A's
+ * rows stay on screen under B's identity. The token itself is not usable
+ * either — it rotates on every silent refresh, and it is a credential, which
+ * has no business being a cache key.
  *
- * It carries no token, address, name or secret: there is nothing to leak in a
- * literal.
+ * The generation costs a refetch when a silent refresh rotates the token, since
+ * a rotation is indistinguishable here from a re-login. That is the deliberate
+ * trade: one extra request on an already-failed request's retry path, in
+ * exchange for never rendering one session's users to another.
+ *
+ * The key carries no token, address, name or secret — only a counter.
  */
 function useSessionScopeKey(): string | null {
-  const token = useSyncExternalStore(onAuthChange, getAccessToken, () => null);
-  return token === null ? null : "authenticated-session";
+  return useSyncExternalStore(onAuthChange, readSessionScopeKey, () => null);
 }
 
 export default function AdminUsersPage() {

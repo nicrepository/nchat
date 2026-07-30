@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -988,5 +988,190 @@ describe("AdminUsersPage — pagination", () => {
     await waitFor(() => expect(mockListAdminUsers).toHaveBeenCalledTimes(2));
     // No cursor: the refresh starts over from the canonical first page.
     expect(mockListAdminUsers.mock.calls[1][0]).not.toMatchObject({ cursor: "cursor-1" });
+  });
+});
+
+// ── Session scope, driven through the real auth module ─────────────────────
+//
+// These are page-level on purpose. The hook's own tests pass the scope key as a
+// string, which proves it reacts to a change but not that a change ever
+// happens. What follows drives the actual `setTokens` / `clearTokens` the app
+// calls, so it fails if the page ever stops deriving a key that moves with the
+// session — which is exactly the defect a constant key had.
+//
+// The page is mounted without RequireAuth so it stays mounted across the
+// switch. Under the real router a logout also navigates away; that unmount is
+// the second line of defence, and it must not be the only one.
+
+function renderAdminUsersPageBare() {
+  return render(
+    <MemoryRouter initialEntries={["/admin/users"]}>
+      <AdminUsersPage />
+    </MemoryRouter>,
+  );
+}
+
+/** A promise whose settlement this test controls. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+const USERS_A: AdminUser[] = [
+  {
+    id: "a1",
+    email: "ana.session-a@example.com",
+    displayName: "Ana SessionA",
+    status: "active",
+    authSource: "local",
+    createdAt: "2024-01-15T10:00:00Z",
+  },
+];
+
+const USERS_B: AdminUser[] = [
+  {
+    id: "b1",
+    email: "bruno.session-b@example.com",
+    displayName: "Bruno SessionB",
+    status: "active",
+    authSource: "local",
+    createdAt: "2024-02-15T10:00:00Z",
+  },
+];
+
+/** Nothing belonging to session A may be on screen. */
+function expectNoTraceOfSessionA() {
+  expect(screen.queryByText("Ana SessionA")).not.toBeInTheDocument();
+  expect(screen.queryByText("ana.session-a@example.com")).not.toBeInTheDocument();
+}
+
+describe("AdminUsersPage — session scope", () => {
+  it("ignores a session A response that lands after session B was installed", async () => {
+    const sessionA = deferred<ReturnType<typeof pageOf>>();
+    const sessionB = deferred<ReturnType<typeof pageOf>>();
+    mockListAdminUsers.mockReturnValueOnce(sessionA.promise).mockReturnValueOnce(sessionB.promise);
+
+    setTokens("access-token-session-a");
+    renderAdminUsersPageBare();
+    await waitFor(() => expect(mockListAdminUsers).toHaveBeenCalledTimes(1));
+
+    // Session A's listing is still in flight when a different session arrives.
+    await act(async () => {
+      setTokens("access-token-session-b");
+    });
+
+    // The key moved, so the page asked again — for B this time.
+    await waitFor(() => expect(mockListAdminUsers).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      sessionB.resolve(pageOf(USERS_B));
+    });
+    expect(await screen.findByText("Bruno SessionB")).toBeInTheDocument();
+
+    // A's request finally answers. It belongs to a session that is gone.
+    await act(async () => {
+      sessionA.resolve(pageOf(USERS_A));
+    });
+
+    expectNoTraceOfSessionA();
+    expect(screen.getByText("Bruno SessionB")).toBeInTheDocument();
+  });
+
+  it("clears a fully loaded session A the moment session B is installed", async () => {
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(USERS_A));
+    setTokens("access-token-session-a");
+    renderAdminUsersPageBare();
+
+    expect(await screen.findByText("Ana SessionA")).toBeInTheDocument();
+
+    // Session B's listing is left pending, so what the screen shows in the
+    // meantime is entirely the result of the switch itself.
+    const sessionB = deferred<ReturnType<typeof pageOf>>();
+    mockListAdminUsers.mockReturnValueOnce(sessionB.promise);
+
+    await act(async () => {
+      setTokens("access-token-session-b");
+    });
+
+    // Immediately, with nothing resolved: A's rows are already gone.
+    expectNoTraceOfSessionA();
+
+    await act(async () => {
+      sessionB.resolve(pageOf(USERS_B));
+    });
+    expect(await screen.findByText("Bruno SessionB")).toBeInTheDocument();
+    expectNoTraceOfSessionA();
+  });
+
+  it("re-fetches for a new session even when the same user signs in again", async () => {
+    mockListAdminUsers.mockResolvedValue(pageOf(USERS_A));
+    setTokens("access-token-session-a");
+    renderAdminUsersPageBare();
+    await screen.findByText("Ana SessionA");
+
+    // Same person, new session. The identity did not change, but the session
+    // did, and anything fetched under the old one is no longer answerable for.
+    await act(async () => {
+      clearTokens();
+      setTokens("access-token-session-a-again");
+    });
+
+    await waitFor(() => expect(mockListAdminUsers).toHaveBeenCalledTimes(2));
+  });
+
+  it("clears the table on logout and asks for nothing without a session", async () => {
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(USERS_A, "cursor-1"));
+    setTokens("access-token-session-a");
+    renderAdminUsersPageBare();
+
+    await screen.findByText("Ana SessionA");
+    // A cursor exists, so the page is offering to load more.
+    expect(screen.getByRole("button", { name: /carregar mais usuários/i })).toBeInTheDocument();
+
+    await act(async () => {
+      clearTokens();
+    });
+
+    expectNoTraceOfSessionA();
+    // The cursor went with the rows: there is nothing left to page through.
+    expect(
+      screen.queryByRole("button", { name: /carregar mais usuários/i }),
+    ).not.toBeInTheDocument();
+    expect(mockListAdminUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a response that arrives after logout", async () => {
+    const sessionA = deferred<ReturnType<typeof pageOf>>();
+    mockListAdminUsers.mockReturnValueOnce(sessionA.promise);
+
+    setTokens("access-token-session-a");
+    renderAdminUsersPageBare();
+    await waitFor(() => expect(mockListAdminUsers).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      clearTokens();
+    });
+    await act(async () => {
+      sessionA.resolve(pageOf(USERS_A));
+    });
+
+    expectNoTraceOfSessionA();
+    expect(mockListAdminUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not request the listing at all without a session", async () => {
+    mockListAdminUsers.mockResolvedValue(pageOf(USERS_A));
+    clearTokens();
+
+    renderAdminUsersPageBare();
+
+    // The page renders — it is simply empty, and nothing was asked of the API.
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Usuários" })).toBeInTheDocument(),
+    );
+    expect(mockListAdminUsers).not.toHaveBeenCalled();
   });
 });
