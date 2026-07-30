@@ -344,10 +344,14 @@ describe("navigating between DM and channel targets", () => {
   it("closes the DM subscription and subscribes to the channel", async () => {
     renderAt(`/chat/dm/${dmId}`);
     expect(await screen.findByText(dmText)).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const dmSocket = FakeWebSocket.instances[0];
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const dmSocket = FakeWebSocket.instances.find((socket) => {
+      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
+      return subscriptions.length === 1 && subscriptions[0]?.target_id === dmId;
+    });
+    expect(dmSocket).toBeDefined();
     await waitFor(() =>
-      expect(dmSocket.subscriptions()).toContainEqual({
+      expect(dmSocket?.subscriptions()).toContainEqual({
         type: "subscribe",
         target_type: "dm",
         target_id: dmId,
@@ -355,26 +359,67 @@ describe("navigating between DM and channel targets", () => {
     );
 
     await clickChannel();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
 
-    expect(dmSocket.closed).toBe(true);
-    expect(dmSocket.subscriptions()).toContainEqual({
+    expect(dmSocket?.closed).toBe(true);
+    expect(dmSocket?.subscriptions()).toContainEqual({
       type: "unsubscribe",
       target_type: "dm",
       target_id: dmId,
     });
 
-    const channelSocket = FakeWebSocket.instances[1];
+    const channelSocket = FakeWebSocket.instances.find((socket) => {
+      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
+      return subscriptions.length === 1 && subscriptions[0]?.target_id === channelId;
+    });
+    expect(channelSocket).toBeDefined();
     await waitFor(() =>
-      expect(channelSocket.subscriptions()).toContainEqual({
+      expect(channelSocket?.subscriptions()).toContainEqual({
         type: "subscribe",
         target_type: "channel",
         target_id: channelId,
       }),
     );
-    expect(channelSocket.subscriptions()).not.toContainEqual(
+    expect(channelSocket?.subscriptions()).not.toContainEqual(
       expect.objectContaining({ target_id: dmId }),
     );
+  });
+
+  it("leaves no subscription or timeline state after a fast A → B → C switch", async () => {
+    renderAt(`/chat/channel/${secretChannelId}`);
+    expect(await within(header()).findByText("confidencial")).toBeInTheDocument();
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const socketA = FakeWebSocket.instances.find((socket) => {
+      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
+      return subscriptions.length === 1 && subscriptions[0]?.target_id === secretChannelId;
+    });
+
+    await clickChannel();
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+    const socketB = FakeWebSocket.instances.find((socket) => {
+      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
+      return subscriptions.length === 1 && subscriptions[0]?.target_id === channelId;
+    });
+
+    await clickDM();
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
+    expect(await screen.findByText(dmText)).toBeInTheDocument();
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
+    const socketC = FakeWebSocket.instances.find((socket) => {
+      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
+      return subscriptions.length === 1 && subscriptions[0]?.target_id === dmId;
+    });
+
+    expect(socketA?.closed).toBe(true);
+    expect(socketB?.closed).toBe(true);
+    expect(socketC?.closed).toBe(false);
+    expect(socketC?.subscriptions()).toContainEqual({
+      type: "subscribe",
+      target_type: "dm",
+      target_id: dmId,
+    });
+    expect(screen.queryByText(channelText)).not.toBeInTheDocument();
   });
 
   it("does not carry the DM's pinned messages into the channel", async () => {

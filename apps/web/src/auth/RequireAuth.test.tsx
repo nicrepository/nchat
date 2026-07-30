@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,8 +26,8 @@ vi.mock("../lib/authSession", async () => {
   };
 });
 
-function renderWithRouter(initialPath = "/protected") {
-  return render(
+function renderWithRouter(initialPath = "/protected", strict = false) {
+  const routes = (
     <MemoryRouter initialEntries={[initialPath]}>
       <Routes>
         <Route path="/login" element={<div>Login page</div>} />
@@ -39,8 +40,9 @@ function renderWithRouter(initialPath = "/protected") {
           }
         />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(strict ? <StrictMode>{routes}</StrictMode> : routes);
 }
 
 beforeEach(() => {
@@ -90,6 +92,16 @@ describe("RequireAuth", () => {
     await waitFor(() => {
       expect(screen.getByText("Login page")).toBeInTheDocument();
     });
+  });
+
+  it("redirects after refresh failure under StrictMode without getting stuck checking", async () => {
+    mockRefresh.mockRejectedValue(new Error("invalid_refresh_token"));
+    renderWithRouter("/protected", true);
+
+    await waitFor(() => {
+      expect(screen.getByText("Login page")).toBeInTheDocument();
+    });
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
   });
 
   it("shows nothing while refresh is in progress", () => {

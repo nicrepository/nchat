@@ -50,6 +50,39 @@ async function mockRefreshApi(page: Page) {
   );
 }
 
+async function mockRefreshFailure(page: Page) {
+  await page.unroute("**/api/auth/refresh");
+  await page.route("**/api/auth/refresh", (route) => route.fulfill({ status: 401 }));
+}
+
+async function mockChatSidebarApi(page: Page) {
+  await page.route("**/api/chat/sidebar", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          current_user_id: "e2e-user",
+          workspace: { id: "e2e-workspace", name: "E2E", slug: "e2e" },
+          channels: [],
+          dm_conversations: [],
+        },
+      }),
+    }),
+  );
+}
+
+async function clearSessionTokens(page: Page) {
+  return page.evaluate(() => {
+    sessionStorage.removeItem("nchat_at");
+    sessionStorage.removeItem("nchat_rt");
+    return {
+      accessToken: sessionStorage.getItem("nchat_at"),
+      refreshToken: sessionStorage.getItem("nchat_rt"),
+    };
+  });
+}
+
 async function mockForgotPasswordApi(page: Page) {
   await page.route("**/api/auth/password/forgot", (route) => route.fulfill({ status: 204 }));
 }
@@ -87,39 +120,49 @@ async function mockOIDCExchangeFailure(page: Page) {
 async function performLogin(page: Page) {
   await mockLoginSuccess(page);
   await mockRefreshApi(page);
+  await mockChatSidebarApi(page);
   await page.goto("/login");
   await page.getByLabel("E-mail corporativo").fill(TEST_EMAIL);
   await page.getByLabel("Senha").fill(TEST_PASSWORD);
   await page.getByRole("button", { name: /^Entrar$/i }).click();
-  await expect(page).toHaveURL("/");
+  await expect(page).toHaveURL("/chat");
 }
 
 test.describe("auth", () => {
   test("unauthenticated visit to protected route redirects to /login", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/login");
+    await clearSessionTokens(page);
+    await mockRefreshFailure(page);
+    const refreshResponse = page.waitForResponse("**/api/auth/refresh");
+    await page.goto("/chat");
+    expect((await refreshResponse).status()).toBe(401);
     await expect(page).toHaveURL("/login");
   });
 
-  test("valid credentials log in and show home page", async ({ page }) => {
+  test("valid credentials log in and show chat shell", async ({ page }) => {
     await performLogin(page);
-    await expect(page.getByRole("heading", { name: "NChat" })).toBeVisible();
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
   });
 
   test("session persists after page reload", async ({ page }) => {
     await performLogin(page);
     await page.reload();
-    await expect(page).toHaveURL("/");
-    await expect(page.getByRole("heading", { name: "NChat" })).toBeVisible();
+    await expect(page).toHaveURL("/chat");
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
   });
 
-  // Simulates logout by clearing session tokens (no logout UI button exists yet in HomePage).
+  // Simulates logout by clearing session tokens (no logout UI button exists yet).
   test("clearing session tokens blocks access to protected route", async ({ page }) => {
     await performLogin(page);
-    await page.evaluate(() => {
-      sessionStorage.removeItem("nchat_at");
-      sessionStorage.removeItem("nchat_rt");
+    await mockRefreshFailure(page);
+    expect(await clearSessionTokens(page)).toEqual({
+      accessToken: null,
+      refreshToken: null,
     });
-    await page.goto("/");
+    const refreshResponse = page.waitForResponse("**/api/auth/refresh");
+    await page.goto("/profile");
+    expect((await refreshResponse).status()).toBe(401);
+    expect(await page.evaluate(() => sessionStorage.getItem("nchat_at"))).toBeNull();
     await expect(page).toHaveURL("/login");
   });
 
@@ -168,8 +211,8 @@ test.describe("auth", () => {
     await mockOIDCExchangeSuccess(page);
     await mockRefreshApi(page);
     await page.goto("/oidc-callback?code=opaque-test-code");
-    await expect(page).toHaveURL("/");
-    await expect(page.getByRole("heading", { name: "NChat" })).toBeVisible();
+    await expect(page).toHaveURL("/chat");
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
   });
 
   test("OIDC callback handles exchange failure with generic SSO error", async ({ page }) => {
@@ -204,7 +247,7 @@ test.describe("auth", () => {
     });
     await mockRefreshApi(page);
     await page.goto("/oidc-callback?code=opaque-test-code");
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/chat");
     expect(exchangeCount).toBe(1);
   });
 
@@ -214,16 +257,16 @@ test.describe("auth", () => {
     await mockOIDCExchangeSuccess(page);
     await mockRefreshApi(page);
     await page.goto("/oidc-callback?code=opaque-test-code");
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/chat");
     // Code must never appear in the final URL
     expect(page.url()).not.toContain("code=");
   });
 
-  test("login page redirects already-authenticated user to /", async ({ page }) => {
+  test("login page redirects already-authenticated user to /chat", async ({ page }) => {
     await performLogin(page);
     await page.goto("/login");
-    await expect(page).toHaveURL("/");
-    await expect(page.getByRole("heading", { name: "NChat" })).toBeVisible();
+    await expect(page).toHaveURL("/chat");
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
   });
 
   test("public route /forgot-password is accessible when unauthenticated", async ({ page }) => {
