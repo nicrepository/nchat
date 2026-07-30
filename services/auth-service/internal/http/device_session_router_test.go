@@ -128,7 +128,7 @@ func TestDeviceSessionRoutes_RequireActiveCurrentSession(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stub := &routerDeviceSessionStub{validateErr: domain.ErrInvalidToken}
-			router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+			router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil, allowAllBootstrapAttempts{})
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -153,7 +153,7 @@ func TestDeleteAllMySessions_InvalidCurrentSessionDoesNotRevokeOthers(t *testing
 	cfg := testConfigWithJWT()
 	token := signRouterAccessToken(t, cfg, "123e4567-e89b-12d3-a456-426614174200", "123e4567-e89b-12d3-a456-426614174201")
 	stub := &routerDeviceSessionStub{validateErr: domain.ErrInvalidToken}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil, allowAllBootstrapAttempts{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, RouteAuthMeSessions, nil)
@@ -172,7 +172,7 @@ func TestDeleteMySession_CurrentActiveSessionCanRevokeItself(t *testing.T) {
 	currentSID := "123e4567-e89b-12d3-a456-426614174301"
 	token := signRouterAccessToken(t, cfg, userID, currentSID)
 	stub := &routerDeviceSessionStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil, allowAllBootstrapAttempts{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/me/sessions/"+currentSID, nil)
@@ -195,7 +195,7 @@ func TestDeleteAllMySessions_MissingSIDTokenIsPubliclyRejected(t *testing.T) {
 	cfg := testConfigWithJWT()
 	token := signRouterAccessToken(t, cfg, "123e4567-e89b-12d3-a456-426614174400", "")
 	stub := &routerDeviceSessionStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil, allowAllBootstrapAttempts{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, RouteAuthMeSessions, nil)
@@ -211,7 +211,7 @@ func TestDeleteAllMySessions_MissingSIDTokenIsPubliclyRejected(t *testing.T) {
 func TestDeviceSessionRoutes_MethodNotAllowedUsesJSONEnvelopeAndAllow(t *testing.T) {
 	cfg := testConfigWithJWT()
 	stub := &routerDeviceSessionStub{}
-	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil, allowAllBootstrapAttempts{})
 
 	tests := []struct {
 		name    string

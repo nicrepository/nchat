@@ -13,7 +13,7 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, avatars AvatarManager, avatarReader AvatarReader, oidcManagers ...service.OIDCManager) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, auth service.AuthSessionManager, login service.LoginManager, password service.PasswordRecoveryManager, invites service.InviteManager, loginAttempts LoginAttemptsManager, sessions SessionManager, devices DeviceManager, avatars AvatarManager, avatarReader AvatarReader, bootstrapAttempts BootstrapAttemptRecorder, oidcManagers ...service.OIDCManager) http.Handler {
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	metrics := observability.NewMetrics(obsCfg)
 
@@ -80,15 +80,26 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAuthOIDCKeycloakLogin, httputil.MethodNotAllowed(http.MethodGet, oidcLoginHandler))
 	mux.Handle(RouteAuthOIDCKeycloakCallback, httputil.MethodNotAllowed(http.MethodGet, oidcCallbackHandler))
 	mux.Handle(RouteAuthOIDCKeycloakExchange, httputil.MethodNotAllowed(http.MethodPost, oidcExchangeHandler))
+	// Every route behind the bootstrap credential is wrapped by the attempt
+	// limiter *outside* the guard, so budget is spent before the credential is
+	// compared. All three share one budget per IP: they authenticate the same
+	// secret, so letting an attacker spend a separate allowance on each would
+	// simply treble the guesses.
+	limitBootstrapAttempts := RateLimitBootstrapAttempts(BootstrapRateLimitConfig{
+		Recorder:          bootstrapAttempts,
+		Attempts:          cfg.AuthBootstrapRateLimitAttempts,
+		Window:            time.Duration(cfg.AuthBootstrapRateLimitWindowMinutes) * time.Minute,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
+	})
 	mux.Handle(RouteAdminUsers, httputil.MethodNotAllowed(http.MethodPost,
-		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateUser(users)),
+		limitBootstrapAttempts(AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminCreateUser(users))),
 	))
 	inviteRetryAfterSeconds := cfg.AuthInviteRateLimitWindowMinutes * 60
 	mux.Handle(RouteAdminInvites, httputil.MethodNotAllowed(http.MethodPost,
-		AdminBootstrapGuard(cfg.AdminBootstrapToken)(BootstrapCreateInvite(invites, inviteRetryAfterSeconds)),
+		limitBootstrapAttempts(AdminBootstrapGuard(cfg.AdminBootstrapToken)(BootstrapCreateInvite(invites, inviteRetryAfterSeconds))),
 	))
 	mux.Handle(RouteAdminUserStatus, httputil.MethodNotAllowed(http.MethodPatch,
-		AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users)),
+		limitBootstrapAttempts(AdminBootstrapGuard(cfg.AdminBootstrapToken)(AdminUpdateUserStatus(users))),
 	))
 
 	// Browser-callable workspace administration. Unlike the bootstrap routes

@@ -90,6 +90,10 @@ func New(cfg config.Config) (*App, error) {
 	var oidc service.OIDCManager
 	var pool storage.Pool
 	var closeDB func()
+	// Left nil when there is no database. The limiter fails closed on a nil
+	// recorder, so the bootstrap routes refuse rather than run their credential
+	// check unbounded.
+	var bootstrapAttempts httpapi.BootstrapAttemptRecorder
 	if cfg.DatabaseURL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), dbBootstrapTimeout)
 		openedPool, dbErr := openDBWithRetry(ctx, cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, logger)
@@ -106,6 +110,7 @@ func New(cfg config.Config) (*App, error) {
 			closeDB = closer.Close
 		}
 		users = service.NewUserService(storage.NewPGXUserStore(pool))
+		bootstrapAttempts = storage.NewPGXBootstrapAttemptStore(pool)
 	}
 
 	emailOutboxEncryptor, emailOutboxErr := emailcrypto.New(cfg.AuthEmailOutboxEncryptionKey)
@@ -210,7 +215,7 @@ func New(cfg config.Config) (*App, error) {
 	return &App{
 		Config:          cfg,
 		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, sessionManager, deviceManager, avatarManager, avatarReader, oidc),
+		Handler:         httpapi.NewRouter(cfg, logger, users, auth, login, password, invites, loginAttempts, sessionManager, deviceManager, avatarManager, avatarReader, bootstrapAttempts, oidc),
 		TracingShutdown: shutdown,
 		closeDB:         closeDB,
 	}, nil

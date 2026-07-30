@@ -60,7 +60,7 @@ func (s *stubAvatarReader) Open(string) (io.ReadCloser, error) {
 func avatarRouter(t *testing.T, mgr AvatarManager, reader AvatarReader) http.Handler {
 	t.Helper()
 	return NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, mgr, reader)
+		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, mgr, reader, allowAllBootstrapAttempts{})
 }
 
 func multipartBody(t *testing.T, field, filename string, content []byte) (*bytes.Buffer, string) {
@@ -280,7 +280,7 @@ func TestServeAvatar_NotFound(t *testing.T) {
 func TestAvatarEndpoints_DisabledReturn503(t *testing.T) {
 	// avatars=nil, reader=nil disables the feature; every endpoint reports 503.
 	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil, allowAllBootstrapAttempts{})
 
 	cases := []struct {
 		method string

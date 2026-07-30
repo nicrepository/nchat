@@ -958,6 +958,42 @@ deployment would look enabled and answer 503 forever.
 The credential never appears in a log line, an error message, a trace or a
 metric label, and no hash of it is recorded either.
 
+**Guessing budget.** Every route behind the bootstrap credential is rate
+limited **before** the credential is compared, so an attacker does not get
+unlimited online guesses at a secret that can mint an owner invite.
+
+| Setting                                    | Default | Range  |
+| ------------------------------------------ | ------- | ------ |
+| `AUTH_BOOTSTRAP_RATE_LIMIT_ATTEMPTS`       | `5`     | 1–100  |
+| `AUTH_BOOTSTRAP_RATE_LIMIT_WINDOW_MINUTES` | `15`    | 1–1440 |
+
+The counter lives in PostgreSQL (`auth.bootstrap_auth_attempts`, migration
+`auth/000009`), keyed by `bootstrap-admin-token:<client-ip>` — never by the
+credential, which would give each guess its own budget. Being in the database
+rather than in process memory is the point: an attacker must not get one budget
+per replica, nor a fresh one on restart. `/admin/users`, `/admin/invites` and
+`/admin/users/{id}/status` share one budget per IP, because they authenticate
+the same secret.
+
+Consequences:
+
+- the budget is charged on **every** attempt, valid or not, and a correct
+  credential neither resets nor refunds it — a stolen credential being replayed
+  is exactly when the limit should still apply;
+- a limited request returns `429` with `Retry-After` and never reaches the
+  credential comparison, so it reads no invite, writes no outbox row and cannot
+  affect the bootstrap lifecycle;
+- the response is identical whether the credential was right, wrong or absent;
+- an `X-NChat-Admin-Token` header over 256 bytes is rejected generically and
+  still spends budget, so padding it is not a free probe;
+- if the counter is **unreachable** the request is refused with `503` and the
+  credential is not compared. It fails closed: an unbounded credential check is
+  worse than a briefly unavailable bootstrap endpoint, and falling back to a
+  per-process count would silently restore the multi-replica hole.
+
+Zero is never "unlimited" — a value outside the ranges above falls back to the
+default. Disable the endpoint by unsetting the credential.
+
 **Server-side authority.** Neither the workspace nor the issuer is expressible
 in the request:
 

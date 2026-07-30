@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"time"
 )
 
 // WithAdminContext returns r carrying the workspace and actor that
@@ -17,4 +18,21 @@ func WithAdminContext(r *http.Request, workspaceID, actorID string) *http.Reques
 	ctx := context.WithValue(r.Context(), ctxKeyUserID, actorID)
 	ctx = context.WithValue(ctx, ctxKeyWorkspaceID, workspaceID)
 	return r.WithContext(ctx)
+}
+
+// AllowAllBootstrapAttemptsForTest is a recorder that never limits, for tests
+// in the external httpapi_test package that exercise routes behind the
+// bootstrap guard without being about the limiter. Tests that *are* about the
+// limiter script their own recorder.
+type AllowAllBootstrapAttemptsForTest struct{}
+
+func (AllowAllBootstrapAttemptsForTest) RecordAttempt(context.Context, string, int, time.Duration) (bool, error) {
+	return true, nil
+}
+
+// allowAllBootstrapAttempts is the same thing for in-package tests.
+type allowAllBootstrapAttempts struct{}
+
+func (allowAllBootstrapAttempts) RecordAttempt(context.Context, string, int, time.Duration) (bool, error) {
+	return true, nil
 }

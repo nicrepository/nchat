@@ -37,6 +37,17 @@ const (
 	minInviteRateLimitPerIPPerHour  = 1
 	maxInviteRateLimitPerIPPerHour  = 5000
 
+	// Guessing budget for the bootstrap credential, per IP. Far tighter than
+	// the other limits because there is no legitimate caller who retries: the
+	// operator pastes a generated 32-byte secret once. Five attempts leaves
+	// room for a typo or a stale shell, and nothing more.
+	defaultBootstrapRateLimitAttempts      = 5
+	defaultBootstrapRateLimitWindowMinutes = 15
+	minBootstrapRateLimitAttempts          = 1
+	maxBootstrapRateLimitAttempts          = 100
+	minBootstrapRateLimitWindowMinutes     = 1
+	maxBootstrapRateLimitWindowMinutes     = 1440
+
 	defaultOIDCProviderName        = "keycloak"
 	defaultOIDCScopes              = "openid email profile"
 	defaultAvatarBaseURL           = "/api/auth/avatars"
@@ -70,18 +81,24 @@ type Config struct {
 	// route must be an explicit operator decision, not something a deployment
 	// inherits by accident.
 	AuthBootstrapWorkspaceID string
-	OIDCEnabled              bool
-	OIDCProviderName         string
-	OIDCIssuerURL            string
-	OIDCClientID             string
-	OIDCClientSecret         string
-	OIDCRedirectURL          string
-	OIDCFrontendCallbackURL  string
-	OIDCScopes               string
-	OIDCHTTPTimeoutSeconds   int
-	OIDCStateTTLMinutes      int
-	OIDCAutoProvisionEnabled bool
-	OIDCAllowedEmailDomains  string
+	// Guessing budget for the bootstrap credential, counted per client IP in
+	// PostgreSQL so it holds across replicas. Zero never means unlimited: an
+	// out-of-range value falls back to the default, and disabling the endpoint
+	// is done by unsetting the credential, not by widening this.
+	AuthBootstrapRateLimitAttempts      int
+	AuthBootstrapRateLimitWindowMinutes int
+	OIDCEnabled                         bool
+	OIDCProviderName                    string
+	OIDCIssuerURL                       string
+	OIDCClientID                        string
+	OIDCClientSecret                    string
+	OIDCRedirectURL                     string
+	OIDCFrontendCallbackURL             string
+	OIDCScopes                          string
+	OIDCHTTPTimeoutSeconds              int
+	OIDCStateTTLMinutes                 int
+	OIDCAutoProvisionEnabled            bool
+	OIDCAllowedEmailDomains             string
 	// AuthTrustedProxyCIDRs is a comma-separated list of CIDRs (e.g. "10.0.0.0/8,172.16.0.0/12")
 	// whose X-Forwarded-For header is trusted for client-IP extraction by the rate limiter.
 	// Leave empty (default) to always use RemoteAddr — safe for direct or single-instance deployments.
@@ -121,6 +138,10 @@ func Load() Config {
 		AuthInviteRateLimitPerIPPerHour: boundedInt("AUTH_INVITE_RATE_LIMIT_PER_IP_PER_HOUR",
 			defaultInviteRateLimitPerIPPerHour, minInviteRateLimitPerIPPerHour, maxInviteRateLimitPerIPPerHour),
 		AuthBootstrapWorkspaceID: strings.TrimSpace(platformconfig.GetString("AUTH_BOOTSTRAP_WORKSPACE_ID", "")),
+		AuthBootstrapRateLimitAttempts: boundedInt("AUTH_BOOTSTRAP_RATE_LIMIT_ATTEMPTS",
+			defaultBootstrapRateLimitAttempts, minBootstrapRateLimitAttempts, maxBootstrapRateLimitAttempts),
+		AuthBootstrapRateLimitWindowMinutes: boundedInt("AUTH_BOOTSTRAP_RATE_LIMIT_WINDOW_MINUTES",
+			defaultBootstrapRateLimitWindowMinutes, minBootstrapRateLimitWindowMinutes, maxBootstrapRateLimitWindowMinutes),
 		OIDCEnabled:              platformconfig.GetBool("OIDC_ENABLED", false),
 		OIDCProviderName:         strings.TrimSpace(platformconfig.GetString("OIDC_PROVIDER_NAME", defaultOIDCProviderName)),
 		OIDCIssuerURL:            strings.TrimRight(strings.TrimSpace(platformconfig.GetString("OIDC_ISSUER_URL", "")), "/"),

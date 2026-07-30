@@ -113,7 +113,7 @@ func (s *inviteStub) EmailHandoffAvailable() bool { return !s.emailHandoffOff }
 func workspaceAdminRouter(t *testing.T, users *workspaceAdminStub, invites service.InviteManager) http.Handler {
 	t.Helper()
 	return NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-		users, nil, nil, nil, invites, nil, routerSessionStub{}, nil, nil, nil)
+		users, nil, nil, nil, invites, nil, routerSessionStub{}, nil, nil, nil, allowAllBootstrapAttempts{})
 }
 
 func adminRequest(t *testing.T, method, path, body string) *http.Request {
@@ -482,7 +482,7 @@ func bootstrapRouter(t *testing.T, invites service.InviteManager, token string) 
 	cfg := jwtTestConfig()
 	cfg.AdminBootstrapToken = token
 	return NewRouter(cfg, platformlog.New("auth-service", "test"),
-		&workspaceAdminStub{workspaceID: adminWorkspaceID}, nil, nil, nil, invites, nil, routerSessionStub{}, nil, nil, nil)
+		&workspaceAdminStub{workspaceID: adminWorkspaceID}, nil, nil, nil, invites, nil, routerSessionStub{}, nil, nil, nil, allowAllBootstrapAttempts{})
 }
 
 func bootstrapRequest(t *testing.T, token, body string) *http.Request {

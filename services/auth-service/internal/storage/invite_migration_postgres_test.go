@@ -113,7 +113,8 @@ func applyMigrationFile(t *testing.T, ctx context.Context, conn *pgx.Conn, path 
 
 // applyMigrationsBefore008 brings the database to the state immediately
 // preceding the migration under test: every auth and chat migration except
-// auth/000008 and its companion chat/000019.
+// auth/000008, its companion chat/000019, and auth/000009, which comes after
+// them and is applied explicitly by the tests that need it.
 func applyMigrationsBefore008(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 	t.Helper()
 	if _, err := conn.Exec(ctx, `DROP SCHEMA IF EXISTS chat CASCADE; DROP SCHEMA IF EXISTS auth CASCADE`); err != nil {
@@ -122,7 +123,9 @@ func applyMigrationsBefore008(t *testing.T, ctx context.Context, conn *pgx.Conn)
 	for _, domainName := range []string{"auth", "chat"} {
 		for _, path := range migrationFiles(t, domainName, ".up.sql") {
 			base := filepath.Base(path)
-			if strings.HasPrefix(base, "000008_invite_workspace_scope") || strings.HasPrefix(base, "000019_invite_workspace_fk") {
+			if strings.HasPrefix(base, "000008_invite_workspace_scope") ||
+				strings.HasPrefix(base, "000019_invite_workspace_fk") ||
+				strings.HasPrefix(base, "000009_bootstrap_auth_attempts") {
 				continue
 			}
 			applyMigrationFile(t, ctx, conn, path)

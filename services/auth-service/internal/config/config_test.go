@@ -1,3 +1,4 @@
+//nolint:gosec // Test fixtures intentionally use example credential strings.
 package config
 
 import (
@@ -559,5 +560,65 @@ func TestLoad_BootstrapTokenIsNotTrimmed(t *testing.T) {
 
 	if got := Load().AdminBootstrapToken; got != " "+validBootstrapToken {
 		t.Fatalf("expected the raw value to survive Load, got %q", got)
+	}
+}
+
+// ── Bootstrap guessing budget ──────────────────────────────────────────────
+
+func TestLoad_BootstrapRateLimitDefaults(t *testing.T) {
+	cfg := Load()
+
+	if cfg.AuthBootstrapRateLimitAttempts != defaultBootstrapRateLimitAttempts {
+		t.Fatalf("expected %d attempts, got %d", defaultBootstrapRateLimitAttempts, cfg.AuthBootstrapRateLimitAttempts)
+	}
+	if cfg.AuthBootstrapRateLimitWindowMinutes != defaultBootstrapRateLimitWindowMinutes {
+		t.Fatalf("expected a %d-minute window, got %d", defaultBootstrapRateLimitWindowMinutes, cfg.AuthBootstrapRateLimitWindowMinutes)
+	}
+}
+
+func TestLoad_BootstrapRateLimitAcceptsValuesInRange(t *testing.T) {
+	t.Setenv("AUTH_BOOTSTRAP_RATE_LIMIT_ATTEMPTS", "20")
+	t.Setenv("AUTH_BOOTSTRAP_RATE_LIMIT_WINDOW_MINUTES", "60")
+
+	cfg := Load()
+
+	if cfg.AuthBootstrapRateLimitAttempts != 20 || cfg.AuthBootstrapRateLimitWindowMinutes != 60 {
+		t.Fatalf("expected the configured budget, got %d/%d",
+			cfg.AuthBootstrapRateLimitAttempts, cfg.AuthBootstrapRateLimitWindowMinutes)
+	}
+}
+
+// Out of range falls back to the default rather than being clamped, and zero
+// is never "unlimited": disabling the endpoint is done by unsetting the
+// credential, not by widening this to nothing.
+func TestLoad_BootstrapRateLimitRejectsOutOfRangeValues(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		attempts string
+		window   string
+	}{
+		{name: "zero attempts", attempts: "0", window: "15"},
+		{name: "negative attempts", attempts: "-1", window: "15"},
+		{name: "attempts above maximum", attempts: "101", window: "15"},
+		{name: "zero window", attempts: "5", window: "0"},
+		{name: "negative window", attempts: "5", window: "-15"},
+		{name: "window above maximum", attempts: "5", window: "1441"},
+		{name: "unparseable", attempts: "many", window: "soon"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AUTH_BOOTSTRAP_RATE_LIMIT_ATTEMPTS", tt.attempts)
+			t.Setenv("AUTH_BOOTSTRAP_RATE_LIMIT_WINDOW_MINUTES", tt.window)
+
+			cfg := Load()
+
+			if cfg.AuthBootstrapRateLimitAttempts < minBootstrapRateLimitAttempts ||
+				cfg.AuthBootstrapRateLimitAttempts > maxBootstrapRateLimitAttempts {
+				t.Fatalf("attempts left the permitted range: %d", cfg.AuthBootstrapRateLimitAttempts)
+			}
+			if cfg.AuthBootstrapRateLimitWindowMinutes < minBootstrapRateLimitWindowMinutes ||
+				cfg.AuthBootstrapRateLimitWindowMinutes > maxBootstrapRateLimitWindowMinutes {
+				t.Fatalf("window left the permitted range: %d", cfg.AuthBootstrapRateLimitWindowMinutes)
+			}
+		})
 	}
 }

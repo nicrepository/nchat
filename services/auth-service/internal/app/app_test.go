@@ -1,3 +1,4 @@
+//nolint:gosec // Test fixtures intentionally use example credential strings.
 package app
 
 import (

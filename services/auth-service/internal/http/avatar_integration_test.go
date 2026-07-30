@@ -88,7 +88,7 @@ func TestAvatarOperationalChain(t *testing.T) {
 	avatarSvc := service.NewAvatarService(fsStore, users, "/api/auth/avatars")
 
 	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, avatarSvc, fsStore)
+		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, avatarSvc, fsStore, allowAllBootstrapAttempts{})
 
 	upload := func(t *testing.T, payload []byte) string {
 		t.Helper()

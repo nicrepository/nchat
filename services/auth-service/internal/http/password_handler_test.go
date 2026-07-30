@@ -196,7 +196,7 @@ func TestAuthPasswordRecoveryInternalErrorReturns500(t *testing.T) {
 
 func TestAuthPasswordRecoveryRouterRateLimitsPublicEndpoints(t *testing.T) {
 	cfg := config.Config{ServiceName: "auth-service", Env: "test", AuthTokenEndpointRateLimitPerMinute: 60, AuthTokenEndpointRateLimitBurst: 1}
-	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, &fakePasswordRecoveryService{}, nil, nil, nil, nil, nil, nil)
+	router := httpapi.NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, &fakePasswordRecoveryService{}, nil, nil, nil, nil, nil, nil, httpapi.AllowAllBootstrapAttemptsForTest{})
 
 	first := httptest.NewRecorder()
 	firstReq := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthPasswordForgot, strings.NewReader(`{"email":"user@example.com"}`))

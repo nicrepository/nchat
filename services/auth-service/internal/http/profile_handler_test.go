@@ -53,7 +53,7 @@ func profileRouter(t *testing.T, reader *stubProfileReader) http.Handler {
 	t.Helper()
 	users := profileUserAdmin{stubProfileReader: reader}
 	return NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-		users, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil)
+		users, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil, allowAllBootstrapAttempts{})
 }
 
 func authedProfileGet(t *testing.T) *http.Request {
@@ -143,7 +143,7 @@ func TestGetMyProfile_InternalErrorMapsTo500(t *testing.T) {
 func TestGetMyProfile_DisabledReturns503(t *testing.T) {
 	// A nil users dependency disables the endpoint.
 	router := NewRouter(jwtTestConfig(), platformlog.New("auth-service", "test"),
-		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, routerSessionStub{}, nil, nil, nil, allowAllBootstrapAttempts{})
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/auth/me", nil))
 	if rr.Code != http.StatusServiceUnavailable {
