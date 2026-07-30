@@ -262,6 +262,12 @@ func New(cfg config.Config) (*App, error) {
 		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
 	}
 
+	// The channel-details panel (issue #435) reports member presence from the
+	// same tracker the hub feeds, so the HTTP layer never has to invent one.
+	if channels != nil {
+		channels = channels.WithPresence(presenceReporter{tracker: presence})
+	}
+
 	// Database is the pool's own bootstrap outcome, independent of JWT or
 	// service wiring; the remaining fields reflect each component's wiring.
 	readiness := httpapi.ReadinessState{
@@ -343,6 +349,19 @@ func (r *appWSWorkspaceResolver) GetDefaultWorkspaceID(ctx context.Context) (str
 // and the guard, its cache and its counter keys follow automatically.
 func (r *appWSWorkspaceResolver) ResolveWorkspaceID(ctx context.Context) (string, error) {
 	return r.GetDefaultWorkspaceID(ctx)
+}
+
+// presenceReporter adapts ws.PresenceTracker to the lookup the HTTP layer
+// declares, so httpapi never imports the ws package. A nil tracker answers no
+// online users, and the details payload then carries an empty online preview
+// rather than members whose presence nothing vouches for.
+type presenceReporter struct{ tracker *ws.PresenceTracker }
+
+func (p presenceReporter) OnlineUserIDs(workspaceID string) []string {
+	if p.tracker == nil {
+		return nil
+	}
+	return p.tracker.OnlineUserIDs(workspaceID)
 }
 
 // hubBroadcaster adapts ws.Hub to service.MessageEventPublisher.

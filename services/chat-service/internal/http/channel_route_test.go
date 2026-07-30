@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,10 @@ type routeMemberStore struct {
 	storage.MemberStore
 	member  domain.WorkspaceMember
 	present bool
+
+	memberPages       map[string]storage.ChannelMemberPage
+	memberLimit       int
+	lastOnlineUserIDs []string
 }
 
 func (s *routeMemberStore) GetWorkspaceMember(_ context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
@@ -59,6 +64,44 @@ func (s *routeMemberStore) GetWorkspaceMember(_ context.Context, workspaceID, us
 		return domain.WorkspaceMember{}, domain.ErrNotFound
 	}
 	return s.member, nil
+}
+
+// ListOnlineChannelMemberProfiles models the store faithfully for route tests:
+// the roster is intersected with the presence snapshot FIRST, then ordered, then
+// truncated. Limiting before filtering here would reproduce the very defect
+// issue #435 fixed and would let a broken handler pass.
+func (s *routeMemberStore) ListOnlineChannelMemberProfiles(
+	_ context.Context, _, channelID string, onlineUserIDs []string, limit int,
+) (storage.ChannelMemberPage, error) {
+	s.memberLimit = limit
+	s.lastOnlineUserIDs = append([]string(nil), onlineUserIDs...)
+	roster := s.memberPages[channelID]
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	online := map[string]struct{}{}
+	for _, userID := range onlineUserIDs {
+		online[userID] = struct{}{}
+	}
+	matched := make([]domain.ChannelMemberProfile, 0, len(roster.Online))
+	for _, member := range roster.Online {
+		if _, ok := online[member.UserID]; ok {
+			matched = append(matched, member)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		left, right := strings.ToLower(matched[i].DisplayName), strings.ToLower(matched[j].DisplayName)
+		if left != right {
+			return left < right
+		}
+		return matched[i].UserID < matched[j].UserID
+	})
+	page := storage.ChannelMemberPage{OnlineCount: len(matched), TotalCount: roster.TotalCount}
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	page.Online = matched
+	return page, nil
 }
 
 // routeChannelStore stands in for the pgx store's atomic creation path. It
@@ -71,6 +114,19 @@ type routeChannelStore struct {
 	member    domain.WorkspaceMember
 	present   bool
 	created   []storage.CreateChannelInput
+
+	// visible models GetVisibleChannelByID: only a channel listed here is
+	// readable by the caller, so a details request for anything else takes the
+	// same ErrNotFound path a private or foreign channel does.
+	visible map[string]domain.Channel
+}
+
+func (s *routeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID, channelID, _ string) (domain.Channel, error) {
+	channel, ok := s.visible[channelID]
+	if !ok || channel.WorkspaceID != workspaceID {
+		return domain.Channel{}, domain.ErrNotFound
+	}
+	return channel, nil
 }
 
 func (s *routeChannelStore) CreateChannelForActiveMember(_ context.Context, input storage.CreateChannelInput) (domain.Channel, error) {
@@ -92,28 +148,43 @@ func (s *routeChannelStore) CreateChannelForActiveMember(_ context.Context, inpu
 // ── harness ───────────────────────────────────────────────────────────────────
 
 type channelRouteEnv struct {
-	router  http.Handler
-	created *routeChannelStore
+	router   http.Handler
+	created  *routeChannelStore
+	members  *routeMemberStore
+	channels *routeChannelStore
+	presence *fakePresence
 }
 
 // newChannelRouteEnv wires the real router around the real ChannelService.
 func newChannelRouteEnv(t *testing.T, sessions httpapi.SessionValidator, workspace domain.Workspace, member domain.WorkspaceMember, memberPresent bool) channelRouteEnv {
 	t.Helper()
 	workspaces := &routeWorkspaceStore{workspace: workspace}
-	members := &routeMemberStore{member: member, present: memberPresent}
-	channels := &routeChannelStore{workspace: workspace, member: member, present: memberPresent}
+	members := &routeMemberStore{
+		member: member, present: memberPresent,
+		memberPages: map[string]storage.ChannelMemberPage{},
+	}
+	channels := &routeChannelStore{
+		workspace: workspace, member: member, present: memberPresent,
+		visible: map[string]domain.Channel{},
+	}
 
+	// Presence is wired the way app.go wires it, so the details route exercises
+	// the real path from the presence snapshot down to the member query.
+	presence := &fakePresence{}
 	handler := httpapi.NewChannelHandler(
 		workspaces,
 		service.NewChannelService(workspaces, channels, members),
 		&fakeDMRateLimiter{},
-	)
+	).WithPresence(presence)
 	return channelRouteEnv{
 		router: httpapi.NewRouter(
 			sidebarTestConfig(), nil, httpapi.ReadinessState{}, makeTestValidator(t), sessions,
 			httpapi.NewSidebarHandler(nil), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, handler, nil, nil,
 		),
-		created: channels,
+		created:  channels,
+		members:  members,
+		channels: channels,
+		presence: presence,
 	}
 }
 

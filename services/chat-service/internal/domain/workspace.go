@@ -200,6 +200,28 @@ type ChannelMember struct {
 	JoinedAt  time.Time
 }
 
+// ChannelMemberProfile is one member of a channel as the channel-details panel
+// needs to render them (issue #435).
+//
+// It carries a stable ID (for a deterministic avatar colour and for "this is
+// you"), the already-resolved visual name, an optional avatar URL and the
+// channel role. E-mail, auth source, workspace role, join date and every other
+// profile attribute are deliberately absent: none of them is displayed, and a
+// member list is the wrong place to hand out a directory.
+type ChannelMemberProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Role        ChannelRole
+}
+
+// MaxChannelDetailsMembers bounds the member page the details endpoint returns.
+//
+// The panel shows a short preview, not the roster, so the response is capped
+// server-side and the total is reported separately. A client asking for more
+// gets this many.
+const MaxChannelDetailsMembers = 30
+
 // DMConversation represents a direct or ad-hoc group DM conversation.
 // Title is empty string when NULL in the database.
 type DMConversation struct {
