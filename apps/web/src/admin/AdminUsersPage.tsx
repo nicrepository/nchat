@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+
+import { getAccessToken, onAuthChange } from "../lib/authSession";
 
 import "./AdminUsersPage.css";
 import AdminShell from "./AdminShell";
@@ -510,8 +520,33 @@ function TableBody({
   return <UserRows users={users} />;
 }
 
+/**
+ * Identifies whose data the admin table is showing.
+ *
+ * The app has no auth Context — `authSession` is the module every authenticated
+ * screen already reads — so the subscription lives here, in the component, and
+ * the hook receives a plain value. That is the point: the hook stays a function
+ * of its arguments and its tests never touch shared state.
+ *
+ * The key is presence, not the token. The token rotates on every silent
+ * refresh, so keying on it would blank the table mid-session for no reason.
+ * Presence is stable across refresh and still changes across a real identity
+ * change, because every login path clears the session first (LoginPage) and
+ * every logout clears it outright — so switching user always passes through
+ * `null`, which is what invalidates.
+ *
+ * It carries no token, address, name or secret: there is nothing to leak in a
+ * literal.
+ */
+function useSessionScopeKey(): string | null {
+  const token = useSyncExternalStore(onAuthChange, getAccessToken, () => null);
+  return token === null ? null : "authenticated-session";
+}
+
 export default function AdminUsersPage() {
-  const { state, reload, loadMore, loadingMore, loadMoreError, hasMore } = useAdminUsers();
+  const sessionScopeKey = useSessionScopeKey();
+  const { state, reload, loadMore, loadingMore, loadMoreError, hasMore } =
+    useAdminUsers(sessionScopeKey);
   const [activeFilter, setActiveFilter] = useState<FilterChip>("all");
   const [search, setSearch] = useState("");
   const [inviteOpen, setInviteOpen] = useState(false);

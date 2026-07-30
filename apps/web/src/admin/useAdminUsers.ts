@@ -17,7 +17,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getAccessToken, onAuthChange } from "../lib/authSession";
 import {
   ADMIN_USERS_PAGE_SIZE,
   type AdminErrorKind,
@@ -55,12 +54,42 @@ function appendUnique(existing: AdminUser[], incoming: AdminUser[]): AdminUser[]
   return existing.concat(incoming.filter((u) => !seen.has(u.id)));
 }
 
-export function useAdminUsers(): AdminUsersQuery {
-  const [state, setState] = useState<AdminUsersState>({ kind: "loading" });
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [hasMore, setHasMore] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [loadMoreError, setLoadMoreError] = useState<AdminErrorKind | null>(null);
+/**
+ * @param sessionScopeKey identifies whose data the table is showing. Any change
+ * invalidates everything in flight and starts over; `null` means there is no
+ * session, so nothing is fetched and nothing is shown. The hook never inspects
+ * the value — it only compares it — so the caller may make it as precise as the
+ * identifiers it actually has.
+ */
+/** Everything a response owns, tagged with the scope it was fetched for. */
+interface ScopedData {
+  scope: string | null;
+  state: AdminUsersState;
+  nextCursor: string | null;
+  hasMore: boolean;
+  loadingMore: boolean;
+  loadMoreError: AdminErrorKind | null;
+}
+
+function emptyFor(scope: string | null): ScopedData {
+  return {
+    scope,
+    state: { kind: "loading" },
+    nextCursor: null,
+    hasMore: false,
+    loadingMore: false,
+    loadMoreError: null,
+  };
+}
+
+export function useAdminUsers(sessionScopeKey: string | null): AdminUsersQuery {
+  // The data carries the scope it belongs to, so a scope change empties the
+  // table by derivation during render rather than by a reset that lands a frame
+  // later. Nothing is mutated to achieve it — the stored rows simply stop being
+  // the rows this scope is asking for.
+  const [data, setData] = useState<ScopedData>(() => emptyFor(sessionScopeKey));
+  const current = data.scope === sessionScopeKey ? data : emptyFor(sessionScopeKey);
+  const { state, nextCursor, hasMore, loadingMore, loadMoreError } = current;
   // Bumping this refetches the first page. Retry and post-invite refresh both
   // go through it, so the table is only ever filled from the canonical source.
   const [reloadToken, setReloadToken] = useState(0);
@@ -87,76 +116,77 @@ export function useAdminUsers(): AdminUsersQuery {
   const initialControllerRef = useRef<AbortController | null>(null);
   const loadMoreControllerRef = useRef<AbortController | null>(null);
 
-  /** True when this response is still the one the UI is waiting for. */
+  /**
+   * True when this response still belongs to the round the UI is waiting for.
+   *
+   * The generation catches a reload; the scope is enforced by the state write
+   * itself, which refuses to touch data belonging to a different scope.
+   */
   const isCurrent = (generation: number) => generation === generationRef.current;
 
   /**
-   * A session change also ends the current generation.
+   * Applies an update only if the stored data still belongs to `scope`.
    *
-   * Reload was not the only way the list could become the wrong list. Logging
-   * out and back in as somebody else — or switching workspace — leaves this
-   * screen mounted, so a request issued under the previous session could still
-   * resolve and call setState. The rows it carries are the previous
-   * workspace's, which is administrative PII for a tenant the current session
-   * may have no business seeing.
-   *
-   * Tokens are the observable proxy for "who is logged in": authSession
-   * notifies on every set and clear. On any change the in-flight work is
-   * invalidated and the table is emptied, then refetched only if a session
-   * remains. Clearing rather than keeping is deliberate — the safe state after
-   * an identity change is "nothing", not "the previous tenant's rows".
+   * This is the second half of staleness: a response issued for one session
+   * must not write into another's table even if it arrives while the
+   * generation happens to line up.
    */
-  useEffect(() => {
-    let token = getAccessToken();
-    return onAuthChange(() => {
-      const next = getAccessToken();
-      if (next === token) return;
-      token = next;
-
-      generationRef.current += 1;
-      initialControllerRef.current?.abort();
-      loadMoreControllerRef.current?.abort();
-      loadMoreControllerRef.current = null;
-
-      setNextCursor(null);
-      setHasMore(false);
-      setLoadingMore(false);
-      setLoadMoreError(null);
-      setState({ kind: "loading" });
-      // Refetch only while signed in. After a logout there is nothing to fetch
-      // and the effect would just produce a 401.
-      if (next !== null) {
-        setReloadToken((n) => n + 1);
-      }
+  const applyScoped = (scope: string | null, update: (prev: ScopedData) => ScopedData) => {
+    setData((prev) => {
+      const base = prev.scope === scope ? prev : emptyFor(scope);
+      return update(base);
     });
-  }, []);
+  };
+
+  /**
+   * Abandon everything in flight. Incrementing the generation is what makes
+   * responses already on their way irrelevant; aborting is the courtesy that
+   * stops the work early where the transport supports it.
+   */
+  const invalidate = () => {
+    generationRef.current += 1;
+    initialControllerRef.current?.abort();
+    loadMoreControllerRef.current?.abort();
+    loadMoreControllerRef.current = null;
+  };
 
   useEffect(() => {
+    // No session, nothing to ask for. A request here would only earn a 401.
+    if (sessionScopeKey === null) return;
+
     const generation = generationRef.current;
+    const scope = sessionScopeKey;
     const controller = new AbortController();
     initialControllerRef.current = controller;
 
     listAdminUsers({ limit: ADMIN_USERS_PAGE_SIZE, signal: controller.signal })
       .then((page) => {
         if (controller.signal.aborted || !isCurrent(generation)) return;
-        setState({ kind: "success", users: page.users });
-        setNextCursor(page.nextCursor);
-        setHasMore(page.hasMore);
-        setLoadMoreError(null);
+        applyScoped(scope, () => ({
+          scope,
+          state: { kind: "success", users: page.users },
+          nextCursor: page.nextCursor,
+          hasMore: page.hasMore,
+          loadingMore: false,
+          loadMoreError: null,
+        }));
       })
       .catch((err: unknown) => {
         if (controller.signal.aborted || !isCurrent(generation)) return;
-        setState({ kind: "error", error: classifyAdminError(err) });
-        setNextCursor(null);
-        setHasMore(false);
+        applyScoped(scope, () => ({
+          ...emptyFor(scope),
+          state: { kind: "error", error: classifyAdminError(err) },
+        }));
       });
 
-    // Unmount (or a new generation) aborts whatever is still open.
+    // Unmount, a reload, or a scope change aborts whatever is still open. The
+    // generation bump is what stops an already-resolved response from applying.
     return () => {
+      generationRef.current += 1;
       controller.abort();
       loadMoreControllerRef.current?.abort();
     };
-  }, [reloadToken]);
+  }, [reloadToken, sessionScopeKey]);
 
   /**
    * Starts over from the first page.
@@ -168,16 +198,8 @@ export function useAdminUsers(): AdminUsersQuery {
    * render, and the initial mount already starts in "loading".
    */
   const reload = useCallback(() => {
-    generationRef.current += 1;
-    initialControllerRef.current?.abort();
-    loadMoreControllerRef.current?.abort();
-    loadMoreControllerRef.current = null;
-
-    setState({ kind: "loading" });
-    setLoadMoreError(null);
-    setLoadingMore(false);
-    setNextCursor(null);
-    setHasMore(false);
+    invalidate();
+    setData((prev) => emptyFor(prev.scope));
     setReloadToken((n) => n + 1);
   }, []);
 
@@ -189,23 +211,26 @@ export function useAdminUsers(): AdminUsersQuery {
     if (state.kind !== "success") return;
 
     const generation = generationRef.current;
+    const scope = sessionScopeKey;
     const controller = new AbortController();
     loadMoreControllerRef.current = controller;
-    setLoadingMore(true);
-    setLoadMoreError(null);
+    applyScoped(scope, (prev) => ({ ...prev, loadingMore: true, loadMoreError: null }));
 
     listAdminUsers({ limit: ADMIN_USERS_PAGE_SIZE, cursor: nextCursor, signal: controller.signal })
       .then((page) => {
         if (controller.signal.aborted || !isCurrent(generation)) return;
         // Appending onto whatever is on screen, not onto a captured copy: the
-        // rows may have changed while this was in flight.
-        setState((current) =>
-          current.kind === "success"
-            ? { kind: "success", users: appendUnique(current.users, page.users) }
-            : current,
-        );
-        setNextCursor(page.nextCursor);
-        setHasMore(page.hasMore);
+        // rows may have changed while this was in flight. applyScoped refuses
+        // to append onto another scope's list.
+        setData((prev) => {
+          if (prev.scope !== scope || prev.state.kind !== "success") return prev;
+          return {
+            ...prev,
+            state: { kind: "success", users: appendUnique(prev.state.users, page.users) },
+            nextCursor: page.nextCursor,
+            hasMore: page.hasMore,
+          };
+        });
       })
       .catch((err: unknown) => {
         // A stale failure is not the user's problem: the list it belonged to is
@@ -214,7 +239,9 @@ export function useAdminUsers(): AdminUsersQuery {
         if (controller.signal.aborted || !isCurrent(generation)) return;
         // The already-loaded rows stay. Only the "load more" affordance reports
         // the failure, and it is the operator who decides to try again.
-        setLoadMoreError(classifyAdminError(err));
+        setData((prev) =>
+          prev.scope === scope ? { ...prev, loadMoreError: classifyAdminError(err) } : prev,
+        );
       })
       .finally(() => {
         // Only the request that owns the slot may release it; a stale one must
@@ -222,11 +249,10 @@ export function useAdminUsers(): AdminUsersQuery {
         if (loadMoreControllerRef.current === controller) {
           loadMoreControllerRef.current = null;
         }
-        if (isCurrent(generation)) {
-          setLoadingMore(false);
-        }
+        if (!isCurrent(generation)) return;
+        setData((prev) => (prev.scope === scope ? { ...prev, loadingMore: false } : prev));
       });
-  }, [nextCursor, hasMore, state.kind]);
+  }, [nextCursor, hasMore, state.kind, sessionScopeKey]);
 
   return { state, reload, loadMore, loadingMore, loadMoreError, hasMore };
 }

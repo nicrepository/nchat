@@ -6,11 +6,10 @@
  * knows how the hook distinguishes a stale response from a live one.
  */
 
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
-import { _resetListeners, clearTokens, setTokens } from "../lib/authSession";
 import type { AdminUser } from "./adminUsersApi";
 import { useAdminUsers } from "./useAdminUsers";
 
@@ -55,17 +54,26 @@ const FIRST = [user("a1"), user("a2")];
 const STALE_SECOND = [user("s1"), user("s2")];
 const RELOADED = [user("b1")];
 
+// Scope keys are literals the test owns. Nothing here reads or writes shared
+// auth state, so cases cannot influence one another and order does not matter.
+const SCOPE_A = "session-a:workspace-a:user-a";
+const SCOPE_B = "session-b:workspace-b:user-b";
+
 beforeEach(() => {
   mockListAdminUsers.mockReset();
-  _resetListeners();
-  sessionStorage.clear();
-  setTokens("session-A");
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
 });
 
 /** Renders the hook with a first page already loaded and a next page available. */
 async function renderWithFirstPage(cursor: string | null = "cursor-1") {
   mockListAdminUsers.mockResolvedValueOnce(pageOf(FIRST, cursor));
-  const view = renderHook(() => useAdminUsers());
+  const view = renderHook(({ scope }: { scope: string | null }) => useAdminUsers(scope), {
+    initialProps: { scope: SCOPE_A as string | null },
+  });
   await waitFor(() => expect(view.result.current.state.kind).toBe("success"));
   return view;
 }
@@ -155,7 +163,7 @@ describe("useAdminUsers — stale page invalidation", () => {
   it("discards an initial page superseded by a newer reload", async () => {
     const slowFirst = deferred<ReturnType<typeof pageOf>>();
     mockListAdminUsers.mockReturnValueOnce(slowFirst.promise);
-    const { result } = renderHook(() => useAdminUsers());
+    const { result } = renderHook(() => useAdminUsers(SCOPE_A));
 
     mockListAdminUsers.mockResolvedValueOnce(pageOf(RELOADED, null));
     act(() => result.current.reload());
@@ -240,9 +248,16 @@ describe("useAdminUsers — normal paging", () => {
 
     mockListAdminUsers.mockResolvedValueOnce(pageOf([user("c1")], null));
     act(() => result.current.loadMore());
-    await waitFor(() => expect(result.current.loadMoreError).toBeNull());
 
-    expect(result.current.state).toEqual({ kind: "success", users: [...FIRST, user("c1")] });
+    // Wait on the appended page, not on the error clearing: loadMore clears the
+    // error the moment it starts, so waiting on that would resolve before the
+    // request finished and race the append.
+    await waitFor(() => {
+      expect(result.current.state).toEqual({ kind: "success", users: [...FIRST, user("c1")] });
+    });
+    expect(result.current.loadMoreError).toBeNull();
+    expect(result.current.loadingMore).toBe(false);
+    expect(result.current.hasMore).toBe(false);
   });
 });
 
@@ -252,7 +267,7 @@ describe("useAdminUsers — unmount", () => {
   it("applies nothing after unmounting with both requests pending", async () => {
     const slowFirst = deferred<ReturnType<typeof pageOf>>();
     mockListAdminUsers.mockReturnValueOnce(slowFirst.promise);
-    const { result, unmount } = renderHook(() => useAdminUsers());
+    const { result, unmount } = renderHook(() => useAdminUsers(SCOPE_A));
 
     const before = result.current.state;
     unmount();
@@ -301,23 +316,27 @@ describe("useAdminUsers — unmount", () => {
   });
 });
 
-describe("useAdminUsers — session change", () => {
+describe("useAdminUsers — session scope", () => {
+  /** Renders with a scope the test can change, like the page does on re-login. */
+  function renderScoped(scope: string | null) {
+    return renderHook(({ s }: { s: string | null }) => useAdminUsers(s), {
+      initialProps: { s: scope },
+    });
+  }
+
   // The listing is administrative PII scoped to a workspace. A response issued
-  // under the previous session must never land in the table after the identity
-  // behind that session has changed.
-  it("discards a page issued before a re-login as someone else", async () => {
+  // under the previous scope must never land in the table after the identity
+  // behind it has changed.
+  it("discards a page issued before the scope changed", async () => {
     const slowFirst = deferred<ReturnType<typeof pageOf>>();
     mockListAdminUsers.mockReturnValueOnce(slowFirst.promise);
-    const { result } = renderHook(() => useAdminUsers());
+    const { result, rerender } = renderScoped(SCOPE_A);
 
-    // Session A's request is in flight; the operator logs out and back in.
+    // Scope A's request is in flight when the session becomes somebody else's.
     mockListAdminUsers.mockResolvedValueOnce(pageOf(RELOADED, null));
-    act(() => {
-      clearTokens();
-      setTokens("session-B");
-    });
+    act(() => rerender({ s: SCOPE_B }));
 
-    // Session A's page arrives late.
+    // Scope A's page arrives late.
     await act(async () => {
       slowFirst.resolve(pageOf(FIRST, "cursor-1"));
       await slowFirst.promise;
@@ -326,22 +345,19 @@ describe("useAdminUsers — session change", () => {
     await waitFor(() => {
       expect(result.current.state).toEqual({ kind: "success", users: RELOADED });
     });
-    // Nothing from the previous session's workspace is on screen.
-    expect(result.current.state).not.toEqual({ kind: "success", users: FIRST });
   });
 
-  it("discards a pending loadMore when the session changes", async () => {
+  it("discards a pending loadMore when the scope changes", async () => {
     const stale = deferred<ReturnType<typeof pageOf>>();
-    const { result } = await renderWithFirstPage();
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(FIRST, "cursor-1"));
+    const { result, rerender } = renderScoped(SCOPE_A);
+    await waitFor(() => expect(result.current.state.kind).toBe("success"));
 
     mockListAdminUsers.mockReturnValueOnce(stale.promise);
     act(() => result.current.loadMore());
 
     mockListAdminUsers.mockResolvedValueOnce(pageOf(RELOADED, null));
-    act(() => {
-      clearTokens();
-      setTokens("session-B");
-    });
+    act(() => rerender({ s: SCOPE_B }));
 
     await act(async () => {
       stale.resolve(pageOf(STALE_SECOND, "cursor-stale"));
@@ -354,27 +370,60 @@ describe("useAdminUsers — session change", () => {
     expect(result.current.loadMoreError).toBeNull();
   });
 
-  // After a logout there is no session to fetch under: the table is emptied and
-  // no request is issued.
-  it("clears the table on logout without refetching", async () => {
-    const { result } = await renderWithFirstPage();
+  // The data is cleared in the same commit as the scope change, not a frame
+  // later, so the previous session's rows are never rendered under the new one.
+  it("clears the table immediately when the scope changes", async () => {
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(FIRST, "cursor-1"));
+    const { result, rerender } = renderScoped(SCOPE_A);
+    await waitFor(() => expect(result.current.state.kind).toBe("success"));
+
+    mockListAdminUsers.mockReturnValueOnce(new Promise(() => {}));
+    act(() => rerender({ s: SCOPE_B }));
+
+    expect(result.current.state).toEqual({ kind: "loading" });
+    expect(result.current.hasMore).toBe(false);
+    expect(result.current.loadMoreError).toBeNull();
+    expect(result.current.loadingMore).toBe(false);
+  });
+
+  // A null scope is a logged-out page: clear everything and ask for nothing.
+  it("clears the table and issues no request when the scope becomes null", async () => {
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(FIRST, "cursor-1"));
+    const { result, rerender } = renderScoped(SCOPE_A);
+    await waitFor(() => expect(result.current.state.kind).toBe("success"));
     const callsBefore = mockListAdminUsers.mock.calls.length;
 
-    act(() => clearTokens());
+    act(() => rerender({ s: null }));
 
     expect(result.current.state).toEqual({ kind: "loading" });
     expect(result.current.hasMore).toBe(false);
     expect(mockListAdminUsers.mock.calls.length).toBe(callsBefore);
   });
 
-  // Re-notifying with the same token is not an identity change.
-  it("ignores an auth notification that does not change the token", async () => {
-    const { result } = await renderWithFirstPage();
+  it("fetches the first page when the scope goes from null to a session", async () => {
+    const { result, rerender } = renderScoped(null);
+    expect(mockListAdminUsers).not.toHaveBeenCalled();
+
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(FIRST, null));
+    act(() => rerender({ s: SCOPE_A }));
+
+    await waitFor(() => {
+      expect(result.current.state).toEqual({ kind: "success", users: FIRST });
+    });
+  });
+
+  // Re-rendering with the same scope is not an identity change: it must not
+  // refetch or blank the table. This is what a silent token refresh looks like.
+  it("does not restart the query when the scope is unchanged", async () => {
+    mockListAdminUsers.mockResolvedValueOnce(pageOf(FIRST, "cursor-1"));
+    const { result, rerender } = renderScoped(SCOPE_A);
+    await waitFor(() => expect(result.current.state.kind).toBe("success"));
     const callsBefore = mockListAdminUsers.mock.calls.length;
 
-    act(() => setTokens("session-A"));
+    act(() => rerender({ s: SCOPE_A }));
 
     expect(result.current.state).toEqual({ kind: "success", users: FIRST });
+    expect(result.current.hasMore).toBe(true);
     expect(mockListAdminUsers.mock.calls.length).toBe(callsBefore);
   });
 });
