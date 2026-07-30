@@ -57,7 +57,7 @@ func TestTargetAwareRateLimiterCapsBucketsByEvictingOldest(t *testing.T) {
 	}
 }
 
-// ── Hourly limiter (issue #425) ────────────────────────────────────────────
+// ── Hourly limiter ────────────────────────────────────────────
 
 // The invite IP ceiling is stated per hour. Reusing the per-minute constructor
 // would have made 30/hour into 30/minute — a sixty-fold weaker control.

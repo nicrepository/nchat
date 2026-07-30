@@ -24,13 +24,8 @@ const (
 	RouteAuthOIDCKeycloakCallback = "/auth/oidc/keycloak/callback"
 	RouteAuthOIDCKeycloakExchange = "/auth/oidc/keycloak/exchange"
 	RouteAdminUserStatus          = "/admin/users/{id}/status"
-	// RF-74 workspace administration (issue #425). These live under /auth, not
-	// under /admin, because /auth is the only prefix a browser can reach on
-	// this service: both the local Traefik gateway and the deployed Ingress
-	// rewrite /api/auth/* to /auth/*, while /api/admin/* is routed to
-	// admin-service instead. The sibling /admin/* routes above keep the
-	// bootstrap-token guard and stay CLI-only — they solve the chicken-and-egg
-	// of creating the first admin, before any workspace membership exists to
-	// authorize against.
+	// Authenticated workspace-admin invitation endpoint. Its sibling
+	// RouteAdminInvites above is the initialization-only route, reachable with
+	// the bootstrap credential until the workspace has its first owner.
 	RouteAuthAdminInvites = "/auth/admin/invites"
 )

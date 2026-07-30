@@ -6,7 +6,7 @@ import (
 )
 
 // WithAdminContext returns r carrying the workspace and actor that
-// RequireWorkspaceAdmin resolves from the session (issue #425).
+// RequireWorkspaceAdmin resolves from the session.
 //
 // The context keys are unexported on purpose: no handler may accept a
 // workspace or an actor from anywhere but the guard chain. Tests in the

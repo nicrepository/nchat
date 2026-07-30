@@ -19,7 +19,7 @@ const (
 	defaultTokenEndpointRateLimitPerMinute = 60
 	defaultTokenEndpointRateLimitBurst     = 10
 
-	// Invite creation budget (issue #425). Conservative on purpose: onboarding
+	// Invite creation budget is conservative on purpose: onboarding
 	// is a human-paced action, so ten invites per admin per ten minutes covers
 	// legitimate bulk onboarding while bounding how fast a stolen admin session
 	// can spray invitations. The IP ceiling is the complementary control and is

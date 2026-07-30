@@ -32,7 +32,7 @@ Admin endpoints use `VITE_ADMIN_API_BASE_URL` (default: `/api/admin`).
 | 17  | POST   | `/admin/users`                   | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
 | 18  | POST   | `/admin/invites`                 | Bootstrap-only, initialization window  | RF-46        |
 | 19  | PATCH  | `/admin/users/{id}/status`       | Bootstrap-only (`X-NChat-Admin-Token`) | —            |
-| 21  | POST   | `/auth/admin/invites`            | Bearer JWT + session + workspace admin | RF-46, RF-74 |
+| 21  | POST   | `/auth/admin/invites`            | Bearer JWT + session + workspace admin | RF-46        |
 
 ---
 
@@ -43,17 +43,40 @@ guarded by `BearerAuth` → `RequireActiveSession` → `RequireWorkspaceAdmin`, 
 that order.
 
 `RequireWorkspaceAdmin` derives both the actor and the workspace server-side:
-the actor is the JWT subject, and the workspace is the one where that actor
-holds an **active** `owner` or `admin` membership in an **active** workspace
-(`chat.workspace_members`). No workspace identifier is accepted from the path,
-query, body or headers — the route carries none.
+the actor is the JWT subject, and the workspace is resolved from that actor's
+own **active** `owner` or `admin` membership in an **active** workspace
+(`chat.workspace_members`).
 
-| Condition                               | Status |
-| --------------------------------------- | ------ |
-| Missing/invalid token                   | `401`  |
-| Revoked or expired session              | `401`  |
-| Authenticated, administers no workspace | `403`  |
-| Service booted without a database       | `503`  |
+**Workspace resolution.** The service never picks a tenant on the caller's
+behalf:
+
+| Administered workspaces | `X-NChat-Workspace-Id`      | Result                             |
+| ----------------------- | --------------------------- | ---------------------------------- |
+| none                    | any                         | `403`                              |
+| exactly one             | absent                      | that workspace                     |
+| two or more             | absent                      | `409 workspace_selection_required` |
+| any                     | one the caller administers  | that workspace                     |
+| any                     | anything else, or malformed | `403`                              |
+
+`X-NChat-Workspace-Id` is a **selector, not authority**. It is checked against
+the caller's own memberships with the same predicate used to authorize them, so
+it can only narrow the answer, never widen it: naming a workspace where the
+caller is a plain member, one that is inactive, or one that does not exist are
+all the same `403`, and none of them reveals which case applied. A caller who
+administers a single workspace gets that workspace whatever they send.
+
+Multiplicity is a refusal rather than a choice on purpose — silently acting on
+one of several tenants is exactly the failure this replaces. The `409` body
+names no workspace and does not disclose how many the caller administers.
+
+| Condition                                        | Status |
+| ------------------------------------------------ | ------ |
+| Missing/invalid token                            | `401`  |
+| Revoked or expired session                       | `401`  |
+| Authenticated, administers no workspace          | `403`  |
+| Selector not among the caller's admin workspaces | `403`  |
+| Several administered, none selected              | `409`  |
+| Service booted without a database                | `503`  |
 
 ### `POST /auth/admin/invites`
 
@@ -63,27 +86,48 @@ Creates an invite **bound to the caller's workspace**. Body: `email`,
 grant privileges or to target another tenant.
 
 Responses: `201` (bare object `{id, email, created_at}`, matching the existing
-bootstrap invite contract), `400` invalid payload or e-mail, `409` conflict,
-`429` rate limited (with `Retry-After`), `503` e-mail handoff disabled.
+bootstrap invite contract), `400` invalid payload or e-mail, `409` conflict (or
+`workspace_selection_required`, see above), `429` rate limited (with
+`Retry-After`), `503` e-mail handoff disabled.
 
-`409` is deliberately one code for three causes — the address already belongs
-to a member of this workspace, an invite is already pending for it here, or the
-partial unique index rejected a race. Distinguishing them would report whether
-an address is present in a workspace the caller may not administer.
+The invite `409` is deliberately one code for three causes — the address already
+belongs to a member of this workspace, an invite is already pending for it here,
+or the partial unique index rejected a race. Distinguishing them would report
+whether an address is present in a workspace the caller may not administer. The
+selection `409` carries its own error code, so a client can tell "resend with a
+workspace selected" from "this will never succeed".
 
-#### Workspace binding
+#### Workspace binding and invite kind
 
 `auth.user_invites.workspace_id` (migration `auth/000008`, foreign key added in
 `chat/000019`) records the issuing workspace, and `invited_by_user_id` records
 the issuing admin. Both come from the session.
 
+`auth.user_invites.invite_kind` records what the invite confers, and is set by
+the issuing code path rather than by any request field:
+
+| Kind              | Issued by                  | Membership on acceptance |
+| ----------------- | -------------------------- | ------------------------ |
+| `member`          | `POST /auth/admin/invites` | `member`                 |
+| `bootstrap_owner` | `POST /admin/invites`      | `owner`                  |
+
+A `kind`, `role`, `owner` or `admin` field in the body reaches nothing: the
+authenticated route always writes `member` and the bootstrap route always writes
+`bootstrap_owner`, overwriting whatever they were handed.
+
 Accepting an invite runs as one transaction: it locks the invite row
 `FOR UPDATE`, resolves or creates the global identity for the address, writes a
-`chat.workspace_members` row for **the invite's** workspace with role `member`,
-joins the workspace's `#geral` channel, and marks the invite accepted. A failure
-at any step rolls the whole thing back, so there is no state where an invite is
-consumed without a membership, or a membership exists while the token is still
-reusable.
+`chat.workspace_members` row for **the invite's** workspace with the role its
+kind confers, joins the workspace's `#geral` channel, and marks the invite
+accepted. A failure at any step rolls the whole thing back, so there is no state
+where an invite is consumed without a membership, a membership exists while the
+token is still reusable, or a workspace is left half-initialized.
+
+**Legacy invites.** Rows written before `auth/000008` carry no workspace.
+The migration leaves them exactly as it found them — same status, same
+timestamps — which is what makes it reversible, and the acceptance path refuses
+them instead, reporting the same `401 invalid_invite_token` as any other
+unusable token.
 
 Identity stays global — one address is one account, with memberships in as many
 workspaces as invited it. Accepting an invite for an address that already has an
@@ -893,14 +937,29 @@ in the request:
 | ------------ | -------------------------------------------------------------------------- |
 | Workspace    | `AUTH_BOOTSTRAP_WORKSPACE_ID` — configuration only, never a lookup or body |
 | Issuer       | System identity; stored as `invited_by_user_id = NULL`                     |
-| Invitee role | Fixed `member` on acceptance, as for any invite                            |
+| Invite kind  | Fixed `bootstrap_owner`                                                    |
+| Invitee role | Fixed `owner` on acceptance — this is the workspace's first administrator  |
 
-A `workspace_id`, `actor_id` or `role` in the body is discarded at decode time.
+A `workspace_id`, `actor_id`, `kind` or `role` in the body is discarded at
+decode time, and `X-NChat-Workspace-Id` is not read on this route at all.
 
 **Lifecycle.** Refused with `503` when: not configured, or the target workspace
 already has an active owner/admin. Both report the same message and neither
 reveals which workspace or who administers it. A failure to determine that
 state is also a refusal — it fails closed rather than reopening the window.
+
+**Closing the window.** Accepting a `bootstrap_owner` invite creates an `owner`
+membership, which is precisely the condition this route checks — so the first
+acceptance closes the window, and every subsequent call answers `503`. The
+acceptance takes a transaction-scoped advisory lock on the workspace before
+locking the invite row and re-checks for an existing administrator while holding
+it, so two acceptances racing in one workspace produce exactly one owner; the
+loser is refused and writes nothing. In the same transaction, any other pending
+`bootstrap_owner` invite for that workspace is revoked, so no outstanding
+bootstrap token survives initialization.
+
+An ordinary invite is unaffected: it still creates a `member` and never closes
+the bootstrap window.
 
 **Rate limit.** Same budget as the authenticated route, counted in PostgreSQL.
 Bootstrap invites share one budget per workspace, because they share one

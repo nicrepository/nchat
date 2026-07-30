@@ -313,7 +313,7 @@ func assertRFC3339(t *testing.T, value string) {
 func testConfig() config.Config {
 	return config.Config{
 		ServiceName: "auth-service", Env: "test", Port: 8081, ReadHeaderTimeoutSeconds: 5,
-		// Issue #425: the invite budget and its Retry-After come from config.
+		// The invite budget and its Retry-After come from config.
 		// Leaving them zero would silently disable both, so the router tests
 		// would assert against a limiter that is not actually running.
 		AuthInviteRateLimitPerActor:      10,

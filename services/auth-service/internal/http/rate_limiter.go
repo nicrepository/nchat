@@ -76,7 +76,7 @@ func NewTokenEndpointRateLimiter(limitPerMinute int, burst int, trustedProxyCIDR
 // NewHourlyEndpointRateLimiter builds the same token bucket with an hourly
 // budget instead of a per-minute one.
 //
-// Invite creation is measured per hour (issue #425): a per-minute figure low
+// Invite creation is measured per hour: a per-minute figure low
 // enough to bound abuse would reject an admin onboarding a handful of people
 // in one sitting. The bucket refills at limitPerHour/60 tokens per minute and
 // starts full, so the whole hourly allowance may be spent at once and then

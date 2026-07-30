@@ -364,7 +364,7 @@ func TestValidateOIDCRequiresRelativeFrontendCallbackPath(t *testing.T) {
 	}
 }
 
-// ── Invite rate limit bounds (issue #425) ──────────────────────────────────
+// ── Invite rate limit bounds ──────────────────────────────────
 
 func TestLoad_InviteRateLimitDefaults(t *testing.T) {
 	cfg := Load()
@@ -419,7 +419,7 @@ func TestLoad_InviteRateLimitRejectsOutOfRangeValues(t *testing.T) {
 	}
 }
 
-// ── Bootstrap workspace (issue #425) ───────────────────────────────────────
+// ── Bootstrap workspace ───────────────────────────────────────
 
 // Empty by default: enabling a route guarded by a pre-shared credential must be
 // an explicit operator decision, not something a deployment inherits.

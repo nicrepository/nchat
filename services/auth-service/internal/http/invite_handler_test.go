@@ -45,7 +45,7 @@ func (f *fakeInviteManager) AcceptInvite(_ context.Context, input domain.AcceptI
 	return f.acceptResult, f.acceptErr
 }
 
-// Issue #425: the handler reads its workspace and actor from the context the
+// The handler reads its workspace and actor from the context the
 // guard chain builds. These direct-handler tests exercise it in isolation, so
 // they stand in for the guard.
 const (
