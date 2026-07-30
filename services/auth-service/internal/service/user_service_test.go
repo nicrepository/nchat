@@ -20,6 +20,7 @@ type fakeStore struct {
 	adminWorkspaceID  string
 	adminWorkspaceErr error
 	gotAdminUserID    string
+	gotAdminSelector  string
 }
 
 func (f *fakeStore) GetPolicySettings(_ context.Context) (domain.PolicySettings, error) {
@@ -45,8 +46,9 @@ func (f *fakeStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProf
 	return domain.SelfProfile{}, nil
 }
 
-func (f *fakeStore) GetAdminWorkspaceID(_ context.Context, userID string) (string, error) {
+func (f *fakeStore) ResolveAdminWorkspaceID(_ context.Context, userID, selector string) (string, error) {
 	f.gotAdminUserID = userID
+	f.gotAdminSelector = selector
 	return f.adminWorkspaceID, f.adminWorkspaceErr
 }
 
@@ -299,17 +301,17 @@ func TestUserService_GetProfile_PropagatesError(t *testing.T) {
 	}
 }
 
-// ── Workspace administration (issue #425) ──────────────────────────────────
+// ── Workspace administration ──────────────────────────────────
 
 // The actor reaches the store unchanged: the service adds no notion of a
 // default or fallback caller.
-func TestUserService_GetAdminWorkspaceID_PassesActorThrough(t *testing.T) {
+func TestUserService_ResolveAdminWorkspaceID_PassesActorThrough(t *testing.T) {
 	store := &fakeStore{adminWorkspaceID: "ws-1"}
 	svc := service.NewUserService(store)
 
-	workspaceID, err := svc.GetAdminWorkspaceID(context.Background(), "actor-1")
+	workspaceID, err := svc.ResolveAdminWorkspaceID(context.Background(), "actor-1", "")
 	if err != nil {
-		t.Fatalf("GetAdminWorkspaceID: %v", err)
+		t.Fatalf("ResolveAdminWorkspaceID: %v", err)
 	}
 	if workspaceID != "ws-1" {
 		t.Fatalf("expected ws-1, got %q", workspaceID)
@@ -321,11 +323,11 @@ func TestUserService_GetAdminWorkspaceID_PassesActorThrough(t *testing.T) {
 
 // A caller who administers nothing must surface as forbidden, not as an empty
 // workspace that a later query would silently widen.
-func TestUserService_GetAdminWorkspaceID_ForbiddenPropagates(t *testing.T) {
+func TestUserService_ResolveAdminWorkspaceID_ForbiddenPropagates(t *testing.T) {
 	store := &fakeStore{adminWorkspaceErr: domain.ErrForbidden}
 	svc := service.NewUserService(store)
 
-	if _, err := svc.GetAdminWorkspaceID(context.Background(), "member-1"); !errors.Is(err, domain.ErrForbidden) {
+	if _, err := svc.ResolveAdminWorkspaceID(context.Background(), "member-1", ""); !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
 }

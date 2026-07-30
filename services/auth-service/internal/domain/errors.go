@@ -38,6 +38,12 @@ var ErrInviteRateLimited = errors.New("invite rate limit exceeded")
 // second onboarding path to a workspace they can already reach.
 var ErrAlreadyMember = errors.New("already a member of this workspace")
 
+// ErrWorkspaceSelectionRequired is returned when the caller administers more
+// than one workspace and did not name which one the request is for. Picking
+// one would silently act on a tenant the caller did not choose, so the request
+// is refused instead. The response carries no workspace identifier.
+var ErrWorkspaceSelectionRequired = errors.New("workspace selection required")
+
 // ErrInviteWorkspaceMissing is returned when an invite predating the workspace
 // binding is presented for acceptance. It names no workspace, so there is no
 // membership it could create; it is refused rather than honoured against a

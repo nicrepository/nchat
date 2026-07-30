@@ -32,11 +32,13 @@ type UserStore interface {
 	// It is idempotent: clearing an already-empty avatar returns "" with no
 	// error, as long as the user exists and is active.
 	ClearAvatarURL(ctx context.Context, userID string) (previous string, err error)
-	// GetAdminWorkspaceID returns the workspace userID administers. It is the
-	// only source of workspace identity for the admin endpoints: nothing the
-	// browser sends reaches it. ErrForbidden when the caller administers no
-	// active workspace, which is also the answer for a plain member or guest.
-	GetAdminWorkspaceID(ctx context.Context, userID string) (string, error)
+	// ResolveAdminWorkspaceID decides the workspace an admin request acts on.
+	// selector is an optional hint validated against this caller's own
+	// memberships, never trusted as authority. ErrForbidden when the caller
+	// administers no active workspace or none matching selector;
+	// ErrWorkspaceSelectionRequired when they administer several and named
+	// none.
+	ResolveAdminWorkspaceID(ctx context.Context, userID, selector string) (string, error)
 }
 
 // PGXUserStore implements UserStore using a pgx connection pool.
@@ -290,37 +292,84 @@ func (s *PGXUserStore) swapAvatarURL(ctx context.Context, userID string, newValu
 	return *previous, nil
 }
 
-// GetAdminWorkspaceID resolves the workspace userID administers.
-//
-// This is the workspace-scoping decision for the whole admin API, taken from
-// the caller's own membership row and nothing else. The three conditions are
-// each load-bearing: the role check is the authorization (a member or guest
-// matches no row and gets ErrForbidden), the membership status check keeps a
+// adminMembershipPredicate is the authorization, expressed once. All three
+// conditions are load-bearing: the role check is the authorization proper (a
+// member or guest matches no row), the membership status check keeps a
 // suspended or departed admin out, and the workspace status check keeps an
-// archived workspace from being administered.
+// archived workspace from being administered. Both queries below select over
+// exactly this predicate so "may administer" cannot acquire two definitions.
+const adminMembershipPredicate = `
+	FROM chat.workspace_members wm
+	JOIN chat.workspaces w
+	  ON w.id = wm.workspace_id AND w.status = 'active'
+	WHERE wm.user_id = $1::uuid
+	  AND wm.status = 'active'
+	  AND wm.role IN ('owner', 'admin')`
+
+// ResolveAdminWorkspaceID decides which workspace a request acts on.
 //
-// A caller who administers several workspaces resolves to the oldest
-// membership, which is stable across calls, so the list and any follow-up
-// mutation always agree on one workspace.
-func (s *PGXUserStore) GetAdminWorkspaceID(ctx context.Context, userID string) (string, error) {
-	var workspaceID string
-	err := s.pool.QueryRow(ctx, `
-		SELECT wm.workspace_id::text
-		FROM chat.workspace_members wm
-		JOIN chat.workspaces w
-		  ON w.id = wm.workspace_id AND w.status = 'active'
-		WHERE wm.user_id = $1::uuid
-		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin')
-		ORDER BY wm.joined_at, wm.workspace_id
-		LIMIT 1`,
-		userID,
-	).Scan(&workspaceID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", domain.ErrForbidden
+// selector is an optional caller-supplied hint, never an authority: when it is
+// present it is checked against this caller's own membership, so naming a
+// workspace the caller does not administer is refused exactly like naming none.
+// When it is absent the answer comes from how many workspaces the caller
+// administers, and multiplicity is an error rather than a choice — silently
+// acting on one of several tenants is the failure mode this replaces.
+//
+//	0 administered → ErrForbidden
+//	1 administered → that workspace
+//	≥2 administered → ErrWorkspaceSelectionRequired
+//
+// The unselected query reads at most two rows because two is all it takes to
+// tell the three cases apart; no row is ever used as "the" answer while a
+// second one exists.
+func (s *PGXUserStore) ResolveAdminWorkspaceID(ctx context.Context, userID, selector string) (string, error) {
+	if selector != "" {
+		var workspaceID string
+		err := s.pool.QueryRow(ctx,
+			`SELECT wm.workspace_id::text`+adminMembershipPredicate+`
+			  AND wm.workspace_id = $2::uuid`,
+			userID, selector,
+		).Scan(&workspaceID)
+		if err != nil {
+			// One answer for "not yours", "not active" and "does not exist":
+			// distinguishing them would let a caller probe for the existence of
+			// workspaces they have nothing to do with.
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", domain.ErrForbidden
+			}
+			return "", fmt.Errorf("resolve selected admin workspace: %w", err)
 		}
-		return "", fmt.Errorf("get admin workspace: %w", err)
+		return workspaceID, nil
 	}
-	return workspaceID, nil
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT wm.workspace_id::text`+adminMembershipPredicate+`
+		LIMIT 2`,
+		userID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("resolve admin workspaces: %w", err)
+	}
+	defer rows.Close()
+
+	var administered []string
+	for rows.Next() {
+		var workspaceID string
+		if err := rows.Scan(&workspaceID); err != nil {
+			return "", fmt.Errorf("scan admin workspace: %w", err)
+		}
+		administered = append(administered, workspaceID)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("resolve admin workspaces: %w", err)
+	}
+
+	switch len(administered) {
+	case 0:
+		return "", domain.ErrForbidden
+	case 1:
+		return administered[0], nil
+	default:
+		return "", domain.ErrWorkspaceSelectionRequired
+	}
 }

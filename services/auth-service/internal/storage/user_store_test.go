@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -562,12 +563,12 @@ func TestPGXUserStore_SuspendOIDCExchangeLifecycle(t *testing.T) {
 	})
 }
 
-// ── Workspace administration (issue #425) ──────────────────────────────────
+// ── Workspace administration ──────────────────────────────────
 
 // The resolver is the tenant boundary for the admin API: it must ask only for
 // memberships that are active, in an active workspace, and carry an
 // administrative role. A caller matching none of that is forbidden, not empty.
-func TestPGXUserStore_GetAdminWorkspaceID_Success(t *testing.T) {
+func TestPGXUserStore_ResolveAdminWorkspaceID_SingleAdminMembership(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -579,9 +580,9 @@ func TestPGXUserStore_GetAdminWorkspaceID_Success(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
 
 	store := storage.NewPGXUserStore(mock)
-	workspaceID, err := store.GetAdminWorkspaceID(context.Background(), "actor-1")
+	workspaceID, err := store.ResolveAdminWorkspaceID(context.Background(), "actor-1", "")
 	if err != nil {
-		t.Fatalf("GetAdminWorkspaceID: %v", err)
+		t.Fatalf("ResolveAdminWorkspaceID: %v", err)
 	}
 	if workspaceID != "ws-1" {
 		t.Fatalf("expected ws-1, got %q", workspaceID)
@@ -591,7 +592,7 @@ func TestPGXUserStore_GetAdminWorkspaceID_Success(t *testing.T) {
 	}
 }
 
-func TestPGXUserStore_GetAdminWorkspaceID_NoAdminMembershipIsForbidden(t *testing.T) {
+func TestPGXUserStore_ResolveAdminWorkspaceID_NoAdminMembershipIsForbidden(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -603,13 +604,16 @@ func TestPGXUserStore_GetAdminWorkspaceID_NoAdminMembershipIsForbidden(t *testin
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}))
 
 	store := storage.NewPGXUserStore(mock)
-	_, err = store.GetAdminWorkspaceID(context.Background(), "member-1")
+	_, err = store.ResolveAdminWorkspaceID(context.Background(), "member-1", "")
 	if !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("expected ErrForbidden for a non-admin, got %v", err)
 	}
 }
 
-func TestPGXUserStore_GetAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
+// The behaviour this replaced picked the oldest membership. Several
+// administered workspaces must now be an error the caller has to resolve, not
+// a silent choice of tenant.
+func TestPGXUserStore_ResolveAdminWorkspaceID_MultipleRequiresSelection(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -618,11 +622,124 @@ func TestPGXUserStore_GetAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
 
 	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
 		WithArgs("actor-1").
-		WillReturnError(errors.New("connection refused"))
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-1").AddRow("ws-2"))
 
 	store := storage.NewPGXUserStore(mock)
-	_, err = store.GetAdminWorkspaceID(context.Background(), "actor-1")
-	if err == nil || errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("an infrastructure failure must not read as forbidden, got %v", err)
+	workspaceID, err := store.ResolveAdminWorkspaceID(context.Background(), "actor-1", "")
+	if !errors.Is(err, domain.ErrWorkspaceSelectionRequired) {
+		t.Fatalf("expected ErrWorkspaceSelectionRequired, got %v", err)
+	}
+	if workspaceID != "" {
+		t.Fatalf("a refused resolution must yield no workspace, got %q", workspaceID)
+	}
+}
+
+// The unselected query must not order by anything: ordering plus a limit is
+// exactly the "oldest wins" tenant choice this replaced. Asserted on the SQL
+// the store actually issues, because a regex over the query text is the only
+// place this invariant is observable.
+func TestPGXUserStore_ResolveAdminWorkspaceID_QueryDoesNotOrderToPickATenant(t *testing.T) {
+	var issued []string
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(
+		pgxmock.QueryMatcherFunc(func(_, actualSQL string) error {
+			issued = append(issued, actualSQL)
+			return nil
+		}),
+	))
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(``).
+		WithArgs("actor-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-1"))
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.ResolveAdminWorkspaceID(context.Background(), "actor-1", ""); err != nil {
+		t.Fatalf("ResolveAdminWorkspaceID: %v", err)
+	}
+	if len(issued) != 1 {
+		t.Fatalf("expected one query, got %d", len(issued))
+	}
+	if strings.Contains(strings.ToUpper(issued[0]), "ORDER BY") {
+		t.Fatalf("tenant resolution must not order rows to pick one:\n%s", issued[0])
+	}
+	if !strings.Contains(issued[0], "LIMIT 2") {
+		t.Fatalf("expected the two-row probe that distinguishes 0/1/many:\n%s", issued[0])
+	}
+}
+
+// The selector narrows; it never authorizes. It is passed to a query carrying
+// the same membership predicate, so it can only ever match a workspace the
+// caller already administers.
+func TestPGXUserStore_ResolveAdminWorkspaceID_SelectorIsCheckedAgainstMembership(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`wm\.workspace_id = \$2::uuid`).
+		WithArgs("actor-1", "ws-2").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}).AddRow("ws-2"))
+
+	store := storage.NewPGXUserStore(mock)
+	workspaceID, err := store.ResolveAdminWorkspaceID(context.Background(), "actor-1", "ws-2")
+	if err != nil {
+		t.Fatalf("ResolveAdminWorkspaceID: %v", err)
+	}
+	if workspaceID != "ws-2" {
+		t.Fatalf("expected ws-2, got %q", workspaceID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A selector naming a workspace the caller does not administer — including one
+// that does not exist — is forbidden, with no hint of which it was.
+func TestPGXUserStore_ResolveAdminWorkspaceID_UnmatchedSelectorIsForbidden(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`wm\.workspace_id = \$2::uuid`).
+		WithArgs("actor-1", "ws-9").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id"}))
+
+	store := storage.NewPGXUserStore(mock)
+	_, err = store.ResolveAdminWorkspaceID(context.Background(), "actor-1", "ws-9")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func TestPGXUserStore_ResolveAdminWorkspaceID_QueryErrorIsWrapped(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		selector string
+	}{
+		{name: "unselected", selector: ""},
+		{name: "selected", selector: "ws-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+
+			mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+				WillReturnError(errors.New("connection refused"))
+
+			store := storage.NewPGXUserStore(mock)
+			_, err = store.ResolveAdminWorkspaceID(context.Background(), "actor-1", tt.selector)
+			if err == nil || errors.Is(err, domain.ErrForbidden) || errors.Is(err, domain.ErrWorkspaceSelectionRequired) {
+				t.Fatalf("an infrastructure failure must not read as a decision, got %v", err)
+			}
+		})
 	}
 }

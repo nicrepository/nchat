@@ -32,12 +32,14 @@ type SelfProfileReader interface {
 // WorkspaceAdminResolver answers "which workspace does this caller
 // administer?" — the question that turns a session into authority.
 //
-// It is what lets the administrative endpoints derive the workspace and the
-// actor entirely server-side, instead of trusting either from the request.
+// It is what lets the administrative endpoints derive the workspace entirely
+// server-side. A selector may narrow the answer but never widen it.
 type WorkspaceAdminResolver interface {
-	// GetAdminWorkspaceID returns the workspace the caller administers, or
-	// ErrForbidden when they administer none.
-	GetAdminWorkspaceID(ctx context.Context, userID string) (string, error)
+	// ResolveAdminWorkspaceID returns the workspace the request acts on.
+	// ErrForbidden when the caller administers none, or none matching
+	// selector; ErrWorkspaceSelectionRequired when several are administered
+	// and no selector was given.
+	ResolveAdminWorkspaceID(ctx context.Context, userID, selector string) (string, error)
 }
 
 // UserAdmin is the combined interface used by the auth HTTP handlers. It also
@@ -110,11 +112,11 @@ func (s *UserService) UpdateUserStatus(ctx context.Context, callerID, targetID, 
 	return s.store.UpdateUserStatus(ctx, targetID, newStatus)
 }
 
-// GetAdminWorkspaceID returns the workspace userID administers.
+// ResolveAdminWorkspaceID returns the workspace the caller's request acts on.
 //
-// The lookup is delegated unchanged: the authorization lives in the SQL, where
-// it holds atomically with the read, rather than in a check here that a later
-// caller could skip.
-func (s *UserService) GetAdminWorkspaceID(ctx context.Context, userID string) (string, error) {
-	return s.store.GetAdminWorkspaceID(ctx, userID)
+// The lookup is delegated unchanged, selector included: the authorization lives
+// in the SQL, where it holds atomically with the read, rather than in a check
+// here that a later caller could skip.
+func (s *UserService) ResolveAdminWorkspaceID(ctx context.Context, userID, selector string) (string, error) {
+	return s.store.ResolveAdminWorkspaceID(ctx, userID, selector)
 }

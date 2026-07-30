@@ -34,11 +34,39 @@ type workspaceAdminStub struct {
 	workspaceID  string
 	workspaceErr error
 	gotActorID   string
+	gotSelector  string
+	selectorSeen bool
+
+	// administered models the real resolver: when set, the stub answers from
+	// these memberships instead of the fixed workspaceID above, so the
+	// zero/one/many branches are exercised through the same code path the
+	// handler uses.
+	administered []string
 }
 
-func (s *workspaceAdminStub) GetAdminWorkspaceID(_ context.Context, userID string) (string, error) {
+func (s *workspaceAdminStub) ResolveAdminWorkspaceID(_ context.Context, userID, selector string) (string, error) {
 	s.gotActorID = userID
-	return s.workspaceID, s.workspaceErr
+	s.gotSelector = selector
+	s.selectorSeen = true
+	if s.administered == nil {
+		return s.workspaceID, s.workspaceErr
+	}
+	if selector != "" {
+		for _, id := range s.administered {
+			if id == selector {
+				return id, nil
+			}
+		}
+		return "", domain.ErrForbidden
+	}
+	switch len(s.administered) {
+	case 0:
+		return "", domain.ErrForbidden
+	case 1:
+		return s.administered[0], nil
+	default:
+		return "", domain.ErrWorkspaceSelectionRequired
+	}
 }
 
 // inviteStub records what the invite manager was asked to create.
@@ -294,7 +322,7 @@ func TestRequireWorkspaceAdmin_NonUUIDSubjectReturns401(t *testing.T) {
 	}
 }
 
-// ── Invite authority and rate limit (issue #425) ───────────────────────────
+// ── Invite authority and rate limit ───────────────────────────
 
 // The workspace and actor reaching the service are the ones the guard
 // resolved, not anything the browser supplied.
@@ -441,7 +469,7 @@ func TestAdminInvites_BootstrapRouteIsNotABypass(t *testing.T) {
 	}
 }
 
-// ── Bootstrap invite route (issue #425) ────────────────────────────────────
+// ── Bootstrap invite route ────────────────────────────────────
 //
 // POST /admin/invites is the initialization-only sibling of the session-scoped
 // route. It previously shared AdminCreateInvite, which reads a workspace and an
@@ -673,5 +701,186 @@ func TestBootstrapInvites_UnwiredDependenciesReturn503(t *testing.T) {
 				t.Fatalf("expected 503, got %d: %s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// ── Workspace selection ───────────────────────────────────────
+//
+// The guard used to resolve the caller's oldest administered workspace, which
+// silently picked a tenant for anyone administering more than one. These cases
+// pin the replacement: zero is a refusal, one is unambiguous, several require
+// the caller to say which, and a selector is validated rather than trusted.
+
+// A third workspace nobody in these tests administers, used as the selector
+// that must not be honoured.
+const unrelatedWorkspaceID = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+
+func selectorRequest(t *testing.T, selector string) *http.Request {
+	t.Helper()
+	req := adminRequest(t, http.MethodPost, RouteAuthAdminInvites, `{"email":"new@example.com","display_name":"New"}`)
+	if selector != "" {
+		req.Header.Set(headerWorkspaceSelector, selector)
+	}
+	return req
+}
+
+func TestAdminInvites_NoAdminWorkspaceReturns403(t *testing.T) {
+	users := &workspaceAdminStub{administered: []string{}}
+	invites := &inviteStub{result: domain.InviteResult{ID: "invite-1", Email: "new@example.com"}}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, ""))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a caller administering nothing, got %d", rec.Code)
+	}
+	if invites.calls != 0 {
+		t.Fatalf("a refused caller must not reach invite creation")
+	}
+}
+
+func TestAdminInvites_SingleAdminWorkspaceNeedsNoSelector(t *testing.T) {
+	users := &workspaceAdminStub{administered: []string{adminWorkspaceID}}
+	invites := &inviteStub{result: domain.InviteResult{ID: "invite-1", Email: "new@example.com"}}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, ""))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if invites.got.WorkspaceID != adminWorkspaceID {
+		t.Fatalf("expected the sole administered workspace, got %q", invites.got.WorkspaceID)
+	}
+}
+
+// The core of the fix: several administered workspaces and no selector is a
+// conflict the caller must resolve, never a silent choice.
+func TestAdminInvites_MultipleAdminWorkspacesWithoutSelectorReturns409(t *testing.T) {
+	users := &workspaceAdminStub{administered: []string{adminWorkspaceID, otherWorkspaceID}}
+	invites := &inviteStub{}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, ""))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when a selection is required, got %d", rec.Code)
+	}
+	if invites.calls != 0 {
+		t.Fatalf("an unresolved workspace must not reach invite creation")
+	}
+	// The refusal must not enumerate what the caller administers.
+	if body := rec.Body.String(); strings.Contains(body, adminWorkspaceID) || strings.Contains(body, otherWorkspaceID) {
+		t.Fatalf("the refusal must not name any workspace: %s", body)
+	}
+}
+
+func TestAdminInvites_ValidSelectorChoosesThatWorkspace(t *testing.T) {
+	for _, selected := range []string{adminWorkspaceID, otherWorkspaceID} {
+		t.Run(selected, func(t *testing.T) {
+			users := &workspaceAdminStub{administered: []string{adminWorkspaceID, otherWorkspaceID}}
+			invites := &inviteStub{result: domain.InviteResult{ID: "invite-1", Email: "new@example.com"}}
+			rec := httptest.NewRecorder()
+
+			workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, selected))
+
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if invites.got.WorkspaceID != selected {
+				t.Fatalf("expected the invite in %q, got %q", selected, invites.got.WorkspaceID)
+			}
+		})
+	}
+}
+
+// A selector is a hint, not authority. Naming a workspace where the caller is
+// only a member, one that does not exist, or one that is inactive all reach the
+// resolver and all come back forbidden — the header never widens what the
+// caller may do.
+func TestAdminInvites_SelectorOutsideAdminMembershipsIsForbidden(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		selector string
+	}{
+		{name: "member only", selector: unrelatedWorkspaceID},
+		{name: "nonexistent", selector: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &workspaceAdminStub{administered: []string{adminWorkspaceID, otherWorkspaceID}}
+			invites := &inviteStub{}
+			rec := httptest.NewRecorder()
+
+			workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, tt.selector))
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if invites.calls != 0 {
+				t.Fatalf("a refused selector must not reach invite creation")
+			}
+		})
+	}
+}
+
+// A caller who administers exactly one workspace gets that workspace whatever
+// they put in the header — the selector can only narrow, so it cannot move the
+// request to a tenant the resolver did not already allow.
+func TestAdminInvites_SelectorCannotOverrideServerSideValidation(t *testing.T) {
+	users := &workspaceAdminStub{administered: []string{adminWorkspaceID}}
+	invites := &inviteStub{}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, otherWorkspaceID))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a workspace the caller does not administer, got %d", rec.Code)
+	}
+	if users.gotSelector != otherWorkspaceID {
+		t.Fatalf("the selector must be handed to the resolver for checking, got %q", users.gotSelector)
+	}
+}
+
+// A malformed selector cannot identify a membership row. It is refused with the
+// same 403 as an unmatched one, and without a lookup, so the two are
+// indistinguishable from outside.
+func TestAdminInvites_MalformedSelectorIsForbiddenWithoutLookup(t *testing.T) {
+	users := &workspaceAdminStub{administered: []string{adminWorkspaceID, otherWorkspaceID}}
+	invites := &inviteStub{}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users, invites).ServeHTTP(rec, selectorRequest(t, "not-a-uuid"))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a malformed selector, got %d", rec.Code)
+	}
+	if users.selectorSeen {
+		t.Fatalf("a malformed selector must not reach the resolver")
+	}
+	if invites.calls != 0 {
+		t.Fatalf("a refused selector must not reach invite creation")
+	}
+}
+
+// The bootstrap route has no session and reads no selector: its workspace comes
+// from configuration alone, so the header cannot point it anywhere.
+func TestBootstrapInvites_SelectorHeaderIsIgnored(t *testing.T) {
+	invites := &inviteStub{result: domain.InviteResult{ID: "invite-1", Email: "first@example.com"}}
+	req := bootstrapRequest(t, bootstrapToken, `{"email":"first@example.com","display_name":"First"}`)
+	req.Header.Set(headerWorkspaceSelector, otherWorkspaceID)
+	rec := httptest.NewRecorder()
+
+	bootstrapRouter(t, invites, bootstrapToken).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if invites.bootstrapCalls != 1 {
+		t.Fatalf("expected the bootstrap command to run, got %d calls", invites.bootstrapCalls)
+	}
+	// domain.BootstrapInviteInput has no workspace field at all, so there is
+	// nothing the header could have reached.
+	if invites.calls != 0 {
+		t.Fatalf("the bootstrap route must not reach the session-scoped command")
 	}
 }

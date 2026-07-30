@@ -15,6 +15,9 @@ import (
 const (
 	errCodeConflict    = "conflict"
 	errCodeUnavailable = "service_unavailable"
+	// Distinct from errCodeConflict so a client can tell "resend with a
+	// workspace selected" from "this request will never succeed".
+	errCodeWorkspaceSelectionRequired = "workspace_selection_required"
 )
 
 type createUserRequest struct {
