@@ -147,11 +147,13 @@ Consequences worth stating:
 | Authoritative budget  | actor × workspace | 10 per 10 min | `AUTH_INVITE_RATE_LIMIT_PER_ACTOR`, `AUTH_INVITE_RATE_LIMIT_WINDOW_MINUTES` |
 | Complementary ceiling | client IP         | 30 per hour   | `AUTH_INVITE_RATE_LIMIT_PER_IP_PER_HOUR`                                    |
 
-The authoritative budget is counted in PostgreSQL inside the creating
-transaction, under an advisory lock keyed by `(workspace, actor)`, so it holds
-across replicas and cannot be raced. The IP ceiling reuses the in-process
-limiter the other auth endpoints use and is a coarse complement only — it is
-per-process and does not survive multiple replicas.
+Both are counted in PostgreSQL, so both hold across replicas and survive a
+restart. The authoritative budget is counted inside the creating transaction,
+under an advisory lock keyed by `(workspace, actor)`, so it cannot be raced. The
+IP ceiling is a separate shared counter, keyed by
+`admin-invites-ip:<client-ip>` in a fixed hourly window and charged before the
+handler runs; it is the complementary control, not the authoritative one,
+because an address is a much weaker identity than an authenticated actor.
 
 Values outside their permitted range fall back to the default rather than being
 clamped, so a typo cannot silently weaken the control.
@@ -995,6 +997,30 @@ bootstrap token survives initialization.
 
 An ordinary invite is unaffected: it still creates a `member` and never closes
 the bootstrap window.
+
+**The window stays shut.** "Has this workspace ever gained an administrator?" is
+a question about its history and is answered independently of whether the
+workspace is currently operational. Archiving a workspace does **not**
+un-initialize it, so the bootstrap credential cannot be used to mint a new
+`bootstrap_owner` invite for a workspace that already had an owner and was later
+archived — nor could accepting such an invite grant ownership that materialises
+on reactivation.
+
+Both issuance and acceptance require all three of: the workspace exists, it is
+`active`, and it has no active `owner`/`admin` membership. Anything else is a
+refusal — `503` on issuance, `401 invalid_invite_token` on acceptance — and the
+refusals are indistinguishable from one another.
+
+| Workspace exists | Status     | Has owner/admin | Bootstrap |
+| ---------------- | ---------- | --------------- | --------- |
+| yes              | `active`   | no              | **open**  |
+| yes              | `active`   | yes             | shut      |
+| yes              | `disabled` | yes             | shut      |
+| yes              | `disabled` | no              | shut      |
+| no               | —          | —               | shut      |
+
+A failure to determine that state is also a refusal: it fails closed rather than
+reopening the window on a transient outage.
 
 **Rate limit.** Same budget as the authenticated route, counted in PostgreSQL.
 Bootstrap invites share one budget per workspace, because they share one
