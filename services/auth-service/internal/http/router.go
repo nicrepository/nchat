@@ -105,18 +105,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	if tokens != nil && users != nil && sessions != nil {
 		requireActive := RequireActiveSession(sessions)
 		requireAdmin := RequireWorkspaceAdmin(users)
-
-		// The listing is read-only but not free: each page sorts the
-		// workspace's members, so an authenticated administrator could drive
-		// unbounded work by paging in a loop. The per-caller budget bounds how
-		// often that can happen. It is in-process, which is effective at the
-		// single replica this service runs today and a coarse ceiling beyond
-		// that — the durable fix for the per-page cost is an index, which
-		// needs a migration and is out of this branch's scope.
-		listReadLimiter := NewTokenEndpointRateLimiter(cfg.AuthTokenEndpointRateLimitPerMinute, cfg.AuthTokenEndpointRateLimitBurst, trustedProxyCIDRs)
-		adminUsersHandler = BearerAuth(tokens)(requireActive(requireAdmin(
-			listReadLimiter.Middleware(AdminListWorkspaceUsers(users)),
-		)))
+		adminUsersHandler = BearerAuth(tokens)(requireActive(requireAdmin(AdminListWorkspaceUsers(users))))
 
 		// The browser invite endpoint. It shares the guard chain above, so the
 		// caller is a verified owner/admin of a real workspace rather than a

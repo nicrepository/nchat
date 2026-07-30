@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
 
@@ -776,5 +777,77 @@ func TestPGXUserStore_ListWorkspaceUsers_QueryErrorIsReturned(t *testing.T) {
 	store := storage.NewPGXUserStore(mock)
 	if _, err := store.ListWorkspaceUsers(context.Background(), "ws-1", 51, nil); err == nil {
 		t.Fatal("expected an error when the query fails")
+	}
+}
+
+// ── Cursor anchor resolution ───────────────────────────────────────────────
+//
+// The cursor names a row by id; its ordering position is read back here, which
+// is what keeps a display name or an e-mail out of the token and out of access
+// logs.
+
+func TestPGXUserStore_GetWorkspaceUserAnchor_ResolvesPosition(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", "u1").
+		WillReturnRows(pgxmock.NewRows([]string{"sort_key"}).AddRow("alice"))
+
+	store := storage.NewPGXUserStore(mock)
+	anchor, err := store.GetWorkspaceUserAnchor(context.Background(), "ws-1", "u1")
+	if err != nil {
+		t.Fatalf("GetWorkspaceUserAnchor: %v", err)
+	}
+	if !anchor.Found || anchor.SortKey != "alice" {
+		t.Fatalf("unexpected anchor: %+v", anchor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A row that has left the workspace — or never belonged to it — has no
+// position. Found=false is what turns the cursor into a 400 rather than an
+// empty page, and it is also what stops a cursor naming a user in another
+// tenant from resolving.
+func TestPGXUserStore_GetWorkspaceUserAnchor_MissingRowIsNotFound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", "gone").
+		WillReturnError(pgx.ErrNoRows)
+
+	store := storage.NewPGXUserStore(mock)
+	anchor, err := store.GetWorkspaceUserAnchor(context.Background(), "ws-1", "gone")
+	if err != nil {
+		t.Fatalf("a missing row is not an error: %v", err)
+	}
+	if anchor.Found {
+		t.Fatalf("expected Found=false, got %+v", anchor)
+	}
+}
+
+func TestPGXUserStore_GetWorkspaceUserAnchor_QueryErrorIsReturned(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs("ws-1", "u1").
+		WillReturnError(errors.New("connection refused"))
+
+	store := storage.NewPGXUserStore(mock)
+	if _, err := store.GetWorkspaceUserAnchor(context.Background(), "ws-1", "u1"); err == nil {
+		t.Fatal("expected the query failure to propagate")
 	}
 }

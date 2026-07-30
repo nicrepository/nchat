@@ -151,12 +151,6 @@ the workspace filter comes from the session on every request, independently of
 the cursor — so at most it moves the caller's position within the workspace
 they already administer.
 
-**Read budget.** The listing is rate limited per caller. Each page sorts the
-workspace's members, so paging in a loop is the way to make a read endpoint
-expensive; the budget bounds how often that can happen. The durable fix for the
-per-page cost is an index on the ordering expression, which needs a migration
-and is therefore not part of this change.
-
 ### `POST /auth/admin/invites`
 
 Creates an invite. Body: `email`, `display_name`, optional `full_name`.
@@ -164,8 +158,8 @@ Creates an invite. Body: `email`, `display_name`, optional `full_name`.
 Shares the guard chain above, so the caller is a verified `owner`/`admin` of a
 real workspace rather than a holder of the shared bootstrap token. Responses:
 `201` `{id, email, created_at}`, `400` invalid payload or e-mail, `409`
-duplicate e-mail or an invite already pending, `429` rate limited, `503` when
-the database or the e-mail handoff is unavailable. The response never carries
+duplicate e-mail or an invite already pending, `503` when the database or the
+e-mail handoff is unavailable. The response never carries
 the invite token — it reaches the invitee only through the encrypted outbox
 handoff.
 

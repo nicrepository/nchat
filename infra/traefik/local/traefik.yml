@@ -18,21 +18,7 @@ providers:
 log:
   level: INFO
 
-# Access logs record the request path, and Traefik cannot strip a query string
-# without dropping the whole path — which would cost every log line its route
-# for the sake of one parameter. So the rule is upstream instead: query
-# parameters must not carry personal data. The workspace user cursor is the
-# case that prompted this note — it once carried a display name or e-mail as
-# its sort key and now carries only identifiers (see
-# domain.WorkspaceUserCursor). Anything added to a query string later is bound
-# by the same rule.
-#
-# Headers are dropped explicitly rather than left to the default, because
-# SECURITY.md requires that Authorization and Cookie never reach a log.
-accessLog:
-  fields:
-    headers:
-      defaultMode: drop
+accessLog: {}
 
 ping:
   entryPoint: web
