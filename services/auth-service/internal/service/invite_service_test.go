@@ -20,7 +20,7 @@ type fakeInviteStore struct {
 	acceptResult domain.AcceptInviteResult
 	createCalls  int
 
-	hasAdmin            bool
+	bootstrapState      domain.BootstrapWorkspaceState
 	hasAdminErr         error
 	hasAdminWorkspaceID string
 
@@ -38,9 +38,15 @@ type fakeInviteStore struct {
 	acceptPasswordHash string
 }
 
-func (f *fakeInviteStore) WorkspaceHasAdmin(_ context.Context, workspaceID string) (bool, error) {
+func (f *fakeInviteStore) BootstrapWorkspaceState(_ context.Context, workspaceID string) (domain.BootstrapWorkspaceState, error) {
 	f.hasAdminWorkspaceID = workspaceID
-	return f.hasAdmin, f.hasAdminErr
+	return f.bootstrapState, f.hasAdminErr
+}
+
+// openBootstrapState is the arrangement every test that expects issuance to
+// succeed needs: the workspace exists, is operational, and has no owner yet.
+func openBootstrapState() domain.BootstrapWorkspaceState {
+	return domain.BootstrapWorkspaceState{Exists: true, Active: true}
 }
 
 func (f *fakeInviteStore) GetPolicySettings(_ context.Context) (domain.PolicySettings, error) {
@@ -310,7 +316,7 @@ func bootstrapService(t *testing.T, store *fakeInviteStore, opts ...service.Invi
 }
 
 func TestInviteService_CreateBootstrapInviteUsesConfiguredWorkspaceAndSystemIssuer(t *testing.T) {
-	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}}
+	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}, bootstrapState: openBootstrapState()}
 	svc := bootstrapService(t, store)
 
 	if _, err := svc.CreateBootstrapInvite(context.Background(), domain.BootstrapInviteInput{
@@ -354,7 +360,7 @@ func TestInviteService_CreateBootstrapInviteRefusesWhenNotConfigured(t *testing.
 // and a pre-shared credential able to inject invites into a live workspace is a
 // standing risk with no remaining purpose.
 func TestInviteService_CreateBootstrapInviteRefusesAfterWorkspaceHasAdmin(t *testing.T) {
-	store := &fakeInviteStore{policy: defaultPolicy(), hasAdmin: true}
+	store := &fakeInviteStore{policy: defaultPolicy(), bootstrapState: domain.BootstrapWorkspaceState{Exists: true, Active: true, Initialized: true}}
 	svc := bootstrapService(t, store)
 
 	_, err := svc.CreateBootstrapInvite(context.Background(), domain.BootstrapInviteInput{
@@ -389,7 +395,7 @@ func TestInviteService_CreateBootstrapInviteFailsClosedOnLifecycleCheckError(t *
 
 // The bootstrap path spends the same budget as the session path.
 func TestInviteService_CreateBootstrapInvitePassesRateLimitToStore(t *testing.T) {
-	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}}
+	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}, bootstrapState: openBootstrapState()}
 	limit := domain.InviteRateLimit{MaxPerWindow: 3, WindowMinutes: 15}
 	svc := bootstrapService(t, store, service.WithInviteRateLimit(limit))
 
@@ -482,7 +488,7 @@ func TestInviteService_CreateInviteAlwaysIssuesMemberKind(t *testing.T) {
 }
 
 func TestInviteService_CreateBootstrapInviteIssuesBootstrapOwnerKind(t *testing.T) {
-	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}}
+	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}, bootstrapState: openBootstrapState()}
 	svc := bootstrapService(t, store)
 
 	if _, err := svc.CreateBootstrapInvite(context.Background(), domain.BootstrapInviteInput{
@@ -545,5 +551,70 @@ func TestInviteService_CreateInvitePassesOneInstantForExpiryAndTTL(t *testing.T)
 	if !store.createExpiresAt.Equal(wantExpiry) {
 		t.Fatalf("expiry must be derived from the canonical instant: got %v, want %v",
 			store.createExpiresAt, wantExpiry)
+	}
+}
+
+// ── Bootstrap window stays shut ────────────────────────────────────────────
+//
+// The window closed on the first owner, but the state probe filtered on an
+// active workspace — so archiving a workspace that already had an owner made it
+// read as uninitialized and reopened the window. Having once had an
+// administrator is a fact about the workspace's history and archiving does not
+// undo it.
+func TestInviteService_CreateBootstrapInviteRefusedOnArchivedWorkspace(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		state domain.BootstrapWorkspaceState
+	}{
+		{
+			name:  "archived after gaining an owner",
+			state: domain.BootstrapWorkspaceState{Exists: true, Initialized: true},
+		},
+		// Even before an owner exists: a workspace nobody is running must not
+		// be handed one, because the grant materialises on reactivation.
+		{
+			name:  "archived before gaining an owner",
+			state: domain.BootstrapWorkspaceState{Exists: true},
+		},
+		{
+			name:  "workspace does not exist",
+			state: domain.BootstrapWorkspaceState{},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeInviteStore{policy: defaultPolicy(), bootstrapState: tt.state}
+			svc := bootstrapService(t, store)
+
+			_, err := svc.CreateBootstrapInvite(context.Background(), domain.BootstrapInviteInput{
+				Email: "attacker@example.test", DisplayName: "Attacker",
+			})
+
+			if !errors.Is(err, domain.ErrBootstrapUnavailable) {
+				t.Fatalf("expected ErrBootstrapUnavailable, got %v", err)
+			}
+			if store.createCalls != 0 {
+				t.Fatal("a closed bootstrap window must not reach invite creation")
+			}
+		})
+	}
+}
+
+// The permanence is the point: the same state that closed the window keeps it
+// closed whatever happens to the workspace's own status afterwards.
+func TestBootstrapWorkspaceState_OpenOnlyWhenExistingActiveAndUninitialized(t *testing.T) {
+	for _, tt := range []struct {
+		state domain.BootstrapWorkspaceState
+		open  bool
+	}{
+		{state: domain.BootstrapWorkspaceState{Exists: true, Active: true}, open: true},
+		{state: domain.BootstrapWorkspaceState{Exists: true, Active: true, Initialized: true}},
+		{state: domain.BootstrapWorkspaceState{Exists: true, Initialized: true}},
+		{state: domain.BootstrapWorkspaceState{Exists: true}},
+		{state: domain.BootstrapWorkspaceState{Active: true}},
+		{state: domain.BootstrapWorkspaceState{}},
+	} {
+		if got := tt.state.BootstrapOpen(); got != tt.open {
+			t.Fatalf("state %+v: expected open=%v, got %v", tt.state, tt.open, got)
+		}
 	}
 }

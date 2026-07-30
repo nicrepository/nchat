@@ -144,6 +144,38 @@ type BootstrapInviteInput struct {
 	FullName    string
 }
 
+// BootstrapWorkspaceState is what the bootstrap lifecycle needs to know about
+// its target workspace, read in one go because the two facts must not drift.
+//
+// Initialized and Active are deliberately separate questions. "Has this
+// workspace ever gained an administrator?" is a fact about its history and is
+// permanent; "is this workspace operational right now?" is a fact about its
+// present and can change in both directions. Answering the first with the
+// second — which is what a single query filtering on an active workspace does —
+// makes an archived workspace look uninitialized, and reopens a bootstrap
+// window that had already closed.
+type BootstrapWorkspaceState struct {
+	// Exists is false when no workspace carries the configured ID at all.
+	Exists bool
+	// Active is false for a workspace that is not operational (status other
+	// than 'active'). Bootstrap must not act on one in either direction:
+	// issuing would plant a credential-issued invite in a workspace nobody is
+	// running, and accepting would hand out ownership that materialises the
+	// moment somebody reactivates it.
+	Active bool
+	// Initialized reports an active owner or admin membership, regardless of
+	// the workspace's own status. Once true it stays true, which is what makes
+	// the bootstrap window close for good.
+	Initialized bool
+}
+
+// BootstrapOpen reports whether the bootstrap window may still be used. Every
+// other combination is a refusal, and all of them report the same thing to the
+// caller.
+func (s BootstrapWorkspaceState) BootstrapOpen() bool {
+	return s.Exists && s.Active && !s.Initialized
+}
+
 // InviteRateLimit bounds how many invites one actor may create in one
 // workspace inside a rolling window. Counted in the database rather than in
 // process memory so the budget holds across replicas.

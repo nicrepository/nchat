@@ -23,11 +23,11 @@ const (
 // check. The store performs all of them in one transaction under a lock.
 type InviteStore interface {
 	GetPolicySettings(ctx context.Context) (domain.PolicySettings, error)
-	// WorkspaceHasAdmin reports whether workspaceID already has an active
-	// owner or admin. It is what closes the bootstrap window: once true, the
-	// authenticated endpoint can do the job and the bootstrap credential is
-	// refused.
-	WorkspaceHasAdmin(ctx context.Context, workspaceID string) (bool, error)
+	// BootstrapWorkspaceState reports whether the bootstrap window is still
+	// open for workspaceID. It closes permanently once the workspace has an
+	// active owner or admin, and is also shut while the workspace is not
+	// operational or does not exist.
+	BootstrapWorkspaceState(ctx context.Context, workspaceID string) (domain.BootstrapWorkspaceState, error)
 	// now is the caller's canonical instant: the store uses it both to retire
 	// invites whose TTL has elapsed and to judge whether one is still active,
 	// and expiresAt is derived from that same instant.
@@ -125,7 +125,10 @@ func (s *InviteService) CreateInvite(ctx context.Context, input domain.AdminInvi
 // It is refused once the target workspace has an active owner or admin: from
 // that moment the authenticated, workspace-scoped endpoint can do the job, and
 // leaving a pre-shared credential able to inject invitations into a live
-// workspace would be a standing risk with no remaining purpose.
+// workspace would be a standing risk with no remaining purpose. That verdict is
+// permanent — archiving a workspace does not un-initialize it — and the
+// endpoint is equally refused while the workspace is not operational or does
+// not exist. Every refusal reports the same thing to the caller.
 func (s *InviteService) CreateBootstrapInvite(ctx context.Context, input domain.BootstrapInviteInput) (domain.InviteResult, error) {
 	if s.emailOutbox == nil {
 		return domain.InviteResult{}, domain.ErrEmailOutboxUnavailable
@@ -134,11 +137,11 @@ func (s *InviteService) CreateBootstrapInvite(ctx context.Context, input domain.
 		return domain.InviteResult{}, domain.ErrBootstrapUnavailable
 	}
 
-	initialized, err := s.store.WorkspaceHasAdmin(ctx, s.bootstrapWorkspaceID)
+	state, err := s.store.BootstrapWorkspaceState(ctx, s.bootstrapWorkspaceID)
 	if err != nil {
 		return domain.InviteResult{}, fmt.Errorf("check bootstrap workspace state: %w", err)
 	}
-	if initialized {
+	if !state.BootstrapOpen() {
 		return domain.InviteResult{}, domain.ErrBootstrapUnavailable
 	}
 

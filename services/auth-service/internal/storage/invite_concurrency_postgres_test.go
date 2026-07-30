@@ -109,10 +109,11 @@ func TestAcceptInviteTx_ConcurrentBootstrapProducesOneOwner(t *testing.T) {
 
 	// The window is closed, which is what the bootstrap route reads.
 	store := storage.NewPGXInviteStore(testPool(t, ctx))
-	hasAdmin, err := store.WorkspaceHasAdmin(ctx, pgWorkspaceA)
+	state, err := store.BootstrapWorkspaceState(ctx, pgWorkspaceA)
 	if err != nil {
-		t.Fatalf("WorkspaceHasAdmin: %v", err)
+		t.Fatalf("BootstrapWorkspaceState: %v", err)
 	}
+	hasAdmin := state.Initialized
 	if !hasAdmin {
 		t.Fatal("after a bootstrap acceptance the workspace must report an administrator")
 	}
@@ -169,10 +170,11 @@ func TestAcceptInviteTx_MemberInviteStillCreatesMember(t *testing.T) {
 	if role != "member" {
 		t.Fatalf("an ordinary invite must confer 'member', got %q", role)
 	}
-	hasAdmin, err := store.WorkspaceHasAdmin(ctx, pgWorkspaceB)
+	state, err := store.BootstrapWorkspaceState(ctx, pgWorkspaceB)
 	if err != nil {
-		t.Fatalf("WorkspaceHasAdmin: %v", err)
+		t.Fatalf("BootstrapWorkspaceState: %v", err)
 	}
+	hasAdmin := state.Initialized
 	if hasAdmin {
 		t.Fatal("an ordinary invite must not close the bootstrap window")
 	}

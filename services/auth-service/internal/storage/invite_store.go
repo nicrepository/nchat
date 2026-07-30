@@ -44,15 +44,10 @@ func (s *PGXInviteStore) GetPolicySettings(ctx context.Context) (domain.PolicySe
 	return p, nil
 }
 
-// WorkspaceHasAdmin reports whether workspaceID already has an active owner or
-// admin — that is, whether it has finished bootstrapping.
-//
-// It asks the same question RequireWorkspaceAdmin asks, from the same table and
-// with the same conditions, so "the bootstrap window is closed" and "somebody
-// can now use the authenticated endpoint" are the same fact rather than two
-// definitions that could drift apart.
-func (s *PGXInviteStore) WorkspaceHasAdmin(ctx context.Context, workspaceID string) (bool, error) {
-	return workspaceHasAdminTx(ctx, s.pool, workspaceID)
+// BootstrapWorkspaceState reports whether the bootstrap window for workspaceID
+// is still open, and why not when it is closed.
+func (s *PGXInviteStore) BootstrapWorkspaceState(ctx context.Context, workspaceID string) (domain.BootstrapWorkspaceState, error) {
+	return bootstrapWorkspaceStateTx(ctx, s.pool, workspaceID)
 }
 
 // memberExistsInWorkspaceTx reports whether email already belongs to a member
@@ -512,28 +507,45 @@ func claimWorkspaceBootstrap(ctx context.Context, q txQueryer, workspaceID strin
 	return nil
 }
 
-// workspaceHasAdminTx is WorkspaceHasAdmin asked inside a transaction, so the
-// answer holds against the write that follows it.
-func workspaceHasAdminTx(ctx context.Context, q queryer, workspaceID string) (bool, error) {
-	var exists int
+// bootstrapWorkspaceStateTx answers both bootstrap questions in one statement,
+// so they hold against each other and against the write that follows.
+//
+// The membership subquery deliberately does *not* filter on the workspace's own
+// status. An earlier version joined chat.workspaces on status = 'active', which
+// meant an archived workspace with a real owner reported as uninitialized: the
+// bootstrap credential could then mint a bootstrap_owner invite, and accepting
+// it granted ownership that took effect the moment anyone reactivated the
+// workspace. Having once had an administrator is a fact about the workspace's
+// history and cannot be undone by archiving it.
+//
+// The workspace's status is still read — as Active, a separate field — because
+// bootstrap must also refuse to act on a workspace nobody is running. The two
+// answers are different questions and are now stored as different fields.
+func bootstrapWorkspaceStateTx(ctx context.Context, q queryer, workspaceID string) (domain.BootstrapWorkspaceState, error) {
+	var state domain.BootstrapWorkspaceState
 	err := q.QueryRow(ctx, `
-		SELECT 1
-		FROM chat.workspace_members wm
-		JOIN chat.workspaces w
-		  ON w.id = wm.workspace_id AND w.status = 'active'
-		WHERE wm.workspace_id = $1::uuid
-		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin')
-		LIMIT 1`,
+		SELECT
+		    w.status = 'active',
+		    EXISTS (
+		        SELECT 1
+		        FROM chat.workspace_members wm
+		        WHERE wm.workspace_id = w.id
+		          AND wm.status = 'active'
+		          AND wm.role IN ('owner', 'admin')
+		    )
+		FROM chat.workspaces w
+		WHERE w.id = $1::uuid`,
 		workspaceID,
-	).Scan(&exists)
+	).Scan(&state.Active, &state.Initialized)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		// A configured workspace that does not exist is not an open window.
+		return domain.BootstrapWorkspaceState{}, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check workspace admin exists: %w", err)
+		return domain.BootstrapWorkspaceState{}, fmt.Errorf("check bootstrap workspace state: %w", err)
 	}
-	return true, nil
+	state.Exists = true
+	return state, nil
 }
 
 // revokeOtherBootstrapInvites makes every remaining bootstrap invite for this
@@ -704,15 +716,17 @@ func (s *PGXInviteStore) AcceptInviteTx(ctx context.Context, tokenHash, displayN
 	}
 
 	if invite.kind == domain.InviteKindBootstrapOwner {
-		initialized, err := workspaceHasAdminTx(ctx, tx, invite.workspaceID)
+		state, err := bootstrapWorkspaceStateTx(ctx, tx, invite.workspaceID)
 		if err != nil {
 			return domain.AcceptInviteResult{}, err
 		}
-		// The window is closed. Refuse without writing anything: no identity,
-		// no membership, and the invite is not marked accepted. The invite that
-		// did close the window already revoked its siblings, so reaching this
-		// point means the workspace gained an administrator by some other path.
-		if initialized {
+		// Refuse without writing anything: no identity, no membership, and the
+		// invite is not marked accepted. Three ways to get here, all closed:
+		// the workspace already has an administrator (the usual race, whose
+		// winner already revoked this invite's siblings); the workspace is not
+		// operational, so granting ownership now would take effect whenever
+		// somebody reactivates it; or it no longer exists at all.
+		if !state.BootstrapOpen() {
 			return domain.AcceptInviteResult{}, domain.ErrInvalidToken
 		}
 	}

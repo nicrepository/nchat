@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -897,15 +898,38 @@ func TestPGXInviteStore_AcceptInviteTxErrors(t *testing.T) {
 
 // ── Bootstrap issuer and lifecycle ────────────────────────────
 
-func TestPGXInviteStore_WorkspaceHasAdmin(t *testing.T) {
+func TestPGXInviteStore_BootstrapWorkspaceState(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		rows *pgxmock.Rows
-		err  error
-		want bool
+		name     string
+		rows     *pgxmock.Rows
+		err      error
+		want     domain.BootstrapWorkspaceState
+		wantOpen bool
 	}{
-		{name: "has an admin", rows: pgxmock.NewRows([]string{"exists"}).AddRow(1), want: true},
-		{name: "has none", err: pgx.ErrNoRows, want: false},
+		{
+			name:     "active and uninitialized",
+			rows:     pgxmock.NewRows([]string{"active", "initialized"}).AddRow(true, false),
+			want:     domain.BootstrapWorkspaceState{Exists: true, Active: true},
+			wantOpen: true,
+		},
+		{
+			name: "active with an administrator",
+			rows: pgxmock.NewRows([]string{"active", "initialized"}).AddRow(true, true),
+			want: domain.BootstrapWorkspaceState{Exists: true, Active: true, Initialized: true},
+		},
+		// The finding: an archived workspace that already has an owner must
+		// still report as initialized, or the window reopens.
+		{
+			name: "archived with an administrator",
+			rows: pgxmock.NewRows([]string{"active", "initialized"}).AddRow(false, true),
+			want: domain.BootstrapWorkspaceState{Exists: true, Initialized: true},
+		},
+		{
+			name: "archived and uninitialized",
+			rows: pgxmock.NewRows([]string{"active", "initialized"}).AddRow(false, false),
+			want: domain.BootstrapWorkspaceState{Exists: true},
+		},
+		{name: "missing workspace", err: pgx.ErrNoRows},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mock, err := pgxmock.NewPool()
@@ -914,7 +938,7 @@ func TestPGXInviteStore_WorkspaceHasAdmin(t *testing.T) {
 			}
 			defer mock.Close()
 
-			expect := mock.ExpectQuery(`FROM chat\.workspace_members wm`).WithArgs(inviteWorkspaceID)
+			expect := mock.ExpectQuery(`FROM chat\.workspaces w`).WithArgs(inviteWorkspaceID)
 			if tc.err != nil {
 				expect.WillReturnError(tc.err)
 			} else {
@@ -922,12 +946,15 @@ func TestPGXInviteStore_WorkspaceHasAdmin(t *testing.T) {
 			}
 
 			store := storage.NewPGXInviteStore(mock)
-			got, err := store.WorkspaceHasAdmin(context.Background(), inviteWorkspaceID)
+			got, err := store.BootstrapWorkspaceState(context.Background(), inviteWorkspaceID)
 			if err != nil {
-				t.Fatalf("WorkspaceHasAdmin: %v", err)
+				t.Fatalf("BootstrapWorkspaceState: %v", err)
 			}
 			if got != tc.want {
-				t.Fatalf("expected %v, got %v", tc.want, got)
+				t.Fatalf("expected %+v, got %+v", tc.want, got)
+			}
+			if got.BootstrapOpen() != tc.wantOpen {
+				t.Fatalf("expected BootstrapOpen=%v for %+v", tc.wantOpen, got)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatalf("unmet expectations: %v", err)
@@ -936,21 +963,62 @@ func TestPGXInviteStore_WorkspaceHasAdmin(t *testing.T) {
 	}
 }
 
-// A failure to determine the state must surface as an error, never as "no
-// admin" — that would reopen the bootstrap window on a transient outage.
-func TestPGXInviteStore_WorkspaceHasAdminQueryErrorIsReturned(t *testing.T) {
+// The membership probe must not be filtered by the workspace's own status.
+// Joining on an active workspace is what made an archived one look
+// uninitialized and reopened a window that had already closed.
+func TestPGXInviteStore_BootstrapStateCountsAdminsRegardlessOfWorkspaceStatus(t *testing.T) {
+	var issued []string
+	mock, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(
+		pgxmock.QueryMatcherFunc(func(_, actualSQL string) error {
+			issued = append(issued, actualSQL)
+			return nil
+		}),
+	))
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(``).WithArgs(inviteWorkspaceID).
+		WillReturnRows(pgxmock.NewRows([]string{"active", "initialized"}).AddRow(false, true))
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.BootstrapWorkspaceState(context.Background(), inviteWorkspaceID); err != nil {
+		t.Fatalf("BootstrapWorkspaceState: %v", err)
+	}
+	if len(issued) != 1 {
+		t.Fatalf("expected one query, got %d", len(issued))
+	}
+	// The membership subquery keys on the workspace id alone. A status
+	// predicate applied to the members join is the regression.
+	_, memberClause, found := strings.Cut(issued[0], "FROM chat.workspace_members")
+	if !found {
+		t.Fatalf("expected a membership subquery in:\n%s", issued[0])
+	}
+	memberClause, _, found = strings.Cut(memberClause, ")")
+	if !found {
+		t.Fatalf("expected the membership subquery to be closed in:\n%s", issued[0])
+	}
+	if strings.Contains(memberClause, "w.status") {
+		t.Fatalf("the membership probe must not depend on the workspace status:\n%s", memberClause)
+	}
+}
+
+// A failure to determine the state must surface as an error, never as an open
+// window — that would reopen the bootstrap on a transient outage.
+func TestPGXInviteStore_BootstrapWorkspaceStateQueryErrorIsReturned(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+	mock.ExpectQuery(`FROM chat\.workspaces w`).
 		WithArgs(inviteWorkspaceID).
 		WillReturnError(errors.New("connection refused"))
 
 	store := storage.NewPGXInviteStore(mock)
-	if _, err := store.WorkspaceHasAdmin(context.Background(), inviteWorkspaceID); err == nil {
+	if _, err := store.BootstrapWorkspaceState(context.Background(), inviteWorkspaceID); err == nil {
 		t.Fatal("expected the query failure to propagate")
 	}
 }
@@ -1057,8 +1125,9 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapCreatesOwnerAndRevokesSiblings(t 
 	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
 		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
 	// The lifecycle check, inside the lock: no administrator yet.
-	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
-		WithArgs(inviteWorkspaceID).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`FROM chat\.workspaces w`).
+		WithArgs(inviteWorkspaceID).
+		WillReturnRows(pgxmock.NewRows([]string{"active", "initialized"}).AddRow(true, false))
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs(inviteEmail).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`SELECT id, email::text, display_name`).
@@ -1093,7 +1162,7 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapCreatesOwnerAndRevokesSiblings(t 
 // the refusal writes nothing: no identity, no membership, and the invite is not
 // marked accepted. This is the branch that stops a race producing a second
 // owner.
-func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedAfterWorkspaceHasAdmin(t *testing.T) {
+func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedOnceInitialized(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -1107,9 +1176,9 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedAfterWorkspaceHasAdmin(t *
 		WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
 		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
-	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+	mock.ExpectQuery(`FROM chat\.workspaces w`).
 		WithArgs(inviteWorkspaceID).
-		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
+		WillReturnRows(pgxmock.NewRows([]string{"active", "initialized"}).AddRow(true, true))
 	// No identity, membership or acceptance is scripted: reaching any of them
 	// would fail this test.
 	mock.ExpectRollback()
@@ -1172,7 +1241,7 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapErrors(t *testing.T) {
 				WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
 				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
-			mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+			mock.ExpectQuery(`FROM chat\.workspaces w`).
 				WithArgs(inviteWorkspaceID).WillReturnError(errors.New("probe failed"))
 			mock.ExpectRollback()
 		}},
@@ -1187,8 +1256,9 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapErrors(t *testing.T) {
 				WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
 				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
-			mock.ExpectQuery(`FROM chat\.workspace_members wm`).
-				WithArgs(inviteWorkspaceID).WillReturnError(pgx.ErrNoRows)
+			mock.ExpectQuery(`FROM chat\.workspaces w`).
+				WithArgs(inviteWorkspaceID).
+				WillReturnRows(pgxmock.NewRows([]string{"active", "initialized"}).AddRow(true, false))
 			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 				WithArgs(inviteEmail).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, display_name`).
@@ -1447,4 +1517,78 @@ func expectReinviteThroughOutboxUpToInsert(mock pgxmock.PgxPoolIface) {
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(inviteInsertRows(time.Now()))
+}
+
+// The finding, at the acceptance boundary: an archived workspace that already
+// has an owner must refuse a bootstrap accept. Before the fix the state probe
+// filtered on an active workspace, so this read as "uninitialized" and the
+// accept created a second owner that took effect on reactivation.
+func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedOnArchivedWorkspace(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		active      bool
+		initialized bool
+	}{
+		{name: "archived with an owner", active: false, initialized: true},
+		// Even with no owner yet: granting ownership of a workspace nobody is
+		// running would take effect the moment somebody reactivates it.
+		{name: "archived without an owner", active: false, initialized: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+			mock.ExpectQuery(`FROM chat\.workspaces w`).
+				WithArgs(inviteWorkspaceID).
+				WillReturnRows(pgxmock.NewRows([]string{"active", "initialized"}).AddRow(tt.active, tt.initialized))
+			// No identity, membership or acceptance is scripted: reaching any
+			// of them fails this test.
+			mock.ExpectRollback()
+
+			store := storage.NewPGXInviteStore(mock)
+			_, err = store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash")
+			if !errors.Is(err, domain.ErrInvalidToken) {
+				t.Fatalf("expected ErrInvalidToken, got %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// A workspace that no longer exists is not an open window either.
+func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedOnMissingWorkspace(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+	mock.ExpectQuery(`FROM chat\.workspaces w`).
+		WithArgs(inviteWorkspaceID).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	_, err = store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash")
+	if !errors.Is(err, domain.ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken, got %v", err)
+	}
 }

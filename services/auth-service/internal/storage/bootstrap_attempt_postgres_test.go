@@ -4,9 +4,13 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
 )
 
@@ -228,5 +232,167 @@ func TestBootstrapAttemptsMigration_Reverses(t *testing.T) {
 			SELECT 1 FROM information_schema.tables
 			WHERE table_schema = 'auth' AND table_name = 'bootstrap_auth_attempts')`) {
 		t.Fatal("the counter table must be gone after the down")
+	}
+}
+
+// ── Bootstrap window and workspace status ──────────────────────────────────
+//
+// Archiving a workspace that already had an owner used to make it read as
+// uninitialized, reopening a window that had closed: the bootstrap credential
+// could mint a bootstrap_owner invite whose acceptance granted ownership that
+// materialised on reactivation. These run against real rows because the bug was
+// in a join, and a join is exactly what a mock cannot check.
+
+func archiveWorkspace(t *testing.T, ctx context.Context, conn *pgx.Conn, workspaceID string) {
+	t.Helper()
+	if _, err := conn.Exec(ctx,
+		`UPDATE chat.workspaces SET status = 'disabled' WHERE id = $1::uuid`, workspaceID); err != nil {
+		t.Fatalf("archive workspace: %v", err)
+	}
+}
+
+func makeWorkspaceOwner(t *testing.T, ctx context.Context, conn *pgx.Conn, workspaceID, email string) {
+	t.Helper()
+	var userID string
+	if err := conn.QueryRow(ctx, `
+		INSERT INTO auth.users (email, display_name, status) VALUES ($1, 'Owner', 'active')
+		RETURNING id::text`, email).Scan(&userID); err != nil {
+		t.Fatalf("seed owner user: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO chat.workspace_members (workspace_id, user_id, role, status)
+		VALUES ($1::uuid, $2::uuid, 'owner', 'active')`, workspaceID, userID); err != nil {
+		t.Fatalf("seed owner membership: %v", err)
+	}
+}
+
+// An archived workspace that already has an owner stays initialized, so the
+// window stays shut.
+func TestBootstrapWorkspaceState_ArchivingDoesNotReopenTheWindow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	store := storage.NewPGXInviteStore(testPool(t, ctx))
+	makeWorkspaceOwner(t, ctx, conn, pgWorkspaceA, "owner-a@example.test")
+
+	state, err := store.BootstrapWorkspaceState(ctx, pgWorkspaceA)
+	if err != nil {
+		t.Fatalf("BootstrapWorkspaceState: %v", err)
+	}
+	if !state.Initialized || state.BootstrapOpen() {
+		t.Fatalf("an owned workspace must be initialized and shut, got %+v", state)
+	}
+
+	archiveWorkspace(t, ctx, conn, pgWorkspaceA)
+
+	state, err = store.BootstrapWorkspaceState(ctx, pgWorkspaceA)
+	if err != nil {
+		t.Fatalf("BootstrapWorkspaceState: %v", err)
+	}
+	if !state.Initialized {
+		t.Fatal("archiving must not un-initialize a workspace that has an owner")
+	}
+	if state.Active {
+		t.Fatal("an archived workspace must not report as active")
+	}
+	if state.BootstrapOpen() {
+		t.Fatal("the bootstrap window must stay shut for an archived, owned workspace")
+	}
+}
+
+// The exploit path end to end: with the workspace archived, accepting a
+// bootstrap invite must write nothing, so reactivating it later confers no
+// ownership.
+func TestAcceptInviteTx_BootstrapRefusedOnArchivedWorkspaceAndReactivationGrantsNothing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	seedPolicy(t, ctx, conn)
+	store := storage.NewPGXInviteStore(testPool(t, ctx))
+
+	makeWorkspaceOwner(t, ctx, conn, pgWorkspaceA, "owner-a@example.test")
+	workspaceA := pgWorkspaceA
+	insertInvite(t, ctx, conn, &workspaceA, "attacker@example.test", "archived-bootstrap-hash", domain.InviteKindBootstrapOwner)
+	archiveWorkspace(t, ctx, conn, pgWorkspaceA)
+
+	_, err := store.AcceptInviteTx(ctx, "archived-bootstrap-hash", "Attacker", "Attacker", "argon2id-hash")
+	if !errors.Is(err, domain.ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken on an archived workspace, got %v", err)
+	}
+
+	// Nothing was written: no identity, no membership, invite not consumed.
+	assertCount(t, ctx, conn, 0, `SELECT count(*) FROM auth.users WHERE email = 'attacker@example.test'`)
+	assertCount(t, ctx, conn, 1,
+		`SELECT count(*) FROM chat.workspace_members WHERE workspace_id = $1::uuid AND role = 'owner'`, pgWorkspaceA)
+	assertCount(t, ctx, conn, 1,
+		`SELECT count(*) FROM auth.user_invites WHERE token_hash = 'archived-bootstrap-hash' AND status = 'pending'`)
+
+	// Reactivating the workspace confers nothing on the invitee, and the
+	// invite is still refused because the workspace has an owner.
+	if _, err := conn.Exec(ctx,
+		`UPDATE chat.workspaces SET status = 'active' WHERE id = $1::uuid`, pgWorkspaceA); err != nil {
+		t.Fatalf("reactivate workspace: %v", err)
+	}
+	assertCount(t, ctx, conn, 1,
+		`SELECT count(*) FROM chat.workspace_members WHERE workspace_id = $1::uuid AND role = 'owner'`, pgWorkspaceA)
+
+	_, err = store.AcceptInviteTx(ctx, "archived-bootstrap-hash", "Attacker", "Attacker", "argon2id-hash")
+	if !errors.Is(err, domain.ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken after reactivation, got %v", err)
+	}
+	assertCount(t, ctx, conn, 0, `SELECT count(*) FROM auth.users WHERE email = 'attacker@example.test'`)
+	assertNoOpenTransactions(t, ctx, conn)
+}
+
+// An archived workspace with no owner is refused too: the grant would take
+// effect the moment somebody reactivates it.
+func TestAcceptInviteTx_BootstrapRefusedOnArchivedUninitializedWorkspace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	seedPolicy(t, ctx, conn)
+	store := storage.NewPGXInviteStore(testPool(t, ctx))
+
+	workspaceB := pgWorkspaceB
+	insertInvite(t, ctx, conn, &workspaceB, "first@example.test", "archived-empty-hash", domain.InviteKindBootstrapOwner)
+	archiveWorkspace(t, ctx, conn, pgWorkspaceB)
+
+	_, err := store.AcceptInviteTx(ctx, "archived-empty-hash", "First", "First", "argon2id-hash")
+	if !errors.Is(err, domain.ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken, got %v", err)
+	}
+	assertCount(t, ctx, conn, 0,
+		`SELECT count(*) FROM chat.workspace_members WHERE workspace_id = $1::uuid`, pgWorkspaceB)
+	assertCount(t, ctx, conn, 0, `SELECT count(*) FROM auth.users WHERE email = 'first@example.test'`)
+}
+
+// The ordinary path is unaffected: an active, uninitialized workspace still
+// bootstraps normally.
+func TestAcceptInviteTx_BootstrapStillWorksOnActiveUninitializedWorkspace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	seedPolicy(t, ctx, conn)
+	store := storage.NewPGXInviteStore(testPool(t, ctx))
+
+	workspaceA := pgWorkspaceA
+	insertInvite(t, ctx, conn, &workspaceA, "first@example.test", "healthy-bootstrap-hash", domain.InviteKindBootstrapOwner)
+
+	if _, err := store.AcceptInviteTx(ctx, "healthy-bootstrap-hash", "First", "First", "argon2id-hash"); err != nil {
+		t.Fatalf("bootstrap on an active workspace must still work: %v", err)
+	}
+	assertCount(t, ctx, conn, 1,
+		`SELECT count(*) FROM chat.workspace_members WHERE workspace_id = $1::uuid AND role = 'owner'`, pgWorkspaceA)
+
+	state, err := store.BootstrapWorkspaceState(ctx, pgWorkspaceA)
+	if err != nil {
+		t.Fatalf("BootstrapWorkspaceState: %v", err)
+	}
+	if !state.Initialized || state.BootstrapOpen() {
+		t.Fatalf("the window must close on the first owner, got %+v", state)
 	}
 }
