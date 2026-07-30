@@ -38,6 +38,12 @@ var ErrInviteRateLimited = errors.New("invite rate limit exceeded")
 // second onboarding path to a workspace they can already reach.
 var ErrAlreadyMember = errors.New("already a member of this workspace")
 
+// ErrInviteWorkspaceMissing is returned when an invite predating the workspace
+// binding is presented for acceptance. It names no workspace, so there is no
+// membership it could create; it is refused rather than honoured against a
+// guessed tenant.
+var ErrInviteWorkspaceMissing = errors.New("invite has no workspace")
+
 // ErrBootstrapUnavailable is returned when the bootstrap invite endpoint is
 // asked to act outside the initialization window: either it was never
 // configured, or the target workspace already has an active administrator and

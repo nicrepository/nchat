@@ -1,6 +1,6 @@
 -- 000019_invite_workspace_fk.up.sql
 -- Referential integrity for the invite/workspace binding added by
--- migrations/auth/000008 (issue #425).
+-- migrations/auth/000008.
 --
 -- This lives in the chat domain purely because of apply order: the runner
 -- collects migrations with `find | sort`, so every migrations/auth file runs
@@ -16,9 +16,9 @@ BEGIN;
 
 SET LOCAL search_path = chat, auth, public;
 
--- Any pending invite that survived auth/000008 without a workspace would fail
--- the constraint below; auth/000008 revoked exactly those, so this is a
--- belt-and-braces guard against an out-of-order or partial apply.
+-- Legacy rows keep workspace_id NULL and a NULL satisfies a foreign key, so
+-- adding this does not touch them. Every workspace-scoped invite must name a
+-- workspace that exists.
 ALTER TABLE auth.user_invites
     ADD CONSTRAINT user_invites_workspace_id_fkey
         FOREIGN KEY (workspace_id)

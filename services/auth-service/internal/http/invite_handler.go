@@ -197,7 +197,11 @@ func writeCreateInviteError(w http.ResponseWriter, err error) {
 
 func writeAcceptInviteError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, domain.ErrInvalidToken):
+	// ErrInviteWorkspaceMissing is reported identically to ErrInvalidToken: an
+	// invite predating the workspace binding is simply not acceptable, and
+	// saying why would describe the database's migration state to an
+	// unauthenticated caller.
+	case errors.Is(err, domain.ErrInvalidToken), errors.Is(err, domain.ErrInviteWorkspaceMissing):
 		httputil.WriteError(w, http.StatusUnauthorized, errCodeInvalidInviteToken, "invalid or expired invite")
 	case errors.Is(err, domain.ErrDuplicateEmail):
 		httputil.WriteError(w, http.StatusConflict, errCodeConflict, "email already registered")

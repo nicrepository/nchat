@@ -1,5 +1,5 @@
 -- 000019_invite_workspace_fk.down.sql
--- Drops the invite/workspace foreign key (issue #425).
+-- Drops the invite/workspace foreign key.
 --
 -- Only the constraint is removed. The workspace_id column, its check and its
 -- indexes belong to migrations/auth/000008 and are rolled back there.

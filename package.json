@@ -39,6 +39,7 @@
     "test:coverage:web": "pnpm --filter @nchat/web test:coverage",
     "typecheck:web": "pnpm --filter @nchat/web typecheck",
     "test:go": "bash scripts/ci/go-test.sh",
+    "test:go:integration": "bash scripts/ci/go-test.sh -tags integration -count=1",
     "test:coverage:go": "bash scripts/ci/go-coverage.sh",
     "test:coverage:go:check": "bash scripts/ci/go-coverage-check.sh",
     "vet:go": "bash scripts/ci/go-vet.sh",
