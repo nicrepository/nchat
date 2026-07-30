@@ -16,7 +16,7 @@ import (
 
 const encryptedInvitePayload = `{"alg":"AES-256-GCM","key_version":"v1","nonce":"bm9uY2U=","ciphertext":"Y2lwaGVydGV4dA=="}`
 
-// Issue #425: invites are workspace-scoped. Every guard below is keyed by the
+// Invites are workspace-scoped. Every guard below is keyed by the
 // workspace so two tenants can invite the same address independently.
 const (
 	inviteWorkspaceID      = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
@@ -27,8 +27,8 @@ const (
 	// The lock keys the store builds. Reproduced literally so a change to the
 	// key shape shows up as a test failure rather than as two workspaces
 	// silently serialising on each other.
-	inviteEmailLockKey  = inviteWorkspaceID + "\x00" + inviteEmail
-	inviteBudgetLockKey = "invite-budget\x00" + inviteWorkspaceID + "\x00" + inviteActorID
+	inviteEmailLockKey  = inviteWorkspaceID + "\x1f" + inviteEmail
+	inviteBudgetLockKey = "invite-budget\x1f" + inviteWorkspaceID + "\x1f" + inviteActorID
 )
 
 // unlimited disables the budget, which skips the counting queries entirely.
@@ -95,7 +95,7 @@ func TestPGXInviteStore_CreateInviteInsertsInviteAndEncryptedOutbox(t *testing.T
 	mock.ExpectBegin()
 	expectInviteCreateGuards(mock)
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
-		WithArgs(inviteWorkspaceID, inviteActorID, inviteEmail, "hashed-invite-value", expiresAt).
+		WithArgs(inviteWorkspaceID, inviteActorID, inviteEmail, "hashed-invite-value", expiresAt, string(domain.InviteKindMember)).
 		WillReturnRows(inviteInsertRows(createdAt))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
 		WithArgs(inviteEmail, "invite-1", encryptedInvitePayload).
@@ -143,7 +143,7 @@ func TestPGXInviteStore_CreateInviteScopesGuardsToWorkspace(t *testing.T) {
 		WithArgs(inviteWorkspaceID, inviteEmail).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
-		WithArgs(inviteWorkspaceID, inviteActorID, inviteEmail, "hash", expiresAt).
+		WithArgs(inviteWorkspaceID, inviteActorID, inviteEmail, "hash", expiresAt, string(domain.InviteKindMember)).
 		WillReturnRows(inviteInsertRows(time.Now()))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -174,7 +174,7 @@ func TestPGXInviteStore_CreateInviteLockKeyIncludesWorkspace(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
-		WithArgs(inviteOtherWorkspaceID + "\x00" + inviteEmail).
+		WithArgs(inviteOtherWorkspaceID + "\x1f" + inviteEmail).
 		WillReturnError(errors.New("stop here"))
 	mock.ExpectRollback()
 
@@ -267,7 +267,7 @@ func TestPGXInviteStore_CreateInviteCountsBudgetPerActorAndWorkspace(t *testing.
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(4))
 	mock.ExpectQuery(`JOIN chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`FROM auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
-	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 	mock.ExpectRollback()
@@ -326,10 +326,10 @@ func TestPGXInviteStore_CreateInviteBudgetKeyIsPerWorkspaceAndActor(t *testing.T
 
 	mock.ExpectBegin()
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
-		WithArgs(inviteOtherWorkspaceID + "\x00" + inviteEmail).
+		WithArgs(inviteOtherWorkspaceID + "\x1f" + inviteEmail).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
-		WithArgs("invite-budget\x00" + inviteOtherWorkspaceID + "\x00" + inviteActorID).
+		WithArgs("invite-budget\x1f" + inviteOtherWorkspaceID + "\x1f" + inviteActorID).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`SELECT count\(\*\)`).
 		WithArgs(inviteActorID, inviteOtherWorkspaceID, 10).
@@ -358,7 +358,7 @@ func TestPGXInviteStore_CreateInviteSkipsBudgetWhenDisabled(t *testing.T) {
 
 	mock.ExpectBegin()
 	expectInviteCreateGuards(mock)
-	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 	mock.ExpectRollback()
@@ -382,7 +382,7 @@ func TestPGXInviteStore_CreateInviteMapsUniqueViolationToPending(t *testing.T) {
 
 	mock.ExpectBegin()
 	expectInviteCreateGuards(mock)
-	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(uniqueViolation())
 	mock.ExpectRollback()
 
@@ -396,8 +396,23 @@ func TestPGXInviteStore_CreateInviteMapsUniqueViolationToPending(t *testing.T) {
 // ── Acceptance ─────────────────────────────────────────────────────────────
 
 func acceptInviteRows(workspaceID string) *pgxmock.Rows {
-	return pgxmock.NewRows([]string{"id", "email", "workspace_id", "accepted", "revoked", "expires_at", "status"}).
-		AddRow("invite-1", inviteEmail, workspaceID, false, false, time.Now().Add(time.Hour), "pending")
+	return acceptInviteRowsOfKind(workspaceID, domain.InviteKindMember)
+}
+
+func acceptInviteRowsOfKind(workspaceID string, kind domain.InviteKind) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{"id", "email", "workspace_id", "invite_kind", "accepted", "revoked", "expires_at", "status"}).
+		AddRow("invite-1", inviteEmail, workspaceID, string(kind), false, false, time.Now().Add(time.Hour), "pending")
+}
+
+// expectInviteLookup scripts both reads AcceptInviteTx makes of the invite: the
+// unlocked peek that only decides which workspace lock to take, and the
+// authoritative FOR UPDATE re-read that everything downstream uses.
+func expectInviteLookup(mock pgxmock.PgxPoolIface, arg any, rows func() *pgxmock.Rows) {
+	for i := 0; i < 2; i++ {
+		mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+			WithArgs(arg).
+			WillReturnRows(rows())
+	}
 }
 
 func newUserRows(createdAt time.Time) *pgxmock.Rows {
@@ -408,9 +423,7 @@ func newUserRows(createdAt time.Time) *pgxmock.Rows {
 // expectAcceptThroughMembership scripts a full acceptance for a brand new
 // account, up to and including the membership writes.
 func expectAcceptThroughMembership(mock pgxmock.PgxPoolIface, createdAt time.Time) {
-	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
-		WithArgs("hashed-value").
-		WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+	expectInviteLookup(mock, "hashed-value", func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
 		WithArgs(inviteEmail).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
@@ -424,7 +437,7 @@ func expectAcceptThroughMembership(mock pgxmock.PgxPoolIface, createdAt time.Tim
 		WithArgs("user-1", "argon2id-hash").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`INSERT INTO chat\.workspace_members`).
-		WithArgs(inviteWorkspaceID, "user-1").
+		WithArgs(inviteWorkspaceID, "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
 		WithArgs(inviteWorkspaceID, "user-1").
@@ -470,16 +483,14 @@ func TestPGXInviteStore_AcceptInviteTxCreatesMembershipInInviteWorkspace(t *test
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
-		WithArgs("hashed-value").
-		WillReturnRows(acceptInviteRows(inviteOtherWorkspaceID))
+	expectInviteLookup(mock, "hashed-value", func() *pgxmock.Rows { return acceptInviteRows(inviteOtherWorkspaceID) })
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(inviteEmail).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`SELECT id, email::text, display_name`).WithArgs(inviteEmail).WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`INSERT INTO auth\.users`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(newUserRows(time.Now()))
 	mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	// The other workspace's ID, not the one used everywhere else in this file.
 	mock.ExpectExec(`INSERT INTO chat\.workspace_members`).
-		WithArgs(inviteOtherWorkspaceID, "user-1").
+		WithArgs(inviteOtherWorkspaceID, "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
 		WithArgs(inviteOtherWorkspaceID, "user-1").
@@ -508,9 +519,7 @@ func TestPGXInviteStore_AcceptInviteTxReusesExistingIdentityWithoutTouchingCrede
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
-		WithArgs("hashed-value").
-		WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+	expectInviteLookup(mock, "hashed-value", func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(inviteEmail).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`SELECT id, email::text, display_name`).
 		WithArgs(inviteEmail).
@@ -518,7 +527,7 @@ func TestPGXInviteStore_AcceptInviteTxReusesExistingIdentityWithoutTouchingCrede
 			AddRow("existing-user", inviteEmail, "Existing Name", "Existing Full", time.Now()))
 	// No INSERT INTO auth.users and no credential write are scripted.
 	mock.ExpectExec(`INSERT INTO chat\.workspace_members`).
-		WithArgs(inviteWorkspaceID, "existing-user").
+		WithArgs(inviteWorkspaceID, "existing-user", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
 		WithArgs(inviteWorkspaceID, "existing-user").
@@ -546,9 +555,11 @@ func TestPGXInviteStore_AcceptInviteTxReusesExistingIdentityWithoutTouchingCrede
 	}
 }
 
-// A pending invite with no workspace cannot produce a membership, so it is
-// refused rather than honoured against some default.
-func TestPGXInviteStore_AcceptInviteTxRejectsInviteWithoutWorkspace(t *testing.T) {
+// A legacy invite predating the workspace binding names no workspace, so there
+// is no membership it could produce. Migration auth/000008 leaves such rows
+// untouched rather than revoking them, which makes refusing them this layer's
+// job.
+func TestPGXInviteStore_AcceptInviteTxRejectsLegacyUnscopedInvite(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -556,15 +567,13 @@ func TestPGXInviteStore_AcceptInviteTxRejectsInviteWithoutWorkspace(t *testing.T
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
-		WithArgs("hashed-value").
-		WillReturnRows(acceptInviteRows(""))
+	expectInviteLookup(mock, "hashed-value", func() *pgxmock.Rows { return acceptInviteRows("") })
 	mock.ExpectRollback()
 
 	store := storage.NewPGXInviteStore(mock)
 	_, err = store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash")
-	if !errors.Is(err, domain.ErrInvalidToken) {
-		t.Fatalf("expected ErrInvalidToken, got %v", err)
+	if !errors.Is(err, domain.ErrInviteWorkspaceMissing) {
+		t.Fatalf("expected ErrInviteWorkspaceMissing, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -573,8 +582,8 @@ func TestPGXInviteStore_AcceptInviteTxRejectsInviteWithoutWorkspace(t *testing.T
 
 func TestPGXInviteStore_AcceptInviteTxRejectsUnknownExpiredAcceptedAndRevokedTokens(t *testing.T) {
 	rows := func(accepted, revoked bool, expires time.Time, status string) *pgxmock.Rows {
-		return pgxmock.NewRows([]string{"id", "email", "workspace_id", "accepted", "revoked", "expires_at", "status"}).
-			AddRow("invite-1", inviteEmail, inviteWorkspaceID, accepted, revoked, expires, status)
+		return pgxmock.NewRows([]string{"id", "email", "workspace_id", "invite_kind", "accepted", "revoked", "expires_at", "status"}).
+			AddRow("invite-1", inviteEmail, inviteWorkspaceID, string(domain.InviteKindMember), accepted, revoked, expires, status)
 	}
 	tests := []struct {
 		name string
@@ -722,20 +731,20 @@ func TestPGXInviteStore_CreateInviteErrors(t *testing.T) {
 		{name: "insert", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			expectInviteCreateGuards(mock)
-			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("insert failed"))
+			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("insert failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "outbox", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			expectInviteCreateGuards(mock)
-			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
+			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
 			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("outbox failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			expectInviteCreateGuards(mock)
-			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
+			mock.ExpectQuery(`INSERT INTO auth\.user_invites`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(inviteInsertRows(time.Now()))
 			mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 			mock.ExpectRollback()
@@ -778,14 +787,14 @@ func TestPGXInviteStore_AcceptInviteTxErrors(t *testing.T) {
 		}},
 		{name: "identity lookup", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).WithArgs(pgxmock.AnyArg()).WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+			expectInviteLookup(mock, pgxmock.AnyArg(), func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, display_name`).WithArgs(pgxmock.AnyArg()).WillReturnError(errors.New("lookup failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "insert user", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).WithArgs(pgxmock.AnyArg()).WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+			expectInviteLookup(mock, pgxmock.AnyArg(), func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, display_name`).WithArgs(pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
 			mock.ExpectQuery(`INSERT INTO auth\.users`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("insert failed"))
@@ -793,7 +802,7 @@ func TestPGXInviteStore_AcceptInviteTxErrors(t *testing.T) {
 		}},
 		{name: "credential", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).WithArgs(pgxmock.AnyArg()).WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+			expectInviteLookup(mock, pgxmock.AnyArg(), func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, display_name`).WithArgs(pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
 			mock.ExpectQuery(`INSERT INTO auth\.users`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(newUserRows(time.Now()))
@@ -802,22 +811,22 @@ func TestPGXInviteStore_AcceptInviteTxErrors(t *testing.T) {
 		}},
 		{name: "workspace membership", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).WithArgs(pgxmock.AnyArg()).WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+			expectInviteLookup(mock, pgxmock.AnyArg(), func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, display_name`).WithArgs(pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
 			mock.ExpectQuery(`INSERT INTO auth\.users`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(newUserRows(time.Now()))
 			mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-			mock.ExpectExec(`INSERT INTO chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("membership failed"))
+			mock.ExpectExec(`INSERT INTO chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("membership failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "general channel membership", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
-			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).WithArgs(pgxmock.AnyArg()).WillReturnRows(acceptInviteRows(inviteWorkspaceID))
+			expectInviteLookup(mock, pgxmock.AnyArg(), func() *pgxmock.Rows { return acceptInviteRows(inviteWorkspaceID) })
 			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`SELECT id, email::text, display_name`).WithArgs(pgxmock.AnyArg()).WillReturnError(pgx.ErrNoRows)
 			mock.ExpectQuery(`INSERT INTO auth\.users`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(newUserRows(time.Now()))
 			mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-			mock.ExpectExec(`INSERT INTO chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectExec(`INSERT INTO chat\.workspace_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			mock.ExpectExec(`INSERT INTO chat\.channel_members`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("channel failed"))
 			mock.ExpectRollback()
 		}},
@@ -865,7 +874,7 @@ func TestPGXInviteStore_AcceptInviteTxErrors(t *testing.T) {
 	}
 }
 
-// ── Bootstrap issuer and lifecycle (issue #425) ────────────────────────────
+// ── Bootstrap issuer and lifecycle ────────────────────────────
 
 func TestPGXInviteStore_WorkspaceHasAdmin(t *testing.T) {
 	for _, tc := range []struct {
@@ -936,13 +945,14 @@ func TestPGXInviteStore_CreateInviteStoresNullIssuerForBootstrap(t *testing.T) {
 
 	input := inviteInput()
 	input.ActorID = domain.BootstrapInviteIssuer
+	input.Kind = domain.InviteKindBootstrapOwner
 	expiresAt := time.Now().Add(time.Hour)
 
 	mock.ExpectBegin()
 	expectInviteCreateGuards(mock)
 	// nil, not "": the column is a UUID and the empty string is not a UUID.
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
-		WithArgs(inviteWorkspaceID, nil, inviteEmail, "hash", expiresAt).
+		WithArgs(inviteWorkspaceID, nil, inviteEmail, "hash", expiresAt, string(domain.InviteKindBootstrapOwner)).
 		WillReturnRows(inviteInsertRows(time.Now()))
 	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -976,7 +986,7 @@ func TestPGXInviteStore_CreateInviteBudgetBindsForBootstrapIssuer(t *testing.T) 
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(inviteEmailLockKey).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
-		WithArgs("invite-budget\x00" + inviteWorkspaceID + "\x00").
+		WithArgs("invite-budget\x1f" + inviteWorkspaceID + "\x1f").
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	// nil is passed for the issuer, and the count is at the limit.
 	mock.ExpectQuery(`IS NOT DISTINCT FROM`).
@@ -991,5 +1001,209 @@ func TestPGXInviteStore_CreateInviteBudgetBindsForBootstrapIssuer(t *testing.T) 
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// ── Bootstrap acceptance ───────────────────────────────────────────────────
+//
+// A bootstrap invite is the only one that creates an owner, and accepting it is
+// what closes the bootstrap window. The scripts below pin the statement order
+// that makes that safe: the workspace lock is taken before the invite row is
+// locked (so two bootstrap acceptances queue instead of deadlocking), the
+// "already has an administrator" check runs inside the lock, and the surviving
+// pending bootstrap invites are revoked in the same transaction.
+
+const bootstrapWorkspaceLockKey = "workspace-bootstrap\x1f" + inviteWorkspaceID
+
+func bootstrapInviteRows() *pgxmock.Rows {
+	return acceptInviteRowsOfKind(inviteWorkspaceID, domain.InviteKindBootstrapOwner)
+}
+
+func TestPGXInviteStore_AcceptInviteTxBootstrapCreatesOwnerAndRevokesSiblings(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	// The unlocked peek comes first and exists only to learn the workspace.
+	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+	// Then the workspace lock, *before* the row is locked.
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+	// The lifecycle check, inside the lock: no administrator yet.
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs(inviteWorkspaceID).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(inviteEmail).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`SELECT id, email::text, display_name`).
+		WithArgs(inviteEmail).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO auth\.users`).
+		WithArgs(inviteEmail, "User", "User Full").WillReturnRows(newUserRows(time.Now()))
+	mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).
+		WithArgs("user-1", "argon2id-hash").WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	// 'owner', not 'member' — this is the whole point of the bootstrap kind.
+	mock.ExpectExec(`INSERT INTO chat\.workspace_members`).
+		WithArgs(inviteWorkspaceID, "user-1", "owner").WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+		WithArgs(inviteWorkspaceID, "user-1").WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs("invite-1", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// Same transaction: the siblings become unusable with the owner's creation.
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs(inviteWorkspaceID, "invite-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash"); err != nil {
+		t.Fatalf("AcceptInviteTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// Once the workspace has an administrator the bootstrap invite is refused, and
+// the refusal writes nothing: no identity, no membership, and the invite is not
+// marked accepted. This is the branch that stops a race producing a second
+// owner.
+func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedAfterWorkspaceHasAdmin(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+		WithArgs("hashed-value").WillReturnRows(bootstrapInviteRows())
+	mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+		WithArgs(inviteWorkspaceID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(1))
+	// No identity, membership or acceptance is scripted: reaching any of them
+	// would fail this test.
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	_, err = store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash")
+	if !errors.Is(err, domain.ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken once the window is closed, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// An ordinary invite takes no workspace lock and runs no lifecycle check: the
+// bootstrap machinery must not touch the path every normal onboarding uses.
+func TestPGXInviteStore_AcceptInviteTxMemberInviteTakesNoWorkspaceLock(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	expectAcceptThroughMembership(mock, time.Now())
+	mock.ExpectExec(`UPDATE auth\.user_invites`).
+		WithArgs("invite-1", "user-1").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash"); err != nil {
+		t.Fatalf("AcceptInviteTx: %v", err)
+	}
+	// expectAcceptThroughMembership scripts neither the workspace lock nor the
+	// admin probe nor the sibling revoke; an unmet or surplus statement fails.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXInviteStore_AcceptInviteTxBootstrapErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(mock pgxmock.PgxPoolIface)
+	}{
+		{name: "workspace lock", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(bootstrapWorkspaceLockKey).WillReturnError(errors.New("lock failed"))
+			mock.ExpectRollback()
+		}},
+		{name: "lifecycle probe", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
+			mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+				WithArgs(inviteWorkspaceID).WillReturnError(errors.New("probe failed"))
+			mock.ExpectRollback()
+		}},
+		// A failure to revoke the siblings must roll back the owner too:
+		// committing here would leave a workspace initialized while another
+		// bootstrap invite stayed pending.
+		{name: "sibling revoke", setup: func(mock pgxmock.PgxPoolIface) {
+			mock.ExpectBegin()
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(bootstrapWorkspaceLockKey).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectQuery(`SELECT id, email::text, COALESCE\(workspace_id`).
+				WithArgs(pgxmock.AnyArg()).WillReturnRows(bootstrapInviteRows())
+			mock.ExpectQuery(`FROM chat\.workspace_members wm`).
+				WithArgs(inviteWorkspaceID).WillReturnError(pgx.ErrNoRows)
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+				WithArgs(inviteEmail).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectQuery(`SELECT id, email::text, display_name`).
+				WithArgs(inviteEmail).WillReturnError(pgx.ErrNoRows)
+			mock.ExpectQuery(`INSERT INTO auth\.users`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnRows(newUserRows(time.Now()))
+			mock.ExpectExec(`INSERT INTO auth\.user_password_credentials`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectExec(`INSERT INTO chat\.workspace_members`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectExec(`INSERT INTO chat\.channel_members`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectExec(`UPDATE auth\.user_invites`).
+				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+			mock.ExpectExec(`UPDATE auth\.user_invites`).
+				WithArgs(inviteWorkspaceID, pgxmock.AnyArg()).WillReturnError(errors.New("revoke failed"))
+			mock.ExpectRollback()
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+			tt.setup(mock)
+
+			store := storage.NewPGXInviteStore(mock)
+			if _, err := store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash"); err == nil {
+				t.Fatal("expected error")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
 	}
 }

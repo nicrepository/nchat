@@ -99,6 +99,10 @@ func (s *InviteService) CreateInvite(ctx context.Context, input domain.AdminInvi
 		return domain.InviteResult{}, fmt.Errorf("%w: actor is required", domain.ErrInvalidInput)
 	}
 
+	// Overwritten, not defaulted: whatever kind reached this input is
+	// discarded, so no caller and no payload can raise an ordinary invite to
+	// the bootstrap kind.
+	input.Kind = domain.InviteKindMember
 	return s.issueInvite(ctx, input)
 }
 
@@ -141,6 +145,7 @@ func (s *InviteService) CreateBootstrapInvite(ctx context.Context, input domain.
 		Email:       input.Email,
 		DisplayName: input.DisplayName,
 		FullName:    input.FullName,
+		Kind:        domain.InviteKindBootstrapOwner,
 	})
 }
 
@@ -193,6 +198,7 @@ func (s *InviteService) issueInvite(ctx context.Context, input domain.AdminInvit
 		Email:       email,
 		DisplayName: displayName,
 		FullName:    fullName,
+		Kind:        input.Kind,
 	}, tokenHash, expiresAt, encryptedPayload, s.rateLimit)
 }
 

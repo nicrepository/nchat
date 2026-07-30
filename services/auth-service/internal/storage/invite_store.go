@@ -52,25 +52,7 @@ func (s *PGXInviteStore) GetPolicySettings(ctx context.Context) (domain.PolicySe
 // can now use the authenticated endpoint" are the same fact rather than two
 // definitions that could drift apart.
 func (s *PGXInviteStore) WorkspaceHasAdmin(ctx context.Context, workspaceID string) (bool, error) {
-	var exists int
-	err := s.pool.QueryRow(ctx, `
-		SELECT 1
-		FROM chat.workspace_members wm
-		JOIN chat.workspaces w
-		  ON w.id = wm.workspace_id AND w.status = 'active'
-		WHERE wm.workspace_id = $1::uuid
-		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin')
-		LIMIT 1`,
-		workspaceID,
-	).Scan(&exists)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("check workspace admin exists: %w", err)
-	}
-	return true, nil
+	return workspaceHasAdminTx(ctx, s.pool, workspaceID)
 }
 
 // memberExistsInWorkspaceTx reports whether email already belongs to a member
@@ -214,10 +196,17 @@ func (s *PGXInviteStore) CreateInvite(ctx context.Context, input domain.AdminInv
 // (workspace, issuer): two invites to *different* addresses by the same issuer
 // take different e-mail locks and would otherwise both read the same remaining
 // slot.
+// The separator between the parts of every advisory-lock key. It must be a
+// byte that cannot occur in a UUID or an e-mail address, so two different keys
+// cannot be assembled into the same string — and it must be legal in a
+// PostgreSQL text parameter, which rules out NUL: the server rejects a NUL byte
+// in text outright, so a NUL separator makes every one of these locks fail.
+const lockKeySeparator = "\x1f"
+
 func reserveInviteSlotTx(ctx context.Context, q txQueryer, input domain.AdminInviteInput, limit domain.InviteRateLimit) error {
 	if _, err := q.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
-		input.WorkspaceID+"\x00"+input.Email,
+		input.WorkspaceID+lockKeySeparator+input.Email,
 	); err != nil {
 		return fmt.Errorf("lock invite email: %w", err)
 	}
@@ -227,7 +216,7 @@ func reserveInviteSlotTx(ctx context.Context, q txQueryer, input domain.AdminInv
 
 	if _, err := q.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
-		"invite-budget\x00"+input.WorkspaceID+"\x00"+input.ActorID,
+		"invite-budget"+lockKeySeparator+input.WorkspaceID+lockKeySeparator+input.ActorID,
 	); err != nil {
 		return fmt.Errorf("lock invite budget: %w", err)
 	}
@@ -272,12 +261,16 @@ func assertInviteAllowedTx(ctx context.Context, q queryer, workspaceID, email st
 // actor, so NULL is not reachable from a browser request.
 func insertInviteTx(ctx context.Context, q queryer, input domain.AdminInviteInput, tokenHash string, expiresAt time.Time) (domain.InviteResult, error) {
 	var result domain.InviteResult
+	kind := input.Kind
+	if kind == "" {
+		kind = domain.InviteKindMember
+	}
 	err := q.QueryRow(ctx, `
 		INSERT INTO auth.user_invites
-		  (workspace_id, invited_by_user_id, email, token_hash, status, expires_at)
-		VALUES ($1::uuid, $2::uuid, $3, $4, 'pending', $5)
+		  (workspace_id, invited_by_user_id, email, token_hash, status, expires_at, invite_kind)
+		VALUES ($1::uuid, $2::uuid, $3, $4, 'pending', $5, $6)
 		RETURNING id, email::text, workspace_id::text, created_at`,
-		input.WorkspaceID, nullableString(input.ActorID), input.Email, tokenHash, expiresAt,
+		input.WorkspaceID, nullableString(input.ActorID), input.Email, tokenHash, expiresAt, string(kind),
 	).Scan(&result.ID, &result.Email, &result.WorkspaceID, &result.CreatedAt)
 	if err != nil {
 		// The partial unique index is the backstop for the pending check: it
@@ -357,6 +350,7 @@ type acceptableInvite struct {
 	id          string
 	email       string
 	workspaceID string
+	kind        domain.InviteKind
 }
 
 // loadAcceptableInvite locks the invite named by tokenHash and returns it only
@@ -370,33 +364,144 @@ type acceptableInvite struct {
 // and already-accepted are indistinguishable to the caller, so a token cannot
 // be probed for which of those it is.
 func loadAcceptableInvite(ctx context.Context, q queryer, tokenHash string) (acceptableInvite, error) {
+	invite, err := selectInvite(ctx, q, tokenHash, true)
+	if err != nil {
+		return acceptableInvite{}, err
+	}
+	// A legacy invite predating the workspace binding names no workspace, so
+	// there is no membership it could create. Migration auth/000008 leaves such
+	// rows exactly as it found them rather than revoking them, which is what
+	// makes it reversible — refusing them is this layer's job, not the
+	// migration's. Distinct from ErrInvalidToken internally so the case is
+	// observable in tests and logs; the HTTP layer reports both identically.
+	if invite.workspaceID == "" {
+		return acceptableInvite{}, domain.ErrInviteWorkspaceMissing
+	}
+	return invite, nil
+}
+
+// peekInviteScope reads an invite without locking it, to learn which workspace
+// lock the acceptance must take.
+//
+// It exists purely for lock ordering. A bootstrap acceptance needs a
+// workspace-wide lock *and* the invite row lock, and taking them in that order
+// is what avoids a deadlock between two bootstrap invites in one workspace: if
+// each transaction locked its own invite row first and then contended for the
+// workspace lock, one would hold what the other needs while waiting for what
+// the other holds. The value read here is advisory only — loadAcceptableInvite
+// re-reads the row FOR UPDATE afterwards and that read is the authoritative one.
+func peekInviteScope(ctx context.Context, q queryer, tokenHash string) (acceptableInvite, error) {
+	return selectInvite(ctx, q, tokenHash, false)
+}
+
+// selectInvite reads the invite named by tokenHash and returns it only when it
+// may still be accepted.
+//
+// Every rejection is ErrInvalidToken, deliberately: unknown, expired, revoked
+// and already-accepted are indistinguishable to the caller, so a token cannot
+// be probed for which of those it is.
+//
+// forUpdate takes the row lock that makes concurrent accepts of the same token
+// safe: the second transaction blocks on it, then re-reads the row the first one
+// committed and sees status = 'accepted'.
+func selectInvite(ctx context.Context, q queryer, tokenHash string, forUpdate bool) (acceptableInvite, error) {
+	query := `
+		SELECT id, email::text, COALESCE(workspace_id::text, ''), invite_kind,
+		       accepted_at IS NOT NULL, revoked_at IS NOT NULL, expires_at, status
+		FROM auth.user_invites
+		WHERE token_hash = $1`
+	if forUpdate {
+		query += `
+		FOR UPDATE`
+	}
+
 	var invite acceptableInvite
+	var kind string
 	var accepted, revoked bool
 	var expiresAt time.Time
 	var status string
-	err := q.QueryRow(ctx, `
-		SELECT id, email::text, COALESCE(workspace_id::text, ''), accepted_at IS NOT NULL,
-		       revoked_at IS NOT NULL, expires_at, status
-		FROM auth.user_invites
-		WHERE token_hash = $1
-		FOR UPDATE`,
-		tokenHash,
-	).Scan(&invite.id, &invite.email, &invite.workspaceID, &accepted, &revoked, &expiresAt, &status)
+	err := q.QueryRow(ctx, query, tokenHash).
+		Scan(&invite.id, &invite.email, &invite.workspaceID, &kind, &accepted, &revoked, &expiresAt, &status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return acceptableInvite{}, domain.ErrInvalidToken
 		}
 		return acceptableInvite{}, fmt.Errorf("select invite token: %w", err)
 	}
+	invite.kind = domain.InviteKind(kind)
 
-	usable := !accepted && !revoked && status == "pending" && expiresAt.After(time.Now().UTC())
-	// A pending invite without a workspace cannot be honoured: there is no
-	// membership to create. Migration auth/000008 revoked every such row, so
-	// this only triggers on a partially applied database.
-	if !usable || invite.workspaceID == "" {
+	if accepted || revoked || status != "pending" || !expiresAt.After(time.Now().UTC()) {
 		return acceptableInvite{}, domain.ErrInvalidToken
 	}
 	return invite, nil
+}
+
+// claimWorkspaceBootstrap serialises bootstrap acceptance for one workspace and
+// refuses once the workspace has an administrator.
+//
+// The advisory lock is taken before the invite row is locked — see
+// peekInviteScope — so two concurrent bootstrap acceptances queue here rather
+// than deadlocking. Whoever holds it sees a workspace state nobody else can
+// change, so the "does this workspace already have an owner or admin?" answer
+// stays true through the membership insert that would falsify it. That is what
+// makes exactly one owner possible: the loser finds the answer already yes.
+func claimWorkspaceBootstrap(ctx context.Context, q txQueryer, workspaceID string) error {
+	if _, err := q.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
+		"workspace-bootstrap"+lockKeySeparator+workspaceID,
+	); err != nil {
+		return fmt.Errorf("lock workspace bootstrap: %w", err)
+	}
+	return nil
+}
+
+// workspaceHasAdminTx is WorkspaceHasAdmin asked inside a transaction, so the
+// answer holds against the write that follows it.
+func workspaceHasAdminTx(ctx context.Context, q queryer, workspaceID string) (bool, error) {
+	var exists int
+	err := q.QueryRow(ctx, `
+		SELECT 1
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		WHERE wm.workspace_id = $1::uuid
+		  AND wm.status = 'active'
+		  AND wm.role IN ('owner', 'admin')
+		LIMIT 1`,
+		workspaceID,
+	).Scan(&exists)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check workspace admin exists: %w", err)
+	}
+	return true, nil
+}
+
+// revokeOtherBootstrapInvites makes every remaining bootstrap invite for this
+// workspace unusable, in the transaction that created the first owner.
+//
+// Without this a second outstanding bootstrap invite would stay pending
+// forever: claimWorkspaceBootstrap already refuses it, but a pending row that
+// can never be accepted is a standing invitation to a workspace that no longer
+// needs one. Revoking is not accepting — the token is consumed as spent, not as
+// honoured.
+func revokeOtherBootstrapInvites(ctx context.Context, q txQueryer, workspaceID, keepInviteID string) error {
+	if _, err := q.Exec(ctx, `
+		UPDATE auth.user_invites
+		SET status     = 'revoked',
+		    revoked_at = now(),
+		    updated_at = now()
+		WHERE workspace_id = $1::uuid
+		  AND invite_kind = 'bootstrap_owner'
+		  AND status = 'pending'
+		  AND id <> $2`,
+		workspaceID, keepInviteID,
+	); err != nil {
+		return fmt.Errorf("revoke remaining bootstrap invites: %w", err)
+	}
+	return nil
 }
 
 // resolveInviteIdentity returns the account that will accept invite, creating
@@ -437,19 +542,27 @@ func resolveInviteIdentity(ctx context.Context, q txQueryer, invite acceptableIn
 //
 // The membership is the point of the whole flow, and it goes to the workspace
 // recorded on the invite — never to one supplied by the accepting client, which
-// sends only a token. 'member' is the only role an invite can confer; there is
-// no field on the invite that could ask for more.
+// sends only a token. The role likewise comes from the invite's kind, which is
+// written at issuance by the service and is not expressible in any request.
 //
-// Both writes are ON CONFLICT DO NOTHING, which is what makes re-acceptance
-// idempotent for someone who is already a member. The channel insert is an
-// INSERT ... SELECT, so a workspace with no general channel is a no-op rather
-// than a failed acceptance.
-func ensureInviteMembership(ctx context.Context, q txQueryer, workspaceID, userID string) error {
+// The workspace write is ON CONFLICT DO NOTHING for an ordinary invite, which
+// makes re-acceptance idempotent for someone who is already a member. A
+// bootstrap invite upgrades instead: its whole purpose is to produce the first
+// owner, and an invitee who already held a plain membership must still end up
+// owning the workspace, or the bootstrap window would never close.
+//
+// The channel insert is an INSERT ... SELECT, so a workspace with no general
+// channel is a no-op rather than a failed acceptance.
+func ensureInviteMembership(ctx context.Context, q txQueryer, workspaceID, userID string, kind domain.InviteKind) error {
+	onConflict := `DO NOTHING`
+	if kind == domain.InviteKindBootstrapOwner {
+		onConflict = `DO UPDATE SET role = 'owner', status = 'active'`
+	}
 	if _, err := q.Exec(ctx, `
 		INSERT INTO chat.workspace_members (workspace_id, user_id, role, status)
-		VALUES ($1::uuid, $2::uuid, 'member', 'active')
-		ON CONFLICT (workspace_id, user_id) DO NOTHING`,
-		workspaceID, userID,
+		VALUES ($1::uuid, $2::uuid, $3, 'active')
+		ON CONFLICT (workspace_id, user_id) `+onConflict,
+		workspaceID, userID, kind.MembershipRole(),
 	); err != nil {
 		return fmt.Errorf("insert workspace membership: %w", err)
 	}
@@ -500,11 +613,17 @@ func completeInviteAcceptance(ctx context.Context, q txQueryer, inviteID, userID
 
 // AcceptInviteTx turns an invite token into a workspace membership.
 //
-// The four steps run in one transaction, and every one of them receives that
-// transaction explicitly — none opens its own, and none commits. A failure at
-// any point rolls the whole thing back, so there is no state where an invite is
-// consumed without a membership, or a membership exists while the token is
-// still reusable.
+// Every step runs in one transaction and receives it explicitly — none opens
+// its own, and none commits. A failure at any point rolls the whole thing back,
+// so there is no state where an invite is consumed without a membership, a
+// membership exists while the token is still reusable, or a workspace is left
+// half-initialized.
+//
+// The unlocked peek that opens it is a lock-ordering device, not a decision:
+// for a bootstrap invite the workspace lock must be held before the invite row
+// is locked, and the workspace is only knowable by reading the invite. Nothing
+// is trusted from that read — loadAcceptableInvite re-reads under FOR UPDATE
+// and everything below uses that result.
 func (s *PGXInviteStore) AcceptInviteTx(ctx context.Context, tokenHash, displayName, fullName, passwordHash string) (domain.AcceptInviteResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -512,9 +631,33 @@ func (s *PGXInviteStore) AcceptInviteTx(ctx context.Context, tokenHash, displayN
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	scope, err := peekInviteScope(ctx, tx, tokenHash)
+	if err != nil {
+		return domain.AcceptInviteResult{}, err
+	}
+	if scope.kind == domain.InviteKindBootstrapOwner && scope.workspaceID != "" {
+		if err := claimWorkspaceBootstrap(ctx, tx, scope.workspaceID); err != nil {
+			return domain.AcceptInviteResult{}, err
+		}
+	}
+
 	invite, err := loadAcceptableInvite(ctx, tx, tokenHash)
 	if err != nil {
 		return domain.AcceptInviteResult{}, err
+	}
+
+	if invite.kind == domain.InviteKindBootstrapOwner {
+		initialized, err := workspaceHasAdminTx(ctx, tx, invite.workspaceID)
+		if err != nil {
+			return domain.AcceptInviteResult{}, err
+		}
+		// The window is closed. Refuse without writing anything: no identity,
+		// no membership, and the invite is not marked accepted. The invite that
+		// did close the window already revoked its siblings, so reaching this
+		// point means the workspace gained an administrator by some other path.
+		if initialized {
+			return domain.AcceptInviteResult{}, domain.ErrInvalidToken
+		}
 	}
 
 	result, err := resolveInviteIdentity(ctx, tx, invite, displayName, fullName, passwordHash)
@@ -522,12 +665,18 @@ func (s *PGXInviteStore) AcceptInviteTx(ctx context.Context, tokenHash, displayN
 		return domain.AcceptInviteResult{}, err
 	}
 
-	if err := ensureInviteMembership(ctx, tx, invite.workspaceID, result.UserID); err != nil {
+	if err := ensureInviteMembership(ctx, tx, invite.workspaceID, result.UserID, invite.kind); err != nil {
 		return domain.AcceptInviteResult{}, err
 	}
 
 	if err := completeInviteAcceptance(ctx, tx, invite.id, result.UserID); err != nil {
 		return domain.AcceptInviteResult{}, err
+	}
+
+	if invite.kind == domain.InviteKindBootstrapOwner {
+		if err := revokeOtherBootstrapInvites(ctx, tx, invite.workspaceID, invite.id); err != nil {
+			return domain.AcceptInviteResult{}, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

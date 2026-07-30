@@ -195,7 +195,7 @@ func TestInviteService_AcceptInviteWeakPasswordRejected(t *testing.T) {
 	}
 }
 
-// ── Workspace authority and rate limit (issue #425) ────────────────────────
+// ── Workspace authority and rate limit ────────────────────────
 
 const (
 	testWorkspaceID = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
@@ -289,7 +289,7 @@ func TestInviteService_CreateInvitePropagatesRateLimitError(t *testing.T) {
 	}
 }
 
-// ── Bootstrap invites (issue #425) ─────────────────────────────────────────
+// ── Bootstrap invites ─────────────────────────────────────────
 //
 // The bootstrap command exists because nothing else can onboard the first
 // person: no HTTP route creates a workspace membership except invite
@@ -453,5 +453,61 @@ func TestInviteService_CreateInviteStillRejectsBootstrapIssuer(t *testing.T) {
 	}
 	if store.createCalls != 0 {
 		t.Fatal("a session invite without an actor must not reach the store")
+	}
+}
+
+// ── Invite kind is server-controlled ───────────────────────────────────────
+//
+// The bootstrap window closes only if its invite creates an owner, and it must
+// be the *only* invite that can. These pin both halves.
+
+func TestInviteService_CreateInviteAlwaysIssuesMemberKind(t *testing.T) {
+	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}}
+	svc := service.NewInviteService(newTestTokenManager(t, strings.Repeat("k", 32)), store,
+		service.WithInviteOutboxEncryptor(newTestEmailOutboxEncryptor(t)))
+
+	if _, err := svc.CreateInvite(context.Background(), domain.AdminInviteInput{
+		WorkspaceID: testWorkspaceID, ActorID: testActorID,
+		Email: "user@example.com", DisplayName: "User",
+		// A caller trying to smuggle the elevated kind in through the input.
+		Kind: domain.InviteKindBootstrapOwner,
+	}); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	if store.createInput.Kind != domain.InviteKindMember {
+		t.Fatalf("the authenticated route must always issue a member invite, got %q", store.createInput.Kind)
+	}
+}
+
+func TestInviteService_CreateBootstrapInviteIssuesBootstrapOwnerKind(t *testing.T) {
+	store := &fakeInviteStore{policy: defaultPolicy(), createResult: domain.InviteResult{ID: "invite-1"}}
+	svc := bootstrapService(t, store)
+
+	if _, err := svc.CreateBootstrapInvite(context.Background(), domain.BootstrapInviteInput{
+		Email: "first@example.com", DisplayName: "First",
+	}); err != nil {
+		t.Fatalf("CreateBootstrapInvite: %v", err)
+	}
+	if store.createInput.Kind != domain.InviteKindBootstrapOwner {
+		t.Fatalf("expected a bootstrap_owner invite, got %q", store.createInput.Kind)
+	}
+}
+
+// The role an invite confers is derived from its kind, in one place, so
+// "which invite grants owner" cannot acquire a second answer. Anything that is
+// not the bootstrap kind — including an unset one — confers plain membership.
+func TestInviteKind_MembershipRole(t *testing.T) {
+	for _, tt := range []struct {
+		kind domain.InviteKind
+		want string
+	}{
+		{kind: domain.InviteKindMember, want: "member"},
+		{kind: domain.InviteKindBootstrapOwner, want: "owner"},
+		{kind: "", want: "member"},
+		{kind: "something-else", want: "member"},
+	} {
+		if got := tt.kind.MembershipRole(); got != tt.want {
+			t.Fatalf("kind %q: expected role %q, got %q", tt.kind, tt.want, got)
+		}
 	}
 }

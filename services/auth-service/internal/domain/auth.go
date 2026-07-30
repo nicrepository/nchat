@@ -91,6 +91,37 @@ type AdminInviteInput struct {
 	Email       string
 	DisplayName string
 	FullName    string
+	// Kind decides the membership acceptance creates. It is set by the
+	// issuing service method, never decoded from a request: CreateInvite
+	// always sets InviteKindMember and CreateBootstrapInvite always sets
+	// InviteKindBootstrapOwner, so no payload field can ask for the elevated
+	// one.
+	Kind InviteKind
+}
+
+// InviteKind is the server-controlled purpose of an invite.
+type InviteKind string
+
+const (
+	// InviteKindMember is an ordinary workspace invitation. Acceptance creates
+	// a 'member' membership, which is the only thing an invite conferred
+	// before the bootstrap kind existed.
+	InviteKindMember InviteKind = "member"
+	// InviteKindBootstrapOwner opens a workspace that has no administrator
+	// yet. Acceptance creates the first 'owner' membership, which is what
+	// makes the bootstrap window close: from that moment WorkspaceHasAdmin is
+	// true and the bootstrap route refuses.
+	InviteKindBootstrapOwner InviteKind = "bootstrap_owner"
+)
+
+// MembershipRole is the chat.workspace_members role an invite of this kind
+// confers. Keeping the mapping here, rather than at the SQL call site, is what
+// stops "which invite grants owner" from having two answers.
+func (k InviteKind) MembershipRole() string {
+	if k == InviteKindBootstrapOwner {
+		return "owner"
+	}
+	return "member"
 }
 
 // BootstrapInviteIssuer is the ActorID of an invite created through the
