@@ -185,6 +185,90 @@ func (s *PGXAttachmentStore) GetAuthorized(
 	}, nil
 }
 
+// ListChannelAttachments returns a channel's most recent listable attachments.
+//
+// The caller's access to the channel has already been settled by
+// AuthorizeDestination, and both identifiers below come from that answer — the
+// workspace in particular is the destination row's own, never a request value.
+// Filtering on both is what keeps a channel UUID from another tenant from
+// selecting anything, even if the authorization ever regressed.
+//
+// The predicate and the order match idx_attachments_channel
+// (workspace_id, channel_id, created_at DESC WHERE destination_kind = 'channel'
+// AND deleted_at IS NULL), so this is an index scan of at most Limit rows and
+// never a table scan of a channel's history. id DESC breaks a created_at tie so
+// two attachments written in the same transaction always come back in the same
+// order.
+func (s *PGXAttachmentStore) ListChannelAttachments(
+	ctx context.Context, query service.ListDestinationAttachmentsQuery,
+) ([]service.ListedAttachment, error) {
+	if s == nil || s.pool == nil {
+		return nil, domain.ErrDependenciesUnavailable
+	}
+	limit := domain.NormalizeAttachmentListLimit(query.Limit)
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.id::text, a.status, a.original_filename,
+		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
+		FROM files.attachments AS a
+		WHERE a.destination_kind = 'channel'
+		  AND a.deleted_at IS NULL
+		  AND a.workspace_id = $1
+		  AND a.channel_id = $2
+		  AND a.status = ANY($3)
+		ORDER BY a.created_at DESC, a.id DESC
+		LIMIT $4`,
+		query.WorkspaceID, query.ChannelID, listableStatuses(), limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list channel attachments: %w", err)
+	}
+	defer rows.Close()
+
+	listed := make([]service.ListedAttachment, 0, limit)
+	for rows.Next() {
+		var (
+			record    service.ListedAttachment
+			status    string
+			createdAt pgtype.Timestamptz
+		)
+		if err := rows.Scan(
+			&record.ID, &status, &record.Filename,
+			&record.DetectedMIME, &record.Size, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan channel attachment: %w", err)
+		}
+		attachmentStatus := domain.Status(status)
+		if !attachmentStatus.Valid() {
+			// A row outside the CHECK's closed set is a data-integrity problem,
+			// not something to serve.
+			return nil, errors.New("attachment has an unknown status")
+		}
+		record.Status = attachmentStatus
+		record.CreatedAt = createdAt.Time.UTC()
+		listed = append(listed, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate channel attachments: %w", err)
+	}
+	return listed, nil
+}
+
+// listableStatuses is the closed set the listing selects, derived from the
+// domain predicate so the SQL filter and Status.Listable can never disagree.
+func listableStatuses() []string {
+	all := []domain.Status{
+		domain.StatusPendingUpload, domain.StatusPendingScan, domain.StatusClean,
+		domain.StatusRejected, domain.StatusFailed, domain.StatusDeleted,
+	}
+	values := make([]string, 0, len(all))
+	for _, status := range all {
+		if status.Listable() {
+			values = append(values, string(status))
+		}
+	}
+	return values
+}
+
 // authorizedAttachmentQuery applies the same destination visibility rules the
 // upload path uses, against the attachment's stored destination. The LEFT JOIN
 // onto a one-row source guarantees a single result row so an invalid session

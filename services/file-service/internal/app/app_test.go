@@ -54,6 +54,9 @@ func uploadsEnabledConfig(t *testing.T) config.Config {
 type stubPool struct{ closed bool }
 
 func (p *stubPool) QueryRow(context.Context, string, ...any) pgx.Row { return nil }
+func (p *stubPool) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("query not configured")
+}
 func (p *stubPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }

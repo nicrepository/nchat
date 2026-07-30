@@ -102,12 +102,45 @@ type StoredAttachment struct {
 	SessionExpiresAt time.Time
 }
 
+// ListDestinationAttachmentsQuery is a resolved, already-authorised listing
+// request. Both identifiers are server-derived: the workspace comes from the
+// destination row, never from the caller.
+type ListDestinationAttachmentsQuery struct {
+	WorkspaceID string
+	ChannelID   string
+	Limit       int
+}
+
+// ListedAttachment is the row a listing loads. It deliberately omits the
+// storage object key, the envelope version and the wrapped data key: a list
+// never needs them, and not selecting them means they cannot leak through a
+// listing bug.
+type ListedAttachment struct {
+	ID           string
+	Status       domain.Status
+	Filename     string
+	DetectedMIME string
+	Size         int64
+	CreatedAt    time.Time
+}
+
 // AttachmentStore is the metadata half of attachment persistence.
 type AttachmentStore interface {
 	CreatePending(ctx context.Context, attachment NewAttachment) error
 	MarkUploaded(ctx context.Context, update UploadedAttachment) error
 	MarkFailed(ctx context.Context, attachmentID, failureCode string) error
 	GetAuthorized(ctx context.Context, input AttachmentAuthInput) (StoredAttachment, error)
+	ListChannelAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) ([]ListedAttachment, error)
+}
+
+// ListChannelAttachmentsInput asks for a channel's most recent attachments.
+// The workspace is absent by design — it is derived from the channel row during
+// authorization, exactly like an upload's.
+type ListChannelAttachmentsInput struct {
+	ChannelID string
+	UserID    string
+	SessionID string
+	Limit     int
 }
 
 // ObjectStore is the blob half. It is intentionally narrow so the service and
@@ -442,6 +475,70 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 		DestinationKind: string(record.Kind),
 		CreatedAt:       record.CreatedAt,
 	}, nil
+}
+
+// ListChannelAttachments returns a channel's most recent attachments for a
+// caller who may currently reach that channel (issue #435).
+//
+// Authorization is the upload path's, unchanged: AuthorizeDestination resolves
+// the channel and its canonical workspace in one query and answers ErrNotFound
+// for a channel that does not exist, is archived, is private and not the
+// caller's, or belongs to another workspace. The listing query is then bound to
+// the workspace that query returned, so a channel UUID from another tenant can
+// never select that tenant's rows.
+//
+// The result is a preview, not an archive: the limit is clamped in the domain
+// and the order is fixed server-side, so a client cannot ask for an unbounded
+// scan or a different one.
+func (s *AttachmentService) ListChannelAttachments(
+	ctx context.Context, input ListChannelAttachmentsInput,
+) ([]AttachmentView, error) {
+	if !s.Ready() {
+		return nil, domain.ErrDependenciesUnavailable
+	}
+	destination, err := domain.NewDestination(domain.DestinationKindChannel, input.ChannelID)
+	if err != nil {
+		// An unparseable channel id is answered like an invisible one, so the
+		// route cannot be used to tell "malformed" from "not yours".
+		return nil, domain.ErrNotFound
+	}
+	userID, sessionID, err := parsePrincipal(input.UserID, input.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	authorized, err := s.authorizer.AuthorizeDestination(ctx, DestinationAuthInput{
+		Destination: destination,
+		UserID:      userID,
+		SessionID:   sessionID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	records, err := s.store.ListChannelAttachments(ctx, ListDestinationAttachmentsQuery{
+		WorkspaceID: authorized.WorkspaceID,
+		ChannelID:   authorized.ID,
+		Limit:       domain.NormalizeAttachmentListLimit(input.Limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	views := make([]AttachmentView, 0, len(records))
+	for _, record := range records {
+		contentType := record.DetectedMIME
+		if contentType == "" {
+			contentType = domain.DefaultContentType
+		}
+		views = append(views, AttachmentView{
+			ID:              record.ID,
+			Filename:        record.Filename,
+			ContentType:     contentType,
+			Size:            record.Size,
+			Status:          string(record.Status),
+			DestinationKind: string(domain.DestinationKindChannel),
+			CreatedAt:       record.CreatedAt,
+		})
+	}
+	return views, nil
 }
 
 // Download re-authorises, refuses anything the scan has not cleared, and
