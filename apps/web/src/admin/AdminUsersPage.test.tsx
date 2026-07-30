@@ -1175,3 +1175,92 @@ describe("AdminUsersPage — session scope", () => {
     expect(mockListAdminUsers).not.toHaveBeenCalled();
   });
 });
+
+// ── Paging by id, presented in name order ──────────────────────────────────
+//
+// The two orders are deliberately different: the server pages by user id
+// because that is what its index covers, and the table presents by name
+// because that is what a person reads. The fixture below makes them disagree —
+// ids ascend while names descend — so a test cannot pass by accident.
+
+/** The visible names, in the order the table renders them. */
+function renderedNames() {
+  return screen
+    .getAllByRole("row")
+    .slice(1) // drop the header row
+    .map((row) => row.querySelector(".admin-users__user-name")?.textContent)
+    .filter((name): name is string => Boolean(name));
+}
+
+function pagedUser(id: string, displayName: string): AdminUser {
+  return {
+    id,
+    email: `${id}@example.com`,
+    displayName,
+    status: "active",
+    authSource: "local",
+    createdAt: "2024-01-01T00:00:00Z",
+  };
+}
+
+describe("AdminUsersPage — id paging, name ordering", () => {
+  it("keeps the table in name order as pages arrive in id order", async () => {
+    const user = userEvent.setup();
+    // Page 1 by id: id-1 (Zoe), id-2 (Nina). Page 2: id-3 (Ana), id-4 (Bruno).
+    mockListAdminUsers
+      .mockResolvedValueOnce(
+        pageOf([pagedUser("id-1", "Zoe"), pagedUser("id-2", "Nina")], "cursor-1"),
+      )
+      .mockResolvedValueOnce(pageOf([pagedUser("id-3", "Ana"), pagedUser("id-4", "Bruno")]));
+
+    renderAdminUsersRoute();
+    await screen.findByText("Zoe");
+
+    // First page alone is already presented by name, not by id.
+    expect(renderedNames()).toEqual(["Nina", "Zoe"]);
+
+    await user.click(screen.getByRole("button", { name: /carregar mais usuários/i }));
+    await screen.findByText("Ana");
+
+    // The second page's names sort above the first page's, and do.
+    expect(renderedNames()).toEqual(["Ana", "Bruno", "Nina", "Zoe"]);
+  });
+
+  it("pages with the cursor the server gave and stops when it stops giving one", async () => {
+    const user = userEvent.setup();
+    mockListAdminUsers
+      .mockResolvedValueOnce(pageOf([pagedUser("id-1", "Zoe")], "cursor-1"))
+      .mockResolvedValueOnce(pageOf([pagedUser("id-2", "Ana")]));
+
+    renderAdminUsersRoute();
+    await screen.findByText("Zoe");
+
+    await user.click(screen.getByRole("button", { name: /carregar mais usuários/i }));
+    await screen.findByText("Ana");
+
+    expect(mockListAdminUsers.mock.calls[1][0]).toMatchObject({ cursor: "cursor-1" });
+    // No cursor came back, so there is nothing further to offer.
+    expect(
+      screen.queryByRole("button", { name: /carregar mais usuários/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("loses no row and repeats none when a page overlaps the previous one", async () => {
+    const user = userEvent.setup();
+    // A membership change between the two reads pushes id-2 across the page
+    // boundary, so it arrives twice.
+    mockListAdminUsers
+      .mockResolvedValueOnce(
+        pageOf([pagedUser("id-1", "Zoe"), pagedUser("id-2", "Nina")], "cursor-1"),
+      )
+      .mockResolvedValueOnce(pageOf([pagedUser("id-2", "Nina"), pagedUser("id-3", "Ana")]));
+
+    renderAdminUsersRoute();
+    await screen.findByText("Zoe");
+
+    await user.click(screen.getByRole("button", { name: /carregar mais usuários/i }));
+    await screen.findByText("Ana");
+
+    expect(renderedNames()).toEqual(["Ana", "Nina", "Zoe"]);
+  });
+});

@@ -25,10 +25,8 @@ type fakeStore struct {
 	workspaceUsersErr error
 	gotWorkspaceID    string
 	gotLimit          int
-	gotAnchor         *domain.WorkspaceUserAnchor
-	anchorNotFound    bool
-	anchorErr         error
-	gotAnchorUserID   string
+	gotAfterUserID    string
+	listCalls         int
 
 	adminWorkspaceID  string
 	adminWorkspaceErr error
@@ -58,21 +56,12 @@ func (f *fakeStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProf
 	return domain.SelfProfile{}, nil
 }
 
-func (f *fakeStore) ListWorkspaceUsers(_ context.Context, workspaceID string, limit int, anchor *domain.WorkspaceUserAnchor) ([]domain.WorkspaceUser, error) {
+func (f *fakeStore) ListWorkspaceUsers(_ context.Context, workspaceID string, limit int, afterUserID string) ([]domain.WorkspaceUser, error) {
 	f.gotWorkspaceID = workspaceID
 	f.gotLimit = limit
-	f.gotAnchor = anchor
+	f.gotAfterUserID = afterUserID
+	f.listCalls++
 	return f.workspaceUsers, f.workspaceUsersErr
-}
-
-// The anchor lookup replaces the sort key the cursor used to carry. Default is
-// "found", so the paging tests do not each have to opt in.
-func (f *fakeStore) GetWorkspaceUserAnchor(_ context.Context, _, userID string) (domain.WorkspaceUserAnchor, error) {
-	f.gotAnchorUserID = userID
-	if f.anchorErr != nil {
-		return domain.WorkspaceUserAnchor{}, f.anchorErr
-	}
-	return domain.WorkspaceUserAnchor{SortKey: "anchor-sort-key", Found: !f.anchorNotFound}, nil
 }
 
 func (f *fakeStore) GetAdminWorkspaceID(_ context.Context, userID string) (string, error) {
@@ -470,12 +459,10 @@ func TestUserService_ListWorkspaceUsers_AcceptsItsOwnCursor(t *testing.T) {
 	if _, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next); err != nil {
 		t.Fatalf("second page: %v", err)
 	}
-	if store.gotAnchor == nil || store.gotAnchor.UserID != listUserID(2) {
-		t.Fatalf("expected the resolved anchor to reach the store, got %+v", store.gotAnchor)
-	}
-	// The position came from the anchor lookup, not from the token.
-	if store.gotAnchorUserID != listUserID(2) {
-		t.Fatalf("expected the anchor to be resolved for the last row, got %q", store.gotAnchorUserID)
+	// The cursor's user id is the position outright — the listing is ordered by
+	// it — so it reaches the store unchanged, with no second query to place it.
+	if store.gotAfterUserID != listUserID(2) {
+		t.Fatalf("expected the store to resume after the last row, got %q", store.gotAfterUserID)
 	}
 }
 
@@ -574,7 +561,7 @@ func TestUserService_ListWorkspaceUsers_OversizedCursorRejectedBeforeStore(t *te
 	if !errors.Is(err, domain.ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
 	}
-	if store.gotLimit != 0 || store.gotAnchorUserID != "" {
+	if store.gotLimit != 0 || store.gotAfterUserID != "" {
 		t.Fatal("an oversized cursor must not reach the store at all")
 	}
 }
@@ -594,9 +581,10 @@ func TestUserService_ListWorkspaceUsers_CursorAtSizeLimitIsStillParsed(t *testin
 	}
 }
 
-// The row a cursor names may have left the workspace between pages. That is not
-// "no more results" — the position is unknown, so the cursor is unusable.
-func TestUserService_ListWorkspaceUsers_MissingAnchorIsInvalidCursor(t *testing.T) {
+// Paging costs one query per page. There is no position to look up, because the
+// cursor's user id *is* the position, and a second round trip per page was pure
+// overhead once the ordering stopped being a text expression.
+func TestUserService_ListWorkspaceUsers_PagesWithASingleStoreCall(t *testing.T) {
 	store := &fakeStore{workspaceUsers: listUsers(4)}
 	svc := service.NewUserService(store)
 
@@ -605,18 +593,86 @@ func TestUserService_ListWorkspaceUsers_MissingAnchorIsInvalidCursor(t *testing.
 		t.Fatalf("first page: %v", err)
 	}
 
-	store.anchorNotFound = true
-	store.gotLimit = 0
-	_, _, err = svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next)
-	if !errors.Is(err, domain.ErrInvalidInput) {
-		t.Fatalf("expected ErrInvalidInput for a vanished anchor, got %v", err)
+	store.listCalls = 0
+	if _, _, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next); err != nil {
+		t.Fatalf("second page: %v", err)
 	}
-	if store.gotLimit != 0 {
-		t.Fatal("an unresolvable anchor must not reach the listing query")
+	if store.listCalls != 1 {
+		t.Fatalf("expected one store call per page, got %d", store.listCalls)
 	}
 }
 
-func TestUserService_ListWorkspaceUsers_AnchorLookupErrorPropagates(t *testing.T) {
+// ── Two workspaces ─────────────────────────────────────────────────────────
+
+// A cursor is usable only in the workspace that minted it.
+//
+// Two tenants, one cursor: it pages workspace A and is refused by workspace B,
+// as a plain ErrInvalidInput that says nothing about whether A exists. The
+// refusal is defence in depth rather than the boundary — the listing query
+// filters by the workspace the session resolved to, so even an accepted foreign
+// cursor could only move the caller's position inside their own workspace — but
+// a cursor that crosses tenants should not be a thing that happens quietly.
+func TestUserService_ListWorkspaceUsers_CursorIsBoundToItsWorkspace(t *testing.T) {
+	const workspaceA = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+	const workspaceB = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+
+	store := &fakeStore{workspaceUsers: listUsers(4)}
+	svc := service.NewUserService(store)
+
+	_, cursorA, err := svc.ListWorkspaceUsers(context.Background(), workspaceA, 3, "")
+	if err != nil {
+		t.Fatalf("first page of A: %v", err)
+	}
+	if cursorA == "" {
+		t.Fatal("expected a cursor for workspace A")
+	}
+
+	// In its own workspace it resumes.
+	store.listCalls = 0
+	if _, _, err := svc.ListWorkspaceUsers(context.Background(), workspaceA, 3, cursorA); err != nil {
+		t.Fatalf("A's cursor must work in A: %v", err)
+	}
+	if store.gotWorkspaceID != workspaceA {
+		t.Fatalf("expected the query to stay in A, got %q", store.gotWorkspaceID)
+	}
+
+	// In another workspace it is refused, and nothing is queried.
+	store.listCalls = 0
+	store.gotWorkspaceID = ""
+	_, _, err = svc.ListWorkspaceUsers(context.Background(), workspaceB, 3, cursorA)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("A's cursor must be refused in B, got %v", err)
+	}
+	if store.listCalls != 0 || store.gotWorkspaceID != "" {
+		t.Fatal("a foreign cursor must not reach the store")
+	}
+}
+
+// The workspace a page is read from is the one the caller was given, never one
+// derived from the cursor — so a cursor cannot redirect the query at all.
+func TestUserService_ListWorkspaceUsers_QueriesOnlyTheGivenWorkspace(t *testing.T) {
+	const workspaceA = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+
+	store := &fakeStore{workspaceUsers: listUsers(4)}
+	svc := service.NewUserService(store)
+
+	_, cursorA, err := svc.ListWorkspaceUsers(context.Background(), workspaceA, 3, "")
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if _, _, err := svc.ListWorkspaceUsers(context.Background(), workspaceA, 3, cursorA); err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if store.gotWorkspaceID != workspaceA {
+		t.Fatalf("every page must query the given workspace, got %q", store.gotWorkspaceID)
+	}
+}
+
+// The member a cursor names may leave the workspace between two pages. Their id
+// is still a valid point to resume after — ids are ordered independently of who
+// currently holds a membership — so paging continues instead of breaking. The
+// row simply is not in the results, which is the correct answer.
+func TestUserService_ListWorkspaceUsers_DepartedMemberStillResumesPaging(t *testing.T) {
 	store := &fakeStore{workspaceUsers: listUsers(4)}
 	svc := service.NewUserService(store)
 
@@ -625,10 +681,17 @@ func TestUserService_ListWorkspaceUsers_AnchorLookupErrorPropagates(t *testing.T
 		t.Fatalf("first page: %v", err)
 	}
 
-	store.anchorErr = errors.New("connection refused")
-	_, _, err = svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next)
-	if err == nil || errors.Is(err, domain.ErrInvalidInput) {
-		t.Fatalf("an infrastructure failure must not read as a bad cursor, got %v", err)
+	// The workspace no longer contains the row the cursor names.
+	store.workspaceUsers = nil
+	users, nextAfter, err := svc.ListWorkspaceUsers(context.Background(), testWorkspaceID, 3, next)
+	if err != nil {
+		t.Fatalf("a departed member must not invalidate the cursor: %v", err)
+	}
+	if len(users) != 0 || nextAfter != "" {
+		t.Fatalf("expected a final empty page, got %d users and cursor %q", len(users), nextAfter)
+	}
+	if store.gotAfterUserID != listUserID(2) {
+		t.Fatalf("expected the query to resume after the named id, got %q", store.gotAfterUserID)
 	}
 }
 
@@ -655,7 +718,7 @@ func TestUserService_ListWorkspaceUsers_RejectsNonUUIDIdentifiers(t *testing.T) 
 			if !errors.Is(err, domain.ErrInvalidInput) {
 				t.Fatalf("expected ErrInvalidInput, got %v", err)
 			}
-			if store.gotAnchorUserID != "" {
+			if store.gotAfterUserID != "" {
 				t.Fatal("a malformed identifier must not reach the store")
 			}
 		})

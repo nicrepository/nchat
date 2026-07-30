@@ -271,36 +271,139 @@ func TestAdminUsers_RevokedSessionReturns401(t *testing.T) {
 	}
 }
 
-// A member and a guest are both "administers no workspace" as far as the
-// resolver is concerned, and both must be refused — not just the member.
-func TestAdminUsers_NonAdminRolesReceive403(t *testing.T) {
-	for _, role := range []string{"member", "guest"} {
-		t.Run(role, func(t *testing.T) {
-			users := &workspaceAdminStub{workspaceErr: domain.ErrForbidden, users: sampleWorkspaceUsers()}
+// A token that is not a token at all never reaches the guard: BearerAuth
+// refuses it, so no membership is looked up and no workspace is resolved.
+func TestAdminUsers_InvalidTokenReturns401(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header string
+	}{
+		{"garbage", "Bearer not-a-jwt"},
+		{"wrong scheme", "Basic " + mustAccessTokenForRouter(t, adminActorID, adminSessionID)},
+		{"empty bearer", "Bearer "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			users := &workspaceAdminStub{workspaceID: adminWorkspaceID, users: sampleWorkspaceUsers()}
+			req := httptest.NewRequest(http.MethodGet, RouteAuthAdminUsers, nil)
+			req.Header.Set("Authorization", tc.header)
 			rec := httptest.NewRecorder()
 
-			workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
+			workspaceAdminRouter(t, users).ServeHTTP(rec, req)
 
-			if rec.Code != http.StatusForbidden {
-				t.Fatalf("expected 403 for %s, got %d", role, rec.Code)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d", rec.Code)
+			}
+			if users.gotActorID != "" {
+				t.Fatal("an unauthenticated request must not reach the resolver")
 			}
 			if users.listCalls != 0 {
-				t.Fatalf("%s must not reach the repository", role)
+				t.Fatal("an unauthenticated request must not reach the repository")
 			}
 		})
 	}
 }
 
-func TestAdminUsers_OwnerAndAdminAreAuthorized(t *testing.T) {
-	// The resolver returns a workspace for owner and admin alike; the handler
-	// does not distinguish them, and this pins that.
+// ── Authorization, one case per role and per membership state ──────────────
+//
+// The resolver answers a single question — "which workspace does this caller
+// administer?" — so every refusal below arrives as the same ErrForbidden. They
+// are separate tests because they are separate ways to be refused, and a change
+// that stopped refusing one of them would otherwise hide behind the others.
+
+// An owner administers their workspace, so the listing is theirs to read.
+func TestAdminUsers_OwnerIsAuthorized(t *testing.T) {
 	users := &workspaceAdminStub{workspaceID: adminWorkspaceID, users: sampleWorkspaceUsers()}
 	rec := httptest.NewRecorder()
 
 	workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+		t.Fatalf("expected 200 for an owner, got %d", rec.Code)
+	}
+	if users.listCalls != 1 {
+		t.Fatalf("expected the listing to run once, got %d calls", users.listCalls)
+	}
+}
+
+// An admin is authorized on the same terms as an owner: the resolver's role
+// filter admits both, and the handler does not distinguish them afterwards.
+func TestAdminUsers_AdminIsAuthorized(t *testing.T) {
+	users := &workspaceAdminStub{workspaceID: adminWorkspaceID, users: sampleWorkspaceUsers()}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an admin, got %d", rec.Code)
+	}
+	if users.gotWorkspaceID != adminWorkspaceID {
+		t.Fatalf("expected the resolved workspace, got %q", users.gotWorkspaceID)
+	}
+}
+
+// A member belongs to the workspace but administers nothing. Belonging is not
+// authority: the member list is not theirs to read.
+func TestAdminUsers_MemberReceives403(t *testing.T) {
+	users := &workspaceAdminStub{workspaceErr: domain.ErrForbidden, users: sampleWorkspaceUsers()}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a member, got %d", rec.Code)
+	}
+	if users.listCalls != 0 {
+		t.Fatal("a member must not reach the repository")
+	}
+}
+
+// A guest is refused for the same reason as a member and by the same predicate.
+// Tested apart from the member because a role list is exactly the kind of thing
+// that gets widened by one entry.
+func TestAdminUsers_GuestReceives403(t *testing.T) {
+	users := &workspaceAdminStub{workspaceErr: domain.ErrForbidden, users: sampleWorkspaceUsers()}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a guest, got %d", rec.Code)
+	}
+	if users.listCalls != 0 {
+		t.Fatal("a guest must not reach the repository")
+	}
+}
+
+// An admin whose membership is no longer active — suspended, or departed — has
+// the role recorded but not the standing. The resolver's membership-status
+// filter is what refuses them, and it must keep doing so.
+func TestAdminUsers_InactiveMembershipReceives403(t *testing.T) {
+	users := &workspaceAdminStub{workspaceErr: domain.ErrForbidden, users: sampleWorkspaceUsers()}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an inactive membership, got %d", rec.Code)
+	}
+	if users.listCalls != 0 {
+		t.Fatal("an inactive membership must not reach the repository")
+	}
+}
+
+// An archived workspace has no administration to do. The resolver joins on the
+// workspace's own status, so its owner is refused along with everyone else.
+func TestAdminUsers_InactiveWorkspaceReceives403(t *testing.T) {
+	users := &workspaceAdminStub{workspaceErr: domain.ErrForbidden, users: sampleWorkspaceUsers()}
+	rec := httptest.NewRecorder()
+
+	workspaceAdminRouter(t, users).ServeHTTP(rec, listRequest(t, ""))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an inactive workspace, got %d", rec.Code)
+	}
+	if users.listCalls != 0 {
+		t.Fatal("an inactive workspace must not reach the repository")
 	}
 }
 

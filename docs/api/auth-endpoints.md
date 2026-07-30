@@ -121,29 +121,41 @@ empty cursor means the end; the two always agree.
 `full_name` is omitted when unset. No password hash, token, session, avatar,
 external subject, sort key or workspace identifier is returned.
 
-**Ordering and cursor.** Rows are ordered by
-`lower(coalesce(nullif(display_name, ''), email))` then by `id`. The `id`
-tiebreak makes the order total — without it two identical display names have
-an undefined relative position and a keyset cursor silently skips or repeats
-rows. Resumption uses a row-value comparison rather than `OFFSET`, so page N
+**Ordering and cursor.** Rows are ordered by `user_id` ascending, and by
+nothing else. That is the second column of the primary key of
+`workspace_members`, so the workspace filter, the resumption and the sort are
+all answered by one range scan of `(workspace_id, user_id)` — a page costs its
+own rows. Being the primary key it is already unique, so the order is total with
+no tiebreak, which is what stops a keyset cursor from skipping or repeating rows
+between pages. Resumption is a range predicate rather than `OFFSET`, so page N
 costs the same as page 1 and concurrent inserts cannot shift the window.
 
+This is not a presentation order. Ordering by name would be, but no index can
+serve `lower(coalesce(nullif(display_name, ''), email))`, so it made every page
+sort the workspace's entire membership before returning fifty rows — cost
+growing with the tenant while the response stayed the same size. **Clients that
+present these rows to a person should sort the rows they have client-side**; the
+web admin table does exactly that, and warns that its filters apply to the pages
+loaded so far.
+
 The cursor is base64url of a versioned JSON object carrying **only** the
-workspace id and the id of the last row of the previous page. It deliberately
-does not carry the sort key: that value is a display name or, when that is
-empty, an e-mail address, so including it put administrative PII into a query
-string and from there into gateway access logs. The ordering position is
-re-derived server-side from the row id, at the cost of one primary-key lookup
-per page.
+workspace id and the id of the last row of the previous page. It carries no sort
+key because there is no longer one to carry — which also settles what used to be
+a disclosure problem, since the old sort key was a display name or an e-mail
+address and would have travelled in a query string and from there into gateway
+access logs.
 
 Validation is total and its failures are indistinguishable. Rejected with a
 generic `400`: a token over 512 bytes (checked before any decode, since the
 value is client-controlled), invalid base64, unparseable JSON, an unknown
-field, a version other than the current one, an id that is not a UUID, a
-workspace other than the session's, and a row that has since left the workspace
-— the last one being "the position is unknown", not "there are no more
-results". The message never says which, so a cursor cannot be used to probe for
-another tenant.
+field, a version other than the current one, an id that is not a UUID, and a
+workspace other than the session's. The message never says which, so a cursor
+cannot be used to probe for another tenant.
+
+A cursor naming a member who has since left the workspace stays valid: the id
+is still a position to resume after, and that member is simply absent from the
+results. Ids are ordered independently of who currently holds a membership, so
+paging continues rather than breaking mid-list.
 
 The cursor is not a capability and holds nothing secret: both values are
 identifiers the caller already has. A tampered cursor cannot widen the query —

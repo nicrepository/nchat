@@ -37,14 +37,10 @@ type UserStore interface {
 	// browser sends reaches it. ErrForbidden when the caller administers no
 	// active workspace, which is also the answer for a plain member or guest.
 	GetAdminWorkspaceID(ctx context.Context, userID string) (string, error)
-	// ListWorkspaceUsers returns at most limit members of workspaceID, ordered
-	// deterministically and resuming after cursor when one is given. The caller
-	// must have obtained workspaceID from GetAdminWorkspaceID.
-	ListWorkspaceUsers(ctx context.Context, workspaceID string, limit int, anchor *domain.WorkspaceUserAnchor) ([]domain.WorkspaceUser, error)
-	// GetWorkspaceUserAnchor resolves the ordering position of userID inside
-	// workspaceID, so a cursor need not carry it. Found is false when that user
-	// is no longer a member.
-	GetWorkspaceUserAnchor(ctx context.Context, workspaceID, userID string) (domain.WorkspaceUserAnchor, error)
+	// ListWorkspaceUsers returns at most limit members of workspaceID in user_id
+	// order, resuming strictly after afterUserID when it is non-empty. The
+	// caller must have obtained workspaceID from GetAdminWorkspaceID.
+	ListWorkspaceUsers(ctx context.Context, workspaceID string, limit int, afterUserID string) ([]domain.WorkspaceUser, error)
 }
 
 // PGXUserStore implements UserStore using a pgx connection pool.
@@ -333,11 +329,6 @@ func (s *PGXUserStore) GetAdminWorkspaceID(ctx context.Context, userID string) (
 	return workspaceID, nil
 }
 
-// workspaceUserSortKey is the ordering expression, written once and reused by
-// the SELECT list, the WHERE clause and the ORDER BY. Repeating it by hand in
-// three places is how a keyset paginator starts skipping or repeating rows.
-const workspaceUserSortKey = `lower(coalesce(nullif(u.display_name, ''), u.email::text))`
-
 // ListWorkspaceUsers returns one page of the members of workspaceID.
 //
 // The join against chat.workspace_members is the tenant boundary: rows are
@@ -346,22 +337,36 @@ const workspaceUserSortKey = `lower(coalesce(nullif(u.display_name, ''), u.email
 // several — and no cursor value can widen it, because the workspace filter is
 // a separate, always-present predicate.
 //
-// Ordering is (sort key, id). The id tiebreak is what makes the order total:
-// two people with the same display name would otherwise have an undefined
-// relative position, and a keyset cursor over an unstable order silently skips
-// or repeats rows between pages.
+// Ordering is wm.user_id alone, which is the second column of the membership
+// table's primary key. That is the whole point of ordering on it: the filter
+// (workspace_id = $1), the resumption (user_id > $2) and the sort are all
+// answered by one range scan of (workspace_id, user_id), so a page costs its
+// own rows and nothing more.
 //
-// Resumption uses a row-value comparison rather than OFFSET, so page N costs
-// the same as page 1 and concurrent inserts cannot shift the window.
+// It replaced an order by lower(coalesce(display_name, email)). That expression
+// was correct but unindexable: no index covers it, so every page sorted the
+// workspace's entire membership before returning fifty rows — cost growing with
+// the tenant while the response stayed the same size (CWE-1050). User id is not
+// a meaningful order to a person; the table sorts what it has client-side, and
+// paging is by id.
+//
+// A single column also makes the keyset a plain > rather than a row-value
+// comparison, and being the primary key it is already unique, so no tiebreak is
+// needed for the order to be total — which is what keeps a cursor from skipping
+// or repeating rows between pages.
+//
+// Resumption is a range predicate rather than OFFSET, so page N costs the same
+// as page 1 and concurrent inserts cannot shift the window.
 //
 // Members who left are excluded; suspended ones are not, because deciding
 // whether to reactivate them is what the screen exists for. Soft-deleted
 // accounts never appear.
-func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID string, limit int, anchor *domain.WorkspaceUserAnchor) ([]domain.WorkspaceUser, error) {
-	var cursorSortKey, cursorUserID any
-	if anchor != nil {
-		cursorSortKey = anchor.SortKey
-		cursorUserID = anchor.UserID
+func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID string, limit int, afterUserID string) ([]domain.WorkspaceUser, error) {
+	// Passed as NULL rather than an empty string: the comparison is against a
+	// uuid, and "" is not one. NULL makes the predicate a no-op for page 1.
+	var after any
+	if afterUserID != "" {
+		after = afterUserID
 	}
 
 	rows, err := s.pool.Query(ctx, `
@@ -372,13 +377,10 @@ func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID strin
 		  ON u.id = wm.user_id AND u.deleted_at IS NULL
 		WHERE wm.workspace_id = $1::uuid
 		  AND wm.status <> 'left'
-		  AND (
-		        $2::text IS NULL
-		     OR (`+workspaceUserSortKey+`, u.id::text) > ($2::text, $3::text)
-		      )
-		ORDER BY `+workspaceUserSortKey+`, u.id
-		LIMIT $4`,
-		workspaceID, cursorSortKey, cursorUserID, limit,
+		  AND ($2::uuid IS NULL OR wm.user_id > $2::uuid)
+		ORDER BY wm.user_id
+		LIMIT $3`,
+		workspaceID, after, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list workspace users: %w", err)
@@ -398,35 +400,4 @@ func (s *PGXUserStore) ListWorkspaceUsers(ctx context.Context, workspaceID strin
 		return nil, fmt.Errorf("iterate workspace users: %w", err)
 	}
 	return users, nil
-}
-
-// GetWorkspaceUserAnchor returns the ordering position of userID within
-// workspaceID.
-//
-// It exists so the cursor can name a row by id alone instead of carrying the
-// sort key, which is a display name or an e-mail address and therefore must not
-// travel in a query string. The lookup is by primary key on both tables, so the
-// cost is a constant per page.
-//
-// The membership join is not decoration: it is what stops a cursor naming a user
-// outside the caller's workspace from resolving to a real position.
-func (s *PGXUserStore) GetWorkspaceUserAnchor(ctx context.Context, workspaceID, userID string) (domain.WorkspaceUserAnchor, error) {
-	var sortKey string
-	err := s.pool.QueryRow(ctx, `
-		SELECT `+workspaceUserSortKey+`
-		FROM chat.workspace_members wm
-		JOIN auth.users u
-		  ON u.id = wm.user_id AND u.deleted_at IS NULL
-		WHERE wm.workspace_id = $1::uuid
-		  AND wm.user_id = $2::uuid
-		  AND wm.status <> 'left'`,
-		workspaceID, userID,
-	).Scan(&sortKey)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.WorkspaceUserAnchor{}, nil
-	}
-	if err != nil {
-		return domain.WorkspaceUserAnchor{}, fmt.Errorf("get workspace user anchor: %w", err)
-	}
-	return domain.WorkspaceUserAnchor{SortKey: sortKey, Found: true}, nil
 }

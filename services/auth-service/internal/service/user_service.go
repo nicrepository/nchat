@@ -224,24 +224,16 @@ func (s *UserService) ListWorkspaceUsers(ctx context.Context, workspaceID string
 		return nil, "", err
 	}
 
-	// The cursor names a row; the position of that row is read from the
-	// database rather than carried in the token, so no display name or e-mail
-	// travels in the query string. A row that has since left the workspace has
-	// no position, which makes the cursor invalid rather than silently empty.
-	var anchor *domain.WorkspaceUserAnchor
+	// The cursor's user id is the position outright, because the listing is
+	// ordered by that id. No second query is needed to place it, and a member
+	// who left between two pages no longer invalidates the cursor: their id is
+	// still a valid point to resume after, they simply are not in the results.
+	after := ""
 	if cursor != nil {
-		resolved, err := s.store.GetWorkspaceUserAnchor(ctx, workspaceID, cursor.UserID)
-		if err != nil {
-			return nil, "", err
-		}
-		if !resolved.Found {
-			return nil, "", fmt.Errorf("%w: invalid cursor", domain.ErrInvalidInput)
-		}
-		resolved.UserID = cursor.UserID
-		anchor = &resolved
+		after = cursor.UserID
 	}
 
-	users, err := s.store.ListWorkspaceUsers(ctx, workspaceID, limit+1, anchor)
+	users, err := s.store.ListWorkspaceUsers(ctx, workspaceID, limit+1, after)
 	if err != nil {
 		return nil, "", err
 	}

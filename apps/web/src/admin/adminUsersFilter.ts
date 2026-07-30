@@ -61,3 +61,36 @@ export function filterAdminUsers(
   const query = search.trim().toLowerCase();
   return users.filter((user) => matchesChip(user, chip) && matchesSearch(user, query));
 }
+
+/** The label the table shows for a user, which is what it should sort on. */
+function visibleName(user: AdminUser): string {
+  return user.displayName.trim() || user.email;
+}
+
+/**
+ * Orders users the way the table presents them: by name, then e-mail, then id.
+ *
+ * The server pages by user id, because that is the column its index covers, and
+ * id order is meaningless to a person reading the table. Sorting is therefore a
+ * presentation concern and lives here — applied to the rows already loaded, on
+ * the way to the screen.
+ *
+ * That means the visible order is only total across what has been fetched: a
+ * later page can bring a name that belongs earlier in the alphabet, and it will
+ * appear above rows already shown. The alternative is fetching every page
+ * before rendering anything, which is exactly the unbounded read the pagination
+ * exists to prevent.
+ *
+ * Returns a new array — the caller's is not reordered, so this can never
+ * disturb the sequence the cursor was derived from.
+ */
+export function sortAdminUsersForDisplay(users: readonly AdminUser[]): AdminUser[] {
+  return [...users].sort(
+    (a, b) =>
+      visibleName(a).localeCompare(visibleName(b), "pt-BR", { sensitivity: "base" }) ||
+      a.email.localeCompare(b.email, "pt-BR", { sensitivity: "base" }) ||
+      // Ids are opaque, so compare them as plain strings: the tiebreak only has
+      // to be stable and total, not meaningful.
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
+}

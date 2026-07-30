@@ -50,12 +50,12 @@ type WorkspaceUser struct {
 
 // WorkspaceUserCursor is the keyset position of the workspace user listing.
 //
-// It names the last row of the previous page and nothing else. Deliberately it
-// does *not* carry the sort key: the sort key is the display name or, when that
-// is empty, the e-mail address — so putting it in the cursor put an
-// administrator's e-mail into a query string, and from there into gateway
-// access logs (CWE-532). The position is instead re-derived server-side from
-// UserID, which costs one primary-key lookup per page.
+// It names the last row of the previous page and nothing else. It carries no
+// sort key, because there is no longer a sort key to carry: the listing orders
+// by user id, so the id *is* the position. That also settles what used to be a
+// disclosure problem — the old ordering was on display name or e-mail, and a
+// cursor carrying it put an administrator's address into a query string and
+// from there into gateway access logs (CWE-532).
 //
 // What remains is two identifiers the caller already holds: their own workspace
 // and a user inside it. It carries its workspace so a cursor minted for one
@@ -76,15 +76,6 @@ const WorkspaceUserCursorVersion = 1
 // decoded at all. The value is client-controlled, so a length check has to come
 // before any allocation or parsing; a legitimate cursor is well under 200 bytes.
 const WorkspaceUserCursorMaxEncodedBytes = 512
-
-// WorkspaceUserAnchor is the ordering position of the row a cursor points at.
-// Found is false when that row is no longer a member of the workspace, which
-// makes the cursor unusable rather than silently empty.
-type WorkspaceUserAnchor struct {
-	SortKey string
-	UserID  string
-	Found   bool
-}
 
 // WorkspaceUserPageLimits bound how many rows one page may carry.
 const (

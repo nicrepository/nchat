@@ -18,7 +18,12 @@ import {
   classifyAdminError,
   createAdminInvite,
 } from "./adminUsersApi";
-import { FILTER_CHIPS, type FilterChip, filterAdminUsers } from "./adminUsersFilter";
+import {
+  FILTER_CHIPS,
+  type FilterChip,
+  filterAdminUsers,
+  sortAdminUsersForDisplay,
+} from "./adminUsersFilter";
 import { type AdminUsersState, useAdminUsers } from "./useAdminUsers";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -588,7 +593,13 @@ export default function AdminUsersPage() {
   }, [closeInvite, reload]);
 
   const filteredUsers = useMemo(
-    () => (state.kind === "success" ? filterAdminUsers(state.users, activeFilter, search) : []),
+    () =>
+      state.kind === "success"
+        ? // Sorted here, not in the hook: the hook's array is the sequence the
+          // server paged through, and the cursor is derived from its last row.
+          // Reordering it there would eventually page from the wrong place.
+          sortAdminUsersForDisplay(filterAdminUsers(state.users, activeFilter, search))
+        : [],
     [state, activeFilter, search],
   );
 
