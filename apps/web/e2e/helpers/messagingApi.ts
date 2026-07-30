@@ -147,6 +147,40 @@ export interface MessagingScenario {
   dmCandidates: DMCandidateFixture[];
   // Pinned message IDs per "kind:targetId" key.
   pinnedIds: Map<string, Set<string>>;
+  // Channel-details payload per channel id (issue #435).
+  channelDetails: Map<string, ChannelDetailsFixture>;
+  // Channel attachments per channel id, newest first, as the server returns them.
+  channelAttachments: Map<string, AttachmentFixture[]>;
+}
+
+export interface ChannelMemberFixture {
+  user_id: string;
+  display_name: string;
+  role: "member" | "moderator";
+  presence: "online";
+}
+
+export interface ChannelDetailsFixture {
+  id: string;
+  slug: string;
+  display_name: string;
+  type: "public" | "private";
+  created_at: string;
+  /** Every active member of the channel, online or not. */
+  member_count: number;
+  /** How many of them are online; may exceed online_members.length. */
+  online_member_count: number;
+  /** Presence-filtered, capped preview — never a general roster. */
+  online_members: ChannelMemberFixture[];
+}
+
+export interface AttachmentFixture {
+  id: string;
+  filename: string;
+  contentType: string;
+  size: number;
+  status: "pending_scan" | "clean" | "rejected";
+  createdAt: string;
 }
 
 export function uniqueId(testInfo: TestInfo, suffix: string): string {
@@ -281,6 +315,34 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     sidebarDMs,
     dmCandidates: options.dmCandidates ?? [{ userId: OTHER_USER_ID, displayName: OTHER_USER_NAME }],
     pinnedIds: new Map(),
+    channelDetails: new Map(),
+    channelAttachments: new Map(),
+  };
+}
+
+/**
+ * Default channel-details payload for a channel in the fixture sidebar. Every
+ * value is derived from the channel itself, so a spec that switches channels
+ * sees genuinely different content without having to script both.
+ *
+ * memberCount defaults to the number of online members but is overridable,
+ * because the two are independent: a channel keeps its size when nobody is
+ * connected, and specs need to assert exactly that.
+ */
+export function channelDetailsFixture(
+  channel: { id: string; slug: string; display_name: string; type: "public" | "private" },
+  onlineMembers: ChannelMemberFixture[],
+  memberCount = onlineMembers.length,
+): ChannelDetailsFixture {
+  return {
+    id: channel.id,
+    slug: channel.slug,
+    display_name: channel.display_name,
+    type: channel.type,
+    created_at: "2024-01-12T09:30:00Z",
+    member_count: memberCount,
+    online_member_count: onlineMembers.length,
+    online_members: onlineMembers,
   };
 }
 
@@ -379,6 +441,64 @@ export async function installMessagingMocks(
   await installInteractionMocks(page, scenario, assertConversationAccess);
   await installConversationMocks(page, scenario);
   await installMessageMocks(page, scenario, expired, assertConversationAccess);
+  await installChannelDetailsMocks(page, scenario, assertConversationAccess);
+}
+
+/**
+ * GET /api/chat/channels/{id}/details and GET /api/files/channels/{id}/attachments.
+ *
+ * Both mirror the server's refusal shape: a channel the caller cannot reach is a
+ * 404, never a 200 with empty data, so a spec cannot mistake "denied" for
+ * "nothing here".
+ */
+async function installChannelDetailsMocks(
+  page: Page,
+  scenario: MessagingScenario,
+  assertConversationAccess: ConversationAccessGuard,
+) {
+  await page.route("**/api/chat/channels/*/details", async (route) => {
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    if (!channelId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const details = scenario.channelDetails.get(channelId);
+    if (!details) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: details }),
+    });
+  });
+
+  await page.route("**/api/files/channels/*/attachments**", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    if (!channelId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const attachments = scenario.channelAttachments.get(channelId) ?? [];
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { attachments } }),
+    });
+  });
+}
+
+function pathSegmentAfter(url: string, collection: string): string | undefined {
+  const path = new URL(url).pathname.split("/").filter(Boolean);
+  const index = path.indexOf(collection);
+  if (index === -1) return undefined;
+  const segment = path[index + 1];
+  return segment ? decodeURIComponent(segment) : undefined;
 }
 
 async function installWebSocketMock(

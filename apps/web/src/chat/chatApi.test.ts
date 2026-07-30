@@ -18,6 +18,7 @@ import {
   editMessage,
   favoriteMessage,
   forwardChannelMessage,
+  fetchChannelDetails,
   fetchChannelMessage,
   fetchChannelMessages,
   fetchPins,
@@ -1881,5 +1882,185 @@ describe("fetchSidebarData", () => {
       channels: [],
       dms: [],
     });
+  });
+});
+
+describe("fetchChannelDetails", () => {
+  it("maps the payload and encodes the channel in the path", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch 1",
+        slug: "infra",
+        display_name: "Infraestrutura",
+        type: "private",
+        created_at: "2024-01-12T09:30:00Z",
+        member_count: 12,
+        online_member_count: 3,
+        online_members: [
+          {
+            user_id: "u-1",
+            display_name: "Álvaro",
+            avatar_url: "/media/a.png",
+            role: "moderator",
+            presence: "online",
+          },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch 1");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/details", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(details).toEqual({
+      id: "ch 1",
+      slug: "infra",
+      name: "Infraestrutura",
+      type: "private",
+      createdAt: "2024-01-12T09:30:00Z",
+      memberCount: 12,
+      onlineCount: 3,
+      onlineMembers: [
+        {
+          userId: "u-1",
+          displayName: "Álvaro",
+          avatarUrl: "/media/a.png",
+          role: "moderator",
+          presence: "online",
+        },
+      ],
+    });
+  });
+
+  it("keeps the server's totals independent of the preview length", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        member_count: 40,
+        online_member_count: 9,
+        online_members: [{ user_id: "u-1", display_name: "Ana", presence: "online" }],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    // A capped preview must never become the channel's size, nor the number of
+    // people online.
+    expect(details.memberCount).toBe(40);
+    expect(details.onlineCount).toBe(9);
+    expect(details.onlineMembers).toHaveLength(1);
+  });
+
+  it("reports a channel with nobody online without zeroing the member total", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "ch-1", member_count: 31, online_member_count: 0, online_members: [] },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.onlineMembers).toEqual([]);
+    expect(details.onlineCount).toBe(0);
+    expect(details.memberCount).toBe(31);
+  });
+
+  it("drops a member the server did not state is online", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        member_count: 5,
+        online_member_count: 1,
+        online_members: [
+          { user_id: "u-1", display_name: "Online", presence: "online" },
+          // An inconsistent payload: away and offline are not online, and a
+          // member with no stated presence is not vouched for at all.
+          { user_id: "u-2", display_name: "Ausente", presence: "away" },
+          { user_id: "u-3", display_name: "Offline", presence: "offline" },
+          { user_id: "u-4", display_name: "Sem presença" },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.onlineMembers.map((member) => member.userId)).toEqual(["u-1"]);
+  });
+
+  it("refuses to invent a presence the server did not send", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        member_count: 2,
+        online_members: [
+          { user_id: "u-1", display_name: "Sem presença" },
+          { user_id: "u-2", display_name: "Valor inesperado", presence: "busy" },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    // Neither is vouched for as online, so neither reaches an online list.
+    expect(details.onlineMembers).toEqual([]);
+  });
+
+  it("ignores a negative or non-numeric count instead of propagating it", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "ch-1", member_count: -3, online_member_count: "muitos", online_members: [] },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.memberCount).toBe(0);
+    expect(details.onlineCount).toBe(0);
+  });
+
+  it("drops malformed members and cross-origin avatars instead of rendering them", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        type: "public",
+        member_count: 1,
+        online_member_count: 2,
+        online_members: [
+          null,
+          { display_name: "sem id", presence: "online" },
+          { user_id: "", presence: "online" },
+          {
+            user_id: "u-1",
+            display_name: "Com avatar hostil",
+            avatar_url: "javascript:alert(1)",
+            presence: "online",
+          },
+          {
+            user_id: "u-2",
+            display_name: "Externo",
+            avatar_url: "https://evil.test/a.png",
+            presence: "online",
+          },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.onlineMembers.map((member) => member.userId)).toEqual(["u-1", "u-2"]);
+    expect(details.onlineMembers[0].avatarUrl).toBeUndefined();
+    expect(details.onlineMembers[1].avatarUrl).toBeUndefined();
+    // An unknown role degrades to the least privileged one.
+    expect(details.onlineMembers[0].role).toBe("member");
+  });
+
+  it("defaults an unknown channel type to public rather than guessing private", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: "ch-1", type: "secret" } });
+
+    await expect(fetchChannelDetails("ch-1")).resolves.toMatchObject({ type: "public" });
+  });
+
+  it("propagates a refusal instead of rendering a partial channel", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "channel not found"));
+
+    await expect(fetchChannelDetails("ch-1")).rejects.toBeInstanceOf(ApiRequestError);
   });
 });
