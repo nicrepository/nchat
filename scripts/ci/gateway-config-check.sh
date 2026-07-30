@@ -9,6 +9,14 @@ TRAEFIK_STATIC_CONFIG="$ROOT_DIR/infra/traefik/local/traefik.yml"
 TRAEFIK_DYNAMIC_CONFIG="$ROOT_DIR/infra/traefik/local/dynamic.yml"
 LOCAL_CERT_DIR="$ROOT_DIR/infra/traefik/local/certs"
 TEMP_CERT_DIR=""
+# The nchat-dev-server overlay reads this env file through a configMapGenerator,
+# so kustomize build fails without it. It is deliberately not versioned — it
+# names one specific machine — which means a clean checkout does not have it and
+# the contract check below cannot render that overlay. The example is versioned
+# and carries the same keys, so it stands in for the real thing here: this gate
+# validates route shape, not deployment values.
+NCHAT_DEV_TOPOLOGY_EXAMPLE="$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/topology.env.example"
+NCHAT_DEV_TOPOLOGY_FILE="$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/topology.env"
 
 require_file() {
   if [ ! -f "$1" ]; then
@@ -21,6 +29,7 @@ require_file "$COMPOSE_FILE"
 require_file "$ENV_EXAMPLE"
 require_file "$TRAEFIK_STATIC_CONFIG"
 require_file "$TRAEFIK_DYNAMIC_CONFIG"
+require_file "$NCHAT_DEV_TOPOLOGY_EXAMPLE"
 
 if git -C "$ROOT_DIR" ls-files --error-unmatch infra/compose/.env.dev >/dev/null 2>&1; then
   echo "infra/compose/.env.dev must not be versioned." >&2
@@ -52,6 +61,31 @@ if sed -n '/nchat-chat-https:/,/nchat-files:/p' "$TRAEFIK_DYNAMIC_CONFIG" | grep
   exit 1
 fi
 
+# Both temporary files are tracked from here on, so a single cleanup covers
+# every exit path — including the early returns below when Docker is absent.
+created_env=0
+created_topology_env=0
+
+# One cleanup, one trap. Each branch removes only what this script created, so a
+# developer's own .env.dev or topology.env survives the run untouched.
+cleanup() {
+  if [ "$created_env" -eq 1 ]; then
+    rm -f "$ENV_FILE"
+  fi
+  if [ "$created_topology_env" -eq 1 ]; then
+    rm -f "$NCHAT_DEV_TOPOLOGY_FILE"
+  fi
+  if [ -n "$TEMP_CERT_DIR" ]; then
+    rm -rf "$TEMP_CERT_DIR"
+  fi
+}
+trap cleanup EXIT
+
+if [ ! -f "$NCHAT_DEV_TOPOLOGY_FILE" ]; then
+  cp "$NCHAT_DEV_TOPOLOGY_EXAMPLE" "$NCHAT_DEV_TOPOLOGY_FILE"
+  created_topology_env=1
+fi
+
 # Issue #425: validates that the local gateway, every Kubernetes overlay, the
 # Go router and the frontend agree on the /api/auth contract. Runs before the
 # Docker-dependent checks below, which exit early when Docker is absent.
@@ -69,21 +103,10 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 0
 fi
 
-created_env=0
 if [ ! -f "$ENV_FILE" ]; then
   cp "$ENV_EXAMPLE" "$ENV_FILE"
   created_env=1
 fi
-
-cleanup() {
-  if [ "$created_env" -eq 1 ]; then
-    rm -f "$ENV_FILE"
-  fi
-  if [ -n "$TEMP_CERT_DIR" ]; then
-    rm -rf "$TEMP_CERT_DIR"
-  fi
-}
-trap cleanup EXIT
 
 set -a
 # shellcheck source=/dev/null
