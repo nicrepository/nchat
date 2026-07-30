@@ -5,6 +5,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -395,4 +396,180 @@ func TestAcceptInviteTx_BootstrapStillWorksOnActiveUninitializedWorkspace(t *tes
 	if !state.Initialized || state.BootstrapOpen() {
 		t.Fatalf("the window must close on the first owner, got %+v", state)
 	}
+}
+
+// ── Bootstrap issuance races bootstrap acceptance ──────────────────────────
+//
+// Issuance validated the window on one connection and persisted on another, so
+// an acceptance committing in between produced a 201, a bootstrap_owner invite
+// and an outbox row for a credential that could never be accepted. Both paths
+// now take the same workspace lock, so whichever commits first is seen by the
+// other. Real connections, because the whole claim is about two transactions.
+
+// issueBootstrapInvite mints a bootstrap_owner invite the way the service does:
+// workspace from configuration, no human actor, kind fixed server-side.
+func issueBootstrapInvite(ctx context.Context, store *storage.PGXInviteStore, workspaceID, email, tokenHash string) error {
+	now := time.Now().UTC()
+	_, err := store.CreateInvite(ctx, domain.AdminInviteInput{
+		WorkspaceID: workspaceID,
+		ActorID:     domain.BootstrapInviteIssuer,
+		Email:       email,
+		DisplayName: "Second Owner",
+		Kind:        domain.InviteKindBootstrapOwner,
+	}, tokenHash, now, now.Add(48*time.Hour),
+		`{"alg":"AES-256-GCM","key_version":"v1","nonce":"bm9uY2U=","ciphertext":"Y2lwaGVydGV4dA=="}`,
+		domain.InviteRateLimit{})
+	return err
+}
+
+// Whichever of the two commits first, the outcome must be a lifecycle with no
+// loose ends: exactly one owner, and no bootstrap_owner invite left pending —
+// because a pending one is precisely an invite that can never be accepted.
+func TestBootstrapIssuanceRacesAcceptance_LeavesNoUnusableInvite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	seedPolicy(t, ctx, conn)
+
+	// One workspace per round, so several interleavings are exercised without
+	// re-running the migrations each time.
+	rounds := []string{
+		"a0000000-0000-4000-8000-0000000000a1",
+		"a0000000-0000-4000-8000-0000000000a2",
+		"a0000000-0000-4000-8000-0000000000a3",
+		"a0000000-0000-4000-8000-0000000000a4",
+		"a0000000-0000-4000-8000-0000000000a5",
+	}
+	for i, workspaceID := range rounds {
+		seedWorkspace(t, ctx, conn, workspaceID, fmt.Sprintf("ws-race-%d", i), "active")
+	}
+
+	accepting := storage.NewPGXInviteStore(testPool(t, ctx))
+	issuing := storage.NewPGXInviteStore(testPool(t, ctx))
+
+	for i, workspaceID := range rounds {
+		t.Run(fmt.Sprintf("round-%d", i), func(t *testing.T) {
+			acceptedToken := fmt.Sprintf("race-accept-%d", i)
+			issuedToken := fmt.Sprintf("race-issue-%d", i)
+			ws := workspaceID
+			insertInvite(t, ctx, conn, &ws, fmt.Sprintf("owner-%d@example.test", i), acceptedToken, domain.InviteKindBootstrapOwner)
+
+			var issueErr error
+			errs := raceTwo(
+				func() error {
+					_, err := accepting.AcceptInviteTx(ctx, acceptedToken, "Owner", "Owner", "argon2id-hash")
+					return err
+				},
+				func() error {
+					// Recorded rather than returned: refusal is a legitimate
+					// outcome of this race, not a test failure.
+					issueErr = issueBootstrapInvite(ctx, issuing, workspaceID, fmt.Sprintf("second-%d@example.test", i), issuedToken)
+					return nil
+				},
+			)
+			for _, err := range errs {
+				if err != nil {
+					t.Fatalf("the acceptance must succeed: %v", err)
+				}
+			}
+
+			// Exactly one owner, whichever way the race went.
+			assertCount(t, ctx, conn, 1,
+				`SELECT count(*) FROM chat.workspace_members WHERE workspace_id = $1::uuid AND role = 'owner'`, workspaceID)
+
+			switch {
+			case issueErr == nil:
+				// Issuance won the lock and committed first. The acceptance
+				// then revoked it as a sibling, so it is not left pending.
+				assertCount(t, ctx, conn, 1,
+					`SELECT count(*) FROM auth.user_invites WHERE token_hash = $1 AND status = 'revoked'`, issuedToken)
+			case errors.Is(issueErr, domain.ErrBootstrapUnavailable):
+				// The acceptance won: issuance refused and wrote nothing.
+				assertCount(t, ctx, conn, 0,
+					`SELECT count(*) FROM auth.user_invites WHERE token_hash = $1`, issuedToken)
+				assertCount(t, ctx, conn, 0,
+					`SELECT count(*) FROM auth.email_outbox eo
+					 JOIN auth.user_invites ui ON ui.id = eo.invite_id
+					 WHERE ui.token_hash = $1`, issuedToken)
+			default:
+				t.Fatalf("unexpected issuance failure: %v", issueErr)
+			}
+
+			// The invariant the finding is about: nothing bootstrap-shaped is
+			// left pending, so no e-mail promises a credential that is dead.
+			assertCount(t, ctx, conn, 0,
+				`SELECT count(*) FROM auth.user_invites
+				 WHERE workspace_id = $1::uuid AND invite_kind = 'bootstrap_owner' AND status = 'pending'`,
+				workspaceID)
+			assertNoOpenTransactions(t, ctx, conn)
+		})
+	}
+}
+
+// Sequentially, after the window has closed, issuance is simply refused — and
+// leaves no invite and no outbox row behind.
+func TestBootstrapIssuance_RefusedOnceWindowClosed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	seedPolicy(t, ctx, conn)
+	store := storage.NewPGXInviteStore(testPool(t, ctx))
+
+	workspaceA := pgWorkspaceA
+	insertInvite(t, ctx, conn, &workspaceA, "owner@example.test", "closing-token", domain.InviteKindBootstrapOwner)
+	if _, err := store.AcceptInviteTx(ctx, "closing-token", "Owner", "Owner", "argon2id-hash"); err != nil {
+		t.Fatalf("first acceptance: %v", err)
+	}
+
+	err := issueBootstrapInvite(ctx, store, pgWorkspaceA, "late@example.test", "late-token")
+	if !errors.Is(err, domain.ErrBootstrapUnavailable) {
+		t.Fatalf("expected ErrBootstrapUnavailable once the window is shut, got %v", err)
+	}
+	// The refusal writes nothing: no invite row, and so no e-mail promising a
+	// credential that could never be accepted. The seeded invite above was
+	// inserted directly, so the outbox is empty either way.
+	assertCount(t, ctx, conn, 0, `SELECT count(*) FROM auth.user_invites WHERE token_hash = 'late-token'`)
+	assertCount(t, ctx, conn, 0, `SELECT count(*) FROM auth.email_outbox`)
+}
+
+// Two concurrent issuances into a still-open workspace must not deadlock on the
+// workspace lock they now share, and both are legitimate: the window is open
+// for each.
+func TestBootstrapIssuance_ConcurrentIssuancesDoNotDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn := migratedDatabase(t, ctx)
+	seedPolicy(t, ctx, conn)
+	storeOne := storage.NewPGXInviteStore(testPool(t, ctx))
+	storeTwo := storage.NewPGXInviteStore(testPool(t, ctx))
+
+	errs := raceTwo(
+		func() error {
+			return issueBootstrapInvite(ctx, storeOne, pgWorkspaceA, "one@example.test", "issue-one")
+		},
+		func() error {
+			return issueBootstrapInvite(ctx, storeTwo, pgWorkspaceA, "two@example.test", "issue-two")
+		},
+	)
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("both issuances are valid while the window is open: %v", err)
+		}
+	}
+
+	assertCount(t, ctx, conn, 2,
+		`SELECT count(*) FROM auth.user_invites WHERE workspace_id = $1::uuid AND invite_kind = 'bootstrap_owner' AND status = 'pending'`,
+		pgWorkspaceA)
+	assertNoOpenTransactions(t, ctx, conn)
+
+	// The first acceptance still closes the window and retires both siblings.
+	if _, err := storeOne.AcceptInviteTx(ctx, "issue-one", "One", "One", "argon2id-hash"); err != nil {
+		t.Fatalf("acceptance: %v", err)
+	}
+	assertCount(t, ctx, conn, 0,
+		`SELECT count(*) FROM auth.user_invites WHERE workspace_id = $1::uuid AND invite_kind = 'bootstrap_owner' AND status = 'pending'`,
+		pgWorkspaceA)
 }

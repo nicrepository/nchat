@@ -137,6 +137,12 @@ func (s *InviteService) CreateBootstrapInvite(ctx context.Context, input domain.
 		return domain.InviteResult{}, domain.ErrBootstrapUnavailable
 	}
 
+	// A cheap early-out, not the authority. It runs on its own connection and
+	// is over before the creating transaction opens, so an acceptance can still
+	// close the window underneath it; the store re-reads this state under the
+	// workspace lock it shares with the acceptance and refuses there. What this
+	// buys is not correctness but work avoided — no token minted, nothing
+	// encrypted — when the window is plainly already shut.
 	state, err := s.store.BootstrapWorkspaceState(ctx, s.bootstrapWorkspaceID)
 	if err != nil {
 		return domain.InviteResult{}, fmt.Errorf("check bootstrap workspace state: %w", err)

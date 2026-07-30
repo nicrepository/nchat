@@ -42,6 +42,18 @@ const lockSeparatorForTest = "\x1f"
 
 var inviteNow = time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
+// expectBootstrapIssuanceGate scripts the workspace claim and the state re-read
+// that a bootstrap_owner creation now performs before anything else, so a
+// concurrent acceptance cannot close the window underneath it.
+func expectBootstrapIssuanceGate(mock pgxmock.PgxPoolIface, active, initialized bool) {
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(bootstrapWorkspaceLockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat\.workspaces w`).
+		WithArgs(inviteWorkspaceID).
+		WillReturnRows(pgxmock.NewRows([]string{"active", "initialized"}).AddRow(active, initialized))
+}
+
 // expectExpireStaleInvites scripts the retirement that now runs under the
 // (workspace, email) lock, before the duplicate checks.
 func expectExpireStaleInvites(mock pgxmock.PgxPoolIface) {
@@ -1038,6 +1050,7 @@ func TestPGXInviteStore_CreateInviteStoresNullIssuerForBootstrap(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour)
 
 	mock.ExpectBegin()
+	expectBootstrapIssuanceGate(mock, true, false)
 	expectInviteCreateGuards(mock)
 	// nil, not "": the column is a UUID and the empty string is not a UUID.
 	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
@@ -1590,5 +1603,151 @@ func TestPGXInviteStore_AcceptInviteTxBootstrapRefusedOnMissingWorkspace(t *test
 	_, err = store.AcceptInviteTx(context.Background(), "hashed-value", "User", "User Full", "argon2id-hash")
 	if !errors.Is(err, domain.ErrInvalidToken) {
 		t.Fatalf("expected ErrInvalidToken, got %v", err)
+	}
+}
+
+// ── Bootstrap issuance is gated inside the transaction ─────────────────────
+//
+// The service checks the window before minting a token, but on its own
+// connection and before this transaction opens. An acceptance committing in
+// between would create the first owner, and issuance would still return 201
+// with an invite that can never be accepted. The claim and the re-read now
+// happen here, under the lock the acceptance also takes.
+
+func TestPGXInviteStore_CreateBootstrapInviteRefusesWhenWindowClosedUnderLock(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		active      bool
+		initialized bool
+	}{
+		// The reported race: an acceptance created the first owner between the
+		// service's check and this transaction.
+		{name: "owner appeared meanwhile", active: true, initialized: true},
+		{name: "workspace archived meanwhile", active: false, initialized: false},
+		{name: "archived and owned", active: false, initialized: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mock, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatalf("pgxmock: %v", err)
+			}
+			defer mock.Close()
+
+			input := inviteInput()
+			input.ActorID = domain.BootstrapInviteIssuer
+			input.Kind = domain.InviteKindBootstrapOwner
+
+			mock.ExpectBegin()
+			expectBootstrapIssuanceGate(mock, tt.active, tt.initialized)
+			// Nothing else is scripted: reaching the e-mail lock, the insert or
+			// the outbox would fail this test. A closed window must leave no
+			// invite row and therefore no e-mail.
+			mock.ExpectRollback()
+
+			store := storage.NewPGXInviteStore(mock)
+			_, err = store.CreateInvite(context.Background(), input, "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited)
+			if !errors.Is(err, domain.ErrBootstrapUnavailable) {
+				t.Fatalf("expected ErrBootstrapUnavailable, got %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// A workspace that vanished is not an open window either.
+func TestPGXInviteStore_CreateBootstrapInviteRefusesWhenWorkspaceMissing(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	input := inviteInput()
+	input.ActorID = domain.BootstrapInviteIssuer
+	input.Kind = domain.InviteKindBootstrapOwner
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).
+		WithArgs(bootstrapWorkspaceLockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat\.workspaces w`).
+		WithArgs(inviteWorkspaceID).WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	_, err = store.CreateInvite(context.Background(), input, "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited)
+	if !errors.Is(err, domain.ErrBootstrapUnavailable) {
+		t.Fatalf("expected ErrBootstrapUnavailable, got %v", err)
+	}
+}
+
+// The workspace claim is the outermost lock of the creating transaction, which
+// is what matches the acceptance path's ordering and keeps the two from forming
+// a cycle. pgxmock is ordered, so scripting it first is the assertion.
+func TestPGXInviteStore_CreateBootstrapInviteClaimsWorkspaceBeforeOtherLocks(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	input := inviteInput()
+	input.ActorID = domain.BootstrapInviteIssuer
+	input.Kind = domain.InviteKindBootstrapOwner
+
+	mock.ExpectBegin()
+	// Workspace claim and state first...
+	expectBootstrapIssuanceGate(mock, true, false)
+	// ...then the e-mail lock and everything that depends on it.
+	expectInviteCreateGuards(mock)
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(inviteInsertRows(time.Now()))
+	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.CreateInvite(context.Background(), input, "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// An ordinary invite must not take the workspace lock at all: serialising every
+// member invitation on one workspace-wide lock would be a needless bottleneck,
+// and the bootstrap window is none of its business.
+func TestPGXInviteStore_CreateMemberInviteTakesNoWorkspaceBootstrapLock(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	// expectInviteCreateGuards scripts the e-mail lock first; a workspace claim
+	// ahead of it would not match.
+	expectInviteCreateGuards(mock)
+	mock.ExpectQuery(`INSERT INTO auth\.user_invites`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(inviteInsertRows(time.Now()))
+	mock.ExpectExec(`INSERT INTO auth\.email_outbox`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXInviteStore(mock)
+	if _, err := store.CreateInvite(context.Background(), inviteInput(), "hash", inviteNow, inviteNow.Add(time.Hour), encryptedInvitePayload, unlimited); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }

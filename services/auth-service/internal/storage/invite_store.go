@@ -172,6 +172,24 @@ func (s *PGXInviteStore) CreateInvite(ctx context.Context, input domain.AdminInv
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Bootstrap issuance is decided here, not by the caller. The service checks
+	// the window before minting a token, but that check runs on its own
+	// connection and is over before this transaction opens: an acceptance
+	// committing in between would create the first owner, and issuance would
+	// then hand out a bootstrap_owner invite that can never be accepted — a 201
+	// and an e-mail for a credential that is already dead.
+	//
+	// Taking the same workspace lock the acceptance takes, and re-reading the
+	// state under it, makes the two mutually exclusive: whichever commits first
+	// is seen by the other. It is acquired before every other lock in this
+	// transaction, matching the acceptance path where it is also outermost, so
+	// the two orderings agree and cannot form a cycle.
+	if input.Kind == domain.InviteKindBootstrapOwner {
+		if err := assertBootstrapOpenTx(ctx, tx, input.WorkspaceID); err != nil {
+			return domain.InviteResult{}, err
+		}
+	}
+
 	if err := reserveInviteSlotTx(ctx, tx, input, limit); err != nil {
 		return domain.InviteResult{}, err
 	}
@@ -488,21 +506,50 @@ func selectInvite(ctx context.Context, q queryer, tokenHash string, forUpdate bo
 	return invite, nil
 }
 
-// claimWorkspaceBootstrap serialises bootstrap acceptance for one workspace and
-// refuses once the workspace has an administrator.
+// claimWorkspaceBootstrap serialises everything that opens or closes the
+// bootstrap window for one workspace: issuing a bootstrap_owner invite and
+// accepting one.
 //
-// The advisory lock is taken before the invite row is locked — see
-// peekInviteScope — so two concurrent bootstrap acceptances queue here rather
-// than deadlocking. Whoever holds it sees a workspace state nobody else can
-// change, so the "does this workspace already have an owner or admin?" answer
-// stays true through the membership insert that would falsify it. That is what
-// makes exactly one owner possible: the loser finds the answer already yes.
+// Whoever holds it sees a workspace state nobody else can change, so the "does
+// this workspace already have an owner or admin?" answer stays true through the
+// write that would falsify it. That is what makes exactly one owner possible —
+// the loser of a race between two acceptances finds the answer already yes —
+// and what stops an issuance from committing an invite that a concurrent
+// acceptance has just made unusable.
+//
+// It is the outermost lock on both paths: taken before the invite row on the
+// acceptance side (see peekInviteScope, which exists only to learn which
+// workspace to lock) and before the e-mail and budget locks on the issuing
+// side. One ordering, so the two cannot form a cycle.
 func claimWorkspaceBootstrap(ctx context.Context, q txQueryer, workspaceID string) error {
 	if _, err := q.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
 		"workspace-bootstrap"+lockKeySeparator+workspaceID,
 	); err != nil {
 		return fmt.Errorf("lock workspace bootstrap: %w", err)
+	}
+	return nil
+}
+
+// assertBootstrapOpenTx claims the workspace and confirms, inside the caller's
+// transaction, that the bootstrap window is still open.
+//
+// The lock and the read belong together: a state read without the lock is only
+// a statement about the past, which is exactly the gap this closes. Refusing
+// with ErrBootstrapUnavailable keeps issuance reporting the same thing whether
+// the window was already shut when the request arrived or closed while it was
+// being served — the caller is told to use the authenticated endpoint either
+// way.
+func assertBootstrapOpenTx(ctx context.Context, q txQueryer, workspaceID string) error {
+	if err := claimWorkspaceBootstrap(ctx, q, workspaceID); err != nil {
+		return err
+	}
+	state, err := bootstrapWorkspaceStateTx(ctx, q, workspaceID)
+	if err != nil {
+		return err
+	}
+	if !state.BootstrapOpen() {
+		return domain.ErrBootstrapUnavailable
 	}
 	return nil
 }
