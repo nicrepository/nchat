@@ -226,7 +226,7 @@ vi.mock("./useChatWebSocket", () => ({
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
-      return { toggleReaction: wsMockState.toggleReaction };
+      return { toggleReaction: wsMockState.toggleReaction, connectionStatus: "connected" };
     },
   ),
 }));
@@ -434,7 +434,7 @@ beforeEach(() => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
-      return { toggleReaction: wsMockState.toggleReaction };
+      return { toggleReaction: wsMockState.toggleReaction, connectionStatus: "connected" };
     },
   );
   mockFetchAllowedReactionEmojis.mockResolvedValue([
@@ -3612,7 +3612,7 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
         onMessageCreated: (evt: WSMessageCreatedEvent) => void;
       }) => {
         capturedOnMessageCreated = onMessageCreated;
-        return { toggleReaction: wsMockState.toggleReaction };
+        return { toggleReaction: wsMockState.toggleReaction, connectionStatus: "connected" };
       },
     );
   });
@@ -3621,6 +3621,7 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
     // Restore to the default no-op so other test suites are not affected.
     vi.mocked(useChatWebSocket).mockImplementation(() => ({
       toggleReaction: wsMockState.toggleReaction,
+      connectionStatus: "connected",
     }));
   });
 

@@ -13,6 +13,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
+import { _resetChatSocket, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
 import { issueCallToken } from "./callApi";
 import { useCallSignaling } from "./useCallSignaling";
 
@@ -111,8 +112,13 @@ function activeEvent(version: number) {
 
 const OriginalWebSocket = global.WebSocket;
 
+// The connection is shared module state; random() === 0 pins each backoff delay
+// to the bottom of its equal-jitter window so the schedule is exact.
+const FIRST_RETRY_MS = RECONNECT_BASE_DELAY_MS / 2;
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
+  _resetChatSocket(() => 0);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   global.WebSocket = FakeWebSocket as any;
   setTokens("test-token");
@@ -124,6 +130,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _resetChatSocket();
   vi.useRealTimers();
   global.WebSocket = OriginalWebSocket;
   clearTokens();
@@ -167,7 +174,7 @@ describe("useCallSignaling", () => {
 
     act(() => {
       staleSocket.close();
-      vi.advanceTimersByTime(250);
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
     });
     const currentSocket = FakeWebSocket.instances[1];
     act(() => currentSocket.simulateOpen());

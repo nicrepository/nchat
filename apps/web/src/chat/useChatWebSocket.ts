@@ -1,35 +1,34 @@
 /**
- * useChatWebSocket — minimal WebSocket hook for realtime message delivery.
+ * useChatWebSocket — realtime message delivery over the tab's shared chat
+ * connection.
  *
- * Auth: passes the Bearer access token as a credential subprotocol plus a
- * fixed public protocol selected by the server so that
- * browser clients (which cannot set arbitrary HTTP headers on the upgrade
- * request) can authenticate without putting the token in the URL query string.
- * The server validates the token but does not echo it back in the response.
+ * The socket itself lives in chatSocket.ts: this hook owns only the
+ * subscription state for its targets. Two components use this hook at once
+ * (the sidebar and the message list) and each used to open its own connection,
+ * which is what exhausted the server's per-user connection budget (issue #449).
+ *
+ * Auth: chatSocket passes the Bearer access token as a credential subprotocol
+ * plus a fixed public protocol selected by the server, so browser clients
+ * (which cannot set arbitrary HTTP headers on the upgrade request) authenticate
+ * without putting the token in the URL query string. The server validates the
+ * token but does not echo it back in the response.
  *
  * Security notes:
  * - Token is passed as Sec-WebSocket-Protocol, not in the URL query string.
- * - Token is read from sessionStorage via getAccessToken() — never from state.
- * - onMessage callback is kept in a ref so re-renders don't restart the socket.
+ * - onMessage callback is kept in a ref so re-renders don't restart anything.
  * - Target filtering is applied here AND in the caller (defence-in-depth).
- * - Errors (auth failures, network issues) are not logged; reconnect is bounded
- *   and keeps the token out of the URL.
- * - Connection is cleaned up on unmount or target change.
+ * - Events from a superseded socket generation are dropped, so a late callback
+ *   can neither apply an event twice nor resubscribe on a dead connection.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import { getAccessToken } from "../lib/authSession";
+import { acquireChatSocket, type ChatSocketHandle, type ChatSocketStatus } from "./chatSocket";
 import { normalizeChatTargetId } from "./chatTargetId";
 
-const CHAT_WS_URL =
-  (import.meta.env.VITE_CHAT_WS_URL as string | undefined) ??
-  `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/api/chat/ws`;
-
-const RECONNECT_BASE_DELAY_MS = 250;
-const RECONNECT_MAX_DELAY_MS = 2_000;
+const SUBSCRIPTION_RETRY_BASE_DELAY_MS = 250;
+const SUBSCRIPTION_RETRY_MAX_DELAY_MS = 2_000;
 const MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS = 3;
-const CHAT_WS_SUBPROTOCOL = "nchat.v1";
 
 export interface WSMessagePayload {
   id: string;
@@ -187,11 +186,12 @@ interface UseChatWebSocketOptions {
 
 export interface ChatWebSocketActions {
   toggleReaction: (messageId: string, emoji: string) => boolean;
+  /** Shared connection state, for discreet feedback and diagnosis. */
+  connectionStatus: ChatSocketStatus;
 }
 
 interface SubscriptionControl {
   generation: number;
-  socket: WebSocket;
   expected: Map<string, WSSubscriptionTarget>;
   pending: Set<string>;
   confirmed: Set<string>;
@@ -240,10 +240,10 @@ export function useChatWebSocket({
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
-  const socketRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<ChatSocketHandle | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ChatSocketStatus>("connecting");
   const desiredTargetsRef = useRef(subscriptionTargets);
   const subscriptionControlRef = useRef<SubscriptionControl | null>(null);
-  const connectionGenerationRef = useRef(0);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
     onMessageUpdatedRef.current = onMessageUpdated;
@@ -258,10 +258,9 @@ export function useChatWebSocket({
   }, [subscriptionSignature]);
 
   const toggleReaction = useCallback((messageId: string, emoji: string) => {
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify({ type: "reaction.toggle", message_id: messageId, emoji }));
-    return true;
+    const handle = socketRef.current;
+    if (!handle) return false;
+    return handle.send({ type: "reaction.toggle", message_id: messageId, emoji });
   }, []);
 
   useEffect(() => {
@@ -269,19 +268,14 @@ export function useChatWebSocket({
     if (!primaryTarget) return;
     const primaryTargetKey = subscriptionTargetKey(primaryTarget);
     let closed = false;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: number | null = null;
-    let reconnectAttempt = 0;
+    let handle: ChatSocketHandle | null = null;
 
-    const clearReconnectTimer = () => {
-      if (reconnectTimer === null) return;
-      window.clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    };
-
-    const currentSubscriptionControl = (socket: WebSocket) => {
+    // A control belongs to exactly one socket generation. Anything arriving
+    // for an older generation — a late acknowledgement, a queued recovery —
+    // is dropped rather than applied to the connection that replaced it.
+    const currentSubscriptionControl = (generation: number) => {
       const control = subscriptionControlRef.current;
-      return !closed && ws === socket && control?.socket === socket ? control : null;
+      return !closed && control?.generation === generation ? control : null;
     };
 
     const clearSubscriptionRecoveryTimer = (control: SubscriptionControl | null) => {
@@ -297,28 +291,26 @@ export function useChatWebSocket({
       return true;
     };
 
-    const sendSubscribe = (socket: WebSocket, targetKeys?: Iterable<string>) => {
-      const control = currentSubscriptionControl(socket);
-      if (!control || socket.readyState !== WebSocket.OPEN) return;
+    const sendSubscribe = (generation: number, targetKeys?: Iterable<string>) => {
+      const control = currentSubscriptionControl(generation);
+      if (!control || !handle?.isOpen()) return;
       const keys = targetKeys ?? control.expected.keys();
       for (const key of keys) {
         const target = control.expected.get(key);
         if (!target) continue;
-        socket.send(
-          JSON.stringify({
-            type: "subscribe",
-            target_type: target.kind,
-            target_id: target.targetId,
-          }),
-        );
+        handle.send({
+          type: "subscribe",
+          target_type: target.kind,
+          target_id: target.targetId,
+        });
       }
     };
 
-    const scheduleSubscriptionRecovery = (socket: WebSocket) => {
-      const control = currentSubscriptionControl(socket);
+    const scheduleSubscriptionRecovery = (generation: number) => {
+      const control = currentSubscriptionControl(generation);
       if (
         !control ||
-        socket.readyState !== WebSocket.OPEN ||
+        !handle?.isOpen() ||
         control.timer !== null ||
         control.attempts >= MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS
       ) {
@@ -330,74 +322,30 @@ export function useChatWebSocket({
         for (const key of control.expected.keys()) control.pending.add(key);
       }
       const delay = Math.min(
-        RECONNECT_BASE_DELAY_MS * 2 ** control.attempts,
-        RECONNECT_MAX_DELAY_MS,
+        SUBSCRIPTION_RETRY_BASE_DELAY_MS * 2 ** control.attempts,
+        SUBSCRIPTION_RETRY_MAX_DELAY_MS,
       );
       control.attempts += 1;
       control.timer = window.setTimeout(() => {
-        const activeControl = currentSubscriptionControl(socket);
+        const activeControl = currentSubscriptionControl(generation);
         if (!activeControl || activeControl.generation !== control.generation) return;
         activeControl.timer = null;
-        sendSubscribe(socket, activeControl.pending);
+        sendSubscribe(generation, activeControl.pending);
       }, delay);
     };
 
-    const scheduleReconnect = () => {
-      if (closed || reconnectTimer !== null) return;
-      const delay = Math.min(
-        RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt,
-        RECONNECT_MAX_DELAY_MS,
-      );
-      reconnectAttempt += 1;
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null;
-        connect();
-      }, delay);
-    };
+    handle = acquireChatSocket({
+      onStatus: (next) => {
+        if (!closed) setConnectionStatus(next);
+      },
 
-    const connect = () => {
-      if (closed) return;
-
-      const token = getAccessToken();
-      if (!token) return;
-
-      let socket: WebSocket;
-      try {
-        // WSTokenMiddleware extracts the credential protocol as a Bearer token;
-        // the server selects only CHAT_WS_SUBPROTOCOL and never echoes the token.
-        socket = new WebSocket(CHAT_WS_URL, [token, CHAT_WS_SUBPROTOCOL]);
-      } catch {
-        // WebSocket constructor may throw on invalid URL.
-        scheduleReconnect();
-        return;
-      }
-
-      ws = socket;
-      socketRef.current = socket;
-      const generation = ++connectionGenerationRef.current;
-      const initialExpected = new Map(
-        desiredTargetsRef.current.map((target) => [subscriptionTargetKey(target), target]),
-      );
-      subscriptionControlRef.current = {
-        generation,
-        socket,
-        expected: initialExpected,
-        pending: new Set(initialExpected.keys()),
-        confirmed: new Set(),
-        primaryAcknowledgement: null,
-        attempts: 0,
-        timer: null,
-      };
-
-      socket.onopen = () => {
-        if (closed || ws !== socket) return;
-        reconnectAttempt = 0;
+      onOpen: (generation) => {
+        if (closed) return;
         const expected = new Map(
           desiredTargetsRef.current.map((target) => [subscriptionTargetKey(target), target]),
         );
         const control: SubscriptionControl = {
           generation,
-          socket,
           expected,
           pending: new Set(expected.keys()),
           confirmed: new Set(),
@@ -407,20 +355,14 @@ export function useChatWebSocket({
         };
         clearSubscriptionRecoveryTimer(subscriptionControlRef.current);
         subscriptionControlRef.current = control;
-        sendSubscribe(socket);
-      };
+        // One resubscribe per generation: this is also the resynchronisation
+        // point, since the acknowledgement is what the caller waits on.
+        sendSubscribe(generation);
+      },
 
-      socket.onmessage = (event: MessageEvent<unknown>) => {
-        const control = currentSubscriptionControl(socket);
-        if (!control || control.generation !== generation) return;
-        let data: unknown;
-        try {
-          data = JSON.parse(event.data as string);
-        } catch {
-          return;
-        }
-        if (!data || typeof data !== "object") return;
-        const d = data as Record<string, unknown>;
+      onMessage: (d, generation) => {
+        const control = currentSubscriptionControl(generation);
+        if (!control) return;
         const incomingTargetId =
           typeof d["target_id"] === "string" ? normalizeChatTargetId(d["target_id"]) : "";
         const incomingTargetType =
@@ -447,11 +389,8 @@ export function useChatWebSocket({
           const clientError = d as unknown as WSClientErrorEvent;
           if (d["operation"] === "subscribe") {
             onSubscriptionErrorRef.current?.(clientError);
-            if (
-              d["code"] === "room_subscription_unavailable" &&
-              socket.readyState === WebSocket.OPEN
-            ) {
-              scheduleSubscriptionRecovery(socket);
+            if (d["code"] === "room_subscription_unavailable" && handle?.isOpen()) {
+              scheduleSubscriptionRecovery(generation);
             }
             return;
           }
@@ -472,63 +411,60 @@ export function useChatWebSocket({
         } else if (d["type"] === "pin.updated") {
           onPinRef.current?.(normalizedData as unknown as WSPinUpdatedEvent);
         }
-      };
+      },
 
-      socket.onerror = () => {
-        // Connection errors are expected (auth failures, network issues).
-        // No logging — the event contains no useful detail and the token must not be logged.
-      };
-
-      socket.onclose = () => {
-        if (closed || ws !== socket) return;
-        const control = currentSubscriptionControl(socket);
+      onClose: (generation) => {
+        const control = currentSubscriptionControl(generation);
         clearSubscriptionRecoveryTimer(control);
         if (subscriptionControlRef.current === control) subscriptionControlRef.current = null;
-        scheduleReconnect();
+      },
+    });
+    socketRef.current = handle;
+    // Seed a control for the generation the handle is already on, so an event
+    // that lands between acquiring the socket and its open callback is still
+    // routed. onOpen replaces it with the control that owns the subscriptions.
+    if (!subscriptionControlRef.current) {
+      const seeded = new Map(
+        desiredTargetsRef.current.map((target) => [subscriptionTargetKey(target), target]),
+      );
+      subscriptionControlRef.current = {
+        generation: handle.generation(),
+        expected: seeded,
+        pending: new Set(seeded.keys()),
+        confirmed: new Set(),
+        primaryAcknowledgement: null,
+        attempts: 0,
+        timer: null,
       };
-    };
-
-    connect();
+    }
 
     return () => {
       closed = true;
-      clearReconnectTimer();
       const control = subscriptionControlRef.current;
       clearSubscriptionRecoveryTimer(control);
-      if (ws) {
-        const socket = ws;
-        ws = null;
-        socketRef.current = null;
-        if (subscriptionControlRef.current?.socket === socket) {
-          subscriptionControlRef.current = null;
+      subscriptionControlRef.current = null;
+      const releasing = handle;
+      handle = null;
+      socketRef.current = null;
+      if (releasing?.isOpen()) {
+        // The connection outlives this hook, so its targets must be dropped
+        // explicitly — releasing alone would leave the server subscribed.
+        for (const target of control?.expected.values() ?? desiredTargetsRef.current) {
+          releasing.send({
+            type: "unsubscribe",
+            target_type: target.kind,
+            target_id: target.targetId,
+          });
         }
-        if (socket.readyState === WebSocket.OPEN) {
-          try {
-            for (const target of control?.expected.values() ?? desiredTargetsRef.current) {
-              socket.send(
-                JSON.stringify({
-                  type: "unsubscribe",
-                  target_type: target.kind,
-                  target_id: target.targetId,
-                }),
-              );
-            }
-          } catch {
-            // Ignore send errors during cleanup.
-          }
-        }
-        socket.onopen = null;
-        socket.onmessage = null;
-        socket.onerror = null;
-        socket.onclose = null;
-        socket.close();
       }
+      releasing?.release();
     };
   }, [primaryTargetSignature]);
 
   useEffect(() => {
     const control = subscriptionControlRef.current;
-    if (!control || control.socket.readyState !== WebSocket.OPEN) return;
+    const handle = socketRef.current;
+    if (!control || !handle?.isOpen()) return;
 
     const targets = JSON.parse(subscriptionSignature) as WSSubscriptionTarget[];
     const nextTargets = new Map(targets.map((target) => [subscriptionTargetKey(target), target]));
@@ -538,25 +474,21 @@ export function useChatWebSocket({
       control.expected.delete(key);
       control.pending.delete(key);
       control.confirmed.delete(key);
-      control.socket.send(
-        JSON.stringify({
-          type: "unsubscribe",
-          target_type: target.kind,
-          target_id: target.targetId,
-        }),
-      );
+      handle.send({
+        type: "unsubscribe",
+        target_type: target.kind,
+        target_id: target.targetId,
+      });
     }
     for (const [key, target] of nextTargets) {
       if (control.expected.has(key)) continue;
       control.expected.set(key, target);
       control.pending.add(key);
-      control.socket.send(
-        JSON.stringify({
-          type: "subscribe",
-          target_type: target.kind,
-          target_id: target.targetId,
-        }),
-      );
+      handle.send({
+        type: "subscribe",
+        target_type: target.kind,
+        target_id: target.targetId,
+      });
     }
     if (control.pending.size === 0) {
       if (control.timer !== null) window.clearTimeout(control.timer);
@@ -568,5 +500,5 @@ export function useChatWebSocket({
     }
   }, [subscriptionSignature]);
 
-  return { toggleReaction };
+  return { toggleReaction, connectionStatus };
 }
