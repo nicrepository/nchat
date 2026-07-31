@@ -151,6 +151,31 @@ export interface MessagingScenario {
   channelDetails: Map<string, ChannelDetailsFixture>;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
+  // Group-details payload per conversation id (issue #441).
+  groupDetails: Map<string, GroupDetailsFixture>;
+  // Conversation attachments per conversation id, newest first.
+  conversationAttachments: Map<string, AttachmentFixture[]>;
+}
+
+export interface GroupParticipantFixture {
+  user_id: string;
+  display_name: string;
+  presence?: "online" | "away" | "offline";
+}
+
+/**
+ * A group's details. Deliberately without visibility, slug or description: a
+ * chat.dm_conversations row has none of them, and the panel must never show a
+ * channel's vocabulary for a group.
+ */
+export interface GroupDetailsFixture {
+  id: string;
+  type: "group";
+  name: string;
+  created_at: string;
+  /** Every active participant; may exceed participants.length. */
+  participant_count: number;
+  participants: GroupParticipantFixture[];
 }
 
 export interface ChannelMemberFixture {
@@ -317,6 +342,8 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     pinnedIds: new Map(),
     channelDetails: new Map(),
     channelAttachments: new Map(),
+    groupDetails: new Map(),
+    conversationAttachments: new Map(),
   };
 }
 
@@ -329,6 +356,27 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
  * because the two are independent: a channel keeps its size when nobody is
  * connected, and specs need to assert exactly that.
  */
+/**
+ * Default group-details payload for a conversation in the fixture sidebar.
+ *
+ * participantCount defaults to the number of participants but is overridable,
+ * because the two are independent: the preview is capped and the total is not.
+ */
+export function groupDetailsFixture(
+  conversation: { id: string; name: string },
+  participants: GroupParticipantFixture[],
+  participantCount = participants.length,
+): GroupDetailsFixture {
+  return {
+    id: conversation.id,
+    type: "group",
+    name: conversation.name,
+    created_at: "2024-03-04T15:00:00Z",
+    participant_count: participantCount,
+    participants,
+  };
+}
+
 export function channelDetailsFixture(
   channel: { id: string; slug: string; display_name: string; type: "public" | "private" },
   onlineMembers: ChannelMemberFixture[],
@@ -471,6 +519,45 @@ async function installChannelDetailsMocks(
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({ data: details }),
+    });
+  });
+
+  await page.route("**/api/chat/dm/*/details", async (route) => {
+    const conversationID = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationID || !assertConversationAccess(conversationID)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const details = scenario.groupDetails.get(conversationID);
+    if (!details) {
+      // Mirrors the server: a 1:1 conversation and one the caller cannot reach
+      // are the same 404, so a spec cannot mistake "no panel" for "denied".
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: details }),
+    });
+  });
+
+  await page.route("**/api/files/dm/*/attachments**", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    const conversationID = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationID || !assertConversationAccess(conversationID)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: { attachments: scenario.conversationAttachments.get(conversationID) ?? [] },
+      }),
     });
   });
 

@@ -18,6 +18,8 @@ import {
   type Channel,
   type ChannelDetails,
   type ChannelMemberProfile,
+  type GroupDetails,
+  type GroupParticipantProfile,
   type DMCandidate,
   type DirectDMResult,
   type MessageBodyFormat,
@@ -983,5 +985,79 @@ export async function fetchChannelDetails(
     memberCount: nonNegativeCount(data.member_count),
     onlineCount: nonNegativeCount(data.online_member_count),
     onlineMembers,
+  };
+}
+
+// ── Group details (issue #441) ───────────────────────────────────────────────
+
+interface GroupParticipantResponse {
+  user_id?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+  presence?: unknown;
+}
+
+interface GroupDetailsEnvelope {
+  data: {
+    id?: unknown;
+    type?: unknown;
+    name?: unknown;
+    created_at?: unknown;
+    participant_count?: unknown;
+    participants?: unknown;
+  };
+}
+
+function mapGroupParticipant(raw: unknown): GroupParticipantProfile | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const participant = raw as GroupParticipantResponse;
+  if (typeof participant.user_id !== "string" || participant.user_id === "") return undefined;
+  // Presence is decoration for a group: an unknown or missing value leaves the
+  // field absent, and the participant is still rendered. Unlike the channel
+  // panel, nothing here filters the list by it.
+  const presence =
+    participant.presence === "online" ||
+    participant.presence === "away" ||
+    participant.presence === "offline"
+      ? participant.presence
+      : undefined;
+  return {
+    userId: participant.user_id,
+    displayName: typeof participant.display_name === "string" ? participant.display_name : "",
+    avatarUrl: safeAvatarUrl(participant.avatar_url),
+    presence,
+  };
+}
+
+/**
+ * Fetches the group-details payload for the panel.
+ *
+ * The server is the authority: a conversation the caller does not participate
+ * in — and a 1:1 conversation, which has no panel in this release — answers 404
+ * and this rejects, so the panel shows its error state rather than a
+ * half-rendered group.
+ */
+export async function fetchGroupDetails(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<GroupDetails> {
+  const res = await authenticatedFetch<GroupDetailsEnvelope>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/details`,
+    { method: "GET", signal },
+  );
+  const data = res.data;
+  const participants = Array.isArray(data.participants)
+    ? data.participants
+        .map(mapGroupParticipant)
+        .filter((participant): participant is GroupParticipantProfile => participant !== undefined)
+    : [];
+  return {
+    id: typeof data.id === "string" ? data.id : conversationId,
+    name: typeof data.name === "string" ? data.name : "",
+    createdAt: typeof data.created_at === "string" ? data.created_at : "",
+    // The server's total. Deriving it from the preview would under-report a
+    // group with more participants than the cap allows.
+    participantCount: nonNegativeCount(data.participant_count),
+    participants,
   };
 }

@@ -2,14 +2,27 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import ChannelDetailsPanel from "./ChannelDetailsPanel";
-import type { ChannelAttachment, ChannelDetails, Message, PinnedItem } from "./chatTypes";
-import type { ChannelDetailsState } from "./useChannelDetails";
+import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import type {
+  ChannelAttachment,
+  ChannelDetails,
+  GroupDetails,
+  Message,
+  PinnedItem,
+} from "./chatTypes";
+import type { ConversationDetailsState } from "./useConversationDetails";
 
 const currentUserId = "user-me";
 
-function channelDetails(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
+/**
+ * A channel fixture already tagged with the discriminant the panel switches on,
+ * so every existing case keeps exercising the channel vocabulary.
+ */
+function channelDetails(
+  overrides: Partial<ChannelDetails> = {},
+): { kind: "channel" } & ChannelDetails {
   return {
+    kind: "channel" as const,
     id: "ch-1",
     slug: "infra",
     name: "Infraestrutura",
@@ -22,7 +35,7 @@ function channelDetails(overrides: Partial<ChannelDetails> = {}): ChannelDetails
   };
 }
 
-function state(overrides: Partial<ChannelDetailsState> = {}): ChannelDetailsState {
+function state(overrides: Partial<ConversationDetailsState> = {}): ConversationDetailsState {
   return {
     details: { status: "ready", data: channelDetails() },
     files: { status: "ready", data: [] },
@@ -72,10 +85,11 @@ function attachment(overrides: Partial<ChannelAttachment> = {}): ChannelAttachme
   };
 }
 
-function renderPanel(overrides: Partial<Parameters<typeof ChannelDetailsPanel>[0]> = {}) {
+function renderPanel(overrides: Partial<Parameters<typeof ConversationDetailsPanel>[0]> = {}) {
   const onClose = vi.fn();
   const { unmount } = render(
-    <ChannelDetailsPanel
+    <ConversationDetailsPanel
+      kind="channel"
       state={state()}
       currentUserId={currentUserId}
       latestPin={null}
@@ -90,7 +104,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("ChannelDetailsPanel — estrutura e acessibilidade", () => {
+describe("ConversationDetailsPanel — canal: estrutura e acessibilidade", () => {
   it("is a complementary region named by its own heading", () => {
     renderPanel();
 
@@ -114,7 +128,7 @@ describe("ChannelDetailsPanel — estrutura e acessibilidade", () => {
   });
 });
 
-describe("ChannelDetailsPanel — seção Sobre", () => {
+describe("ConversationDetailsPanel — canal: seção Sobre", () => {
   it("shows the real creation date, visibility and member total", () => {
     renderPanel({
       state: state({
@@ -186,7 +200,8 @@ describe("ChannelDetailsPanel — seção Sobre", () => {
 
   it("shows a loading state and then an error state without faking data", () => {
     const { unmount } = render(
-      <ChannelDetailsPanel
+      <ConversationDetailsPanel
+        kind="channel"
         state={state({ details: { status: "loading" } })}
         currentUserId={currentUserId}
         latestPin={null}
@@ -197,7 +212,8 @@ describe("ChannelDetailsPanel — seção Sobre", () => {
     unmount();
 
     render(
-      <ChannelDetailsPanel
+      <ConversationDetailsPanel
+        kind="channel"
         state={state({ details: { status: "error" } })}
         currentUserId={currentUserId}
         latestPin={null}
@@ -210,7 +226,7 @@ describe("ChannelDetailsPanel — seção Sobre", () => {
   });
 });
 
-describe("ChannelDetailsPanel — membros", () => {
+describe("ConversationDetailsPanel — canal: membros", () => {
   const members = [
     {
       userId: currentUserId,
@@ -304,7 +320,8 @@ describe("ChannelDetailsPanel — membros", () => {
     unmount();
 
     render(
-      <ChannelDetailsPanel
+      <ConversationDetailsPanel
+        kind="channel"
         state={state({ details: { status: "error" } })}
         currentUserId={currentUserId}
         latestPin={null}
@@ -340,7 +357,7 @@ describe("ChannelDetailsPanel — membros", () => {
   });
 });
 
-describe("ChannelDetailsPanel — ações indisponíveis", () => {
+describe("ConversationDetailsPanel — canal: ações indisponíveis", () => {
   it("offers the member actions as disabled controls with a stated reason", async () => {
     renderPanel();
 
@@ -361,7 +378,7 @@ describe("ChannelDetailsPanel — ações indisponíveis", () => {
   });
 });
 
-describe("ChannelDetailsPanel — mensagem fixada", () => {
+describe("ConversationDetailsPanel — canal: mensagem fixada", () => {
   it("shows an empty state when nothing is pinned", () => {
     renderPanel();
 
@@ -394,7 +411,7 @@ describe("ChannelDetailsPanel — mensagem fixada", () => {
   });
 });
 
-describe("ChannelDetailsPanel — arquivos recentes", () => {
+describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
   it("shows name, timestamp and formatted size, in the order received", () => {
     renderPanel({
       state: state({
@@ -490,7 +507,8 @@ describe("ChannelDetailsPanel — arquivos recentes", () => {
     unmount();
 
     const loading = render(
-      <ChannelDetailsPanel
+      <ConversationDetailsPanel
+        kind="channel"
         state={state({ files: { status: "loading" } })}
         currentUserId={currentUserId}
         latestPin={null}
@@ -501,7 +519,8 @@ describe("ChannelDetailsPanel — arquivos recentes", () => {
     loading.unmount();
 
     render(
-      <ChannelDetailsPanel
+      <ConversationDetailsPanel
+        kind="channel"
         state={state({ files: { status: "error" } })}
         currentUserId={currentUserId}
         latestPin={null}
@@ -511,5 +530,207 @@ describe("ChannelDetailsPanel — arquivos recentes", () => {
     // The channel's own metadata survives a file-service failure.
     expect(screen.getByText("Não foi possível carregar os arquivos.")).toBeInTheDocument();
     expect(screen.getByText(/Canal público/)).toBeInTheDocument();
+  });
+});
+
+// ── Painel de grupo (issue #441) ─────────────────────────────────────────────
+
+function groupDetails(overrides: Partial<GroupDetails> = {}): { kind: "group" } & GroupDetails {
+  return {
+    kind: "group" as const,
+    id: "conv-1",
+    name: "Time de Infra",
+    createdAt: "2024-03-04T15:00:00.000Z",
+    participantCount: 4,
+    participants: [],
+    ...overrides,
+  };
+}
+
+function renderGroupPanel(details: { kind: "group" } & GroupDetails, viewerId = currentUserId) {
+  const onClose = vi.fn();
+  const rendered = render(
+    <ConversationDetailsPanel
+      kind="group"
+      state={{ details: { status: "ready", data: details }, files: { status: "ready", data: [] } }}
+      currentUserId={viewerId}
+      latestPin={null}
+      onClose={onClose}
+    />,
+  );
+  return { onClose, ...rendered };
+}
+
+describe("ConversationDetailsPanel — grupo", () => {
+  it("uses the group heading and close label, not the channel ones", () => {
+    renderGroupPanel(groupDetails());
+
+    expect(screen.getByRole("complementary", { name: "Detalhes do grupo" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Detalhes do grupo" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Detalhes do canal" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Fechar detalhes do grupo" })).toBeInTheDocument();
+  });
+
+  it("shows the group name, creation date and participant total", () => {
+    renderGroupPanel(groupDetails({ name: "Time de Infra", participantCount: 12 }));
+
+    expect(screen.getByTestId("chat-details-group-name")).toHaveTextContent("Time de Infra");
+    expect(screen.getByText(/Criado em 4 de março de 2024/)).toBeInTheDocument();
+    expect(screen.getByText(/12 participantes/)).toBeInTheDocument();
+  });
+
+  it("never shows a channel's visibility or description", () => {
+    renderGroupPanel(groupDetails());
+
+    // A group is neither public nor private, and has no description column.
+    expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Canal privado/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
+    // Nor the channel's people vocabulary.
+    expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
+  });
+
+  it("calls the section Participantes and counts the server total", () => {
+    renderGroupPanel(
+      groupDetails({
+        participantCount: 12,
+        participants: [{ userId: "u-1", displayName: "Ana" }],
+      }),
+    );
+
+    // The heading counts every participant, not the length of the capped list.
+    expect(screen.getByRole("heading", { name: "Participantes (12)" })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps offline participants in the list", () => {
+    renderGroupPanel(
+      groupDetails({
+        participantCount: 2,
+        participants: [
+          { userId: "u-1", displayName: "Conectada", presence: "online" },
+          { userId: "u-2", displayName: "Desconectado", presence: "offline" },
+        ],
+      }),
+    );
+
+    const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
+      "listitem",
+    );
+    // Unlike the channel panel, presence decorates a row and never removes it.
+    expect(rows).toHaveLength(2);
+    expect(screen.getByText("Desconectado")).toBeInTheDocument();
+    expect(screen.getByText(/Participante · Offline/)).toBeInTheDocument();
+  });
+
+  it("marks the authenticated participant by id, not by name", () => {
+    renderGroupPanel(
+      groupDetails({
+        participantCount: 2,
+        participants: [
+          { userId: currentUserId, displayName: "Álvaro" },
+          // Same display name, different person: only the ID may decide.
+          { userId: "someone-else", displayName: "Álvaro" },
+        ],
+      }),
+    );
+
+    const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
+      "listitem",
+    );
+    expect(within(rows[0]).getByText("Você")).toBeInTheDocument();
+    expect(within(rows[1]).queryByText("Você")).not.toBeInTheDocument();
+  });
+
+  it("does not mark anyone when the viewer's id is unknown", () => {
+    renderGroupPanel(groupDetails({ participants: [{ userId: "", displayName: "Sem id" }] }), "");
+
+    expect(screen.queryByText("Você")).not.toBeInTheDocument();
+  });
+
+  it("handles an empty participant list without claiming the group is broken", () => {
+    renderGroupPanel(groupDetails({ participantCount: 0, participants: [] }));
+
+    expect(screen.getByText("Nenhum participante para exibir.")).toBeInTheDocument();
+  });
+
+  it("falls back to a neutral label when the group has no title", () => {
+    renderGroupPanel(groupDetails({ name: "" }));
+
+    expect(screen.getByTestId("chat-details-group-name")).toHaveTextContent("Grupo sem nome");
+  });
+
+  it("renders the group name and participant names as text, never as markup", () => {
+    renderGroupPanel(
+      groupDetails({
+        name: "<img src=x onerror=alert(1)>",
+        participants: [{ userId: "u-1", displayName: "<script>alert(1)</script>" }],
+      }),
+    );
+
+    expect(screen.getByTestId("chat-details-group-name")).toHaveTextContent(
+      "<img src=x onerror=alert(1)>",
+    );
+    expect(screen.getByText("<script>alert(1)</script>")).toBeInTheDocument();
+    expect(document.querySelector("img[src='x']")).toBeNull();
+    expect(document.querySelector("script")).toBeNull();
+  });
+
+  it("uses group wording for the empty pin and file states", () => {
+    renderGroupPanel(groupDetails());
+
+    expect(screen.getByTestId("chat-details-pin-empty")).toHaveTextContent(
+      "Nenhuma mensagem fixada neste grupo.",
+    );
+    expect(screen.getByTestId("chat-details-files-empty")).toHaveTextContent(
+      "Nenhum arquivo enviado neste grupo.",
+    );
+  });
+
+  it("offers the participant actions as explicitly unavailable", async () => {
+    renderGroupPanel(groupDetails());
+
+    const addParticipants = screen.getByRole("button", { name: /Adicionar participantes/ });
+    expect(addParticipants).toBeDisabled();
+    expect(addParticipants).toHaveAttribute("aria-describedby");
+
+    await userEvent.click(addParticipants);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "A gestão de participantes do grupo ainda não está disponível nesta versão.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows group wording while loading and on error", () => {
+    const { unmount } = render(
+      <ConversationDetailsPanel
+        kind="group"
+        state={{ details: { status: "loading" }, files: { status: "loading" } }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Carregando informações do grupo…")).toBeInTheDocument();
+    expect(screen.getByText("Carregando participantes…")).toBeInTheDocument();
+    unmount();
+
+    render(
+      <ConversationDetailsPanel
+        kind="group"
+        state={{ details: { status: "error" }, files: { status: "error" } }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Não foi possível carregar as informações do grupo."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Não foi possível carregar os participantes.")).toBeInTheDocument();
   });
 });

@@ -38,9 +38,9 @@ import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from 
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
-import { useChannelDetails } from "./useChannelDetails";
-import ChannelDetailsPanel from "./ChannelDetailsPanel";
-import { channelDetailsPanelId } from "./channelDetailsDisplay";
+import { useConversationDetails } from "./useConversationDetails";
+import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
@@ -196,6 +196,8 @@ function IconWarning() {
 
 interface DetailsToggleProps {
   open: boolean;
+  /** Names the control after what it opens: a channel's or a group's details. */
+  label: string;
   onToggle: () => void;
 }
 
@@ -208,7 +210,7 @@ interface DetailsToggleProps {
  * what lets the panel hand focus back here when it closes itself.
  */
 const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function DetailsToggle(
-  { open, onToggle },
+  { open, label, onToggle },
   ref,
 ) {
   return (
@@ -217,9 +219,9 @@ const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function
         ref={ref}
         type="button"
         className="chat-msg-area__header-btn"
-        aria-label="Detalhes do canal"
+        aria-label={label}
         aria-expanded={open}
-        aria-controls={channelDetailsPanelId}
+        aria-controls={conversationDetailsPanelId}
         onClick={onToggle}
         data-testid="chat-details-toggle"
       >
@@ -252,9 +254,11 @@ interface HeaderDMProps {
   name: string;
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
+  /** Present only for ad-hoc groups; a 1:1 DM has no details panel yet. */
+  detailsToggle?: React.ReactNode;
 }
 
-function HeaderDM({ name, counterpart }: HeaderDMProps) {
+function HeaderDM({ name, counterpart, detailsToggle }: HeaderDMProps) {
   const src = counterpart?.avatarUrl;
   // A load failure is scoped to the URL that was current when it happened, so a
   // change of src must clear it — otherwise navigating A → B → A would never
@@ -293,6 +297,7 @@ function HeaderDM({ name, counterpart }: HeaderDMProps) {
         )}
       </div>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {detailsToggle}
     </header>
   );
 }
@@ -903,9 +908,27 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
   // Details are a channel concept; a DM has no members list, visibility or
   // creation date to show, so the control is not rendered there at all.
-  const supportsDetails = kind === "channel" && targetId !== "";
-  const detailsChannelId = supportsDetails && detailsOpen ? targetId : null;
-  const detailsState = useChannelDetails(detailsChannelId);
+  // Which aggregate the panel would describe, from the domain discriminant:
+  // chat.channels for a channel, and a chat.dm_conversations row of type
+  // 'group' for an ad-hoc group. A 1:1 DM resolves to null — it has no panel in
+  // this release (issue #441) — and so does an unknown target.
+  //
+  // activeDM.type is the server's own `direct`/`group` value carried by the
+  // sidebar payload, never the participant count or the conversation's name.
+  const detailsKind: "channel" | "group" | null =
+    targetId === ""
+      ? null
+      : kind === "channel"
+        ? "channel"
+        : activeDM?.type === "group"
+          ? "group"
+          : null;
+  const supportsDetails = detailsKind !== null;
+  const detailsTarget = useMemo(
+    () => (detailsKind && detailsOpen ? { kind: detailsKind, id: targetId } : null),
+    [detailsKind, detailsOpen, targetId],
+  );
+  const detailsState = useConversationDetails(detailsTarget);
 
   const closeDetails = useCallback(() => {
     setDetailsOpen(false);
@@ -1091,12 +1114,30 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             name={resolvedName}
             detailsToggle={
               supportsDetails ? (
-                <DetailsToggle ref={detailsToggleRef} open={detailsOpen} onToggle={toggleDetails} />
+                <DetailsToggle
+                  ref={detailsToggleRef}
+                  open={detailsOpen}
+                  label="Detalhes do canal"
+                  onToggle={toggleDetails}
+                />
               ) : undefined
             }
           />
         ) : (
-          <HeaderDM name={resolvedName} counterpart={activeDM?.counterpart} />
+          <HeaderDM
+            name={resolvedName}
+            counterpart={activeDM?.counterpart}
+            detailsToggle={
+              supportsDetails ? (
+                <DetailsToggle
+                  ref={detailsToggleRef}
+                  open={detailsOpen}
+                  label="Detalhes do grupo"
+                  onToggle={toggleDetails}
+                />
+              ) : undefined
+            }
+          />
         )}
 
         <PinnedBar pin={latestPin} onUnpin={togglePin} />
@@ -1212,7 +1253,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       </div>
 
       {showDetails && (
-        <ChannelDetailsPanel
+        <ConversationDetailsPanel
+          kind={detailsKind ?? "channel"}
           state={detailsState}
           currentUserId={ctx.currentUserId}
           latestPin={latestPin}

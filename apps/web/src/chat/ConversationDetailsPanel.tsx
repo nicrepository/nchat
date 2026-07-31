@@ -1,5 +1,15 @@
 /**
- * ChannelDetailsPanel — the "Detalhes do canal" side panel (issue #435).
+ * ConversationDetailsPanel — the side panel for a channel ("Detalhes do canal",
+ * issue #435) and for an ad-hoc group ("Detalhes do grupo", issue #441).
+ *
+ * One shell, two vocabularies. The frame — heading, close button, loading and
+ * error states, the pinned-message section and the recent-files section — is
+ * identical for both, because those concepts are identical for both. What
+ * differs is the aggregate being described: a channel has visibility, a
+ * creation date and members; a group has a name, a creation date and
+ * participants, and no visibility at all. Those two sections are therefore
+ * separate components selected by the `kind` tag, not one component with a
+ * pile of optional props.
  *
  * Security invariants:
  * - Every server-supplied string (channel name, member names, file names, pin
@@ -20,9 +30,16 @@
 
 import { useEffect, useRef } from "react";
 
-import "./ChannelDetailsPanel.css";
+import "./ConversationDetailsPanel.css";
 import RichTextRenderer from "./RichTextRenderer";
-import type { ChannelAttachment, ChannelMemberProfile, PinnedItem } from "./chatTypes";
+import type {
+  ChannelAttachment,
+  ChannelDetails,
+  ChannelMemberProfile,
+  GroupDetails,
+  GroupParticipantProfile,
+  PinnedItem,
+} from "./chatTypes";
 import {
   avatarColorFor,
   formatDayLabel,
@@ -31,12 +48,12 @@ import {
   initialsFrom,
   senderLabel,
 } from "./messageDisplay";
-import type { ChannelDetailsState } from "./useChannelDetails";
+import type { ConversationDetailsState } from "./useConversationDetails";
 import {
-  channelDetailsPanelId,
-  channelDetailsTitleId,
+  conversationDetailsPanelId,
+  conversationDetailsTitleId,
   formatFileSize,
-} from "./channelDetailsDisplay";
+} from "./conversationDetailsDisplay";
 
 /** Material symbol name for a file, chosen from the *detected* type only. */
 function fileIconFor(contentType: string): string {
@@ -105,12 +122,20 @@ function UnavailableAction({
   );
 }
 
+/**
+ * A person row, shared by the channel's members and the group's participants.
+ *
+ * `subtitle` is what the two surfaces disagree about — a channel shows the
+ * channel role, a group has no role to show — so it is passed in rather than
+ * derived here from a union.
+ */
 interface MemberRowProps {
-  member: ChannelMemberProfile;
+  member: ChannelMemberProfile | GroupParticipantProfile;
+  subtitle: string;
   isCurrentUser: boolean;
 }
 
-function MemberRow({ member, isCurrentUser }: MemberRowProps) {
+function MemberRow({ member, subtitle, isCurrentUser }: MemberRowProps) {
   const color = avatarColorFor(member.userId);
   return (
     <li className="chat-details__member">
@@ -142,7 +167,7 @@ function MemberRow({ member, isCurrentUser }: MemberRowProps) {
           {isCurrentUser && <span className="chat-details__badge">Você</span>}
         </span>
         <span className="chat-details__member-role">
-          {member.role === "moderator" ? "Moderador" : "Membro"}
+          {subtitle}
           {member.presence && ` · ${presenceLabel[member.presence]}`}
         </span>
       </span>
@@ -150,8 +175,164 @@ function MemberRow({ member, isCurrentUser }: MemberRowProps) {
   );
 }
 
-interface ChannelDetailsPanelProps {
-  state: ChannelDetailsState;
+/**
+ * The "Sobre" section of a channel: description placeholder, creation date,
+ * visibility and member total.
+ */
+function ChannelAboutSection({ details }: { details: ChannelDetails }) {
+  return (
+    <>
+      {/*
+        chat.channels has no description column, so there is nothing to render
+        here yet. The empty state is the honest outcome, not a placeholder for
+        data the server withheld.
+      */}
+      <p className="chat-details__empty" data-testid="chat-details-description">
+        Este canal ainda não tem descrição.
+      </p>
+      <p className="chat-details__meta">
+        <span className="material-symbols-outlined" aria-hidden="true">
+          calendar_today
+        </span>
+        {details.createdAt
+          ? `Criado em ${formatLongDate(details.createdAt)}`
+          : "Data de criação indisponível"}
+      </p>
+      <p className="chat-details__meta">
+        <span className="material-symbols-outlined" aria-hidden="true">
+          {details.type === "private" ? "lock" : "public"}
+        </span>
+        {details.type === "private" ? "Canal privado" : "Canal público"}
+        {" · "}
+        {details.memberCount === 1 ? "1 membro" : `${details.memberCount} membros`}
+      </p>
+    </>
+  );
+}
+
+/**
+ * The "Sobre" section of a group: name, creation date and participant total.
+ *
+ * Deliberately without visibility: a group is not public or private, it is a
+ * closed conversation between the people in it, and rendering a channel's
+ * vocabulary here would state something the domain never says.
+ */
+function GroupAboutSection({ details }: { details: GroupDetails }) {
+  return (
+    <>
+      <p className="chat-details__group-name" data-testid="chat-details-group-name">
+        {details.name || "Grupo sem nome"}
+      </p>
+      <p className="chat-details__meta">
+        <span className="material-symbols-outlined" aria-hidden="true">
+          calendar_today
+        </span>
+        {details.createdAt
+          ? `Criado em ${formatLongDate(details.createdAt)}`
+          : "Data de criação indisponível"}
+      </p>
+      <p className="chat-details__meta">
+        <span className="material-symbols-outlined" aria-hidden="true">
+          group
+        </span>
+        {details.participantCount === 1
+          ? "1 participante"
+          : `${details.participantCount} participantes`}
+      </p>
+    </>
+  );
+}
+
+/** The channel's online-members list (issue #435): presence-filtered server-side. */
+function ChannelMembersSection({
+  details,
+  currentUserId,
+}: {
+  details: ChannelDetails;
+  currentUserId: string;
+}) {
+  if (details.onlineMembers.length === 0) {
+    // "ninguem online agora", never "este canal nao tem membros" — the
+    // channel's size is reported separately and is unaffected.
+    return <SectionMessage>Nenhum membro online no momento.</SectionMessage>;
+  }
+  return (
+    <ul className="chat-details__members" aria-label="Membros online do canal">
+      {details.onlineMembers.map((member) => (
+        <MemberRow
+          key={member.userId}
+          member={member}
+          subtitle={member.role === "moderator" ? "Moderador" : "Membro"}
+          isCurrentUser={Boolean(currentUserId) && member.userId === currentUserId}
+        />
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The group's participant list (issue #441).
+ *
+ * Every active participant appears, online or not: presence is shown beside a
+ * participant, never used to decide whether they are shown.
+ */
+function GroupParticipantsSection({
+  details,
+  currentUserId,
+}: {
+  details: GroupDetails;
+  currentUserId: string;
+}) {
+  if (details.participants.length === 0) {
+    return <SectionMessage>Nenhum participante para exibir.</SectionMessage>;
+  }
+  return (
+    <ul className="chat-details__members" aria-label="Participantes do grupo">
+      {details.participants.map((participant) => (
+        <MemberRow
+          key={participant.userId}
+          member={participant}
+          subtitle="Participante"
+          isCurrentUser={Boolean(currentUserId) && participant.userId === currentUserId}
+        />
+      ))}
+    </ul>
+  );
+}
+
+/** Per-kind wording, in one table so a missing case is a type error. */
+const panelCopy = {
+  channel: {
+    title: "Detalhes do canal",
+    closeLabel: "Fechar detalhes do canal",
+    peopleHeading: "Membros online",
+    peopleUnavailable: "A gestão de membros do canal ainda não está disponível nesta versão.",
+    addAction: "Adicionar membros",
+    pinEmpty: "Nenhuma mensagem fixada neste canal.",
+    filesEmpty: "Nenhum arquivo enviado neste canal.",
+    filesUnavailable: "A central de arquivos do canal ainda não está disponível nesta versão.",
+  },
+  group: {
+    title: "Detalhes do grupo",
+    closeLabel: "Fechar detalhes do grupo",
+    peopleHeading: "Participantes",
+    peopleUnavailable: "A gestão de participantes do grupo ainda não está disponível nesta versão.",
+    addAction: "Adicionar participantes",
+    pinEmpty: "Nenhuma mensagem fixada neste grupo.",
+    filesEmpty: "Nenhum arquivo enviado neste grupo.",
+    filesUnavailable: "A central de arquivos do grupo ainda não está disponível nesta versão.",
+  },
+} as const;
+
+interface ConversationDetailsPanelProps {
+  /**
+   * Which vocabulary the frame uses. It is the caller's domain discriminant,
+   * resolved from the conversation record — never from the route or the name —
+   * and it is available before the data loads, so the heading is correct while
+   * the sections are still fetching.
+   */
+  kind: "channel" | "group";
+  state: ConversationDetailsState;
   /** Identifies the viewer by ID; a display name would be ambiguous. */
   currentUserId: string;
   /**
@@ -163,12 +344,14 @@ interface ChannelDetailsPanelProps {
   onClose: () => void;
 }
 
-export default function ChannelDetailsPanel({
+export default function ConversationDetailsPanel({
+  kind,
   state,
   currentUserId,
   latestPin,
   onClose,
-}: ChannelDetailsPanelProps) {
+}: ConversationDetailsPanelProps) {
+  const copy = panelCopy[kind];
   const closeButtonRef = useRef<HTMLButtonElement>(null);
 
   // Focus moves into the panel once, on open, so a keyboard user lands on it
@@ -184,20 +367,21 @@ export default function ChannelDetailsPanel({
 
   return (
     <aside
-      id={channelDetailsPanelId}
+      id={conversationDetailsPanelId}
       className="chat-details"
-      aria-labelledby={channelDetailsTitleId}
-      data-testid="chat-channel-details"
+      aria-labelledby={conversationDetailsTitleId}
+      data-testid="chat-conversation-details"
+      data-conversation-kind={kind}
     >
       <div className="chat-details__head">
-        <h2 id={channelDetailsTitleId} className="chat-details__title">
-          Detalhes do canal
+        <h2 id={conversationDetailsTitleId} className="chat-details__title">
+          {copy.title}
         </h2>
         <button
           ref={closeButtonRef}
           type="button"
           className="chat-details__close"
-          aria-label="Fechar detalhes do canal"
+          aria-label={copy.closeLabel}
           onClick={onClose}
         >
           <span className="material-symbols-outlined" aria-hidden="true">
@@ -213,94 +397,77 @@ export default function ChannelDetailsPanel({
             Sobre
           </h3>
           {details.status === "loading" && (
-            <SectionMessage role="status">Carregando informações do canal…</SectionMessage>
+            <SectionMessage role="status">
+              {kind === "channel"
+                ? "Carregando informações do canal…"
+                : "Carregando informações do grupo…"}
+            </SectionMessage>
           )}
           {details.status === "error" && (
             <SectionMessage role="alert">
-              Não foi possível carregar as informações do canal.
+              {kind === "channel"
+                ? "Não foi possível carregar as informações do canal."
+                : "Não foi possível carregar as informações do grupo."}
             </SectionMessage>
           )}
-          {details.status === "ready" && (
-            <>
-              {/*
-                chat.channels has no description column, so there is nothing to
-                render here yet. The empty state is the honest outcome, not a
-                placeholder for data the server withheld.
-              */}
-              <p className="chat-details__empty" data-testid="chat-details-description">
-                Este canal ainda não tem descrição.
-              </p>
-              <p className="chat-details__meta">
-                <span className="material-symbols-outlined" aria-hidden="true">
-                  calendar_today
-                </span>
-                {details.data.createdAt
-                  ? `Criado em ${formatLongDate(details.data.createdAt)}`
-                  : "Data de criação indisponível"}
-              </p>
-              <p className="chat-details__meta">
-                <span className="material-symbols-outlined" aria-hidden="true">
-                  {details.data.type === "private" ? "lock" : "public"}
-                </span>
-                {details.data.type === "private" ? "Canal privado" : "Canal público"}
-                {" · "}
-                {details.data.memberCount === 1
-                  ? "1 membro"
-                  : `${details.data.memberCount} membros`}
-              </p>
-            </>
-          )}
+          {details.status === "ready" &&
+            (details.data.kind === "channel" ? (
+              <ChannelAboutSection details={details.data} />
+            ) : (
+              <GroupAboutSection details={details.data} />
+            ))}
         </section>
 
-        {/* ── Membros online ────────────────────────────────────────────── */}
-        <section className="chat-details__section" aria-labelledby="chat-details-members">
+        {/* ── Pessoas (membros online / participantes) ──────────────────── */}
+        <section className="chat-details__section" aria-labelledby="chat-details-people">
           <div className="chat-details__section-head">
             {/*
-              The heading counts onlineCount, not the rendered list: the list is
-              a capped preview, so showing its length would under-report a
-              channel with more online members than fit. The channel's total size
-              lives in "Sobre" above and is a different number entirely.
+              The count is the server's total for this section, never the length
+              of the rendered list: both lists are capped previews. For a channel
+              that total is how many members are online; for a group it is how
+              many participants there are.
             */}
-            <h3 id="chat-details-members" className="chat-details__label">
-              Membros online
-              {details.status === "ready" && ` (${details.data.onlineCount})`}
+            <h3 id="chat-details-people" className="chat-details__label">
+              {copy.peopleHeading}
+              {details.status === "ready" &&
+                ` (${
+                  details.data.kind === "channel"
+                    ? details.data.onlineCount
+                    : details.data.participantCount
+                })`}
             </h3>
             <UnavailableAction
               label="Ver todos"
-              reasonId="chat-details-members-unavailable"
+              reasonId="chat-details-people-unavailable"
               className="chat-details__link-action"
             />
           </div>
           {details.status === "loading" && (
-            <SectionMessage role="status">Carregando membros…</SectionMessage>
+            <SectionMessage role="status">
+              {kind === "channel" ? "Carregando membros…" : "Carregando participantes…"}
+            </SectionMessage>
           )}
           {details.status === "error" && (
-            <SectionMessage role="alert">Não foi possível carregar os membros.</SectionMessage>
+            <SectionMessage role="alert">
+              {kind === "channel"
+                ? "Não foi possível carregar os membros."
+                : "Não foi possível carregar os participantes."}
+            </SectionMessage>
           )}
           {details.status === "ready" &&
-            (details.data.onlineMembers.length === 0 ? (
-              // "ninguém online agora", never "este canal não tem membros" —
-              // the channel's size is reported separately and is unaffected.
-              <SectionMessage>Nenhum membro online no momento.</SectionMessage>
+            (details.data.kind === "channel" ? (
+              <ChannelMembersSection details={details.data} currentUserId={currentUserId} />
             ) : (
-              <ul className="chat-details__members" aria-label="Membros online do canal">
-                {details.data.onlineMembers.map((member) => (
-                  <MemberRow
-                    key={member.userId}
-                    member={member}
-                    isCurrentUser={Boolean(currentUserId) && member.userId === currentUserId}
-                  />
-                ))}
-              </ul>
+              <GroupParticipantsSection details={details.data} currentUserId={currentUserId} />
             ))}
           <UnavailableAction
-            label="Adicionar membros"
+            label={copy.addAction}
             icon="person_add"
-            reasonId="chat-details-members-unavailable"
+            reasonId="chat-details-people-unavailable"
             className="chat-details__wide-action"
           />
-          <p id="chat-details-members-unavailable" className="chat-details__note">
-            A gestão de membros do canal ainda não está disponível nesta versão.
+          <p id="chat-details-people-unavailable" className="chat-details__note">
+            {copy.peopleUnavailable}
           </p>
         </section>
 
@@ -311,7 +478,7 @@ export default function ChannelDetailsPanel({
           </h3>
           {latestPin === null ? (
             <p className="chat-details__empty" data-testid="chat-details-pin-empty">
-              Nenhuma mensagem fixada neste canal.
+              {copy.pinEmpty}
             </p>
           ) : (
             <div className="chat-details__pin" data-testid="chat-details-pin">
@@ -360,7 +527,7 @@ export default function ChannelDetailsPanel({
           {files.status === "ready" &&
             (files.data.length === 0 ? (
               <p className="chat-details__empty" data-testid="chat-details-files-empty">
-                Nenhum arquivo enviado neste canal.
+                {copy.filesEmpty}
               </p>
             ) : (
               <ul className="chat-details__files" aria-label="Arquivos recentes">
@@ -392,7 +559,7 @@ export default function ChannelDetailsPanel({
               </ul>
             ))}
           <p id="chat-details-files-unavailable" className="chat-details__note">
-            A central de arquivos do canal ainda não está disponível nesta versão.
+            {copy.filesUnavailable}
           </p>
         </section>
       </div>

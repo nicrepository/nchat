@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatFileSize } from "./channelDetailsDisplay";
+import { formatFileSize } from "./conversationDetailsDisplay";
 
 describe("formatFileSize", () => {
   it("keeps bytes whole below one kibibyte", () => {
