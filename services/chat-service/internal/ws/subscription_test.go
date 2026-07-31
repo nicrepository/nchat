@@ -75,6 +75,9 @@ func (f *fakeDMStore) CreateGroupConversation(_ context.Context, _ storage.Creat
 func (f *fakeDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ string) ([]domain.DMConversation, error) {
 	return nil, nil
 }
+func (f *fakeDMStore) GetDirectCounterpartProfile(_ context.Context, _, _, _ string) (domain.DMDirectProfile, error) {
+	return domain.DMDirectProfile{}, nil
+}
 func (f *fakeDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
 	return storage.DMParticipantPage{}, nil
 }

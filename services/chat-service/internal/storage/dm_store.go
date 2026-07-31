@@ -49,6 +49,14 @@ type DMStore interface {
 	// participants, in one round trip. The caller's access to the conversation
 	// must already have been settled.
 	ListParticipantProfiles(ctx context.Context, workspaceID, conversationID string, limit int) (DMParticipantPage, error)
+	// GetDirectCounterpartProfile authorises callerID for conversationID and
+	// returns the one active participant who is not them, in a single query.
+	// It is the authority for both: any earlier visibility check is a
+	// convenience, never the permission this read relies on. It answers
+	// ErrNotFound when the caller is not currently authorised *or* no such
+	// participant exists — the two are deliberately indistinguishable — and
+	// ErrInconsistentDirectConversation when more than one does.
+	GetDirectCounterpartProfile(ctx context.Context, workspaceID, conversationID, callerID string) (domain.DMDirectProfile, error)
 }
 
 // DMParticipantPage is one capped page of a conversation's participants plus the
@@ -131,6 +139,111 @@ func (s *PGXDMStore) ListParticipantProfiles(
 		return DMParticipantPage{}, fmt.Errorf("iterate dm participant profiles: %w", err)
 	}
 	return page, nil
+}
+
+// GetDirectCounterpartProfile authorises the caller and resolves who the other
+// side of a 1:1 conversation is, in one query (issue #443).
+//
+// It is authoritative, not a projection of a decision taken earlier. Access is
+// re-established here, in the same statement and against the same snapshot that
+// reads the profile, so a membership revoked between an earlier visibility check
+// and this call cannot leave a stale "yes" standing: the two EXISTS clauses put
+// the caller's own dm_members and workspace_members rows into the predicate that
+// selects the counterpart, and losing either yields zero rows rather than a
+// profile.
+//
+// The caller's user ID is a *predicate*, never a selector: the query asks for
+// the active participants of this conversation who are not the caller, so the
+// counterpart cannot be chosen by the client and the caller can never be
+// returned as their own profile. Two people with the same display name are
+// still two rows with two IDs — identity here is dm.user_id, never a name.
+//
+// The membership predicates are the same set ListParticipantProfiles applies,
+// for the same reason: "who is in this conversation" must not mean one thing
+// for access and another for display. The conversation must be active and in
+// workspaceID, dc.type must be 'direct' as the database recorded it, each
+// participant's dm_members row must be 'active' (so someone who left is gone),
+// they must still be an active workspace member, and the counterpart's account
+// must be active and not deleted.
+//
+// The row limit is 2, not 1: one row is the normal case, and a second is what
+// distinguishes a corrupt 'direct' row from a healthy one. Taking LIMIT 1 would
+// silently pick an arbitrary "other participant" out of a conversation the
+// domain says cannot have several.
+//
+// The projection is explicit and minimal — no SELECT * — so a future column on
+// auth.users cannot start flowing into a profile response by accident.
+//
+// Zero rows is deliberately one answer for several causes — no such
+// conversation, another workspace, not a direct row, caller not (or no longer)
+// a participant, caller suspended, counterpart gone. Telling them apart would
+// take a second query whose only product is a more precise denial, which is
+// exactly the thing a caller must not be given.
+func (s *PGXDMStore) GetDirectCounterpartProfile(
+	ctx context.Context, workspaceID, conversationID, callerID string,
+) (domain.DMDirectProfile, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text,
+		       COALESCE(
+		           NULLIF(BTRIM(u.full_name), ''),
+		           NULLIF(BTRIM(u.display_name), ''),
+		           ''
+		       ) AS display_name,
+		       COALESCE(u.avatar_url, '') AS avatar_url,
+		       COALESCE(u.email::text, '') AS email
+		FROM chat.dm_conversations dc
+		JOIN chat.dm_members dm
+		  ON dm.conversation_id = dc.id
+		 AND dm.status = 'active'
+		 AND dm.user_id <> $3::uuid
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = dc.workspace_id
+		 AND wm.user_id = dm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE dc.id = $2::uuid
+		  AND dc.workspace_id = $1::uuid
+		  AND dc.status = 'active'
+		  AND dc.type = 'direct'
+		  AND EXISTS (
+		      SELECT 1
+		      FROM chat.dm_members caller_dm
+		      WHERE caller_dm.conversation_id = dc.id
+		        AND caller_dm.user_id = $3::uuid
+		        AND caller_dm.status = 'active'
+		  )
+		  AND EXISTS (
+		      SELECT 1
+		      FROM chat.workspace_members caller_wm
+		      WHERE caller_wm.workspace_id = dc.workspace_id
+		        AND caller_wm.user_id = $3::uuid
+		        AND caller_wm.status = 'active'
+		  )
+		LIMIT 2`, workspaceID, conversationID, callerID)
+	if err != nil {
+		return domain.DMDirectProfile{}, fmt.Errorf("get direct counterpart profile: %w", err)
+	}
+	defer rows.Close()
+
+	profiles := make([]domain.DMDirectProfile, 0, 2)
+	for rows.Next() {
+		var profile domain.DMDirectProfile
+		if err := rows.Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL, &profile.Email); err != nil {
+			return domain.DMDirectProfile{}, fmt.Errorf("scan direct counterpart profile: %w", err)
+		}
+		profiles = append(profiles, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.DMDirectProfile{}, fmt.Errorf("iterate direct counterpart profile: %w", err)
+	}
+	switch len(profiles) {
+	case 1:
+		return profiles[0], nil
+	case 0:
+		return domain.DMDirectProfile{}, domain.ErrNotFound
+	default:
+		return domain.DMDirectProfile{}, domain.ErrInconsistentDirectConversation
+	}
 }
 
 // PGXDMStore implements DMStore using a pgx connection pool.

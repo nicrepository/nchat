@@ -259,6 +259,28 @@ type DMParticipantProfile struct {
 	Presence    string
 }
 
+// DMDirectProfile is the other participant of a 1:1 conversation, as the
+// profile panel renders them (issue #443).
+//
+// It is a strictly larger projection than DMParticipantProfile by exactly one
+// field — Email — because the prototype's profile card shows the corporate
+// address and a participant row does not. Everything else auth.users holds
+// (auth_source, external_subject, status, last_login_at, email_verified_at,
+// the password credential, every session and device row) stays out: this is a
+// profile summary, not a directory record.
+//
+// Job title, department and time zone are deliberately absent as fields. No
+// column anywhere in auth.users, chat.workspace_members or any other table
+// stores them today, so there is nothing to project; inventing a field the
+// database cannot fill would only move the fabrication one layer down. The
+// panel renders "Não informado" for those rows, which is the truth.
+type DMDirectProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Email       string
+}
+
 // MaxDMDetailsParticipants bounds the participant page the group-details
 // endpoint returns.
 //

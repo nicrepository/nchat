@@ -1,15 +1,18 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type {
   ChannelAttachment,
   ChannelDetails,
+  DirectDetails,
+  DirectProfile,
   GroupDetails,
   Message,
   PinnedItem,
 } from "./chatTypes";
+import { localTimeRefreshMs } from "./conversationDetailsDisplay";
 import type { ConversationDetailsState } from "./useConversationDetails";
 
 const currentUserId = "user-me";
@@ -98,6 +101,17 @@ function renderPanel(overrides: Partial<Parameters<typeof ConversationDetailsPan
     />,
   );
   return { onClose, unmount };
+}
+
+/**
+ * Tabs forward until `target` has focus, so a test asserts "reachable by
+ * keyboard" rather than "exactly N tab stops away" — the latter breaks whenever
+ * an unrelated control is added to the panel.
+ */
+async function tabUntilFocused(target: HTMLElement, maxStops = 20) {
+  for (let stop = 0; stop < maxStops && document.activeElement !== target; stop += 1) {
+    await userEvent.tab();
+  }
 }
 
 afterEach(() => {
@@ -358,23 +372,48 @@ describe("ConversationDetailsPanel — canal: membros", () => {
 });
 
 describe("ConversationDetailsPanel — canal: ações indisponíveis", () => {
-  it("offers the member actions as disabled controls with a stated reason", async () => {
+  it("offers the member actions as reachable controls that state their reason", async () => {
     renderPanel();
 
     const seeAll = screen.getAllByRole("button", { name: "Ver todos" });
     const addMembers = screen.getByRole("button", { name: /Adicionar membros/ });
     for (const button of [...seeAll, addMembers]) {
-      expect(button).toBeDisabled();
-      expect(button).toHaveAttribute("aria-describedby");
+      // aria-disabled, never the HTML attribute: `disabled` would drop the
+      // control out of the tab order and take the announced reason with it.
+      expect(button).not.toBeDisabled();
+      expect(button).toHaveAttribute("aria-disabled", "true");
+      expect(button).toHaveAccessibleDescription();
     }
+    // Each "Ver todos" is described by its own section's reason, not a shared one.
+    expect(seeAll[0]).toHaveAccessibleDescription(
+      "A gestão de membros do canal ainda não está disponível nesta versão.",
+    );
+    expect(seeAll[1]).toHaveAccessibleDescription(
+      "A central de arquivos do canal ainda não está disponível nesta versão.",
+    );
+    expect(addMembers).toHaveAccessibleDescription(
+      "A gestão de membros do canal ainda não está disponível nesta versão.",
+    );
 
-    // Clicking a disabled control changes nothing and, above all, never reports
-    // a success that did not happen.
+    // Activating an unavailable control changes nothing and, above all, never
+    // reports a success that did not happen.
     await userEvent.click(addMembers);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(
       screen.getByText("A gestão de membros do canal ainda não está disponível nesta versão."),
     ).toBeInTheDocument();
+  });
+
+  it("keeps the unavailable actions in the keyboard tab order", async () => {
+    renderPanel();
+
+    // The panel puts focus on its close button on open; from there the tab
+    // order must actually reach the unavailable actions.
+    expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
+    const addMembers = screen.getByRole("button", { name: /Adicionar membros/ });
+    await tabUntilFocused(addMembers);
+
+    expect(addMembers).toHaveFocus();
   });
 });
 
@@ -693,8 +732,11 @@ describe("ConversationDetailsPanel — grupo", () => {
     renderGroupPanel(groupDetails());
 
     const addParticipants = screen.getByRole("button", { name: /Adicionar participantes/ });
-    expect(addParticipants).toBeDisabled();
-    expect(addParticipants).toHaveAttribute("aria-describedby");
+    expect(addParticipants).not.toBeDisabled();
+    expect(addParticipants).toHaveAttribute("aria-disabled", "true");
+    expect(addParticipants).toHaveAccessibleDescription(
+      "A gestão de participantes do grupo ainda não está disponível nesta versão.",
+    );
 
     await userEvent.click(addParticipants);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -732,5 +774,438 @@ describe("ConversationDetailsPanel — grupo", () => {
       screen.getByText("Não foi possível carregar as informações do grupo."),
     ).toBeInTheDocument();
     expect(screen.getByText("Não foi possível carregar os participantes.")).toBeInTheDocument();
+  });
+});
+
+// ── Painel de perfil, DM 1:1 (issue #443) ────────────────────────────────────
+
+function directDetails(overrides: Partial<DirectProfile> = {}): { kind: "direct" } & DirectDetails {
+  return {
+    kind: "direct" as const,
+    conversationId: "conv-dm-1",
+    profile: {
+      userId: "user-other",
+      displayName: "Juliane Lino",
+      ...overrides,
+    },
+  };
+}
+
+function renderProfilePanel(details: { kind: "direct" } & DirectDetails = directDetails()) {
+  const onClose = vi.fn();
+  const rendered = render(
+    <ConversationDetailsPanel
+      kind="direct"
+      state={{ details: { status: "ready", data: details }, files: { status: "loading" } }}
+      currentUserId={currentUserId}
+      latestPin={null}
+      onClose={onClose}
+    />,
+  );
+  return { onClose, ...rendered };
+}
+
+/**
+ * The value of the metadata row labelled `label`.
+ *
+ * Reading the row by its label rather than by index is what lets the "ordem do
+ * protótipo" test and the per-field tests fail for different reasons.
+ */
+function metaRow(label: string): string {
+  const card = screen.getByTestId("chat-details-profile-meta");
+  const row = Array.from(card.children).find(
+    (child) => child.firstElementChild?.textContent === label,
+  );
+  expect(row, `no metadata row labelled ${label}`).toBeTruthy();
+  return row?.lastElementChild?.textContent ?? "";
+}
+
+describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () => {
+  it("is titled Perfil, not the conversation vocabulary", () => {
+    renderProfilePanel();
+
+    expect(screen.getByRole("complementary", { name: "Perfil" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Perfil" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Detalhes do canal" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Detalhes do grupo" })).not.toBeInTheDocument();
+  });
+
+  it("closes through an accessible close button and takes focus on open", async () => {
+    const { onClose } = renderProfilePanel();
+
+    const close = screen.getByRole("button", { name: "Fechar perfil" });
+    expect(close).toHaveFocus();
+    await userEvent.click(close);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no channel or group section at all", () => {
+    renderProfilePanel();
+
+    // A profile is not a conversation projection: none of these belongs here,
+    // and a two-person "participants" list would describe the conversation
+    // instead of the person.
+    expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Participantes/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Mensagem fixada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Arquivos recentes" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Sobre" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/participantes/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
+  it("shows the other participant's name, role and presence", () => {
+    renderProfilePanel(
+      directDetails({
+        displayName: "Juliane Lino",
+        jobTitle: "Infraestrutura & Suporte",
+        presence: "online",
+      }),
+    );
+
+    expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent("Juliane Lino");
+    // The subtitle repeats the job title exactly as the prototype does.
+    expect(screen.getAllByText("Infraestrutura & Suporte").length).toBeGreaterThan(0);
+    // Presence is a word, never only a colour.
+    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Online");
+  });
+
+  it("falls back to initials when there is no avatar", () => {
+    renderProfilePanel(directDetails({ displayName: "Juliane Lino" }));
+
+    const avatar = screen.getByTestId("chat-details-profile-avatar");
+    expect(avatar.querySelector("img")).toBeNull();
+    expect(avatar).toHaveTextContent("JL");
+  });
+
+  it("renders an accepted avatar as a decorative image", () => {
+    renderProfilePanel(directDetails({ avatarUrl: "/media/juliane.png" }));
+
+    const image = screen.getByTestId("chat-details-profile-avatar").querySelector("img");
+    expect(image).toHaveAttribute("src", "/media/juliane.png");
+    // Decorative: the name is right next to it, so an alt would be a duplicate.
+    expect(image).toHaveAttribute("alt", "");
+  });
+
+  it("shows every metadata row the prototype has, in order", () => {
+    renderProfilePanel(
+      directDetails({
+        jobTitle: "Infraestrutura & Suporte",
+        department: "TI",
+        timezone: "America/Sao_Paulo",
+        email: "juliane.lino@nic-labs.test",
+      }),
+    );
+
+    const labels = Array.from(screen.getByTestId("chat-details-profile-meta").children).map(
+      (row) => row.firstElementChild?.textContent,
+    );
+    expect(labels).toEqual(["Cargo", "Departamento", "Fuso horário", "Horário local", "E-mail"]);
+    expect(metaRow("Cargo")).toBe("Infraestrutura & Suporte");
+    expect(metaRow("Departamento")).toBe("TI");
+    expect(metaRow("Fuso horário")).toBe("America/Sao_Paulo");
+    expect(metaRow("E-mail")).toBe("juliane.lino@nic-labs.test");
+  });
+
+  it("says Não informado for every field the domain does not record", () => {
+    // Today's real payload: an identity and nothing else. The card keeps its
+    // shape and states the absence rather than dropping rows.
+    renderProfilePanel(directDetails());
+
+    for (const label of ["Cargo", "Departamento", "Fuso horário", "Horário local", "E-mail"]) {
+      expect(metaRow(label)).toBe("Não informado");
+    }
+    // An absent job title leaves no empty subtitle behind.
+    expect(document.querySelector(".chat-details__profile-role")).toBeNull();
+  });
+
+  it("omits the presence badge when the server tracks nothing", () => {
+    renderProfilePanel(directDetails());
+
+    // Absent is not "offline": the UI must not assert a state on the server's
+    // behalf.
+    expect(screen.queryByTestId("chat-details-profile-status")).not.toBeInTheDocument();
+  });
+
+  it("shows the e-mail as text, never as a mailto link", () => {
+    renderProfilePanel(directDetails({ email: "juliane.lino@nic-labs.test" }));
+
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(document.querySelector("a[href^='mailto:']")).toBeNull();
+  });
+
+  it("renders name, job title and department as text, never as markup", () => {
+    renderProfilePanel(
+      directDetails({
+        displayName: "<img src=x onerror=alert(1)>",
+        jobTitle: "<script>alert('cargo')</script>",
+        department: "<iframe src=javascript:alert(1)>",
+        email: "<b>nao@e.markup</b>",
+      }),
+    );
+
+    expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent(
+      "<img src=x onerror=alert(1)>",
+    );
+    expect(metaRow("Cargo")).toBe("<script>alert('cargo')</script>");
+    expect(metaRow("Departamento")).toBe("<iframe src=javascript:alert(1)>");
+    expect(metaRow("E-mail")).toBe("<b>nao@e.markup</b>");
+    expect(document.querySelector("img[src='x']")).toBeNull();
+    expect(document.querySelector("script")).toBeNull();
+    expect(document.querySelector("iframe")).toBeNull();
+    expect(document.querySelector("b")).toBeNull();
+  });
+});
+
+describe("ConversationDetailsPanel — DM 1:1: fuso e horário local", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // A fixed instant, so "the clock in São Paulo" is a computable value rather
+    // than whatever the CI machine happens to read.
+    vi.setSystemTime(new Date("2026-07-15T13:12:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("derives the local time from the profile's zone", () => {
+    renderProfilePanel(directDetails({ timezone: "America/Sao_Paulo" }));
+
+    // 13:12 UTC is 10:12 in São Paulo (UTC-3).
+    expect(metaRow("Horário local")).toBe("10:12");
+  });
+
+  it("uses the profile's zone even when the viewer is somewhere else", () => {
+    renderProfilePanel(directDetails({ timezone: "Asia/Tokyo" }));
+
+    // 13:12 UTC is 22:12 in Tokyo. Nothing here may fall back to the reader's
+    // own clock, which would state the wrong thing about another person.
+    expect(metaRow("Horário local")).toBe("22:12");
+  });
+
+  it("respects daylight saving instead of a fixed offset", () => {
+    // Lisbon is UTC+1 in July and UTC+0 in January; a stored offset would get
+    // one of the two wrong.
+    const summer = renderProfilePanel(directDetails({ timezone: "Europe/Lisbon" }));
+    expect(metaRow("Horário local")).toBe("14:12");
+    summer.unmount();
+
+    vi.setSystemTime(new Date("2026-01-15T13:12:00.000Z"));
+    renderProfilePanel(directDetails({ timezone: "Europe/Lisbon" }));
+    expect(metaRow("Horário local")).toBe("13:12");
+  });
+
+  it("advances the clock without re-rendering every second", () => {
+    renderProfilePanel(directDetails({ timezone: "America/Sao_Paulo" }));
+    expect(metaRow("Horário local")).toBe("10:12");
+
+    act(() => {
+      vi.advanceTimersByTime(localTimeRefreshMs);
+    });
+    expect(metaRow("Horário local")).toBe("10:13");
+  });
+
+  it("treats an invalid or hostile zone as absent, without breaking the panel", () => {
+    for (const timezone of ["Nao/Existe", "-03:00", "<script>alert(1)</script>", " "]) {
+      const { unmount } = renderProfilePanel(directDetails({ timezone }));
+
+      expect(metaRow("Fuso horário")).toBe("Não informado");
+      expect(metaRow("Horário local")).toBe("Não informado");
+      // The rest of the profile is unaffected.
+      expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent("Juliane Lino");
+      unmount();
+    }
+  });
+
+  it("starts no timer for a profile without a usable zone", () => {
+    // The panel's own interval is what is being observed, so setInterval is
+    // spied on directly: a global timer count would also see React's scheduler.
+    const scheduled = vi.spyOn(globalThis, "setInterval");
+    const { unmount } = renderProfilePanel(directDetails({ timezone: "Nao/Existe" }));
+
+    expect(scheduled).not.toHaveBeenCalled();
+    unmount();
+    scheduled.mockRestore();
+  });
+
+  it("ticks once a minute and clears its timer on unmount", () => {
+    const scheduled = vi.spyOn(globalThis, "setInterval");
+    const cleared = vi.spyOn(globalThis, "clearInterval");
+    const { unmount } = renderProfilePanel(directDetails({ timezone: "America/Sao_Paulo" }));
+
+    // One timer, at the display's own resolution — not sixty ticks per visible
+    // change.
+    expect(scheduled).toHaveBeenCalledTimes(1);
+    expect(scheduled).toHaveBeenCalledWith(expect.any(Function), localTimeRefreshMs);
+
+    // A conversation switch unmounts this panel; a leaked interval would keep
+    // ticking against a dead component for the rest of the session.
+    unmount();
+    expect(cleared).toHaveBeenCalledWith(scheduled.mock.results[0]?.value);
+    scheduled.mockRestore();
+    cleared.mockRestore();
+  });
+});
+
+describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
+  it("offers 'Ver perfil completo' as explicitly unavailable", async () => {
+    renderProfilePanel();
+
+    const action = screen.getByRole("button", { name: "Ver perfil completo" });
+    // No route renders another user's full profile, so the affordance stays
+    // visible and unavailable with its reason announced — never an href="#" and
+    // never a navigation to the reader's own account page.
+    expect(action).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+
+    await userEvent.click(action);
+    expect(
+      screen.getByText(
+        "O perfil completo de outros usuários ainda não está disponível nesta versão.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not carry the HTML disabled attribute, which would hide it from the tab order", () => {
+    renderProfilePanel();
+
+    const action = screen.getByRole("button", { name: "Ver perfil completo" });
+    // The whole point of the control is the sentence it is described by. A
+    // `disabled` button cannot be focused, so that sentence would never be
+    // announced to anyone navigating by keyboard.
+    expect(action).not.toBeDisabled();
+    expect(action).not.toHaveAttribute("disabled");
+  });
+
+  it("announces the reason as its accessible description", () => {
+    renderProfilePanel();
+
+    const action = screen.getByRole("button", { name: "Ver perfil completo" });
+    const reasonId = action.getAttribute("aria-describedby");
+    expect(reasonId).toBeTruthy();
+    // The reference must resolve: a dangling aria-describedby announces nothing.
+    expect(document.querySelectorAll(`#${reasonId}`)).toHaveLength(1);
+    expect(action).toHaveAccessibleDescription(
+      "O perfil completo de outros usuários ainda não está disponível nesta versão.",
+    );
+    // The description complements the name; it never replaces it.
+    expect(action).toHaveAccessibleName("Ver perfil completo");
+  });
+
+  it("is reachable by Tab from the panel's initial focus", async () => {
+    renderProfilePanel();
+
+    expect(screen.getByRole("button", { name: "Fechar perfil" })).toHaveFocus();
+    const action = screen.getByRole("button", { name: "Ver perfil completo" });
+    // Walks the real tab order rather than assuming a fixed number of stops.
+    await tabUntilFocused(action);
+
+    expect(action).toHaveFocus();
+  });
+
+  it("does nothing when activated by Enter, Space or a click", async () => {
+    const { onClose } = renderProfilePanel();
+    const action = screen.getByRole("button", { name: "Ver perfil completo" });
+    await tabUntilFocused(action);
+
+    const pathBefore = window.location.pathname;
+    for (const key of ["{Enter}", " "]) {
+      await userEvent.keyboard(key);
+    }
+    await userEvent.click(action);
+
+    // No navigation, no dialog, no success, and the panel is still the panel.
+    expect(window.location.pathname).toBe(pathBefore);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("complementary", { name: "Perfil" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-profile-name")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    // Focus stays where the user put it.
+    expect(action).toHaveFocus();
+  });
+
+  it("announces loading under the Perfil heading", () => {
+    render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{ details: { status: "loading" }, files: { status: "loading" } }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Perfil" })).toBeInTheDocument();
+    expect(screen.getByText("Carregando perfil…")).toBeInTheDocument();
+    // No card of "Não informado" rows while nothing has arrived.
+    expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
+  });
+
+  it("shows an error instead of an empty profile card", () => {
+    render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{ details: { status: "error" }, files: { status: "loading" } }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível carregar o perfil.");
+    // A failure must never read as "a person with no attributes".
+    expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
+    expect(screen.queryByText("Não informado")).not.toBeInTheDocument();
+  });
+
+  it("refuses to render a channel or group payload as a profile", () => {
+    render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: { status: "ready", data: groupDetails() },
+          files: { status: "ready", data: [] },
+        }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    // The tag records which request produced the data, so a response that
+    // outlived a conversation switch cannot be shown here as somebody's profile.
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível carregar o perfil.");
+    expect(screen.queryByText("Time de Infra")).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
+  it("refuses to render a payload whose tag is not direct", () => {
+    // The hook stores what the client returned. A value tagged for another
+    // aggregate reaching the direct panel means something upstream mislabelled
+    // it, and the panel must not translate it into a person.
+    render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: { status: "ready", data: channelDetails() },
+          files: { status: "ready", data: [] },
+        }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível carregar o perfil.");
+    expect(screen.queryByTestId("chat-details-profile-name")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
+    expect(screen.queryByText("Infraestrutura")).not.toBeInTheDocument();
   });
 });

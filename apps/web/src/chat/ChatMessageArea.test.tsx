@@ -9,6 +9,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 
+import { ApiRequestError } from "../lib/api";
+
 import type { ChatOutletContext } from "./ChatShell";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -64,6 +66,7 @@ const {
   mockGetMessageHistory,
   mockFetchChannelDetails,
   mockFetchGroupDetails,
+  mockFetchDirectProfile,
   mockFetchChannelAttachments,
   wsMockState,
 } = vi.hoisted(() => ({
@@ -125,6 +128,7 @@ const {
   mockGetMessageHistory: vi.fn(),
   mockFetchChannelDetails: vi.fn(),
   mockFetchGroupDetails: vi.fn(),
+  mockFetchDirectProfile: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
@@ -192,6 +196,8 @@ vi.mock("./chatApi", () => ({
     mockFetchChannelDetails(channelId, signal),
   fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
     mockFetchGroupDetails(conversationId, signal),
+  fetchDirectProfile: (conversationId: string, signal?: AbortSignal) =>
+    mockFetchDirectProfile(conversationId, signal),
 }));
 
 // file-service lives behind its own client; the panel's files section is mocked
@@ -268,6 +274,22 @@ function groupDetailsFor(conversationId: string) {
         presence: "offline" as const,
       },
     ],
+  };
+}
+
+// The 1:1 profile payload, keyed by conversation, so a test that switches DMs
+// can assert the panel followed the switch rather than kept the first person.
+function directProfileFor(conversationId: string) {
+  return {
+    // The tag comes from the client, which validated the one the server sent.
+    kind: "direct" as const,
+    conversationId,
+    profile: {
+      userId: `outro-de-${conversationId}`,
+      displayName: `Perfil de ${conversationId}`,
+      email: `${conversationId}@nic.test`,
+      presence: "online" as const,
+    },
   };
 }
 
@@ -443,6 +465,9 @@ beforeEach(() => {
   mockFetchChannelAttachments.mockResolvedValue([]);
   mockFetchGroupDetails.mockImplementation((conversationId: string) =>
     Promise.resolve(groupDetailsFor(conversationId)),
+  );
+  mockFetchDirectProfile.mockImplementation((conversationId: string) =>
+    Promise.resolve(directProfileFor(conversationId)),
   );
   mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
@@ -4450,7 +4475,13 @@ const directConversationId = "dm-juliane";
  * discriminant (`direct` / `group`) exactly as it does in the app — never from
  * the URL or from the conversation's name.
  */
-function renderDMWithContext(dmId: string, currentUserId = "me-123") {
+function renderDMWithContext(
+  dmId: string,
+  currentUserId = "me-123",
+  // A legacy DM whose counterpart the sidebar could not resolve is a real
+  // shape, so it is a fixture option rather than a separate render helper.
+  { withCounterpart = true }: { withCounterpart?: boolean } = {},
+) {
   return render(
     <MemoryRouter initialEntries={[`/chat/dm/${dmId}`]}>
       <Routes>
@@ -4473,6 +4504,9 @@ function renderDMWithContext(dmId: string, currentUserId = "me-123") {
                     type: "1:1",
                     name: "Juliane",
                     participants: [],
+                    counterpart: withCounterpart
+                      ? { userId: "juliane-1", displayName: "Juliane" }
+                      : undefined,
                   },
                 ],
               }}
@@ -4519,13 +4553,13 @@ describe("ChatMessageArea — painel de detalhes do grupo (#441)", () => {
     );
   });
 
-  it("does not offer the control in a 1:1 DM", async () => {
+  it("does not lend the group's control or endpoint to a 1:1 DM", async () => {
     mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
     renderDMWithContext(directConversationId);
     await screen.findByTestId("chat-msg-bubble");
 
-    // Out of scope for this issue: a 1:1 conversation has no panel and must not
-    // borrow the group's.
+    // A 1:1 has its own control and its own endpoint (issue #443); what it must
+    // never do is borrow the group's vocabulary or read the group projection.
     expect(screen.queryByRole("button", { name: "Detalhes do grupo" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Detalhes do canal" })).not.toBeInTheDocument();
     expect(mockFetchGroupDetails).not.toHaveBeenCalled();
@@ -4694,5 +4728,280 @@ describe("ChatMessageArea — alternância canal ↔ grupo (#441)", () => {
     expect(screen.getByRole("heading", { name: "Detalhes do grupo" })).toBeInTheDocument();
     expect(screen.queryByText("Membro de geral")).not.toBeInTheDocument();
     expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
+  });
+});
+
+// ── Painel de perfil da DM 1:1 (issue #443) ──────────────────────────────────
+
+function profileToggle() {
+  return screen.getByRole("button", { name: "Abrir perfil de Juliane" });
+}
+
+describe("ChatMessageArea — painel de perfil da DM 1:1 (#443)", () => {
+  it("offers a profile control named after the other person", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    const toggle = profileToggle();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(toggle);
+
+    const panel = await screen.findByTestId("chat-conversation-details");
+    expect(panel).toHaveAttribute("data-conversation-kind", "direct");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle.getAttribute("aria-controls")).toBe(panel.id);
+    expect(screen.getByRole("heading", { name: "Perfil" })).toBeInTheDocument();
+
+    // The profile endpoint, named after the conversation and nothing else.
+    expect(mockFetchDirectProfile).toHaveBeenCalledWith(
+      directConversationId,
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchGroupDetails).not.toHaveBeenCalled();
+    expect(mockFetchChannelDetails).not.toHaveBeenCalled();
+    // A profile has no files section, so file-service is never asked.
+    expect(mockFetchChannelAttachments).not.toHaveBeenCalled();
+  });
+
+  it("names the control after the conversation when no counterpart is known", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId, "me-123", { withCounterpart: false });
+    await screen.findByTestId("chat-msg-bubble");
+
+    // A legacy DM whose counterpart the sidebar could not resolve still gets a
+    // usable accessible name — never a blank one and never an ID.
+    expect(screen.getByRole("button", { name: "Abrir perfil da conversa" })).toBeInTheDocument();
+  });
+
+  it("shows the profile of the other participant, not the viewer", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(profileToggle());
+
+    const name = await screen.findByTestId("chat-details-profile-name");
+    expect(name).toHaveTextContent(`Perfil de ${directConversationId}`);
+    // The panel renders what the server resolved; the viewer's own id never
+    // appears as the subject of the card.
+    expect(name).not.toHaveTextContent("me-123");
+  });
+
+  it("shows no group or channel section in a 1:1", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(profileToggle());
+    await screen.findByTestId("chat-details-profile-name");
+
+    expect(screen.queryByRole("heading", { name: /Participantes/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Arquivos recentes" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-group-name")).not.toBeInTheDocument();
+  });
+
+  it("closes from the panel and returns focus to the header control", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(profileToggle());
+    await screen.findByTestId("chat-conversation-details");
+
+    await userEvent.click(screen.getByRole("button", { name: "Fechar perfil" }));
+
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+    expect(profileToggle()).toHaveFocus();
+  });
+
+  it("does not remount the conversation or lose a typed draft", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    const editor = screen.getByTestId("chat-composer-input");
+    await fillEditor(editor, "rascunho da DM");
+    const listBefore = screen.getByRole("log", { name: "Mensagens" });
+    const messageRequestsBefore = mockFetchDMMessages.mock.calls.length;
+
+    await userEvent.click(profileToggle());
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(profileToggle());
+
+    // Opening the panel is a layout change, not a navigation: nothing here is
+    // remounted, so the message list, the draft and the subscription survive.
+    expect(screen.getByRole("log", { name: "Mensagens" })).toBe(listBefore);
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho da DM");
+    expect(mockFetchDMMessages.mock.calls.length).toBe(messageRequestsBefore);
+  });
+
+  it("shows an error state when the profile is refused", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchDirectProfile.mockRejectedValue(new Error("404"));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(profileToggle());
+
+    expect(await screen.findByText("Não foi possível carregar o perfil.")).toBeInTheDocument();
+    // A refusal is never rendered as a person with no attributes.
+    expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
+  });
+});
+
+const secondDirectConversationId = "dm-marcos";
+
+/**
+ * A shell that navigates between two 1:1 DMs in place, which is what makes
+ * "the panel stayed open and its content followed the conversation" observable.
+ */
+function renderDirectSwitcher(currentUserId = "me-123") {
+  function Switcher() {
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate(`/chat/dm/${secondDirectConversationId}`)}>
+          ir para a outra DM
+        </button>
+        <ParentWithContext
+          ctx={{
+            currentUserId,
+            channels: [],
+            dms: [
+              {
+                id: directConversationId,
+                type: "1:1",
+                name: "Juliane",
+                participants: [],
+                counterpart: { userId: "juliane-1", displayName: "Juliane" },
+              },
+              {
+                id: secondDirectConversationId,
+                type: "1:1",
+                name: "Marcos",
+                participants: [],
+                counterpart: { userId: "marcos-1", displayName: "Marcos" },
+              },
+            ],
+          }}
+        />
+      </>
+    );
+  }
+  return render(
+    <MemoryRouter initialEntries={[`/chat/dm/${directConversationId}`]}>
+      <Routes>
+        <Route path="/chat" element={<Switcher />}>
+          <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("ChatMessageArea — resposta divergente do perfil (#443)", () => {
+  it("shows the error state and no identity when the server answers for another conversation", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    // What the real client does when conversation_id does not match the request:
+    // it rejects rather than rendering whoever came back.
+    mockFetchDirectProfile.mockRejectedValue(
+      new ApiRequestError(
+        200,
+        "invalid_response",
+        "Invalid direct profile response: conversation_id does not match the requested conversation",
+      ),
+    );
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(profileToggle());
+
+    expect(await screen.findByText("Não foi possível carregar o perfil.")).toBeInTheDocument();
+    // Not a single attribute of the wrong person may reach the panel.
+    expect(screen.queryByTestId("chat-details-profile-name")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
+    expect(screen.queryByText(/@nic\.test/)).not.toBeInTheDocument();
+  });
+
+  it("clears the previous DM's profile when the next one violates the contract", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDirectSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(profileToggle());
+    expect(await screen.findByTestId("chat-details-profile-name")).toHaveTextContent(
+      `Perfil de ${directConversationId}`,
+    );
+
+    // The panel stays open across the switch, so a stale card is exactly the
+    // failure mode: the previous person must be gone even though the new
+    // response is unusable.
+    mockFetchDirectProfile.mockRejectedValue(
+      new ApiRequestError(200, "invalid_response", "Invalid direct profile response: kind"),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "ir para a outra DM" }));
+
+    expect(await screen.findByText("Não foi possível carregar o perfil.")).toBeInTheDocument();
+    expect(screen.queryByText(`Perfil de ${directConversationId}`)).not.toBeInTheDocument();
+    expect(screen.queryByText(`${directConversationId}@nic.test`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatMessageArea — ação indisponível do perfil por teclado (#443)", () => {
+  it("reaches 'Ver perfil completo' by keyboard and activating it changes nothing", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    const editor = screen.getByTestId("chat-composer-input");
+    await fillEditor(editor, "rascunho que não pode sumir");
+    const listBefore = screen.getByRole("log", { name: "Mensagens" });
+    const messageRequestsBefore = mockFetchDMMessages.mock.calls.length;
+
+    // Opened from the keyboard, as someone who never touches a mouse would.
+    const toggle = profileToggle();
+    toggle.focus();
+    await userEvent.keyboard("{Enter}");
+
+    const panel = await screen.findByTestId("chat-conversation-details");
+    const close = screen.getByRole("button", { name: "Fechar perfil" });
+    expect(close).toHaveFocus();
+    await screen.findByTestId("chat-details-profile-name");
+
+    // The action must be on the real tab path out of the close button.
+    const action = screen.getByRole("button", { name: "Ver perfil completo" });
+    for (let stop = 0; stop < 20 && document.activeElement !== action; stop += 1) {
+      await userEvent.tab();
+    }
+    expect(action).toHaveFocus();
+    expect(action).toHaveAttribute("aria-disabled", "true");
+    expect(action).not.toBeDisabled();
+    expect(action).toHaveAccessibleDescription(
+      "O perfil completo de outros usuários ainda não está disponível nesta versão.",
+    );
+
+    const pathBefore = window.location.pathname;
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard(" ");
+
+    // Nothing happened: no route change, no dialog, and the conversation under
+    // the panel was never remounted.
+    expect(window.location.pathname).toBe(pathBefore);
+    expect(panel).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("log", { name: "Mensagens" })).toBe(listBefore);
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent(
+      "rascunho que não pode sumir",
+    );
+    expect(mockFetchDMMessages.mock.calls.length).toBe(messageRequestsBefore);
+
+    // And the panel still closes normally, returning focus to its opener.
+    await userEvent.click(screen.getByRole("button", { name: "Fechar perfil" }));
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+    expect(profileToggle()).toHaveFocus();
   });
 });

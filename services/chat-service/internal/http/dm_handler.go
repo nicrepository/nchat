@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
@@ -19,6 +20,7 @@ type dmProvider interface {
 	GetOrCreateDirectConversation(ctx context.Context, input service.CreateDirectConversationInput) (service.CreateDirectConversationOutput, error)
 	CreateGroupConversation(ctx context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error)
 	GetGroupDetails(ctx context.Context, input service.GroupDetailsInput) (service.GroupDetails, error)
+	GetDirectProfile(ctx context.Context, input service.DirectProfileInput) (service.DirectProfile, error)
 }
 
 type dmRateLimiter interface {
@@ -212,6 +214,134 @@ func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDe
 // conversation", nor a group from a 1:1 they cannot see.
 func writeGroupDetailsError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "conversation not found")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+// ── Direct profile (issue #443) ──────────────────────────────────────────────
+
+// directProfileJSON is the other participant of a 1:1 conversation.
+//
+// It is the group participant's shape plus the corporate e-mail, which the
+// prototype's profile card shows and a participant row does not. Nothing else
+// from auth.users appears: no phone, no auth_source, no external_subject, no
+// status, no last_login_at, no roles, no session or device data. A profile
+// summary is not a directory record and must not become one by accretion.
+//
+// job_title, department and timezone are absent rather than empty. No column in
+// the domain stores them today, so an empty string here would assert "this
+// person has no job title" instead of "this deployment does not record one" —
+// the client distinguishes the two by the key being missing and renders "Não
+// informado". When those columns exist they are added here and the panel starts
+// showing them with no further change.
+type directProfileJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	Email       string `json:"email,omitempty"`
+	// Presence is omitted when the server does not track it, so a client can
+	// tell "not tracked" from "tracked and offline".
+	Presence string `json:"presence,omitempty"`
+}
+
+// directProfileResponse is the panel payload for a 1:1 conversation.
+//
+// It carries a profile, not a participant list: a direct conversation's roster
+// is the caller plus one person, and shipping it as `participants` would invite
+// the client to pick a side. The server has already picked, and `kind` names
+// the variant so the client switches on a tag rather than guessing from which
+// fields happen to be present.
+type directProfileResponse struct {
+	Kind           string            `json:"kind"`
+	ConversationID string            `json:"conversation_id"`
+	Profile        directProfileJSON `json:"profile"`
+}
+
+// DirectProfile handles GET /api/chat/dm/{conversationID}/profile.
+//
+// Only the conversation is named, and it is not trusted: the service settles
+// the caller's participation against the server-side workspace, refuses
+// anything that is not a `direct` row, and resolves the counterpart from the
+// membership rows. There is no user ID anywhere in the request, so this cannot
+// be used to read an arbitrary person's profile, and a conversation the caller
+// cannot reach — including a group — answers the same 404 as a missing one.
+func (h *DMHandler) DirectProfile(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.dms == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "conversations not available")
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	result, err := h.dms.GetDirectProfile(r.Context(), service.DirectProfileInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeDirectProfileError(w, r, conversationID, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, directProfileResponse{
+		Kind:           "direct",
+		ConversationID: result.Conversation.ID,
+		Profile: directProfileJSON{
+			UserID:      result.Profile.UserID,
+			DisplayName: result.Profile.DisplayName,
+			AvatarURL:   result.Profile.AvatarURL,
+			Email:       result.Profile.Email,
+			Presence:    h.presenceOf(workspaceID, result.Profile.UserID),
+		},
+	})
+}
+
+// presenceOf reports the live presence of one user, or "" when presence is not
+// wired at all. A profile is a single person, so the batch read the group panel
+// needs would be one membership scan to answer one question; the set is
+// consulted directly instead.
+//
+// Presence never gates the profile: an unwired or empty source only changes
+// what this field says.
+func (h *DMHandler) presenceOf(workspaceID, userID string) string {
+	if h.presence == nil {
+		return ""
+	}
+	for _, online := range h.presence.OnlineUserIDs(workspaceID) {
+		if online == userID {
+			return presenceOnline
+		}
+	}
+	return presenceOffline
+}
+
+// writeDirectProfileError folds every denial into the same 404 — a caller must
+// not be able to tell "this conversation exists but is not yours" from "no such
+// conversation", nor a group from a 1:1 they cannot see.
+//
+// A conversation that is `direct` but does not resolve to exactly one
+// counterpart is the one case that is not a denial: it is corrupt data, so it
+// answers 500 and is logged with the conversation ID (an identifier the caller
+// already holds) and nothing else — no e-mail, no name, no participant IDs.
+func writeDirectProfileError(w http.ResponseWriter, r *http.Request, conversationID string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInconsistentDirectConversation):
+		slog.ErrorContext(r.Context(), "chat direct profile inconsistent conversation",
+			slog.String("conversation_id", conversationID))
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "conversation not found")
 	default:

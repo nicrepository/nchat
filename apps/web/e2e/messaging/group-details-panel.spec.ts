@@ -160,7 +160,7 @@ test.describe("painel de detalhes do grupo", () => {
     expect(new URL(page.url()).pathname).toContain(GROUP_DM_ID);
   });
 
-  test("não oferece o painel em uma DM 1:1", async ({ page }, testInfo) => {
+  test("não empresta o painel de grupo para uma DM 1:1", async ({ page }, testInfo) => {
     const targetId = uniqueId(testInfo, "dm-direta");
     const scenario = createScenario({
       kind: "dm",
@@ -174,13 +174,17 @@ test.describe("painel de detalhes do grupo", () => {
     await page.goto(`/chat/dm/${targetId}`);
     await expect(page.getByTestId("chat-composer-input")).toBeVisible();
 
-    // Fora do escopo desta issue: a DM 1:1 não ganha painel nem empresta o do grupo.
+    // Uma DM 1:1 tem o próprio painel — "Perfil" (issue #443) — e nunca o
+    // vocabulário de grupo ou de canal.
     await expect(page.getByRole("button", { name: "Detalhes do grupo", exact: true })).toHaveCount(
       0,
     );
     await expect(page.getByRole("button", { name: "Detalhes do canal", exact: true })).toHaveCount(
       0,
     );
+    await expect(
+      page.getByRole("button", { name: `Abrir perfil de ${OTHER_USER_NAME}`, exact: true }),
+    ).toBeVisible();
   });
 
   test("mostra estados vazios com o vocabulário do grupo", async ({ page }, testInfo) => {
@@ -207,6 +211,10 @@ test.describe("painel de detalhes do grupo", () => {
     await expect(panel.getByText("Nenhum arquivo enviado neste grupo.")).toBeVisible();
     await expect(panel.getByText("Nenhum participante para exibir.")).toBeVisible();
     // A ação de gestão fica visível e explicitamente indisponível.
-    await expect(panel.getByRole("button", { name: /Adicionar participantes/ })).toBeDisabled();
+    // Indisponível pela semântica: o botão continua alcançável por teclado para
+    // que o motivo descrito por aria-describedby possa ser anunciado.
+    const addParticipants = panel.getByRole("button", { name: /Adicionar participantes/ });
+    await expect(addParticipants).toHaveAttribute("aria-disabled", "true");
+    expect(await addParticipants.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
   });
 });

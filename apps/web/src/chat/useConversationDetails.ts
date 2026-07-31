@@ -1,12 +1,16 @@
 /**
- * useConversationDetails — data for the details panel of a channel (issue #435)
- * or an ad-hoc group (issue #441).
+ * useConversationDetails — data for the details panel of a channel (issue #435),
+ * an ad-hoc group (issue #441) or a 1:1 DM's profile (issue #443).
  *
  * Two independent requests behind one hook: the conversation projection from
  * chat-service and the recent attachments from file-service. They are separate
  * sections of the panel and separate services, so a failure in one leaves the
  * other rendered — a single combined state would let a file-service outage
  * blank out the conversation's own metadata.
+ *
+ * A direct target issues only the first: the profile panel has no files section
+ * (issue #443), and requesting attachments nobody will render would be a
+ * request for data the user did not ask for.
  *
  * Correctness properties this hook owns:
  *  - every request is keyed by the *pair* (kind, id), not by the id alone: a
@@ -27,19 +31,20 @@
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
-import { fetchChannelDetails, fetchGroupDetails } from "./chatApi";
+import { fetchChannelDetails, fetchDirectProfile, fetchGroupDetails } from "./chatApi";
 import { fetchConversationAttachments } from "./filesApi";
 import type { ChannelAttachment, ConversationDetails } from "./chatTypes";
 
 /**
  * What the panel is being opened for.
  *
- * `kind` is the domain discriminant — "channel" for chat.channels, "group" for
- * a chat.dm_conversations row of type 'group' — and never something derived
- * from the URL or from how many people are in the conversation.
+ * `kind` is the domain discriminant — "channel" for chat.channels, "group" and
+ * "direct" for a chat.dm_conversations row of the matching type — and never
+ * something derived from the URL or from how many people are in the
+ * conversation.
  */
 export interface ConversationDetailsTarget {
-  kind: "channel" | "group";
+  kind: "channel" | "group" | "direct";
   id: string;
 }
 
@@ -88,9 +93,8 @@ function isAbort(error: unknown): boolean {
 }
 
 /**
- * Loads the panel's data for `target`. Pass null (panel closed, or the open
- * conversation is a 1:1 DM, which has no panel in this release) and the hook
- * stays idle and issues no request.
+ * Loads the panel's data for `target`. Pass null (panel closed, or an unknown
+ * target) and the hook stays idle and issues no request.
  */
 export function useConversationDetails(
   target: ConversationDetailsTarget | null,
@@ -108,19 +112,32 @@ export function useConversationDetails(
     // Reset first, always: the panel must show a loading state for the new
     // conversation rather than the previous one's participants and files.
     dispatch({ type: "reset" });
-    if (!nextID || (nextKind !== "channel" && nextKind !== "group")) return;
+    if (!nextID || (nextKind !== "channel" && nextKind !== "group" && nextKind !== "direct")) {
+      return;
+    }
 
     const controller = new AbortController();
     abortRef.current = controller;
 
+    // Each kind has its own endpoint because each names a different aggregate:
+    // a channel, a group conversation, and the person on the other end of a
+    // direct one.
+    //
+    // The direct client returns an already-discriminated value and this hook
+    // passes it through untouched. Re-tagging it here — or substituting the
+    // requested ID for the one the server sent — would overwrite the two things
+    // fetchDirectProfile validated, and a response for the wrong conversation
+    // would arrive labelled as the right one.
     const details =
       nextKind === "channel"
         ? fetchChannelDetails(nextID, controller.signal).then(
             (channel): ConversationDetails => ({ kind: "channel", ...channel }),
           )
-        : fetchGroupDetails(nextID, controller.signal).then(
-            (group): ConversationDetails => ({ kind: "group", ...group }),
-          );
+        : nextKind === "group"
+          ? fetchGroupDetails(nextID, controller.signal).then(
+              (group): ConversationDetails => ({ kind: "group", ...group }),
+            )
+          : fetchDirectProfile(nextID, controller.signal);
 
     details.then(
       (resolved) => {
@@ -132,6 +149,11 @@ export function useConversationDetails(
         dispatch({ type: "details_error" });
       },
     );
+
+    // A 1:1 profile has no files section, so no attachment request is issued
+    // and `files` stays at its initial loading value, unread by the direct
+    // variant of the panel.
+    if (nextKind === "direct") return;
 
     // A group's attachments live under the DM destination, never the channel
     // one: the two are separate resources with separate authorization.

@@ -196,13 +196,16 @@ function IconWarning() {
 
 interface DetailsToggleProps {
   open: boolean;
-  /** Names the control after what it opens: a channel's or a group's details. */
+  /**
+   * Names the control after what it opens: a channel's details, a group's
+   * details, or a named person's profile.
+   */
   label: string;
   onToggle: () => void;
 }
 
 /**
- * The channel-details toggle.
+ * The details toggle.
  *
  * A real <button>, so it is reachable and operable by keyboard for free.
  * aria-expanded carries the state and aria-controls points at the panel, which
@@ -255,7 +258,7 @@ interface HeaderDMProps {
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
-  /** Present only for ad-hoc groups; a 1:1 DM has no details panel yet. */
+  /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
 }
 
@@ -925,23 +928,25 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // or the scroll position — and the panel stays open across a channel switch.
   const [detailsOpen, setDetailsOpen] = useState(false);
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
-  // Details are a channel concept; a DM has no members list, visibility or
-  // creation date to show, so the control is not rendered there at all.
   // Which aggregate the panel would describe, from the domain discriminant:
   // chat.channels for a channel, and a chat.dm_conversations row of type
-  // 'group' for an ad-hoc group. A 1:1 DM resolves to null — it has no panel in
-  // this release (issue #441) — and so does an unknown target.
+  // 'group' or 'direct' for a conversation. Only an unknown target resolves to
+  // null.
   //
   // activeDM.type is the server's own `direct`/`group` value carried by the
-  // sidebar payload, never the participant count or the conversation's name.
-  const detailsKind: "channel" | "group" | null =
+  // sidebar payload, never the participant count or the conversation's name: a
+  // group that happens to have two people is still a group, and a 1:1 DM whose
+  // title looks like a group's is still a 1:1.
+  const detailsKind: "channel" | "group" | "direct" | null =
     targetId === ""
       ? null
       : kind === "channel"
         ? "channel"
-        : activeDM?.type === "group"
-          ? "group"
-          : null;
+        : activeDM === undefined
+          ? null
+          : activeDM.type === "group"
+            ? "group"
+            : "direct";
   const supportsDetails = detailsKind !== null;
   const detailsTarget = useMemo(
     () => (detailsKind && detailsOpen ? { kind: detailsKind, id: targetId } : null),
@@ -1116,6 +1121,19 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   const showDetails = supportsDetails && detailsOpen;
 
+  // A group's control names the panel; a 1:1's names the person it is about,
+  // because "Detalhes da conversa" would be an odd thing to hear announced for
+  // a panel that shows one profile. The name comes from the sidebar payload the
+  // header already renders, so the label never waits on a request; when the
+  // counterpart could not be resolved it degrades to the conversation itself
+  // rather than to a blank or an ID.
+  const detailsToggleLabel =
+    detailsKind === "direct"
+      ? activeDM?.counterpart?.displayName
+        ? `Abrir perfil de ${activeDM.counterpart.displayName}`
+        : "Abrir perfil da conversa"
+      : "Detalhes do grupo";
+
   return (
     <div
       className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
@@ -1152,7 +1170,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
                 <DetailsToggle
                   ref={detailsToggleRef}
                   open={detailsOpen}
-                  label="Detalhes do grupo"
+                  label={detailsToggleLabel}
                   onToggle={toggleDetails}
                 />
               ) : undefined

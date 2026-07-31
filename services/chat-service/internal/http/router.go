@@ -180,6 +180,11 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("GET "+RouteDMDetails, authMiddleware(
 			msgListLimiter.Middleware(http.HandlerFunc(directMessages.GroupDetails)),
 		))
+		// The 1:1 profile panel (issue #443) is the same kind of read on the same
+		// resource, so it shares the same budget.
+		mux.Handle("GET "+RouteDMProfile, authMiddleware(
+			msgListLimiter.Middleware(http.HandlerFunc(directMessages.DirectProfile)),
+		))
 	}
 
 	// DM message endpoints: GET list, POST create, GET single.
