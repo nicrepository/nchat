@@ -17,6 +17,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import App from "../App";
 import { clearTokens, setTokens } from "../lib/authSession";
+import { _resetChatSocket } from "./chatSocket";
 import type { Message, MessagePage } from "./chatTypes";
 
 // ── chatApi mock ──────────────────────────────────────────────────────────────
@@ -202,6 +203,7 @@ beforeEach(() => {
   FakeWebSocket.instances = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   global.WebSocket = FakeWebSocket as any;
+  _resetChatSocket();
 
   api.fetchSidebarData.mockResolvedValue({
     currentUserId: "me-1",
@@ -224,6 +226,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _resetChatSocket();
   global.WebSocket = OriginalWebSocket;
 
   // FakeWebSocket.instances is static, so a socket a previous test opened would
@@ -231,6 +234,13 @@ afterEach(() => {
   FakeWebSocket.instances = [];
   clearTokens();
 });
+
+/** The tab's single shared chat connection. */
+function socket(): FakeWebSocket {
+  const current = FakeWebSocket.instances.at(-1);
+  if (!current) throw new Error("no chat socket was opened");
+  return current;
+}
 
 function renderAt(path: string) {
   window.history.pushState({}, "", path);
@@ -341,84 +351,77 @@ describe("navigating between DM and channel targets", () => {
     expect(screen.queryByLabelText("Carregando mensagens")).not.toBeInTheDocument();
   });
 
-  it("closes the DM subscription and subscribes to the channel", async () => {
+  it("moves the single shared connection from the DM to the channel", async () => {
     renderAt(`/chat/dm/${dmId}`);
     expect(await screen.findByText(dmText)).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
-    const dmSocket = FakeWebSocket.instances.find((socket) => {
-      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
-      return subscriptions.length === 1 && subscriptions[0]?.target_id === dmId;
-    });
-    expect(dmSocket).toBeDefined();
+
+    // Issue #449: the sidebar, the message list and call signalling all share
+    // one connection. Opening one socket each is what exhausted the server's
+    // per-user connection budget, so the count is the assertion.
     await waitFor(() =>
-      expect(dmSocket?.subscriptions()).toContainEqual({
+      expect(socket().subscriptions()).toContainEqual({
+        type: "subscribe",
+        target_type: "dm",
+        target_id: dmId,
+      }),
+    );
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    await clickChannel();
+    await waitFor(() =>
+      expect(socket().subscriptions()).toContainEqual({
+        type: "subscribe",
+        target_type: "channel",
+        target_id: channelId,
+      }),
+    );
+
+    // Switching target resubscribes on the live socket instead of replacing it.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(socket().closed).toBe(false);
+    expect(socket().subscriptions()).toContainEqual({
+      type: "unsubscribe",
+      target_type: "dm",
+      target_id: dmId,
+    });
+  });
+
+  it("leaves no subscription or timeline state after a fast A → B → C switch", async () => {
+    renderAt(`/chat/channel/${secretChannelId}`);
+    expect(await within(header()).findByText("confidencial")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(socket().subscriptions()).toContainEqual({
+        type: "subscribe",
+        target_type: "channel",
+        target_id: secretChannelId,
+      }),
+    );
+
+    await clickChannel();
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
+
+    await clickDM();
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
+    expect(await screen.findByText(dmText)).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(socket().subscriptions()).toContainEqual({
         type: "subscribe",
         target_type: "dm",
         target_id: dmId,
       }),
     );
 
-    await clickChannel();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
-
-    expect(dmSocket?.closed).toBe(true);
-    expect(dmSocket?.subscriptions()).toContainEqual({
-      type: "unsubscribe",
-      target_type: "dm",
-      target_id: dmId,
-    });
-
-    const channelSocket = FakeWebSocket.instances.find((socket) => {
-      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
-      return subscriptions.length === 1 && subscriptions[0]?.target_id === channelId;
-    });
-    expect(channelSocket).toBeDefined();
-    await waitFor(() =>
-      expect(channelSocket?.subscriptions()).toContainEqual({
-        type: "subscribe",
+    // Every abandoned target is released, and no switch leaked a second socket.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(socket().closed).toBe(false);
+    for (const abandoned of [secretChannelId, channelId]) {
+      expect(socket().subscriptions()).toContainEqual({
+        type: "unsubscribe",
         target_type: "channel",
-        target_id: channelId,
-      }),
-    );
-    expect(channelSocket?.subscriptions()).not.toContainEqual(
-      expect.objectContaining({ target_id: dmId }),
-    );
-  });
-
-  it("leaves no subscription or timeline state after a fast A → B → C switch", async () => {
-    renderAt(`/chat/channel/${secretChannelId}`);
-    expect(await within(header()).findByText("confidencial")).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
-    const socketA = FakeWebSocket.instances.find((socket) => {
-      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
-      return subscriptions.length === 1 && subscriptions[0]?.target_id === secretChannelId;
-    });
-
-    await clickChannel();
-    await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
-    const socketB = FakeWebSocket.instances.find((socket) => {
-      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
-      return subscriptions.length === 1 && subscriptions[0]?.target_id === channelId;
-    });
-
-    await clickDM();
-    await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
-    expect(await screen.findByText(dmText)).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(5));
-    const socketC = FakeWebSocket.instances.find((socket) => {
-      const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
-      return subscriptions.length === 1 && subscriptions[0]?.target_id === dmId;
-    });
-
-    expect(socketA?.closed).toBe(true);
-    expect(socketB?.closed).toBe(true);
-    expect(socketC?.closed).toBe(false);
-    expect(socketC?.subscriptions()).toContainEqual({
-      type: "subscribe",
-      target_type: "dm",
-      target_id: dmId,
-    });
+        target_id: abandoned,
+      });
+    }
     expect(screen.queryByText(channelText)).not.toBeInTheDocument();
   });
 
