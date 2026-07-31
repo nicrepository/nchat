@@ -8,6 +8,30 @@ export function formatTime(iso: string): string {
   }
 }
 
+/** "12 de janeiro de 2024", or "" when the value is not a usable date. */
+export function formatLongDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString("pt-BR", { day: "numeric", month: "long", year: "numeric" });
+}
+
+/**
+ * Day label for a timestamp: "Hoje", "Ontem", or the long date.
+ *
+ * Shared by the conversation's day dividers and the details panel so a date
+ * never reads one way above the messages and another way beside them.
+ */
+export function formatDayLabel(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return "Hoje";
+  if (date.toDateString() === yesterday.toDateString()) return "Ontem";
+  return formatLongDate(iso);
+}
+
 export function senderLabel(msg: Message): string {
   return msg.senderDisplayName || msg.senderEmail || msg.senderId.slice(0, 8);
 }

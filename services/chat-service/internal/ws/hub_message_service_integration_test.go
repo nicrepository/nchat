@@ -73,6 +73,10 @@ func (s *integDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ st
 func (s *integDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Context, _, _ string) ([]domain.DMConversationWithParticipantIDs, error) {
 	return nil, nil
 }
+func (s *integDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
+	return storage.DMParticipantPage{}, nil
+}
+
 func (s *integDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	return s.conv, nil
 }

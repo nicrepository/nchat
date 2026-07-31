@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -166,6 +167,37 @@ func (p *PresenceTracker) Status(workspaceID, userID string) PresenceStatus {
 		return s
 	}
 	return PresenceOffline
+}
+
+// OnlineUserIDs returns every user in workspaceID whose presence is currently
+// PresenceOnline, sorted by user ID.
+//
+// Only PresenceOnline qualifies. PresenceAway is a distinct state by definition
+// — the user still holds a connection but has been inactive past the away
+// timeout — so it is not folded in here, and PresenceOffline users have no
+// entry at all (Disconnect deletes the key rather than storing offline).
+//
+// It answers the whole question in one pass under a single read lock, so a
+// caller never has to ask about members one at a time. The result is a snapshot:
+// presence can change the instant the lock is released, which is inherent to
+// presence and not something a longer lock would fix.
+//
+// workspaceID must be server-asserted; scoping by it is what keeps one
+// workspace's connected users invisible to another.
+func (p *PresenceTracker) OnlineUserIDs(workspaceID string) []string {
+	p.mu.RLock()
+	userIDs := make([]string, 0, len(p.status))
+	for key, status := range p.status {
+		if key.workspaceID == workspaceID && status == PresenceOnline {
+			userIDs = append(userIDs, key.userID)
+		}
+	}
+	p.mu.RUnlock()
+
+	// Map iteration order is randomised, so the slice is sorted before it
+	// leaves: callers that log, compare or paginate it must see a stable order.
+	sort.Strings(userIDs)
+	return userIDs
 }
 
 // run is the background goroutine that drives away transitions.

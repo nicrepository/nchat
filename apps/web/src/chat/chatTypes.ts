@@ -205,3 +205,113 @@ export interface PinnedItem {
   pinnedByUserId: string;
   pinnedAt: string; // ISO 8601
 }
+
+// ── Channel details panel (issue #435) ───────────────────────────────────────
+
+export type ChannelMemberRole = "member" | "moderator";
+
+/**
+ * One member of a channel, as the details panel renders them.
+ *
+ * `presence` is what the server asserts about this member. Every entry the
+ * server puts in `onlineMembers` carries "online"; the field is kept rather
+ * than implied so the client can verify the claim instead of trusting the
+ * list's name. It is absent when the server states nothing — never defaulted
+ * to a status the backend did not send.
+ *
+ * `role` is the channel role, the only complementary attribute the domain has:
+ * there is no job title or department anywhere in auth.users.
+ */
+export interface ChannelMemberProfile {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe same-origin target. */
+  avatarUrl?: string;
+  role: ChannelMemberRole;
+  presence?: OnlineStatus;
+}
+
+/**
+ * The channel-details payload.
+ *
+ * The three member figures are independent and none is derived from another:
+ *  - `memberCount` is every active member of the channel, online or not — the
+ *    channel's size, which does not change when someone disconnects;
+ *  - `onlineCount` is how many of those are online right now, and may exceed
+ *    `onlineMembers.length` when more are online than the preview shows;
+ *  - `onlineMembers` is the capped preview, filtered by presence server-side
+ *    *before* the limit is applied, so an offline member never takes a slot
+ *    from an online one.
+ *
+ * `description` is deliberately not a field: chat.channels has no description
+ * column, so the panel renders its empty state rather than a value nothing can
+ * produce.
+ */
+export interface ChannelDetails {
+  id: string;
+  slug: string;
+  name: string;
+  type: ChannelType;
+  createdAt: string; // ISO 8601
+  memberCount: number;
+  onlineCount: number;
+  onlineMembers: ChannelMemberProfile[];
+}
+
+/**
+ * One participant of a group conversation, as the details panel renders them.
+ *
+ * Deliberately without a role: chat.dm_members.role is closed by CHECK to
+ * 'member', so a group has no role to show. `presence` is decoration — it says
+ * whether this participant is connected and never decides whether they appear.
+ */
+export interface GroupParticipantProfile {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe same-origin target. */
+  avatarUrl?: string;
+  presence?: OnlineStatus;
+}
+
+/**
+ * The group-details payload.
+ *
+ * A group is a `chat.dm_conversations` row of type 'group', not a channel, so
+ * this carries no visibility, slug, category or description — the domain has
+ * none of them for conversations and none is invented here.
+ *
+ * `participantCount` is every active participant and is never
+ * `participants.length`: that array is a capped preview.
+ */
+export interface GroupDetails {
+  id: string;
+  name: string;
+  createdAt: string; // ISO 8601
+  participantCount: number;
+  participants: GroupParticipantProfile[];
+}
+
+/**
+ * What the details panel is describing right now.
+ *
+ * The two shapes are discriminated by `kind`, mirroring the domain: a channel
+ * and a group are different aggregates with different vocabulary, so the panel
+ * switches on the tag rather than on optional fields that only one of them
+ * ever populates.
+ */
+export type ConversationDetails =
+  | ({ kind: "channel" } & ChannelDetails)
+  | ({ kind: "group" } & GroupDetails);
+
+/** Scan lifecycle of an attachment. Only "clean" is ever downloadable. */
+export type AttachmentStatus = "pending_scan" | "clean" | "rejected";
+
+export interface ChannelAttachment {
+  id: string;
+  filename: string;
+  contentType: string;
+  /** Plaintext size in bytes. */
+  size: number;
+  status: AttachmentStatus;
+  createdAt: string; // ISO 8601
+}

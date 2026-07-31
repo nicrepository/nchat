@@ -44,6 +44,93 @@ type DMStore interface {
 	// participant as seen by userID. A single SQL query (no N+1) is used.
 	ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error)
 	GetVisibleConversationByID(ctx context.Context, workspaceID, conversationID, userID string) (domain.DMConversation, error)
+	// ListParticipantProfiles returns up to limit active participants of
+	// conversationID in workspaceID plus the total number of active
+	// participants, in one round trip. The caller's access to the conversation
+	// must already have been settled.
+	ListParticipantProfiles(ctx context.Context, workspaceID, conversationID string, limit int) (DMParticipantPage, error)
+}
+
+// DMParticipantPage is one capped page of a conversation's participants plus the
+// total the same predicate matches. TotalCount is the authoritative figure the
+// UI displays; len(Participants) is only how many fit in the page and must never
+// be shown as the participant count.
+type DMParticipantPage struct {
+	Participants []domain.DMParticipantProfile
+	TotalCount   int
+}
+
+// ListParticipantProfiles returns a capped page of a conversation's active
+// participants and the full total, in a single query.
+//
+// Every predicate that makes a participant "real" is applied here and nowhere
+// else: the conversation must be active and belong to workspaceID, the
+// participant's dm_members row must be status 'active' (so someone who left is
+// gone), they must still be an active member of the workspace, and their
+// account must be active and not deleted. That is the same shape
+// GetVisibleConversationByID uses to decide the caller may read the
+// conversation at all, so "who is in this group" cannot mean one thing for
+// access and another for display.
+//
+// The dc.workspace_id filter is what keeps a conversation UUID from another
+// tenant from ever resolving here, and the conversation_id filter is what keeps
+// participants of another group out of this one's list.
+//
+// Unlike the channel panel, presence does not select rows: a group lists every
+// active participant and the caller annotates presence afterwards, so an
+// offline participant is never dropped and never loses a slot.
+//
+// COUNT(*) OVER () is evaluated before LIMIT, so the total describes the whole
+// matching set and not the page; a second COUNT query would be a second chance
+// to drift from this one's predicate.
+func (s *PGXDMStore) ListParticipantProfiles(
+	ctx context.Context, workspaceID, conversationID string, limit int,
+) (DMParticipantPage, error) {
+	if limit <= 0 || limit > domain.MaxDMDetailsParticipants {
+		limit = domain.MaxDMDetailsParticipants
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text,
+		       COALESCE(
+		           NULLIF(BTRIM(u.full_name), ''),
+		           NULLIF(BTRIM(u.display_name), ''),
+		           ''
+		       ) AS display_name,
+		       COALESCE(u.avatar_url, '') AS avatar_url,
+		       COUNT(*) OVER () AS total_count
+		FROM chat.dm_members dm
+		JOIN chat.dm_conversations dc
+		  ON dc.id = dm.conversation_id
+		 AND dc.workspace_id = $1::uuid
+		 AND dc.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = dc.workspace_id
+		 AND wm.user_id = dm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE dm.conversation_id = $2::uuid
+		  AND dm.status = 'active'
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $3`, workspaceID, conversationID, limit)
+	if err != nil {
+		return DMParticipantPage{}, fmt.Errorf("list dm participant profiles: %w", err)
+	}
+	defer rows.Close()
+
+	page := DMParticipantPage{Participants: make([]domain.DMParticipantProfile, 0, limit)}
+	for rows.Next() {
+		var profile domain.DMParticipantProfile
+		var total int
+		if err := rows.Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL, &total); err != nil {
+			return DMParticipantPage{}, fmt.Errorf("scan dm participant profile: %w", err)
+		}
+		page.TotalCount = total
+		page.Participants = append(page.Participants, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return DMParticipantPage{}, fmt.Errorf("iterate dm participant profiles: %w", err)
+	}
+	return page, nil
 }
 
 // PGXDMStore implements DMStore using a pgx connection pool.

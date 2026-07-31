@@ -20,12 +20,25 @@ type fakeChannelProvider struct {
 	err       error
 	lastInput service.CreateChannelInput
 	calls     int
+
+	details          service.ChannelDetails
+	detailsErr       error
+	lastDetailsInput service.ChannelDetailsInput
+	detailsCalls     int
 }
 
 func (f *fakeChannelProvider) CreateChannel(_ context.Context, input service.CreateChannelInput) (domain.Channel, error) {
 	f.calls++
 	f.lastInput = input
 	return f.channel, f.err
+}
+
+func (f *fakeChannelProvider) GetChannelDetails(
+	_ context.Context, input service.ChannelDetailsInput,
+) (service.ChannelDetails, error) {
+	f.detailsCalls++
+	f.lastDetailsInput = input
+	return f.details, f.detailsErr
 }
 
 func channelTestHandler(provider *fakeChannelProvider) *httpapi.ChannelHandler {

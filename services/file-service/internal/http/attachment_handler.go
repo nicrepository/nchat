@@ -40,7 +40,14 @@ type AttachmentUseCases interface {
 	Upload(ctx context.Context, input service.UploadInput) (service.AttachmentView, error)
 	Metadata(ctx context.Context, input service.AttachmentAuthInput) (service.AttachmentView, error)
 	Download(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
+	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) ([]service.AttachmentView, error)
 	Ready() bool
+}
+
+// listAttachmentsResponse is the listing payload. The array is named rather
+// than returned bare so a cursor can be added later without breaking clients.
+type listAttachmentsResponse struct {
+	Attachments []service.AttachmentView `json:"attachments"`
 }
 
 // AttachmentHandler serves the RF-30 upload, metadata and download routes.
@@ -170,6 +177,74 @@ func (h *AttachmentHandler) GetMetadata(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, view)
+}
+
+// ListChannelAttachments handles GET /channels/{channelID}/attachments.
+func (h *AttachmentHandler) ListChannelAttachments(w http.ResponseWriter, r *http.Request) {
+	h.listAttachments(w, r, domain.DestinationKindChannel, r.PathValue("channelID"))
+}
+
+// ListConversationAttachments handles GET /dm/{conversationID}/attachments.
+func (h *AttachmentHandler) ListConversationAttachments(w http.ResponseWriter, r *http.Request) {
+	h.listAttachments(w, r, domain.DestinationKindDM, r.PathValue("conversationID"))
+}
+
+// listAttachments serves both listing routes.
+//
+// It returns metadata only — never content and never a token — so a member of a
+// channel or a participant of a conversation learns what has been shared there
+// and in what scan state, and nothing about how any of it is stored. A
+// destination the caller cannot reach answers 404, the same as one that does
+// not exist. The kind comes from the route, never from the request, so the two
+// destination spaces can never be crossed.
+func (h *AttachmentHandler) listAttachments(
+	w http.ResponseWriter, r *http.Request, kind domain.DestinationKind, destinationID string,
+) {
+	startedAt := time.Now()
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	if !h.Ready() {
+		writeAttachmentError(w, domain.ErrDependenciesUnavailable)
+		return
+	}
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+	views, err := h.useCases.ListDestinationAttachments(r.Context(), service.ListDestinationAttachmentsInput{
+		Destination: domain.Destination{Kind: kind, ID: destinationID},
+		UserID:      principal.UserID,
+		SessionID:   principal.SessionID,
+		Limit:       limit,
+	})
+	if err != nil {
+		status, code := attachmentErrorStatus(err)
+		h.logAttachment(r, startedAt, "list", code, status, "")
+		writeAttachmentError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, listAttachmentsResponse{Attachments: views})
+}
+
+// parseListLimit reads the optional ?limit=. An absent value means "the
+// default"; a malformed one is rejected rather than silently defaulted, so a
+// client never believes it asked for a page size it did not get. The ceiling
+// itself is enforced in the domain, not here.
+func parseListLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return 0, true
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit <= 0 {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest,
+			"limit must be a positive integer")
+		return 0, false
+	}
+	return limit, true
 }
 
 // DownloadContent handles GET /attachments/{attachmentID}/content.

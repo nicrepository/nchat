@@ -238,6 +238,68 @@ func (s *DMService) GetConversation(ctx context.Context, input GetDMConversation
 	return conversation, nil
 }
 
+// GroupDetailsInput asks for the group-details panel payload (issue #441).
+// The workspace is resolved server-side by the handler and the caller is the
+// authenticated principal; neither is ever taken from the request.
+type GroupDetailsInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	// ParticipantLimit caps the participant preview. Values outside
+	// (0, domain.MaxDMDetailsParticipants] are clamped by the store.
+	ParticipantLimit int
+}
+
+// GroupDetails is the panel payload: the conversation itself, a capped preview
+// of its participants and the authoritative participant total.
+//
+// ParticipantCount is every active participant and is deliberately not derived
+// from Participants, which is only as long as the preview cap allows.
+type GroupDetails struct {
+	Conversation     domain.DMConversation
+	Participants     []domain.DMParticipantProfile
+	ParticipantCount int
+}
+
+// GetGroupDetails returns the group-details payload for a group conversation
+// the caller participates in.
+//
+// Access is settled first, by the same GetVisibleConversationByID predicate the
+// rest of the DM surface uses: a conversation that does not exist, is archived,
+// belongs to another workspace, or that the caller is not an active participant
+// of all come back as a bare ErrNotFound, so the endpoint cannot be used to
+// probe which conversation UUIDs exist. Only after that are participants read,
+// so an unauthorised caller never reaches a roster.
+//
+// A 1:1 conversation is refused with the same ErrNotFound. Details for direct
+// messages are out of scope for this issue, and answering for them here would
+// ship an unreviewed surface — the type is checked against the row the database
+// returned, never against anything the client said.
+func (s *DMService) GetGroupDetails(ctx context.Context, input GroupDetailsInput) (GroupDetails, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	conversation, err := s.dms.GetVisibleConversationByID(
+		ctx,
+		workspaceID,
+		strings.TrimSpace(input.ConversationID),
+		strings.TrimSpace(input.CallerID),
+	)
+	if err != nil {
+		return GroupDetails{}, err
+	}
+	if conversation.Type != domain.DMConversationTypeGroup {
+		return GroupDetails{}, domain.ErrNotFound
+	}
+	page, err := s.dms.ListParticipantProfiles(ctx, workspaceID, conversation.ID, input.ParticipantLimit)
+	if err != nil {
+		return GroupDetails{}, fmt.Errorf("list dm participant profiles: %w", err)
+	}
+	return GroupDetails{
+		Conversation:     conversation,
+		Participants:     page.Participants,
+		ParticipantCount: page.TotalCount,
+	}, nil
+}
+
 func normalizeGroupDMParticipants(callerID string, invited []string) ([]string, error) {
 	// Checked on the raw list, before any per-ID work, so an oversized payload is
 	// rejected without parsing every entry first.

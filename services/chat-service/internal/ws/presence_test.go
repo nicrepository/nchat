@@ -339,3 +339,83 @@ func TestPresence_ConcurrentMultiUserMultiWorkspace_NoRace(t *testing.T) {
 
 	wg.Wait()
 }
+
+// ── OnlineUserIDs (issue #435) ───────────────────────────────────────────────
+
+func TestPresence_OnlineUserIDs_ReturnsOnlyOnlineUsersSorted(t *testing.T) {
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(5*time.Minute, clk)
+
+	// Deliberately connected out of order: the result must be sorted, not
+	// whatever order the map happens to iterate in.
+	for _, userID := range []string{"user-c", "user-a", "user-b"} {
+		p.Connect("ws-1", userID, "conn-"+userID)
+	}
+
+	got := p.OnlineUserIDs("ws-1")
+	if len(got) != 3 || got[0] != "user-a" || got[1] != "user-b" || got[2] != "user-c" {
+		t.Fatalf("expected the online users in sorted order, got %v", got)
+	}
+}
+
+func TestPresence_OnlineUserIDs_ExcludesAwayAndOffline(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	p.Connect("ws-1", "user-away", "conn-away")
+	// Push the first user past the away timeout, then connect a second one so
+	// only that second user is still online.
+	clk.Advance(awayTimeout + time.Second)
+	p.checkAway()
+	p.Connect("ws-1", "user-online", "conn-online")
+	// A third user connects and leaves: offline users have no entry at all.
+	p.Connect("ws-1", "user-gone", "conn-gone")
+	p.Disconnect("ws-1", "user-gone", "conn-gone")
+
+	if got := p.Status("ws-1", "user-away"); got != PresenceAway {
+		t.Fatalf("precondition failed: expected away, got %q", got)
+	}
+
+	got := p.OnlineUserIDs("ws-1")
+	if len(got) != 1 || got[0] != "user-online" {
+		t.Fatalf("away and offline users must not be reported as online, got %v", got)
+	}
+}
+
+func TestPresence_OnlineUserIDs_IsWorkspaceScoped(t *testing.T) {
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(5*time.Minute, clk)
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	p.Connect("ws-2", "user-2", "conn-2")
+
+	if got := p.OnlineUserIDs("ws-1"); len(got) != 1 || got[0] != "user-1" {
+		t.Fatalf("workspace ws-1 leaked another workspace's users: %v", got)
+	}
+	if got := p.OnlineUserIDs("ws-2"); len(got) != 1 || got[0] != "user-2" {
+		t.Fatalf("workspace ws-2 leaked another workspace's users: %v", got)
+	}
+	if got := p.OnlineUserIDs("ws-unknown"); len(got) != 0 {
+		t.Fatalf("an unknown workspace must report nobody online, got %v", got)
+	}
+}
+
+func TestPresence_OnlineUserIDs_ReflectsActivityRestoringOnline(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	clk.Advance(awayTimeout + time.Second)
+	p.checkAway()
+	if got := p.OnlineUserIDs("ws-1"); len(got) != 0 {
+		t.Fatalf("an away user must not be listed as online, got %v", got)
+	}
+
+	p.RecordActivity("ws-1", "user-1", "conn-1")
+
+	if got := p.OnlineUserIDs("ws-1"); len(got) != 1 || got[0] != "user-1" {
+		t.Fatalf("expected the user back online after activity, got %v", got)
+	}
+}

@@ -200,6 +200,28 @@ type ChannelMember struct {
 	JoinedAt  time.Time
 }
 
+// ChannelMemberProfile is one member of a channel as the channel-details panel
+// needs to render them (issue #435).
+//
+// It carries a stable ID (for a deterministic avatar colour and for "this is
+// you"), the already-resolved visual name, an optional avatar URL and the
+// channel role. E-mail, auth source, workspace role, join date and every other
+// profile attribute are deliberately absent: none of them is displayed, and a
+// member list is the wrong place to hand out a directory.
+type ChannelMemberProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Role        ChannelRole
+}
+
+// MaxChannelDetailsMembers bounds the member page the details endpoint returns.
+//
+// The panel shows a short preview, not the roster, so the response is capped
+// server-side and the total is reported separately. A client asking for more
+// gets this many.
+const MaxChannelDetailsMembers = 30
+
 // DMConversation represents a direct or ad-hoc group DM conversation.
 // Title is empty string when NULL in the database.
 type DMConversation struct {
@@ -212,6 +234,38 @@ type DMConversation struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
+
+// DMParticipantProfile is one participant of a group conversation as the
+// group-details panel renders them (issue #441).
+//
+// It carries a stable ID (for a deterministic avatar colour and for "this is
+// you"), the already-resolved visual name, an optional avatar URL and the live
+// presence status. E-mail, workspace role, join date and every other profile
+// attribute are deliberately absent.
+//
+// There is no Role field, unlike ChannelMemberProfile: chat.dm_members.role is
+// closed by CHECK to the single value 'member', so it carries no information a
+// panel could show. A group has no owner or moderator in this domain.
+//
+// Presence is decoration here, not a filter: unlike the channel panel — whose
+// list is defined as "the members who are online" — a group's participant list
+// is every active participant, and someone being offline never removes them
+// from it. Presence is therefore resolved for the returned page rather than
+// used to select it.
+type DMParticipantProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Presence    string
+}
+
+// MaxDMDetailsParticipants bounds the participant page the group-details
+// endpoint returns.
+//
+// The panel shows a short preview, not the roster, so the response is capped
+// server-side and the total is reported separately. A client asking for more
+// gets this many.
+const MaxDMDetailsParticipants = 30
 
 // DMMember represents membership in a DM conversation.
 // LeftAt is zero when NULL in the database.

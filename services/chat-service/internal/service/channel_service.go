@@ -121,6 +121,71 @@ func (s *ChannelService) ListChannels(ctx context.Context, workspaceID, callerID
 	return channels, nil
 }
 
+// ChannelDetailsInput asks for the channel-details panel payload (issue #435).
+// The workspace is resolved server-side by the handler and the caller is the
+// authenticated principal; neither is ever taken from the request body.
+type ChannelDetailsInput struct {
+	WorkspaceID string
+	CallerID    string
+	ChannelID   string
+	// OnlineUserIDs is the presence snapshot for the workspace, resolved by the
+	// handler from the presence source in one batch. It is a *filter*, never a
+	// source of identity: only IDs that are also active members of this channel
+	// survive the store's join, so a stale or foreign entry selects nothing.
+	// Empty means nobody is online and the preview comes back empty — absence of
+	// presence is never read as "online".
+	OnlineUserIDs []string
+	// MemberLimit caps the online-member preview. Values outside
+	// (0, domain.MaxChannelDetailsMembers] are clamped by the store.
+	MemberLimit int
+}
+
+// ChannelDetails is the panel payload: the channel itself, a capped preview of
+// the members who are online, and the two totals behind it.
+//
+// MemberCount is every active member of the channel and is deliberately not
+// derived from OnlineMembers — the panel shows it as the channel's size, which
+// does not change when someone disconnects.
+type ChannelDetails struct {
+	Channel       domain.Channel
+	OnlineMembers []domain.ChannelMemberProfile
+	OnlineCount   int
+	MemberCount   int
+}
+
+// GetChannelDetails returns the channel-details payload for a channel the
+// caller may read.
+//
+// Visibility is settled first, by the same GetVisibleChannelByID predicate the
+// rest of the channel surface uses: a private channel the caller does not
+// belong to, an archived channel, a channel in another workspace and a channel
+// that does not exist all come back as a bare ErrNotFound, so the endpoint
+// cannot be used to probe which channel UUIDs exist. Only after that does the
+// member query run, so an unauthorised caller never reaches a roster — the
+// presence snapshot the handler collected is likewise never returned to a
+// caller who fails this gate.
+func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDetailsInput) (ChannelDetails, error) {
+	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
+		return ChannelDetails{}, err
+	}
+	channel, err := s.channels.GetVisibleChannelByID(ctx, input.WorkspaceID, input.ChannelID, input.CallerID)
+	if err != nil {
+		return ChannelDetails{}, err
+	}
+	page, err := s.members.ListOnlineChannelMemberProfiles(
+		ctx, input.WorkspaceID, channel.ID, input.OnlineUserIDs, input.MemberLimit,
+	)
+	if err != nil {
+		return ChannelDetails{}, fmt.Errorf("list online channel member profiles: %w", err)
+	}
+	return ChannelDetails{
+		Channel:       channel,
+		OnlineMembers: page.Online,
+		OnlineCount:   page.OnlineCount,
+		MemberCount:   page.TotalCount,
+	}, nil
+}
+
 // GetChannel returns one visibility-bound active channel by ID or slug.
 func (s *ChannelService) GetChannel(ctx context.Context, input GetChannelInput) (domain.Channel, error) {
 	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {

@@ -16,6 +16,7 @@ import (
 // suites, not here.
 type fakePool struct {
 	queryRow func(sql string, args ...any) pgx.Row
+	query    func(sql string, args ...any) (pgx.Rows, error)
 	exec     func(sql string, args ...any) (pgconn.CommandTag, error)
 	pingErr  error
 	closed   bool
@@ -40,8 +41,52 @@ func (p *fakePool) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 	return p.exec(sql, args...)
 }
 
+func (p *fakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	p.lastSQL, p.lastArgs = sql, args
+	if p.query == nil {
+		return nil, errors.New("no query configured")
+	}
+	return p.query(sql, args...)
+}
+
 func (p *fakePool) Ping(context.Context) error { return p.pingErr }
 func (p *fakePool) Close()                     { p.closed = true }
+
+// valueRows replays scripted rows through the pgx.Rows surface the stores use:
+// Next, Scan, Err and Close. Everything else panics rather than answering
+// plausibly, so a store that starts relying on it fails loudly here.
+type valueRows struct {
+	rows   [][]any
+	index  int
+	err    error
+	closed bool
+}
+
+func (r *valueRows) Next() bool {
+	if r.err != nil || r.index >= len(r.rows) {
+		return false
+	}
+	r.index++
+	return true
+}
+
+func (r *valueRows) Scan(dest ...any) error {
+	if r.index == 0 || r.index > len(r.rows) {
+		return errors.New("scan called outside a row")
+	}
+	return valueRow{values: r.rows[r.index-1]}.Scan(dest...)
+}
+
+func (r *valueRows) Err() error { return r.err }
+func (r *valueRows) Close()     { r.closed = true }
+
+func (r *valueRows) CommandTag() pgconn.CommandTag { return pgconn.CommandTag{} }
+func (r *valueRows) FieldDescriptions() []pgconn.FieldDescription {
+	return nil
+}
+func (r *valueRows) Values() ([]any, error) { return nil, errors.New("not supported") }
+func (r *valueRows) RawValues() [][]byte    { return nil }
+func (r *valueRows) Conn() *pgx.Conn        { return nil }
 
 // valueRow assigns the configured values to the scan destinations in order.
 type valueRow struct {

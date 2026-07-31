@@ -1,0 +1,373 @@
+/*
+ * ConversationDetailsPanel — side panel for a channel ("Detalhes do canal",
+ * issue #435) and for an ad-hoc group ("Detalhes do grupo", issue #441).
+ *
+ * The panel is a grid column of .chat-msg-area, not an overlay: the conversation
+ * keeps its own column and simply narrows. Only below the layout's breakpoint
+ * does it take the full width, because at that size two columns would leave the
+ * messages unreadable. Every token here is the chat scope's; nothing global is
+ * touched.
+ */
+
+.chat-details {
+  grid-area: details;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--color-surface, #fff);
+  border-left: 1px solid var(--color-border, #e8e3f0);
+  overflow: hidden;
+}
+
+.chat-details__head {
+  flex-shrink: 0;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 12px 0 20px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-details__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+}
+
+.chat-details__close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-details__close:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__close .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.chat-details__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px 24px;
+}
+
+.chat-details__section + .chat-details__section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-details__section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-details__label {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted, #7c7390);
+}
+
+.chat-details__section-head .chat-details__label {
+  margin-bottom: 0;
+}
+
+.chat-details__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-details__meta .material-symbols-outlined {
+  font-size: 16px;
+  color: var(--color-muted-2, #a39cb3);
+  flex: none;
+}
+
+.chat-details__empty,
+.chat-details__note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-muted, #7c7390);
+}
+
+/* ── Actions ────────────────────────────────────────────────────────────── */
+
+.chat-details__link-action {
+  flex: none;
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-primary, #6d28d9);
+  cursor: pointer;
+}
+
+.chat-details__wide-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface-2, #faf8fd);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-ink-2, #3d3550);
+  cursor: pointer;
+}
+
+.chat-details__wide-action .material-symbols-outlined {
+  font-size: 16px;
+}
+
+/* A disabled action stays visible and legible — it is an affordance that is not
+   available yet, not a control that has been hidden. */
+.chat-details__link-action:disabled,
+.chat-details__wide-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ── Members ────────────────────────────────────────────────────────────── */
+
+.chat-details__members,
+.chat-details__files {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-details__member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.chat-details__avatar {
+  position: relative;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+
+.chat-details__avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/* Same palette the sidebar and the message header use, so one person reads as
+   the same colour everywhere. */
+.chat-details__avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.chat-details__avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.chat-details__avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.chat-details__avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.chat-details__avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.chat-details__avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
+}
+
+.chat-details__presence {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--color-surface, #fff);
+  background: var(--color-muted-2, #a39cb3);
+}
+
+.chat-details__presence--online {
+  background: #16a34a;
+}
+.chat-details__presence--away {
+  background: #d97706;
+}
+
+.chat-details__member-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-details__member-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-details__member-role {
+  font-size: 11px;
+  color: var(--color-muted, #7c7390);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-details__badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* ── Pinned message ─────────────────────────────────────────────────────── */
+
+.chat-details__pin {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-details__pin-icon {
+  flex: none;
+  font-size: 18px;
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__pin-text {
+  min-width: 0;
+}
+
+.chat-details__pin-body {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--color-ink, #16121f);
+  /* Long unbroken content must wrap inside the panel, never widen it. */
+  overflow-wrap: anywhere;
+}
+
+.chat-details__pin-by {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-muted, #7c7390);
+}
+
+/* ── Files ──────────────────────────────────────────────────────────────── */
+
+.chat-details__file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.chat-details__file-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm, 6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__file-icon .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.chat-details__file-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-details__file-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-details__file-meta {
+  font-size: 11px;
+  color: var(--color-muted, #7c7390);
+}
+
+.chat-details__file-status {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-weight: 700;
+  background: var(--color-warning-tint, #fef3c7);
+  color: var(--color-warning-ink, #92400e);
+}
+
+.chat-details__file-status--rejected {
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+}
