@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Locator } from "@playwright/test";
 
 import {
   CURRENT_USER_ID,
@@ -16,6 +17,19 @@ import {
   revealActions,
   uniqueId,
 } from "../helpers/messagingApi";
+
+/**
+ * Asserts that the pinned bar previews one specific message.
+ *
+ * The bar renders the author and the body in two separate spans, so each is
+ * matched on its own dynamic text rather than on the section's aggregate
+ * textContent — that aggregate also contains the "keep" and "close" icon
+ * glyphs, which are presentation and not part of any contract.
+ */
+async function expectPinPreview(pinsBar: Locator, bodyText: string) {
+  await expect(pinsBar.getByText(`${OTHER_USER_NAME}:`, { exact: true })).toBeVisible();
+  await expect(pinsBar.getByText(`${OTHER_USER_NAME}: ${bodyText}`, { exact: true })).toBeVisible();
+}
 
 /**
  * Objetivo: reação (WS round-trip), favorito e pin (REST) — cada um com
@@ -217,11 +231,14 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     page,
   }, testInfo) => {
     const targetId = uniqueId(testInfo, "dm");
+    // Unique per run, so the assertions below can only be satisfied by the very
+    // message this test pinned — never by fixture text that happens to match.
+    const pinnedText = `${uniqueId(testInfo, "pin")} mensagem para fixar`;
     const original = makeMessage({
       id: `${targetId}-msg`,
       sender_id: OTHER_USER_ID,
       sender_display_name: OTHER_USER_NAME,
-      body_text: "mensagem para fixar",
+      body_text: pinnedText,
     });
     const scenario = createScenario({
       kind: "dm",
@@ -235,16 +252,28 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     await revealActions(page, original.id);
     await page.getByRole("button", { name: "Fixar mensagem" }).click();
 
+    // The bar previews the pinned message itself (issue #435), so what is
+    // asserted is the author and the body of the message just pinned. The
+    // section's aggregate textContent is deliberately not used: it also carries
+    // the icon glyphs and the close button's label.
     const pinsBar = page.getByTestId("chat-pins");
-    await expect(pinsBar).toContainText("1 mensagem fixada");
+    await expect(pinsBar).toBeVisible();
+    await expect(pinsBar).toHaveAttribute("aria-label", "Mensagem fixada");
+    await expectPinPreview(pinsBar, pinnedText);
     await expect(
       messageBubble(page, original.id).getByRole("button", { name: "Desafixar mensagem" }),
     ).toHaveAttribute("aria-pressed", "true");
     expect(scenario.requests.pins).toEqual([{ messageId: original.id, targetId, action: "add" }]);
 
     await page.reload();
-    await expect(page.getByTestId("chat-pins")).toContainText("1 mensagem fixada");
+    // Same message after a reload — the pin survived, not merely some bar.
+    const pinsBarAfterReload = page.getByTestId("chat-pins");
+    await expect(pinsBarAfterReload).toBeVisible();
+    await expectPinPreview(pinsBarAfterReload, pinnedText);
     await revealActions(page, original.id);
+    await expect(
+      messageBubble(page, original.id).getByRole("button", { name: "Desafixar mensagem" }),
+    ).toHaveAttribute("aria-pressed", "true");
     await messageBubble(page, original.id)
       .getByRole("button", { name: "Desafixar mensagem" })
       .click();
