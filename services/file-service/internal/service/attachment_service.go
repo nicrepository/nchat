@@ -103,12 +103,16 @@ type StoredAttachment struct {
 }
 
 // ListDestinationAttachmentsQuery is a resolved, already-authorised listing
-// request. Both identifiers are server-derived: the workspace comes from the
-// destination row, never from the caller.
+// request. Every identifier is server-derived: the workspace and the
+// destination both come from the destination row, never from the caller.
+//
+// Kind decides which destination column the query filters on, so a channel UUID
+// can never select a conversation's attachments or the other way round.
 type ListDestinationAttachmentsQuery struct {
-	WorkspaceID string
-	ChannelID   string
-	Limit       int
+	WorkspaceID   string
+	Kind          domain.DestinationKind
+	DestinationID string
+	Limit         int
 }
 
 // ListedAttachment is the row a listing loads. It deliberately omits the
@@ -130,17 +134,17 @@ type AttachmentStore interface {
 	MarkUploaded(ctx context.Context, update UploadedAttachment) error
 	MarkFailed(ctx context.Context, attachmentID, failureCode string) error
 	GetAuthorized(ctx context.Context, input AttachmentAuthInput) (StoredAttachment, error)
-	ListChannelAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) ([]ListedAttachment, error)
+	ListDestinationAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) ([]ListedAttachment, error)
 }
 
-// ListChannelAttachmentsInput asks for a channel's most recent attachments.
-// The workspace is absent by design — it is derived from the channel row during
-// authorization, exactly like an upload's.
-type ListChannelAttachmentsInput struct {
-	ChannelID string
-	UserID    string
-	SessionID string
-	Limit     int
+// ListDestinationAttachmentsInput asks for one destination's most recent
+// attachments. The workspace is absent by design — it is derived from the
+// destination row during authorization, exactly like an upload's.
+type ListDestinationAttachmentsInput struct {
+	Destination domain.Destination
+	UserID      string
+	SessionID   string
+	Limit       int
 }
 
 // ObjectStore is the blob half. It is intentionally narrow so the service and
@@ -477,29 +481,34 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 	}, nil
 }
 
-// ListChannelAttachments returns a channel's most recent attachments for a
-// caller who may currently reach that channel (issue #435).
+// ListDestinationAttachments returns a destination's most recent attachments
+// for a caller who can currently reach it (issues #435 and #441).
 //
 // Authorization is the upload path's, unchanged: AuthorizeDestination resolves
-// the channel and its canonical workspace in one query and answers ErrNotFound
-// for a channel that does not exist, is archived, is private and not the
-// caller's, or belongs to another workspace. The listing query is then bound to
-// the workspace that query returned, so a channel UUID from another tenant can
-// never select that tenant's rows.
+// the destination and its canonical workspace in one query and answers
+// ErrNotFound for anything that does not exist, is archived, is private and not
+// the caller's, or belongs to another workspace. Channels and conversations
+// each go through their own policy inside that call — there is no second,
+// divergent rule here, and a group's attachments are gated by active
+// participation in the conversation exactly as its messages are.
+//
+// The listing query is then bound to the workspace, the kind and the ID that
+// query returned, so a channel UUID can never select a conversation's rows and
+// a UUID from another tenant can never select that tenant's.
 //
 // The result is a preview, not an archive: the limit is clamped in the domain
 // and the order is fixed server-side, so a client cannot ask for an unbounded
 // scan or a different one.
-func (s *AttachmentService) ListChannelAttachments(
-	ctx context.Context, input ListChannelAttachmentsInput,
+func (s *AttachmentService) ListDestinationAttachments(
+	ctx context.Context, input ListDestinationAttachmentsInput,
 ) ([]AttachmentView, error) {
 	if !s.Ready() {
 		return nil, domain.ErrDependenciesUnavailable
 	}
-	destination, err := domain.NewDestination(domain.DestinationKindChannel, input.ChannelID)
+	destination, err := domain.NewDestination(input.Destination.Kind, input.Destination.ID)
 	if err != nil {
-		// An unparseable channel id is answered like an invisible one, so the
-		// route cannot be used to tell "malformed" from "not yours".
+		// An unparseable or unknown destination is answered like an invisible
+		// one, so the route cannot be used to tell "malformed" from "not yours".
 		return nil, domain.ErrNotFound
 	}
 	userID, sessionID, err := parsePrincipal(input.UserID, input.SessionID)
@@ -514,10 +523,11 @@ func (s *AttachmentService) ListChannelAttachments(
 	if err != nil {
 		return nil, err
 	}
-	records, err := s.store.ListChannelAttachments(ctx, ListDestinationAttachmentsQuery{
-		WorkspaceID: authorized.WorkspaceID,
-		ChannelID:   authorized.ID,
-		Limit:       domain.NormalizeAttachmentListLimit(input.Limit),
+	records, err := s.store.ListDestinationAttachments(ctx, ListDestinationAttachmentsQuery{
+		WorkspaceID:   authorized.WorkspaceID,
+		Kind:          destination.Kind,
+		DestinationID: authorized.ID,
+		Limit:         domain.NormalizeAttachmentListLimit(input.Limit),
 	})
 	if err != nil {
 		return nil, err
@@ -534,7 +544,7 @@ func (s *AttachmentService) ListChannelAttachments(
 			ContentType:     contentType,
 			Size:            record.Size,
 			Status:          string(record.Status),
-			DestinationKind: string(domain.DestinationKindChannel),
+			DestinationKind: string(destination.Kind),
 			CreatedAt:       record.CreatedAt,
 		})
 	}

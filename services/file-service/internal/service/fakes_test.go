@@ -87,7 +87,7 @@ type fakeStore struct {
 	listCalled int
 }
 
-func (s *fakeStore) ListChannelAttachments(
+func (s *fakeStore) ListDestinationAttachments(
 	_ context.Context, query service.ListDestinationAttachmentsQuery,
 ) ([]service.ListedAttachment, error) {
 	s.mu.Lock()

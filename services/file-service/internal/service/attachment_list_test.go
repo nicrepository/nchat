@@ -10,16 +10,22 @@ import (
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
 
-func listInput(limit int) service.ListChannelAttachmentsInput {
-	return service.ListChannelAttachmentsInput{
-		ChannelID: testChannelID,
-		UserID:    testUserID,
-		SessionID: testSessionID,
-		Limit:     limit,
+func listInput(limit int) service.ListDestinationAttachmentsInput {
+	return destinationListInput(domain.DestinationKindChannel, testChannelID, limit)
+}
+
+func destinationListInput(
+	kind domain.DestinationKind, id string, limit int,
+) service.ListDestinationAttachmentsInput {
+	return service.ListDestinationAttachmentsInput{
+		Destination: domain.Destination{Kind: kind, ID: id},
+		UserID:      testUserID,
+		SessionID:   testSessionID,
+		Limit:       limit,
 	}
 }
 
-func TestListChannelAttachments_ProjectsTheStoredRows(t *testing.T) {
+func TestListDestinationAttachments_ProjectsTheStoredRows(t *testing.T) {
 	f := newFixture(t)
 	createdAt := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	f.store.listed = []service.ListedAttachment{
@@ -32,7 +38,7 @@ func TestListChannelAttachments_ProjectsTheStoredRows(t *testing.T) {
 		{ID: "a-2", Status: domain.StatusPendingScan, Filename: "topologia", Size: 10, CreatedAt: createdAt},
 	}
 
-	views, err := f.service.ListChannelAttachments(context.Background(), listInput(0))
+	views, err := f.service.ListDestinationAttachments(context.Background(), listInput(0))
 	if err != nil {
 		t.Fatalf("ListChannelAttachments: %v", err)
 	}
@@ -53,7 +59,7 @@ func TestListChannelAttachments_ProjectsTheStoredRows(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachments_QueriesTheAuthorizedWorkspaceOnly(t *testing.T) {
+func TestListDestinationAttachments_QueriesTheAuthorizedWorkspaceOnly(t *testing.T) {
 	f := newFixture(t)
 	// The authorizer answers with the destination's own canonical workspace and
 	// channel; the query must use those, never the request's channel string.
@@ -63,13 +69,15 @@ func TestListChannelAttachments_QueriesTheAuthorizedWorkspaceOnly(t *testing.T) 
 		SessionExpiresAt: time.Now().Add(time.Hour),
 	}
 
-	if _, err := f.service.ListChannelAttachments(context.Background(), listInput(0)); err != nil {
+	if _, err := f.service.ListDestinationAttachments(context.Background(), listInput(0)); err != nil {
 		t.Fatalf("ListChannelAttachments: %v", err)
 	}
 	if f.store.listCalled != 1 {
 		t.Fatalf("expected exactly one store query, got %d", f.store.listCalled)
 	}
-	if f.store.listQuery.WorkspaceID != testWorkspaceID || f.store.listQuery.ChannelID != testChannelID {
+	if f.store.listQuery.WorkspaceID != testWorkspaceID ||
+		f.store.listQuery.DestinationID != testChannelID ||
+		f.store.listQuery.Kind != domain.DestinationKindChannel {
 		t.Fatalf("query must be bound to the authorized destination: %+v", f.store.listQuery)
 	}
 	if len(f.authorizer.calls) != 1 || f.authorizer.calls[0].Destination.Kind != domain.DestinationKindChannel {
@@ -77,7 +85,7 @@ func TestListChannelAttachments_QueriesTheAuthorizedWorkspaceOnly(t *testing.T) 
 	}
 }
 
-func TestListChannelAttachments_ClampsTheLimit(t *testing.T) {
+func TestListDestinationAttachments_ClampsTheLimit(t *testing.T) {
 	for name, tt := range map[string]struct{ asked, want int }{
 		"unspecified":  {asked: 0, want: domain.DefaultAttachmentListLimit},
 		"within range": {asked: 5, want: 5},
@@ -88,7 +96,7 @@ func TestListChannelAttachments_ClampsTheLimit(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
-			if _, err := f.service.ListChannelAttachments(context.Background(), listInput(tt.asked)); err != nil {
+			if _, err := f.service.ListDestinationAttachments(context.Background(), listInput(tt.asked)); err != nil {
 				t.Fatalf("ListChannelAttachments: %v", err)
 			}
 			if f.store.listQuery.Limit != tt.want {
@@ -98,9 +106,9 @@ func TestListChannelAttachments_ClampsTheLimit(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachments_RefusesUnreachableChannels(t *testing.T) {
+func TestListDestinationAttachments_RefusesUnreachableChannels(t *testing.T) {
 	for name, tt := range map[string]struct {
-		input   service.ListChannelAttachmentsInput
+		input   service.ListDestinationAttachmentsInput
 		authErr error
 		want    error
 	}{
@@ -108,20 +116,27 @@ func TestListChannelAttachments_RefusesUnreachableChannels(t *testing.T) {
 		"session invalid":     {input: listInput(0), authErr: domain.ErrUnauthorized, want: domain.ErrUnauthorized},
 		// A malformed UUID is answered exactly like an invisible channel, so the
 		// route cannot be used to tell one from the other.
-		"malformed channel id": {
-			input: service.ListChannelAttachmentsInput{ChannelID: "../../etc", UserID: testUserID, SessionID: testSessionID},
+		"malformed destination id": {
+			input: destinationListInput(domain.DestinationKindChannel, "../../etc", 0),
+			want:  domain.ErrNotFound,
+		},
+		"unknown destination kind": {
+			input: destinationListInput("workspace", testChannelID, 0),
 			want:  domain.ErrNotFound,
 		},
 		"malformed principal": {
-			input: service.ListChannelAttachmentsInput{ChannelID: testChannelID, UserID: "nope", SessionID: testSessionID},
-			want:  domain.ErrUnauthorized,
+			input: service.ListDestinationAttachmentsInput{
+				Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+				UserID:      "nope", SessionID: testSessionID,
+			},
+			want: domain.ErrUnauthorized,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
 			f.authorizer.err = tt.authErr
 
-			_, err := f.service.ListChannelAttachments(context.Background(), tt.input)
+			_, err := f.service.ListDestinationAttachments(context.Background(), tt.input)
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("expected %v, got %v", tt.want, err)
 			}
@@ -132,9 +147,9 @@ func TestListChannelAttachments_RefusesUnreachableChannels(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachments_RequiresAWiredService(t *testing.T) {
+func TestListDestinationAttachments_RequiresAWiredService(t *testing.T) {
 	unwired := service.NewAttachmentService(nil, nil, nil, nil, 0, true, nil, discardLogger())
-	_, err := unwired.ListChannelAttachments(context.Background(), listInput(0))
+	_, err := unwired.ListDestinationAttachments(context.Background(), listInput(0))
 	if !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("expected ErrUnavailable, got %v", err)
 	}
@@ -152,5 +167,62 @@ func TestStatusListable_ExcludesIncompleteAndAbandonedUploads(t *testing.T) {
 		if got := status.Listable(); got != want {
 			t.Fatalf("%s: expected listable=%v, got %v", status, want, got)
 		}
+	}
+}
+
+// TestListDestinationAttachments_KeepsChannelsAndConversationsApart is the
+// isolation guard for issue #441: the kind travels from the route to the query,
+// so a conversation listing can never be answered from channel rows.
+func TestListDestinationAttachments_KeepsChannelsAndConversationsApart(t *testing.T) {
+	for name, tt := range map[string]struct {
+		kind domain.DestinationKind
+		id   string
+	}{
+		"channel": {kind: domain.DestinationKindChannel, id: testChannelID},
+		"dm":      {kind: domain.DestinationKindDM, id: testConversation},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.authorizer.result = service.AuthorizedDestination{
+				ID: tt.id, WorkspaceID: testWorkspaceID,
+				SessionExpiresAt: time.Now().Add(time.Hour),
+			}
+
+			if _, err := f.service.ListDestinationAttachments(
+				context.Background(), destinationListInput(tt.kind, tt.id, 0),
+			); err != nil {
+				t.Fatalf("ListDestinationAttachments: %v", err)
+			}
+
+			// The kind the route pinned reaches both the authorizer and the
+			// query, so neither can be satisfied by the other space.
+			if f.authorizer.calls[0].Destination.Kind != tt.kind {
+				t.Fatalf("authorization must use the route's kind, got %v", f.authorizer.calls[0].Destination.Kind)
+			}
+			if f.store.listQuery.Kind != tt.kind || f.store.listQuery.DestinationID != tt.id {
+				t.Fatalf("query must be bound to the route's destination: %+v", f.store.listQuery)
+			}
+		})
+	}
+}
+
+func TestListDestinationAttachments_ReportsTheDestinationKindItListed(t *testing.T) {
+	f := newFixture(t)
+	f.authorizer.result = service.AuthorizedDestination{
+		ID: testConversation, WorkspaceID: testWorkspaceID,
+		SessionExpiresAt: time.Now().Add(time.Hour),
+	}
+	f.store.listed = []service.ListedAttachment{
+		{ID: "a-1", Status: domain.StatusClean, Filename: "ata.pdf", CreatedAt: time.Now()},
+	}
+
+	views, err := f.service.ListDestinationAttachments(
+		context.Background(), destinationListInput(domain.DestinationKindDM, testConversation, 0),
+	)
+	if err != nil {
+		t.Fatalf("ListDestinationAttachments: %v", err)
+	}
+	if len(views) != 1 || views[0].DestinationKind != string(domain.DestinationKindDM) {
+		t.Fatalf("expected the dm destination kind, got %+v", views)
 	}
 }
