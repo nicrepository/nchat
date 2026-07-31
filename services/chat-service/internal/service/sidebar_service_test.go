@@ -130,6 +130,10 @@ func (f *sidebarFakeDMStore) ListVisibleConversationsByUser(_ context.Context, _
 func (f *sidebarFakeDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Context, _, _ string) ([]domain.DMConversationWithParticipantIDs, error) {
 	return f.dms, f.err
 }
+func (f *sidebarFakeDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
+	return storage.DMParticipantPage{}, nil
+}
+
 func (f *sidebarFakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil
 }

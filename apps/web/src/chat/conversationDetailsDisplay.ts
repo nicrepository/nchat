@@ -1,17 +1,17 @@
 /**
  * Presentation values shared by the details panel and the header control that
- * opens it (issue #435).
+ * opens it (issues #435 and #441).
  *
- * They live outside ChannelDetailsPanel.tsx so that file exports components and
+ * They live outside ConversationDetailsPanel.tsx so that file exports components and
  * nothing else — the toggle needs the panel's id for aria-controls, and
  * importing a component module for a string would be the wrong dependency.
  */
 
 /** aria-labelledby target: the panel's own heading. */
-export const channelDetailsTitleId = "chat-channel-details-title";
+export const conversationDetailsTitleId = "chat-channel-details-title";
 
 /** aria-controls target: stable, so the toggle can name the panel it opens. */
-export const channelDetailsPanelId = "chat-channel-details-panel";
+export const conversationDetailsPanelId = "chat-channel-details-panel";
 
 /**
  * Human-readable size, binary units, pt-BR decimal separator.

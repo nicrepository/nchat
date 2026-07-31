@@ -73,11 +73,11 @@ type fakeUseCases struct {
 
 	listViews []service.AttachmentView
 	listErr   error
-	listInput service.ListChannelAttachmentsInput
+	listInput service.ListDestinationAttachmentsInput
 }
 
-func (f *fakeUseCases) ListChannelAttachments(
-	_ context.Context, input service.ListChannelAttachmentsInput,
+func (f *fakeUseCases) ListDestinationAttachments(
+	_ context.Context, input service.ListDestinationAttachmentsInput,
 ) ([]service.AttachmentView, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -846,10 +846,9 @@ func TestAttachmentRoutesRejectTheWrongMethod(t *testing.T) {
 	router := newTestRouter(t, useCases, enabledConfig())
 
 	tests := []struct{ method, path string }{
-		// GET on the channel collection is the listing route (issue #435), so
-		// the unrouted method asserted here is PUT.
+		// GET on both collections is the listing route (issues #435 and #441),
+		// so the unrouted method asserted here is PUT.
 		{method: http.MethodPut, path: channelUploadPath(testChannelID)},
-		{method: http.MethodGet, path: dmUploadPath(testDMID)},
 		{method: http.MethodPut, path: dmUploadPath(testDMID)},
 		{method: http.MethodDelete, path: "/attachments/" + uuid.NewString()},
 		{method: http.MethodPost, path: "/attachments/" + uuid.NewString() + "/content"},

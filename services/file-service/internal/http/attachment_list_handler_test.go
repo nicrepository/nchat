@@ -34,7 +34,7 @@ func decodeAttachments(t *testing.T, response *httptest.ResponseRecorder) []map[
 	return body.Data.Attachments
 }
 
-func TestListChannelAttachmentsServesMetadataOnly(t *testing.T) {
+func TestListDestinationAttachmentsServesMetadataOnly(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.listViews = []service.AttachmentView{{
 		ID: "a-1", Filename: "relatório <script>.pdf", ContentType: "application/pdf",
@@ -66,15 +66,16 @@ func TestListChannelAttachmentsServesMetadataOnly(t *testing.T) {
 			t.Fatalf("listing leaked %q: %v", forbidden, item)
 		}
 	}
-	if useCases.listInput.ChannelID != testChannelID {
-		t.Fatalf("expected the path channel, got %q", useCases.listInput.ChannelID)
+	if useCases.listInput.Destination.ID != testChannelID ||
+		useCases.listInput.Destination.Kind != domain.DestinationKindChannel {
+		t.Fatalf("expected the path channel, got %+v", useCases.listInput.Destination)
 	}
 	if useCases.listInput.Limit != 0 {
 		t.Fatalf("an absent limit must stay unspecified, got %d", useCases.listInput.Limit)
 	}
 }
 
-func TestListChannelAttachmentsForwardsTheRequestedLimit(t *testing.T) {
+func TestListDestinationAttachmentsForwardsTheRequestedLimit(t *testing.T) {
 	useCases := readyUseCases()
 	router := newTestRouter(t, useCases, enabledConfig())
 
@@ -86,7 +87,7 @@ func TestListChannelAttachmentsForwardsTheRequestedLimit(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachmentsRejectsAMalformedLimit(t *testing.T) {
+func TestListDestinationAttachmentsRejectsAMalformedLimit(t *testing.T) {
 	for _, raw := range []string{"abc", "0", "-1", "1e3"} {
 		useCases := readyUseCases()
 		router := newTestRouter(t, useCases, enabledConfig())
@@ -101,7 +102,7 @@ func TestListChannelAttachmentsRejectsAMalformedLimit(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachmentsHidesUnreachableChannels(t *testing.T) {
+func TestListDestinationAttachmentsHidesUnreachableChannels(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.listErr = domain.ErrNotFound
 	router := newTestRouter(t, useCases, enabledConfig())
@@ -115,7 +116,7 @@ func TestListChannelAttachmentsHidesUnreachableChannels(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachmentsRequiresAuthentication(t *testing.T) {
+func TestListDestinationAttachmentsRequiresAuthentication(t *testing.T) {
 	router := newTestRouter(t, readyUseCases(), enabledConfig())
 
 	response := httptest.NewRecorder()
@@ -125,7 +126,7 @@ func TestListChannelAttachmentsRequiresAuthentication(t *testing.T) {
 	}
 }
 
-func TestListChannelAttachmentsIsUnavailableWhileUploadsAreDisabled(t *testing.T) {
+func TestListDestinationAttachmentsIsUnavailableWhileUploadsAreDisabled(t *testing.T) {
 	disabled := enabledConfig()
 	disabled.UploadsEnabled = false
 	router := newTestRouter(t, readyUseCases(), disabled)
@@ -133,5 +134,44 @@ func TestListChannelAttachmentsIsUnavailableWhileUploadsAreDisabled(t *testing.T
 	response := listRequest(t, router, channelUploadPath(testChannelID))
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", response.Code)
+	}
+}
+
+// The conversation listing is a separate route with its own destination kind,
+// so a group's files can never be served from the channel space (issue #441).
+func TestListDestinationAttachmentsServesConversationsOnTheirOwnRoute(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.listViews = []service.AttachmentView{{
+		ID: "a-1", Filename: "ata-do-grupo.pdf", ContentType: "application/pdf",
+		Size: 1024, Status: string(domain.StatusClean), DestinationKind: "dm",
+		CreatedAt: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
+	}}
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	response := listRequest(t, router, dmUploadPath(testDMID))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if useCases.listInput.Destination.Kind != domain.DestinationKindDM ||
+		useCases.listInput.Destination.ID != testDMID {
+		t.Fatalf("expected the path conversation, got %+v", useCases.listInput.Destination)
+	}
+	attachments := decodeAttachments(t, response)
+	if len(attachments) != 1 || attachments[0]["id"] != "a-1" {
+		t.Fatalf("unexpected attachments: %v", attachments)
+	}
+}
+
+func TestListDestinationAttachmentsHidesUnreachableConversations(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.listErr = domain.ErrNotFound
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	response := listRequest(t, router, dmUploadPath(testDMID))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", response.Code)
+	}
+	if errorCode(t, response) != httputil.ErrCodeNotFound {
+		t.Fatalf("unexpected code %q", errorCode(t, response))
 	}
 }

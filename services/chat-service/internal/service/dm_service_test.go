@@ -772,6 +772,10 @@ type fakeDMStore struct {
 	visibleConversation  domain.DMConversation
 	getVisibleErr        error
 
+	participants     storage.DMParticipantPage
+	participantsErr  error
+	participantCalls []dmParticipantCall
+
 	lastDirectInput   storage.CreateDirectConversationInput
 	lastGroupInput    storage.CreateGroupConversationInput
 	createDirectCalls int
@@ -795,6 +799,37 @@ func (f *fakeDMStore) CreateGroupConversation(_ context.Context, input storage.C
 func (f *fakeDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ string) ([]domain.DMConversation, error) {
 	f.listVisibleCalls++
 	return f.visibleConversations, f.listVisibleErr
+}
+
+// ListParticipantProfiles models the store contract: an already-authorised page
+// of the conversation's active participants, capped, plus the full total. The
+// total is deliberately independent of the page so a test can prove the panel
+// never reports the preview's length as the participant count.
+func (f *fakeDMStore) ListParticipantProfiles(
+	_ context.Context, workspaceID, conversationID string, limit int,
+) (storage.DMParticipantPage, error) {
+	f.participantCalls = append(f.participantCalls, dmParticipantCall{
+		workspaceID: workspaceID, conversationID: conversationID, limit: limit,
+	})
+	if f.participantsErr != nil {
+		return storage.DMParticipantPage{}, f.participantsErr
+	}
+	if limit <= 0 || limit > domain.MaxDMDetailsParticipants {
+		limit = domain.MaxDMDetailsParticipants
+	}
+	page := storage.DMParticipantPage{TotalCount: f.participants.TotalCount}
+	participants := f.participants.Participants
+	if len(participants) > limit {
+		participants = participants[:limit]
+	}
+	page.Participants = participants
+	return page, nil
+}
+
+type dmParticipantCall struct {
+	workspaceID    string
+	conversationID string
+	limit          int
 }
 
 func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {

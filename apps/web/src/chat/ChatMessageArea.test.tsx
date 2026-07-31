@@ -63,6 +63,7 @@ const {
   mockDeleteMessage,
   mockGetMessageHistory,
   mockFetchChannelDetails,
+  mockFetchGroupDetails,
   mockFetchChannelAttachments,
   wsMockState,
 } = vi.hoisted(() => ({
@@ -123,6 +124,7 @@ const {
   mockDeleteMessage: vi.fn<(messageId: string) => Promise<Message>>(),
   mockGetMessageHistory: vi.fn(),
   mockFetchChannelDetails: vi.fn(),
+  mockFetchGroupDetails: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
@@ -188,13 +190,18 @@ vi.mock("./chatApi", () => ({
   getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
   fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
     mockFetchChannelDetails(channelId, signal),
+  fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
+    mockFetchGroupDetails(conversationId, signal),
 }));
 
 // file-service lives behind its own client; the panel's files section is mocked
 // here exactly like the chat endpoints above.
 vi.mock("./filesApi", () => ({
-  fetchChannelAttachments: (channelId: string, limit: number, signal?: AbortSignal) =>
-    mockFetchChannelAttachments(channelId, limit, signal),
+  fetchConversationAttachments: (
+    target: { kind: "channel" | "dm"; id: string },
+    limit: number,
+    signal?: AbortSignal,
+  ) => mockFetchChannelAttachments(target, limit, signal),
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
@@ -246,6 +253,24 @@ const messagePage = (messages: Message[]): MessagePage => ({ messages, nextCurso
 
 // Channel-details payload keyed by channel, so a test that switches channels can
 // assert the panel followed the switch rather than kept the first channel's data.
+function groupDetailsFor(conversationId: string) {
+  return {
+    id: conversationId,
+    name: `Grupo ${conversationId}`,
+    createdAt: "2024-03-04T15:00:00.000Z",
+    participantCount: 4,
+    participants: [
+      { userId: "me-123", displayName: `Participante de ${conversationId}` },
+      // Deliberately offline: a group lists everyone, connected or not.
+      {
+        userId: "other-1",
+        displayName: `Offline de ${conversationId}`,
+        presence: "offline" as const,
+      },
+    ],
+  };
+}
+
 function channelDetailsFor(channelId: string) {
   return {
     id: channelId,
@@ -416,6 +441,9 @@ beforeEach(() => {
     Promise.resolve(channelDetailsFor(channelId)),
   );
   mockFetchChannelAttachments.mockResolvedValue([]);
+  mockFetchGroupDetails.mockImplementation((conversationId: string) =>
+    Promise.resolve(groupDetailsFor(conversationId)),
+  );
   mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
@@ -4213,18 +4241,18 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
 
     const toggle = detailsToggle();
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("chat-channel-details")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
 
     await userEvent.click(toggle);
-    expect(await screen.findByTestId("chat-channel-details")).toBeInTheDocument();
+    expect(await screen.findByTestId("chat-conversation-details")).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     // The control names the panel it opens.
     expect(toggle.getAttribute("aria-controls")).toBe(
-      screen.getByTestId("chat-channel-details").id,
+      screen.getByTestId("chat-conversation-details").id,
     );
 
     await userEvent.click(toggle);
-    expect(screen.queryByTestId("chat-channel-details")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-expanded", "false");
   });
 
@@ -4234,7 +4262,7 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
     await screen.findByTestId("chat-msg-bubble");
 
     await userEvent.click(detailsToggle());
-    await screen.findByTestId("chat-channel-details");
+    await screen.findByTestId("chat-conversation-details");
 
     await userEvent.click(screen.getByRole("button", { name: "Fechar detalhes do canal" }));
 
@@ -4261,7 +4289,7 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
     const messageRequestsBefore = mockFetchChannelMessages.mock.calls.length;
 
     await userEvent.click(detailsToggle());
-    await screen.findByTestId("chat-channel-details");
+    await screen.findByTestId("chat-conversation-details");
     await userEvent.click(detailsToggle());
 
     // Same DOM node: the scroll container was reconciled in place, never
@@ -4274,11 +4302,11 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
 
   it("stays open across a channel switch and reloads every section for the new channel", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
-    mockFetchChannelAttachments.mockImplementation((channelId: string) =>
+    mockFetchChannelAttachments.mockImplementation((target: { id: string }) =>
       Promise.resolve([
         {
-          id: `a-${channelId}`,
-          filename: `arquivo-${channelId}.pdf`,
+          id: `a-${target.id}`,
+          filename: `arquivo-${target.id}.pdf`,
           contentType: "application/pdf",
           size: 1024,
           status: "clean" as const,
@@ -4400,13 +4428,271 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
     await screen.findByTestId("chat-msg-bubble");
 
     await userEvent.click(detailsToggle());
-    await screen.findByTestId("chat-channel-details");
+    await screen.findByTestId("chat-conversation-details");
 
     expect(mockFetchChannelDetails).toHaveBeenCalledWith("geral", expect.any(AbortSignal));
     expect(mockFetchChannelAttachments).toHaveBeenCalledWith(
-      "geral",
+      { kind: "channel", id: "geral" },
       expect.any(Number),
       expect.any(AbortSignal),
     );
+  });
+});
+
+// ── Painel de detalhes do grupo (issue #441) ─────────────────────────────────
+
+const groupConversationId = "grupo-infra";
+const directConversationId = "dm-juliane";
+
+/**
+ * Renders a DM route whose outlet context carries the sidebar's conversation
+ * records, so the component resolves the conversation type from the domain
+ * discriminant (`direct` / `group`) exactly as it does in the app — never from
+ * the URL or from the conversation's name.
+ */
+function renderDMWithContext(dmId: string, currentUserId = "me-123") {
+  return render(
+    <MemoryRouter initialEntries={[`/chat/dm/${dmId}`]}>
+      <Routes>
+        <Route
+          path="/chat"
+          element={
+            <ParentWithContext
+              ctx={{
+                currentUserId,
+                channels: [],
+                dms: [
+                  {
+                    id: groupConversationId,
+                    type: "group",
+                    name: "Time de Infra",
+                    participants: [],
+                  },
+                  {
+                    id: directConversationId,
+                    type: "1:1",
+                    name: "Juliane",
+                    participants: [],
+                  },
+                ],
+              }}
+            />
+          }
+        >
+          <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+function groupToggle() {
+  return screen.getByRole("button", { name: "Detalhes do grupo" });
+}
+
+describe("ChatMessageArea — painel de detalhes do grupo (#441)", () => {
+  it("offers the details control in an ad-hoc group", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(groupConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    const toggle = groupToggle();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(toggle);
+
+    const panel = await screen.findByTestId("chat-conversation-details");
+    expect(panel).toHaveAttribute("data-conversation-kind", "group");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle.getAttribute("aria-controls")).toBe(panel.id);
+    expect(screen.getByRole("heading", { name: "Detalhes do grupo" })).toBeInTheDocument();
+    // The group endpoint is used, never the channel one.
+    expect(mockFetchGroupDetails).toHaveBeenCalledWith(
+      groupConversationId,
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchChannelDetails).not.toHaveBeenCalled();
+    expect(mockFetchChannelAttachments).toHaveBeenCalledWith(
+      { kind: "dm", id: groupConversationId },
+      expect.any(Number),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("does not offer the control in a 1:1 DM", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(directConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    // Out of scope for this issue: a 1:1 conversation has no panel and must not
+    // borrow the group's.
+    expect(screen.queryByRole("button", { name: "Detalhes do grupo" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Detalhes do canal" })).not.toBeInTheDocument();
+    expect(mockFetchGroupDetails).not.toHaveBeenCalled();
+  });
+
+  it("closes from the panel and returns focus to the header control", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(groupConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(groupToggle());
+    await screen.findByTestId("chat-conversation-details");
+
+    await userEvent.click(screen.getByRole("button", { name: "Fechar detalhes do grupo" }));
+
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+    expect(groupToggle()).toHaveFocus();
+  });
+
+  it("does not remount the conversation or lose a typed draft", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMWithContext(groupConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    const editor = screen.getByTestId("chat-composer-input");
+    await fillEditor(editor, "rascunho do grupo");
+    const listBefore = screen.getByRole("log", { name: "Mensagens" });
+    const messageRequestsBefore = mockFetchDMMessages.mock.calls.length;
+
+    await userEvent.click(groupToggle());
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(groupToggle());
+
+    expect(screen.getByRole("log", { name: "Mensagens" })).toBe(listBefore);
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho do grupo");
+    expect(mockFetchDMMessages.mock.calls.length).toBe(messageRequestsBefore);
+  });
+
+  it("shows the same pinned message in the bar and in the panel", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValue([
+      {
+        message: makeMessage({ id: "m-old", senderDisplayName: "Ana", bodyText: "pin antigo" }),
+        pinnedByUserId: "u1",
+        pinnedAt: "2026-07-15T10:00:00.000Z",
+      },
+      {
+        message: makeMessage({ id: "m-new", senderDisplayName: "Bruno", bodyText: "pin recente" }),
+        pinnedByUserId: "u2",
+        pinnedAt: "2026-07-15T12:00:00.000Z",
+      },
+    ]);
+    renderDMWithContext(groupConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(groupToggle());
+
+    // One usePins instance, one selectLatestPin result, shared by both surfaces.
+    const bar = await screen.findByTestId("chat-pins");
+    const card = await screen.findByTestId("chat-details-pin");
+    expect(bar).toHaveTextContent("pin recente");
+    expect(card).toHaveTextContent("pin recente");
+    expect(card).not.toHaveTextContent("pin antigo");
+  });
+
+  it("keeps the group section rendered when only the files request fails", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchChannelAttachments.mockRejectedValue(new Error("file-service indisponível"));
+    renderDMWithContext(groupConversationId);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(groupToggle());
+
+    expect(await screen.findByText("Não foi possível carregar os arquivos.")).toBeInTheDocument();
+    // The group's own metadata survives a file-service failure.
+    expect(screen.getByTestId("chat-details-group-name")).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Participantes do grupo" })).toBeInTheDocument();
+  });
+});
+
+// ── Alternância entre canal e grupo (issue #441) ─────────────────────────────
+
+/**
+ * Renders a shell that can navigate between a channel and a group without
+ * remounting ChatMessageArea, which is what makes "the panel stays open and its
+ * content follows the conversation" observable.
+ */
+function renderCrossTypeSwitcher(currentUserId = "me-123") {
+  function Switcher() {
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate(`/chat/dm/${groupConversationId}`)}>
+          ir para o grupo
+        </button>
+        <ParentWithContext
+          ctx={{
+            currentUserId,
+            channels: [],
+            dms: [
+              { id: groupConversationId, type: "group", name: "Time de Infra", participants: [] },
+            ],
+          }}
+        />
+      </>
+    );
+  }
+  return render(
+    <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+      <Routes>
+        <Route path="/chat" element={<Switcher />}>
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe("ChatMessageArea — alternância canal ↔ grupo (#441)", () => {
+  it("switches vocabulary and data when moving from a channel to a group", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m2" })]));
+    renderCrossTypeSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(screen.getByRole("button", { name: "Detalhes do canal" }));
+    expect(await screen.findByText("Membro de geral")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Detalhes do canal" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para o grupo" }));
+
+    // The panel stays open and now describes the group, with no channel-only
+    // wording left behind from the previous conversation.
+    expect(await screen.findByRole("heading", { name: "Detalhes do grupo" })).toBeInTheDocument();
+    expect(await screen.findByText(`Participante de ${groupConversationId}`)).toBeInTheDocument();
+    expect(screen.queryByText("Membro de geral")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
+  });
+
+  it("ignores a late channel answer that resolves after the switch to a group", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m2" })]));
+    let resolveChannel: (value: ReturnType<typeof channelDetailsFor>) => void = () => {};
+    mockFetchChannelDetails.mockImplementationOnce(
+      () =>
+        new Promise<ReturnType<typeof channelDetailsFor>>((resolve) => {
+          resolveChannel = resolve;
+        }),
+    );
+
+    renderCrossTypeSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(screen.getByRole("button", { name: "Detalhes do canal" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para o grupo" }));
+    expect(await screen.findByRole("heading", { name: "Detalhes do grupo" })).toBeInTheDocument();
+
+    // The abandoned channel finally answers. Its members must not appear under
+    // the group's heading.
+    await act(async () => {
+      resolveChannel(channelDetailsFor("geral"));
+    });
+
+    expect(screen.getByRole("heading", { name: "Detalhes do grupo" })).toBeInTheDocument();
+    expect(screen.queryByText("Membro de geral")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
   });
 });

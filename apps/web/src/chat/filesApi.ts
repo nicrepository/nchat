@@ -55,18 +55,23 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
 }
 
 /**
- * Lists a channel's most recent attachments, newest first.
+ * Lists one destination's most recent attachments, newest first.
+ *
+ * The destination kind selects the route, and the two routes are separate
+ * resources on the server with separate authorization — a channel id can never
+ * reach the conversation listing or the other way round.
  *
  * `limit` is a request, not a guarantee: the server clamps it and owns the
  * ordering, so a caller cannot ask for an unbounded scan or a different sort.
  */
-export async function fetchChannelAttachments(
-  channelId: string,
+export async function fetchConversationAttachments(
+  target: { kind: "channel" | "dm"; id: string },
   limit: number,
   signal?: AbortSignal,
 ): Promise<ChannelAttachment[]> {
+  const collection = target.kind === "channel" ? "channels" : "dm";
   const res = await authenticatedFetch<AttachmentsEnvelope>(
-    `${FILES_BASE}/channels/${encodeURIComponent(channelId)}/attachments?limit=${encodeURIComponent(limit)}`,
+    `${FILES_BASE}/${collection}/${encodeURIComponent(target.id)}/attachments?limit=${encodeURIComponent(limit)}`,
     { method: "GET", signal },
   );
   const raw = res.data.attachments;

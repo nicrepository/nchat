@@ -3,6 +3,10 @@
 Projecao somente leitura de um canal, usada pelo painel lateral **Detalhes do
 canal** na area de conversa.
 
+> Grupos ad-hoc tem contrato proprio, em
+> [chat-group-details.md](./chat-group-details.md). Um grupo nao e um canal e
+> nao deve ser consultado por esta rota.
+
 ## Contrato
 
 | Metodo | Rota publica                             | Descricao         |

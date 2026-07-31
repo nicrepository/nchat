@@ -40,7 +40,7 @@ type AttachmentUseCases interface {
 	Upload(ctx context.Context, input service.UploadInput) (service.AttachmentView, error)
 	Metadata(ctx context.Context, input service.AttachmentAuthInput) (service.AttachmentView, error)
 	Download(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
-	ListChannelAttachments(ctx context.Context, input service.ListChannelAttachmentsInput) ([]service.AttachmentView, error)
+	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) ([]service.AttachmentView, error)
 	Ready() bool
 }
 
@@ -180,12 +180,26 @@ func (h *AttachmentHandler) GetMetadata(w http.ResponseWriter, r *http.Request) 
 }
 
 // ListChannelAttachments handles GET /channels/{channelID}/attachments.
+func (h *AttachmentHandler) ListChannelAttachments(w http.ResponseWriter, r *http.Request) {
+	h.listAttachments(w, r, domain.DestinationKindChannel, r.PathValue("channelID"))
+}
+
+// ListConversationAttachments handles GET /dm/{conversationID}/attachments.
+func (h *AttachmentHandler) ListConversationAttachments(w http.ResponseWriter, r *http.Request) {
+	h.listAttachments(w, r, domain.DestinationKindDM, r.PathValue("conversationID"))
+}
+
+// listAttachments serves both listing routes.
 //
 // It returns metadata only — never content and never a token — so a member of a
-// channel learns what has been shared there and in what scan state, and nothing
-// about how any of it is stored. A channel the caller cannot reach answers 404,
-// the same as one that does not exist.
-func (h *AttachmentHandler) ListChannelAttachments(w http.ResponseWriter, r *http.Request) {
+// channel or a participant of a conversation learns what has been shared there
+// and in what scan state, and nothing about how any of it is stored. A
+// destination the caller cannot reach answers 404, the same as one that does
+// not exist. The kind comes from the route, never from the request, so the two
+// destination spaces can never be crossed.
+func (h *AttachmentHandler) listAttachments(
+	w http.ResponseWriter, r *http.Request, kind domain.DestinationKind, destinationID string,
+) {
 	startedAt := time.Now()
 	principal, ok := AuthenticatedPrincipal(r)
 	if !ok {
@@ -200,11 +214,11 @@ func (h *AttachmentHandler) ListChannelAttachments(w http.ResponseWriter, r *htt
 	if !ok {
 		return
 	}
-	views, err := h.useCases.ListChannelAttachments(r.Context(), service.ListChannelAttachmentsInput{
-		ChannelID: r.PathValue("channelID"),
-		UserID:    principal.UserID,
-		SessionID: principal.SessionID,
-		Limit:     limit,
+	views, err := h.useCases.ListDestinationAttachments(r.Context(), service.ListDestinationAttachmentsInput{
+		Destination: domain.Destination{Kind: kind, ID: destinationID},
+		UserID:      principal.UserID,
+		SessionID:   principal.SessionID,
+		Limit:       limit,
 	})
 	if err != nil {
 		status, code := attachmentErrorStatus(err)

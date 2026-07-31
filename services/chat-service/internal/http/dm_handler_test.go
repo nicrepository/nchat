@@ -29,6 +29,10 @@ type fakeDMProvider struct {
 	lastSearchInput  service.SearchDMCandidatesInput
 	lastCreateInput  service.CreateDirectConversationInput
 	lastGroupInput   service.CreateGroupConversationInput
+	groupDetails     service.GroupDetails
+	groupDetailsErr  error
+	lastDetailsInput service.GroupDetailsInput
+	detailsCalls     int
 	searchCalls      int
 	createCalls      int
 	groupCreateCalls int
@@ -70,6 +74,14 @@ func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input servic
 	f.groupCreateCalls++
 	f.lastGroupInput = input
 	return f.groupOutput, f.groupErr
+}
+
+func (f *fakeDMProvider) GetGroupDetails(
+	_ context.Context, input service.GroupDetailsInput,
+) (service.GroupDetails, error) {
+	f.detailsCalls++
+	f.lastDetailsInput = input
+	return f.groupDetails, f.groupDetailsErr
 }
 
 func dmTestHandler(provider *fakeDMProvider) *httpapi.DMHandler {

@@ -29,6 +29,11 @@ const (
 	RouteDMMessages            = "/api/chat/dm/{conversationID}/messages"
 	RouteDMMessage             = "/api/chat/dm/{conversationID}/messages/{messageID}"
 	RouteDMReferences          = "/api/chat/dm/{conversationID}/message-references"
+	// Issue #441 group-details panel. It lives under the DM prefix because a
+	// group *is* a chat.dm_conversations row (type='group'); a /channels/ route
+	// would name the wrong aggregate, and a separate /groups/ prefix would
+	// invent a resource the domain does not have.
+	RouteDMDetails             = "/api/chat/dm/{conversationID}/details"
 	RouteAllowedReactionEmojis = "/api/chat/reactions/allowed-emojis"
 	RouteMessageFavorite       = "/api/chat/messages/{messageID}/favorite"
 	RouteFavorites             = "/api/chat/favorites"

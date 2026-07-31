@@ -1,5 +1,6 @@
 /*
- * ChannelDetailsPanel — "Detalhes do canal" side panel (issue #435).
+ * ConversationDetailsPanel — side panel for a channel ("Detalhes do canal",
+ * issue #435) and for an ad-hoc group ("Detalhes do grupo", issue #441).
  *
  * The panel is a grid column of .chat-msg-area, not an overlay: the conversation
  * keeps its own column and simply narrows. Only below the layout's breakpoint

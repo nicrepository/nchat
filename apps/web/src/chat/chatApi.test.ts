@@ -19,6 +19,7 @@ import {
   favoriteMessage,
   forwardChannelMessage,
   fetchChannelDetails,
+  fetchGroupDetails,
   fetchChannelMessage,
   fetchChannelMessages,
   fetchPins,
@@ -2062,5 +2063,123 @@ describe("fetchChannelDetails", () => {
     mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "channel not found"));
 
     await expect(fetchChannelDetails("ch-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("fetchGroupDetails (issue #441)", () => {
+  it("maps the payload from the DM resource, not the channel one", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv 1",
+        type: "group",
+        name: "Time de Infra",
+        created_at: "2024-03-04T15:00:00Z",
+        participant_count: 12,
+        participants: [
+          {
+            user_id: "u-1",
+            display_name: "Álvaro",
+            avatar_url: "/media/a.png",
+            presence: "online",
+          },
+        ],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv 1");
+
+    // A group is a conversation: its details live under /dm/, never /channels/.
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv%201/details", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(details).toEqual({
+      id: "conv 1",
+      name: "Time de Infra",
+      createdAt: "2024-03-04T15:00:00Z",
+      participantCount: 12,
+      participants: [
+        {
+          userId: "u-1",
+          displayName: "Álvaro",
+          avatarUrl: "/media/a.png",
+          presence: "online",
+        },
+      ],
+    });
+  });
+
+  it("keeps offline participants, unlike the channel's online-only list", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv-1",
+        participant_count: 3,
+        participants: [
+          { user_id: "u-1", display_name: "Conectada", presence: "online" },
+          { user_id: "u-2", display_name: "Desconectado", presence: "offline" },
+          { user_id: "u-3", display_name: "Sem presença" },
+        ],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv-1");
+
+    expect(details.participants.map((participant) => participant.userId)).toEqual([
+      "u-1",
+      "u-2",
+      "u-3",
+    ]);
+    expect(details.participants[2].presence).toBeUndefined();
+  });
+
+  it("keeps the server's participant total independent of the preview", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv-1",
+        participant_count: 40,
+        participants: [{ user_id: "u-1", display_name: "Ana" }],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv-1");
+
+    expect(details.participantCount).toBe(40);
+    expect(details.participants).toHaveLength(1);
+  });
+
+  it("drops malformed participants and unsafe avatars", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv-1",
+        participant_count: 2,
+        participants: [
+          null,
+          { display_name: "sem id" },
+          { user_id: "" },
+          { user_id: "u-1", display_name: "Hostil", avatar_url: "javascript:alert(1)" },
+          { user_id: "u-2", display_name: "Externo", avatar_url: "https://evil.test/a.png" },
+        ],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv-1");
+
+    expect(details.participants.map((participant) => participant.userId)).toEqual(["u-1", "u-2"]);
+    expect(details.participants[0].avatarUrl).toBeUndefined();
+    expect(details.participants[1].avatarUrl).toBeUndefined();
+  });
+
+  it("ignores a negative or non-numeric total", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "conv-1", participant_count: -2, participants: [] },
+    });
+
+    await expect(fetchGroupDetails("conv-1")).resolves.toMatchObject({ participantCount: 0 });
+  });
+
+  it("propagates a refusal instead of rendering a partial group", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(fetchGroupDetails("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
   });
 });

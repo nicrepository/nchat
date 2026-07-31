@@ -1,26 +1,38 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { channelFilesPreviewLimit, useChannelDetails } from "./useChannelDetails";
-import type { ChannelAttachment, ChannelDetails } from "./chatTypes";
+import { channelFilesPreviewLimit, useConversationDetails } from "./useConversationDetails";
+import type { ChannelAttachment, ChannelDetails, GroupDetails } from "./chatTypes";
 
-const { mockFetchChannelDetails, mockFetchChannelAttachments } = vi.hoisted(() => ({
-  mockFetchChannelDetails:
-    vi.fn<(channelId: string, signal?: AbortSignal) => Promise<ChannelDetails>>(),
-  mockFetchChannelAttachments:
-    vi.fn<
-      (channelId: string, limit: number, signal?: AbortSignal) => Promise<ChannelAttachment[]>
-    >(),
-}));
+const { mockFetchChannelDetails, mockFetchGroupDetails, mockFetchChannelAttachments } = vi.hoisted(
+  () => ({
+    mockFetchChannelDetails:
+      vi.fn<(channelId: string, signal?: AbortSignal) => Promise<ChannelDetails>>(),
+    mockFetchGroupDetails: vi.fn<(id: string, signal?: AbortSignal) => Promise<GroupDetails>>(),
+    mockFetchChannelAttachments:
+      vi.fn<
+        (
+          target: { kind: "channel" | "dm"; id: string },
+          limit: number,
+          signal?: AbortSignal,
+        ) => Promise<ChannelAttachment[]>
+      >(),
+  }),
+);
 
 vi.mock("./chatApi", () => ({
   fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
     mockFetchChannelDetails(channelId, signal),
+  fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
+    mockFetchGroupDetails(conversationId, signal),
 }));
 
 vi.mock("./filesApi", () => ({
-  fetchChannelAttachments: (channelId: string, limit: number, signal?: AbortSignal) =>
-    mockFetchChannelAttachments(channelId, limit, signal),
+  fetchConversationAttachments: (
+    target: { kind: "channel" | "dm"; id: string },
+    limit: number,
+    signal?: AbortSignal,
+  ) => mockFetchChannelAttachments(target, limit, signal),
 }));
 
 function details(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
@@ -57,9 +69,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("useChannelDetails", () => {
+describe("useConversationDetails", () => {
   it("issues no request while idle", () => {
-    const { result } = renderHook(() => useChannelDetails(null));
+    const { result } = renderHook(() => useConversationDetails(null));
 
     expect(mockFetchChannelDetails).not.toHaveBeenCalled();
     expect(mockFetchChannelAttachments).not.toHaveBeenCalled();
@@ -70,14 +82,17 @@ describe("useChannelDetails", () => {
     mockFetchChannelDetails.mockResolvedValue(details({ name: "Infra" }));
     mockFetchChannelAttachments.mockResolvedValue([attachment("a-1")]);
 
-    const { result } = renderHook(() => useChannelDetails("ch-1"));
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
 
     await waitFor(() => expect(result.current.details.status).toBe("ready"));
     await waitFor(() => expect(result.current.files.status).toBe("ready"));
 
-    expect(result.current.details).toEqual({ status: "ready", data: details({ name: "Infra" }) });
+    expect(result.current.details).toEqual({
+      status: "ready",
+      data: { kind: "channel", ...details({ name: "Infra" }) },
+    });
     expect(mockFetchChannelAttachments).toHaveBeenCalledWith(
-      "ch-1",
+      { kind: "channel", id: "ch-1" },
       channelFilesPreviewLimit,
       expect.any(AbortSignal),
     );
@@ -86,7 +101,7 @@ describe("useChannelDetails", () => {
   it("keeps one failed section from destroying the other", async () => {
     mockFetchChannelAttachments.mockRejectedValue(new Error("file-service down"));
 
-    const { result } = renderHook(() => useChannelDetails("ch-1"));
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
 
     await waitFor(() => expect(result.current.files.status).toBe("error"));
     expect(result.current.details.status).toBe("ready");
@@ -94,9 +109,12 @@ describe("useChannelDetails", () => {
 
   it("resets to loading and refetches when the channel changes", async () => {
     mockFetchChannelDetails.mockResolvedValueOnce(details({ id: "ch-1", name: "Primeiro" }));
-    const { result, rerender } = renderHook(({ id }) => useChannelDetails(id), {
-      initialProps: { id: "ch-1" as string | null },
-    });
+    const { result, rerender } = renderHook(
+      ({ id }) => useConversationDetails({ kind: "channel", id }),
+      {
+        initialProps: { id: "ch-1" },
+      },
+    );
     await waitFor(() => expect(result.current.details.status).toBe("ready"));
 
     // A never-resolving second channel: the panel must show loading, not the
@@ -120,9 +138,12 @@ describe("useChannelDetails", () => {
       });
     });
 
-    const { result, rerender } = renderHook(({ id }) => useChannelDetails(id), {
-      initialProps: { id: "ch-1" as string | null },
-    });
+    const { result, rerender } = renderHook(
+      ({ id }) => useConversationDetails({ kind: "channel", id }),
+      {
+        initialProps: { id: "ch-1" },
+      },
+    );
 
     mockFetchChannelDetails.mockResolvedValueOnce(details({ id: "ch-2", name: "Segundo" }));
     rerender({ id: "ch-2" });
@@ -137,7 +158,7 @@ describe("useChannelDetails", () => {
 
     expect(result.current.details).toEqual({
       status: "ready",
-      data: details({ id: "ch-2", name: "Segundo" }),
+      data: { kind: "channel", ...details({ id: "ch-2", name: "Segundo" }) },
     });
   });
 
@@ -148,7 +169,7 @@ describe("useChannelDetails", () => {
       return new Promise<ChannelDetails>(() => {});
     });
 
-    const { unmount } = renderHook(() => useChannelDetails("ch-1"));
+    const { unmount } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
     unmount();
 
     expect(signal?.aborted).toBe(true);
@@ -159,7 +180,7 @@ describe("useChannelDetails", () => {
     abortError.name = "AbortError";
     mockFetchChannelDetails.mockRejectedValueOnce(abortError);
 
-    const { result } = renderHook(() => useChannelDetails("ch-1"));
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
     await waitFor(() => expect(result.current.files.status).toBe("ready"));
 
     expect(result.current.details.status).toBe("loading");

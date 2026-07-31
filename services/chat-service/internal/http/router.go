@@ -174,6 +174,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
 		mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))
 		mux.Handle("POST "+RouteDMGroupConversations, authMiddleware(http.HandlerFunc(directMessages.CreateGroup)))
+		// Group details (issue #441) is a read, so it shares the listing budget
+		// rather than the write one: the panel refetches on every conversation
+		// switch.
+		mux.Handle("GET "+RouteDMDetails, authMiddleware(
+			msgListLimiter.Middleware(http.HandlerFunc(directMessages.GroupDetails)),
+		))
 	}
 
 	// DM message endpoints: GET list, POST create, GET single.

@@ -258,6 +258,51 @@ export interface ChannelDetails {
   onlineMembers: ChannelMemberProfile[];
 }
 
+/**
+ * One participant of a group conversation, as the details panel renders them.
+ *
+ * Deliberately without a role: chat.dm_members.role is closed by CHECK to
+ * 'member', so a group has no role to show. `presence` is decoration — it says
+ * whether this participant is connected and never decides whether they appear.
+ */
+export interface GroupParticipantProfile {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe same-origin target. */
+  avatarUrl?: string;
+  presence?: OnlineStatus;
+}
+
+/**
+ * The group-details payload.
+ *
+ * A group is a `chat.dm_conversations` row of type 'group', not a channel, so
+ * this carries no visibility, slug, category or description — the domain has
+ * none of them for conversations and none is invented here.
+ *
+ * `participantCount` is every active participant and is never
+ * `participants.length`: that array is a capped preview.
+ */
+export interface GroupDetails {
+  id: string;
+  name: string;
+  createdAt: string; // ISO 8601
+  participantCount: number;
+  participants: GroupParticipantProfile[];
+}
+
+/**
+ * What the details panel is describing right now.
+ *
+ * The two shapes are discriminated by `kind`, mirroring the domain: a channel
+ * and a group are different aggregates with different vocabulary, so the panel
+ * switches on the tag rather than on optional fields that only one of them
+ * ever populates.
+ */
+export type ConversationDetails =
+  | ({ kind: "channel" } & ChannelDetails)
+  | ({ kind: "group" } & GroupDetails);
+
 /** Scan lifecycle of an attachment. Only "clean" is ever downloadable. */
 export type AttachmentStatus = "pending_scan" | "clean" | "rejected";
 

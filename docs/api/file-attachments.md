@@ -23,13 +23,14 @@ Prefixo publico `/api/files`, removido pelo gateway antes de chegar ao servico
 (`strip-files-prefix` em `infra/traefik/local/dynamic.yml`). Todas as rotas
 exigem `Authorization: Bearer <access-token>`.
 
-| Metodo | Rota publica                                    | Descricao                |
-| ------ | ----------------------------------------------- | ------------------------ |
-| POST   | `/api/files/channels/{channelID}/attachments`   | upload em canal          |
-| POST   | `/api/files/dm/{conversationID}/attachments`    | upload em DM             |
-| GET    | `/api/files/channels/{channelID}/attachments`   | anexos recentes do canal |
-| GET    | `/api/files/attachments/{attachmentID}`         | metadados                |
-| GET    | `/api/files/attachments/{attachmentID}/content` | download do conteudo     |
+| Metodo | Rota publica                                    | Descricao                   |
+| ------ | ----------------------------------------------- | --------------------------- |
+| POST   | `/api/files/channels/{channelID}/attachments`   | upload em canal             |
+| POST   | `/api/files/dm/{conversationID}/attachments`    | upload em DM                |
+| GET    | `/api/files/channels/{channelID}/attachments`   | anexos recentes do canal    |
+| GET    | `/api/files/dm/{conversationID}/attachments`    | anexos recentes da conversa |
+| GET    | `/api/files/attachments/{attachmentID}`         | metadados                   |
+| GET    | `/api/files/attachments/{attachmentID}/content` | download do conteudo        |
 
 O destino vem da rota, nunca do corpo. Nao existe forma de request que nomeie
 canal e DM ao mesmo tempo, e o workspace nunca e aceito do cliente: ele e
@@ -84,14 +85,64 @@ nem qualquer detalhe de topologia.
 Destino inexistente e destino inacessivel retornam o mesmo `404`, sem indicar a
 existencia do UUID.
 
-### Listagem de anexos do canal (issue #435)
+### Listagem de anexos de um destino (issues #435 e #441)
+
+| Metodo | Rota publica                                  | Identificador              |
+| ------ | --------------------------------------------- | -------------------------- |
+| GET    | `/api/files/channels/{channelID}/attachments` | `chat.channels.id`         |
+| GET    | `/api/files/dm/{conversationID}/attachments`  | `chat.dm_conversations.id` |
+
+As duas rotas sao o mesmo caso de uso com destinos diferentes. O tipo do destino
+vem da **rota**, nunca do corpo nem de um parametro, entao um `channelID` nunca
+seleciona anexos de conversa e um `conversationID` nunca seleciona os de canal:
+sao duas consultas estaticas distintas, cada uma comparando a sua propria coluna
+(`channel_id` ou `conversation_id`) e fixando o seu proprio `destination_kind`.
+
+**Autenticacao:** `Authorization: Bearer <access-token>` e sessao ativa.
+
+**Autorizacao:** identica a do upload no mesmo destino -- `AuthorizeDestination`
+resolve o destino e o workspace canonico dele em uma consulta:
+
+- canal: workspace ativo, membership ativa no workspace, canal ativo, e canal
+  publico **ou** com `chat.channel_members` do chamador;
+- conversa: workspace ativo, membership ativa no workspace, conversa ativa, e
+  `chat.dm_members` ativo do chamador.
+
+O workspace nunca vem do cliente: e lido da linha do destino e e o que amarra a
+listagem. Destino inexistente, arquivado, fora do alcance do chamador ou de
+outro workspace respondem o mesmo `404`, sem revelar a existencia do UUID.
+
+#### `conversationID` aceita `direct` e `group`
+
+A rota de conversa e **generica**: `conversationID` pode ser uma DM 1:1
+(`type = 'direct'`) ou um grupo ad-hoc (`type = 'group'`). Nao ha checagem de
+`type` aqui, e isso e deliberado -- upload
+(`POST /api/files/dm/{conversationID}/attachments`) e download ja tratam
+`destination_kind = 'dm'` genericamente, entao restringir apenas a listagem
+criaria a divergencia de permitir anexar um arquivo a uma DM 1:1 e depois
+recusar lista-lo.
+
+A issue #441 apenas **consome** esta rota para grupos, porque o painel de
+detalhes de DM 1:1 esta fora do escopo dela. "Painel fora do escopo" nao
+significa "API de anexos proibida": o controle de acesso continua sendo
+participacao ativa na conversa, igual ao upload.
+
+> Contraste deliberado com `GET /api/chat/dm/{conversationID}/details`
+> ([chat-group-details.md](./chat-group-details.md)), que **exige**
+> `type = 'group'`. Aquela projecao foi criada para o painel de grupo e nao tem
+> irmao generico preexistente; esta rota tem, e segue o comportamento dele.
+
+#### Requisicao
 
 ```bash
 curl "https://nchat.local:8443/api/files/channels/$CHANNEL/attachments?limit=5" \
   -H "Authorization: Bearer $ACCESS_TOKEN"
+
+curl "https://nchat.local:8443/api/files/dm/$CONVERSATION/attachments?limit=5" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
-Resposta `200`:
+Resposta `200` (mesma forma nas duas rotas; `destinationKind` reflete a rota):
 
 ```json
 {
@@ -111,22 +162,34 @@ Resposta `200`:
 }
 ```
 
-A autorizacao e a mesma do upload: `AuthorizeDestination` resolve o canal e o
-workspace canonico dele em uma consulta, e a listagem e ligada ao workspace que
-essa consulta devolveu. Canal inexistente, arquivado, privado sem participacao
-ou de outro workspace respondem o mesmo `404`.
+Campos: `id`, `filename` (nome normalizado, so para exibicao), `contentType`
+(tipo **detectado** no upload), `size` (plaintext, bytes), `status` (estado do
+scan) e `createdAt` (RFC3339 UTC). `destinationKind` e `channel` ou `dm`,
+conforme a rota.
 
-Regras da listagem:
+#### Ordenacao, limite e estados
 
 - ordem fixa no servidor: `created_at DESC, id DESC` (desempate deterministico);
+  o cliente nao escolhe a ordenacao;
+- `limit` e opcional, default 20 e teto 50, ambos aplicados no servidor; valor
+  nao inteiro ou <= 0 responde `400 bad_request` em vez de virar o default
+  silenciosamente;
 - so aparecem anexos com status `pending_scan`, `clean` ou `rejected` --
   `pending_upload`, `failed` e `deleted` sao uploads incompletos ou removidos,
-  nunca arquivos do canal;
-- `limit` e opcional, default 20 e teto 50; valor nao inteiro ou <= 0 responde
-  `400 bad_request` em vez de virar o default silenciosamente;
-- a resposta e apenas metadado: chave do objeto, DEK, versao do envelope e
-  workspace nunca sao serializados. O download continua sendo autorizado
-  separadamente e so serve anexo `clean`.
+  nunca arquivos do destino;
+- destino sem anexos responde `200` com `attachments: []`.
+
+#### A listagem nao autoriza download
+
+A resposta e **apenas metadado**. Nao ha URL de conteudo, nem link assinado, nem
+token: chave do objeto no SeaweedFS, DEK, versao do envelope e workspace nunca
+sao serializados.
+
+Aparecer na listagem **nao** concede permissao de download. O conteudo continua
+em `GET /api/files/attachments/{attachmentID}/content`, que reautoriza a cada
+chamada e so serve anexo com `status = clean`; `pending_scan` e `rejected`
+aparecem na lista com o seu estado e respondem `409 file_not_scanned` no
+download.
 
 ### Download
 
