@@ -1,0 +1,54 @@
+package app
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
+)
+
+type callHandlerAdapter struct{ service *service.CallService }
+
+func (a *callHandlerAdapter) StartCall(ctx context.Context, command ws.StartCallCommand) (domain.Call, error) {
+	return a.service.Start(ctx, service.StartCallInput{
+		WorkspaceID: command.WorkspaceID, RequestID: command.RequestID,
+		CallerID: command.CallerID, CalleeID: command.CalleeID, Type: command.Type,
+	})
+}
+
+func (a *callHandlerAdapter) TransitionCall(ctx context.Context, workspaceID, actorID, callID string, action ws.ClientMessageType) (domain.Call, error) {
+	switch action {
+	case ws.ClientMessageTypeCallAccept:
+		return a.service.Accept(ctx, workspaceID, actorID, callID)
+	case ws.ClientMessageTypeCallDecline:
+		return a.service.Decline(ctx, workspaceID, actorID, callID)
+	case ws.ClientMessageTypeCallCancel:
+		return a.service.Cancel(ctx, workspaceID, actorID, callID)
+	case ws.ClientMessageTypeCallEnd:
+		return a.service.End(ctx, workspaceID, actorID, callID)
+	default:
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+}
+
+func (a *callHandlerAdapter) CurrentCall(ctx context.Context, workspaceID, actorID string) (domain.Call, error) {
+	return a.service.Current(ctx, workspaceID, actorID)
+}
+
+func runCallExpiryWorker(ctx context.Context, calls *service.CallService, logger *slog.Logger) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := calls.ExpireDue(ctx); err != nil && ctx.Err() == nil {
+				logger.WarnContext(ctx, "call expiry scan failed", "error_code", "call_expiry_failed")
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}

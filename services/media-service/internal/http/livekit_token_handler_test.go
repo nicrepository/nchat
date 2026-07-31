@@ -40,45 +40,41 @@ func (f *fakeTokenIssuer) Issue(ctx context.Context, input service.IssueTokenInp
 	return f.result, f.err
 }
 
-func TestLiveKitTokenHandlerIssuesChannelAndDMTokenFromPrincipal(t *testing.T) {
-	for _, kind := range []domain.ResourceKind{domain.ResourceKindChannel, domain.ResourceKindDM} {
-		t.Run(string(kind), func(t *testing.T) {
-			expiresAt := time.Date(2026, 7, 21, 15, 4, 5, 0, time.UTC)
-			issuer := &fakeTokenIssuer{result: service.IssuedToken{
-				Token: "signed-livekit-token", ExpiresAt: expiresAt,
-			}}
-			response := serveLiveKitHandler(
-				LiveKitToken(issuer, slog.Default()),
-				`{"kind":"`+string(kind)+`","id":"`+handlerTestResource+`"}`,
-				authenticatedRequestContext(),
-			)
+func TestLiveKitTokenHandlerIssuesCallTokenFromPrincipal(t *testing.T) {
+	expiresAt := time.Date(2026, 7, 21, 15, 4, 5, 0, time.UTC)
+	issuer := &fakeTokenIssuer{result: service.IssuedToken{
+		Token: "signed-livekit-token", ExpiresAt: expiresAt,
+	}}
+	response := serveLiveKitHandler(
+		LiveKitToken(issuer, slog.Default()),
+		`{"call_id":"`+handlerTestResource+`"}`,
+		authenticatedRequestContext(),
+	)
 
-			if response.Code != http.StatusOK {
-				t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
-			}
-			var body struct {
-				Data struct {
-					Token     string `json:"token"`
-					ExpiresAt string `json:"expiresAt"`
-				} `json:"data"`
-			}
-			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
-				t.Fatalf("decode response: %v", err)
-			}
-			if body.Data.Token != issuer.result.Token || body.Data.ExpiresAt != expiresAt.Format(time.RFC3339) {
-				t.Fatalf("unexpected response: %+v", body.Data)
-			}
-			if issuer.calls != 1 {
-				t.Fatalf("expected one issuer call, got %d", issuer.calls)
-			}
-			if issuer.input.Kind != kind || issuer.input.ResourceID != handlerTestResource ||
-				issuer.input.UserID != handlerTestUserID || issuer.input.SessionID != handlerTestSessionID {
-				t.Fatalf("issuer received untrusted or incorrect input: %+v", issuer.input)
-			}
-			if !issuer.input.AccessExpiresAt.Equal(authenticatedRequestContext().Value(principalContextKey{}).(Principal).AccessExpiresAt) {
-				t.Fatalf("unexpected access expiry: %s", issuer.input.AccessExpiresAt)
-			}
-		})
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Token     string `json:"token"`
+			ExpiresAt string `json:"expiresAt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Data.Token != issuer.result.Token || body.Data.ExpiresAt != expiresAt.Format(time.RFC3339) {
+		t.Fatalf("unexpected response: %+v", body.Data)
+	}
+	if issuer.calls != 1 {
+		t.Fatalf("expected one issuer call, got %d", issuer.calls)
+	}
+	if issuer.input.Kind != domain.ResourceKindCall || issuer.input.ResourceID != handlerTestResource ||
+		issuer.input.UserID != handlerTestUserID || issuer.input.SessionID != handlerTestSessionID {
+		t.Fatalf("issuer received untrusted or incorrect input: %+v", issuer.input)
+	}
+	if !issuer.input.AccessExpiresAt.Equal(authenticatedRequestContext().Value(principalContextKey{}).(Principal).AccessExpiresAt) {
+		t.Fatalf("unexpected access expiry: %s", issuer.input.AccessExpiresAt)
 	}
 }
 
@@ -91,13 +87,13 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 		{name: "empty", body: "", want: http.StatusBadRequest},
 		{name: "malformed", body: "{", want: http.StatusBadRequest},
 		{name: "invalid kind", body: `{"kind":"group","id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
-		{name: "invalid uuid", body: `{"kind":"channel","id":"not-a-uuid"}`, want: http.StatusBadRequest},
-		{name: "trailing json", body: `{"kind":"channel","id":"` + handlerTestResource + `"}{}`, want: http.StatusBadRequest},
-		{name: "identity", body: `{"kind":"channel","id":"` + handlerTestResource + `","identity":"other"}`, want: http.StatusBadRequest},
-		{name: "room", body: `{"kind":"channel","id":"` + handlerTestResource + `","room":"admin"}`, want: http.StatusBadRequest},
-		{name: "grants", body: `{"kind":"channel","id":"` + handlerTestResource + `","grants":{}}`, want: http.StatusBadRequest},
-		{name: "ttl", body: `{"kind":"channel","id":"` + handlerTestResource + `","ttl":3600}`, want: http.StatusBadRequest},
-		{name: "oversized", body: `{"kind":"channel","id":"` + strings.Repeat("a", liveKitTokenBodyLimit) + `"}`, want: http.StatusRequestEntityTooLarge},
+		{name: "invalid uuid", body: `{"call_id":"not-a-uuid"}`, want: http.StatusBadRequest},
+		{name: "trailing json", body: `{"call_id":"` + handlerTestResource + `"}{}`, want: http.StatusBadRequest},
+		{name: "identity", body: `{"call_id":"` + handlerTestResource + `","identity":"other"}`, want: http.StatusBadRequest},
+		{name: "room", body: `{"call_id":"` + handlerTestResource + `","room":"admin"}`, want: http.StatusBadRequest},
+		{name: "grants", body: `{"call_id":"` + handlerTestResource + `","grants":{}}`, want: http.StatusBadRequest},
+		{name: "ttl", body: `{"call_id":"` + handlerTestResource + `","ttl":3600}`, want: http.StatusBadRequest},
+		{name: "oversized", body: `{"call_id":"` + strings.Repeat("a", liveKitTokenBodyLimit) + `"}`, want: http.StatusRequestEntityTooLarge},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -116,13 +112,13 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 func TestLiveKitTokenHandlerRequiresPrincipalAndJSON(t *testing.T) {
 	issuer := &fakeTokenIssuer{}
 	response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()),
-		`{"kind":"channel","id":"`+handlerTestResource+`"}`, context.Background())
+		`{"call_id":"`+handlerTestResource+`"}`, context.Background())
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", response.Code)
 	}
 
 	request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken,
-		strings.NewReader(`{"kind":"channel","id":"`+handlerTestResource+`"}`))
+		strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`))
 	request = request.WithContext(authenticatedRequestContext())
 	response = httptest.NewRecorder()
 	LiveKitToken(issuer, slog.Default()).ServeHTTP(response, request)
@@ -151,7 +147,7 @@ func TestLiveKitTokenHandlerMapsServiceErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			issuer := &fakeTokenIssuer{err: tt.err}
 			response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()),
-				`{"kind":"dm","id":"`+handlerTestResource+`"}`, authenticatedRequestContext())
+				`{"call_id":"`+handlerTestResource+`"}`, authenticatedRequestContext())
 			if response.Code != tt.want {
 				t.Fatalf("expected %d, got %d: %s", tt.want, response.Code, response.Body.String())
 			}
@@ -178,7 +174,7 @@ func TestLiveKitTokenHandlerDoesNotLogTokensSecretsOrIdentifiers(t *testing.T) {
 	}}
 	handler := httputil.RequestID(LiveKitToken(issuer, logger))
 	request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken,
-		strings.NewReader(`{"kind":"channel","id":"`+handlerTestResource+`"}`))
+		strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Request-ID", "req-success")
 	request = request.WithContext(authenticatedRequestContext())
@@ -232,7 +228,7 @@ func TestLiveKitTokenHandlerClassifiesLogsAndCorrelatesInternalFailures(t *testi
 			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 			handler := httputil.RequestID(LiveKitToken(&fakeTokenIssuer{err: tt.issuerErr}, logger))
 			request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken,
-				strings.NewReader(`{"kind":"dm","id":"`+handlerTestResource+`"}`))
+				strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`))
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("X-Request-ID", "req-correlated")
 			ctx := trace.ContextWithSpanContext(authenticatedRequestContext(), spanContext)
@@ -347,7 +343,7 @@ func TestLiveKitTokenHandlerPropagatesCanceledContext(t *testing.T) {
 	cancel()
 	issuer := &fakeTokenIssuer{}
 	response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()),
-		`{"kind":"channel","id":"`+handlerTestResource+`"}`, ctx)
+		`{"call_id":"`+handlerTestResource+`"}`, ctx)
 	if issuer.calls != 1 {
 		t.Fatalf("expected canceled context to reach issuer, got %d calls", issuer.calls)
 	}

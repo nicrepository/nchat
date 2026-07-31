@@ -28,6 +28,8 @@ func (a *PGXResourceAuthorizer) Authorize(ctx context.Context, input service.Aut
 		query = channelAuthorizationQuery
 	case domain.ResourceKindDM:
 		query = dmAuthorizationQuery
+	case domain.ResourceKindCall:
+		query = callAuthorizationQuery
 	default:
 		return service.AuthorizedResource{}, domain.ErrInvalidInput
 	}
@@ -86,6 +88,24 @@ const dmAuthorizationQuery = authsession.ActiveSessionCTE + `,
 		 AND dm.user_id = active.user_id
 		 AND dm.status = 'active'
 		WHERE dc.status = 'active'
+	)
+	SELECT
+		(SELECT session_expires_at FROM active_session) AS session_expires_at,
+		(SELECT id::text FROM authorized_resource) AS resource_id`
+
+const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
+	authorized_resource AS (
+		SELECT c.id
+		FROM active_session AS active
+		JOIN chat.calls AS c ON c.id = $3
+		JOIN chat.workspaces AS w
+		  ON w.id = c.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members AS wm
+		  ON wm.workspace_id = c.workspace_id
+		 AND wm.user_id = active.user_id
+		 AND wm.status = 'active'
+		WHERE c.status = 'active'
+		  AND (c.caller_id = active.user_id OR c.callee_id = active.user_id)
 	)
 	SELECT
 		(SELECT session_expires_at FROM active_session) AS session_expires_at,

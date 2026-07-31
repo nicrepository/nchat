@@ -30,8 +30,7 @@ type LiveKitTokenIssuer interface {
 }
 
 type liveKitTokenRequest struct {
-	Kind domain.ResourceKind `json:"kind"`
-	ID   string              `json:"id"`
+	CallID string `json:"call_id"`
 }
 
 func LiveKitToken(issuer LiveKitTokenIssuer, logger *slog.Logger) http.Handler {
@@ -67,25 +66,25 @@ func LiveKitToken(issuer LiveKitTokenIssuer, logger *slog.Logger) http.Handler {
 			writeLiveKitTokenDecodeError(w, r, logger, startedAt, err)
 			return
 		}
-		resourceID, err := uuid.Parse(request.ID)
-		if err != nil || !request.Kind.Valid() {
-			writeLiveKitTokenError(w, r, logger, startedAt, boundedResourceKind(request.Kind), domain.ErrInvalidInput)
+		callID, err := uuid.Parse(request.CallID)
+		if err != nil {
+			writeLiveKitTokenError(w, r, logger, startedAt, "call", domain.ErrInvalidInput)
 			return
 		}
 
 		issued, err := issuer.Issue(r.Context(), service.IssueTokenInput{
-			Kind:            request.Kind,
-			ResourceID:      resourceID.String(),
+			Kind:            domain.ResourceKindCall,
+			ResourceID:      callID.String(),
 			UserID:          principal.UserID,
 			SessionID:       principal.SessionID,
 			AccessExpiresAt: principal.AccessExpiresAt,
 		})
 		if err != nil {
-			writeLiveKitTokenError(w, r, logger, startedAt, string(request.Kind), err)
+			writeLiveKitTokenError(w, r, logger, startedAt, "call", err)
 			return
 		}
 
-		logLiveKitTokenResult(r, logger, startedAt, string(request.Kind), "issued", http.StatusOK, "")
+		logLiveKitTokenResult(r, logger, startedAt, "call", "issued", http.StatusOK, "")
 		httputil.WriteJSON(w, http.StatusOK, issued)
 	})
 }
@@ -184,13 +183,6 @@ func liveKitFailureCause(err error) string {
 	default:
 		return "unexpected"
 	}
-}
-
-func boundedResourceKind(kind domain.ResourceKind) string {
-	if kind.Valid() {
-		return string(kind)
-	}
-	return "invalid"
 }
 
 func isJSONRequestContentType(value string) bool {
