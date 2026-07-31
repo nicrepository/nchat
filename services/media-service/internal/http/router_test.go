@@ -435,7 +435,7 @@ func TestNewRouterLiveKitEnabledWithCompleteDependenciesUsesFunctionalFlow(t *te
 	})
 
 	for _, auth := range []string{"", "Bearer invalid"} {
-		response := serveRouterTokenRequest(router, auth, `{"kind":"channel","id":"`+handlerTestResource+`"}`)
+		response := serveRouterTokenRequest(router, auth, `{"call_id":"`+handlerTestResource+`"}`)
 		if response.Code != http.StatusUnauthorized {
 			t.Fatalf("expected 401 for auth %q, got %d", auth, response.Code)
 		}
@@ -445,12 +445,12 @@ func TestNewRouterLiveKitEnabledWithCompleteDependenciesUsesFunctionalFlow(t *te
 	}
 
 	first := serveRouterTokenRequest(router, "Bearer "+token,
-		`{"kind":"channel","id":"`+handlerTestResource+`"}`)
+		`{"call_id":"`+handlerTestResource+`"}`)
 	if first.Code != http.StatusOK || issuer.calls != 1 {
 		t.Fatalf("expected issued token, status=%d calls=%d body=%s", first.Code, issuer.calls, first.Body.String())
 	}
 	second := serveRouterTokenRequest(router, "Bearer "+token,
-		`{"kind":"channel","id":"`+handlerTestResource+`"}`)
+		`{"call_id":"`+handlerTestResource+`"}`)
 	if second.Code != http.StatusTooManyRequests || second.Header().Get("Retry-After") != "60" {
 		t.Fatalf("expected 429 after limit, status=%d retry=%q", second.Code, second.Header().Get("Retry-After"))
 	}
@@ -514,7 +514,7 @@ func TestLiveKitTokenCacheControlNoStoreAtRouter(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		response := serveRouterTokenRequest(newRouter(t, validator, &fakeTokenIssuer{result: issued}),
-			"Bearer "+accessToken, `{"kind":"channel","id":"`+handlerTestResource+`"}`)
+			"Bearer "+accessToken, `{"call_id":"`+handlerTestResource+`"}`)
 		assertResponseMetadata(t, response, http.StatusOK)
 
 		var envelope struct {
@@ -551,16 +551,16 @@ func TestLiveKitTokenCacheControlNoStoreAtRouter(t *testing.T) {
 			body: `{`, status: http.StatusBadRequest},
 		{name: "unauthorized", validator: stubAccessTokenValidator{err: errors.New("invalid access token")},
 			issuer: &fakeTokenIssuer{}, authorization: "Bearer " + accessToken,
-			body: `{"kind":"channel","id":"` + handlerTestResource + `"}`, status: http.StatusUnauthorized},
+			body: `{"call_id":"` + handlerTestResource + `"}`, status: http.StatusUnauthorized},
 		{name: "not found", issuer: &fakeTokenIssuer{err: domain.ErrNotFound}, authorization: "Bearer " + accessToken,
-			body: `{"kind":"channel","id":"` + handlerTestResource + `"}`, status: http.StatusNotFound},
+			body: `{"call_id":"` + handlerTestResource + `"}`, status: http.StatusNotFound},
 		{name: "rate limited", issuer: &fakeTokenIssuer{result: issued}, authorization: "Bearer " + accessToken,
-			body: `{"kind":"channel","id":"` + handlerTestResource + `"}`, status: http.StatusTooManyRequests,
+			body: `{"call_id":"` + handlerTestResource + `"}`, status: http.StatusTooManyRequests,
 			primeLimiter: true},
 		{name: "internal error", issuer: &fakeTokenIssuer{err: errors.New("operational failure")}, authorization: "Bearer " + accessToken,
-			body: `{"kind":"channel","id":"` + handlerTestResource + `"}`, status: http.StatusInternalServerError},
+			body: `{"call_id":"` + handlerTestResource + `"}`, status: http.StatusInternalServerError},
 		{name: "unavailable", issuer: &fakeTokenIssuer{err: domain.ErrUnavailable}, authorization: "Bearer " + accessToken,
-			body: `{"kind":"channel","id":"` + handlerTestResource + `"}`, status: http.StatusServiceUnavailable},
+			body: `{"call_id":"` + handlerTestResource + `"}`, status: http.StatusServiceUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -617,7 +617,7 @@ func serveRouterTokenRequest(router http.Handler, authorization, body string) *h
 
 func serveRouterUnavailableRequest(router http.Handler, ctx context.Context, requestID string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken,
-		strings.NewReader(`{"kind":"channel","id":"`+handlerTestResource+`"}`)).WithContext(ctx)
+		strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`)).WithContext(ctx)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Request-ID", requestID)
 	response := httptest.NewRecorder()

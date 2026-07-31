@@ -257,11 +257,12 @@ interface HeaderDMProps {
   name: string;
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
+  onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
 }
 
-function HeaderDM({ name, counterpart, detailsToggle }: HeaderDMProps) {
+export function HeaderDM({ name, counterpart, onStartCall, detailsToggle }: HeaderDMProps) {
   const src = counterpart?.avatarUrl;
   // A load failure is scoped to the URL that was current when it happened, so a
   // change of src must clear it — otherwise navigating A → B → A would never
@@ -300,6 +301,24 @@ function HeaderDM({ name, counterpart, detailsToggle }: HeaderDMProps) {
         )}
       </div>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {counterpart && onStartCall && (
+        <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
+          <button
+            type="button"
+            aria-label="Iniciar chamada de áudio"
+            onClick={() => onStartCall(counterpart.userId, "audio")}
+          >
+            Áudio
+          </button>
+          <button
+            type="button"
+            aria-label="Iniciar chamada de vídeo"
+            onClick={() => onStartCall(counterpart.userId, "video")}
+          >
+            Vídeo
+          </button>
+        </div>
+      )}
       {detailsToggle}
     </header>
   );
@@ -1145,6 +1164,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           <HeaderDM
             name={resolvedName}
             counterpart={activeDM?.counterpart}
+            onStartCall={ctx.startCall}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle

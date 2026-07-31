@@ -22,10 +22,11 @@ type ResourceKind string
 const (
 	ResourceKindChannel ResourceKind = "channel"
 	ResourceKindDM      ResourceKind = "dm"
+	ResourceKindCall    ResourceKind = "call"
 )
 
 func (k ResourceKind) Valid() bool {
-	return k == ResourceKindChannel || k == ResourceKindDM
+	return k == ResourceKindChannel || k == ResourceKindDM || k == ResourceKindCall
 }
 
 // RoomName derives a canonical LiveKit room without user-controlled text.

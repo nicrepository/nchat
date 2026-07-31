@@ -10,7 +10,12 @@ metadata:
     # pod or every auth route answers 404. Versioning it here also replaces the
     # equivalent rule that had been applied to this cluster out of band, which
     # no manifest described and a re-apply would have silently dropped.
-    traefik.ingress.kubernetes.io/router.middlewares: nchat-dev-auth-api-prefix@kubernetescrd
+    #
+    # RF-23 follow-up: media-service registers /media/*, not /api/media/*, so
+    # the same class of bug applies to POST /api/media/media/livekit/token —
+    # see media-api-prefix below. Both regexes are mutually exclusive prefixes,
+    # so chaining them is order-independent.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-dev-auth-api-prefix@kubernetescrd,nchat-dev-media-api-prefix@kubernetescrd
 spec:
   ingressClassName: traefik
   tls:
@@ -160,3 +165,26 @@ spec:
   replacePathRegex:
     regex: "^/api/auth/(.*)"
     replacement: "/auth/${1}"
+---
+# Rewrites the public /api/media/<rest> contract onto the /media/<rest> paths
+# the media-service router actually registers. The local Traefik gateway
+# (infra/traefik/local/dynamic.yml) already strips /api/media the same way;
+# this overlay's Ingress previously forwarded /api/media verbatim, so
+# POST /api/media/media/livekit/token reached media-service as
+# /api/media/media/livekit/token and answered 404 (no such route). Paths that
+# do not start with /api/media/ are left unchanged.
+#
+# Example: /api/media/media/livekit/token -> /media/livekit/token
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: media-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/media/(.*)"
+    replacement: "/${1}"

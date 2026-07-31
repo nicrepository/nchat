@@ -1,6 +1,10 @@
 package ws
 
-import "time"
+import (
+	"time"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+)
 
 // TargetType identifies the kind of chat target a subscription refers to.
 type TargetType string
@@ -8,6 +12,7 @@ type TargetType string
 const (
 	TargetTypeChannel TargetType = "channel"
 	TargetTypeDM      TargetType = "dm"
+	TargetTypeUser    TargetType = "user"
 )
 
 // EventType identifies the kind of server-sent event envelope.
@@ -20,7 +25,13 @@ const (
 	EventTypeReactionUpdated EventType = "reaction.updated"
 	// EventTypePinUpdated is emitted after a message is pinned or unpinned in a
 	// channel or DM (RF-05). Delivered to readable target subscribers only.
-	EventTypePinUpdated EventType = "pin.updated"
+	EventTypePinUpdated    EventType = "pin.updated"
+	EventTypeCallRinging   EventType = "call.ringing"
+	EventTypeCallAccepted  EventType = "call.accepted"
+	EventTypeCallDeclined  EventType = "call.declined"
+	EventTypeCallCancelled EventType = "call.cancelled"
+	EventTypeCallTimedOut  EventType = "call.timed_out"
+	EventTypeCallEnded     EventType = "call.ended"
 )
 
 // CurrentEventSchemaVersion is the version of the outbound WebSocket event
@@ -36,6 +47,12 @@ const (
 	ClientMessageTypeUnsubscribe    ClientMessageType = "unsubscribe"
 	ClientMessageTypePing           ClientMessageType = "ping"
 	ClientMessageTypeReactionToggle ClientMessageType = "reaction.toggle"
+	ClientMessageTypeCallStart      ClientMessageType = "call.start"
+	ClientMessageTypeCallAccept     ClientMessageType = "call.accept"
+	ClientMessageTypeCallDecline    ClientMessageType = "call.decline"
+	ClientMessageTypeCallCancel     ClientMessageType = "call.cancel"
+	ClientMessageTypeCallEnd        ClientMessageType = "call.end"
+	ClientMessageTypeCallSync       ClientMessageType = "call.sync"
 )
 
 // MessagePayload carries the full message DTO for message.created events.
@@ -122,6 +139,21 @@ type ReactionEventPayload struct {
 	Reactions   []ReactionPayload `json:"reactions"`
 }
 
+type CallEventPayload struct {
+	ID         string            `json:"call_id"`
+	RequestID  string            `json:"request_id"`
+	CallerID   string            `json:"caller_id"`
+	CalleeID   string            `json:"callee_id"`
+	CallType   domain.CallType   `json:"call_type"`
+	Status     domain.CallStatus `json:"status"`
+	Version    int64             `json:"version"`
+	CreatedAt  time.Time         `json:"created_at"`
+	OccurredAt time.Time         `json:"occurred_at"`
+	ExpiresAt  time.Time         `json:"expires_at"`
+	AcceptedAt *time.Time        `json:"accepted_at,omitempty"`
+	EndedAt    *time.Time        `json:"ended_at,omitempty"`
+}
+
 // Event is the outbound event envelope sent to WebSocket clients and exchanged
 // over the distributed BroadcastBus.
 //
@@ -145,6 +177,7 @@ type Event struct {
 	MessageUpdate *MessageUpdatedPayload `json:"message_update,omitempty"`
 	Reaction      *ReactionEventPayload  `json:"reaction,omitempty"`
 	Pin           *PinEventPayload       `json:"pin,omitempty"`
+	Call          *CallEventPayload      `json:"call,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`
@@ -160,9 +193,13 @@ type Event struct {
 // Workspace and user identity are always taken from the server auth context,
 // never from the fields of this message.
 type ClientMessage struct {
-	Type       ClientMessageType `json:"type"`
-	TargetType TargetType        `json:"target_type,omitempty"`
-	TargetID   string            `json:"target_id,omitempty"`
-	MessageID  string            `json:"message_id,omitempty"`
-	Emoji      string            `json:"emoji,omitempty"`
+	Type         ClientMessageType `json:"type"`
+	TargetType   TargetType        `json:"target_type,omitempty"`
+	TargetID     string            `json:"target_id,omitempty"`
+	MessageID    string            `json:"message_id,omitempty"`
+	Emoji        string            `json:"emoji,omitempty"`
+	RequestID    string            `json:"request_id,omitempty"`
+	CallID       string            `json:"call_id,omitempty"`
+	TargetUserID string            `json:"target_user_id,omitempty"`
+	CallType     domain.CallType   `json:"call_type,omitempty"`
 }

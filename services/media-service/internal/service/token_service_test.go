@@ -51,7 +51,7 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
 
 	result, err := svc.Issue(context.Background(), IssueTokenInput{
-		Kind: domain.ResourceKindChannel, ResourceID: serviceTestResource,
+		Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 		UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 		AccessExpiresAt: now.Add(10 * time.Minute),
 	})
@@ -64,7 +64,7 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	if signer.input.Identity != serviceTestUserID {
 		t.Fatalf("identity must come from authenticated user, got %q", signer.input.Identity)
 	}
-	if signer.input.Room != "channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+	if signer.input.Room != "call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
 		t.Fatalf("room must be server-derived, got %q", signer.input.Room)
 	}
 	if !signer.input.ExpiresAt.Equal(wantDeadline) {
@@ -92,7 +92,7 @@ func TestTokenServiceCapsDeadlineByAccessTokenAndSession(t *testing.T) {
 			signer := &tokenSignerStub{result: SignedToken{Token: "token", ExpiresAt: tt.wantDeadline}}
 			svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
 			_, err := svc.Issue(context.Background(), IssueTokenInput{
-				Kind: domain.ResourceKindDM, ResourceID: serviceTestResource,
+				Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 				UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 				AccessExpiresAt: tt.accessExpiry,
 			})
@@ -118,7 +118,7 @@ func TestTokenServiceAcceptsConfiguredTTLBounds(t *testing.T) {
 			svc := NewTokenService(authorizer, signer, ttl, func() time.Time { return now })
 
 			if _, err := svc.Issue(context.Background(), IssueTokenInput{
-				Kind: domain.ResourceKindChannel, ResourceID: serviceTestResource,
+				Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 				UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 				AccessExpiresAt: now.Add(20 * time.Minute),
 			}); err != nil {
@@ -138,7 +138,7 @@ func TestTokenServiceRejectsExpiredBoundsWithoutSigning(t *testing.T) {
 	svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
 
 	result, err := svc.Issue(context.Background(), IssueTokenInput{
-		Kind: domain.ResourceKindChannel, ResourceID: serviceTestResource,
+		Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 		UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 		AccessExpiresAt: now.Add(time.Minute),
 	})
@@ -154,7 +154,7 @@ func TestTokenServicePropagatesAuthorizationAndSignerFailuresWithoutToken(t *tes
 	signer := &tokenSignerStub{}
 	svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
 	input := IssueTokenInput{
-		Kind: domain.ResourceKindChannel, ResourceID: serviceTestResource,
+		Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 		UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 		AccessExpiresAt: now.Add(time.Minute),
 	}
@@ -180,7 +180,7 @@ func TestTokenServiceRejectsSignerExpiryBeyondAuthorizedDeadline(t *testing.T) {
 	svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
 
 	result, err := svc.Issue(context.Background(), IssueTokenInput{
-		Kind: domain.ResourceKindDM, ResourceID: serviceTestResource,
+		Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 		UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 		AccessExpiresAt: now.Add(3 * time.Minute),
 	})
@@ -198,7 +198,7 @@ func TestTokenServiceRejectsInvalidConfigurationAndPrincipal(t *testing.T) {
 		Token: "token", ExpiresAt: now.Add(time.Minute),
 	}}
 	validInput := IssueTokenInput{
-		Kind: domain.ResourceKindChannel, ResourceID: serviceTestResource,
+		Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 		UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 		AccessExpiresAt: now.Add(time.Minute),
 	}
@@ -241,7 +241,7 @@ func TestTokenServiceRejectsInvalidCanonicalResourceFromStorage(t *testing.T) {
 	signer := &tokenSignerStub{}
 	result, err := NewTokenService(authorizer, signer, time.Minute, func() time.Time { return now }).
 		Issue(context.Background(), IssueTokenInput{
-			Kind: domain.ResourceKindChannel, ResourceID: serviceTestResource,
+			Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 			UserID: serviceTestUserID, SessionID: serviceTestSessionID,
 			AccessExpiresAt: now.Add(time.Minute),
 		})

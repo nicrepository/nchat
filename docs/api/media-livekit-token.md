@@ -1,8 +1,8 @@
 # Media-service: token de participante LiveKit
 
-O endpoint abaixo e uma preparacao tecnica para chamadas da V1.0. Ele somente emite
-um token de participante com acesso a uma sala; nao cria chamadas, nao implementa
-WebRTC no cliente e nao gerencia participantes.
+O endpoint emite o token de mídia somente para participante autenticado de uma
+chamada RF-23 que o `chat-service` já tenha colocado em `active`. Ele não cria,
+atende, recusa ou encerra chamadas.
 
 ## Contrato
 
@@ -11,21 +11,9 @@ WebRTC no cliente e nao gerencia participantes.
 Requer `Authorization: Bearer <access-token>` e `Content-Type: application/json`.
 O corpo tem limite de 4 KiB e rejeita campos desconhecidos.
 
-Canal:
-
 ```json
 {
-  "kind": "channel",
-  "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-}
-```
-
-DM:
-
-```json
-{
-  "kind": "dm",
-  "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  "call_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 }
 ```
 
@@ -41,8 +29,8 @@ Resposta:
 ```
 
 `identity`, `room`, `grants` e TTL nunca sao aceitos do cliente. A identidade e o
-UUID `sub` do access token. A sala e derivada do UUID canonico persistido como
-`channel:<uuid>` ou `dm:<uuid>`.
+UUID `sub` do access token. A sala é derivada exclusivamente do UUID persistido:
+`call:<uuid>`.
 
 ## Autenticacao e autorizacao
 
@@ -50,13 +38,11 @@ O media-service valida a assinatura HS256, issuer, audience e claims obrigatorio
 do access token. A mesma consulta PostgreSQL valida usuario ativo, vinculo entre
 `sub` e `sid`, revogacao, expiracao idle e expiracao absoluta da sessao.
 
-Na mesma consulta, o servico aplica as regras de visibilidade do chat-service:
+Na mesma consulta, o serviço exige workspace e membership ativos, chamada com
+`status = 'active'` e `sub` igual a `caller_id` ou `callee_id`. Uma chamada
+`ringing`, expirada, recusada, cancelada ou encerrada nunca autoriza token.
 
-- canal ativo em workspace ativo, com membership ativo no workspace; canais publicos
-  ou gerais sao legiveis, e canais privados exigem membership no canal;
-- DM ativa em workspace ativo, com membership ativo no workspace e na conversa.
-
-Recurso ausente e recurso inacessivel retornam o mesmo `404`, sem indicar a
+Chamada ausente e chamada inacessivel retornam o mesmo `404`, sem indicar a
 existencia do UUID. Falha ou inatividade de sessao retorna `401`.
 
 ## Token
@@ -74,17 +60,17 @@ gateway.
 
 ## Codigos HTTP
 
-| Status | Condicao                                              |
-| -----: | ----------------------------------------------------- |
-|    200 | token emitido                                         |
-|    400 | JSON, `kind` ou UUID invalido; campo desconhecido     |
-|    401 | Bearer invalido ou sessao inativa                     |
-|    404 | canal/DM ausente ou inacessivel                       |
-|    413 | corpo acima de 4 KiB                                  |
-|    415 | Content-Type diferente de JSON                        |
-|    429 | limite por usuario excedido                           |
-|    503 | integracao desabilitada ou dependencias nao compostas |
-|    500 | falha interna ou de banco, sem detalhes sensiveis     |
+| Status | Condicao                                               |
+| -----: | ------------------------------------------------------ |
+|    200 | token emitido                                          |
+|    400 | JSON ou `call_id` invalido; campo desconhecido         |
+|    401 | Bearer invalido ou sessao inativa                      |
+|    404 | chamada não ativa, ausente ou usuário não participante |
+|    413 | corpo acima de 4 KiB                                   |
+|    415 | Content-Type diferente de JSON                         |
+|    429 | limite por usuario excedido                            |
+|    503 | integracao desabilitada ou dependencias nao compostas  |
+|    500 | falha interna ou de banco, sem detalhes sensiveis      |
 
 ## Configuracao
 
@@ -124,7 +110,7 @@ go run ./cmd/media-service
 
 Os predicados reais de sessao e autorizacao podem ser validados em um PostgreSQL
 descartavel. O banco informado deve ter nome terminado em `_test`; a suite aplica
-as migrations reais `auth/000001` e `chat/000001` a `000003`:
+as migrations reais, incluindo `chat/000019_call_lifecycle`:
 
 ```bash
 MEDIA_TEST_DATABASE_URL='postgres://user:password@127.0.0.1:5432/nchat_media_test?sslmode=disable' go test -tags=integration -count=1 ./internal/storage -run TestPGXResourceAuthorizerPostgreSQLPredicates
