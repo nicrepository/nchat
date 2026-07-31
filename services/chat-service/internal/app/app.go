@@ -267,6 +267,12 @@ func New(cfg config.Config) (*App, error) {
 	if channels != nil {
 		channels = channels.WithPresence(presenceReporter{tracker: presence})
 	}
+	// The group-details panel (issue #441) annotates participants with the same
+	// tracker. Unlike the channel panel it does not filter by presence, so this
+	// only decides what each row says about itself.
+	if directMessages != nil {
+		directMessages = directMessages.WithPresence(presenceReporter{tracker: presence})
+	}
 
 	// Database is the pool's own bootstrap outcome, independent of JWT or
 	// service wiring; the remaining fields reflect each component's wiring.

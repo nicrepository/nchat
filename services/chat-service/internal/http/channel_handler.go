@@ -203,8 +203,14 @@ type channelDetailsResponse struct {
 	OnlineMembers     []channelDetailsMemberJSON `json:"online_members"`
 }
 
-// presenceOnline is the only status an entry in online_members can carry.
-const presenceOnline = "online"
+// Presence values serialised by the details endpoints. presenceOnline is the
+// only status an entry in online_members can carry; presenceOffline exists for
+// the group panel, whose participant list is not presence-filtered and so has
+// to say which of its rows are connected.
+const (
+	presenceOnline  = "online"
+	presenceOffline = "offline"
+)
 
 // Details handles GET /api/chat/channels/{channelID}/details.
 //
