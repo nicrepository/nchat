@@ -18,7 +18,9 @@ import {
   editMessage,
   favoriteMessage,
   forwardChannelMessage,
+  ERR_INVALID_RESPONSE,
   fetchChannelDetails,
+  fetchDirectProfile,
   fetchGroupDetails,
   fetchChannelMessage,
   fetchChannelMessages,
@@ -389,7 +391,7 @@ describe("fetchDMs", () => {
       "//evil.example.test/a.png", // protocol-relative cross-origin
       "/\\evil.example.test/a.png", // backslash escape
       "https://user:pass@localhost:3000/a.png", // credentials, even same host
-      "/media/a.png ", // control character
+      "/media/a.png\u0000", // control character
       "media/a.png", // no leading slash -> would resolve relative to /chat, still same-origin? see below
       "  ",
       "\t\n",
@@ -485,20 +487,34 @@ describe("fetchDMs", () => {
   // from a corrupted or hostile payload; the conversation is still one the
   // server authorized, so it is kept and read as 1:1 — the section that grants
   // nothing extra — rather than dropped or promoted to a group.
-  it("reads any non-group type as 1:1 instead of dropping the conversation", async () => {
+  it("drops a conversation whose type this build does not recognise", async () => {
     mockAuthFetch.mockResolvedValue(
       sidebarResponse({
         dms: [
+          { id: "dm-ok", type: "direct", name: "Juliane" },
           { id: "dm-unknown", type: "broadcast", name: "Desconhecida" },
           { id: "dm-missing", name: "Sem tipo" },
+          { id: "dm-empty", type: "", name: "Vazio" },
+          { id: "dm-null", type: null, name: "Nulo" },
+          { id: "dm-number", type: 1, name: "Número" },
+          { id: "dm-object", type: { kind: "direct" }, name: "Objeto" },
+          // chat.dm_conversations.type is CHECK'd to the exact lowercase
+          // literals, so casing is not a variant the contract admits.
           { id: "dm-case", type: "GROUP", name: "Maiúsculas" },
+          { id: "dm-grp", type: "group", name: "Equipe" },
         ],
       }),
     );
 
     const dms = await fetchDMs();
-    expect(dms.map((dm) => dm.id)).toEqual(["dm-unknown", "dm-missing", "dm-case"]);
-    expect(dms.every((dm) => dm.type === "1:1")).toBe(true);
+
+    // An unrecognised type is not a 1:1. Rendering it as one would give it a
+    // profile control and a request for a counterpart it may not have.
+    expect(dms.map((dm) => dm.id)).toEqual(["dm-ok", "dm-grp"]);
+    expect(dms.map((dm) => dm.type)).toEqual(["1:1", "group"]);
+    // Per-item tolerance, like the other list parsers here: one bad row does not
+    // cost the user the rest of their conversations.
+    expect(dms).toHaveLength(2);
   });
 
   it("returns empty array when dm_conversations list is empty", async () => {
@@ -2181,5 +2197,238 @@ describe("fetchGroupDetails (issue #441)", () => {
     mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
 
     await expect(fetchGroupDetails("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("fetchDirectProfile (issue #443)", () => {
+  it("asks the profile endpoint of the conversation and never names a user", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv 1",
+        profile: {
+          user_id: "u-other",
+          display_name: "Juliane Lino",
+          avatar_url: "/media/juliane.png",
+          email: "juliane@nic.test",
+          presence: "online",
+        },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv 1");
+
+    // Only the conversation is in the URL: who the profile belongs to is the
+    // server's decision, so there is no user ID to tamper with.
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv%201/profile", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(details).toEqual({
+      kind: "direct",
+      conversationId: "conv 1",
+      profile: {
+        userId: "u-other",
+        displayName: "Juliane Lino",
+        avatarUrl: "/media/juliane.png",
+        email: "juliane@nic.test",
+        presence: "online",
+        jobTitle: undefined,
+        department: undefined,
+        timezone: undefined,
+      },
+    });
+  });
+
+  it("reads the professional fields when the server sends them", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: {
+          user_id: "u-other",
+          display_name: "Juliane Lino",
+          job_title: "Infraestrutura & Suporte",
+          department: "TI",
+          timezone: "America/Sao_Paulo",
+        },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv-1");
+
+    expect(details.profile).toMatchObject({
+      jobTitle: "Infraestrutura & Suporte",
+      department: "TI",
+      timezone: "America/Sao_Paulo",
+    });
+  });
+
+  it("leaves absent and blank fields undefined rather than empty strings", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: {
+          user_id: "u-other",
+          display_name: "Juliane Lino",
+          email: "   ",
+          job_title: "",
+          presence: "unknown-state",
+        },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv-1");
+
+    expect(details.profile.email).toBeUndefined();
+    expect(details.profile.jobTitle).toBeUndefined();
+    // A presence value outside the domain is not "offline": the UI must not
+    // assert a state the server did not send.
+    expect(details.profile.presence).toBeUndefined();
+  });
+
+  it("drops an unsafe or cross-origin avatar", async () => {
+    for (const avatarUrl of ["javascript:alert(1)", "https://evil.test/a.png", "/\\evil.test"]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind: "direct",
+          conversation_id: "conv-1",
+          profile: { user_id: "u-other", display_name: "Juliane", avatar_url: avatarUrl },
+        },
+      });
+
+      const details = await fetchDirectProfile("conv-1");
+      expect(details.profile.avatarUrl).toBeUndefined();
+    }
+  });
+
+  it("rejects a payload without an identity instead of returning a blank profile", async () => {
+    for (const profile of [
+      undefined,
+      null,
+      {},
+      { user_id: "u-other" },
+      { display_name: "Sem id" },
+      { user_id: "", display_name: "Juliane" },
+      { user_id: "u-other", display_name: "   " },
+    ]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: { kind: "direct", conversation_id: "conv-1", profile },
+      });
+
+      // The panel's contract is that a rendered profile is a real person; a card
+      // of "Não informado" rows must never stand in for a broken response.
+      await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+    }
+  });
+
+  it('rejects every kind that is not exactly "direct"', async () => {
+    for (const kind of [undefined, null, "", "group", "channel", "Direct", "broadcast", 1, {}]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind,
+          conversation_id: "conv-1",
+          profile: { user_id: "u-other", display_name: "Juliane" },
+        },
+      });
+
+      // The tag is the only thing separating a profile from a conversation
+      // projection. Substituting "direct" for a missing or wrong one would let a
+      // group payload be rendered as a person.
+      const error = await fetchDirectProfile("conv-1").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ApiRequestError);
+      expect((error as ApiRequestError).code).toBe(ERR_INVALID_RESPONSE);
+    }
+  });
+
+  it("rejects a missing, empty or non-string conversation_id", async () => {
+    for (const conversationId of [undefined, null, "", "   ".trim(), 42, {}]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind: "direct",
+          conversation_id: conversationId,
+          profile: { user_id: "u-other", display_name: "Juliane" },
+        },
+      });
+
+      // Never substituted with the requested ID: doing so would make a response
+      // that identifies no conversation indistinguishable from a correct one.
+      await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+    }
+  });
+
+  it("rejects a profile answered for a different conversation", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-B",
+        profile: {
+          user_id: "u-bruno",
+          display_name: "Bruno",
+          email: "bruno@nic.test",
+        },
+      },
+    });
+
+    // A misrouted response — A's request answered with B's profile. Echoing the
+    // requested ID back would hide exactly this.
+    const error = await fetchDirectProfile("conv-A").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiRequestError);
+    expect((error as ApiRequestError).code).toBe(ERR_INVALID_RESPONSE);
+    // Nothing about B may travel in the error either.
+    expect((error as Error).message).not.toContain("conv-B");
+    expect((error as Error).message).not.toContain("bruno@nic.test");
+  });
+
+  it("rejects an envelope whose data is not an object", async () => {
+    for (const data of [undefined, null, "direct", 7, []]) {
+      mockAuthFetch.mockResolvedValueOnce({ data });
+
+      await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+    }
+  });
+
+  it("returns an already-discriminated variant, so no caller has to tag it", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: { user_id: "u-other", display_name: "Juliane" },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv-1");
+
+    expect(details.kind).toBe("direct");
+    // The value the server sent, which was checked against the request — not the
+    // argument echoed back.
+    expect(details.conversationId).toBe("conv-1");
+  });
+
+  it("propagates a refusal instead of rendering a partial profile", async () => {
+    // A group, a conversation in another workspace and one the caller is not in
+    // all arrive as the same 404.
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  it("forwards the abort signal so a conversation switch cancels the request", async () => {
+    const controller = new AbortController();
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: { user_id: "u-other", display_name: "Juliane" },
+      },
+    });
+
+    await fetchDirectProfile("conv-1", controller.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv-1/profile", {
+      method: "GET",
+      signal: controller.signal,
+    });
   });
 });

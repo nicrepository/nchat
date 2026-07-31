@@ -776,6 +776,10 @@ type fakeDMStore struct {
 	participantsErr  error
 	participantCalls []dmParticipantCall
 
+	counterpart      domain.DMDirectProfile
+	counterpartErr   error
+	counterpartCalls []dmCounterpartCall
+
 	lastDirectInput   storage.CreateDirectConversationInput
 	lastGroupInput    storage.CreateGroupConversationInput
 	createDirectCalls int
@@ -830,6 +834,28 @@ type dmParticipantCall struct {
 	workspaceID    string
 	conversationID string
 	limit          int
+}
+
+// GetDirectCounterpartProfile models the store contract: identity resolution
+// for an already-authorised conversation. Every argument is recorded so a test
+// can prove the workspace and the caller reached the query — the two predicates
+// that stop a foreign conversation and a self-profile respectively.
+func (f *fakeDMStore) GetDirectCounterpartProfile(
+	_ context.Context, workspaceID, conversationID, callerID string,
+) (domain.DMDirectProfile, error) {
+	f.counterpartCalls = append(f.counterpartCalls, dmCounterpartCall{
+		workspaceID: workspaceID, conversationID: conversationID, callerID: callerID,
+	})
+	if f.counterpartErr != nil {
+		return domain.DMDirectProfile{}, f.counterpartErr
+	}
+	return f.counterpart, nil
+}
+
+type dmCounterpartCall struct {
+	workspaceID    string
+	conversationID string
+	callerID       string
 }
 
 func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {

@@ -375,6 +375,7 @@ func TestDMContractRoutesRequireAuthentication(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, RouteDMCandidates+"?query=an", nil),
 		httptest.NewRequest(http.MethodPost, RouteDMConversations, strings.NewReader(`{"other_user_id":"55555555-5555-5555-5555-555555555555"}`)),
 		httptest.NewRequest(http.MethodPost, RouteDMGroupConversations, strings.NewReader(`{"participant_user_ids":["55555555-5555-5555-5555-555555555555","66666666-6666-6666-6666-666666666666"]}`)),
+		httptest.NewRequest(http.MethodGet, "/api/chat/dm/33333333-3333-3333-3333-333333333333/profile", nil),
 	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
@@ -428,6 +429,14 @@ func TestDMContractRoutesAreRegisteredOnlyWithHandler(t *testing.T) {
 		}},
 		{name: "group creation", request: func(t *testing.T) *http.Request {
 			return routerPOSTRequest(t, RouteDMGroupConversations)
+		}},
+		// The 1:1 profile route (issue #443) must be registered under the same
+		// condition as the rest of the DM surface: absent without a handler,
+		// authenticated and 503 with one. A route that 404s only because it was
+		// never wired would be indistinguishable from a conversation that does
+		// not exist, and would hide a deployment mistake.
+		{name: "direct profile", request: func(t *testing.T) *http.Request {
+			return routerGETRequest(t, "/api/chat/dm/33333333-3333-3333-3333-333333333333/profile")
 		}},
 	}
 	for _, test := range []struct {

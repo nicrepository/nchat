@@ -33,6 +33,10 @@ type fakeDMProvider struct {
 	groupDetailsErr  error
 	lastDetailsInput service.GroupDetailsInput
 	detailsCalls     int
+	directProfile    service.DirectProfile
+	directProfileErr error
+	lastProfileInput service.DirectProfileInput
+	profileCalls     int
 	searchCalls      int
 	createCalls      int
 	groupCreateCalls int
@@ -82,6 +86,14 @@ func (f *fakeDMProvider) GetGroupDetails(
 	f.detailsCalls++
 	f.lastDetailsInput = input
 	return f.groupDetails, f.groupDetailsErr
+}
+
+func (f *fakeDMProvider) GetDirectProfile(
+	_ context.Context, input service.DirectProfileInput,
+) (service.DirectProfile, error) {
+	f.profileCalls++
+	f.lastProfileInput = input
+	return f.directProfile, f.directProfileErr
 }
 
 func dmTestHandler(provider *fakeDMProvider) *httpapi.DMHandler {

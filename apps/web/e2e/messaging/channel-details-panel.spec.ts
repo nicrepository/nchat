@@ -105,7 +105,11 @@ test.describe("painel de detalhes do canal", () => {
     ).toBeVisible();
 
     // Ações ainda sem fluxo: visíveis, desabilitadas, sem simular sucesso.
-    await expect(panel.getByRole("button", { name: /Adicionar membros/ })).toBeDisabled();
+    // Indisponível pela semântica: o botão continua alcançável por teclado para
+    // que o motivo descrito por aria-describedby possa ser anunciado.
+    const addMembers = panel.getByRole("button", { name: /Adicionar membros/ });
+    await expect(addMembers).toHaveAttribute("aria-disabled", "true");
+    expect(await addMembers.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
 
     // ── 3. a rota não mudou e o compositor segue utilizável ──────────────
     expect(new URL(page.url()).pathname).toBe(routeBeforeOpening);

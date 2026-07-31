@@ -1,15 +1,20 @@
 /**
  * ConversationDetailsPanel — the side panel for a channel ("Detalhes do canal",
- * issue #435) and for an ad-hoc group ("Detalhes do grupo", issue #441).
+ * issue #435), an ad-hoc group ("Detalhes do grupo", issue #441) and a 1:1 DM
+ * ("Perfil", issue #443).
  *
- * One shell, two vocabularies. The frame — heading, close button, loading and
- * error states, the pinned-message section and the recent-files section — is
- * identical for both, because those concepts are identical for both. What
- * differs is the aggregate being described: a channel has visibility, a
- * creation date and members; a group has a name, a creation date and
- * participants, and no visibility at all. Those two sections are therefore
- * separate components selected by the `kind` tag, not one component with a
- * pile of optional props.
+ * One shell, three vocabularies. The frame — the aside, the heading, the close
+ * button, the focus handling and the responsive behaviour — is identical for
+ * all three, because those concepts are identical for all three. What differs
+ * is the aggregate being described, so the body is selected by the `kind` tag
+ * rather than assembled from optional props:
+ *  - a channel has visibility, a creation date and members;
+ *  - a group has a name, a creation date and participants, and no visibility;
+ *  - a 1:1 DM has none of those. It has one other person, so the panel shows a
+ *    profile and not conversation metadata: no description, no visibility, no
+ *    member count, no roster, no pins and no files. The prototype's DM panel is
+ *    a profile card, and rendering a two-person "participants" list there would
+ *    describe the conversation instead of the person.
  *
  * Security invariants:
  * - Every server-supplied string (channel name, member names, file names, pin
@@ -28,7 +33,7 @@
  * message list, the composer or the WebSocket subscription.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import "./ConversationDetailsPanel.css";
 import RichTextRenderer from "./RichTextRenderer";
@@ -36,6 +41,7 @@ import type {
   ChannelAttachment,
   ChannelDetails,
   ChannelMemberProfile,
+  DirectDetails,
   GroupDetails,
   GroupParticipantProfile,
   PinnedItem,
@@ -53,6 +59,10 @@ import {
   conversationDetailsPanelId,
   conversationDetailsTitleId,
   formatFileSize,
+  formatLocalTime,
+  isValidTimeZone,
+  localTimeRefreshMs,
+  notInformedLabel,
 } from "./conversationDetailsDisplay";
 
 /** Material symbol name for a file, chosen from the *detected* type only. */
@@ -94,10 +104,24 @@ function SectionMessage({ children, role }: SectionMessageProps) {
 /**
  * An action whose flow does not exist yet.
  *
- * It is rendered as a real disabled button rather than hidden or faked: the
- * affordance stays visible and its unavailability is announced (aria-disabled
- * plus a described reason) instead of the click silently doing nothing or, far
- * worse, showing a success that never happened.
+ * It is a real, focusable <button> rather than something hidden or faked: the
+ * affordance stays visible and its unavailability is announced instead of the
+ * click silently doing nothing or, far worse, showing a success that never
+ * happened.
+ *
+ * The unavailable state is `aria-disabled`, never the HTML `disabled`
+ * attribute. A `disabled` button is removed from the tab order, so the very
+ * reason this component exists to convey — the sentence `reasonId` points at —
+ * is unreachable for anyone navigating by keyboard: they cannot land on the
+ * control, so the description is never announced and the action reads as
+ * missing rather than as not-yet-available. `aria-disabled` states the same
+ * thing to assistive technology while leaving the control reachable.
+ *
+ * Nothing can be activated: there is no callback in the props, so no caller can
+ * attach one, and `type="button"` keeps a click out of any enclosing form. The
+ * handler below is the explicit statement of that — it exists to do nothing on
+ * click, Enter, Space and touch alike, since all three routes end at the same
+ * click event.
  */
 function UnavailableAction({
   label,
@@ -107,11 +131,22 @@ function UnavailableAction({
 }: {
   label: string;
   icon?: string;
+  /**
+   * Describes why the action is unavailable. Must be the id of an element that
+   * is in the DOM whenever this button is, or the announcement is a dangling
+   * reference.
+   */
   reasonId: string;
   className: string;
 }) {
   return (
-    <button type="button" className={className} disabled aria-describedby={reasonId}>
+    <button
+      type="button"
+      className={className}
+      aria-disabled="true"
+      aria-describedby={reasonId}
+      onClick={(event) => event.preventDefault()}
+    >
       {icon && (
         <span className="material-symbols-outlined" aria-hidden="true">
           {icon}
@@ -300,11 +335,169 @@ function GroupParticipantsSection({
   );
 }
 
-/** Per-kind wording, in one table so a missing case is a type error. */
-const panelCopy = {
+// ── 1:1 profile (issue #443) ────────────────────────────────────────────────
+
+/**
+ * One row of the profile's metadata card.
+ *
+ * `value` being empty is the normal case for a field the domain does not
+ * record, and the row still renders, reading "Não informado". Dropping it would
+ * make the card's shape depend on the data and leave the reader unable to tell
+ * "not recorded" from "there is no such field here".
+ *
+ * Both halves are text nodes. A label is a constant and a value is whatever the
+ * server sent — a name, a job title, a department, an address — and none of it
+ * is ever interpreted as markup or used to build a URL.
+ */
+function ProfileMetaRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="chat-details__profile-row">
+      <span className="chat-details__profile-row-label">{label}</span>
+      <span className="chat-details__profile-row-value">{value || notInformedLabel}</span>
+    </div>
+  );
+}
+
+/**
+ * The "Horário local" row.
+ *
+ * The clock is read from the browser but interpreted in the *profile's* zone,
+ * never the viewer's: the instant is universal, the wall-clock reading is not.
+ * A missing or unusable zone leaves the row absent rather than quietly
+ * substituting the reader's own time, which would be a statement about the
+ * wrong person.
+ *
+ * The timer is what makes this a clock instead of a snapshot of when the panel
+ * happened to open, and it is cleared on unmount and whenever the zone changes,
+ * so switching conversations cannot leave one running.
+ */
+function ProfileLocalTimeRow({ timezone }: { timezone?: string }) {
+  const [now, setNow] = useState(() => new Date());
+  const valid = isValidTimeZone(timezone);
+
+  useEffect(() => {
+    if (!valid) return;
+    const timer = setInterval(() => setNow(new Date()), localTimeRefreshMs);
+    return () => clearInterval(timer);
+  }, [valid, timezone]);
+
+  return (
+    <ProfileMetaRow label="Horário local" value={valid ? formatLocalTime(now, timezone) : ""} />
+  );
+}
+
+/**
+ * The profile of the other participant of a 1:1 DM.
+ *
+ * `displayName` is the one field the panel refuses to do without — chatApi
+ * rejects a payload lacking it, so reaching here means there is a real person
+ * to name. Everything else degrades: the avatar falls back to initials, the
+ * presence badge disappears when the server tracks nothing rather than claiming
+ * "offline", and each metadata row says "Não informado".
+ */
+function DirectProfileSection({ details }: { details: DirectDetails }) {
+  const profile = details.profile;
+  const color = avatarColorFor(profile.userId);
+  return (
+    <div className="chat-details__profile">
+      <span
+        className={`chat-details__profile-avatar chat-details__avatar--${color}`}
+        aria-hidden="true"
+        data-testid="chat-details-profile-avatar"
+      >
+        {profile.avatarUrl ? (
+          <img
+            className="chat-details__avatar-img"
+            src={profile.avatarUrl}
+            alt=""
+            referrerPolicy="no-referrer"
+          />
+        ) : (
+          initialsFrom(profile.displayName)
+        )}
+        {profile.presence && (
+          <span
+            className={`chat-details__profile-presence chat-details__presence--${profile.presence}`}
+          />
+        )}
+      </span>
+
+      <p className="chat-details__profile-name" data-testid="chat-details-profile-name">
+        {profile.displayName}
+      </p>
+      {profile.jobTitle && <p className="chat-details__profile-role">{profile.jobTitle}</p>}
+
+      {/* Presence is a word, not only a colour: the dot repeats what the text
+          already says, so the state survives greyscale and a screen reader. */}
+      {profile.presence && (
+        <p
+          className={`chat-details__profile-status chat-details__profile-status--${profile.presence}`}
+          data-testid="chat-details-profile-status"
+        >
+          <span
+            className={`chat-details__status-dot chat-details__presence--${profile.presence}`}
+            aria-hidden="true"
+          />
+          {presenceLabel[profile.presence]}
+        </p>
+      )}
+
+      {/* The prototype's order, which reads from role to contact. */}
+      <div className="chat-details__profile-meta" data-testid="chat-details-profile-meta">
+        <ProfileMetaRow label="Cargo" value={profile.jobTitle ?? ""} />
+        <ProfileMetaRow label="Departamento" value={profile.department ?? ""} />
+        <ProfileMetaRow
+          label="Fuso horário"
+          value={isValidTimeZone(profile.timezone) ? profile.timezone : ""}
+        />
+        <ProfileLocalTimeRow timezone={profile.timezone} />
+        {/* Text, never a mailto: link. Nothing in this issue asks for a compose
+            action, and turning an address into a target is a decision of its
+            own. */}
+        <ProfileMetaRow label="E-mail" value={profile.email ?? ""} />
+      </div>
+
+      <UnavailableAction
+        label="Ver perfil completo"
+        icon="person"
+        reasonId="chat-details-profile-unavailable"
+        className="chat-details__wide-action"
+      />
+      <p id="chat-details-profile-unavailable" className="chat-details__note">
+        {/*
+          /profile is this application's *own* account page, not a directory
+          entry for someone else, and no route renders another user's full
+          profile. The action therefore stays visible and unavailable with this
+          sentence announced as its description, rather than linking somewhere
+          that would show the reader their own account.
+
+          The sentence is visible rather than sr-only: it fits the panel's
+          existing note style, and a reason worth announcing to a screen reader
+          is worth showing to everyone else.
+        */}
+        O perfil completo de outros usuários ainda não está disponível nesta versão.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The frame's wording, for every kind including the profile.
+ *
+ * Separate from `conversationCopy` below because the frame is the part all
+ * three share: a heading and a close button. Keeping the direct variant out of
+ * the conversation table is what stops it from acquiring a "participants"
+ * heading or a "files" empty state it has no section for.
+ */
+const panelHeader = {
+  channel: { title: "Detalhes do canal", closeLabel: "Fechar detalhes do canal" },
+  group: { title: "Detalhes do grupo", closeLabel: "Fechar detalhes do grupo" },
+  direct: { title: "Perfil", closeLabel: "Fechar perfil" },
+} as const;
+
+/** Per-conversation wording, in one table so a missing case is a type error. */
+const conversationCopy = {
   channel: {
-    title: "Detalhes do canal",
-    closeLabel: "Fechar detalhes do canal",
     peopleHeading: "Membros online",
     peopleUnavailable: "A gestão de membros do canal ainda não está disponível nesta versão.",
     addAction: "Adicionar membros",
@@ -313,8 +506,6 @@ const panelCopy = {
     filesUnavailable: "A central de arquivos do canal ainda não está disponível nesta versão.",
   },
   group: {
-    title: "Detalhes do grupo",
-    closeLabel: "Fechar detalhes do grupo",
     peopleHeading: "Participantes",
     peopleUnavailable: "A gestão de participantes do grupo ainda não está disponível nesta versão.",
     addAction: "Adicionar participantes",
@@ -324,6 +515,241 @@ const panelCopy = {
   },
 } as const;
 
+/**
+ * The body of a 1:1 panel: one profile, or the state of trying to load it.
+ *
+ * The three states are exclusive on purpose. A failed load renders the error
+ * and nothing else — never a card of "Não informado" rows, which would present
+ * a failure as a person with no attributes. And the heading above stays
+ * "Perfil" throughout, so the frame does not flicker between vocabularies while
+ * the request is in flight.
+ *
+ * `details.data.kind` is re-checked rather than assumed: the tag is what the
+ * hook recorded about the request it actually made, so a response that survived
+ * a conversation switch cannot be rendered here as a profile.
+ */
+function DirectBody({ details }: { details: ConversationDetailsState["details"] }) {
+  if (details.status === "loading") {
+    return <SectionMessage role="status">Carregando perfil…</SectionMessage>;
+  }
+  if (details.status === "error" || details.data.kind !== "direct") {
+    return <SectionMessage role="alert">Não foi possível carregar o perfil.</SectionMessage>;
+  }
+  return <DirectProfileSection details={details.data} />;
+}
+
+/**
+ * The body of a channel or group panel: about, people, pin and files.
+ *
+ * Extracted so the direct variant can be a sibling rather than a set of
+ * conditionals threaded through four sections. The conversation vocabulary and
+ * the profile vocabulary now live in separate functions, and neither can grow a
+ * branch for the other by accident.
+ */
+function ConversationBody({
+  kind,
+  details: rawDetails,
+  files,
+  currentUserId,
+  latestPin,
+}: {
+  kind: "channel" | "group";
+  details: ConversationDetailsState["details"];
+  files: ConversationDetailsState["files"];
+  currentUserId: string;
+  latestPin: PinnedItem | null;
+}) {
+  const copy = conversationCopy[kind];
+  // `kind` is the conversation the user is looking at *now*; the loaded data
+  // still describes whichever conversation was open when the request was made.
+  // For one render after a switch those disagree — the hook resets on its own
+  // effect — so data whose tag does not match is treated as not yet loaded.
+  //
+  // This is not defensive padding: without it, "ready" plus the wrong variant
+  // is read as "the other one of the two", which is how a direct payload would
+  // reach the participants section and be asked for a list it does not have.
+  const details: ConversationDetailsState["details"] =
+    rawDetails.status === "ready" && rawDetails.data.kind !== kind
+      ? { status: "loading" }
+      : rawDetails;
+  return (
+    <>
+      {/* ── Sobre ─────────────────────────────────────────────────────── */}
+      <section className="chat-details__section" aria-labelledby="chat-details-about">
+        <h3 id="chat-details-about" className="chat-details__label">
+          Sobre
+        </h3>
+        {details.status === "loading" && (
+          <SectionMessage role="status">
+            {kind === "channel"
+              ? "Carregando informações do canal…"
+              : "Carregando informações do grupo…"}
+          </SectionMessage>
+        )}
+        {details.status === "error" && (
+          <SectionMessage role="alert">
+            {kind === "channel"
+              ? "Não foi possível carregar as informações do canal."
+              : "Não foi possível carregar as informações do grupo."}
+          </SectionMessage>
+        )}
+        {details.status === "ready" &&
+          (details.data.kind === "channel" ? (
+            <ChannelAboutSection details={details.data} />
+          ) : details.data.kind === "group" ? (
+            <GroupAboutSection details={details.data} />
+          ) : null)}
+      </section>
+
+      {/* ── Pessoas (membros online / participantes) ──────────────────── */}
+      <section className="chat-details__section" aria-labelledby="chat-details-people">
+        <div className="chat-details__section-head">
+          {/*
+            The count is the server's total for this section, never the length
+            of the rendered list: both lists are capped previews. For a channel
+            that total is how many members are online; for a group it is how
+            many participants there are.
+          */}
+          <h3 id="chat-details-people" className="chat-details__label">
+            {copy.peopleHeading}
+            {details.status === "ready" &&
+              details.data.kind !== "direct" &&
+              ` (${
+                details.data.kind === "channel"
+                  ? details.data.onlineCount
+                  : details.data.participantCount
+              })`}
+          </h3>
+          <UnavailableAction
+            label="Ver todos"
+            reasonId="chat-details-people-unavailable"
+            className="chat-details__link-action"
+          />
+        </div>
+        {details.status === "loading" && (
+          <SectionMessage role="status">
+            {kind === "channel" ? "Carregando membros…" : "Carregando participantes…"}
+          </SectionMessage>
+        )}
+        {details.status === "error" && (
+          <SectionMessage role="alert">
+            {kind === "channel"
+              ? "Não foi possível carregar os membros."
+              : "Não foi possível carregar os participantes."}
+          </SectionMessage>
+        )}
+        {details.status === "ready" &&
+          (details.data.kind === "channel" ? (
+            <ChannelMembersSection details={details.data} currentUserId={currentUserId} />
+          ) : details.data.kind === "group" ? (
+            <GroupParticipantsSection details={details.data} currentUserId={currentUserId} />
+          ) : null)}
+        <UnavailableAction
+          label={copy.addAction}
+          icon="person_add"
+          reasonId="chat-details-people-unavailable"
+          className="chat-details__wide-action"
+        />
+        <p id="chat-details-people-unavailable" className="chat-details__note">
+          {copy.peopleUnavailable}
+        </p>
+      </section>
+
+      {/* ── Mensagem fixada ───────────────────────────────────────────── */}
+      <section className="chat-details__section" aria-labelledby="chat-details-pin">
+        <h3 id="chat-details-pin" className="chat-details__label">
+          Mensagem fixada
+        </h3>
+        {latestPin === null ? (
+          <p className="chat-details__empty" data-testid="chat-details-pin-empty">
+            {copy.pinEmpty}
+          </p>
+        ) : (
+          <div className="chat-details__pin" data-testid="chat-details-pin">
+            <span className="material-symbols-outlined chat-details__pin-icon" aria-hidden="true">
+              push_pin
+            </span>
+            <div className="chat-details__pin-text">
+              <div className="chat-details__pin-body">
+                {latestPin.message.isRemoved ? (
+                  <em>Mensagem removida.</em>
+                ) : (
+                  <RichTextRenderer
+                    text={latestPin.message.bodyText}
+                    bodyFormat={latestPin.message.bodyFormat}
+                  />
+                )}
+              </div>
+              <div className="chat-details__pin-by">
+                {senderLabel(latestPin.message)}
+                {latestPin.pinnedAt &&
+                  ` · ${formatDayLabel(latestPin.pinnedAt)}, ${formatTime(latestPin.pinnedAt)}`}
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* ── Arquivos recentes ─────────────────────────────────────────── */}
+      <section className="chat-details__section" aria-labelledby="chat-details-files">
+        <div className="chat-details__section-head">
+          <h3 id="chat-details-files" className="chat-details__label">
+            Arquivos recentes
+          </h3>
+          <UnavailableAction
+            label="Ver todos"
+            reasonId="chat-details-files-unavailable"
+            className="chat-details__link-action"
+          />
+        </div>
+        {files.status === "loading" && (
+          <SectionMessage role="status">Carregando arquivos…</SectionMessage>
+        )}
+        {files.status === "error" && (
+          <SectionMessage role="alert">Não foi possível carregar os arquivos.</SectionMessage>
+        )}
+        {files.status === "ready" &&
+          (files.data.length === 0 ? (
+            <p className="chat-details__empty" data-testid="chat-details-files-empty">
+              {copy.filesEmpty}
+            </p>
+          ) : (
+            <ul className="chat-details__files" aria-label="Arquivos recentes">
+              {files.data.map((file) => (
+                <li key={file.id} className="chat-details__file">
+                  <span className="chat-details__file-icon" aria-hidden="true">
+                    <span className="material-symbols-outlined">
+                      {fileIconFor(file.contentType)}
+                    </span>
+                  </span>
+                  <span className="chat-details__file-text">
+                    {/* A filename is text. It is never a URL and never markup. */}
+                    <span className="chat-details__file-name">{file.filename}</span>
+                    <span className="chat-details__file-meta">
+                      {file.createdAt &&
+                        `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
+                      {formatFileSize(file.size)}
+                      {file.status !== "clean" && (
+                        <span
+                          className={`chat-details__file-status chat-details__file-status--${file.status}`}
+                        >
+                          {attachmentStatusLabel[file.status]}
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ))}
+        <p id="chat-details-files-unavailable" className="chat-details__note">
+          {copy.filesUnavailable}
+        </p>
+      </section>
+    </>
+  );
+}
+
 interface ConversationDetailsPanelProps {
   /**
    * Which vocabulary the frame uses. It is the caller's domain discriminant,
@@ -331,7 +757,7 @@ interface ConversationDetailsPanelProps {
    * and it is available before the data loads, so the heading is correct while
    * the sections are still fetching.
    */
-  kind: "channel" | "group";
+  kind: "channel" | "group" | "direct";
   state: ConversationDetailsState;
   /** Identifies the viewer by ID; a display name would be ambiguous. */
   currentUserId: string;
@@ -351,7 +777,7 @@ export default function ConversationDetailsPanel({
   latestPin,
   onClose,
 }: ConversationDetailsPanelProps) {
-  const copy = panelCopy[kind];
+  const header = panelHeader[kind];
   const closeButtonRef = useRef<HTMLButtonElement>(null);
 
   // Focus moves into the panel once, on open, so a keyboard user lands on it
@@ -375,13 +801,13 @@ export default function ConversationDetailsPanel({
     >
       <div className="chat-details__head">
         <h2 id={conversationDetailsTitleId} className="chat-details__title">
-          {copy.title}
+          {header.title}
         </h2>
         <button
           ref={closeButtonRef}
           type="button"
           className="chat-details__close"
-          aria-label={copy.closeLabel}
+          aria-label={header.closeLabel}
           onClick={onClose}
         >
           <span className="material-symbols-outlined" aria-hidden="true">
@@ -391,177 +817,17 @@ export default function ConversationDetailsPanel({
       </div>
 
       <div className="chat-details__body">
-        {/* ── Sobre ─────────────────────────────────────────────────────── */}
-        <section className="chat-details__section" aria-labelledby="chat-details-about">
-          <h3 id="chat-details-about" className="chat-details__label">
-            Sobre
-          </h3>
-          {details.status === "loading" && (
-            <SectionMessage role="status">
-              {kind === "channel"
-                ? "Carregando informações do canal…"
-                : "Carregando informações do grupo…"}
-            </SectionMessage>
-          )}
-          {details.status === "error" && (
-            <SectionMessage role="alert">
-              {kind === "channel"
-                ? "Não foi possível carregar as informações do canal."
-                : "Não foi possível carregar as informações do grupo."}
-            </SectionMessage>
-          )}
-          {details.status === "ready" &&
-            (details.data.kind === "channel" ? (
-              <ChannelAboutSection details={details.data} />
-            ) : (
-              <GroupAboutSection details={details.data} />
-            ))}
-        </section>
-
-        {/* ── Pessoas (membros online / participantes) ──────────────────── */}
-        <section className="chat-details__section" aria-labelledby="chat-details-people">
-          <div className="chat-details__section-head">
-            {/*
-              The count is the server's total for this section, never the length
-              of the rendered list: both lists are capped previews. For a channel
-              that total is how many members are online; for a group it is how
-              many participants there are.
-            */}
-            <h3 id="chat-details-people" className="chat-details__label">
-              {copy.peopleHeading}
-              {details.status === "ready" &&
-                ` (${
-                  details.data.kind === "channel"
-                    ? details.data.onlineCount
-                    : details.data.participantCount
-                })`}
-            </h3>
-            <UnavailableAction
-              label="Ver todos"
-              reasonId="chat-details-people-unavailable"
-              className="chat-details__link-action"
-            />
-          </div>
-          {details.status === "loading" && (
-            <SectionMessage role="status">
-              {kind === "channel" ? "Carregando membros…" : "Carregando participantes…"}
-            </SectionMessage>
-          )}
-          {details.status === "error" && (
-            <SectionMessage role="alert">
-              {kind === "channel"
-                ? "Não foi possível carregar os membros."
-                : "Não foi possível carregar os participantes."}
-            </SectionMessage>
-          )}
-          {details.status === "ready" &&
-            (details.data.kind === "channel" ? (
-              <ChannelMembersSection details={details.data} currentUserId={currentUserId} />
-            ) : (
-              <GroupParticipantsSection details={details.data} currentUserId={currentUserId} />
-            ))}
-          <UnavailableAction
-            label={copy.addAction}
-            icon="person_add"
-            reasonId="chat-details-people-unavailable"
-            className="chat-details__wide-action"
+        {kind === "direct" ? (
+          <DirectBody details={details} />
+        ) : (
+          <ConversationBody
+            kind={kind}
+            details={details}
+            files={files}
+            currentUserId={currentUserId}
+            latestPin={latestPin}
           />
-          <p id="chat-details-people-unavailable" className="chat-details__note">
-            {copy.peopleUnavailable}
-          </p>
-        </section>
-
-        {/* ── Mensagem fixada ───────────────────────────────────────────── */}
-        <section className="chat-details__section" aria-labelledby="chat-details-pin">
-          <h3 id="chat-details-pin" className="chat-details__label">
-            Mensagem fixada
-          </h3>
-          {latestPin === null ? (
-            <p className="chat-details__empty" data-testid="chat-details-pin-empty">
-              {copy.pinEmpty}
-            </p>
-          ) : (
-            <div className="chat-details__pin" data-testid="chat-details-pin">
-              <span className="material-symbols-outlined chat-details__pin-icon" aria-hidden="true">
-                push_pin
-              </span>
-              <div className="chat-details__pin-text">
-                <div className="chat-details__pin-body">
-                  {latestPin.message.isRemoved ? (
-                    <em>Mensagem removida.</em>
-                  ) : (
-                    <RichTextRenderer
-                      text={latestPin.message.bodyText}
-                      bodyFormat={latestPin.message.bodyFormat}
-                    />
-                  )}
-                </div>
-                <div className="chat-details__pin-by">
-                  {senderLabel(latestPin.message)}
-                  {latestPin.pinnedAt &&
-                    ` · ${formatDayLabel(latestPin.pinnedAt)}, ${formatTime(latestPin.pinnedAt)}`}
-                </div>
-              </div>
-            </div>
-          )}
-        </section>
-
-        {/* ── Arquivos recentes ─────────────────────────────────────────── */}
-        <section className="chat-details__section" aria-labelledby="chat-details-files">
-          <div className="chat-details__section-head">
-            <h3 id="chat-details-files" className="chat-details__label">
-              Arquivos recentes
-            </h3>
-            <UnavailableAction
-              label="Ver todos"
-              reasonId="chat-details-files-unavailable"
-              className="chat-details__link-action"
-            />
-          </div>
-          {files.status === "loading" && (
-            <SectionMessage role="status">Carregando arquivos…</SectionMessage>
-          )}
-          {files.status === "error" && (
-            <SectionMessage role="alert">Não foi possível carregar os arquivos.</SectionMessage>
-          )}
-          {files.status === "ready" &&
-            (files.data.length === 0 ? (
-              <p className="chat-details__empty" data-testid="chat-details-files-empty">
-                {copy.filesEmpty}
-              </p>
-            ) : (
-              <ul className="chat-details__files" aria-label="Arquivos recentes">
-                {files.data.map((file) => (
-                  <li key={file.id} className="chat-details__file">
-                    <span className="chat-details__file-icon" aria-hidden="true">
-                      <span className="material-symbols-outlined">
-                        {fileIconFor(file.contentType)}
-                      </span>
-                    </span>
-                    <span className="chat-details__file-text">
-                      {/* A filename is text. It is never a URL and never markup. */}
-                      <span className="chat-details__file-name">{file.filename}</span>
-                      <span className="chat-details__file-meta">
-                        {file.createdAt &&
-                          `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
-                        {formatFileSize(file.size)}
-                        {file.status !== "clean" && (
-                          <span
-                            className={`chat-details__file-status chat-details__file-status--${file.status}`}
-                          >
-                            {attachmentStatusLabel[file.status]}
-                          </span>
-                        )}
-                      </span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            ))}
-          <p id="chat-details-files-unavailable" className="chat-details__note">
-            {copy.filesUnavailable}
-          </p>
-        </section>
+        )}
       </div>
     </aside>
   );
