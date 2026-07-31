@@ -62,7 +62,7 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 	}
 	cfg := validAppConfig()
 	sessionExpiry := time.Now().UTC().Add(10 * time.Minute)
-	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.channels`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.calls`).
 		WithArgs(appTestSessionID, appTestUserID, appTestResource).
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
 			AddRow(sessionExpiry, appTestResource))
@@ -77,7 +77,7 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
 
 	request := httptest.NewRequest(http.MethodPost, httpapi.RouteLiveKitToken,
-		strings.NewReader(`{"kind":"channel","id":"`+appTestResource+`"}`))
+		strings.NewReader(`{"call_id":"`+appTestResource+`"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+signedAppAccessToken(t))
 	response := httptest.NewRecorder()
@@ -102,7 +102,7 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 		t.Fatalf("verify LiveKit token: %v", err)
 	}
 	if grants.Identity != appTestUserID || grants.Video == nil ||
-		!grants.Video.RoomJoin || grants.Video.Room != "channel:"+appTestResource {
+		!grants.Video.RoomJoin || grants.Video.Room != "call:"+appTestResource {
 		t.Fatalf("unexpected LiveKit grants: %+v", grants)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

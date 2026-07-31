@@ -313,6 +313,9 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			if handleReactionClientError(c, msgErr) {
 				continue
 			}
+			if isCallClientMessage(msg.Type) && handleCallClientError(c, msg.Type, msg.CallID, msgErr) {
+				continue
+			}
 			if msg.Type == ClientMessageTypeSubscribe {
 				if c.ctx.Err() != nil || ctx.Err() != nil || errors.Is(msgErr, ErrClientNotRegistered) {
 					return
@@ -357,6 +360,7 @@ type clientErrorResponse struct {
 	Type       string `json:"type"`
 	Operation  string `json:"operation,omitempty"`
 	Code       string `json:"code"`
+	CallID     string `json:"call_id,omitempty"`
 	RetryAfter int    `json:"retry_after,omitempty"`
 }
 

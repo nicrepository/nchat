@@ -344,7 +344,7 @@ describe("navigating between DM and channel targets", () => {
   it("closes the DM subscription and subscribes to the channel", async () => {
     renderAt(`/chat/dm/${dmId}`);
     expect(await screen.findByText(dmText)).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
     const dmSocket = FakeWebSocket.instances.find((socket) => {
       const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
       return subscriptions.length === 1 && subscriptions[0]?.target_id === dmId;
@@ -359,7 +359,7 @@ describe("navigating between DM and channel targets", () => {
     );
 
     await clickChannel();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
 
     expect(dmSocket?.closed).toBe(true);
     expect(dmSocket?.subscriptions()).toContainEqual({
@@ -388,7 +388,7 @@ describe("navigating between DM and channel targets", () => {
   it("leaves no subscription or timeline state after a fast A → B → C switch", async () => {
     renderAt(`/chat/channel/${secretChannelId}`);
     expect(await within(header()).findByText("confidencial")).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
     const socketA = FakeWebSocket.instances.find((socket) => {
       const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
       return subscriptions.length === 1 && subscriptions[0]?.target_id === secretChannelId;
@@ -396,7 +396,7 @@ describe("navigating between DM and channel targets", () => {
 
     await clickChannel();
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
     const socketB = FakeWebSocket.instances.find((socket) => {
       const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
       return subscriptions.length === 1 && subscriptions[0]?.target_id === channelId;
@@ -405,7 +405,7 @@ describe("navigating between DM and channel targets", () => {
     await clickDM();
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
     expect(await screen.findByText(dmText)).toBeInTheDocument();
-    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(5));
     const socketC = FakeWebSocket.instances.find((socket) => {
       const subscriptions = socket.subscriptions().filter(({ type }) => type === "subscribe");
       return subscriptions.length === 1 && subscriptions[0]?.target_id === dmId;

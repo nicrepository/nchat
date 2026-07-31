@@ -45,12 +45,14 @@ type App struct {
 	Handler         http.Handler
 	TracingShutdown observability.ShutdownFunc
 
-	hub             *ws.Hub
-	presence        *ws.PresenceTracker
-	mentionCache    *storage.ValkeyMentionLabelCache
-	reactionLimiter *ws.ValkeyReactionLimiter
-	closeDB         func()
-	shutdownOnce    sync.Once
+	hub              *ws.Hub
+	presence         *ws.PresenceTracker
+	mentionCache     *storage.ValkeyMentionLabelCache
+	reactionLimiter  *ws.ValkeyReactionLimiter
+	callWorkerCancel context.CancelFunc
+	callWorkerWG     *sync.WaitGroup
+	closeDB          func()
+	shutdownOnce     sync.Once
 }
 
 // Shutdown stops the WebSocket hub, presence tracker, and tracing exporter in
@@ -64,6 +66,10 @@ type App struct {
 func (a *App) Shutdown(ctx context.Context) error {
 	var err error
 	a.shutdownOnce.Do(func() {
+		if a.callWorkerCancel != nil {
+			a.callWorkerCancel()
+			a.callWorkerWG.Wait()
+		}
 		a.hub.Shutdown()
 		a.presence.Stop()
 		if a.mentionCache != nil {
@@ -120,6 +126,7 @@ func New(cfg config.Config) (*App, error) {
 	var permissionSvc *service.PermissionService
 	var channelSvc *service.ChannelService
 	var channelCategorySvc *service.ChannelCategoryService
+	var callSvc *service.CallService
 
 	var closeDB func()
 	databaseReady := false
@@ -149,6 +156,7 @@ func New(cfg config.Config) (*App, error) {
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
+			callSvc = service.NewCallService(storage.NewPGXCallStore(pool), time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
 			permissionSvc = service.NewPermissionService(memberStore, channelStore)
 			channelSvc = service.NewChannelService(workspaceStore, channelStore, memberStore)
 			// channelStore is both the category store and the visible-channel read
@@ -206,6 +214,10 @@ func New(cfg config.Config) (*App, error) {
 		} else {
 			reactionLimiter = limiter
 			options = append(options, ws.WithReactionHandler(&reactionHandlerAdapter{service: reactionSvc}), ws.WithReactionLimiter(limiter))
+			if callSvc != nil {
+				options = append(options, ws.WithCallHandler(&callHandlerAdapter{service: callSvc}),
+					ws.WithCallLimiter(limiter, cfg.CallStartRateLimitMaxActions, cfg.CallStartRateLimitWindowSeconds))
+			}
 		}
 	}
 	// RF-19 (issue #419): the configurable per-workspace send limit. It reuses
@@ -251,6 +263,19 @@ func New(cfg config.Config) (*App, error) {
 	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
 
+	var callWorkerCancel context.CancelFunc
+	var callWorkerWG *sync.WaitGroup
+	if callSvc != nil {
+		callSvc.SetPublisher(hub)
+		workerCtx, cancel := context.WithCancel(context.Background())
+		callWorkerCancel = cancel
+		callWorkerWG = &sync.WaitGroup{}
+		callWorkerWG.Add(1)
+		go func() {
+			defer callWorkerWG.Done()
+			runCallExpiryWorker(workerCtx, callSvc, logger)
+		}()
+	}
 	// Wire the hub as the broadcast publisher for message creation events.
 	// SetPublisher is called after both messageSvc and hub are ready.
 	if messageSvc != nil {
@@ -286,15 +311,17 @@ func New(cfg config.Config) (*App, error) {
 	}
 
 	return &App{
-		Config:          cfg,
-		Logger:          logger,
-		Handler:         httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam),
-		TracingShutdown: shutdown,
-		hub:             hub,
-		presence:        presence,
-		mentionCache:    mentionCache,
-		reactionLimiter: reactionLimiter,
-		closeDB:         closeDB,
+		Config:           cfg,
+		Logger:           logger,
+		Handler:          httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam),
+		TracingShutdown:  shutdown,
+		hub:              hub,
+		presence:         presence,
+		mentionCache:     mentionCache,
+		reactionLimiter:  reactionLimiter,
+		callWorkerCancel: callWorkerCancel,
+		callWorkerWG:     callWorkerWG,
+		closeDB:          closeDB,
 	}, nil
 }
 
