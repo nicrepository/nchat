@@ -209,9 +209,10 @@ interface HeaderDMProps {
   name: string;
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
+  onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
 }
 
-function HeaderDM({ name, counterpart }: HeaderDMProps) {
+export function HeaderDM({ name, counterpart, onStartCall }: HeaderDMProps) {
   const src = counterpart?.avatarUrl;
   // A load failure is scoped to the URL that was current when it happened, so a
   // change of src must clear it — otherwise navigating A → B → A would never
@@ -250,6 +251,24 @@ function HeaderDM({ name, counterpart }: HeaderDMProps) {
         )}
       </div>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {counterpart && onStartCall && (
+        <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
+          <button
+            type="button"
+            aria-label="Iniciar chamada de áudio"
+            onClick={() => onStartCall(counterpart.userId, "audio")}
+          >
+            Áudio
+          </button>
+          <button
+            type="button"
+            aria-label="Iniciar chamada de vídeo"
+            onClick={() => onStartCall(counterpart.userId, "video")}
+          >
+            Vídeo
+          </button>
+        </div>
+      )}
     </header>
   );
 }
@@ -1017,7 +1036,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       {kind === "channel" ? (
         <HeaderChannel name={resolvedName} />
       ) : (
-        <HeaderDM name={resolvedName} counterpart={activeDM?.counterpart} />
+        <HeaderDM
+          name={resolvedName}
+          counterpart={activeDM?.counterpart}
+          onStartCall={ctx.startCall}
+        />
       )}
 
       <PinnedBar pins={pins} onUnpin={togglePin} />

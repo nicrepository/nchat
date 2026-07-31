@@ -1,0 +1,74 @@
+.chat-msg-area__call-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.chat-msg-area__call-actions button,
+.call-panel button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-msg-area__call-actions button:hover,
+.call-panel button:hover {
+  border-color: var(--color-primary, #6d28d9);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__call-actions button:focus-visible,
+.call-panel button:focus-visible {
+  outline: 3px solid var(--color-primary-tint-strong, #e6d7f7);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__call-actions button:disabled,
+.call-panel button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.call-panel {
+  position: fixed;
+  z-index: 20;
+  right: 24px;
+  bottom: 24px;
+  width: min(360px, calc(100vw - 48px));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-md, 0 4px 16px rgb(22 18 31 / 6%));
+}
+
+.call-panel > div:first-child,
+.call-panel__error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.call-panel > div:first-child span {
+  color: var(--color-muted, #7c7390);
+  font-size: 13px;
+}
+
+.call-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.call-panel__error {
+  color: var(--color-danger-ink, #991b1b);
+  font-size: 14px;
+}
