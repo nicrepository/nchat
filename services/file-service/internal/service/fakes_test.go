@@ -80,6 +80,24 @@ type fakeStore struct {
 
 	authorized    service.StoredAttachment
 	authorizedErr error
+
+	listed     []service.ListedAttachment
+	listErr    error
+	listQuery  service.ListDestinationAttachmentsQuery
+	listCalled int
+}
+
+func (s *fakeStore) ListChannelAttachments(
+	_ context.Context, query service.ListDestinationAttachmentsQuery,
+) ([]service.ListedAttachment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listCalled++
+	s.listQuery = query
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.listed, nil
 }
 
 func newFakeStore() *fakeStore {

@@ -16,6 +16,8 @@ import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
   type Channel,
+  type ChannelDetails,
+  type ChannelMemberProfile,
   type DMCandidate,
   type DirectDMResult,
   type MessageBodyFormat,
@@ -892,4 +894,94 @@ export async function fetchPins(target: PinTarget, signal?: AbortSignal): Promis
   const url = `${targetBasePath(target)}/pins`;
   const res = await authenticatedFetch<PinsEnvelope>(url, { method: "GET", signal });
   return (res.data.pins ?? []).map(mapPin);
+}
+
+// ── Channel details (issue #435) ─────────────────────────────────────────────
+
+interface ChannelDetailsMemberResponse {
+  user_id?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+  role?: unknown;
+  presence?: unknown;
+}
+
+interface ChannelDetailsEnvelope {
+  data: {
+    id?: unknown;
+    slug?: unknown;
+    display_name?: unknown;
+    type?: unknown;
+    created_at?: unknown;
+    member_count?: unknown;
+    online_member_count?: unknown;
+    online_members?: unknown;
+  };
+}
+
+function mapChannelMember(raw: unknown): ChannelMemberProfile | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const member = raw as ChannelDetailsMemberResponse;
+  if (typeof member.user_id !== "string" || member.user_id === "") return undefined;
+  const displayName = typeof member.display_name === "string" ? member.display_name : "";
+  // presence is only accepted as one of the values the domain defines; anything
+  // else (including a missing field) leaves it absent rather than "offline",
+  // which the UI must not claim on the server's behalf.
+  const presence =
+    member.presence === "online" || member.presence === "away" || member.presence === "offline"
+      ? member.presence
+      : undefined;
+  return {
+    userId: member.user_id,
+    displayName,
+    avatarUrl: safeAvatarUrl(member.avatar_url),
+    role: member.role === "moderator" ? "moderator" : "member",
+    presence,
+  };
+}
+
+function nonNegativeCount(raw: unknown): number {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : 0;
+}
+
+/**
+ * Fetches the channel-details payload for the panel.
+ *
+ * The server is the authority on visibility: a channel the caller cannot read
+ * answers 404 and this rejects, so the panel shows its error state instead of a
+ * partially-rendered channel.
+ */
+export async function fetchChannelDetails(
+  channelId: string,
+  signal?: AbortSignal,
+): Promise<ChannelDetails> {
+  const res = await authenticatedFetch<ChannelDetailsEnvelope>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/details`,
+    { method: "GET", signal },
+  );
+  const data = res.data;
+  const onlineMembers = Array.isArray(data.online_members)
+    ? data.online_members
+        .map(mapChannelMember)
+        .filter((member): member is ChannelMemberProfile => member !== undefined)
+        // Defence in depth, not the fix: the server already filters by presence
+        // before applying its limit, and this only stops a member the server did
+        // not vouch for as online from reaching an "online members" list. It can
+        // never restore an online member the server left out, which is exactly
+        // why the correction itself lives server-side.
+        .filter((member) => member.presence === "online")
+    : [];
+  return {
+    id: typeof data.id === "string" ? data.id : channelId,
+    slug: typeof data.slug === "string" ? data.slug : "",
+    name: typeof data.display_name === "string" ? data.display_name : "",
+    type: data.type === "private" ? "private" : "public",
+    createdAt: typeof data.created_at === "string" ? data.created_at : "",
+    // Both totals are the server's. Deriving either from onlineMembers.length
+    // would under-report: that array is a capped preview, and the channel's size
+    // does not shrink when a member disconnects.
+    memberCount: nonNegativeCount(data.member_count),
+    onlineCount: nonNegativeCount(data.online_member_count),
+    onlineMembers,
+  };
 }

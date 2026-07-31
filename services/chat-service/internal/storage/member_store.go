@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
@@ -24,6 +25,14 @@ type MemberStore interface {
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
 	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
+	// ListOnlineChannelMemberProfiles returns the channel's member totals plus up
+	// to limit of the members in onlineUserIDs, in one round trip. The presence
+	// filter is applied before the limit, so an online member never loses a slot
+	// to an offline one. The caller's read access to the channel must already
+	// have been settled.
+	ListOnlineChannelMemberProfiles(
+		ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
+	) (ChannelMemberPage, error)
 	SearchDMCandidates(ctx context.Context, workspaceID, callerID, prefix string, limit int) ([]domain.DMCandidate, error)
 	// RemoveChannelMember deletes the channel membership for userID in channelID, scoped to
 	// workspaceID. Returns ErrCannotLeaveGeneralChannel if the channel has is_general=true.
@@ -388,6 +397,135 @@ func (s *PGXMemberStore) SearchChannelMembers(ctx context.Context, workspaceID, 
 		return nil, fmt.Errorf("iterate channel member mentions: %w", err)
 	}
 	return results, nil
+}
+
+// ChannelMemberPage is the channel-details member section: a capped preview of
+// the members who are online right now, plus two totals.
+//
+// The three fields answer three different questions and must never be derived
+// from one another:
+//   - TotalCount is every active member of the channel, online or not. It is
+//     what "12 membros" in the panel reports.
+//   - OnlineCount is how many of those are currently online. It can exceed
+//     len(Online) when more members are online than the preview shows.
+//   - Online is the capped, ordered preview itself.
+type ChannelMemberPage struct {
+	Online      []domain.ChannelMemberProfile
+	OnlineCount int
+	TotalCount  int
+}
+
+// ListOnlineChannelMemberProfiles returns a channel's member totals and a capped
+// preview of the members who are online right now.
+//
+// onlineUserIDs is the presence snapshot, resolved by the caller from the
+// presence source in one batch. Restricting the *rows* by it — rather than
+// annotating a page that was already cut to `limit` — is the whole point: an
+// online member who sorts 31st alphabetically must still appear, and an offline
+// member must never occupy one of the preview's slots. The filter is therefore
+// applied inside online_members, before ORDER BY and LIMIT run.
+//
+// The active-membership predicate lives in exactly one place (the
+// active_members CTE) and is the same one SearchChannelMembers uses — active
+// channel in the given workspace, active workspace membership, active
+// non-deleted user. Both counts and the preview all read from it, so the total,
+// the online total and the list cannot disagree about who belongs to the
+// channel. The workspace_id filter on chat.channels is what keeps a channel
+// UUID from another tenant from ever resolving here, and the user_id filter is
+// an intersection: a presence entry for someone who is not a member of this
+// channel selects nothing.
+//
+// The LEFT JOIN LATERAL onto a one-row source guarantees exactly one row even
+// when nobody is online, so the totals still come back for an empty preview —
+// the same idiom file-service uses to keep a count and an optional payload in a
+// single round trip. There is one query per request: no per-member lookup, and
+// no second query that could drift from the first one's predicate.
+func (s *PGXMemberStore) ListOnlineChannelMemberProfiles(
+	ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
+) (ChannelMemberPage, error) {
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	// A nil slice would be sent as NULL, and `= ANY(NULL)` is NULL rather than
+	// false; an empty array is what makes "nobody online" select no rows.
+	if onlineUserIDs == nil {
+		onlineUserIDs = []string{}
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH active_members AS (
+			SELECT cm.user_id,
+			       cm.role::text AS role,
+			       COALESCE(
+			           NULLIF(BTRIM(u.full_name), ''),
+			           NULLIF(BTRIM(u.display_name), ''),
+			           ''
+			       ) AS display_name,
+			       COALESCE(u.avatar_url, '') AS avatar_url
+			FROM chat.channel_members cm
+			JOIN chat.channels c
+			  ON c.id = cm.channel_id
+			 AND c.workspace_id = $1::uuid
+			 AND c.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = c.workspace_id
+			 AND wm.user_id = cm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+			WHERE cm.channel_id = $2::uuid
+		),
+		online_members AS (
+			SELECT * FROM active_members WHERE user_id = ANY($3::uuid[])
+		)
+		SELECT
+			(SELECT count(*) FROM active_members) AS total_count,
+			(SELECT count(*) FROM online_members) AS online_count,
+			page.user_id::text,
+			page.display_name,
+			page.avatar_url,
+			page.role
+		FROM (SELECT 1) AS single_row
+		LEFT JOIN LATERAL (
+			SELECT * FROM online_members
+			ORDER BY lower(display_name), user_id
+			LIMIT $4
+		) AS page ON true`,
+		workspaceID, channelID, onlineUserIDs, limit)
+	if err != nil {
+		return ChannelMemberPage{}, fmt.Errorf("list online channel member profiles: %w", err)
+	}
+	defer rows.Close()
+
+	page := ChannelMemberPage{Online: make([]domain.ChannelMemberProfile, 0, limit)}
+	for rows.Next() {
+		var (
+			profile     domain.ChannelMemberProfile
+			total       int
+			online      int
+			userID      pgtype.Text
+			displayName pgtype.Text
+			avatarURL   pgtype.Text
+			role        pgtype.Text
+		)
+		if err := rows.Scan(&total, &online, &userID, &displayName, &avatarURL, &role); err != nil {
+			return ChannelMemberPage{}, fmt.Errorf("scan channel member profile: %w", err)
+		}
+		page.TotalCount = total
+		page.OnlineCount = online
+		// The lateral join contributes NULL columns when nobody is online. That
+		// is the "totals only" row, not a member.
+		if !userID.Valid {
+			continue
+		}
+		profile.UserID = userID.String
+		profile.DisplayName = displayName.String
+		profile.AvatarURL = avatarURL.String
+		profile.Role = domain.ChannelRole(role.String)
+		page.Online = append(page.Online, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return ChannelMemberPage{}, fmt.Errorf("iterate channel member profiles: %w", err)
+	}
+	return page, nil
 }
 
 func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, callerID, prefix string, limit int) ([]domain.DMCandidate, error) {

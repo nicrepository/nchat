@@ -62,6 +62,8 @@ const {
   mockEditMessage,
   mockDeleteMessage,
   mockGetMessageHistory,
+  mockFetchChannelDetails,
+  mockFetchChannelAttachments,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -120,6 +122,8 @@ const {
     vi.fn<(messageId: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockDeleteMessage: vi.fn<(messageId: string) => Promise<Message>>(),
   mockGetMessageHistory: vi.fn(),
+  mockFetchChannelDetails: vi.fn(),
+  mockFetchChannelAttachments: vi.fn(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
@@ -182,6 +186,15 @@ vi.mock("./chatApi", () => ({
     mockEditMessage(messageId, body, bodyFormat),
   deleteMessage: (messageId: string) => mockDeleteMessage(messageId),
   getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
+  fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
+    mockFetchChannelDetails(channelId, signal),
+}));
+
+// file-service lives behind its own client; the panel's files section is mocked
+// here exactly like the chat endpoints above.
+vi.mock("./filesApi", () => ({
+  fetchChannelAttachments: (channelId: string, limit: number, signal?: AbortSignal) =>
+    mockFetchChannelAttachments(channelId, limit, signal),
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
@@ -230,6 +243,28 @@ const makeMessage = (overrides: Partial<Message> = {}): Message => ({
 const emptyPage: MessagePage = { messages: [], nextCursor: "" };
 
 const messagePage = (messages: Message[]): MessagePage => ({ messages, nextCursor: "" });
+
+// Channel-details payload keyed by channel, so a test that switches channels can
+// assert the panel followed the switch rather than kept the first channel's data.
+function channelDetailsFor(channelId: string) {
+  return {
+    id: channelId,
+    slug: channelId,
+    name: `Canal ${channelId}`,
+    type: "public" as const,
+    createdAt: "2024-01-12T09:30:00.000Z",
+    memberCount: 3,
+    onlineCount: 1,
+    onlineMembers: [
+      {
+        userId: "me-123",
+        displayName: `Membro de ${channelId}`,
+        role: "member" as const,
+        presence: "online" as const,
+      },
+    ],
+  };
+}
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
@@ -377,6 +412,10 @@ beforeEach(() => {
   mockPinMessage.mockResolvedValue(undefined);
   mockUnpinMessage.mockResolvedValue(undefined);
   mockGetMessageHistory.mockResolvedValue({ entries: [], nextCursor: undefined });
+  mockFetchChannelDetails.mockImplementation((channelId: string) =>
+    Promise.resolve(channelDetailsFor(channelId)),
+  );
+  mockFetchChannelAttachments.mockResolvedValue([]);
   mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
@@ -3705,33 +3744,34 @@ describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
     await userEvent.click(pinBtn);
 
     expect(mockPinMessage).toHaveBeenCalledWith({ kind: "channel", id: "geral" }, "m1");
-    // The pins bar appears once the reload resolves with the new pin.
-    expect(await screen.findByTestId("chat-pins")).toHaveTextContent("1 mensagem fixada");
+    // The pins bar appears once the reload resolves, showing the pinned message
+    // itself — since issue #435 the bar carries only the most recent pin.
+    expect(await screen.findByTestId("chat-pins")).toHaveTextContent("fixe-me");
   });
 
-  it("expands the pins bar and unpins a removed message", async () => {
+  it("shows only the most recent pin in the bar and unpins it", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
     mockFetchPins.mockResolvedValue([
       {
-        message: makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "ativo" }),
+        message: makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "antigo" }),
         pinnedByUserId: "u1",
-        pinnedAt: new Date().toISOString(),
+        pinnedAt: "2026-07-15T10:00:00.000Z",
       },
       {
-        message: makeMessage({ id: "m2", isRemoved: true, status: "deleted", bodyText: "" }),
+        message: makeMessage({ id: "m2", senderDisplayName: "Bruno", bodyText: "recente" }),
         pinnedByUserId: "u2",
-        pinnedAt: new Date().toISOString(),
+        pinnedAt: "2026-07-15T12:00:00.000Z",
       },
     ]);
     renderChannelAreaForUser();
 
-    await userEvent.click(await screen.findByRole("button", { name: /2 mensagens fixadas/i }));
+    const bar = await screen.findByTestId("chat-pins");
+    expect(bar).toHaveTextContent("Bruno:");
+    expect(bar).toHaveTextContent("recente");
+    // The older pin is not in the bar at all — there is no expandable list.
+    expect(bar).not.toHaveTextContent("antigo");
 
-    expect(screen.getByText(/Ana:/)).toBeInTheDocument();
-    const removedItem = screen.getByText("Mensagem removida.").closest("li");
-    expect(removedItem).not.toBeNull();
-
-    await userEvent.click(removedItem!.querySelector("button")!);
+    await userEvent.click(within(bar).getByRole("button", { name: "Desafixar mensagem" }));
 
     expect(mockUnpinMessage).toHaveBeenCalledWith({ kind: "channel", id: "geral" }, "m2");
   });
@@ -3764,7 +3804,7 @@ describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
     await userEvent.click(screen.getByRole("button", { name: "Fixar mensagem" }));
 
     expect(mockPinMessage).toHaveBeenCalledWith({ kind: "dm", id: "dm-juliane" }, "m1");
-    expect(await screen.findByTestId("chat-pins")).toHaveTextContent("1 mensagem fixada");
+    expect(await screen.findByTestId("chat-pins")).toHaveTextContent("Olá, mundo!");
   });
 });
 
@@ -4127,5 +4167,246 @@ describe("ChatMessageArea — exclusão com placeholder (RF-14)", () => {
     expect(screen.getByText("Mensagem original indisponível.")).toBeInTheDocument();
     expect(screen.queryByText("Conteúdo privado")).not.toBeInTheDocument();
     expect(screen.getByText("resposta")).toBeInTheDocument();
+  });
+});
+
+// ── Painel de detalhes do canal (issue #435) ─────────────────────────────────
+
+/**
+ * Renders the message area under a route that can switch channels without
+ * remounting the component, which is exactly the condition the panel's
+ * behaviour depends on: React Router updates the :id parameter in place, so
+ * ChatMessageArea (and the panel state it owns) survives the navigation.
+ */
+function renderChannelSwitcher(currentUserId = "me-123") {
+  function Switcher() {
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate("/chat/channel/outro")}>
+          ir para outro canal
+        </button>
+        <ParentWithContext ctx={{ currentUserId, channels: [], dms: [] }} />
+      </>
+    );
+  }
+  return render(
+    <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+      <Routes>
+        <Route path="/chat" element={<Switcher />}>
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+function detailsToggle() {
+  return screen.getByRole("button", { name: "Detalhes do canal" });
+}
+
+describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
+  it("opens and closes from the header control, reflecting the state in aria-expanded", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    const toggle = detailsToggle();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("chat-channel-details")).not.toBeInTheDocument();
+
+    await userEvent.click(toggle);
+    expect(await screen.findByTestId("chat-channel-details")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    // The control names the panel it opens.
+    expect(toggle.getAttribute("aria-controls")).toBe(
+      screen.getByTestId("chat-channel-details").id,
+    );
+
+    await userEvent.click(toggle);
+    expect(screen.queryByTestId("chat-channel-details")).not.toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("returns focus to the header control when the panel closes itself", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-channel-details");
+
+    await userEvent.click(screen.getByRole("button", { name: "Fechar detalhes do canal" }));
+
+    expect(detailsToggle()).toHaveFocus();
+  });
+
+  it("is not offered in a DM, which has no channel details to show", async () => {
+    mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderDMArea();
+    await screen.findByTestId("chat-msg-bubble");
+
+    expect(screen.queryByRole("button", { name: "Detalhes do canal" })).not.toBeInTheDocument();
+    expect(mockFetchChannelDetails).not.toHaveBeenCalled();
+  });
+
+  it("does not remount the conversation or lose a typed draft when it opens and closes", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    const editor = screen.getByTestId("chat-composer-input");
+    await fillEditor(editor, "rascunho preservado");
+    const listBefore = screen.getByRole("log", { name: "Mensagens" });
+    const messageRequestsBefore = mockFetchChannelMessages.mock.calls.length;
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-channel-details");
+    await userEvent.click(detailsToggle());
+
+    // Same DOM node: the scroll container was reconciled in place, never
+    // recreated, so the scroll position and the list state are intact.
+    expect(screen.getByRole("log", { name: "Mensagens" })).toBe(listBefore);
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho preservado");
+    // No refetch: useMessages was never restarted.
+    expect(mockFetchChannelMessages.mock.calls.length).toBe(messageRequestsBefore);
+  });
+
+  it("stays open across a channel switch and reloads every section for the new channel", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchChannelAttachments.mockImplementation((channelId: string) =>
+      Promise.resolve([
+        {
+          id: `a-${channelId}`,
+          filename: `arquivo-${channelId}.pdf`,
+          contentType: "application/pdf",
+          size: 1024,
+          status: "clean" as const,
+          createdAt: "2026-07-15T12:00:00.000Z",
+        },
+      ]),
+    );
+    renderChannelSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    expect(await screen.findByText("Membro de geral")).toBeInTheDocument();
+    expect(await screen.findByText("arquivo-geral.pdf")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para outro canal" }));
+
+    // The panel is still open and now describes the channel the user switched to.
+    expect(await screen.findByText("Membro de outro")).toBeInTheDocument();
+    expect(await screen.findByText("arquivo-outro.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("Membro de geral")).not.toBeInTheDocument();
+    expect(screen.queryByText("arquivo-geral.pdf")).not.toBeInTheDocument();
+  });
+
+  it("ignores a late answer for the channel the user has already left", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    let resolveFirst: (value: ReturnType<typeof channelDetailsFor>) => void = () => {};
+    mockFetchChannelDetails
+      .mockImplementationOnce(
+        () =>
+          new Promise<ReturnType<typeof channelDetailsFor>>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockImplementation((channelId: string) => Promise.resolve(channelDetailsFor(channelId)));
+
+    renderChannelSwitcher();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para outro canal" }));
+    expect(await screen.findByText("Membro de outro")).toBeInTheDocument();
+
+    // The abandoned channel finally answers. Its members must not appear.
+    await act(async () => {
+      resolveFirst(channelDetailsFor("geral"));
+    });
+
+    expect(screen.getByText("Membro de outro")).toBeInTheDocument();
+    expect(screen.queryByText("Membro de geral")).not.toBeInTheDocument();
+  });
+
+  it("keeps the channel section rendered when only the files request fails", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchChannelAttachments.mockRejectedValue(new Error("file-service indisponível"));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+
+    expect(await screen.findByText("Não foi possível carregar os arquivos.")).toBeInTheDocument();
+    expect(screen.getByText(/Canal público/)).toBeInTheDocument();
+  });
+
+  it("shows the same pinned message in the bar and in the panel", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValue([
+      {
+        message: makeMessage({ id: "m-old", senderDisplayName: "Ana", bodyText: "pin antigo" }),
+        pinnedByUserId: "u1",
+        pinnedAt: "2026-07-15T10:00:00.000Z",
+      },
+      {
+        message: makeMessage({ id: "m-new", senderDisplayName: "Bruno", bodyText: "pin recente" }),
+        pinnedByUserId: "u2",
+        pinnedAt: "2026-07-15T12:00:00.000Z",
+      },
+    ]);
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+
+    const bar = await screen.findByTestId("chat-pins");
+    const card = await screen.findByTestId("chat-details-pin");
+    expect(bar).toHaveTextContent("pin recente");
+    expect(card).toHaveTextContent("pin recente");
+    expect(bar).not.toHaveTextContent("pin antigo");
+    expect(card).not.toHaveTextContent("pin antigo");
+  });
+
+  it("updates the bar and the panel together after an unpin", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    mockFetchPins.mockResolvedValueOnce([
+      {
+        message: makeMessage({ id: "m-new", senderDisplayName: "Bruno", bodyText: "pin recente" }),
+        pinnedByUserId: "u2",
+        pinnedAt: "2026-07-15T12:00:00.000Z",
+      },
+    ]);
+    // The reload after the unpin returns the channel with nothing pinned.
+    mockFetchPins.mockResolvedValue([]);
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-details-pin");
+
+    await userEvent.click(
+      within(screen.getByTestId("chat-pins")).getByRole("button", { name: "Desafixar mensagem" }),
+    );
+
+    expect(mockUnpinMessage).toHaveBeenCalledWith({ kind: "channel", id: "geral" }, "m-new");
+    await waitFor(() => expect(screen.queryByTestId("chat-pins")).not.toBeInTheDocument());
+    expect(screen.getByTestId("chat-details-pin-empty")).toBeInTheDocument();
+  });
+
+  it("requests only the selected channel and never a stale one", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-channel-details");
+
+    expect(mockFetchChannelDetails).toHaveBeenCalledWith("geral", expect.any(AbortSignal));
+    expect(mockFetchChannelAttachments).toHaveBeenCalledWith(
+      "geral",
+      expect.any(Number),
+      expect.any(AbortSignal),
+    );
   });
 });

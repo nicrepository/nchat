@@ -205,3 +205,68 @@ export interface PinnedItem {
   pinnedByUserId: string;
   pinnedAt: string; // ISO 8601
 }
+
+// ── Channel details panel (issue #435) ───────────────────────────────────────
+
+export type ChannelMemberRole = "member" | "moderator";
+
+/**
+ * One member of a channel, as the details panel renders them.
+ *
+ * `presence` is what the server asserts about this member. Every entry the
+ * server puts in `onlineMembers` carries "online"; the field is kept rather
+ * than implied so the client can verify the claim instead of trusting the
+ * list's name. It is absent when the server states nothing — never defaulted
+ * to a status the backend did not send.
+ *
+ * `role` is the channel role, the only complementary attribute the domain has:
+ * there is no job title or department anywhere in auth.users.
+ */
+export interface ChannelMemberProfile {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe same-origin target. */
+  avatarUrl?: string;
+  role: ChannelMemberRole;
+  presence?: OnlineStatus;
+}
+
+/**
+ * The channel-details payload.
+ *
+ * The three member figures are independent and none is derived from another:
+ *  - `memberCount` is every active member of the channel, online or not — the
+ *    channel's size, which does not change when someone disconnects;
+ *  - `onlineCount` is how many of those are online right now, and may exceed
+ *    `onlineMembers.length` when more are online than the preview shows;
+ *  - `onlineMembers` is the capped preview, filtered by presence server-side
+ *    *before* the limit is applied, so an offline member never takes a slot
+ *    from an online one.
+ *
+ * `description` is deliberately not a field: chat.channels has no description
+ * column, so the panel renders its empty state rather than a value nothing can
+ * produce.
+ */
+export interface ChannelDetails {
+  id: string;
+  slug: string;
+  name: string;
+  type: ChannelType;
+  createdAt: string; // ISO 8601
+  memberCount: number;
+  onlineCount: number;
+  onlineMembers: ChannelMemberProfile[];
+}
+
+/** Scan lifecycle of an attachment. Only "clean" is ever downloadable. */
+export type AttachmentStatus = "pending_scan" | "clean" | "rejected";
+
+export interface ChannelAttachment {
+  id: string;
+  filename: string;
+  contentType: string;
+  /** Plaintext size in bytes. */
+  size: number;
+  status: AttachmentStatus;
+  createdAt: string; // ISO 8601
+}

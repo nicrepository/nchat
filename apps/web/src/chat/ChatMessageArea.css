@@ -6,13 +6,66 @@
 
 /* ── Layout ──────────────────────────────────────────────────────────────────── */
 
+/*
+ * The message area is a grid of two columns: the conversation and the optional
+ * details panel (issue #435). The conversation keeps its own flex column inside
+ * __conversation, so the header, the pinned bar, the list and the composer are
+ * laid out exactly as before and none of them is remounted when the panel is
+ * added or removed — the panel is a *trailing sibling*, and React reconciles the
+ * preceding subtree untouched.
+ */
 .chat-msg-area {
-  display: flex;
-  flex-direction: column;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "conversation";
   height: 100%;
   min-height: 0;
   background: var(--color-bg, #f7f5fb);
   overflow: hidden;
+}
+
+.chat-msg-area--with-details {
+  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-areas: "conversation details";
+}
+
+.chat-msg-area__conversation {
+  grid-area: conversation;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Narrow desktop: the panel gives width back to the messages rather than
+   squeezing them below a readable measure. */
+@media (max-width: 1180px) {
+  .chat-msg-area--with-details {
+    grid-template-columns: minmax(0, 1fr) 272px;
+  }
+}
+
+/*
+ * Tablet and below: two columns would leave the conversation unusable, so the
+ * panel covers it instead of narrowing it. The conversation keeps its full width
+ * underneath — nothing is unmounted, the scroll position and the composer are
+ * intact — and closing the panel reveals it again. Nothing overflows the
+ * viewport, so the page never scrolls horizontally.
+ */
+@media (max-width: 900px) {
+  .chat-msg-area--with-details {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "conversation";
+  }
+
+  .chat-msg-area--with-details .chat-details {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
+  }
 }
 
 /* ── Header ──────────────────────────────────────────────────────────────────── */
@@ -41,6 +94,43 @@
   color: var(--color-ink, #16121f);
   margin: 0;
   letter-spacing: -0.01em;
+}
+
+/* Pushes the header actions to the trailing edge without a wrapper element. */
+.chat-msg-area__header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chat-msg-area__header-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-msg-area__header-btn:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+/* The open state is carried visually as well as through aria-expanded, so the
+   control reads as a toggle for sighted and assistive users alike. */
+.chat-msg-area__header-btn[aria-expanded="true"] {
+  background: var(--color-primary-tint-strong, #e6d7f7);
+  color: var(--color-primary-strong, #5b21b6);
+}
+
+.chat-msg-area__header-btn .material-symbols-outlined {
+  font-size: 20px;
 }
 
 /* DM avatar in header */
@@ -694,43 +784,18 @@
   background: var(--color-surface-muted, #f7f8fa);
 }
 
-.chat-msg-area__pins-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 8px 16px;
-  border: none;
-  background: transparent;
-  color: var(--color-text-secondary, #4b5563);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.chat-msg-area__pins-toggle .material-symbols-outlined {
-  font-size: 18px;
-  color: var(--color-accent, #4a7dff);
-}
-
-.chat-msg-area__pins-list {
-  list-style: none;
-  margin: 0;
-  padding: 0 8px 8px;
-  max-height: 220px;
-  overflow-y: auto;
-}
-
+/* One row: the pin icon, the current pinned message, and an unpin action. */
 .chat-msg-area__pins-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
-  border-radius: 6px;
+  padding: 8px 16px;
 }
 
-.chat-msg-area__pins-item:hover {
-  background: var(--color-surface, #fff);
+.chat-msg-area__pins-item > .material-symbols-outlined {
+  flex: none;
+  font-size: 18px;
+  color: var(--color-primary, #6d28d9);
 }
 
 .chat-msg-area__pins-text {

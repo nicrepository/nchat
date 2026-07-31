@@ -18,7 +18,15 @@
  * upgrade cannot set custom headers; token-in-URL is rejected server-side).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useOutletContext, useParams } from "react-router";
 
@@ -29,10 +37,20 @@ import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
 import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
 import { usePins } from "./usePins";
+import { selectLatestPin } from "./selectLatestPin";
+import { useChannelDetails } from "./useChannelDetails";
+import ChannelDetailsPanel from "./ChannelDetailsPanel";
+import { channelDetailsPanelId } from "./channelDetailsDisplay";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
-import { avatarColorFor, formatTime, initialsFrom, senderLabel } from "./messageDisplay";
+import {
+  avatarColorFor,
+  formatDayLabel,
+  formatTime,
+  initialsFrom,
+  senderLabel,
+} from "./messageDisplay";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -112,20 +130,6 @@ function quoteAuthorLabel(
   return parent ? senderLabel(parent) : "Usuário desconhecido";
 }
 
-function formatDate(iso: string): string {
-  try {
-    const d = new Date(iso);
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    if (d.toDateString() === today.toDateString()) return "Hoje";
-    if (d.toDateString() === yesterday.toDateString()) return "Ontem";
-    return d.toLocaleDateString("pt-BR", { day: "numeric", month: "long", year: "numeric" });
-  } catch {
-    return "";
-  }
-}
-
 // ── SVG icons ─────────────────────────────────────────────────────────────────
 
 function IconHash({ className }: { className?: string }) {
@@ -190,17 +194,56 @@ function IconWarning() {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-interface HeaderChannelProps {
-  name: string;
+interface DetailsToggleProps {
+  open: boolean;
+  onToggle: () => void;
 }
 
-function HeaderChannel({ name }: HeaderChannelProps) {
+/**
+ * The channel-details toggle.
+ *
+ * A real <button>, so it is reachable and operable by keyboard for free.
+ * aria-expanded carries the state and aria-controls points at the panel, which
+ * is why the panel needs a stable id rather than a generated one. The ref is
+ * what lets the panel hand focus back here when it closes itself.
+ */
+const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function DetailsToggle(
+  { open, onToggle },
+  ref,
+) {
+  return (
+    <div className="chat-msg-area__header-actions">
+      <button
+        ref={ref}
+        type="button"
+        className="chat-msg-area__header-btn"
+        aria-label="Detalhes do canal"
+        aria-expanded={open}
+        aria-controls={channelDetailsPanelId}
+        onClick={onToggle}
+        data-testid="chat-details-toggle"
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          info
+        </span>
+      </button>
+    </div>
+  );
+});
+
+interface HeaderChannelProps {
+  name: string;
+  detailsToggle?: React.ReactNode;
+}
+
+function HeaderChannel({ name, detailsToggle }: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
       <span className="chat-msg-area__header-icon" aria-hidden="true">
         <IconHash />
       </span>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {detailsToggle}
     </header>
   );
 }
@@ -542,7 +585,7 @@ function MessageList({
   let lastSenderId = "";
   let lastMinute = "";
   for (const msg of messages) {
-    const day = formatDate(msg.createdAt);
+    const day = formatDayLabel(msg.createdAt);
     if (day !== lastDay) {
       withDividers.push({ type: "divider", label: day });
       lastDay = day;
@@ -715,47 +758,37 @@ function ReferenceDestinationDialog({
 // ── Pinned messages bar (RF-05) ──────────────────────────────────────────────
 
 interface PinnedBarProps {
-  pins: PinnedItem[];
+  /**
+   * The one pin selectLatestPin chose, not the list. The details panel receives
+   * the same object, so "the bar and the panel show the same message" holds by
+   * construction instead of by two components agreeing on a rule.
+   */
+  pin: PinnedItem | null;
   onUnpin: (messageId: string, pin: boolean) => void;
 }
 
-function PinnedBar({ pins, onUnpin }: PinnedBarProps) {
-  const [expanded, setExpanded] = useState(false);
-  if (pins.length === 0) return null;
+function PinnedBar({ pin, onUnpin }: PinnedBarProps) {
+  if (pin === null) return null;
   return (
-    <section className="chat-msg-area__pins" aria-label="Mensagens fixadas" data-testid="chat-pins">
-      <button
-        type="button"
-        className="chat-msg-area__pins-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((v) => !v)}
-      >
+    <section className="chat-msg-area__pins" aria-label="Mensagem fixada" data-testid="chat-pins">
+      <div className="chat-msg-area__pins-item">
         <span className="material-symbols-outlined" aria-hidden="true">
           keep
         </span>
-        {pins.length === 1 ? "1 mensagem fixada" : `${pins.length} mensagens fixadas`}
-      </button>
-      {expanded && (
-        <ul className="chat-msg-area__pins-list">
-          {pins.map((pin) => (
-            <li key={pin.message.id} className="chat-msg-area__pins-item">
-              <span className="chat-msg-area__pins-text">
-                <span className="chat-msg-area__pins-sender">{senderLabel(pin.message)}: </span>
-                {pin.message.isRemoved ? "Mensagem removida." : pin.message.bodyText}
-              </span>
-              <button
-                type="button"
-                aria-label="Desafixar mensagem"
-                onClick={() => onUnpin(pin.message.id, false)}
-              >
-                <span className="material-symbols-outlined" aria-hidden="true">
-                  close
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
+        <span className="chat-msg-area__pins-text">
+          <span className="chat-msg-area__pins-sender">{senderLabel(pin.message)}: </span>
+          {pin.message.isRemoved ? "Mensagem removida." : pin.message.bodyText}
+        </span>
+        <button
+          type="button"
+          aria-label="Desafixar mensagem"
+          onClick={() => onUnpin(pin.message.id, false)}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">
+            close
+          </span>
+        </button>
+      </div>
     </section>
   );
 }
@@ -855,6 +888,33 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   const pinTarget = useMemo(() => (targetId ? { kind, id: targetId } : null), [kind, targetId]);
   const { pins, pinnedIds, error: pinError, togglePin, reload: reloadPins } = usePins(pinTarget);
+
+  // One selector, one list, one result: the bar above the conversation and the
+  // details panel are handed the same object, so a pin/unpin updates both at
+  // once and neither can show a message the other does not.
+  const latestPin = useMemo(() => selectLatestPin(pins), [pins]);
+
+  // Panel state lives here, in the component that owns the conversation, and
+  // not in the message list or a global store. This component is not remounted
+  // when messages change or when the route parameter changes, so toggling the
+  // panel cannot restart useMessages, the WebSocket subscription, the composer
+  // or the scroll position — and the panel stays open across a channel switch.
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsToggleRef = useRef<HTMLButtonElement>(null);
+  // Details are a channel concept; a DM has no members list, visibility or
+  // creation date to show, so the control is not rendered there at all.
+  const supportsDetails = kind === "channel" && targetId !== "";
+  const detailsChannelId = supportsDetails && detailsOpen ? targetId : null;
+  const detailsState = useChannelDetails(detailsChannelId);
+
+  const closeDetails = useCallback(() => {
+    setDetailsOpen(false);
+    // Focus returns to the control that opened the panel, but only if it is
+    // still mounted — after a channel switch to a DM it is not, and forcing
+    // focus onto a detached node would drop it to <body> instead.
+    detailsToggleRef.current?.focus();
+  }, []);
+  const toggleDetails = useCallback(() => setDetailsOpen((open) => !open), []);
 
   const {
     state,
@@ -1012,77 +1072,96 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [kind, targetId],
   );
 
+  const showDetails = supportsDetails && detailsOpen;
+
   return (
-    <div className="chat-msg-area" data-testid="chat-message-area">
-      {kind === "channel" ? (
-        <HeaderChannel name={resolvedName} />
-      ) : (
-        <HeaderDM name={resolvedName} counterpart={activeDM?.counterpart} />
-      )}
-
-      <PinnedBar pins={pins} onUnpin={togglePin} />
-
-      {state.status === "loading" && <LoadingSkeleton />}
-
-      {state.status === "error" && <ErrorState onRetry={retry} />}
-
-      {state.status === "ready" && state.messages.length === 0 && (
-        <EmptyState kind={kind} name={resolvedName} />
-      )}
-
-      {state.status === "ready" && state.messages.length > 0 && (
-        <MessageList
-          messages={state.messages}
-          currentUserId={ctx.currentUserId}
-          hasMore={state.nextCursor !== ""}
-          loadingMore={state.loadingMore}
-          lastMutation={state.lastMutation}
-          onLoadMore={loadMore}
-          onToggleReaction={handleToggleReaction}
-          onReplyMessage={selectReply}
-          onReferenceMessage={setReferenceSource}
-          onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
-          onReferenceJump={jumpToReference}
-          onToggleFavorite={toggleFavorite}
-          onEditMessage={editMessageLocal}
-          onEditForbidden={handleEditForbidden}
-          onDeleteMessage={deleteMessageLocal}
-          editDisabledIds={editDisabledIds}
-          channelId={kind === "channel" ? targetId : undefined}
-          onTogglePin={togglePin}
-          pinnedIds={pinnedIds}
-          allowedReactionEmojis={allowedReactionEmojis}
-          recentReactionEmojis={recentReactionEmojis}
-          focusMessageId={focusMessageId}
-        />
-      )}
-
-      {state.sendError && (
-        <div className="chat-msg-area__send-error" role="alert" data-testid="chat-send-error">
-          <IconWarning />
-          {state.sendError}
-        </div>
-      )}
-
-      {state.realtimeError && (
-        <div
-          className="chat-msg-area__realtime-error"
-          role="status"
-          data-testid="chat-realtime-error"
-        >
-          <IconWarning />
-          Conexão em tempo real instável. Tentando reconectar...
-        </div>
-      )}
-
-      {(reactionInputError || state.actionError || pinError) && (
-        <div className="chat-msg-area__reaction-error" role="alert">
-          <IconWarning />
-          {reactionInputError || state.actionError || pinError}
-        </div>
-      )}
-
+    <div
+      className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
+      data-testid="chat-message-area"
+    >
       {/*
+        The conversation column is always rendered, never conditionally, so the
+        panel below is a trailing sibling: adding or removing it leaves this
+        entire subtree — message list, composer, scroll container — reconciled in
+        place rather than remounted.
+      */}
+      <div className="chat-msg-area__conversation">
+        {kind === "channel" ? (
+          <HeaderChannel
+            name={resolvedName}
+            detailsToggle={
+              supportsDetails ? (
+                <DetailsToggle ref={detailsToggleRef} open={detailsOpen} onToggle={toggleDetails} />
+              ) : undefined
+            }
+          />
+        ) : (
+          <HeaderDM name={resolvedName} counterpart={activeDM?.counterpart} />
+        )}
+
+        <PinnedBar pin={latestPin} onUnpin={togglePin} />
+
+        {state.status === "loading" && <LoadingSkeleton />}
+
+        {state.status === "error" && <ErrorState onRetry={retry} />}
+
+        {state.status === "ready" && state.messages.length === 0 && (
+          <EmptyState kind={kind} name={resolvedName} />
+        )}
+
+        {state.status === "ready" && state.messages.length > 0 && (
+          <MessageList
+            messages={state.messages}
+            currentUserId={ctx.currentUserId}
+            hasMore={state.nextCursor !== ""}
+            loadingMore={state.loadingMore}
+            lastMutation={state.lastMutation}
+            onLoadMore={loadMore}
+            onToggleReaction={handleToggleReaction}
+            onReplyMessage={selectReply}
+            onReferenceMessage={setReferenceSource}
+            onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
+            onReferenceJump={jumpToReference}
+            onToggleFavorite={toggleFavorite}
+            onEditMessage={editMessageLocal}
+            onEditForbidden={handleEditForbidden}
+            onDeleteMessage={deleteMessageLocal}
+            editDisabledIds={editDisabledIds}
+            channelId={kind === "channel" ? targetId : undefined}
+            onTogglePin={togglePin}
+            pinnedIds={pinnedIds}
+            allowedReactionEmojis={allowedReactionEmojis}
+            recentReactionEmojis={recentReactionEmojis}
+            focusMessageId={focusMessageId}
+          />
+        )}
+
+        {state.sendError && (
+          <div className="chat-msg-area__send-error" role="alert" data-testid="chat-send-error">
+            <IconWarning />
+            {state.sendError}
+          </div>
+        )}
+
+        {state.realtimeError && (
+          <div
+            className="chat-msg-area__realtime-error"
+            role="status"
+            data-testid="chat-realtime-error"
+          >
+            <IconWarning />
+            Conexão em tempo real instável. Tentando reconectar...
+          </div>
+        )}
+
+        {(reactionInputError || state.actionError || pinError) && (
+          <div className="chat-msg-area__reaction-error" role="alert">
+            <IconWarning />
+            {reactionInputError || state.actionError || pinError}
+          </div>
+        )}
+
+        {/*
         The composer is keyed by the conversation identity so switching targets
         destroys the TipTap instance and mounts an empty one. The editor body is
         the only per-target state React Router's in-place route update would
@@ -1092,38 +1171,52 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         useEditor keeps the same instance) and the send button would post it to
         the wrong conversation. Drafts are deliberately not persisted.
       */}
-      <ChatComposer
-        key={`${kind}:${targetId}`}
-        channelId={kind === "channel" ? targetId : undefined}
-        bodyFormat={kind === "channel" ? "v3" : "v2"}
-        placeholder={
-          kind === "channel" ? `Mensagem para #${resolvedName}…` : `Mensagem para ${resolvedName}…`
-        }
-        disabled={state.status !== "ready"}
-        replyPreview={replyPreview}
-        onCancelReply={cancelReply}
-        referencePreview={referencePreview}
-        referenceTargetLabel={referenceTargetLabel}
-        onCancelReference={() =>
-          navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
-        }
-        onSend={handleSend}
-      />
-      {referenceSource && (
-        <ReferenceDestinationDialog
-          current={{ kind, id: targetId }}
-          channels={ctx.channels}
-          dms={ctx.dms}
-          onClose={() => setReferenceSource(null)}
-          onSelect={selectReferenceDestination}
+        <ChatComposer
+          key={`${kind}:${targetId}`}
+          channelId={kind === "channel" ? targetId : undefined}
+          bodyFormat={kind === "channel" ? "v3" : "v2"}
+          placeholder={
+            kind === "channel"
+              ? `Mensagem para #${resolvedName}…`
+              : `Mensagem para ${resolvedName}…`
+          }
+          disabled={state.status !== "ready"}
+          replyPreview={replyPreview}
+          onCancelReply={cancelReply}
+          referencePreview={referencePreview}
+          referenceTargetLabel={referenceTargetLabel}
+          onCancelReference={() =>
+            navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
+          }
+          onSend={handleSend}
         />
-      )}
-      {forwardSource && kind === "channel" && (
-        <ForwardMessageDialog
-          source={forwardSource}
-          channels={ctx.channels}
-          onClose={closeForwardDialog}
-          onSuccess={closeForwardDialog}
+        {referenceSource && (
+          <ReferenceDestinationDialog
+            current={{ kind, id: targetId }}
+            channels={ctx.channels}
+            dms={ctx.dms}
+            onClose={() => setReferenceSource(null)}
+            onSelect={selectReferenceDestination}
+          />
+        )}
+        {/* Both dialogs render through a portal, so their position here costs the
+          conversation column no layout. */}
+        {forwardSource && kind === "channel" && (
+          <ForwardMessageDialog
+            source={forwardSource}
+            channels={ctx.channels}
+            onClose={closeForwardDialog}
+            onSuccess={closeForwardDialog}
+          />
+        )}
+      </div>
+
+      {showDetails && (
+        <ChannelDetailsPanel
+          state={detailsState}
+          currentUserId={ctx.currentUserId}
+          latestPin={latestPin}
+          onClose={closeDetails}
         />
       )}
     </div>

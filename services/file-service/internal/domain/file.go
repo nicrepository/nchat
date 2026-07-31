@@ -120,6 +120,44 @@ const (
 // CHECK, so a name the domain accepts is always storable.
 const MaxFilenameBytes = 255
 
+// Listing bounds for a destination's recent attachments (issue #435).
+//
+// The list is a recency preview, not a paginated archive: there is no cursor,
+// so the ceiling is what stops a caller from asking for a whole channel's
+// history in one request. A missing or out-of-range limit becomes the default.
+const (
+	DefaultAttachmentListLimit = 20
+	MaxAttachmentListLimit     = 50
+)
+
+// NormalizeAttachmentListLimit clamps a client-supplied limit into the closed
+// range above. Zero and negative values mean "unspecified" and take the default.
+func NormalizeAttachmentListLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultAttachmentListLimit
+	}
+	if limit > MaxAttachmentListLimit {
+		return MaxAttachmentListLimit
+	}
+	return limit
+}
+
+// Listable reports whether an attachment in this status belongs in a
+// destination's file list.
+//
+// pending_upload and failed are excluded: they are incomplete or abandoned
+// uploads, never files a member put in the channel. pending_scan and rejected
+// are included so the UI can show that a file exists and what the scan decided
+// — neither is downloadable, which Downloadable, not this predicate, decides.
+func (s Status) Listable() bool {
+	switch s {
+	case StatusPendingScan, StatusClean, StatusRejected:
+		return true
+	default:
+		return false
+	}
+}
+
 // DefaultContentType is served whenever no type could be detected. It is inert.
 const DefaultContentType = "application/octet-stream"
 

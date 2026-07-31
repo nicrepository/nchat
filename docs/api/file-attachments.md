@@ -23,12 +23,13 @@ Prefixo publico `/api/files`, removido pelo gateway antes de chegar ao servico
 (`strip-files-prefix` em `infra/traefik/local/dynamic.yml`). Todas as rotas
 exigem `Authorization: Bearer <access-token>`.
 
-| Metodo | Rota publica                                    | Descricao            |
-| ------ | ----------------------------------------------- | -------------------- |
-| POST   | `/api/files/channels/{channelID}/attachments`   | upload em canal      |
-| POST   | `/api/files/dm/{conversationID}/attachments`    | upload em DM         |
-| GET    | `/api/files/attachments/{attachmentID}`         | metadados            |
-| GET    | `/api/files/attachments/{attachmentID}/content` | download do conteudo |
+| Metodo | Rota publica                                    | Descricao                |
+| ------ | ----------------------------------------------- | ------------------------ |
+| POST   | `/api/files/channels/{channelID}/attachments`   | upload em canal          |
+| POST   | `/api/files/dm/{conversationID}/attachments`    | upload em DM             |
+| GET    | `/api/files/channels/{channelID}/attachments`   | anexos recentes do canal |
+| GET    | `/api/files/attachments/{attachmentID}`         | metadados                |
+| GET    | `/api/files/attachments/{attachmentID}/content` | download do conteudo     |
 
 O destino vem da rota, nunca do corpo. Nao existe forma de request que nomeie
 canal e DM ao mesmo tempo, e o workspace nunca e aceito do cliente: ele e
@@ -82,6 +83,50 @@ nem qualquer detalhe de topologia.
 
 Destino inexistente e destino inacessivel retornam o mesmo `404`, sem indicar a
 existencia do UUID.
+
+### Listagem de anexos do canal (issue #435)
+
+```bash
+curl "https://nchat.local:8443/api/files/channels/$CHANNEL/attachments?limit=5" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+Resposta `200`:
+
+```json
+{
+  "data": {
+    "attachments": [
+      {
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "filename": "relatorio.pdf",
+        "contentType": "application/pdf",
+        "size": 184320,
+        "status": "clean",
+        "destinationKind": "channel",
+        "createdAt": "2026-07-28T12:00:00Z"
+      }
+    ]
+  }
+}
+```
+
+A autorizacao e a mesma do upload: `AuthorizeDestination` resolve o canal e o
+workspace canonico dele em uma consulta, e a listagem e ligada ao workspace que
+essa consulta devolveu. Canal inexistente, arquivado, privado sem participacao
+ou de outro workspace respondem o mesmo `404`.
+
+Regras da listagem:
+
+- ordem fixa no servidor: `created_at DESC, id DESC` (desempate deterministico);
+- so aparecem anexos com status `pending_scan`, `clean` ou `rejected` --
+  `pending_upload`, `failed` e `deleted` sao uploads incompletos ou removidos,
+  nunca arquivos do canal;
+- `limit` e opcional, default 20 e teto 50; valor nao inteiro ou <= 0 responde
+  `400 bad_request` em vez de virar o default silenciosamente;
+- a resposta e apenas metadado: chave do objeto, DEK, versao do envelope e
+  workspace nunca sao serializados. O download continua sendo autorizado
+  separadamente e so serve anexo `clean`.
 
 ### Download
 

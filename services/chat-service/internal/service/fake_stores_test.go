@@ -2,6 +2,8 @@ package service_test
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -213,10 +215,71 @@ type fakeMemberStore struct {
 	// suspended or deleted user is still an active member here yet is not
 	// eligible for a DM.
 	ineligibleAccounts map[string]struct{}
+
+	memberProfiles     storage.ChannelMemberPage
+	memberProfilesErr  error
+	memberProfileCalls []memberProfileCall
+}
+
+// memberProfileCall records what the service asked the store for, so a test can
+// assert that the presence snapshot reached the query rather than being applied
+// somewhere after the limit.
+type memberProfileCall struct {
+	workspaceID   string
+	channelID     string
+	onlineUserIDs []string
+	limit         int
 }
 
 func (f *fakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
 	return f.mentionCandidates, f.mentionErr
+}
+
+// ListOnlineChannelMemberProfiles models the store contract faithfully: it
+// intersects the channel's members with the presence snapshot FIRST and only
+// then sorts and truncates. A fake that limited before filtering would hide the
+// very defect issue #435 is about.
+func (f *fakeMemberStore) ListOnlineChannelMemberProfiles(
+	_ context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
+) (storage.ChannelMemberPage, error) {
+	f.memberProfileCalls = append(f.memberProfileCalls, memberProfileCall{
+		workspaceID:   workspaceID,
+		channelID:     channelID,
+		onlineUserIDs: append([]string(nil), onlineUserIDs...),
+		limit:         limit,
+	})
+	if f.memberProfilesErr != nil {
+		return storage.ChannelMemberPage{}, f.memberProfilesErr
+	}
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	online := map[string]struct{}{}
+	for _, userID := range onlineUserIDs {
+		online[userID] = struct{}{}
+	}
+	matched := make([]domain.ChannelMemberProfile, 0, len(f.memberProfiles.Online))
+	for _, member := range f.memberProfiles.Online {
+		if _, ok := online[member.UserID]; ok {
+			matched = append(matched, member)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		left, right := strings.ToLower(matched[i].DisplayName), strings.ToLower(matched[j].DisplayName)
+		if left != right {
+			return left < right
+		}
+		return matched[i].UserID < matched[j].UserID
+	})
+	page := storage.ChannelMemberPage{
+		OnlineCount: len(matched),
+		TotalCount:  f.memberProfiles.TotalCount,
+	}
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	page.Online = matched
+	return page, nil
 }
 
 func (f *fakeMemberStore) SearchDMCandidates(_ context.Context, _, _, query string, limit int) ([]domain.DMCandidate, error) {

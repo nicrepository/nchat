@@ -151,6 +151,11 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	// 503 on a route that does not exist.
 	if channels != nil {
 		mux.Handle("POST "+RouteChannels, authMiddleware(http.HandlerFunc(channels.Create)))
+		// Channel details (issue #435) is a read, so it shares the listing budget
+		// rather than the write one: the panel refetches on every channel switch.
+		mux.Handle("GET "+RouteChannelDetails, authMiddleware(
+			msgListLimiter.Middleware(http.HandlerFunc(channels.Details)),
+		))
 	}
 	// RF-17 channel categories. Registered only when wired, like the channel and
 	// DM routes, so a build without the handler answers 404 on a route that does
