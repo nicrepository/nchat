@@ -14,6 +14,7 @@ const liveKitMock = vi.hoisted(() => {
     Disconnected: "disconnected",
     Reconnecting: "reconnecting",
     Reconnected: "reconnected",
+    AudioPlaybackStatusChanged: "audioPlaybackChanged",
   } as const;
   const kinds = { Audio: "audio", Video: "video" } as const;
   const permissionDenied = "permission-denied";
@@ -85,6 +86,7 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onDisconnected: vi.fn(),
     onReconnecting: vi.fn(),
     onReconnected: vi.fn(),
+    onAudioPlaybackChanged: vi.fn(),
   };
 }
 
@@ -189,7 +191,7 @@ describe("createLiveKitSpikeSession", () => {
     expect(handlers.onRemoteElement).toHaveBeenCalledWith(audio);
   });
 
-  it("handles rejected remote audio playback without dropping the element", async () => {
+  it("reports rejected remote audio playback without dropping the element", async () => {
     const { handlers, room } = setup();
     const audio = document.createElement("audio");
     audio.play = vi.fn(async () => {
@@ -203,6 +205,20 @@ describe("createLiveKitSpikeSession", () => {
 
     expect(handlers.onRemoteElement).toHaveBeenCalledWith(audio);
     expect(handlers.onElementRemoved).not.toHaveBeenCalled();
+    expect(handlers.onAudioPlaybackChanged).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it("forwards playback status without duplicating its listener after reconnect", () => {
+    const { handlers, room } = setup();
+
+    room.emit(liveKitMock.events.AudioPlaybackStatusChanged, false);
+    room.emit(liveKitMock.events.Reconnecting);
+    room.emit(liveKitMock.events.Reconnected);
+    room.emit(liveKitMock.events.AudioPlaybackStatusChanged, true);
+
+    expect(handlers.onAudioPlaybackChanged).toHaveBeenNthCalledWith(1, false);
+    expect(handlers.onAudioPlaybackChanged).toHaveBeenNthCalledWith(2, true);
+    expect(room.listeners.get(liveKitMock.events.AudioPlaybackStatusChanged)).toHaveLength(1);
   });
 
   it("unsubscribes only the matching track", () => {
@@ -264,7 +280,9 @@ describe("createLiveKitSpikeSession", () => {
 
     await session.disconnect();
     room.emit(liveKitMock.events.Disconnected);
+    room.emit(liveKitMock.events.AudioPlaybackStatusChanged, false);
     expect(handlers.onDisconnected).toHaveBeenCalledOnce();
+    expect(handlers.onAudioPlaybackChanged).not.toHaveBeenCalled();
   });
 
   it("cleans up idempotently without removing internal Room listeners", async () => {

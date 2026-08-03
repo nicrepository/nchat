@@ -9,12 +9,13 @@
  * real server.
  */
 
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { _resetChatSocket, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
 import { issueCallToken } from "./callApi";
+import type { CallMediaBridge } from "./useCallSignaling";
 import { useCallSignaling } from "./useCallSignaling";
 
 vi.mock("./callApi", () => ({
@@ -108,6 +109,24 @@ function activeEvent(version: number) {
   };
 }
 
+function endedEvent(version: number) {
+  return {
+    type: "call.ended",
+    event_id: `00000000-0000-4000-8000-00000000080${version}`,
+    target_type: "user",
+    target_id: baseCall.callee_id,
+    call: { ...baseCall, status: "ended", version },
+  };
+}
+
+function mediaBridge(): CallMediaBridge {
+  return {
+    startAudio: vi.fn(async () => undefined),
+    connect: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
+  };
+}
+
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 const OriginalWebSocket = global.WebSocket;
@@ -198,6 +217,143 @@ describe("useCallSignaling", () => {
 
     act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
     expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(baseCall.call_id);
+  });
+
+  it("connects the media bridge with the active call token", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+
+    await waitFor(() =>
+      expect(media.connect).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ ...baseCall, status: "active" }),
+        "media-token",
+      ),
+    );
+    expect(result.current.mediaReady).toBe(true);
+  });
+
+  it("does not duplicate an in-flight media connection for repeated active events", async () => {
+    let finishConnect: (() => void) | undefined;
+    const media = mediaBridge();
+    vi.mocked(media.connect).mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishConnect = resolve;
+        }),
+    );
+    renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateMessage(activeEvent(2));
+      FakeWebSocket.instances[0].simulateMessage(activeEvent(3));
+    });
+
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    expect(issueCallToken).toHaveBeenCalledOnce();
+
+    finishConnect?.();
+  });
+
+  it("unlocks audio from start and accept user actions", () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+
+    act(() => {
+      result.current.start(baseCall.callee_id, "audio");
+    });
+    expect(media.startAudio).toHaveBeenCalledOnce();
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(ringingEvent(1)));
+    act(() => {
+      result.current.accept();
+    });
+    expect(media.startAudio).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops capture immediately on end and on authoritative terminal events", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() => {
+      result.current.end();
+    });
+    expect(media.stop).toHaveBeenCalledOnce();
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(endedEvent(3)));
+    expect(media.stop).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores media side effects from a stale terminal event", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(endedEvent(2)));
+
+    expect(result.current.call?.status).toBe("active");
+    expect(media.stop).not.toHaveBeenCalled();
+  });
+
+  it("can retry with a fresh token after media connection fails", async () => {
+    const media = mediaBridge();
+    vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() =>
+      expect(result.current.error).toBe(
+        "Não foi possível preparar a mídia da chamada. Tente novamente.",
+      ),
+    );
+
+    act(() => result.current.retryMedia());
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
+    expect(media.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("restarts disconnected media with a fresh token", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(result.current.mediaReady).toBe(true));
+
+    act(() => result.current.retryMedia());
+
+    await waitFor(() => expect(media.connect).toHaveBeenCalledTimes(2));
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not surface a late media failure after the call has ended", async () => {
+    let rejectToken!: (reason: unknown) => void;
+    vi.mocked(issueCallToken).mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectToken = reject;
+        }),
+    );
+    const { result } = renderHook(() => useCallSignaling(mediaBridge()));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(endedEvent(3)));
+    await act(async () => rejectToken(new Error("late failure")));
+
+    expect(result.current.call?.status).toBe("ended");
+    expect(result.current.error).toBeNull();
   });
 
   it("does not create duplicate sockets or listeners for repeated close events before retry fires", () => {

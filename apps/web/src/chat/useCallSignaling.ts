@@ -11,6 +11,9 @@ import {
   type CallState,
   type CallType,
 } from "./callState";
+import type { CallMediaSessionController } from "./useCallMedia";
+
+export type CallMediaBridge = Pick<CallMediaSessionController, "startAudio" | "connect" | "stop">;
 
 export interface CallController {
   call: Call | null;
@@ -26,7 +29,7 @@ export interface CallController {
   clearTerminal: () => void;
 }
 
-export function useCallSignaling(): CallController {
+export function useCallSignaling(media?: CallMediaBridge): CallController {
   const [state, setState] = useState<CallState>(initialCallState);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -34,23 +37,37 @@ export function useCallSignaling(): CallController {
   const socketRef = useRef<ChatSocketHandle | null>(null);
   const callRef = useRef<Call | null>(null);
   const pendingRef = useRef(false);
-  const mediaTokenRef = useRef<{ callId: string; token: string; expiresAt: string } | null>(null);
+  const mediaCallIdRef = useRef("");
+  const mediaRequestCallIdRef = useRef("");
+  const mediaRef = useRef(media);
 
   useEffect(() => {
-    callRef.current = state.call;
-  }, [state.call]);
+    mediaRef.current = media;
+  }, [media]);
 
   const requestMedia = useCallback(async (call: Call) => {
-    if (call.status !== "active" || mediaTokenRef.current?.callId === call.call_id) return;
+    if (
+      call.status !== "active" ||
+      mediaCallIdRef.current === call.call_id ||
+      mediaRequestCallIdRef.current === call.call_id
+    ) {
+      return;
+    }
+    mediaRequestCallIdRef.current = call.call_id;
     try {
       const result = await issueCallToken(call.call_id);
       if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
-      mediaTokenRef.current = { callId: call.call_id, ...result };
+      await mediaRef.current?.connect(call, result.token);
+      if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
+      mediaCallIdRef.current = call.call_id;
       setMediaReady(true);
       setError(null);
     } catch {
+      if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
       setMediaReady(false);
       setError("Não foi possível preparar a mídia da chamada. Tente novamente.");
+    } finally {
+      if (mediaRequestCallIdRef.current === call.call_id) mediaRequestCallIdRef.current = "";
     }
   }, []);
 
@@ -73,11 +90,16 @@ export function useCallSignaling(): CallController {
           pendingRef.current = false;
           setPending(false);
           setError(null);
-          setState((current) => applyCallEvent(current, event));
+          const nextState = applyCallEvent({ call: callRef.current }, event);
+          if (nextState.call === callRef.current) return;
+          callRef.current = nextState.call;
+          setState(nextState);
           if (event.call.status === "active") void requestMedia(event.call);
           if (isTerminalCall(event.call.status)) {
-            mediaTokenRef.current = null;
+            mediaCallIdRef.current = "";
+            mediaRequestCallIdRef.current = "";
             setMediaReady(false);
+            void mediaRef.current?.stop();
           }
           return;
         }
@@ -100,7 +122,11 @@ export function useCallSignaling(): CallController {
     return () => {
       closed = true;
       socketRef.current = null;
+      callRef.current = null;
+      mediaCallIdRef.current = "";
+      mediaRequestCallIdRef.current = "";
       handle.release();
+      void mediaRef.current?.stop();
     };
   }, [requestMedia]);
 
@@ -129,23 +155,63 @@ export function useCallSignaling(): CallController {
     pending,
     error,
     mediaReady,
-    start: (targetUserId, callType) =>
-      send({
+    start: (targetUserId, callType) => {
+      void mediaRef.current?.startAudio();
+      const started = send({
         type: "call.start",
         request_id: crypto.randomUUID(),
         target_user_id: targetUserId,
         call_type: callType,
-      }),
-    accept: () => transition("call.accept"),
-    decline: () => transition("call.decline"),
-    cancel: () => transition("call.cancel"),
-    end: () => transition("call.end"),
+      });
+      if (!started) void mediaRef.current?.stop();
+      return started;
+    },
+    accept: () => {
+      void mediaRef.current?.startAudio();
+      const accepted = transition("call.accept");
+      if (!accepted) void mediaRef.current?.stop();
+      return accepted;
+    },
+    decline: () => {
+      const declined = transition("call.decline");
+      if (declined) void mediaRef.current?.stop();
+      return declined;
+    },
+    cancel: () => {
+      const cancelled = transition("call.cancel");
+      if (cancelled) void mediaRef.current?.stop();
+      return cancelled;
+    },
+    end: () => {
+      const ended = transition("call.end");
+      if (ended) void mediaRef.current?.stop();
+      return ended;
+    },
     retryMedia: () => {
       const call = callRef.current;
-      if (call) void requestMedia(call);
+      if (!call || call.status !== "active" || mediaRequestCallIdRef.current === call.call_id) {
+        return;
+      }
+      mediaRequestCallIdRef.current = call.call_id;
+      mediaCallIdRef.current = "";
+      setMediaReady(false);
+      setError(null);
+      void Promise.resolve(mediaRef.current?.stop())
+        .catch(() => undefined)
+        .then(() => {
+          if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") {
+            return;
+          }
+          mediaRequestCallIdRef.current = "";
+          void requestMedia(call);
+        });
     },
     clearTerminal: () => {
-      if (state.call && isTerminalCall(state.call.status)) setState(initialCallState);
+      if (state.call && isTerminalCall(state.call.status)) {
+        void mediaRef.current?.stop();
+        callRef.current = null;
+        setState(initialCallState);
+      }
     },
   };
 }

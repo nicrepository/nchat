@@ -162,6 +162,7 @@ export default function LiveKitSpikePage({
       onReconnected() {
         if (isAttemptCurrent(attempt)) setStatus("connected");
       },
+      onAudioPlaybackChanged: () => undefined,
     };
   }
 

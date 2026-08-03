@@ -32,6 +32,7 @@ export interface LiveKitSpikeSessionCallbacks {
   onDisconnected(): void;
   onReconnecting(): void;
   onReconnected(): void;
+  onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
 }
 
 export interface LiveKitSpikeSession {
@@ -67,7 +68,8 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .on(RoomEvent.ParticipantDisconnected, this.onParticipantDisconnected)
       .on(RoomEvent.Disconnected, this.onDisconnected)
       .on(RoomEvent.Reconnecting, this.onReconnecting)
-      .on(RoomEvent.Reconnected, this.onReconnected);
+      .on(RoomEvent.Reconnected, this.onReconnected)
+      .on(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged);
   }
 
   async connect(serverUrl: string, token: string): Promise<void> {
@@ -174,7 +176,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     this.remoteTracks.set(track, { participantSid: participant.sid, elements });
     this.callbacks.onRemoteElement(element);
     if (track.kind === Track.Kind.Audio) {
-      void element.play().catch(() => undefined);
+      void element.play().catch(() => {
+        if (!this.disposed) this.callbacks.onAudioPlaybackChanged(false);
+      });
     }
   };
 
@@ -202,6 +206,10 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     if (!this.disposed) this.callbacks.onReconnected();
   };
 
+  private readonly onAudioPlaybackChanged = (canPlaybackAudio: boolean): void => {
+    if (!this.disposed) this.callbacks.onAudioPlaybackChanged(canPlaybackAudio);
+  };
+
   private async dispose(): Promise<void> {
     try {
       await this.room.disconnect(true);
@@ -219,7 +227,8 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .off(RoomEvent.ParticipantDisconnected, this.onParticipantDisconnected)
       .off(RoomEvent.Disconnected, this.onDisconnected)
       .off(RoomEvent.Reconnecting, this.onReconnecting)
-      .off(RoomEvent.Reconnected, this.onReconnected);
+      .off(RoomEvent.Reconnected, this.onReconnected)
+      .off(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged);
   }
 
   private removeRemoteTrack(track: RemoteTrack): void {
