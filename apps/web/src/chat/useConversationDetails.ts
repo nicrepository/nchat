@@ -130,11 +130,23 @@ export function useConversationDetails(
   const kind = target?.kind ?? "";
   const id = target?.id ?? "";
 
-  const load = useCallback((nextKind: string, nextID: string) => {
+  /**
+   * Fetches both sections for (nextKind, nextID).
+   *
+   * `reset` is the difference between the two callers, and it is not cosmetic.
+   * A target *switch* must reset: showing the previous conversation's
+   * participants and files under the new one's name would be wrong, and briefly
+   * so in a way the user cannot detect. A *refetch* of the conversation already
+   * displayed must not: the data is about to be replaced by a newer version of
+   * itself, and blanking the section in between unmounts everything inside it —
+   * including the control the user just activated, which drops keyboard focus
+   * to <body> mid-flow.
+   */
+  const load = useCallback((nextKind: string, nextID: string, reset = true) => {
     abortRef.current?.abort();
-    // Reset first, always: the panel must show a loading state for the new
-    // conversation rather than the previous one's participants and files.
-    dispatch({ type: "reset" });
+    if (reset) {
+      dispatch({ type: "reset" });
+    }
     if (!nextID || (nextKind !== "channel" && nextKind !== "group" && nextKind !== "direct")) {
       return;
     }
@@ -207,9 +219,10 @@ export function useConversationDetails(
   // loaded.
   const targetRef = useRef({ kind, id });
 
+  // Refetch in place: same target, newer data, no blank frame and no unmount.
   const reload = useCallback(() => {
     const { kind: currentKind, id: currentID } = targetRef.current;
-    load(currentKind, currentID);
+    load(currentKind, currentID, false);
   }, [load]);
 
   useEffect(() => {

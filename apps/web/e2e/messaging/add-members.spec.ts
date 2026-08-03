@@ -283,8 +283,7 @@ test.describe("adicionar membros a um grupo", () => {
     scenario.groupDetails.set(
       targetId,
       groupDetailsFixture(
-        targetId,
-        "Time de Infra",
+        { id: targetId, name: "Time de Infra" },
         [{ user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" }],
         4,
         canManage,
@@ -471,8 +470,7 @@ test.describe("troca de conversa com o seletor aberto", () => {
     scenario.groupDetails.set(
       groupId as string,
       groupDetailsFixture(
-        groupId as string,
-        "E2E Grupo",
+        { id: groupId as string, name: "E2E Grupo" },
         [{ user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" }],
         3,
         true,
@@ -576,8 +574,7 @@ test.describe("candidatos excluem membros fora da prévia", () => {
     scenario.groupDetails.set(
       targetId,
       groupDetailsFixture(
-        targetId,
-        "Time de Infra",
+        { id: targetId, name: "Time de Infra" },
         [{ user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" }],
         35,
         true,

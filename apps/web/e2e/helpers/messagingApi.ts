@@ -197,6 +197,12 @@ export interface GroupDetailsFixture {
   /** Every active participant; may exceed participants.length. */
   participant_count: number;
   participants: GroupParticipantFixture[];
+  /**
+   * Whether the server would let this caller add participants (issue #398).
+   * Always sent, so a spec that omits it exercises the safe default: absent
+   * reads as false and the action stays hidden.
+   */
+  can_manage_members: boolean;
 }
 
 /**
@@ -248,41 +254,6 @@ export interface ChannelDetailsFixture {
    * reads as false and the action stays hidden.
    */
   can_manage_members: boolean;
-}
-
-export interface GroupParticipantFixture {
-  user_id: string;
-  display_name: string;
-  presence?: "online" | "offline";
-}
-
-export interface GroupDetailsFixture {
-  id: string;
-  type: "group";
-  name: string;
-  created_at: string;
-  /** Every active participant; participants[] is only the capped preview. */
-  participant_count: number;
-  participants: GroupParticipantFixture[];
-  can_manage_members: boolean;
-}
-
-export function groupDetailsFixture(
-  conversationId: string,
-  name: string,
-  participants: GroupParticipantFixture[],
-  participantCount = participants.length,
-  canManageMembers = false,
-): GroupDetailsFixture {
-  return {
-    id: conversationId,
-    type: "group",
-    name,
-    created_at: "2024-03-04T15:00:00Z",
-    participant_count: participantCount,
-    participants,
-    can_manage_members: canManageMembers,
-  };
 }
 
 export interface AttachmentFixture {
@@ -451,24 +422,20 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
 }
 
 /**
- * Default channel-details payload for a channel in the fixture sidebar. Every
- * value is derived from the channel itself, so a spec that switches channels
- * sees genuinely different content without having to script both.
- *
- * memberCount defaults to the number of online members but is overridable,
- * because the two are independent: a channel keeps its size when nobody is
- * connected, and specs need to assert exactly that.
- */
-/**
  * Default group-details payload for a conversation in the fixture sidebar.
  *
  * participantCount defaults to the number of participants but is overridable,
  * because the two are independent: the preview is capped and the total is not.
+ *
+ * canManageMembers defaults to false (issue #398), matching the server's own
+ * strict normalization: a spec that says nothing about the permission exercises
+ * the safe default, where the add action stays hidden.
  */
 export function groupDetailsFixture(
   conversation: { id: string; name: string },
   participants: GroupParticipantFixture[],
   participantCount = participants.length,
+  canManageMembers = false,
 ): GroupDetailsFixture {
   return {
     id: conversation.id,
@@ -477,6 +444,7 @@ export function groupDetailsFixture(
     created_at: "2024-03-04T15:00:00Z",
     participant_count: participantCount,
     participants,
+    can_manage_members: canManageMembers,
   };
 }
 
@@ -497,6 +465,15 @@ export function directProfileFixture(
   };
 }
 
+/**
+ * Default channel-details payload for a channel in the fixture sidebar. Every
+ * value is derived from the channel itself, so a spec that switches channels
+ * sees genuinely different content without having to script both.
+ *
+ * memberCount defaults to the number of online members but is overridable,
+ * because the two are independent: a channel keeps its size when nobody is
+ * connected, and specs need to assert exactly that.
+ */
 export function channelDetailsFixture(
   channel: { id: string; slug: string; display_name: string; type: "public" | "private" },
   onlineMembers: ChannelMemberFixture[],
