@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -439,6 +440,50 @@ func TestAppWSWorkspaceResolver(t *testing.T) {
 	}
 }
 
+// ResolveWorkspaceID and GetDefaultWorkspaceID must stay the same answer: the
+// WebSocket session bind uses one and the anti-spam guard the other, and two
+// lookups that could disagree would let a session bind to one workspace while
+// its sends were counted against another.
+func TestAppWSWorkspaceResolverResolvesTheSameWorkspaceAsTheDefaultLookup(t *testing.T) {
+	resolver := appWSWorkspaceResolver{store: workspaceResolverStore{workspace: domain.Workspace{ID: "workspace-1"}}}
+
+	resolved, err := resolver.ResolveWorkspaceID(t.Context())
+	if err != nil {
+		t.Fatalf("ResolveWorkspaceID: %v", err)
+	}
+	canonical, err := resolver.GetDefaultWorkspaceID(t.Context())
+	if err != nil {
+		t.Fatalf("GetDefaultWorkspaceID: %v", err)
+	}
+	if resolved != canonical || resolved != "workspace-1" {
+		t.Fatalf("ResolveWorkspaceID = %q, GetDefaultWorkspaceID = %q", resolved, canonical)
+	}
+}
+
+// presenceReporter is what the channel- and group-details panels read presence
+// through (issues #435, #441, #398). A tracker that was never wired must answer
+// "nobody online" rather than panic — the panel then shows an empty preview,
+// which is the honest outcome, and never a member whose presence is invented.
+func TestPresenceReporterAnswersNobodyWithoutATracker(t *testing.T) {
+	if online := (presenceReporter{}).OnlineUserIDs("workspace-1"); len(online) != 0 {
+		t.Fatalf("an unwired tracker reported %v online", online)
+	}
+}
+
+func TestPresenceReporterReportsTheTrackersOnlineUsers(t *testing.T) {
+	tracker := ws.NewPresenceTracker(time.Minute)
+	t.Cleanup(tracker.Stop)
+	tracker.Connect("workspace-1", "user-1", "client-1")
+	// Another workspace's session must not appear in this one's answer.
+	tracker.Connect("workspace-2", "user-2", "client-2")
+
+	online := presenceReporter{tracker: tracker}.OnlineUserIDs("workspace-1")
+
+	if len(online) != 1 || online[0] != "user-1" {
+		t.Fatalf("online = %v, want only user-1", online)
+	}
+}
+
 func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 	now := time.Now().UTC()
 	got := domainMessageToWSPayload(domain.Message{
@@ -555,6 +600,153 @@ func TestHubBroadcasterPublishesPinUpdated(t *testing.T) {
 	broadcaster := hubBroadcaster{hub: hub}
 
 	broadcaster.PublishPinUpdated(t.Context(), "workspace-1", string(ws.TargetTypeDM), "dm-1", "message-1", "user-1", true)
+}
+
+// ── Add-members broadcasters (issue #398) ───────────────────────────────────
+//
+// These cover the adapter only: it is the seam where the HTTP layer's plain
+// strings become ws types, and getting that translation wrong would route a
+// correct event to the wrong room. Delivery, authorization and canonicalization
+// belong to internal/ws and are not re-tested here — the bus is read purely as
+// the observable proof that the adapter handed the right envelope over.
+
+// publishedEvents drains up to want events, failing rather than hanging when the
+// adapter publishes fewer than expected.
+func publishedEvents(t *testing.T, bus *captureBroadcastBus, want int) []ws.Event {
+	t.Helper()
+	events := make([]ws.Event, 0, want)
+	for range want {
+		select {
+		case event := <-bus.published:
+			events = append(events, event)
+		case <-time.After(time.Second):
+			t.Fatalf("published %d event(s), want %d", len(events), want)
+		}
+	}
+	return events
+}
+
+func TestHubBroadcasterPublishesMembersAdded(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 1)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-members-broadcaster")
+	t.Cleanup(hub.Shutdown)
+
+	// "dm" as a plain string, exactly as the HTTP layer passes it: the adapter
+	// exists so that layer keeps no ws import.
+	(&hubBroadcaster{hub: hub}).PublishMembersAdded(
+		t.Context(), "workspace-1", "dm", "dm-1", "actor-1", 2, 7,
+	)
+
+	event := publishedEvents(t, bus, 1)[0]
+	if event.Type != ws.EventTypeMembersAdded {
+		t.Fatalf("Type = %q, want %q", event.Type, ws.EventTypeMembersAdded)
+	}
+	if event.WorkspaceID != "workspace-1" {
+		t.Fatalf("WorkspaceID = %q, want workspace-1", event.WorkspaceID)
+	}
+	// The string became the typed target, and the ID travelled untouched.
+	if event.TargetType != ws.TargetTypeDM || event.TargetID != "dm-1" {
+		t.Fatalf("target = %s/%s, want dm/dm-1", event.TargetType, event.TargetID)
+	}
+	if event.Members == nil {
+		t.Fatal("members payload was dropped by the adapter")
+	}
+	if event.Members.ActorUserID != "actor-1" ||
+		event.Members.AddedCount != 2 || event.Members.MemberCount != 7 {
+		t.Fatalf("members payload = %+v", event.Members)
+	}
+	// It is target-scoped: a recipient is what makes delivery bypass
+	// subscriptions, and this event must never carry one.
+	if event.RecipientUserID != "" {
+		t.Fatalf("RecipientUserID = %q, want empty", event.RecipientUserID)
+	}
+}
+
+// The event says how many people were added, never who. The adapter takes no
+// member IDs at all, and this is the assertion that keeps it that way.
+func TestHubBroadcasterMembersAddedCarriesNoMemberIdentities(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 1)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-members-pii")
+	t.Cleanup(hub.Shutdown)
+
+	(&hubBroadcaster{hub: hub}).PublishMembersAdded(
+		t.Context(), "workspace-1", "channel", "channel-1", "actor-1", 3, 9,
+	)
+
+	encoded, err := json.Marshal(publishedEvents(t, bus, 1)[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, leak := range []string{
+		"added_user_ids", "user_ids", "participants", "display_name", "email", "body_text",
+	} {
+		if strings.Contains(string(encoded), leak) {
+			t.Fatalf("members.added carried %q: %s", leak, encoded)
+		}
+	}
+}
+
+func TestHubBroadcasterPublishesConversationAvailablePerRecipient(t *testing.T) {
+	// One event per recipient, so the buffer must hold both or the adapter would
+	// block on the second.
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 2)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-available-broadcaster")
+	t.Cleanup(hub.Shutdown)
+
+	(&hubBroadcaster{hub: hub}).PublishConversationAvailable(
+		t.Context(), "workspace-1", "channel", "channel-1", []string{"added-1", "added-2"},
+	)
+
+	recipients := map[string]int{}
+	for _, event := range publishedEvents(t, bus, 2) {
+		if event.Type != ws.EventTypeConversationAvailable {
+			t.Fatalf("Type = %q, want %q", event.Type, ws.EventTypeConversationAvailable)
+		}
+		if event.WorkspaceID != "workspace-1" {
+			t.Fatalf("WorkspaceID = %q, want workspace-1", event.WorkspaceID)
+		}
+		if event.TargetType != ws.TargetTypeChannel || event.TargetID != "channel-1" {
+			t.Fatalf("target = %s/%s, want channel/channel-1", event.TargetType, event.TargetID)
+		}
+		recipients[event.RecipientUserID]++
+	}
+	// Each addressee named exactly once, and nobody else: one event per
+	// recipient is what stops a recipient from learning who else was added.
+	if len(recipients) != 2 || recipients["added-1"] != 1 || recipients["added-2"] != 1 {
+		t.Fatalf("recipients = %v, want one event each for added-1 and added-2", recipients)
+	}
+}
+
+// A committed add that inserted nobody has no one to address, so the adapter
+// must publish nothing rather than an event with an empty recipient.
+func TestHubBroadcasterConversationAvailableWithNoRecipientsPublishesNothing(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 1)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-available-empty")
+	t.Cleanup(hub.Shutdown)
+
+	broadcaster := &hubBroadcaster{hub: hub}
+	broadcaster.PublishConversationAvailable(t.Context(), "workspace-1", "dm", "dm-1", nil)
+	broadcaster.PublishConversationAvailable(t.Context(), "workspace-1", "dm", "dm-1", []string{})
+
+	select {
+	case event := <-bus.published:
+		t.Fatalf("published %+v for an add that named nobody", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// Both adapters are wired in deployments with no distributed bus configured
+// (NopBus). The defined behaviour there is local delivery only: the call
+// completes normally and publishes nowhere.
+func TestHubBroadcasterAddMembersSignalsSurviveAMissingBus(t *testing.T) {
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), ws.NopBus{}, "test-members-nopbus")
+	t.Cleanup(hub.Shutdown)
+	broadcaster := &hubBroadcaster{hub: hub}
+
+	broadcaster.PublishMembersAdded(t.Context(), "workspace-1", "channel", "channel-1", "actor-1", 1, 4)
+	broadcaster.PublishConversationAvailable(
+		t.Context(), "workspace-1", "channel", "channel-1", []string{"added-1"},
+	)
 }
 
 type reactionStoreStub struct {

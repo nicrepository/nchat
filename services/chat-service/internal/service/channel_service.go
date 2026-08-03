@@ -151,6 +151,16 @@ type ChannelDetails struct {
 	OnlineMembers []domain.ChannelMemberProfile
 	OnlineCount   int
 	MemberCount   int
+	// CanManageMembers is the server's own answer to "may this caller add
+	// participants" (issue #398), derived from the membership this method already
+	// had to load. It exists so the panel can disable an action the server would
+	// refuse, and it is never the control: POST .../members re-derives the
+	// decision from the session on every call. A client that ignores it gets a
+	// 403, not a membership row.
+	//
+	// It is false for #geral, matching the write path: membership there is owned
+	// by the workspace sync, not by this flow.
+	CanManageMembers bool
 }
 
 // GetChannelDetails returns the channel-details payload for a channel the
@@ -165,7 +175,8 @@ type ChannelDetails struct {
 // presence snapshot the handler collected is likewise never returned to a
 // caller who fails this gate.
 func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDetailsInput) (ChannelDetails, error) {
-	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
+	member, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID)
+	if err != nil {
 		return ChannelDetails{}, err
 	}
 	channel, err := s.channels.GetVisibleChannelByID(ctx, input.WorkspaceID, input.ChannelID, input.CallerID)
@@ -183,6 +194,9 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		OnlineMembers: page.Online,
 		OnlineCount:   page.OnlineCount,
 		MemberCount:   page.TotalCount,
+		// The same predicate the write path checks, evaluated on the membership
+		// already loaded above — not a second, parallel rule that could drift.
+		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
 }
 

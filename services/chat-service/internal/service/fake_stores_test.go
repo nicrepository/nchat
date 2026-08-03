@@ -219,6 +219,31 @@ type fakeMemberStore struct {
 	memberProfiles     storage.ChannelMemberPage
 	memberProfilesErr  error
 	memberProfileCalls []memberProfileCall
+
+	candidateErr           error
+	candidateCalls         []candidateSearchCall
+	addCMsErr              error
+	addChannelMembersCalls []addChannelMembersCall
+}
+
+// addChannelMembersCall records what the service handed the store, so a test can
+// assert the IDs were canonicalised, de-duplicated and workspace-scoped before
+// they ever reached SQL.
+// candidateSearchCall records what the service handed the store, so a test can
+// assert the target and the server-derived actor reached SQL.
+type candidateSearchCall struct {
+	WorkspaceID string
+	TargetID    string
+	CallerID    string
+	Query       string
+	Limit       int
+}
+
+type addChannelMembersCall struct {
+	WorkspaceID string
+	ChannelID   string
+	CallerID    string
+	UserIDs     []string
 }
 
 // memberProfileCall records what the service asked the store for, so a test can
@@ -388,6 +413,93 @@ func (f *fakeMemberStore) AddChannelMember(_ context.Context, channelID, userID 
 	m := domain.ChannelMember{ChannelID: channelID, UserID: userID, Role: role, JoinedAt: time.Now()}
 	f.channelMembers[key] = m
 	return m, nil
+}
+
+// AddChannelMembers models the real statement's two properties that matter to
+// the service: it is all-or-nothing, and an already-present member is counted
+// rather than treated as an error.
+//
+// Eligibility mirrors what the SQL join enforces — an active workspace
+// membership whose account is not in ineligibleAccounts — so a service test can
+// exercise the "one user is not eligible, nothing is written" path without a
+// database. addCMsErr lets a test force a storage failure instead.
+func (f *fakeMemberStore) AddChannelMembers(
+	_ context.Context, workspaceID, channelID, callerID string, userIDs []string,
+) (storage.AddMembersResult, error) {
+	f.addChannelMembersCalls = append(f.addChannelMembersCalls, addChannelMembersCall{
+		WorkspaceID: workspaceID, ChannelID: channelID, CallerID: callerID,
+		UserIDs: append([]string(nil), userIDs...),
+	})
+	if f.addCMsErr != nil {
+		return storage.AddMembersResult{}, f.addCMsErr
+	}
+	// Models the transactional re-check the real store performs: the actor must
+	// still be an active owner/admin at write time, so a test that revokes the
+	// role between the service check and here sees the write refused.
+	actor, ok := f.workspaceMembers[wmKey(workspaceID, callerID)]
+	if !ok || actor.Status != domain.MemberStatusActive ||
+		(actor.Role != domain.WorkspaceRoleOwner && actor.Role != domain.WorkspaceRoleAdmin) {
+		return storage.AddMembersResult{}, domain.ErrForbidden
+	}
+	for _, userID := range userIDs {
+		member, ok := f.workspaceMembers[wmKey(workspaceID, userID)]
+		if !ok || member.Status != domain.MemberStatusActive {
+			return storage.AddMembersResult{}, domain.ErrForbidden
+		}
+		if _, blocked := f.ineligibleAccounts[userID]; blocked {
+			return storage.AddMembersResult{}, domain.ErrForbidden
+		}
+	}
+	// Mirrors the real store's RETURNING: only rows the insert actually created.
+	addedUserIDs := make([]string, 0, len(userIDs))
+	for _, userID := range userIDs {
+		key := cmKey(channelID, userID)
+		if _, exists := f.channelMembers[key]; exists {
+			continue
+		}
+		f.channelMembers[key] = domain.ChannelMember{
+			ChannelID: channelID, UserID: userID,
+			Role: domain.ChannelRoleMember, JoinedAt: time.Now(),
+		}
+		addedUserIDs = append(addedUserIDs, userID)
+	}
+	added := len(addedUserIDs)
+	total := 0
+	for key := range f.channelMembers {
+		if strings.HasPrefix(key, channelID+":") {
+			total++
+		}
+	}
+	return storage.AddMembersResult{
+		Added: added, AlreadyMembers: len(userIDs) - added, TotalCount: total,
+		AddedUserIDs: addedUserIDs,
+	}, nil
+}
+
+// SearchChannelMemberCandidates models the store's NOT EXISTS: current members
+// of the channel are excluded by the query, so a service test can prove the
+// picker no longer depends on the panel's preview.
+func (f *fakeMemberStore) SearchChannelMemberCandidates(
+	_ context.Context, workspaceID, channelID, callerID, prefix string, limit int,
+) ([]domain.DMCandidate, error) {
+	f.candidateCalls = append(f.candidateCalls, candidateSearchCall{
+		WorkspaceID: workspaceID, TargetID: channelID, CallerID: callerID,
+		Query: prefix, Limit: limit,
+	})
+	if f.candidateErr != nil {
+		return nil, f.candidateErr
+	}
+	results := make([]domain.DMCandidate, 0, len(f.dmCandidates))
+	for _, candidate := range f.dmCandidates {
+		if _, member := f.channelMembers[cmKey(channelID, candidate.UserID)]; member {
+			continue
+		}
+		if candidate.UserID == callerID {
+			continue
+		}
+		results = append(results, candidate)
+	}
+	return results, nil
 }
 
 func (f *fakeMemberStore) GetChannelMember(_ context.Context, channelID, userID string) (domain.ChannelMember, error) {

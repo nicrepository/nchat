@@ -114,6 +114,31 @@ func TestDMHandler_GroupDetails_ReturnsTheGroupAndItsParticipants(t *testing.T) 
 	}
 }
 
+// can_manage_members (issue #398) is always serialized, so a client that
+// predates the field reads absent-as-false and hides the add action.
+func TestDMHandler_GroupDetails_SerializesTheAddParticipantsPermission(t *testing.T) {
+	for name, canManage := range map[string]bool{"permitted": true, "refused": false} {
+		t.Run(name, func(t *testing.T) {
+			provider := &fakeDMProvider{groupDetails: service.GroupDetails{
+				Conversation:     groupConversation(),
+				ParticipantCount: 1,
+				CanManageMembers: canManage,
+			}}
+
+			rec := serveGroupDetails(t, groupDetailsHandler(provider), testConversationID)
+
+			data := detailsData(t, rec)
+			got, present := data["can_manage_members"].(bool)
+			if !present {
+				t.Fatalf("can_manage_members absent from the payload: %v", data)
+			}
+			if got != canManage {
+				t.Fatalf("can_manage_members = %v, want %v", got, canManage)
+			}
+		})
+	}
+}
+
 func TestDMHandler_GroupDetails_OmitsPresenceWhenNotTracked(t *testing.T) {
 	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
 		Conversation:     groupConversation(),

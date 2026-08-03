@@ -13,13 +13,20 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 type dmProvider interface {
 	SearchDMCandidates(ctx context.Context, input service.SearchDMCandidatesInput) ([]domain.DMCandidate, error)
 	GetOrCreateDirectConversation(ctx context.Context, input service.CreateDirectConversationInput) (service.CreateDirectConversationOutput, error)
 	CreateGroupConversation(ctx context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error)
+	// AddGroupParticipants adds people to an existing group conversation (#398).
+	AddGroupParticipants(ctx context.Context, input service.AddGroupParticipantsInput) (storage.AddMembersResult, error)
+	// GetGroupDetails is the read-only projection the group panel renders.
 	GetGroupDetails(ctx context.Context, input service.GroupDetailsInput) (service.GroupDetails, error)
+	// SearchGroupParticipantCandidates lists people not already in the group.
+	SearchGroupParticipantCandidates(ctx context.Context, input service.SearchGroupParticipantCandidatesInput) ([]domain.DMCandidate, error)
+	// GetDirectProfile is the 1:1 profile projection (issue #443).
 	GetDirectProfile(ctx context.Context, input service.DirectProfileInput) (service.DirectProfile, error)
 }
 
@@ -43,6 +50,7 @@ type DMHandler struct {
 	workspaces workspaceResolver
 	dms        dmProvider
 	limiter    dmRateLimiter
+	broadcast  membersBroadcaster
 	presence   presenceLookup
 }
 
@@ -63,6 +71,17 @@ func (h *DMHandler) WithPresence(presence presenceLookup) *DMHandler {
 	}
 	next := *h
 	next.presence = presence
+	return &next
+}
+
+// WithMembersBroadcast returns a handler that emits the post-commit members.added
+// signal (issue #398). Wired after the hub exists, like the channel handler's.
+func (h *DMHandler) WithMembersBroadcast(broadcast membersBroadcaster) *DMHandler {
+	if h == nil {
+		return nil
+	}
+	next := *h
+	next.broadcast = broadcast
 	return &next
 }
 
@@ -133,6 +152,11 @@ type groupDetailsResponse struct {
 	CreatedAt        string                 `json:"created_at"`
 	ParticipantCount int                    `json:"participant_count"`
 	Participants     []groupParticipantJSON `json:"participants"`
+	// CanManageMembers (issue #398) is always sent, so a client that predates it
+	// reads absent-as-false and hides the add action — the safe direction. It is
+	// a rendering hint: POST .../members re-derives the decision in its own
+	// transaction.
+	CanManageMembers bool `json:"can_manage_members"`
 }
 
 // GroupDetails handles GET /api/chat/dm/{conversationID}/details.
@@ -206,6 +230,7 @@ func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDe
 		CreatedAt:        details.Conversation.CreatedAt.UTC().Format(time.RFC3339),
 		ParticipantCount: details.ParticipantCount,
 		Participants:     participants,
+		CanManageMembers: details.CanManageMembers,
 	}
 }
 
@@ -358,7 +383,7 @@ func (h *DMHandler) SearchCandidates(w http.ResponseWriter, r *http.Request) {
 		writeUnauthorized(w)
 		return
 	}
-	if !h.allowAction(w, r, callerID, "dm_search", dmCandidateSearchRateLimit) {
+	if !h.allowAction(w, r, callerID, dmCandidateSearchAction, dmCandidateSearchRateLimit) {
 		return
 	}
 	limit, ok := parseDMCandidateLimit(w, r)
@@ -379,13 +404,7 @@ func (h *DMHandler) SearchCandidates(w http.ResponseWriter, r *http.Request) {
 		writeDMCandidateError(w, err)
 		return
 	}
-	response := searchDMCandidatesResponse{Candidates: make([]dmCandidateJSON, 0, len(candidates))}
-	for _, candidate := range candidates {
-		response.Candidates = append(response.Candidates, dmCandidateJSON{
-			UserID: candidate.UserID, DisplayName: candidate.DisplayName,
-		})
-	}
-	httputil.WriteJSON(w, http.StatusOK, response)
+	writeCandidates(w, candidates)
 }
 
 func (h *DMHandler) GetOrCreateDirect(w http.ResponseWriter, r *http.Request) {
@@ -471,6 +490,146 @@ func (h *DMHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httputil.WriteJSON(w, http.StatusCreated, createGroupDMResponse{ConversationID: conversation.ID})
+}
+
+// AddParticipants handles POST /api/chat/dm/{conversationID}/members.
+//
+// The mirror of the channel route, and deliberately a separate one: a group is a
+// chat.dm_conversations row, so pointing a conversation ID at /channels/… would
+// name the wrong aggregate. It shares the add-members rate-limit budget with the
+// channel route, so a caller cannot get a second allowance by switching
+// conversation type.
+//
+// Everything that decides the outcome is in DMService: whether the caller
+// participates, whether the conversation is a group rather than a 1:1, who is
+// eligible, the batch cap and the participant ceiling. A 1:1 conversation is
+// answered 404 here even when the caller is in it — adding a third person would
+// convert it into a group, which this issue does not do.
+func (h *DMHandler) AddParticipants(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	if !h.allowAction(w, r, callerID, addMembersAction, addMembersRateLimit) {
+		return
+	}
+	if !requireJSONContentType(w, r) {
+		return
+	}
+	var request addMembersRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	result, err := h.dms.AddGroupParticipants(r.Context(), service.AddGroupParticipantsInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+		UserIDs:        request.UserIDs,
+	})
+	if err != nil {
+		writeAddMembersError(w, err)
+		return
+	}
+	// Only after the service returned successfully, which means the transaction
+	// committed. A rolled-back add broadcasts nothing.
+	//
+	// Gated on the ID list rather than on Added: both come from the same
+	// RETURNING and cannot disagree, but the list is the one the fan-out below
+	// actually addresses, so reading the gate from it leaves no way for a future
+	// change to publish to nobody.
+	if h.broadcast != nil && len(result.AddedUserIDs) > 0 {
+		h.broadcast.PublishMembersAdded(
+			r.Context(), workspaceID, "dm", conversationID, callerID, result.Added, result.TotalCount,
+		)
+		h.broadcast.PublishConversationAvailable(
+			r.Context(), workspaceID, "dm", conversationID, result.AddedUserIDs,
+		)
+	}
+	httputil.WriteJSON(w, http.StatusOK, addMembersResponse{
+		Added:          result.Added,
+		AlreadyMembers: result.AlreadyMembers,
+		MemberCount:    result.TotalCount,
+	})
+}
+
+// dmCandidateSearchAction is the shared limiter namespace for every candidate
+// search — workspace-wide and both contextual ones. One budget, so a caller
+// cannot enumerate faster by alternating routes.
+const dmCandidateSearchAction = "dm_search"
+
+// writeCandidates serialises a candidate list. The two fields are what the
+// picker renders; e-mail, role and membership state are never included.
+func writeCandidates(w http.ResponseWriter, candidates []domain.DMCandidate) {
+	response := searchDMCandidatesResponse{Candidates: make([]dmCandidateJSON, 0, len(candidates))}
+	for _, candidate := range candidates {
+		response.Candidates = append(response.Candidates, dmCandidateJSON{
+			UserID: candidate.UserID, DisplayName: candidate.DisplayName,
+		})
+	}
+	httputil.WriteJSON(w, http.StatusOK, response)
+}
+
+// parseCandidateLimit reads the optional limit, rejecting anything that is not a
+// positive integer. The service clamps it to the server maximum; the client
+// never chooses the ceiling.
+func parseCandidateLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
+	return parseDMCandidateLimit(w, r)
+}
+
+// ParticipantCandidates handles GET /api/chat/dm/{conversationID}/member-candidates.
+//
+// The group counterpart of the channel route. Participation authorises it, so a
+// caller who is not in the group cannot learn who is — and a 1:1 is answered
+// 404, since it has no add-participants flow at all.
+func (h *DMHandler) ParticipantCandidates(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	if !h.allowAction(w, r, callerID, dmCandidateSearchAction, dmCandidateSearchRateLimit) {
+		return
+	}
+	limit, ok := parseCandidateLimit(w, r)
+	if !ok {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	candidates, err := h.dms.SearchGroupParticipantCandidates(
+		r.Context(), service.SearchGroupParticipantCandidatesInput{
+			WorkspaceID:    workspaceID,
+			CallerID:       callerID,
+			ConversationID: conversationID,
+			Query:          r.URL.Query().Get("query"),
+			Limit:          limit,
+		})
+	if err != nil {
+		writeCandidateSearchError(w, err)
+		return
+	}
+	writeCandidates(w, candidates)
 }
 
 func requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {

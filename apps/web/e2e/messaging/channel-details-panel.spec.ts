@@ -104,12 +104,17 @@ test.describe("painel de detalhes do canal", () => {
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("relatorio-backup.pdf"),
     ).toBeVisible();
 
-    // Ações ainda sem fluxo: visíveis, desabilitadas, sem simular sucesso.
-    // Indisponível pela semântica: o botão continua alcançável por teclado para
-    // que o motivo descrito por aria-describedby possa ser anunciado.
-    const addMembers = panel.getByRole("button", { name: /Adicionar membros/ });
-    await expect(addMembers).toHaveAttribute("aria-disabled", "true");
-    expect(await addMembers.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
+    // "Ver todos" continua sem fluxo: visível, indisponível pela semântica, sem
+    // simular sucesso. O botão segue alcançável por teclado para que o motivo
+    // descrito por aria-describedby possa ser anunciado.
+    const seeAll = panel.getByRole("button", { name: "Ver todos" }).first();
+    await expect(seeAll).toHaveAttribute("aria-disabled", "true");
+    expect(await seeAll.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
+
+    // "Adicionar membros" deixou de ser um placeholder (issue #398): virou fluxo
+    // real, e este cenário não concede a permissão, então a ação fica ausente —
+    // o padrão seguro. O fluxo em si é coberto por add-members.spec.ts.
+    await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
 
     // ── 3. a rota não mudou e o compositor segue utilizável ──────────────
     expect(new URL(page.url()).pathname).toBe(routeBeforeOpening);

@@ -209,8 +209,12 @@ interface DetailsToggleProps {
  *
  * A real <button>, so it is reachable and operable by keyboard for free.
  * aria-expanded carries the state and aria-controls points at the panel, which
- * is why the panel needs a stable id rather than a generated one. The ref is
+ * is why each panel needs a stable id rather than a generated one. The ref is
  * what lets the panel hand focus back here when it closes itself.
+ *
+ * The two variants differ only in their accessible name and the id they point
+ * at — the affordance, the icon and the keyboard behaviour are identical, so
+ * one component with a discriminator beats two that would drift apart.
  */
 const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function DetailsToggle(
   { open, label, onToggle },
@@ -937,6 +941,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // sidebar payload, never the participant count or the conversation's name: a
   // group that happens to have two people is still a group, and a 1:1 DM whose
   // title looks like a group's is still a 1:1.
+  //
+  // The same discriminant decides whether the panel offers "Adicionar membros"
+  // (issue #398): a channel and a group do, a 1:1 does not — adding a third
+  // person would convert a direct conversation into a group, which that issue
+  // deliberately does not do.
   const detailsKind: "channel" | "group" | "direct" | null =
     targetId === ""
       ? null
@@ -953,6 +962,12 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [detailsKind, detailsOpen, targetId],
   );
   const detailsState = useConversationDetails(detailsTarget);
+
+  // members.added names nobody, so the only correct response is to refetch the
+  // open panel (issue #398) — and it is the same call the local add makes, so
+  // the HTTP response and the event converge on one view of the roster instead
+  // of two. A closed panel has no target and so refetches nothing.
+  const reloadOpenDetails = detailsState.reload;
 
   const closeDetails = useCallback(() => {
     setDetailsOpen(false);
@@ -981,6 +996,14 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
+    // Someone added participants to the open conversation (issue #398). The
+    // event names nobody, so the only correct response is to refetch — which is
+    // also the same call the local add makes, so the two converge instead of
+    // producing two different views of the roster.
+    //
+    // Passed directly: useMessages holds this callback in a ref, so a new
+    // identity each render does not restart the socket or its subscriptions.
+    onMembersAdded: reloadOpenDetails,
     onMessageRemoved: reloadPins,
   });
 

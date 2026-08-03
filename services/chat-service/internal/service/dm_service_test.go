@@ -786,6 +786,23 @@ type fakeDMStore struct {
 	createGroupCalls  int
 	listVisibleCalls  int
 	getVisibleCalls   int
+
+	groupCandidates       []domain.DMCandidate
+	groupCandidatesErr    error
+	candidateCalls        []groupCandidateCall
+	addParticipantsResult storage.AddMembersResult
+	addParticipantsErr    error
+	addParticipantsCalls  int
+	lastAddParticipants   storage.AddGroupParticipantsInput
+}
+
+// groupCandidateCall records the scope the service handed the store.
+type groupCandidateCall struct {
+	WorkspaceID    string
+	ConversationID string
+	CallerID       string
+	Query          string
+	Limit          int
 }
 
 func (f *fakeDMStore) CreateDirectConversation(_ context.Context, input storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
@@ -798,6 +815,22 @@ func (f *fakeDMStore) CreateGroupConversation(_ context.Context, input storage.C
 	f.createGroupCalls++
 	f.lastGroupInput = input
 	return f.createdConversation, f.createGroupErr
+}
+
+func (f *fakeDMStore) SearchGroupParticipantCandidates(
+	_ context.Context, workspaceID, conversationID, callerID, prefix string, limit int,
+) ([]domain.DMCandidate, error) {
+	f.candidateCalls = append(f.candidateCalls, groupCandidateCall{
+		WorkspaceID: workspaceID, ConversationID: conversationID, CallerID: callerID,
+		Query: prefix, Limit: limit,
+	})
+	return f.groupCandidates, f.groupCandidatesErr
+}
+
+func (f *fakeDMStore) AddGroupParticipants(_ context.Context, input storage.AddGroupParticipantsInput) (storage.AddMembersResult, error) {
+	f.addParticipantsCalls++
+	f.lastAddParticipants = input
+	return f.addParticipantsResult, f.addParticipantsErr
 }
 
 func (f *fakeDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ string) ([]domain.DMConversation, error) {

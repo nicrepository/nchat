@@ -146,6 +146,61 @@ export function useChatSidebar() {
     return load();
   }, [load]);
 
+  /**
+   * Refetches the sidebar in place after a membership change (issue #398).
+   *
+   * Distinct from `load`, which resets to the loading state: that is right for
+   * a first mount and wrong here, because blanking a populated sidebar to add
+   * one conversation loses the rendered list, the unread counts and the
+   * selection for a frame. This replaces the data when it arrives instead.
+   *
+   * `fetchSidebarData` is the authoritative source and re-derives membership
+   * server-side, so the event is only a hint: a signal for a conversation the
+   * user cannot actually read adds nothing.
+   *
+   * Coalescing: a burst (two people added in quick succession, or several
+   * sessions of the same user) must not start several overlapping refetches. A
+   * request already in flight sets a "do it again when done" flag rather than
+   * starting a second one, so no event is lost and at most two run in sequence.
+   */
+  const refreshInFlight = useRef(false);
+  const refreshQueued = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const refreshSidebar = useCallback(() => {
+    if (refreshInFlight.current) {
+      refreshQueued.current = true;
+      return;
+    }
+    refreshInFlight.current = true;
+    const run = () => {
+      fetchSidebarData()
+        .then(({ currentUserId, channels, dms }) => {
+          if (mountedRef.current) dispatch({ type: "loaded", currentUserId, channels, dms });
+        })
+        .catch(() => {
+          // The sidebar on screen stays valid; the next event or navigation
+          // retries. Deliberately no error state and no retry loop — a failed
+          // hint must not blank a working sidebar.
+        })
+        .finally(() => {
+          if (refreshQueued.current && mountedRef.current) {
+            refreshQueued.current = false;
+            run();
+            return;
+          }
+          refreshInFlight.current = false;
+        });
+    };
+    run();
+  }, []);
+
   const realtimeTargets: WSSubscriptionTarget[] =
     state.status === "ready"
       ? [
@@ -159,6 +214,9 @@ export function useChatSidebar() {
     kind: primaryTarget?.kind ?? "channel",
     targetId: primaryTarget?.targetId ?? "",
     additionalTargets: realtimeTargets.slice(1),
+    // A conversation the user was just added to. They are not subscribed to it,
+    // so this is the only way they hear about it before a reload.
+    onConversationAvailable: refreshSidebar,
     onMessageCreated: (event: WSMessageCreatedEvent) => {
       if (seenRealtimeMessageIds.current.has(event.message_id)) return;
       seenRealtimeMessageIds.current.add(event.message_id);

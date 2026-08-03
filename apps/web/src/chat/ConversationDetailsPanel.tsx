@@ -33,11 +33,13 @@
  * message list, the composer or the WebSocket subscription.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import "./ConversationDetailsPanel.css";
+import AddMembersDialog from "./AddMembersDialog";
 import RichTextRenderer from "./RichTextRenderer";
 import type {
+  AddMembersResult,
   ChannelAttachment,
   ChannelDetails,
   ChannelMemberProfile,
@@ -495,20 +497,35 @@ const panelHeader = {
   direct: { title: "Perfil", closeLabel: "Fechar perfil" },
 } as const;
 
-/** Per-conversation wording, in one table so a missing case is a type error. */
+/**
+ * Per-conversation wording, in one table so a missing case is a type error.
+ *
+ * `peopleUnavailable` is now about the *full list* only. Adding people is a real
+ * flow (issue #398), so the sentence that used to say member management was
+ * unavailable would be false; what remains unavailable is "Ver todos", which is
+ * the one control still pointing at this note as its reason.
+ */
 const conversationCopy = {
   channel: {
     peopleHeading: "Membros online",
-    peopleUnavailable: "A gestão de membros do canal ainda não está disponível nesta versão.",
+    peopleUnavailable:
+      "A lista completa de membros do canal ainda não está disponível nesta versão.",
     addAction: "Adicionar membros",
+    addedNone: "Todas as pessoas selecionadas já participam deste canal.",
+    addedOne: "1 pessoa adicionada ao canal.",
+    addedMany: (count: number) => `${count} pessoas adicionadas ao canal.`,
     pinEmpty: "Nenhuma mensagem fixada neste canal.",
     filesEmpty: "Nenhum arquivo enviado neste canal.",
     filesUnavailable: "A central de arquivos do canal ainda não está disponível nesta versão.",
   },
   group: {
     peopleHeading: "Participantes",
-    peopleUnavailable: "A gestão de participantes do grupo ainda não está disponível nesta versão.",
+    peopleUnavailable:
+      "A lista completa de participantes do grupo ainda não está disponível nesta versão.",
     addAction: "Adicionar participantes",
+    addedNone: "Todas as pessoas selecionadas já participam deste grupo.",
+    addedOne: "1 pessoa adicionada ao grupo.",
+    addedMany: (count: number) => `${count} pessoas adicionadas ao grupo.`,
     pinEmpty: "Nenhuma mensagem fixada neste grupo.",
     filesEmpty: "Nenhum arquivo enviado neste grupo.",
     filesUnavailable: "A central de arquivos do grupo ainda não está disponível nesta versão.",
@@ -552,12 +569,14 @@ function ConversationBody({
   files,
   currentUserId,
   latestPin,
+  reload,
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
   files: ConversationDetailsState["files"];
   currentUserId: string;
   latestPin: PinnedItem | null;
+  reload: () => void;
 }) {
   const copy = conversationCopy[kind];
   // `kind` is the conversation the user is looking at *now*; the loaded data
@@ -572,6 +591,60 @@ function ConversationBody({
     rawDetails.status === "ready" && rawDetails.data.kind !== kind
       ? { status: "loading" }
       : rawDetails;
+
+  // ── Add members (issue #398) ─────────────────────────────────────────────
+  //
+  // The conversation currently described, or "" while loading. Both the picker
+  // and the notice are keyed on it rather than on a boolean, which is what makes
+  // confirming into the wrong conversation unrepresentable: the panel is
+  // deliberately not remounted on a target switch, so a boolean would survive
+  // one and let a dialog opened for A post its selection to B.
+  const targetId =
+    details.status === "ready" && details.data.kind !== "direct" ? details.data.id : "";
+  const canManageMembers =
+    details.status === "ready" && details.data.kind !== "direct" && details.data.canManageMembers;
+
+  const addMembersButtonRef = useRef<HTMLButtonElement>(null);
+  const [pickerFor, setPickerFor] = useState<string | null>(null);
+  const [addedNotice, setAddedNotice] = useState<{ targetId: string; text: string } | null>(null);
+
+  // Open only while the conversation it was opened for is still on screen. The
+  // comparison closes it during render — the dialog unmounts, its
+  // AbortController cancels any in-flight search or submit, and the selection
+  // goes with it. One structural mechanism, no effect.
+  const pickerOpen = pickerFor !== null && pickerFor === targetId && targetId !== "";
+
+  const closePicker = useCallback(() => {
+    setPickerFor(null);
+    // The button is only rendered while the caller may manage members, so the
+    // ref can be detached by the time this runs (a refetch that revoked the
+    // permission). Focusing a detached node would drop focus to <body>.
+    addMembersButtonRef.current?.focus();
+  }, []);
+
+  const handleAdded = useCallback(
+    (result: AddMembersResult) => {
+      closePicker();
+      // The server's own numbers, never a local increment: someone else may have
+      // added people between the search and this response.
+      setAddedNotice({
+        targetId,
+        text:
+          result.added === 0
+            ? copy.addedNone
+            : result.added === 1
+              ? copy.addedOne
+              : copy.addedMany(result.added),
+      });
+      // The single reconciliation path: the response is not merged into the
+      // rendered list, the panel refetches. So the roster and both counters come
+      // from one authority, and a concurrent members.added refetching too cannot
+      // double-count anything.
+      reload();
+    },
+    [closePicker, copy, reload, targetId],
+  );
+
   return (
     <>
       {/* ── Sobre ─────────────────────────────────────────────────────── */}
@@ -644,16 +717,58 @@ function ConversationBody({
           ) : details.data.kind === "group" ? (
             <GroupParticipantsSection details={details.data} currentUserId={currentUserId} />
           ) : null)}
-        <UnavailableAction
-          label={copy.addAction}
-          icon="person_add"
-          reasonId="chat-details-people-unavailable"
-          className="chat-details__wide-action"
-        />
+        {/*
+          Rendered only once the server has answered and said this caller may
+          manage members (issue #398). Loading, error and "not permitted" all
+          leave it absent — the safe default, since canManageMembers is false
+          unless the server sent exactly true. Hiding it is not the security
+          boundary: POST .../members re-derives the decision from the session on
+          every call.
+        */}
+        {canManageMembers && (
+          <button
+            ref={addMembersButtonRef}
+            type="button"
+            className="chat-details__wide-action"
+            onClick={() => setPickerFor(targetId)}
+            data-testid="chat-details-add-members"
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              person_add
+            </span>
+            {copy.addAction}
+          </button>
+        )}
+        {addedNotice?.targetId === targetId && (
+          // Announced rather than shown as a transient toast: the panel above
+          // has already been refetched, and this says what changed.
+          <p className="chat-details__note" role="status">
+            {addedNotice.text}
+          </p>
+        )}
         <p id="chat-details-people-unavailable" className="chat-details__note">
           {copy.peopleUnavailable}
         </p>
       </section>
+
+      {pickerOpen && (
+        <AddMembersDialog
+          target={
+            kind === "channel"
+              ? { kind: "channel", channelId: targetId }
+              : { kind: "group", conversationId: targetId }
+          }
+          /*
+            Only the viewer. Current members are excluded by the search endpoint
+            itself, in SQL — this list deliberately does not carry the rendered
+            roster, because both sections are capped previews and passing them
+            made members they could not show appear as selectable.
+          */
+          excludedUserIds={currentUserId ? [currentUserId] : []}
+          onClose={closePicker}
+          onAdded={handleAdded}
+        />
+      )}
 
       {/* ── Mensagem fixada ───────────────────────────────────────────── */}
       <section className="chat-details__section" aria-labelledby="chat-details-pin">
@@ -826,6 +941,7 @@ export default function ConversationDetailsPanel({
             files={files}
             currentUserId={currentUserId}
             latestPin={latestPin}
+            reload={state.reload}
           />
         )}
       </div>

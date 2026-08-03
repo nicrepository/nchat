@@ -1,6 +1,27 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// The panel itself calls no API; AddMembersDialog does (issue #398), and these
+// stubs are what let the add flow be exercised through the real dialog.
+const {
+  searchChannelMemberCandidates,
+  searchGroupParticipantCandidates,
+  addChannelMembers,
+  addGroupParticipants,
+} = vi.hoisted(() => ({
+  searchChannelMemberCandidates: vi.fn(),
+  searchGroupParticipantCandidates: vi.fn(),
+  addChannelMembers: vi.fn(),
+  addGroupParticipants: vi.fn(),
+}));
+
+vi.mock("./chatApi", () => ({
+  searchChannelMemberCandidates,
+  searchGroupParticipantCandidates,
+  addChannelMembers,
+  addGroupParticipants,
+}));
 
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type {
@@ -34,6 +55,9 @@ function channelDetails(
     memberCount: 12,
     onlineCount: 0,
     onlineMembers: [],
+    // Off unless a case turns it on: the add action is absent by default, which
+    // is what the server's own strict `=== true` normalization produces.
+    canManageMembers: false,
     ...overrides,
   };
 }
@@ -42,6 +66,7 @@ function state(overrides: Partial<ConversationDetailsState> = {}): ConversationD
   return {
     details: { status: "ready", data: channelDetails() },
     files: { status: "ready", data: [] },
+    reload: vi.fn(),
     ...overrides,
   };
 }
@@ -372,12 +397,13 @@ describe("ConversationDetailsPanel — canal: membros", () => {
 });
 
 describe("ConversationDetailsPanel — canal: ações indisponíveis", () => {
-  it("offers the member actions as reachable controls that state their reason", async () => {
+  it("offers the still-unimplemented actions as reachable controls that state their reason", async () => {
     renderPanel();
 
+    // "Ver todos" is what remains unavailable; adding members is a real flow
+    // (issue #398) and is asserted separately below.
     const seeAll = screen.getAllByRole("button", { name: "Ver todos" });
-    const addMembers = screen.getByRole("button", { name: /Adicionar membros/ });
-    for (const button of [...seeAll, addMembers]) {
+    for (const button of seeAll) {
       // aria-disabled, never the HTML attribute: `disabled` would drop the
       // control out of the tab order and take the announced reason with it.
       expect(button).not.toBeDisabled();
@@ -386,22 +412,16 @@ describe("ConversationDetailsPanel — canal: ações indisponíveis", () => {
     }
     // Each "Ver todos" is described by its own section's reason, not a shared one.
     expect(seeAll[0]).toHaveAccessibleDescription(
-      "A gestão de membros do canal ainda não está disponível nesta versão.",
+      "A lista completa de membros do canal ainda não está disponível nesta versão.",
     );
     expect(seeAll[1]).toHaveAccessibleDescription(
       "A central de arquivos do canal ainda não está disponível nesta versão.",
     );
-    expect(addMembers).toHaveAccessibleDescription(
-      "A gestão de membros do canal ainda não está disponível nesta versão.",
-    );
 
     // Activating an unavailable control changes nothing and, above all, never
     // reports a success that did not happen.
-    await userEvent.click(addMembers);
+    await userEvent.click(seeAll[0]);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("A gestão de membros do canal ainda não está disponível nesta versão."),
-    ).toBeInTheDocument();
   });
 
   it("keeps the unavailable actions in the keyboard tab order", async () => {
@@ -410,10 +430,10 @@ describe("ConversationDetailsPanel — canal: ações indisponíveis", () => {
     // The panel puts focus on its close button on open; from there the tab
     // order must actually reach the unavailable actions.
     expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
-    const addMembers = screen.getByRole("button", { name: /Adicionar membros/ });
-    await tabUntilFocused(addMembers);
+    const seeAll = screen.getAllByRole("button", { name: "Ver todos" })[0];
+    await tabUntilFocused(seeAll);
 
-    expect(addMembers).toHaveFocus();
+    expect(seeAll).toHaveFocus();
   });
 });
 
@@ -582,22 +602,31 @@ function groupDetails(overrides: Partial<GroupDetails> = {}): { kind: "group" } 
     createdAt: "2024-03-04T15:00:00.000Z",
     participantCount: 4,
     participants: [],
+    canManageMembers: false,
     ...overrides,
   };
 }
 
-function renderGroupPanel(details: { kind: "group" } & GroupDetails, viewerId = currentUserId) {
+function renderGroupPanel(
+  details: { kind: "group" } & GroupDetails,
+  viewerId = currentUserId,
+  reload: () => void = vi.fn(),
+) {
   const onClose = vi.fn();
   const rendered = render(
     <ConversationDetailsPanel
       kind="group"
-      state={{ details: { status: "ready", data: details }, files: { status: "ready", data: [] } }}
+      state={{
+        details: { status: "ready", data: details },
+        files: { status: "ready", data: [] },
+        reload,
+      }}
       currentUserId={viewerId}
       latestPin={null}
       onClose={onClose}
     />,
   );
-  return { onClose, ...rendered };
+  return { onClose, reload, ...rendered };
 }
 
 describe("ConversationDetailsPanel — grupo", () => {
@@ -728,30 +757,25 @@ describe("ConversationDetailsPanel — grupo", () => {
     );
   });
 
-  it("offers the participant actions as explicitly unavailable", async () => {
+  it("states the group reason for the action that is still unavailable", async () => {
     renderGroupPanel(groupDetails());
 
-    const addParticipants = screen.getByRole("button", { name: /Adicionar participantes/ });
-    expect(addParticipants).not.toBeDisabled();
-    expect(addParticipants).toHaveAttribute("aria-disabled", "true");
-    expect(addParticipants).toHaveAccessibleDescription(
-      "A gestão de participantes do grupo ainda não está disponível nesta versão.",
+    const seeAll = screen.getAllByRole("button", { name: "Ver todos" })[0];
+    expect(seeAll).not.toBeDisabled();
+    expect(seeAll).toHaveAttribute("aria-disabled", "true");
+    expect(seeAll).toHaveAccessibleDescription(
+      "A lista completa de participantes do grupo ainda não está disponível nesta versão.",
     );
 
-    await userEvent.click(addParticipants);
+    await userEvent.click(seeAll);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "A gestão de participantes do grupo ainda não está disponível nesta versão.",
-      ),
-    ).toBeInTheDocument();
   });
 
   it("shows group wording while loading and on error", () => {
     const { unmount } = render(
       <ConversationDetailsPanel
         kind="group"
-        state={{ details: { status: "loading" }, files: { status: "loading" } }}
+        state={{ details: { status: "loading" }, files: { status: "loading" }, reload: vi.fn() }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -764,7 +788,7 @@ describe("ConversationDetailsPanel — grupo", () => {
     render(
       <ConversationDetailsPanel
         kind="group"
-        state={{ details: { status: "error" }, files: { status: "error" } }}
+        state={{ details: { status: "error" }, files: { status: "error" }, reload: vi.fn() }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -796,7 +820,11 @@ function renderProfilePanel(details: { kind: "direct" } & DirectDetails = direct
   const rendered = render(
     <ConversationDetailsPanel
       kind="direct"
-      state={{ details: { status: "ready", data: details }, files: { status: "loading" } }}
+      state={{
+        details: { status: "ready", data: details },
+        files: { status: "loading" },
+        reload: vi.fn(),
+      }}
       currentUserId={currentUserId}
       latestPin={null}
       onClose={onClose}
@@ -1134,7 +1162,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
     render(
       <ConversationDetailsPanel
         kind="direct"
-        state={{ details: { status: "loading" }, files: { status: "loading" } }}
+        state={{ details: { status: "loading" }, files: { status: "loading" }, reload: vi.fn() }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1151,7 +1179,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
     render(
       <ConversationDetailsPanel
         kind="direct"
-        state={{ details: { status: "error" }, files: { status: "loading" } }}
+        state={{ details: { status: "error" }, files: { status: "loading" }, reload: vi.fn() }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1171,6 +1199,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
         state={{
           details: { status: "ready", data: groupDetails() },
           files: { status: "ready", data: [] },
+          reload: vi.fn(),
         }}
         currentUserId={currentUserId}
         latestPin={null}
@@ -1196,6 +1225,7 @@ describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
         state={{
           details: { status: "ready", data: channelDetails() },
           files: { status: "ready", data: [] },
+          reload: vi.fn(),
         }}
         currentUserId={currentUserId}
         latestPin={null}
@@ -1207,5 +1237,484 @@ describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
     expect(screen.queryByTestId("chat-details-profile-name")).not.toBeInTheDocument();
     expect(screen.queryByTestId("chat-details-profile-meta")).not.toBeInTheDocument();
     expect(screen.queryByText("Infraestrutura")).not.toBeInTheDocument();
+  });
+});
+
+// ── Adicionar membros (issue #398) ───────────────────────────────────────────
+//
+// Migrated from the deleted ChannelDetailsPanel and GroupDetailsPanel suites:
+// the flow now lives in the unified panel and must behave identically for both
+// vocabularies, and must not exist at all for a 1:1.
+
+function readyChannel(overrides: Partial<ChannelDetails> = {}, reload = vi.fn()) {
+  return {
+    details: {
+      status: "ready" as const,
+      data: channelDetails({ canManageMembers: true, ...overrides }),
+    },
+    files: { status: "ready" as const, data: [] },
+    reload,
+  };
+}
+
+function readyGroup(overrides: Partial<GroupDetails> = {}, reload = vi.fn()) {
+  return {
+    details: {
+      status: "ready" as const,
+      data: groupDetails({ canManageMembers: true, ...overrides }),
+    },
+    files: { status: "ready" as const, data: [] },
+    reload,
+  };
+}
+
+function renderChannelFor(state: ConversationDetailsState) {
+  return render(
+    <ConversationDetailsPanel
+      kind="channel"
+      state={state}
+      currentUserId={currentUserId}
+      latestPin={null}
+      onClose={vi.fn()}
+    />,
+  );
+}
+
+describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
+  // The action is server-gated. `canManageMembers` is normalized to false unless
+  // the server explicitly said true, so every state that is not "ready and
+  // permitted" must leave the control absent.
+  it("offers the action when the server says the caller may manage members", () => {
+    renderPanel({ state: state({ details: readyChannel().details }) });
+
+    expect(screen.getByTestId("chat-details-add-members")).toBeEnabled();
+    expect(screen.getByTestId("chat-details-add-members")).toHaveTextContent("Adicionar membros");
+  });
+
+  it.each([
+    ["public", "public" as const],
+    ["private", "private" as const],
+  ])("offers the action on a %s channel", (_label, type) => {
+    renderPanel({ state: state({ details: readyChannel({ type }).details }) });
+
+    expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
+  });
+
+  it("offers the action on a group, with the group's wording", () => {
+    renderGroupPanel(groupDetails({ canManageMembers: true }));
+
+    expect(screen.getByTestId("chat-details-add-members")).toHaveTextContent(
+      "Adicionar participantes",
+    );
+  });
+
+  it("hides the action when the caller may not manage members", () => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ canManageMembers: false }) },
+      }),
+    });
+    expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
+  });
+
+  it("hides the action on a group when the server withholds the permission", () => {
+    renderGroupPanel(groupDetails({ canManageMembers: false }));
+
+    expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
+  });
+
+  // Default-safe: an undefined permission must never render the action, or a
+  // rolling deploy would show a control every click of which is refused.
+  it.each([
+    ["loading", { status: "loading" } as const],
+    ["error", { status: "error" } as const],
+  ])("hides the action while the panel is %s", (_label, details) => {
+    renderPanel({ state: state({ details }) });
+
+    expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
+  });
+
+  // A 1:1 has no add action at all: a third person would convert the direct
+  // conversation into a group, which issue #398 deliberately does not do.
+  it("never offers the action on a 1:1 profile", () => {
+    render(
+      <ConversationDetailsPanel
+        kind="direct"
+        state={{
+          details: {
+            status: "ready",
+            data: {
+              kind: "direct",
+              conversationId: "dm-1",
+              profile: { userId: "user-other", displayName: "Juliane Lino" },
+            },
+          },
+          files: { status: "ready", data: [] },
+          reload: vi.fn(),
+        }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Adicionar/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — adicionar membros: fluxo", () => {
+  beforeEach(() => {
+    searchChannelMemberCandidates.mockResolvedValue([{ userId: "u-9", displayName: "Bruno Dias" }]);
+    searchGroupParticipantCandidates.mockResolvedValue([
+      { userId: "u-9", displayName: "Bruno Dias" },
+    ]);
+    addChannelMembers.mockResolvedValue({ added: 1, alreadyMembers: 0, memberCount: 5 });
+    addGroupParticipants.mockResolvedValue({ added: 1, alreadyMembers: 0, memberCount: 5 });
+  });
+
+  it("opens and closes the picker, returning focus to the action", async () => {
+    const user = userEvent.setup();
+    renderPanel({ state: state({ details: readyChannel().details }) });
+
+    const action = screen.getByTestId("chat-details-add-members");
+    await user.click(action);
+    expect(screen.getByRole("dialog", { name: "Adicionar membros" })).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(action).toHaveFocus();
+  });
+
+  it("posts a channel selection to the channel endpoint", async () => {
+    const user = userEvent.setup();
+    renderChannelFor(readyChannel({ id: "ch-77" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Adicionar" }));
+
+    await waitFor(() =>
+      expect(addChannelMembers).toHaveBeenCalledWith("ch-77", ["u-9"], expect.any(AbortSignal)),
+    );
+    // A channel flow must never reach the group endpoint.
+    expect(addGroupParticipants).not.toHaveBeenCalled();
+  });
+
+  it("posts a group selection to the group endpoint", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConversationDetailsPanel
+        kind="group"
+        state={readyGroup({ id: "dm-42" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Adicionar" }));
+
+    await waitFor(() =>
+      expect(addGroupParticipants).toHaveBeenCalledWith("dm-42", ["u-9"], expect.any(AbortSignal)),
+    );
+    expect(addChannelMembers).not.toHaveBeenCalled();
+  });
+
+  it("refetches after a successful add instead of merging the response", async () => {
+    const reload = vi.fn();
+    const user = userEvent.setup();
+    renderChannelFor(readyChannel({}, reload));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Adicionar" }));
+
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    expect(await screen.findByText("1 pessoa adicionada ao canal.")).toBeInTheDocument();
+  });
+
+  it("uses the group's wording in the success notice", async () => {
+    const reload = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <ConversationDetailsPanel
+        kind="group"
+        state={readyGroup({}, reload)}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Adicionar" }));
+
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    expect(await screen.findByText("1 pessoa adicionada ao grupo.")).toBeInTheDocument();
+  });
+
+  // added: 0 is a legitimate outcome — everyone picked was already in — and it
+  // must read as such rather than as a failure or a fresh success.
+  it("reports an add that changed nothing without claiming a success", async () => {
+    addChannelMembers.mockResolvedValue({ added: 0, alreadyMembers: 1, memberCount: 5 });
+    const user = userEvent.setup();
+    renderChannelFor(readyChannel());
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Adicionar" }));
+
+    expect(
+      await screen.findByText("Todas as pessoas selecionadas já participam deste canal."),
+    ).toBeInTheDocument();
+  });
+});
+
+// The corrected eligibility source (issue #398).
+describe("ConversationDetailsPanel — busca contextual de candidatos", () => {
+  it("searches through the channel-scoped endpoint", async () => {
+    searchChannelMemberCandidates.mockResolvedValue([{ userId: "u-9", displayName: "Bruno Dias" }]);
+    const user = userEvent.setup();
+    renderChannelFor(readyChannel({ id: "ch-77" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+
+    expect(await screen.findByRole("button", { name: /Bruno Dias/ })).toBeInTheDocument();
+    expect(searchChannelMemberCandidates).toHaveBeenCalledWith(
+      "ch-77",
+      "br",
+      expect.any(AbortSignal),
+    );
+    expect(searchGroupParticipantCandidates).not.toHaveBeenCalled();
+  });
+
+  it("searches through the group-scoped endpoint and filters the viewer locally", async () => {
+    searchGroupParticipantCandidates.mockResolvedValue([
+      { userId: currentUserId, displayName: "Eu Mesmo" },
+      { userId: "u-9", displayName: "Bruno Dias" },
+    ]);
+    const user = userEvent.setup();
+    render(
+      <ConversationDetailsPanel
+        kind="group"
+        state={readyGroup({ id: "dm-77" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "an");
+
+    expect(await within(dialog).findByRole("button", { name: /Bruno Dias/ })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /Eu Mesmo/ })).not.toBeInTheDocument();
+    expect(searchGroupParticipantCandidates).toHaveBeenCalledWith(
+      "dm-77",
+      "an",
+      expect.any(AbortSignal),
+    );
+  });
+
+  // The panel's rendered roster must not become the exclusion list: the channel
+  // list is presence-filtered and the group list is capped, so both are
+  // incomplete by construction and using them offered current members.
+  it("does not derive exclusions from the online-members preview", async () => {
+    searchChannelMemberCandidates.mockResolvedValue([
+      { userId: "online-member", displayName: "Ana Lima" },
+    ]);
+    const user = userEvent.setup();
+    renderChannelFor(
+      readyChannel({
+        onlineMembers: [
+          { userId: "online-member", displayName: "Ana Lima", role: "member", presence: "online" },
+        ],
+      }),
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "an");
+
+    // Whatever the endpoint returns is offered — the server decides membership,
+    // and in production it would not have returned a current member.
+    expect(await screen.findByRole("button", { name: /Ana Lima/ })).toBeInTheDocument();
+  });
+
+  it("does not derive exclusions from the participant preview", async () => {
+    searchGroupParticipantCandidates.mockResolvedValue([
+      { userId: "p-1", displayName: "Ana Lima" },
+    ]);
+    const user = userEvent.setup();
+    render(
+      <ConversationDetailsPanel
+        kind="group"
+        state={readyGroup({
+          participants: [{ userId: "p-1", displayName: "Ana Lima", presence: "online" }],
+        })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "an");
+
+    expect(await within(dialog).findByRole("button", { name: /Ana Lima/ })).toBeInTheDocument();
+  });
+});
+
+// The panel deliberately survives a target switch, so nothing unmounts the
+// dialog for us. These prove a selection made for conversation A can never be
+// confirmed into conversation B.
+describe("ConversationDetailsPanel — troca de conversa", () => {
+  beforeEach(() => {
+    searchChannelMemberCandidates.mockResolvedValue([{ userId: "u-9", displayName: "Bruno Dias" }]);
+    addChannelMembers.mockResolvedValue({ added: 1, alreadyMembers: 0, memberCount: 5 });
+  });
+
+  it("closes the picker and sends nothing when the channel changes mid-selection", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderChannelFor(readyChannel({ id: "ch-A" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    expect(within(dialog).getByRole("list", { name: "Pessoas selecionadas" })).toBeInTheDocument();
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={readyChannel({ id: "ch-B" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    // The decisive assertion: nothing was posted, to either channel.
+    expect(addChannelMembers).not.toHaveBeenCalled();
+  });
+
+  it("starts the picker empty after a channel switch", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderChannelFor(readyChannel({ id: "ch-A" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await screen.findByRole("button", { name: /Bruno Dias/ }));
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={readyChannel({ id: "ch-B" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByTestId("chat-details-add-members"));
+
+    const reopened = screen.getByRole("dialog", { name: "Adicionar membros" });
+    expect(
+      within(reopened).queryByRole("list", { name: "Pessoas selecionadas" }),
+    ).not.toBeInTheDocument();
+    expect(within(reopened).getByLabelText("Pesquisar pessoa")).toHaveValue("");
+    expect(within(reopened).getByRole("button", { name: "Adicionar" })).toBeDisabled();
+  });
+
+  it("closes the picker when the channel changes while a search is pending", async () => {
+    // A search that never settles: the switch must not wait for it, and its
+    // eventual resolution must not write into the new channel's dialog.
+    searchChannelMemberCandidates.mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+    const { rerender } = renderChannelFor(readyChannel({ id: "ch-A" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={readyChannel({ id: "ch-B" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    expect(addChannelMembers).not.toHaveBeenCalled();
+  });
+
+  it("closes the picker when the channel changes after a failed submit", async () => {
+    addChannelMembers.mockRejectedValue(new Error("boom"));
+    const user = userEvent.setup();
+    const { rerender } = renderChannelFor(readyChannel({ id: "ch-A" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await screen.findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(screen.getByRole("button", { name: "Adicionar" }));
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={readyChannel({ id: "ch-B" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    // Exactly the one failed attempt against channel A; nothing retried into B.
+    expect(addChannelMembers).toHaveBeenCalledTimes(1);
+    expect(addChannelMembers).toHaveBeenCalledWith("ch-A", ["u-9"], expect.any(AbortSignal));
+  });
+
+  // The panel stays mounted across a switch by design, so the notice must be
+  // cleared by identity rather than by unmount.
+  it("clears the added notice when the panel switches channel", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderChannelFor(readyChannel({ id: "ch-1" }));
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await screen.findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(screen.getByRole("button", { name: "Adicionar" }));
+    expect(await screen.findByText("1 pessoa adicionada ao canal.")).toBeInTheDocument();
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={readyChannel({ id: "ch-2" })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText(/pessoas? adicionada/)).not.toBeInTheDocument();
   });
 });

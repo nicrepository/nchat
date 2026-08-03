@@ -126,6 +126,7 @@ func New(cfg config.Config) (*App, error) {
 	var permissionSvc *service.PermissionService
 	var channelSvc *service.ChannelService
 	var channelCategorySvc *service.ChannelCategoryService
+	var memberSvc *service.MemberService
 	var callSvc *service.CallService
 
 	var closeDB func()
@@ -165,10 +166,11 @@ func New(cfg config.Config) (*App, error) {
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
-			mentionSvc = service.NewMentionService(
-				service.NewMemberService(memberStore, channelStore, workspaceStore),
-				permissionSvc,
-			)
+			// One MemberService instance for both consumers: mention autocomplete
+			// reads channel members through it, and issue #398 writes them. Two
+			// instances would only be two paths to the same stores.
+			memberSvc = service.NewMemberService(memberStore, channelStore, workspaceStore)
+			mentionSvc = service.NewMentionService(memberSvc, permissionSvc)
 		}
 	}
 
@@ -295,7 +297,16 @@ func New(cfg config.Config) (*App, error) {
 	// The group-details panel (issue #441) annotates participants with the same
 	// tracker. Unlike the channel panel it does not filter by presence, so this
 	// only decides what each row says about itself.
+	// Add members (issue #398) broadcasts over the same hub, wired after it
+	// exists. Both routes share one adapter so the channel and the group event
+	// travel the identical path.
+	if memberSvc != nil && channels != nil {
+		channels = channels.WithMembers(memberSvc, &hubBroadcaster{hub: hub})
+	}
 	if directMessages != nil {
+		directMessages = directMessages.WithMembersBroadcast(&hubBroadcaster{hub: hub})
+		// The details panel reports participant presence from the same tracker
+		// the hub feeds, exactly like the channel panel.
 		directMessages = directMessages.WithPresence(presenceReporter{tracker: presence})
 	}
 
@@ -456,6 +467,17 @@ func domainMessageToWSUpdatedPayload(msg domain.Message) ws.MessageUpdatedPayloa
 // PublishPinUpdated adapts the hub for the RF-05 pin broadcaster interface.
 func (b *hubBroadcaster) PublishPinUpdated(ctx context.Context, workspaceID, targetType, targetID, messageID, actorUserID string, pinned bool) {
 	b.hub.PublishPinUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, actorUserID, pinned)
+}
+
+// PublishMembersAdded adapts the hub for the issue #398 members broadcaster,
+// converting the string targetType so the HTTP layer keeps no ws import.
+func (b *hubBroadcaster) PublishMembersAdded(ctx context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int) {
+	b.hub.PublishMembersAdded(ctx, workspaceID, ws.TargetType(targetType), targetID, actorUserID, addedCount, memberCount)
+}
+
+// PublishConversationAvailable adapts the hub's user-scoped signal (issue #398).
+func (b *hubBroadcaster) PublishConversationAvailable(ctx context.Context, workspaceID, targetType, targetID string, userIDs []string) {
+	b.hub.PublishConversationAvailable(ctx, workspaceID, ws.TargetType(targetType), targetID, userIDs)
 }
 
 func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {

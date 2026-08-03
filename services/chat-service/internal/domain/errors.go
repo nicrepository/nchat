@@ -65,6 +65,16 @@ var (
 	ErrDuplicateChannelCategoryName = fmt.Errorf("%w: category name already in use", ErrConflict)
 	// ErrChannelCategoryLimitReached reports the per-workspace category ceiling.
 	ErrChannelCategoryLimitReached = fmt.Errorf("%w: workspace category limit reached", ErrConflict)
+	// ErrTooManyMembersRequested reports a batch above MaxAddMembersPerRequest.
+	//
+	// This is a bound on the *request*, decided before any database work, and it
+	// never depends on who the caller is or what the conversation contains.
+	// There is deliberately no companion error for a conversation being "full":
+	// channels and groups have no fixed participant capacity in this product.
+	ErrTooManyMembersRequested = fmt.Errorf("%w: at most %d users may be added per request", ErrInvalidInput, MaxAddMembersPerRequest)
+	// ErrNoMembersRequested reports an empty or all-blank user list. An add that
+	// adds nobody is a client bug, not a no-op success.
+	ErrNoMembersRequested = fmt.Errorf("%w: user_ids must contain at least one user", ErrInvalidInput)
 	// ErrInvalidChannelCategoryOrder reports a reorder payload that is not
 	// exactly the workspace's category set: a duplicate ID, a missing one, or one
 	// belonging to another workspace. It says which rule was broken but never

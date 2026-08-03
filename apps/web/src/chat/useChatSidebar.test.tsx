@@ -10,14 +10,22 @@ const { mockFetchSidebarData, websocket } = vi.hoisted(() => ({
   mockFetchSidebarData: vi.fn(),
   websocket: {
     onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
+    onConversationAvailable: null as (() => void) | null,
   },
 }));
 
 vi.mock("./chatApi", () => ({ fetchSidebarData: mockFetchSidebarData }));
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
-    ({ onMessageCreated }: { onMessageCreated: (event: WSMessageCreatedEvent) => void }) => {
+    ({
+      onMessageCreated,
+      onConversationAvailable,
+    }: {
+      onMessageCreated: (event: WSMessageCreatedEvent) => void;
+      onConversationAvailable?: () => void;
+    }) => {
       websocket.onMessageCreated = onMessageCreated;
+      websocket.onConversationAvailable = onConversationAvailable ?? null;
       return { toggleReaction: vi.fn() };
     },
   ),
@@ -135,5 +143,129 @@ describe("useChatSidebar realtime unread", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("message-c", dmC, "other-2", "dm")));
     expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 0, dmC: 1 });
+  });
+});
+
+// ── conversation.available (issue #398) ─────────────────────────────────────
+
+describe("useChatSidebar — conversa recém-disponível", () => {
+  it("refetches the sidebar and shows the new conversation", async () => {
+    const withoutB = {
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public" as const, canWrite: true }],
+      dms: [],
+    };
+    const withB = {
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public" as const, canWrite: true },
+        { id: channelB, name: "B", type: "private" as const, canWrite: true },
+      ],
+      dms: [],
+    };
+    mockFetchSidebarData.mockResolvedValueOnce(withoutB).mockResolvedValue(withB);
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      websocket.onConversationAvailable?.();
+    });
+
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels.map((c) => c.id)).toEqual([channelA, channelB]);
+    });
+  });
+
+  // The refetch replaces the list wholesale, so repeated events cannot duplicate.
+  it("does not duplicate conversations across repeated events", async () => {
+    const data = {
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public" as const, canWrite: true }],
+      dms: [{ id: dmC, type: "1:1" as const, name: "C", participants: [] }],
+    };
+    mockFetchSidebarData.mockResolvedValue(data);
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      websocket.onConversationAvailable?.();
+      websocket.onConversationAvailable?.();
+      websocket.onConversationAvailable?.();
+    });
+
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels).toHaveLength(1);
+      expect(result.current.state.dms).toHaveLength(1);
+    });
+  });
+
+  // A burst must not start one refetch per event: an in-flight request absorbs
+  // the others and runs at most once more.
+  it("coalesces a burst of events into at most two refetches", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public" as const, canWrite: true }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    const afterMount = mockFetchSidebarData.mock.calls.length;
+
+    await act(async () => {
+      for (let i = 0; i < 6; i++) websocket.onConversationAvailable?.();
+    });
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    const triggered = mockFetchSidebarData.mock.calls.length - afterMount;
+    expect(triggered).toBeGreaterThan(0);
+    expect(triggered).toBeLessThanOrEqual(2);
+  });
+
+  // A failed hint must not blank a working sidebar or start a retry loop.
+  it("keeps the current sidebar when the refetch fails", async () => {
+    const data = {
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public" as const, canWrite: true }],
+      dms: [],
+    };
+    mockFetchSidebarData.mockResolvedValueOnce(data).mockRejectedValue(new Error("offline"));
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      websocket.onConversationAvailable?.();
+    });
+
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("state was blanked");
+      expect(result.current.state.channels).toHaveLength(1);
+    });
+  });
+
+  // The refetch must not flip the sidebar back through "loading", which would
+  // unmount the rendered list for a frame.
+  it("never returns to the loading state while refreshing", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public" as const, canWrite: true }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const seen: string[] = [];
+    await act(async () => {
+      websocket.onConversationAvailable?.();
+      seen.push(result.current.state.status);
+    });
+
+    expect(seen).not.toContain("loading");
   });
 });

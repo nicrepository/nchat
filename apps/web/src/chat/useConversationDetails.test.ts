@@ -56,6 +56,7 @@ function details(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
     createdAt: "2024-01-12T09:30:00Z",
     memberCount: 3,
     onlineCount: 0,
+    canManageMembers: false,
     onlineMembers: [],
     ...overrides,
   };
@@ -208,6 +209,7 @@ function group(overrides: Partial<GroupDetails> = {}): GroupDetails {
     createdAt: "2024-03-04T15:00:00Z",
     participantCount: 4,
     participants: [],
+    canManageMembers: false,
     ...overrides,
   };
 }
@@ -391,5 +393,87 @@ describe("useConversationDetails — o hook não reescreve o contrato do cliente
 
     await waitFor(() => expect(result.current.details.status).toBe("error"));
     expect(result.current.details).toEqual({ status: "error" });
+  });
+});
+
+// ── reload (issue #398) ──────────────────────────────────────────────────────
+
+describe("useConversationDetails — reload", () => {
+  it("refetches the open target without blanking what is on screen", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details({ memberCount: 3 }));
+    mockFetchChannelAttachments.mockResolvedValue([]);
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    mockFetchChannelDetails.mockResolvedValue(details({ memberCount: 4 }));
+    const statuses: string[] = [];
+    mockFetchChannelDetails.mockImplementation(async () => {
+      // Sampled while the request is in flight: the section must still be
+      // "ready". Blanking it here unmounts the add-members control the user
+      // just used and drops keyboard focus to <body> mid-flow.
+      statuses.push(result.current.details.status);
+      return details({ memberCount: 4 });
+    });
+
+    await act(async () => {
+      result.current.reload();
+    });
+
+    await waitFor(() => {
+      const section = result.current.details;
+      expect(
+        section.status === "ready" && section.data.kind === "channel" && section.data.memberCount,
+      ).toBe(4);
+    });
+    expect(statuses).toEqual(["ready"]);
+  });
+
+  // A switch is the opposite case and must still reset, or the previous
+  // conversation's roster would show under the new one's name.
+  it("still blanks the panel on a target switch", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details());
+    mockFetchChannelAttachments.mockResolvedValue([]);
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useConversationDetails({ kind: "channel", id }),
+      { initialProps: { id: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    let pending: (() => void) | undefined;
+    mockFetchChannelDetails.mockImplementation(
+      () =>
+        new Promise<ChannelDetails>((resolve) => {
+          pending = () => resolve(details({ id: "ch-2" }));
+        }),
+    );
+    rerender({ id: "ch-2" });
+
+    expect(result.current.details.status).toBe("loading");
+    await act(async () => {
+      pending?.();
+    });
+  });
+
+  it("refetches the target that is open now, not the one it was created for", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details());
+    mockFetchChannelAttachments.mockResolvedValue([]);
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useConversationDetails({ kind: "channel", id }),
+      { initialProps: { id: "ch-1" } },
+    );
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+    // Captured before the switch, the way useMessages holds it for the lifetime
+    // of the socket.
+    const captured = result.current.reload;
+
+    rerender({ id: "ch-2" });
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+    mockFetchChannelDetails.mockClear();
+
+    await act(async () => {
+      captured();
+    });
+
+    expect(mockFetchChannelDetails).toHaveBeenCalledWith("ch-2", expect.any(AbortSignal));
   });
 });

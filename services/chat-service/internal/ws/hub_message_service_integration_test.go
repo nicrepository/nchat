@@ -64,6 +64,18 @@ type integDMStore struct {
 func (s *integDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
 	return storage.CreateDirectConversationResult{}, nil
 }
+func (s *integDMStore) SearchGroupParticipantCandidates(_ context.Context, _, _, _, _ string, _ int) ([]domain.DMCandidate, error) {
+	return nil, nil
+}
+
+func (s *integDMStore) AddGroupParticipants(_ context.Context, _ storage.AddGroupParticipantsInput) (storage.AddMembersResult, error) {
+	return storage.AddMembersResult{}, nil
+}
+
+func (s *integDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
+	return storage.DMParticipantPage{}, nil
+}
+
 func (s *integDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil
 }
@@ -76,10 +88,6 @@ func (s *integDMStore) ListVisibleConversationsWithParticipantIDs(_ context.Cont
 func (s *integDMStore) GetDirectCounterpartProfile(_ context.Context, _, _, _ string) (domain.DMDirectProfile, error) {
 	return domain.DMDirectProfile{}, nil
 }
-func (s *integDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
-	return storage.DMParticipantPage{}, nil
-}
-
 func (s *integDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	return s.conv, nil
 }

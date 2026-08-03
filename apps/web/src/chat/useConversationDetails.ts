@@ -59,6 +59,21 @@ export type AsyncSection<T> =
 export interface ConversationDetailsState {
   details: AsyncSection<ConversationDetails>;
   files: AsyncSection<ChannelAttachment[]>;
+  /**
+   * Refetches the panel for the target it is currently showing (issue #398).
+   *
+   * The single reconciliation path after a membership change. Both triggers —
+   * the local add's HTTP response and a members.added event from anyone else —
+   * call this rather than merging a response into the rendered list, so the
+   * roster and both counters always come from one authority and two triggers
+   * arriving together cannot double a member or a count.
+   *
+   * It re-reads the current target rather than taking one as an argument, so a
+   * caller holding a stale closure cannot make the panel load a conversation
+   * that is no longer open. With the panel closed there is no target and this
+   * is a no-op.
+   */
+  reload: () => void;
 }
 
 type Action =
@@ -68,12 +83,20 @@ type Action =
   | { type: "files_ready"; files: ChannelAttachment[] }
   | { type: "files_error" };
 
-const initialState: ConversationDetailsState = {
+/**
+ * The reducer owns the two sections only; `reload` is attached by the hook.
+ *
+ * Keeping the callback out of reducer state is what stops a dispatch from ever
+ * replacing it with a stale identity.
+ */
+type Sections = Omit<ConversationDetailsState, "reload">;
+
+const initialState: Sections = {
   details: { status: "loading" },
   files: { status: "loading" },
 };
 
-function reducer(state: ConversationDetailsState, action: Action): ConversationDetailsState {
+function reducer(state: Sections, action: Action): Sections {
   switch (action.type) {
     case "reset":
       return initialState;
@@ -107,11 +130,23 @@ export function useConversationDetails(
   const kind = target?.kind ?? "";
   const id = target?.id ?? "";
 
-  const load = useCallback((nextKind: string, nextID: string) => {
+  /**
+   * Fetches both sections for (nextKind, nextID).
+   *
+   * `reset` is the difference between the two callers, and it is not cosmetic.
+   * A target *switch* must reset: showing the previous conversation's
+   * participants and files under the new one's name would be wrong, and briefly
+   * so in a way the user cannot detect. A *refetch* of the conversation already
+   * displayed must not: the data is about to be replaced by a newer version of
+   * itself, and blanking the section in between unmounts everything inside it —
+   * including the control the user just activated, which drops keyboard focus
+   * to <body> mid-flow.
+   */
+  const load = useCallback((nextKind: string, nextID: string, reset = true) => {
     abortRef.current?.abort();
-    // Reset first, always: the panel must show a loading state for the new
-    // conversation rather than the previous one's participants and files.
-    dispatch({ type: "reset" });
+    if (reset) {
+      dispatch({ type: "reset" });
+    }
     if (!nextID || (nextKind !== "channel" && nextKind !== "group" && nextKind !== "direct")) {
       return;
     }
@@ -173,10 +208,28 @@ export function useConversationDetails(
     );
   }, []);
 
+  // The loaded target is mirrored into a ref, written by the same effect that
+  // performs the load, so `reload` can read it without being re-created on every
+  // switch. A caller that stored the callback — useMessages holds it for the
+  // lifetime of the socket — therefore always refetches the conversation that is
+  // open now, never the one that was open when it captured it.
+  //
+  // Written in the effect rather than during render: a render can be discarded,
+  // and a ref updated by a discarded one would point at a target that was never
+  // loaded.
+  const targetRef = useRef({ kind, id });
+
+  // Refetch in place: same target, newer data, no blank frame and no unmount.
+  const reload = useCallback(() => {
+    const { kind: currentKind, id: currentID } = targetRef.current;
+    load(currentKind, currentID, false);
+  }, [load]);
+
   useEffect(() => {
+    targetRef.current = { kind, id };
     load(kind, id);
     return () => abortRef.current?.abort();
   }, [kind, id, load]);
 
-  return state;
+  return { ...state, reload };
 }
