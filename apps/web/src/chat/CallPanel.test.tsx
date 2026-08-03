@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -35,7 +35,7 @@ function controller(
     decline: vi.fn(() => true),
     cancel: vi.fn(() => true),
     end: vi.fn(() => true),
-    retryMedia: vi.fn(),
+    retryMedia: vi.fn(async () => undefined),
     clearTerminal: vi.fn(),
   };
 }
@@ -73,6 +73,14 @@ function renderPanel(calls: CallController, mediaController?: ReturnType<typeof 
       media={mediaController}
     />,
   );
+}
+
+function deferredValue<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 describe("CallPanel", () => {
@@ -212,9 +220,11 @@ describe("CallPanel", () => {
     );
   });
 
-  it("keeps permission denial recoverable and blocks duplicate retry", async () => {
+  it("ends permission retry from the controller promise after token failure", async () => {
     const user = userEvent.setup();
     const calls = controller("active", currentUserId);
+    const retryOperation = deferredValue<void>();
+    calls.retryMedia = vi.fn(() => retryOperation.promise);
     const denied = media({
       status: "permission-denied",
       error: "Permissão de câmera negada pelo navegador.",
@@ -230,32 +240,28 @@ describe("CallPanel", () => {
     expect(calls.end).not.toHaveBeenCalled();
     expect(retry).toBeDisabled();
 
+    calls.error = "Não foi possível preparar a mídia da chamada. Tente novamente.";
     view.rerender(
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
         participantId={otherUserId}
         participantName="Ana Lima"
-        media={media({ status: "connecting", error: null })}
+        media={media({ status: "idle", error: null })}
       />,
     );
     expect(screen.getByRole("button", { name: "Tentar mídia novamente" })).toBeDisabled();
 
-    view.rerender(
-      <CallPanel
-        calls={calls}
-        currentUserId={currentUserId}
-        participantId={otherUserId}
-        participantName="Ana Lima"
-        media={media({
-          status: "permission-denied",
-          error: "Permissão de câmera negada pelo navegador.",
-        })}
-      />,
-    );
+    await act(async () => retryOperation.resolve());
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Tentar mídia novamente" })).toBeEnabled(),
     );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Não foi possível preparar a mídia da chamada. Tente novamente.",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Tentar mídia novamente" }));
+    expect(calls.retryMedia).toHaveBeenCalledTimes(2);
   });
 
   it("restores media controls when permission retry succeeds", async () => {

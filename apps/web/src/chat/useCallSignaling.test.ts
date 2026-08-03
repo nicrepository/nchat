@@ -127,6 +127,16 @@ function mediaBridge(): CallMediaBridge {
   };
 }
 
+function deferredValue<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 const OriginalWebSocket = global.WebSocket;
@@ -159,17 +169,95 @@ afterEach(() => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("useCallSignaling", () => {
-  it("does not double-send two commands fired before the pending state re-renders", () => {
-    const { result } = renderHook(() => useCallSignaling());
+  it("keeps the first accepted action media preparation when accept is duplicated", () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
     act(() => FakeWebSocket.instances[0].simulateOpen());
     act(() => FakeWebSocket.instances[0].simulateMessage(ringingEvent(1)));
 
+    let firstAccepted = false;
+    let duplicateAccepted = true;
     act(() => {
-      result.current.accept();
-      result.current.accept();
+      firstAccepted = result.current.accept();
+      duplicateAccepted = result.current.accept();
     });
 
+    expect(firstAccepted).toBe(true);
+    expect(duplicateAccepted).toBe(false);
     expect(callCommands(FakeWebSocket.instances[0])).toHaveLength(1);
+    expect(media.startAudio).toHaveBeenCalledOnce();
+    expect(media.stop).not.toHaveBeenCalled();
+    expect(result.current.error).toBeNull();
+  });
+
+  it("keeps the first accepted action media preparation when start is duplicated", () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    vi.mocked(media.startAudio).mockImplementation(async () => {
+      expect(callCommands(socket)).toHaveLength(1);
+    });
+
+    let firstStarted = false;
+    let duplicateStarted = true;
+    act(() => {
+      firstStarted = result.current.start(baseCall.callee_id, "video");
+      duplicateStarted = result.current.start(baseCall.callee_id, "video");
+    });
+
+    expect(firstStarted).toBe(true);
+    expect(duplicateStarted).toBe(false);
+    expect(callCommands(socket)).toHaveLength(1);
+    expect(media.startAudio).toHaveBeenCalledOnce();
+    expect(media.stop).not.toHaveBeenCalled();
+    expect(result.current.error).toBeNull();
+  });
+
+  it("releases the reservation after a real send failure so a new start can succeed", () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    socket.readyState = FakeWebSocket.CLOSING;
+    let failedStart = true;
+    act(() => {
+      failedStart = result.current.start(baseCall.callee_id, "audio");
+    });
+    expect(failedStart).toBe(false);
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("Conexão em tempo real indisponível.");
+    expect(media.startAudio).not.toHaveBeenCalled();
+    expect(media.stop).not.toHaveBeenCalled();
+
+    socket.readyState = FakeWebSocket.OPEN;
+    let nextStart = false;
+    act(() => {
+      nextStart = result.current.start(baseCall.callee_id, "audio");
+    });
+    expect(nextStart).toBe(true);
+    expect(callCommands(socket)).toHaveLength(1);
+    expect(media.startAudio).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a new start after a server error releases the pending command", () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    act(() => socket.simulateMessage({ type: "call.error", code: "call_invalid_state" }));
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+
+    expect(callCommands(socket)).toHaveLength(2);
+    expect(media.startAudio).toHaveBeenCalledTimes(2);
+    expect(media.stop).not.toHaveBeenCalled();
   });
 
   it("ignores an event carrying an older version than the current call state", () => {
@@ -317,8 +405,8 @@ describe("useCallSignaling", () => {
       ),
     );
 
-    act(() => result.current.retryMedia());
-    await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
+    await act(async () => result.current.retryMedia());
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
     expect(media.connect).toHaveBeenCalledTimes(2);
   });
 
@@ -329,11 +417,134 @@ describe("useCallSignaling", () => {
     act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
     await waitFor(() => expect(result.current.mediaReady).toBe(true));
 
-    act(() => result.current.retryMedia());
-
-    await waitFor(() => expect(media.connect).toHaveBeenCalledTimes(2));
+    await act(async () => result.current.retryMedia());
+    expect(media.connect).toHaveBeenCalledTimes(2);
     expect(media.stop).toHaveBeenCalledOnce();
     expect(issueCallToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("completes a failed token retry and allows another retry with a fresh token", async () => {
+    const media = mediaBridge();
+    vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+    const failedRetry = result.current.retryMedia();
+
+    expect(failedRetry).toBeInstanceOf(Promise);
+    await act(async () => failedRetry);
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+    expect(result.current.error).toBe(
+      "Não foi possível preparar a mídia da chamada. Tente novamente.",
+    );
+
+    vi.mocked(issueCallToken).mockResolvedValueOnce({
+      token: "fresh-media-token",
+      expiresAt: "2026-07-30T12:06:00Z",
+    });
+    await act(async () => result.current.retryMedia());
+
+    expect(issueCallToken).toHaveBeenCalledTimes(3);
+    expect(media.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ call_id: baseCall.call_id }),
+      "fresh-media-token",
+    );
+    expect(result.current.error).toBeNull();
+    expect(result.current.mediaReady).toBe(true);
+  });
+
+  it("shares one pending media retry between concurrent callers", async () => {
+    const media = mediaBridge();
+    vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    const token = deferredValue<{ token: string; expiresAt: string }>();
+    vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+    const firstRetry = result.current.retryMedia();
+    const duplicateRetry = result.current.retryMedia();
+
+    expect(firstRetry).toBeInstanceOf(Promise);
+    expect(duplicateRetry).toBe(firstRetry);
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
+    expect(media.stop).toHaveBeenCalledOnce();
+
+    token.resolve({
+      token: "fresh-media-token",
+      expiresAt: "2026-07-30T12:06:00Z",
+    });
+    await act(async () => firstRetry);
+    expect(media.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("completes a failed connection retry and permits the next attempt", async () => {
+    const media = mediaBridge();
+    vi.mocked(media.connect)
+      .mockRejectedValueOnce(new Error("initial failure"))
+      .mockRejectedValueOnce(new Error("retry failure"));
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    await act(async () => result.current.retryMedia());
+    expect(media.connect).toHaveBeenCalledTimes(2);
+    expect(result.current.error).toBe(
+      "Não foi possível preparar a mídia da chamada. Tente novamente.",
+    );
+
+    await act(async () => result.current.retryMedia());
+    expect(media.connect).toHaveBeenCalledTimes(3);
+    expect(result.current.error).toBeNull();
+    expect(result.current.mediaReady).toBe(true);
+  });
+
+  it("ignores a late token failure from a retry after the call ends", async () => {
+    const media = mediaBridge();
+    vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+    const { result } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    const token = deferredValue<{ token: string; expiresAt: string }>();
+    vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+    const retry = result.current.retryMedia();
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
+
+    act(() => FakeWebSocket.instances[0].simulateMessage(endedEvent(3)));
+    token.reject(new Error("late token failure"));
+    await act(async () => retry);
+
+    expect(result.current.call?.status).toBe("ended");
+    expect(result.current.error).toBeNull();
+    expect(media.connect).toHaveBeenCalledOnce();
+  });
+
+  it("does not connect or update after unmount during a media retry", async () => {
+    const media = mediaBridge();
+    vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+    const { result, unmount } = renderHook(() => useCallSignaling(media));
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    const token = deferredValue<{ token: string; expiresAt: string }>();
+    vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+    const retry = result.current.retryMedia();
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
+
+    unmount();
+    token.reject(new Error("late token failure"));
+    await retry;
+
+    expect(media.connect).toHaveBeenCalledOnce();
   });
 
   it("does not surface a late media failure after the call has ended", async () => {

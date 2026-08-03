@@ -43,11 +43,9 @@ export default function CallPanel({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [endingCallId, setEndingCallId] = useState("");
   const [retryingMediaCallId, setRetryingMediaCallId] = useState("");
-  const retryProgressRef = useRef(false);
+  const retryPromiseRef = useRef<Promise<void> | null>(null);
   const terminal = call && call.status in terminalLabels;
   const retryingMedia = Boolean(dialogCallId && retryingMediaCallId === dialogCallId);
-  const mediaStatus = media?.status;
-  const mediaLoading = media?.mediaLoading ?? false;
 
   useEffect(() => {
     if (!terminal) return;
@@ -61,34 +59,10 @@ export default function CallPanel({
     if (!dialog.open && typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
     return () => {
+      retryPromiseRef.current = null;
       if (dialog.open && typeof dialog.close === "function") dialog.close();
     };
   }, [dialogCallId]);
-
-  useEffect(() => {
-    if (!retryingMedia) {
-      retryProgressRef.current = false;
-      return;
-    }
-    if (
-      mediaLoading ||
-      mediaStatus === "idle" ||
-      mediaStatus === "connecting" ||
-      mediaStatus === "reconnecting"
-    ) {
-      retryProgressRef.current = true;
-      return;
-    }
-    if (
-      retryProgressRef.current &&
-      (mediaStatus === "connected" ||
-        mediaStatus === "permission-denied" ||
-        mediaStatus === "error")
-    ) {
-      retryProgressRef.current = false;
-      setRetryingMediaCallId("");
-    }
-  }, [mediaLoading, mediaStatus, retryingMedia]);
 
   if (!call && !calls.error) return null;
   if (!call) {
@@ -124,11 +98,20 @@ export default function CallPanel({
     if (!ending && calls.end()) setEndingCallId(callId);
   }
 
-  function retryMedia() {
-    if (retryingMedia || calls.pending) return;
-    retryProgressRef.current = false;
+  async function retryMedia() {
+    if (retryPromiseRef.current || calls.pending) return;
     setRetryingMediaCallId(callId);
-    calls.retryMedia();
+    let operation: Promise<void> | null = null;
+    try {
+      operation = calls.retryMedia();
+      retryPromiseRef.current = operation;
+      await operation;
+    } finally {
+      if (!operation || retryPromiseRef.current === operation) {
+        retryPromiseRef.current = null;
+        setRetryingMediaCallId("");
+      }
+    }
   }
 
   return (
@@ -226,7 +209,7 @@ export default function CallPanel({
           <div className="call-panel__error" role="alert">
             <span>{error}</span>
             {active && (
-              <button type="button" onClick={calls.retryMedia}>
+              <button type="button" disabled={retryingMedia || calls.pending} onClick={retryMedia}>
                 Tentar mídia novamente
               </button>
             )}

@@ -25,7 +25,7 @@ export interface CallController {
   decline: () => boolean;
   cancel: () => boolean;
   end: () => boolean;
-  retryMedia: () => void;
+  retryMedia: () => Promise<void>;
   clearTerminal: () => void;
 }
 
@@ -39,6 +39,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
   const pendingRef = useRef(false);
   const mediaCallIdRef = useRef("");
   const mediaRequestCallIdRef = useRef("");
+  const mediaRetryPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
   const mediaRef = useRef(media);
 
   useEffect(() => {
@@ -98,6 +99,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
           if (isTerminalCall(event.call.status)) {
             mediaCallIdRef.current = "";
             mediaRequestCallIdRef.current = "";
+            mediaRetryPromiseRef.current = null;
             setMediaReady(false);
             void mediaRef.current?.stop();
           }
@@ -125,6 +127,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
       callRef.current = null;
       mediaCallIdRef.current = "";
       mediaRequestCallIdRef.current = "";
+      mediaRetryPromiseRef.current = null;
       handle.release();
       void mediaRef.current?.stop();
     };
@@ -132,11 +135,18 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
 
   const send = useCallback((payload: Record<string, unknown>) => {
     const handle = socketRef.current;
-    if (!handle || pendingRef.current || !handle.send(payload)) {
+    if (!handle) {
       setError("Conexão em tempo real indisponível.");
       return false;
     }
+    if (pendingRef.current) return false;
     pendingRef.current = true;
+    if (!handle.send(payload)) {
+      pendingRef.current = false;
+      setPending(false);
+      setError("Conexão em tempo real indisponível.");
+      return false;
+    }
     setPending(true);
     setError(null);
     return true;
@@ -156,20 +166,18 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
     error,
     mediaReady,
     start: (targetUserId, callType) => {
-      void mediaRef.current?.startAudio();
       const started = send({
         type: "call.start",
         request_id: crypto.randomUUID(),
         target_user_id: targetUserId,
         call_type: callType,
       });
-      if (!started) void mediaRef.current?.stop();
+      if (started) void mediaRef.current?.startAudio();
       return started;
     },
     accept: () => {
-      void mediaRef.current?.startAudio();
       const accepted = transition("call.accept");
-      if (!accepted) void mediaRef.current?.stop();
+      if (accepted) void mediaRef.current?.startAudio();
       return accepted;
     },
     decline: () => {
@@ -189,22 +197,32 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
     },
     retryMedia: () => {
       const call = callRef.current;
+      const pendingRetry = mediaRetryPromiseRef.current;
+      if (call && pendingRetry?.callId === call.call_id) return pendingRetry.promise;
       if (!call || call.status !== "active" || mediaRequestCallIdRef.current === call.call_id) {
-        return;
+        return Promise.resolve();
       }
       mediaRequestCallIdRef.current = call.call_id;
       mediaCallIdRef.current = "";
       setMediaReady(false);
       setError(null);
-      void Promise.resolve(mediaRef.current?.stop())
+      const retrying = Promise.resolve(mediaRef.current?.stop())
         .catch(() => undefined)
         .then(() => {
           if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") {
             return;
           }
           mediaRequestCallIdRef.current = "";
-          void requestMedia(call);
+          return requestMedia(call);
+        })
+        .finally(() => {
+          if (mediaRequestCallIdRef.current === call.call_id) mediaRequestCallIdRef.current = "";
+          if (mediaRetryPromiseRef.current?.promise === retrying) {
+            mediaRetryPromiseRef.current = null;
+          }
         });
+      mediaRetryPromiseRef.current = { callId: call.call_id, promise: retrying };
+      return retrying;
     },
     clearTerminal: () => {
       if (state.call && isTerminalCall(state.call.status)) {
