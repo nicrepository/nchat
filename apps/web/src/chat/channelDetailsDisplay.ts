@@ -13,6 +13,12 @@ export const channelDetailsTitleId = "chat-channel-details-title";
 /** aria-controls target: stable, so the toggle can name the panel it opens. */
 export const channelDetailsPanelId = "chat-channel-details-panel";
 
+/** aria-labelledby target for the group panel's own heading (issue #441). */
+export const groupDetailsTitleId = "chat-group-details-title";
+
+/** aria-controls target: stable, so the group toggle can name what it opens. */
+export const groupDetailsPanelId = "chat-group-details-panel";
+
 /**
  * Human-readable size, binary units, pt-BR decimal separator.
  *

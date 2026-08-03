@@ -36,9 +36,30 @@ export type AsyncSection<T> =
   | { status: "ready"; data: T }
   | { status: "error" };
 
-export interface ChannelDetailsState {
+/** The two async sections the reducer owns. Kept apart from the hook's return
+ * type so `reload` — a callback, not state — never has to be threaded through
+ * the reducer or restated in every action's result. */
+export interface ChannelDetailsSections {
   details: AsyncSection<ChannelDetails>;
   files: AsyncSection<ChannelAttachment[]>;
+}
+
+export interface ChannelDetailsState extends ChannelDetailsSections {
+  /**
+   * Refetches the panel from the server (issue #398).
+   *
+   * The single reconciliation path after a membership change: both the HTTP
+   * response and the members.added WebSocket event call this, and because it
+   * replaces the section wholesale rather than appending, the two arriving
+   * together cannot produce a duplicated member row or a double-counted total.
+   * It reuses the same abort-keyed load the channel switch uses, so a refetch
+   * racing a channel switch is dropped by the same signal.
+   *
+   * It does not blank the panel first: the currently rendered data stays until
+   * the newer version replaces it, so nothing inside unmounts and focus is not
+   * dropped from a control the user is still using.
+   */
+  reload: () => void;
 }
 
 type Action =
@@ -48,12 +69,12 @@ type Action =
   | { type: "files_ready"; files: ChannelAttachment[] }
   | { type: "files_error" };
 
-const initialState: ChannelDetailsState = {
+const initialState: ChannelDetailsSections = {
   details: { status: "loading" },
   files: { status: "loading" },
 };
 
-function reducer(state: ChannelDetailsState, action: Action): ChannelDetailsState {
+function reducer(state: ChannelDetailsSections, action: Action): ChannelDetailsSections {
   switch (action.type) {
     case "reset":
       return initialState;
@@ -80,11 +101,22 @@ export function useChannelDetails(channelId: string | null): ChannelDetailsState
   const [state, dispatch] = useReducer(reducer, initialState);
   const abortRef = useRef<AbortController | null>(null);
 
-  const load = useCallback((id: string | null) => {
+  /**
+   * Fetches both sections for `id`.
+   *
+   * `reset` is the difference between the two callers, and it is not cosmetic.
+   * A channel *switch* must reset: showing the previous channel's members under
+   * the new channel's name would be wrong, and briefly so in a way the user
+   * cannot detect. A *refetch* of the channel already displayed must not: the
+   * data is about to be replaced by a newer version of itself, and blanking the
+   * section in between unmounts everything inside it — including the control the
+   * user just activated, which drops keyboard focus to <body> mid-flow.
+   */
+  const load = useCallback((id: string | null, reset = true) => {
     abortRef.current?.abort();
-    // Reset first, always: the panel must show a loading state for the new
-    // channel rather than the previous channel's members and files.
-    dispatch({ type: "reset" });
+    if (reset) {
+      dispatch({ type: "reset" });
+    }
     if (!id) return;
 
     const controller = new AbortController();
@@ -118,5 +150,10 @@ export function useChannelDetails(channelId: string | null): ChannelDetailsState
     return () => abortRef.current?.abort();
   }, [channelId, load]);
 
-  return state;
+  // Refetch in place: same channel, newer data, no blank frame and no unmount.
+  // Bound to the current channelId rather than to a ref, so it can never refetch
+  // the channel the panel has already moved away from.
+  const reload = useCallback(() => load(channelId, false), [load, channelId]);
+
+  return { ...state, reload };
 }

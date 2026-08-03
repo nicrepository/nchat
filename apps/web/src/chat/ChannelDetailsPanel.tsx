@@ -18,11 +18,17 @@
  * message list, the composer or the WebSocket subscription.
  */
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import "./ChannelDetailsPanel.css";
+import AddMembersDialog from "./AddMembersDialog";
 import RichTextRenderer from "./RichTextRenderer";
-import type { ChannelAttachment, ChannelMemberProfile, PinnedItem } from "./chatTypes";
+import type {
+  AddMembersResult,
+  ChannelAttachment,
+  ChannelMemberProfile,
+  PinnedItem,
+} from "./chatTypes";
 import {
   avatarColorFor,
   formatDayLabel,
@@ -170,6 +176,28 @@ export default function ChannelDetailsPanel({
   onClose,
 }: ChannelDetailsPanelProps) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const addMembersButtonRef = useRef<HTMLButtonElement>(null);
+  /**
+   * The channel the picker was opened for, or null.
+   *
+   * Storing the identity instead of a boolean is the whole protection against
+   * confirming a selection into the wrong channel. The panel is deliberately
+   * not remounted on a channel switch (issue #435), so a boolean would survive
+   * one: the dialog would stay open, keep the people picked in channel A, and
+   * its confirm would post them to channel B.
+   *
+   * Comparing against the channel currently rendered closes that during render,
+   * with no effect and no second mechanism: the dialog unmounts, its
+   * AbortController cancels any in-flight search or submit, and the selection
+   * goes with it. Nothing is mutated on the way out.
+   */
+  const [pickerFor, setPickerFor] = useState<string | null>(null);
+  // The notice carries the channel it describes rather than being reset when the
+  // channel changes. The panel is deliberately not remounted on a channel switch
+  // (issue #435), so a bare string would outlive its channel and report "2
+  // pessoas adicionadas" under one nobody was added to. Tying it to an identity
+  // makes that unrepresentable, and needs no effect to enforce.
+  const [addedNotice, setAddedNotice] = useState<{ channelId: string; text: string } | null>(null);
 
   // Focus moves into the panel once, on open, so a keyboard user lands on it
   // instead of continuing from the header button. Deliberately not re-run on
@@ -181,6 +209,47 @@ export default function ChannelDetailsPanel({
 
   const details = state.details;
   const files = state.files;
+  const channelId = details.status === "ready" ? details.data.id : "";
+
+  // Open only while the channel it was opened for is still the one on screen.
+  const pickerOpen = pickerFor !== null && pickerFor === channelId && channelId !== "";
+
+  /**
+   * Closes the picker and returns focus to the control that opened it.
+   *
+   * The button is only rendered while the caller may manage members, so the ref
+   * can be detached by the time this runs (a refetch that revoked the
+   * permission). Focusing a detached node would drop focus to <body>; the
+   * optional call leaves it where the browser put it instead.
+   */
+  const closePicker = useCallback(() => {
+    setPickerFor(null);
+    addMembersButtonRef.current?.focus();
+  }, []);
+
+  const reload = state.reload;
+  const handleAdded = useCallback(
+    (result: AddMembersResult) => {
+      closePicker();
+      // The server's own numbers, never a local increment: someone else may have
+      // added people between the search and this response.
+      setAddedNotice({
+        channelId,
+        text:
+          result.added === 0
+            ? "Todas as pessoas selecionadas já participam deste canal."
+            : result.added === 1
+              ? "1 pessoa adicionada ao canal."
+              : `${result.added} pessoas adicionadas ao canal.`,
+      });
+      // The single reconciliation path. The response is not merged into the
+      // rendered list; the panel refetches, so the member list and both counters
+      // come from one authority and a concurrent WebSocket event refetching too
+      // cannot double-count anything.
+      reload();
+    },
+    [channelId, closePicker, reload],
+  );
 
   return (
     <aside
@@ -293,15 +362,35 @@ export default function ChannelDetailsPanel({
                 ))}
               </ul>
             ))}
-          <UnavailableAction
-            label="Adicionar membros"
-            icon="person_add"
-            reasonId="chat-details-members-unavailable"
-            className="chat-details__wide-action"
-          />
-          <p id="chat-details-members-unavailable" className="chat-details__note">
-            A gestão de membros do canal ainda não está disponível nesta versão.
-          </p>
+          {/*
+            Rendered only once the server has answered and said this caller may
+            manage members (issue #398). While loading, on error, and for a
+            caller without the permission, the control is absent — the safe
+            default, since `canManageMembers` is false unless the server sent
+            true. Hiding it is not the security boundary: POST .../members
+            re-derives the decision from the session on every call.
+          */}
+          {details.status === "ready" && details.data.canManageMembers && (
+            <button
+              ref={addMembersButtonRef}
+              type="button"
+              className="chat-details__wide-action"
+              onClick={() => setPickerFor(channelId)}
+              data-testid="chat-details-add-members"
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                person_add
+              </span>
+              Adicionar membros
+            </button>
+          )}
+          {addedNotice?.channelId === channelId && (
+            // Announced rather than shown as a transient toast: the panel below
+            // has already been refetched, and this says what changed.
+            <p className="chat-details__note" role="status">
+              {addedNotice.text}
+            </p>
+          )}
         </section>
 
         {/* ── Mensagem fixada ───────────────────────────────────────────── */}
@@ -396,6 +485,29 @@ export default function ChannelDetailsPanel({
           </p>
         </section>
       </div>
+
+      {pickerOpen && (
+        <AddMembersDialog
+          target={{ kind: "channel", channelId }}
+          /*
+            The viewer plus the members the panel can see. It is deliberately
+            partial — onlineMembers is a capped, presence-filtered preview, so an
+            offline member is not in it and will still be offered. That is
+            harmless: the server reports them under already_members and writes no
+            duplicate row, which is exactly why this is a UX filter and not a
+            check.
+          */
+          /*
+            Only the viewer. Current members are excluded by the search endpoint
+            itself, in SQL — this list deliberately does not carry them, because
+            the section above is a capped preview and passing it made members it
+            could not show appear as selectable.
+          */
+          excludedUserIds={currentUserId ? [currentUserId] : []}
+          onClose={closePicker}
+          onAdded={handleAdded}
+        />
+      )}
     </aside>
   );
 }

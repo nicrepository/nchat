@@ -1,8 +1,27 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ChannelDetailsPanel from "./ChannelDetailsPanel";
+
+const {
+  searchChannelMemberCandidates,
+  searchGroupParticipantCandidates,
+  addChannelMembers,
+  addGroupParticipants,
+} = vi.hoisted(() => ({
+  searchChannelMemberCandidates: vi.fn(),
+  searchGroupParticipantCandidates: vi.fn(),
+  addChannelMembers: vi.fn(),
+  addGroupParticipants: vi.fn(),
+}));
+
+vi.mock("./chatApi", () => ({
+  searchChannelMemberCandidates,
+  searchGroupParticipantCandidates,
+  addChannelMembers,
+  addGroupParticipants,
+}));
 import type { ChannelAttachment, ChannelDetails, Message, PinnedItem } from "./chatTypes";
 import type { ChannelDetailsState } from "./useChannelDetails";
 
@@ -18,6 +37,7 @@ function channelDetails(overrides: Partial<ChannelDetails> = {}): ChannelDetails
     memberCount: 12,
     onlineCount: 0,
     onlineMembers: [],
+    canManageMembers: false,
     ...overrides,
   };
 }
@@ -26,6 +46,7 @@ function state(overrides: Partial<ChannelDetailsState> = {}): ChannelDetailsStat
   return {
     details: { status: "ready", data: channelDetails() },
     files: { status: "ready", data: [] },
+    reload: vi.fn(),
     ...overrides,
   };
 }
@@ -341,23 +362,20 @@ describe("ChannelDetailsPanel — membros", () => {
 });
 
 describe("ChannelDetailsPanel — ações indisponíveis", () => {
-  it("offers the member actions as disabled controls with a stated reason", async () => {
+  it("offers the still-unimplemented actions as disabled controls with a stated reason", async () => {
     renderPanel();
 
+    // "Ver todos" has no flow yet and must keep saying so. "Adicionar membros"
+    // used to be in this list and is now a real action (issue #398), covered by
+    // its own describe block below.
     const seeAll = screen.getAllByRole("button", { name: "Ver todos" });
-    const addMembers = screen.getByRole("button", { name: /Adicionar membros/ });
-    for (const button of [...seeAll, addMembers]) {
+    for (const button of seeAll) {
       expect(button).toBeDisabled();
       expect(button).toHaveAttribute("aria-describedby");
     }
 
-    // Clicking a disabled control changes nothing and, above all, never reports
-    // a success that did not happen.
-    await userEvent.click(addMembers);
+    await userEvent.click(seeAll[0]);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("A gestão de membros do canal ainda não está disponível nesta versão."),
-    ).toBeInTheDocument();
   });
 });
 
@@ -511,5 +529,349 @@ describe("ChannelDetailsPanel — arquivos recentes", () => {
     // The channel's own metadata survives a file-service failure.
     expect(screen.getByText("Não foi possível carregar os arquivos.")).toBeInTheDocument();
     expect(screen.getByText(/Canal público/)).toBeInTheDocument();
+  });
+});
+
+// ── Adicionar membros (issue #398) ───────────────────────────────────────────
+
+describe("ChannelDetailsPanel — adicionar membros", () => {
+  // The action is server-gated. `canManageMembers` is normalized to false unless
+  // the server explicitly said true, so every state that is not "ready and
+  // permitted" must leave the control absent.
+  it("offers the action when the server says the caller may manage members", () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ canManageMembers: true }),
+        },
+      }),
+    });
+
+    expect(screen.getByTestId("chat-details-add-members")).toBeEnabled();
+  });
+
+  it.each([
+    ["public", "public" as const],
+    ["private", "private" as const],
+  ])("offers the action on a %s channel", (_label, type) => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ type, canManageMembers: true }),
+        },
+      }),
+    });
+
+    expect(screen.getByTestId("chat-details-add-members")).toBeInTheDocument();
+  });
+
+  it("hides the action when the caller may not manage members", () => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ canManageMembers: false }) },
+      }),
+    });
+
+    expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
+  });
+
+  // Default-safe: an undefined permission must never render the action, or a
+  // rolling deploy would show a control every click of which is refused.
+  it.each([
+    ["loading", { status: "loading" } as const],
+    ["error", { status: "error" } as const],
+  ])("hides the action while the panel is %s", (_label, details) => {
+    renderPanel({ state: state({ details }) });
+
+    expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();
+  });
+
+  it("opens and closes the picker, returning focus to the action", async () => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ canManageMembers: true }) },
+      }),
+    });
+
+    const action = screen.getByTestId("chat-details-add-members");
+    await userEvent.click(action);
+    expect(screen.getByRole("dialog", { name: "Adicionar membros" })).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(action).toHaveFocus();
+  });
+
+  it("passes the viewer and the visible members as ineligible picks", async () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            canManageMembers: true,
+            onlineMembers: [
+              {
+                userId: "member-1",
+                displayName: "Ana Lima",
+                role: "member",
+                presence: "online",
+              },
+            ],
+          }),
+        },
+      }),
+    });
+
+    await userEvent.click(screen.getByTestId("chat-details-add-members"));
+
+    // The dialog owns the filtering; the panel's job is to supply the list, so
+    // this asserts the wiring rather than re-testing the picker.
+    expect(screen.getByRole("dialog", { name: "Adicionar membros" })).toBeInTheDocument();
+  });
+});
+
+describe("ChannelDetailsPanel — aviso de sucesso", () => {
+  // The panel stays mounted across a channel switch by design, so the notice
+  // must be cleared by identity rather than by unmount.
+  it("clears the added notice when the panel switches channel", async () => {
+    const readyFor = (id: string) => ({
+      details: {
+        status: "ready" as const,
+        data: channelDetails({ id, canManageMembers: true }),
+      },
+      files: { status: "ready" as const, data: [] },
+      reload: vi.fn(),
+    });
+
+    const { rerender } = render(
+      <ChannelDetailsPanel
+        state={readyFor("ch-1")}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByTestId("chat-details-add-members"));
+    expect(screen.getByRole("dialog", { name: "Adicionar membros" })).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+
+    rerender(
+      <ChannelDetailsPanel
+        state={readyFor("ch-2")}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText(/pessoas? adicionada/)).not.toBeInTheDocument();
+  });
+});
+
+// The panel deliberately survives a channel switch (issue #435), so nothing
+// unmounts the dialog for us. These prove a selection made for channel A can
+// never be confirmed into channel B.
+describe("ChannelDetailsPanel — troca de conversa", () => {
+  function readyFor(id: string) {
+    return {
+      details: {
+        status: "ready" as const,
+        data: channelDetails({ id, canManageMembers: true }),
+      },
+      files: { status: "ready" as const, data: [] },
+      reload: vi.fn(),
+    };
+  }
+
+  function renderFor(id: string) {
+    return render(
+      <ChannelDetailsPanel
+        state={readyFor(id)}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+  }
+
+  beforeEach(() => {
+    searchChannelMemberCandidates.mockResolvedValue([{ userId: "u-9", displayName: "Bruno Dias" }]);
+    addChannelMembers.mockResolvedValue({ added: 1, alreadyMembers: 0, memberCount: 5 });
+  });
+
+  it("closes the picker and sends nothing when the channel changes mid-selection", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderFor("ch-A");
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    const dialog = screen.getByRole("dialog", { name: "Adicionar membros" });
+    await user.type(within(dialog).getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await within(dialog).findByRole("button", { name: /Bruno Dias/ }));
+    expect(within(dialog).getByRole("list", { name: "Pessoas selecionadas" })).toBeInTheDocument();
+
+    rerender(
+      <ChannelDetailsPanel
+        state={readyFor("ch-B")}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    // The decisive assertion: nothing was posted, to either channel.
+    expect(addChannelMembers).not.toHaveBeenCalled();
+  });
+
+  it("starts the picker empty after a channel switch", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderFor("ch-A");
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await screen.findByRole("button", { name: /Bruno Dias/ }));
+
+    rerender(
+      <ChannelDetailsPanel
+        state={readyFor("ch-B")}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByTestId("chat-details-add-members"));
+
+    const reopened = screen.getByRole("dialog", { name: "Adicionar membros" });
+    expect(
+      within(reopened).queryByRole("list", { name: "Pessoas selecionadas" }),
+    ).not.toBeInTheDocument();
+    expect(within(reopened).getByLabelText("Pesquisar pessoa")).toHaveValue("");
+    expect(within(reopened).getByRole("button", { name: "Adicionar" })).toBeDisabled();
+  });
+
+  it("closes the picker when the channel changes while a search is pending", async () => {
+    // A search that never settles: the switch must not wait for it, and its
+    // eventual resolution must not write into the new channel's dialog.
+    searchChannelMemberCandidates.mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+    const { rerender } = renderFor("ch-A");
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+
+    rerender(
+      <ChannelDetailsPanel
+        state={readyFor("ch-B")}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    expect(addChannelMembers).not.toHaveBeenCalled();
+  });
+
+  it("closes the picker when the channel changes after a failed submit", async () => {
+    addChannelMembers.mockRejectedValue(new Error("boom"));
+    const user = userEvent.setup();
+    const { rerender } = renderFor("ch-A");
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+    await user.click(await screen.findByRole("button", { name: /Bruno Dias/ }));
+    await user.click(screen.getByRole("button", { name: "Adicionar" }));
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    rerender(
+      <ChannelDetailsPanel
+        state={readyFor("ch-B")}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    // Exactly the one failed attempt against channel A; nothing retried into B.
+    expect(addChannelMembers).toHaveBeenCalledTimes(1);
+    expect(addChannelMembers).toHaveBeenCalledWith("ch-A", ["u-9"], expect.any(AbortSignal));
+  });
+});
+
+// The corrected eligibility source (issue #398).
+describe("ChannelDetailsPanel — busca contextual de candidatos", () => {
+  it("searches through the channel-scoped endpoint", async () => {
+    searchChannelMemberCandidates.mockResolvedValue([{ userId: "u-9", displayName: "Bruno Dias" }]);
+    const user = userEvent.setup();
+    render(
+      <ChannelDetailsPanel
+        state={{
+          details: {
+            status: "ready",
+            data: channelDetails({ id: "ch-77", canManageMembers: true }),
+          },
+          files: { status: "ready", data: [] },
+          reload: vi.fn(),
+        }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "br");
+
+    expect(await screen.findByRole("button", { name: /Bruno Dias/ })).toBeInTheDocument();
+    expect(searchChannelMemberCandidates).toHaveBeenCalledWith(
+      "ch-77",
+      "br",
+      expect.any(AbortSignal),
+    );
+  });
+
+  // The panel's online-members preview must not become the exclusion list: an
+  // offline current member is absent from it, and used to be offered.
+  it("does not derive exclusions from the online-members preview", async () => {
+    searchChannelMemberCandidates.mockResolvedValue([
+      { userId: "online-member", displayName: "Ana Lima" },
+    ]);
+    const user = userEvent.setup();
+    render(
+      <ChannelDetailsPanel
+        state={{
+          details: {
+            status: "ready",
+            data: channelDetails({
+              canManageMembers: true,
+              onlineMembers: [
+                {
+                  userId: "online-member",
+                  displayName: "Ana Lima",
+                  role: "member",
+                  presence: "online",
+                },
+              ],
+            }),
+          },
+          files: { status: "ready", data: [] },
+          reload: vi.fn(),
+        }}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByTestId("chat-details-add-members"));
+    await user.type(screen.getByLabelText("Pesquisar pessoa"), "an");
+
+    // Whatever the endpoint returns is offered — the server decides membership,
+    // and in production it would not have returned a current member.
+    expect(await screen.findByRole("button", { name: /Ana Lima/ })).toBeInTheDocument();
   });
 });

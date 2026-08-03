@@ -33,6 +33,7 @@ function details(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
     memberCount: 3,
     onlineCount: 0,
     onlineMembers: [],
+    canManageMembers: false,
     ...overrides,
   };
 }
@@ -163,5 +164,62 @@ describe("useChannelDetails", () => {
     await waitFor(() => expect(result.current.files.status).toBe("ready"));
 
     expect(result.current.details.status).toBe("loading");
+  });
+});
+
+describe("useChannelDetails — reload (issue #398)", () => {
+  it("refetches the open channel on demand", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details({ memberCount: 3 }));
+    mockFetchChannelAttachments.mockResolvedValue([]);
+
+    const { result } = renderHook(() => useChannelDetails("ch-1"));
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    mockFetchChannelDetails.mockResolvedValue(details({ memberCount: 5 }));
+    await act(async () => result.current.reload());
+
+    await waitFor(() => {
+      expect(result.current.details).toEqual({
+        status: "ready",
+        data: expect.objectContaining({ memberCount: 5 }),
+      });
+    });
+    expect(mockFetchChannelDetails).toHaveBeenLastCalledWith("ch-1", expect.any(AbortSignal));
+  });
+
+  // The reconciliation property that matters: the response and the WebSocket
+  // event both call reload, and reload *replaces* the section rather than
+  // merging into it, so two refetches cannot double a member or a counter.
+  it("replaces the member list wholesale rather than appending", async () => {
+    mockFetchChannelDetails.mockResolvedValue(
+      details({
+        memberCount: 2,
+        onlineMembers: [{ userId: "u-1", displayName: "Ana", role: "member", presence: "online" }],
+      }),
+    );
+    mockFetchChannelAttachments.mockResolvedValue([]);
+
+    const { result } = renderHook(() => useChannelDetails("ch-1"));
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    // Two reloads in a row, as an HTTP response landing next to the event would
+    // produce. The list must still hold exactly what the server last said.
+    await act(async () => result.current.reload());
+    await act(async () => result.current.reload());
+
+    await waitFor(() => {
+      const section = result.current.details;
+      if (section.status !== "ready") throw new Error("not ready");
+      expect(section.data.onlineMembers).toHaveLength(1);
+      expect(section.data.memberCount).toBe(2);
+    });
+  });
+
+  it("stays idle when the panel is closed", async () => {
+    const { result } = renderHook(() => useChannelDetails(null));
+
+    await act(async () => result.current.reload());
+
+    expect(mockFetchChannelDetails).not.toHaveBeenCalled();
   });
 });

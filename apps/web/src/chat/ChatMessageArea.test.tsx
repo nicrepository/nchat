@@ -63,6 +63,7 @@ const {
   mockDeleteMessage,
   mockGetMessageHistory,
   mockFetchChannelDetails,
+  mockFetchGroupDetails,
   mockFetchChannelAttachments,
   wsMockState,
 } = vi.hoisted(() => ({
@@ -123,6 +124,7 @@ const {
   mockDeleteMessage: vi.fn<(messageId: string) => Promise<Message>>(),
   mockGetMessageHistory: vi.fn(),
   mockFetchChannelDetails: vi.fn(),
+  mockFetchGroupDetails: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
@@ -188,6 +190,8 @@ vi.mock("./chatApi", () => ({
   getMessageHistory: (...args: unknown[]) => mockGetMessageHistory(...args),
   fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
     mockFetchChannelDetails(channelId, signal),
+  fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
+    mockFetchGroupDetails(conversationId, signal),
 }));
 
 // file-service lives behind its own client; the panel's files section is mocked
@@ -415,6 +419,7 @@ beforeEach(() => {
   mockFetchChannelDetails.mockImplementation((channelId: string) =>
     Promise.resolve(channelDetailsFor(channelId)),
   );
+  mockFetchGroupDetails.mockRejectedValue(new Error("group details not stubbed for this test"));
   mockFetchChannelAttachments.mockResolvedValue([]);
   mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
@@ -4408,5 +4413,98 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
       expect.any(Number),
       expect.any(AbortSignal),
     );
+  });
+});
+
+// ── Details panel per conversation kind (issues #435, #441, #398) ────────────
+
+describe("ChatMessageArea — qual painel de detalhes cada conversa recebe", () => {
+  const renderDMWith = (dms: ChatOutletContext["dms"], dmId: string) => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    return render(
+      <MemoryRouter initialEntries={[`/chat/dm/${dmId}`]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms }} />}
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  };
+
+  it("offers a details toggle on a channel", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    renderChannelArea("geral");
+
+    const toggle = await screen.findByTestId("chat-details-toggle");
+    expect(toggle).toHaveAccessibleName("Detalhes do canal");
+  });
+
+  it("offers a details toggle on a group DM", async () => {
+    renderDMWith(
+      [{ id: "dm-group", type: "group", name: "Time de Infra", participants: [] }],
+      "dm-group",
+    );
+
+    const toggle = await screen.findByTestId("chat-details-toggle");
+    expect(toggle).toHaveAccessibleName("Detalhes do grupo");
+  });
+
+  // A 1:1 has no panel and no add-members action: a third participant would
+  // convert it into a group, which this flow deliberately does not do.
+  it("offers no details toggle on a 1:1 DM", async () => {
+    renderDMWith([{ id: "dm-1a1", type: "1:1", name: "Juliane", participants: [] }], "dm-1a1");
+
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("chat-details-toggle")).not.toBeInTheDocument();
+  });
+
+  it("opens the group panel — not the channel panel — for a group DM", async () => {
+    mockFetchGroupDetails.mockResolvedValue({
+      id: "dm-group",
+      name: "Time de Infra",
+      createdAt: "2024-03-04T15:00:00.000Z",
+      participantCount: 3,
+      participants: [],
+      canManageMembers: true,
+    });
+    renderDMWith(
+      [{ id: "dm-group", type: "group", name: "Time de Infra", participants: [] }],
+      "dm-group",
+    );
+
+    await userEvent.click(await screen.findByTestId("chat-details-toggle"));
+
+    expect(await screen.findByTestId("chat-group-details")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-channel-details")).not.toBeInTheDocument();
+    // The group panel must not issue the channel-details request.
+    expect(mockFetchChannelDetails).not.toHaveBeenCalled();
+    expect(mockFetchGroupDetails).toHaveBeenCalledWith("dm-group", expect.any(AbortSignal));
+  });
+
+  it("keeps the composer mounted while the group panel opens", async () => {
+    mockFetchGroupDetails.mockResolvedValue({
+      id: "dm-group",
+      name: "Time de Infra",
+      createdAt: "2024-03-04T15:00:00.000Z",
+      participantCount: 1,
+      participants: [],
+      canManageMembers: false,
+    });
+    renderDMWith(
+      [{ id: "dm-group", type: "group", name: "Time de Infra", participants: [] }],
+      "dm-group",
+    );
+
+    const composer = await screen.findByTestId("chat-composer-input");
+    await userEvent.click(await screen.findByTestId("chat-details-toggle"));
+    await screen.findByTestId("chat-group-details");
+
+    // Same element instance: the panel is a sibling, so opening it reconciles
+    // the conversation column in place rather than remounting it.
+    expect(screen.getByTestId("chat-composer-input")).toBe(composer);
   });
 });
