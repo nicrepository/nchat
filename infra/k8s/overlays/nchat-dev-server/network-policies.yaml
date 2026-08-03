@@ -25,6 +25,7 @@ spec:
           - seaweedfs
           - livekit
           - coturn
+          - media
   policyTypes:
     - Egress
   egress:
@@ -92,6 +93,7 @@ spec:
                   - notification
                   - migrations
                   - postgres-bootstrap
+                  - media
       ports:
         - protocol: TCP
           port: 5432
@@ -191,6 +193,25 @@ spec:
         values:
           - migrations
           - postgres-bootstrap
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-media-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: media
   policyTypes:
     - Egress
   egress:

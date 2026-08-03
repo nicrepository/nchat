@@ -188,6 +188,35 @@ validate_nchat_dev() {
   grep -Fq "port: $LIVEKIT_API_PORT" <<<"$policy_block"
   grep -Fq 'protocol: TCP' <<<"$policy_block"
   grep -Fq 'app.kubernetes.io/component: media' <<<"$policy_block"
+  if grep -Fq 'port: 5432' <<<"$policy_block"; then
+    echo "error: LiveKit NetworkPolicy must not include PostgreSQL port" >&2
+    return 1
+  fi
+  if grep -Fq 'app.kubernetes.io/component: postgres' <<<"$policy_block"; then
+    echo "error: LiveKit NetworkPolicy must not select PostgreSQL" >&2
+    return 1
+  fi
+
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-dns-egress)"
+  grep -Fq -- '- media' <<<"$policy_block"
+  grep -Fq 'protocol: UDP' <<<"$policy_block"
+  grep -Fq 'protocol: TCP' <<<"$policy_block"
+  grep -Fq 'port: 53' <<<"$policy_block"
+  grep -Fq 'kubernetes.io/metadata.name: kube-system' <<<"$policy_block"
+
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-postgres)"
+  grep -Fq 'app.kubernetes.io/component: postgres' <<<"$policy_block"
+  grep -Fq -- '- media' <<<"$policy_block"
+  grep -Fq 'port: 5432' <<<"$policy_block"
+
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-media-postgres-egress)"
+  grep -Fq 'app.kubernetes.io/component: media' <<<"$policy_block"
+  grep -Fq 'app.kubernetes.io/component: postgres' <<<"$policy_block"
+  grep -Fq 'protocol: TCP' <<<"$policy_block"
+  grep -Fq 'port: 5432' <<<"$policy_block"
+  [[ "$(grep -Fc 'port:' <<<"$policy_block")" -eq 1 ]]
+  if grep -Fq 'ipBlock:' <<<"$policy_block"; then return 1; fi
+  if grep -Fq 'namespaceSelector: {}' <<<"$policy_block"; then return 1; fi
   [[ "$(grep -R -l 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches" | wc -l)" -eq 1 ]]
   grep -q 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml"
 
@@ -215,6 +244,7 @@ validate_nchat_dev() {
     nchat-allow-chat-data-egress \
     nchat-allow-dns-egress \
     nchat-allow-livekit-api-egress \
+    nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
     nchat-allow-notification-postgres-egress \
     nchat-default-deny-egress | LC_ALL=C sort)" ]]
@@ -222,7 +252,7 @@ validate_nchat_dev() {
     nchat-allow-dns-egress nchat-allow-traefik-http nchat-allow-postgres \
     nchat-allow-valkey nchat-allow-auth-postgres-egress nchat-allow-chat-data-egress \
     nchat-allow-notification-postgres-egress nchat-allow-migrations-postgres-egress \
-    nchat-allow-livekit-api-egress; do
+    nchat-allow-livekit-api-egress nchat-allow-media-postgres-egress; do
     grep -q 'ports:' <<<"$(yaml_document "$application" NetworkPolicy "$policy_block")"
   done
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-traefik-http)"
