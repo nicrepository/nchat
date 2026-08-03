@@ -79,6 +79,19 @@ yaml_document() {
   ' "$file"
 }
 
+# port_pairs prints one "PROTOCOL/PORT" line per ports: list entry found in an
+# isolated NetworkPolicy document, regardless of whether the renderer emits
+# "port:" or "protocol:" first within each entry.
+port_pairs() {
+  awk '
+    function emit() { if (proto != "" || port != "") { print proto "/" port; proto = ""; port = "" } }
+    /^[[:space:]]*- (port:|protocol:)/ { emit() }
+    /port:/ { port = $NF }
+    /protocol:/ { proto = $NF }
+    END { emit() }
+  ' <<<"$1"
+}
+
 network_policy_names_by_type() {
   local file="$1" wanted_type="$2"
   awk -v wanted_type="$wanted_type" '
@@ -184,10 +197,28 @@ validate_nchat_dev() {
   if grep -R -Eq '/containers/0|/env/-' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server"; then return 1; fi
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-livekit-api-egress)"
-  grep -Fq "cidr: $NCHAT_DEV_NODE_CIDR" <<<"$policy_block"
-  grep -Fq "port: $LIVEKIT_API_PORT" <<<"$policy_block"
-  grep -Fq 'protocol: TCP' <<<"$policy_block"
   grep -Fq 'app.kubernetes.io/component: media' <<<"$policy_block"
+  if [[ "$(grep -Fxc '  - ports:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-livekit-api-egress must have exactly one egress rule" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - ipBlock:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-livekit-api-egress must have exactly one ipBlock destination" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - podSelector:' <<<"$policy_block")" -ne 0 ]]; then
+    echo "error: nchat-allow-livekit-api-egress must not select a destination pod" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - namespaceSelector:' <<<"$policy_block")" -ne 0 ]]; then
+    echo "error: nchat-allow-livekit-api-egress must not target a namespace" >&2
+    return 1
+  fi
+  grep -Fq "cidr: $NCHAT_DEV_NODE_CIDR" <<<"$policy_block"
+  if [[ "$(port_pairs "$policy_block")" != "TCP/$LIVEKIT_API_PORT" ]]; then
+    echo "error: nchat-allow-livekit-api-egress must have exactly one port TCP/$LIVEKIT_API_PORT" >&2
+    return 1
+  fi
   if grep -Fq 'port: 5432' <<<"$policy_block"; then
     echo "error: LiveKit NetworkPolicy must not include PostgreSQL port" >&2
     return 1
@@ -199,24 +230,79 @@ validate_nchat_dev() {
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-dns-egress)"
   grep -Fq -- '- media' <<<"$policy_block"
-  grep -Fq 'protocol: UDP' <<<"$policy_block"
-  grep -Fq 'protocol: TCP' <<<"$policy_block"
-  grep -Fq 'port: 53' <<<"$policy_block"
+  if [[ "$(grep -Fxc '  - ports:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-dns-egress must have exactly one egress rule" >&2
+    return 1
+  fi
+  if [[ "$(port_pairs "$policy_block" | LC_ALL=C sort)" != "$(printf '%s\n' 'TCP/53' 'UDP/53' | LC_ALL=C sort)" ]]; then
+    echo "error: nchat-allow-dns-egress must expose exactly UDP/53 and TCP/53" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - namespaceSelector:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-dns-egress must target exactly one namespace" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - podSelector:' <<<"$policy_block")" -ne 0 ]]; then
+    echo "error: nchat-allow-dns-egress must not select a destination pod" >&2
+    return 1
+  fi
+  if grep -Fq 'ipBlock:' <<<"$policy_block"; then
+    echo "error: nchat-allow-dns-egress must not use an ipBlock destination" >&2
+    return 1
+  fi
+  if grep -Fq 'namespaceSelector: {}' <<<"$policy_block"; then
+    echo "error: nchat-allow-dns-egress must not use an empty namespaceSelector" >&2
+    return 1
+  fi
   grep -Fq 'kubernetes.io/metadata.name: kube-system' <<<"$policy_block"
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-postgres)"
   grep -Fq 'app.kubernetes.io/component: postgres' <<<"$policy_block"
   grep -Fq -- '- media' <<<"$policy_block"
-  grep -Fq 'port: 5432' <<<"$policy_block"
+  if [[ "$(grep -Fxc '  - from:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-postgres must have exactly one ingress rule" >&2
+    return 1
+  fi
+  if [[ "$(port_pairs "$policy_block")" != "TCP/5432" ]]; then
+    echo "error: nchat-allow-postgres must allow only TCP/5432" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - podSelector:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-postgres must authorize exactly one origin pod selector" >&2
+    return 1
+  fi
+  if grep -Fq 'ipBlock:' <<<"$policy_block"; then
+    echo "error: nchat-allow-postgres must not use an ipBlock origin" >&2
+    return 1
+  fi
+  if grep -Fq 'namespaceSelector: {}' <<<"$policy_block"; then
+    echo "error: nchat-allow-postgres must not use an empty namespaceSelector" >&2
+    return 1
+  fi
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-media-postgres-egress)"
   grep -Fq 'app.kubernetes.io/component: media' <<<"$policy_block"
   grep -Fq 'app.kubernetes.io/component: postgres' <<<"$policy_block"
-  grep -Fq 'protocol: TCP' <<<"$policy_block"
-  grep -Fq 'port: 5432' <<<"$policy_block"
-  [[ "$(grep -Fc 'port:' <<<"$policy_block")" -eq 1 ]]
-  if grep -Fq 'ipBlock:' <<<"$policy_block"; then return 1; fi
-  if grep -Fq 'namespaceSelector: {}' <<<"$policy_block"; then return 1; fi
+  if [[ "$(grep -Fxc '  - ports:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-media-postgres-egress must have exactly one egress rule" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '    - podSelector:' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-media-postgres-egress must have exactly one destination" >&2
+    return 1
+  fi
+  if [[ "$(port_pairs "$policy_block")" != "TCP/5432" ]]; then
+    echo "error: nchat-allow-media-postgres-egress must allow only TCP/5432" >&2
+    return 1
+  fi
+  if grep -Fq 'ipBlock:' <<<"$policy_block"; then
+    echo "error: nchat-allow-media-postgres-egress must not use an ipBlock destination" >&2
+    return 1
+  fi
+  if grep -Fq 'namespaceSelector' <<<"$policy_block"; then
+    echo "error: nchat-allow-media-postgres-egress must not target a namespace" >&2
+    return 1
+  fi
   [[ "$(grep -R -l 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches" | wc -l)" -eq 1 ]]
   grep -q 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml"
 
