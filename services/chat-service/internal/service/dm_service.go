@@ -15,9 +15,15 @@ import (
 
 const (
 	minGroupDMParticipants = 3
-	// maxGroupDMParticipants bounds the participant list, caller included. Without it
-	// a single request could fan out into an unbounded number of membership rows and
-	// per-participant eligibility look-ups.
+	// maxGroupDMParticipants bounds the participant list of one *creation*
+	// request, caller included. Without it a single request could fan out into an
+	// unbounded number of membership rows and per-participant eligibility
+	// look-ups.
+	//
+	// It is not a capacity: a group has no total participant limit, and
+	// AddGroupParticipants (issue #398) grows one past this number freely. The
+	// two are different questions — how large one payload may be, and how large
+	// a conversation may become — and only the first has an answer here.
 	maxGroupDMParticipants  = 50
 	maxDMTitleRunes         = 120
 	minDMCandidateQuery     = 2
@@ -211,6 +217,220 @@ func (s *DMService) CreateGroupConversation(ctx context.Context, input CreateGro
 		return domain.DMConversation{}, fmt.Errorf("create group conversation: %w", err)
 	}
 	return conversation, nil
+}
+
+// AddGroupParticipantsInput asks to add participants to an existing group DM
+// (issue #398).
+//
+// WorkspaceID is resolved server-side and CallerID is the authenticated
+// principal. There is no role, status or created_by field: a group's membership
+// role is closed by CHECK to 'member', so there is nothing for a caller to set.
+type AddGroupParticipantsInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	UserIDs        []string
+}
+
+// AddGroupParticipants adds active workspace members to an existing group DM.
+//
+// Authorization is participation, and it is settled by the same
+// GetVisibleConversationByID predicate every other DM read uses: an active
+// workspace, an active workspace membership, an active conversation, and an
+// active dm_members row for the caller. A caller who is not in the group cannot
+// tell a group they are excluded from apart from one that does not exist —
+// both are the same bare ErrNotFound.
+//
+// Participation is the whole policy on purpose. chat.dm_members.role is closed
+// by CHECK to the single value 'member', so a group has no owner, admin or
+// moderator to require; there is no privileged participant to be. Routing this
+// through domain.CanManageChannelMembers would be worse than useless: a
+// workspace admin is not a participant, cannot see the conversation under the
+// SQL policy above, and giving them authority over a private peer conversation
+// they cannot read would be an escalation rather than a control. Any participant
+// may already create a new group with anyone in the workspace, so "a participant
+// may add a participant" grants no power that is not already held. The
+// divergence from the issue's generic wording is recorded in SECURITY.md.
+//
+// A 1:1 conversation is refused with the same ErrNotFound, checked against the
+// row the database returned rather than anything the client said. Adding a third
+// person to a direct DM would silently convert it into a group, and that
+// conversion is explicitly out of scope: direct uniqueness is keyed on the
+// unordered pair, so the row would keep a direct_pair_key describing a
+// conversation that is no longer a pair.
+//
+// The store re-establishes all of it under a row lock, which is what makes the
+// authorization hold against a concurrent revocation. There is no capacity
+// check: groups have no fixed participant limit.
+func (s *DMService) AddGroupParticipants(ctx context.Context, input AddGroupParticipantsInput) (storage.AddMembersResult, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	conversation, err := s.dms.GetVisibleConversationByID(
+		ctx,
+		workspaceID,
+		strings.TrimSpace(input.ConversationID),
+		strings.TrimSpace(input.CallerID),
+	)
+	if err != nil {
+		return storage.AddMembersResult{}, err
+	}
+	if conversation.Type != domain.DMConversationTypeGroup {
+		return storage.AddMembersResult{}, domain.ErrNotFound
+	}
+
+	userIDs, err := normalizeAddMemberIDs(input.UserIDs)
+	if err != nil {
+		return storage.AddMembersResult{}, err
+	}
+
+	// The caller is handed to the store so the transaction re-establishes their
+	// participation itself. GetVisibleConversationByID above refuses a stranger
+	// before any payload work, but its answer is not the permission the write
+	// runs under — participation can be revoked in between.
+	//
+	// No participant ceiling is passed: a group has no fixed capacity. The only
+	// bound is normalizeAddMemberIDs above, which caps one *request* at
+	// domain.MaxAddMembersPerRequest; successive requests may keep growing the
+	// conversation.
+	result, err := s.dms.AddGroupParticipants(ctx, storage.AddGroupParticipantsInput{
+		WorkspaceID:    workspaceID,
+		ConversationID: conversation.ID,
+		CallerID:       strings.TrimSpace(input.CallerID),
+		UserIDs:        userIDs,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrForbidden) ||
+			errors.Is(err, domain.ErrNotFound) ||
+			errors.Is(err, domain.ErrInvalidInput) {
+			return storage.AddMembersResult{}, err
+		}
+		return storage.AddMembersResult{}, fmt.Errorf("add group participants: %w", err)
+	}
+	return result, nil
+}
+
+// GroupDetailsInput asks for the group-details panel payload (issue #441).
+// The workspace is resolved server-side by the handler and the caller is the
+// authenticated principal; neither is ever taken from the request.
+type GroupDetailsInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	// ParticipantLimit caps the participant preview. Values outside
+	// (0, domain.MaxDMDetailsParticipants] are clamped by the store.
+	ParticipantLimit int
+}
+
+// GroupDetails is the panel payload: the conversation itself, a capped preview
+// of its participants and the authoritative participant total.
+//
+// ParticipantCount is every active participant and is deliberately not derived
+// from Participants, which is only as long as the preview cap allows.
+type GroupDetails struct {
+	Conversation     domain.DMConversation
+	Participants     []domain.DMParticipantProfile
+	ParticipantCount int
+	// CanManageMembers is the server's answer to "may this caller add
+	// participants" (issue #398).
+	//
+	// For a group it is true whenever the payload exists at all, and that is not
+	// a shortcut: the policy *is* active participation, and
+	// GetVisibleConversationByID succeeding already means the caller is an
+	// active participant of an active conversation. The field is still sent so
+	// the panel reads one shape for channels and groups, and so a future policy
+	// change has one place to become false. It remains a rendering hint —
+	// POST .../members re-derives it inside its own transaction.
+	CanManageMembers bool
+}
+
+// GetGroupDetails returns the group-details payload for a group conversation
+// the caller participates in.
+//
+// Access is settled first, by the same GetVisibleConversationByID predicate the
+// rest of the DM surface uses: a conversation that does not exist, is archived,
+// belongs to another workspace, or that the caller is not an active participant
+// of all come back as a bare ErrNotFound, so the endpoint cannot be used to
+// probe which conversation UUIDs exist. Only after that are participants read,
+// so an unauthorised caller never reaches a roster.
+//
+// A 1:1 conversation is refused with the same ErrNotFound. Details for direct
+// messages are out of scope for this issue, and answering for them here would
+// ship an unreviewed surface — the type is checked against the row the database
+// returned, never against anything the client said.
+func (s *DMService) GetGroupDetails(ctx context.Context, input GroupDetailsInput) (GroupDetails, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	conversation, err := s.dms.GetVisibleConversationByID(
+		ctx,
+		workspaceID,
+		strings.TrimSpace(input.ConversationID),
+		strings.TrimSpace(input.CallerID),
+	)
+	if err != nil {
+		return GroupDetails{}, err
+	}
+	if conversation.Type != domain.DMConversationTypeGroup {
+		return GroupDetails{}, domain.ErrNotFound
+	}
+	page, err := s.dms.ListParticipantProfiles(ctx, workspaceID, conversation.ID, input.ParticipantLimit)
+	if err != nil {
+		return GroupDetails{}, fmt.Errorf("list dm participant profiles: %w", err)
+	}
+	return GroupDetails{
+		Conversation:     conversation,
+		Participants:     page.Participants,
+		ParticipantCount: page.TotalCount,
+		CanManageMembers: true,
+	}, nil
+}
+
+// SearchGroupParticipantCandidatesInput asks who could still be added to a group
+// (issue #398).
+type SearchGroupParticipantCandidatesInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	Query          string
+	Limit          int // Zero uses the server default.
+}
+
+// SearchGroupParticipantCandidates returns workspace members eligible to be
+// added to a group, with current participants already excluded by the store.
+//
+// Access is settled first by GetVisibleConversationByID — the same predicate the
+// rest of the DM surface uses — so a caller who does not participate cannot use
+// this to learn who is in a group they cannot see, and a 1:1 is refused with the
+// same bare ErrNotFound as a conversation that does not exist. The policy is
+// unchanged: participation is what authorises, exactly as for the write.
+//
+// Current participants are excluded in SQL. The panel's participant list is
+// capped at domain.MaxDMDetailsParticipants, so in a larger group it was never
+// a complete roster; deciding eligibility from it is the defect this replaces.
+func (s *DMService) SearchGroupParticipantCandidates(
+	ctx context.Context, input SearchGroupParticipantCandidatesInput,
+) ([]domain.DMCandidate, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	callerID := strings.TrimSpace(input.CallerID)
+	conversation, err := s.dms.GetVisibleConversationByID(
+		ctx, workspaceID, strings.TrimSpace(input.ConversationID), callerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if conversation.Type != domain.DMConversationTypeGroup {
+		return nil, domain.ErrNotFound
+	}
+
+	query, limit, err := normalizeCandidateSearch(input.Query, input.Limit)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates, err := s.dms.SearchGroupParticipantCandidates(
+		ctx, workspaceID, conversation.ID, callerID, query, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search group participant candidates: %w", err)
+	}
+	return candidates, nil
 }
 
 // ListConversations returns active DM conversations visible to callerID in workspaceID.

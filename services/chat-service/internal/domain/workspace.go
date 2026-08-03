@@ -275,6 +275,38 @@ type DMCandidate struct {
 	DisplayName string
 }
 
+// DMParticipantProfile is one participant of a group conversation as the
+// group-details panel renders them (issue #441).
+//
+// It carries a stable ID (for a deterministic avatar colour and for "this is
+// you"), the already-resolved visual name, an optional avatar URL and the live
+// presence status. E-mail, workspace role, join date and every other profile
+// attribute are deliberately absent.
+//
+// There is no Role field, unlike ChannelMemberProfile: chat.dm_members.role is
+// closed by CHECK to the single value 'member', so it carries no information a
+// panel could show. A group has no owner or moderator in this domain.
+//
+// Presence is decoration here, not a filter: unlike the channel panel — whose
+// list is defined as "the members who are online" — a group's participant list
+// is every active participant, and someone being offline never removes them
+// from it. Presence is therefore resolved for the returned page rather than
+// used to select it.
+type DMParticipantProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Presence    string
+}
+
+// MaxDMDetailsParticipants bounds the participant page the group-details
+// endpoint returns.
+//
+// The panel shows a short preview, not the roster, so the response is capped
+// server-side and the total is reported separately. A client asking for more
+// gets this many.
+const MaxDMDetailsParticipants = 30
+
 // CanReadChannel reports whether a user may read ch.
 // wm is the workspace membership (nil = non-member).
 // cm is the channel membership (nil = not a channel member).
@@ -311,4 +343,41 @@ func CanManageWorkspace(wm *WorkspaceMember) bool {
 		return false
 	}
 	return wm.Role == WorkspaceRoleOwner || wm.Role == WorkspaceRoleAdmin
+}
+
+// MaxAddMembersPerRequest bounds one add-members call (issue #398).
+//
+// A batch ceiling, not a conversation ceiling: it caps how many membership rows
+// and per-user eligibility joins a single accepted request can cost, so an
+// oversized payload is refused by one comparison instead of by the database.
+// It is deliberately below the 50-participant group maximum, so no single
+// request can fill a group from empty, and it is comfortably above what the
+// panel's selector produces in one human confirmation.
+const MaxAddMembersPerRequest = 25
+
+// CanManageChannelMembers reports whether a user may add participants to a
+// channel (issue #398).
+//
+// It is the workspace management gate — active owner or admin — reusing
+// CanManageWorkspace rather than restating it, exactly as channel update,
+// channel archival and channel categories do. The choice is not a new policy:
+// removing a member from a channel already takes owner or admin
+// (MemberService.RemoveMemberFromChannel), and docs/runbooks/
+// task-chat-channel-join-leave.md names the addition its "manager-add flow".
+// Adding and removing the same row are the same authority.
+//
+// Deliberately *not* "any member of the channel": that would let anyone with
+// read access to a private channel widen its audience, which is precisely the
+// property a private channel has. Deliberately not the per-channel 'moderator'
+// role either — nothing in this codebase ever assigns it, so gating on it would
+// be dead code standing in for a real check. This predicate is the named seam
+// to widen when RF-74 introduces a real moderation role; the divergence is
+// recorded in SECURITY.md.
+//
+// Group DM participation is a different question with a different answer and is
+// deliberately not routed through here: chat.dm_members.role is closed by CHECK
+// to the single value 'member', so a group has no manager to be, and a
+// workspace admin is not even a participant. See DMService.AddGroupParticipants.
+func CanManageChannelMembers(wm *WorkspaceMember) bool {
+	return CanManageWorkspace(wm)
 }

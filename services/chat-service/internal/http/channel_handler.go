@@ -10,6 +10,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 // channelProvider is the ChannelService surface used by ChannelHandler.
@@ -50,11 +51,32 @@ const (
 	channelRateLimitWindowSeconds = 60
 )
 
+// channelMemberManager is the MemberService surface used to add participants
+// (issue #398), declared here as the narrowest thing this handler needs.
+type channelMemberManager interface {
+	AddChannelMembers(ctx context.Context, input service.AddChannelMembersInput) (storage.AddMembersResult, error)
+	// SearchChannelMemberCandidates lists people not already in the channel.
+	SearchChannelMemberCandidates(ctx context.Context, input service.SearchChannelMemberCandidatesInput) ([]domain.DMCandidate, error)
+}
+
+// membersBroadcaster publishes the post-commit "this target changed" signal.
+// Declared as an interface so the HTTP layer never imports the ws package;
+// app.go adapts the hub to it, exactly as it does for pins.
+type membersBroadcaster interface {
+	PublishMembersAdded(ctx context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int)
+	// PublishConversationAvailable signals the newly added users directly, since
+	// they are not yet subscribed to the target and so cannot receive the
+	// room-scoped event above.
+	PublishConversationAvailable(ctx context.Context, workspaceID, targetType, targetID string, userIDs []string)
+}
+
 type ChannelHandler struct {
 	workspaces workspaceResolver
 	channels   channelProvider
 	limiter    channelRateLimiter
 	presence   presenceLookup
+	members    channelMemberManager
+	broadcast  membersBroadcaster
 }
 
 func NewChannelHandler(workspaces workspaceResolver, channels channelProvider, limiter channelRateLimiter) *ChannelHandler {
@@ -71,6 +93,26 @@ func (h *ChannelHandler) WithPresence(presence presenceLookup) *ChannelHandler {
 	next := *h
 	next.presence = presence
 	return &next
+}
+
+// WithMembers returns a handler that can add channel participants (issue #398).
+// Wired after the hub exists so the broadcaster is available; without it the
+// route is left unregistered rather than served without its realtime signal.
+func (h *ChannelHandler) WithMembers(members channelMemberManager, broadcast membersBroadcaster) *ChannelHandler {
+	if h == nil {
+		return nil
+	}
+	next := *h
+	next.members = members
+	next.broadcast = broadcast
+	return &next
+}
+
+// HasMembers reports whether the add-members route can be served. The router
+// asks before registering it, so a partially wired service answers 404 for a
+// route it cannot honour instead of 503 on every call.
+func (h *ChannelHandler) HasMembers() bool {
+	return h != nil && h.members != nil
 }
 
 // createChannelRequest is the whole accepted body. The workspace, the creator,
@@ -201,6 +243,12 @@ type channelDetailsResponse struct {
 	MemberCount       int                        `json:"member_count"`
 	OnlineMemberCount int                        `json:"online_member_count"`
 	OnlineMembers     []channelDetailsMemberJSON `json:"online_members"`
+	// CanManageMembers lets the panel disable an action the server would refuse
+	// (issue #398). It is a hint for the UI and never a control: the add-members
+	// route re-derives the same decision from the session on every call. It is
+	// always sent, so a client that predates it reads absent-as-false and hides
+	// the action — the safe direction — rather than enabling it by default.
+	CanManageMembers bool `json:"can_manage_members"`
 }
 
 // presenceOnline is the only status an entry in online_members can carry.
@@ -284,6 +332,252 @@ func channelDetailsBody(details service.ChannelDetails) channelDetailsResponse {
 		MemberCount:       details.MemberCount,
 		OnlineMemberCount: details.OnlineCount,
 		OnlineMembers:     members,
+		CanManageMembers:  details.CanManageMembers,
+	}
+}
+
+// ── Add members (issue #398) ─────────────────────────────────────────────────
+
+// addMembersRequest is the whole accepted body.
+//
+// One field, and it is the only thing a client is in a position to know: which
+// people the user picked. The workspace, the actor, the membership role, the
+// membership status and every eligibility verdict are server-derived and
+// deliberately absent — the strict decoder answers 400 to a client that sends
+// them, so there is no field through which a caller could nominate themselves an
+// admin, aim the write at another workspace, or assert that someone is eligible.
+type addMembersRequest struct {
+	UserIDs []string `json:"user_ids"`
+}
+
+// addMembersResponse reports what the write actually did.
+//
+// Added and AlreadyMembers are separate so a retry stays legible: the second
+// identical request reports the same people under already_members and adds
+// nothing, rather than looking like a fresh success or like a failure.
+// MemberCount is the server's post-commit total, so the panel updates its
+// counter from the authority instead of incrementing a local guess.
+type addMembersResponse struct {
+	Added          int `json:"added"`
+	AlreadyMembers int `json:"already_members"`
+	MemberCount    int `json:"member_count"`
+}
+
+// addMembersRateLimit is one budget for the whole add-participants capability.
+//
+// Deliberately a single action name shared by the channel and the group route,
+// following the channel-categories precedent: a caller must not get a separate
+// allowance per conversation type for what is the same write. Ten per minute is
+// far above a human using a picker and far below anything that could use the
+// endpoint to enumerate or to amplify membership rows.
+const addMembersRateLimit = 10
+
+// addMembersAction is the shared limiter namespace for both add-members routes.
+const addMembersAction = "add_members"
+
+// AddMembers handles POST /api/chat/channels/{channelID}/members.
+//
+// Transport concerns only. Who may add, who may be added, the batch cap, the
+// de-duplication and the atomicity all live below in MemberService and the
+// store; this function never inspects the list beyond decoding it, and never
+// makes an authorization decision of its own.
+//
+// The order matters: the caller is authenticated, then throttled, then the body
+// is read. Rate limiting before the body means an unauthenticated flood cannot
+// make the server parse anything, and decodeStrictJSON caps the read at
+// maxBodyBytes so an oversized payload is refused by the reader rather than
+// buffered.
+//
+// The realtime event is published only after the service returns successfully,
+// so a rolled-back transaction broadcasts nothing.
+func (h *ChannelHandler) AddMembers(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.members == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	allowed, err := h.limiter.AllowActionWithLimit(r.Context(), callerID, addMembersAction, addMembersRateLimit, channelRateLimitWindowSeconds)
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(channelRateLimitWindowSeconds))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return
+	}
+	if !requireJSONContentType(w, r) {
+		return
+	}
+	var request addMembersRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")
+		} else {
+			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+		}
+		return
+	}
+
+	result, err := h.members.AddChannelMembers(r.Context(), service.AddChannelMembersInput{
+		WorkspaceID: workspace.ID,
+		CallerID:    callerID,
+		ChannelID:   channelID,
+		UserIDs:     request.UserIDs,
+	})
+	if err != nil {
+		writeAddMembersError(w, err)
+		return
+	}
+	// Gated on the ID list rather than on Added: both come from the same
+	// RETURNING and cannot disagree, but the list is what the fan-out below
+	// addresses.
+	if h.broadcast != nil && len(result.AddedUserIDs) > 0 {
+		h.broadcast.PublishMembersAdded(
+			r.Context(), workspace.ID, "channel", channelID, callerID, result.Added, result.TotalCount,
+		)
+		// The people who were actually inserted are told directly: they do not
+		// subscribe to this channel yet, so the broadcast above cannot reach
+		// them. AddedUserIDs comes from the transaction's RETURNING, so a
+		// request that named an existing member does not signal them.
+		h.broadcast.PublishConversationAvailable(
+			r.Context(), workspace.ID, "channel", channelID, result.AddedUserIDs,
+		)
+	}
+	httputil.WriteJSON(w, http.StatusOK, addMembersResponse{
+		Added:          result.Added,
+		AlreadyMembers: result.AlreadyMembers,
+		MemberCount:    result.TotalCount,
+	})
+}
+
+// MemberCandidates handles GET /api/chat/channels/{channelID}/member-candidates.
+//
+// The contextual replacement for a workspace-wide people search. Who is
+// offerable depends on who is already in *this* channel, and only the database
+// knows that: the details panel's member section is presence-filtered and
+// capped, so it never was a membership list.
+//
+// Response fields are the two the picker renders. No e-mail, no role, no
+// membership state — a candidate list is not a directory.
+func (h *ChannelHandler) MemberCandidates(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.members == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	// Shares the enumeration budget with the workspace-wide DM candidate search,
+	// so adding a contextual route does not hand a caller a second allowance for
+	// probing who exists.
+	allowed, err := h.limiter.AllowActionWithLimit(
+		r.Context(), callerID, dmCandidateSearchAction, dmCandidateSearchRateLimit, channelRateLimitWindowSeconds,
+	)
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(channelRateLimitWindowSeconds))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return
+	}
+	limit, ok := parseCandidateLimit(w, r)
+	if !ok {
+		return
+	}
+	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")
+		} else {
+			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+		}
+		return
+	}
+
+	candidates, err := h.members.SearchChannelMemberCandidates(r.Context(), service.SearchChannelMemberCandidatesInput{
+		WorkspaceID: workspace.ID,
+		CallerID:    callerID,
+		ChannelID:   channelID,
+		Query:       r.URL.Query().Get("query"),
+		Limit:       limit,
+	})
+	if err != nil {
+		writeCandidateSearchError(w, err)
+		return
+	}
+	writeCandidates(w, candidates)
+}
+
+// writeCandidateSearchError maps both contextual candidate searches.
+//
+// A caller without management rights on a channel, and one who does not
+// participate in a group, both land on the same statuses the corresponding
+// write already returns, so the search cannot be used to discover something the
+// mutation would refuse to act on.
+func writeCandidateSearchError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid search")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+// writeAddMembersError maps the add-members failures for both routes.
+//
+// An unauthorized caller and an ineligible target both surface as ErrForbidden
+// and both answer 403. They are deliberately *not* separated: the layer that
+// raised the error would be enough to tell them apart internally, but exposing
+// that distinction is exactly what would turn the endpoint into an account
+// oracle. The body says only "forbidden" — never which user was refused, nor
+// whether they are suspended, deleted, in another workspace or nonexistent, so
+// the four are indistinguishable from outside.
+//
+// 404 covers a channel or conversation the caller cannot act on, collapsing
+// missing, archived, cross-workspace, wrong-type and not-a-participant into one
+// answer so the route cannot be used to probe which UUIDs exist.
+//
+// There is deliberately no capacity status. Channels and groups have no fixed
+// participant limit: the only bound is how many IDs one request may carry, and
+// exceeding that is ErrInvalidInput (400), because it is a property of the
+// request rather than of the conversation.
+//
+// No branch carries SQL text, a constraint name, a user ID or a rejected value.
+func writeAddMembersError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
 }
 

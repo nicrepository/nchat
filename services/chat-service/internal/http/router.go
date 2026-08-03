@@ -156,6 +156,15 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("GET "+RouteChannelDetails, authMiddleware(
 			msgListLimiter.Middleware(http.HandlerFunc(channels.Details)),
 		))
+		// Add members (issue #398) carries its own budget inside the handler, like
+		// the category mutations. Registered only when the member service is wired
+		// so a partially built service answers 404 for a route it cannot honour.
+		if channels.HasMembers() {
+			mux.Handle("POST "+RouteChannelMembers, authMiddleware(http.HandlerFunc(channels.AddMembers)))
+			// Contextual candidate search (issue #398): its own budget inside the
+			// handler, shared with the workspace-wide search.
+			mux.Handle("GET "+RouteChannelMemberCandidates, authMiddleware(http.HandlerFunc(channels.MemberCandidates)))
+		}
 	}
 	// RF-17 channel categories. Registered only when wired, like the channel and
 	// DM routes, so a build without the handler answers 404 on a route that does
@@ -174,6 +183,15 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
 		mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))
 		mux.Handle("POST "+RouteDMGroupConversations, authMiddleware(http.HandlerFunc(directMessages.CreateGroup)))
+		// Adding participants to an existing group (issue #398). Same shared
+		// add-members budget as the channel route, applied inside the handler.
+		mux.Handle("POST "+RouteDMMembers, authMiddleware(http.HandlerFunc(directMessages.AddParticipants)))
+		mux.Handle("GET "+RouteDMMemberCandidates, authMiddleware(http.HandlerFunc(directMessages.ParticipantCandidates)))
+		// Group details (issue #441) is a read, so it shares the listing budget
+		// rather than the write one: the panel refetches on every group switch.
+		mux.Handle("GET "+RouteDMDetails, authMiddleware(
+			msgListLimiter.Middleware(http.HandlerFunc(directMessages.Details)),
+		))
 	}
 
 	// DM message endpoints: GET list, POST create, GET single.

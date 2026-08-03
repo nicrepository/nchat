@@ -12,6 +12,7 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 const (
@@ -32,6 +33,19 @@ type fakeDMProvider struct {
 	searchCalls      int
 	createCalls      int
 	groupCreateCalls int
+
+	participantCandidates     []domain.DMCandidate
+	participantCandidatesErr  error
+	participantCandidateCalls int
+	lastParticipantCandidates service.SearchGroupParticipantCandidatesInput
+	groupDetails              service.GroupDetails
+	groupDetailsErr           error
+	groupDetailsCalls         int
+	lastGroupDetails          service.GroupDetailsInput
+	addMembersResult          storage.AddMembersResult
+	addMembersErr             error
+	addMembersCalls           int
+	lastAddMembers            service.AddGroupParticipantsInput
 }
 
 type fakeDMRateLimiter struct {
@@ -64,6 +78,26 @@ func (f *fakeDMProvider) GetOrCreateDirectConversation(_ context.Context, input 
 	f.createCalls++
 	f.lastCreateInput = input
 	return f.createOutput, f.createErr
+}
+
+func (f *fakeDMProvider) SearchGroupParticipantCandidates(
+	_ context.Context, input service.SearchGroupParticipantCandidatesInput,
+) ([]domain.DMCandidate, error) {
+	f.participantCandidateCalls++
+	f.lastParticipantCandidates = input
+	return f.participantCandidates, f.participantCandidatesErr
+}
+
+func (f *fakeDMProvider) GetGroupDetails(_ context.Context, input service.GroupDetailsInput) (service.GroupDetails, error) {
+	f.groupDetailsCalls++
+	f.lastGroupDetails = input
+	return f.groupDetails, f.groupDetailsErr
+}
+
+func (f *fakeDMProvider) AddGroupParticipants(_ context.Context, input service.AddGroupParticipantsInput) (storage.AddMembersResult, error) {
+	f.addMembersCalls++
+	f.lastAddMembers = input
+	return f.addMembersResult, f.addMembersErr
 }
 
 func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error) {

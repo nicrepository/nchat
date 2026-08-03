@@ -18,6 +18,18 @@ func dmConversationCols() []string {
 	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at"}
 }
 
+// dmMemberUpsertRows is what the participant upsert returns: how many of the
+// requested users were eligible, and which of them the statement actually made
+// active. The two are separate because they answer different questions — an
+// eligible user who was already a participant is counted but not returned, and
+// that gap is exactly what stops a re-add from being reported as an addition.
+func dmMemberUpsertRows(eligible int, addedUserIDs ...string) *pgxmock.Rows {
+	if addedUserIDs == nil {
+		addedUserIDs = []string{}
+	}
+	return pgxmock.NewRows([]string{"eligible", "added_user_ids"}).AddRow(eligible, addedUserIDs)
+}
+
 func TestPGXDMStore_CreateDirectConversation_CreatesCanonicalPair(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -31,9 +43,9 @@ func TestPGXDMStore_CreateDirectConversation_CreatesCanonicalPair(t *testing.T) 
 		WithArgs("ws-1", "user-1", "pair-key").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now))
-	mock.ExpectExec(`(?s)INSERT INTO chat\.dm_members.*unnest\(\$3::uuid\[\]\).*auth\.users u.*u\.status = 'active' AND u\.deleted_at IS NULL`).
+	mock.ExpectQuery(`(?s)unnest\(\$3::uuid\[\]\).*auth\.users u.*u\.status = 'active' AND u\.deleted_at IS NULL.*INSERT INTO chat\.dm_members`).
 		WithArgs("dm-1", "ws-1", []string{"user-1", "user-2"}).
-		WillReturnResult(pgxmock.NewResult("INSERT", 2))
+		WillReturnRows(dmMemberUpsertRows(2))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXDMStore(mock)
@@ -70,9 +82,9 @@ func TestPGXDMStore_CreateDirectConversation_ReturnsExistingCanonicalPair(t *tes
 		WithArgs("ws-1", "pair-key").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-1", "ws-1", "direct", "", "active", "user-2", now, now))
-	mock.ExpectExec(`INSERT INTO chat\.dm_members`).
+	mock.ExpectQuery(`INSERT INTO chat\.dm_members`).
 		WithArgs("dm-1", "ws-1", []string{"user-1", "user-2"}).
-		WillReturnResult(pgxmock.NewResult("INSERT", 2))
+		WillReturnRows(dmMemberUpsertRows(2))
 	mock.ExpectCommit()
 
 	result, err := storage.NewPGXDMStore(mock).CreateDirectConversation(context.Background(), storage.CreateDirectConversationInput{
@@ -119,13 +131,13 @@ func TestPGXDMStore_CreateDirectConversation_RollsBackFailurePaths(t *testing.T)
 		{name: "member", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", "user-1", "pair-key").WillReturnRows(conversationRows())
-			mock.ExpectExec(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1", "user-2"}).WillReturnError(errors.New("member failed"))
+			mock.ExpectQuery(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1", "user-2"}).WillReturnError(errors.New("member failed"))
 			mock.ExpectRollback()
 		}},
 		{name: "commit", setup: func(mock pgxmock.PgxPoolIface) {
 			mock.ExpectBegin()
 			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", "user-1", "pair-key").WillReturnRows(conversationRows())
-			mock.ExpectExec(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1", "user-2"}).WillReturnResult(pgxmock.NewResult("INSERT", 2))
+			mock.ExpectQuery(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1", "user-2"}).WillReturnRows(dmMemberUpsertRows(2))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 			mock.ExpectRollback()
 		}},
@@ -164,9 +176,9 @@ func TestPGXDMStore_CreateGroupConversation_CommitsConversationAndMembers(t *tes
 		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-group", "ws-1", "group", "Project", "active", "user-1", now, now))
-	mock.ExpectExec(`(?s)INSERT INTO chat\.dm_members.*unnest\(\$3::uuid\[\]\).*auth\.users u.*u\.status = 'active' AND u\.deleted_at IS NULL`).
+	mock.ExpectQuery(`(?s)unnest\(\$3::uuid\[\]\).*auth\.users u.*u\.status = 'active' AND u\.deleted_at IS NULL.*INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
-		WillReturnResult(pgxmock.NewResult("INSERT", 3))
+		WillReturnRows(dmMemberUpsertRows(3))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXDMStore(mock)
@@ -200,7 +212,7 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenMemberInsertFails(t *te
 		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now))
-	mock.ExpectExec(`INSERT INTO chat\.dm_members`).
+	mock.ExpectQuery(`INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
 		WillReturnError(errors.New("member insert failed"))
 	mock.ExpectRollback()
@@ -235,9 +247,9 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenAParticipantIsNotEligib
 	// Two of the three requested participants were eligible at write time: the
 	// count mismatch alone must abort the whole group, without the store having to
 	// know which one dropped out.
-	mock.ExpectExec(`INSERT INTO chat\.dm_members`).
+	mock.ExpectQuery(`INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
-		WillReturnResult(pgxmock.NewResult("INSERT", 2))
+		WillReturnRows(dmMemberUpsertRows(2))
 	mock.ExpectRollback()
 
 	store := storage.NewPGXDMStore(mock)
@@ -272,7 +284,7 @@ func TestPGXDMStore_CreateGroupConversation_PropagatesTransactionFailures(t *tes
 			mock.ExpectBegin()
 			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 				WillReturnRows(pgxmock.NewRows(dmConversationCols()).AddRow("dm-1", "ws-1", "group", "", "active", "user-1", now, now))
-			mock.ExpectExec(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1"}).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectQuery(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1"}).WillReturnRows(dmMemberUpsertRows(1))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 			mock.ExpectRollback()
 		}},
