@@ -24,7 +24,7 @@ import {
 
 type WSListener = (event: MessageEvent) => void;
 type OpenListener = () => void;
-type CloseListener = () => void;
+type CloseListener = (event: CloseEvent) => void;
 
 class FakeWebSocket {
   static OPEN = 1;
@@ -55,7 +55,7 @@ class FakeWebSocket {
 
   close() {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.(new CloseEvent("close", { code: 1006 }));
   }
 
   /** Test helper: simulate server pushing a message. */
@@ -1088,8 +1088,8 @@ describe("useChatWebSocket", () => {
     const ws = FakeWebSocket.instances[0];
     act(() => {
       ws.close();
-      ws.onclose?.();
-      ws.onclose?.();
+      ws.onclose?.(new CloseEvent("close", { code: 1006 }));
+      ws.onclose?.(new CloseEvent("close", { code: 1006 }));
       vi.advanceTimersByTime(FIRST_RETRY_MS);
     });
 

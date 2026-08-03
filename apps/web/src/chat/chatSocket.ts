@@ -30,6 +30,15 @@ const CHAT_WS_URL =
 
 export const CHAT_WS_SUBPROTOCOL = "nchat.v1";
 
+/**
+ * Close code the server sends when it permanently rejects the connection
+ * (e.g. the inbound rate limit was exceeded — see WS_INBOUND_BURST). Unlike
+ * a transient drop (1006, 1011, ...), retrying immediately would just resend
+ * the same messages and get closed again, so this code alone — never the
+ * reason string, which is diagnostic only — stops the reconnect loop.
+ */
+const WS_CLOSE_POLICY_VIOLATION = 1008;
+
 /** First retry lands in [BASE/2, BASE]; each further attempt doubles the ceiling. */
 export const RECONNECT_BASE_DELAY_MS = 1_000;
 /** Ceiling for the exponential term, so a long outage settles at ~15–30s. */
@@ -152,7 +161,11 @@ function discardSocket(): void {
 function ensureOnlineListener(): void {
   if (onlineListener) return;
   onlineListener = () => {
-    if (refCount === 0) return;
+    // Implicit trigger only: back online must never pull the connection out
+    // of a fatal "failed" state on its own — that recovery is reserved for
+    // an explicit new session (handleAuthChange) or a fresh acquireChatSocket
+    // call, both of which call connect() directly and are not guarded here.
+    if (refCount === 0 || status === "failed") return;
     // Back online is an explicit signal, so it also clears a bounded give-up.
     consecutiveFailures = 0;
     clearReconnectTimer();
@@ -256,12 +269,21 @@ function connect(): void {
     // is nothing to log here and nothing to schedule.
   };
 
-  created.onclose = () => {
+  created.onclose = (event: CloseEvent) => {
     if (socket !== created) return;
     socket = null;
     clearStabilityTimer();
-    consecutiveFailures = reachedOpen ? 0 : consecutiveFailures + 1;
     for (const listener of [...listeners]) listener.onClose?.(currentGeneration);
+    if (event.code === WS_CLOSE_POLICY_VIOLATION) {
+      // Permanent rejection: reconnecting would resend the same bootstrap
+      // burst and loop forever. Stop until an explicit new session or a new
+      // acquire retries — see handleAuthChange and acquireChatSocket.
+      clearReconnectTimer();
+      setStatus("failed");
+      devLog("stopped after policy violation close");
+      return;
+    }
+    consecutiveFailures = reachedOpen ? 0 : consecutiveFailures + 1;
     scheduleReconnect();
   };
 }

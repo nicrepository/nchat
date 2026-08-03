@@ -9,5 +9,10 @@ data:
   AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
   AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
   VALKEY_WS_BROADCAST_ENABLED: "true"
+  # chat-service bootstrap sends 1 call.sync + 12 subscribe messages right
+  # after open (issue #455); raising only the burst absorbs that spike while
+  # WS_INBOUND_MESSAGES_PER_MINUTE (sustained rate) stays at its code default.
+  # See docs/ws-hub-foundation.md#inbound-rate-limiting.
+  WS_INBOUND_BURST: "60"
   SEAWEEDFS_FILER_URL: null
   SEAWEEDFS_S3_ENDPOINT: null

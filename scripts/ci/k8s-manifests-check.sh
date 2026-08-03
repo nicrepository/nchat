@@ -353,6 +353,25 @@ validate_nchat_dev() {
   if grep -Eq 'name: s3|port: 8333|containerPort: 8333|[[:space:]]- -s3$' "$data"; then return 1; fi
   if grep -Eq 'SEAWEEDFS_(FILER_URL|S3_ENDPOINT)' "$application"; then return 1; fi
 
+  # WS_INBOUND_BURST=60 must be declared exactly once in nchat-config so the
+  # web client's bootstrap burst (1 call.sync + 12 subscribe messages) is not
+  # closed with 1008 (issue #455). The sustained rate must stay untouched.
+  # Kustomize's YAML map merge silently collapses a duplicate key in the
+  # source, so the duplication itself must be caught in the source overlay
+  # file, not only in the rendered/merged output.
+  if [[ "$(grep -c '^  WS_INBOUND_BURST:' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/configmap-patch.yaml")" -ne 1 ]]; then
+    echo "error: nchat-dev-server configmap-patch.yaml must declare WS_INBOUND_BURST exactly once" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '  WS_INBOUND_BURST: "60"' "$application")" -ne 1 ]]; then
+    echo "error: nchat-config must declare WS_INBOUND_BURST: \"60\" exactly once" >&2
+    return 1
+  fi
+  if grep -q 'WS_INBOUND_MESSAGES_PER_MINUTE' "$application"; then
+    echo "error: nchat-dev-server must not override WS_INBOUND_MESSAGES_PER_MINUTE" >&2
+    return 1
+  fi
+
   mapfile -t external_image_refs < <(
     grep -hE '^        image: (postgres|valkey/valkey|chrislusf/seaweedfs|livekit/livekit-server|coturn/coturn):' \
       "$application" "$data"
