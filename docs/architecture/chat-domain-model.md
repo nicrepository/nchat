@@ -575,6 +575,135 @@ redacted: deleted messages preserve identity, author, target, and chronology,
 but expose an empty body and no quote. Clients render the localized
 removed-message placeholder and suppress content actions and edit history.
 
+## Adding members to existing conversations (issue #398)
+
+Membership is **definitive**: there is no invite table, `chat.channel_members`
+has no status column, and `chat.dm_members.status` distinguishes only active from
+left. Adding somebody therefore takes effect at commit; "convidar" is interface
+wording, not a persisted state. No pending/accepted/declined/expired model was
+introduced, because supporting one honestly would need a table, a lifecycle and
+an expiry worker that nothing else in the domain has.
+
+The two conversation aggregates keep their own route, because they are different
+aggregates: `POST /api/chat/channels/{id}/members` and
+`POST /api/chat/dm/{id}/members`. There is deliberately no third notion of a
+"public group" or "private group" -- `chat.dm_conversations` has no visibility
+column, and none was added to satisfy the issue's generic wording. A 1:1 direct
+conversation refuses the operation: a third participant would convert it into a
+group, and its `direct_pair_key` would then describe a conversation that is no
+longer a pair.
+
+Authorization differs between the two because the schema does. Channels use
+`domain.CanManageChannelMembers` (active workspace `owner` or `admin`), the same
+authority that already removes a channel member. Groups take active
+participation, because `chat.dm_members.role` is closed by CHECK to `'member'`
+and a group has no privileged participant to require. Both decisions and the
+alternatives rejected are recorded in `SECURITY.md`.
+
+No migration was needed. The primary keys `(channel_id, user_id)` and
+`(conversation_id, user_id)` already give the uniqueness the idempotency relies
+on, `idx_channel_members_user` and `idx_dm_members_conversation_active` already
+serve the lookups, and the composite workspace FKs already bound the association.
+Both writes are one `INSERT ... SELECT` that tests eligibility in the same
+statement it writes, so the service's pre-check cannot be raced; a mismatch
+between requested and eligible rows aborts the transaction, and no partial
+membership survives. Group adds additionally lock the conversation row
+(`FOR SHARE`), which pins the authorization context -- not a capacity, of which
+there is none.
+
+Events are published only after commit, carry counts and never identities, and
+exist to tell subscribers to refetch -- the same shape `pin.updated` uses. The
+refetch is the single reconciliation path, so the HTTP response and the event
+arriving together cannot duplicate a member or double a counter.
+
+`members.added` reaches _subscribers_, which by construction excludes the people
+who were just added: they do not subscribe to a private channel or a group
+before belonging to it. `conversation.available` closes that gap -- the one
+user-scoped event in this protocol, delivered straight to the sessions of the
+users the transaction actually inserted (`AddMembersResult.AddedUserIDs`, from
+the statement's `RETURNING`, never from the request). Besides the conversation
+it names only its own addressee, which is what lets another instance route it,
+and it grants nothing: the client reacts by refetching the sidebar, which
+re-derives membership server-side.
+
+Both cross the `BroadcastBus`, because the session that needs the event is
+usually not on the pod that performed the write, and each keeps its own scope
+there: `members.added` re-enters the ordinary subscription fan-out on the
+receiving node, while `conversation.available` is routed by `recipient_user_id`.
+The bus is a trust boundary in both cases -- an envelope arriving over it
+asserts its own workspace, target and addressee, none of which the receiver
+decided. So a remote envelope is strictly canonicalized before anything else,
+and access is then re-derived from the authoritative record: per subscriber at
+fan-out for `members.added`, and for the named recipient before any frame is
+sent for `conversation.available`. Denial, error and timeout all fail closed.
+`source_instance_id` suppresses the publisher's own echo, and an event received
+from the bus is never republished onto it.
+
+### Authorization is re-derived inside the writing transaction
+
+Both writes take the authenticated actor as an explicit argument and re-establish
+their authority in the same transaction that inserts, under a row lock:
+
+- channels re-read `chat.workspace_members` for the actor and require an active
+  `owner`/`admin` row -- the SQL statement of `domain.CanManageChannelMembers`;
+- groups re-read the actor's active `chat.dm_members` row, joined to an active
+  workspace membership, because a participation row outlives the workspace
+  membership that justified it.
+
+The service still checks first, but only so a caller with no business here is
+refused before the conversation lookup can leak whether an ID exists. It is not
+the control: a role demoted, a membership suspended, or a participant removed
+between that check and the write leaves the transaction with nothing to insert
+from, and the whole thing rolls back with `ErrForbidden`. The service's
+verdict is deliberately not passed down as a boolean; a boolean computed a moment
+ago is exactly what the query exists to distrust.
+
+Lock order is conversation/channel -> actor membership -> target rows -> insert,
+the same order everywhere, so two of these cannot deadlock against each other.
+No lock is held across a WebSocket publish: events go out after commit.
+
+### Candidate search is conversation-scoped, not workspace-wide
+
+"Who can still be added" depends on who is already in the target, and only the
+database knows that. The details panels do not: a channel's member section is
+filtered by presence before its cap, and a group's participant list is capped at
+`domain.MaxDMDetailsParticipants`. Both are previews, and using them as the
+eligibility rule offered existing members as selectable — an offline channel
+member, or a group's 31st participant onwards.
+
+`GET /api/chat/channels/{id}/member-candidates` and
+`GET /api/chat/dm/{id}/member-candidates` exclude current members with a
+`NOT EXISTS` in the same statement that filters for eligibility, under the same
+authorization the corresponding write uses. The client sends only a query and an
+optional limit; it never sends a membership list, and it does not filter by one.
+
+The search is a snapshot and the write remains the authority: someone may join
+between the two, and that race resolves as an idempotent `added: 0` rather than
+an error.
+
+### No fixed conversation capacity
+
+Channels and groups have **no total participant limit**. A conversation may grow
+without bound across successive requests, and there is no "full" state, no
+capacity conflict and no ceiling check anywhere in the write path.
+
+The only bound is `domain.MaxAddMembersPerRequest` (25), which caps how many IDs
+a single HTTP request may carry — an operational and anti-abuse bound on the
+payload. Exceeding it is `ErrTooManyMembersRequested`, which wraps
+`ErrInvalidInput` and answers 400, because it describes the request rather than
+the conversation. Reading multiple successive requests as a way around a limit
+would be a category error: there is no limit to get around.
+
+The store still opens a transaction and still locks, but only `FOR SHARE`, and
+only to pin the authorization context while the write happens — archiving the
+conversation or revoking the actor are UPDATEs that conflict with `FOR SHARE`.
+With no ceiling to serialise, two people adding different users to the same
+large conversation proceed in parallel instead of queueing.
+
+What the transaction does compute is which of the requested users _newly_ became
+participants. That is not a capacity check: it is what `AddedUserIDs` reports,
+and therefore who the user-scoped fan-out addresses.
+
 ## Cross-schema identity
 
 `workspace_members.user_id`, `channel_members.user_id`, `dm_members.user_id`,

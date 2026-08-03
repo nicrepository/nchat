@@ -128,6 +128,45 @@ do escopo da tarefa. `CanManageChannelCategories` e a costura nomeada
 para incluir um papel real de moderacao de workspace quando o RF-74
 criar um. Mesma forma de divergencia registrada acima para RF-05.
 
+## Autorizacao para adicionar membros
+
+Adicionar participantes a um **canal** (issue #398) exige papel ativo de `owner`
+ou `admin` no workspace, exposto como `domain.CanManageChannelMembers`, que
+delega a `CanManageWorkspace`. E o mesmo gate ja usado para update/archive de
+canal, para categorias e para a operacao inversa -- remover membro de canal, que
+`MemberService.RemoveMemberFromChannel` ja restringia a owner/admin. Adicionar e
+remover a mesma linha sao a mesma autoridade;
+`docs/runbooks/task-chat-channel-join-leave.md` ja chamava a adicao de
+"manager-add flow".
+
+Deliberadamente **nao** e "qualquer membro do canal": isso permitiria a quem
+apenas le um canal privado ampliar a audiencia dele, que e precisamente a
+propriedade que um canal privado tem. O papel `moderator` de
+`chat.channel_members` tambem nao e consultado -- nenhum caminho de codigo o
+atribui, entao decidir por ele seria codigo morto ocupando o lugar de uma
+verificacao real. Mesma forma de divergencia registrada para RF-05 e RF-17.
+`CanManageChannelMembers` e a costura nomeada para alargar quando o RF-74 criar
+um papel real de moderacao.
+
+Adicionar participantes a um **grupo** (`chat.dm_conversations` com
+`type = 'group'`) exige apenas participacao ativa na conversa. Nao ha gestor a
+exigir: `chat.dm_members.role` e fechado por CHECK ao unico valor `'member'`,
+entao um grupo nao tem owner, admin nem moderador. Usar `CanManageWorkspace` aqui
+seria **mais permissivo, nao menos**: um admin de workspace nao e participante,
+nao enxerga a conversa pela politica SQL de DM, e lhe dar autoridade sobre uma
+conversa privada entre pares que ele nao pode ler seria escalacao. Usar
+`created_by` congelaria o grupo quando o criador sai e essa coluna nunca e usada
+para autorizacao neste servico. Qualquer participante ja pode criar um grupo novo
+com qualquer pessoa do workspace, entao a regra nao concede poder novo.
+
+DM 1:1 nao aceita a operacao: adicionar uma terceira pessoa converteria a
+conversa em grupo, o que esta fora do escopo da issue.
+
+Em ambas as rotas, um chamador sem permissao e um usuario inelegivel respondem o
+mesmo `403`, sem dizer qual usuario nem se ele esta suspenso, deletado, em outro
+workspace ou inexistente -- distinguir isso transformaria a rota em um oraculo de
+contas.
+
 ## Regras para uploads
 
 - Definir limite de tamanho.

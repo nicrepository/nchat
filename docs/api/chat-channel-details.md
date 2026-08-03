@@ -150,3 +150,228 @@ Sem N+1: uma consulta por requisicao, uma leitura de presenca por requisicao,
 ordenacao deterministica (`lower(display_name)` com `user_id` como desempate) e
 limite constante do servidor. O `LEFT JOIN LATERAL` sobre uma linha unica
 garante que as contagens voltem mesmo quando ninguem esta online.
+
+## Adicionar membros (issue #398)
+
+| Metodo | Rota publica                             | Descricao              |
+| ------ | ---------------------------------------- | ---------------------- |
+| POST   | `/api/chat/channels/{channelID}/members` | adiciona participantes |
+
+Exige `Authorization: Bearer <access-token>` e sessao ativa. O workspace nao
+aparece na rota: e resolvido no servidor a partir da sessao, como nas demais.
+
+### Autorizacao
+
+`owner` ou `admin` ativo do workspace, via `domain.CanManageChannelMembers` --
+que delega a `CanManageWorkspace`, o mesmo gate de update/archive de canal e de
+categorias. **Nao** e "qualquer membro do canal": isso permitiria a quem apenas
+le um canal privado ampliar a audiencia dele, que e exatamente a propriedade que
+um canal privado tem. O papel `moderator` de `chat.channel_members` nao e
+consultado porque nenhum caminho de codigo o atribui; a divergencia esta
+registrada em `SECURITY.md`.
+
+A autorizacao e verificada **antes** de o canal ser lido, entao um chamador sem
+permissao nao descobre pela resposta se um UUID de canal existe.
+
+O campo `can_manage_members` da resposta de `GET .../details` carrega a mesma
+decisao para o painel decidir se mostra a acao. E uma dica de renderizacao, nunca
+o controle: este endpoint reavalia a decisao a cada chamada. Ausente ou invalido
+e lido como `false` pelo cliente.
+
+### Corpo
+
+```json
+{ "user_ids": ["22222222-2222-4222-8222-222222222222"] }
+```
+
+`user_ids` e o **unico** campo aceito. `workspace_id`, `actor_id`, `role`,
+`created_by`, `status` e qualquer afirmacao de elegibilidade sao derivados no
+servidor e o decoder estrito responde `400` a um corpo que os carregue. O papel
+do novo membro e sempre `member`.
+
+### Limites
+
+> **Canais e grupos nao possuem limite total fixo de participantes.** O endpoint
+> aceita no maximo 25 IDs por requisicao por motivo operacional e de protecao
+> contra abuso. Requisicoes sucessivas podem adicionar outros membros, sem teto
+> de composicao. Nao existe estado "conversa cheia" e nenhuma resposta reporta
+> capacidade esgotada.
+
+- maximo de `domain.MaxAddMembersPerRequest` (25) IDs por requisicao, verificado
+  na lista crua antes de qualquer parse. **E o tamanho de um lote HTTP, nao a
+  capacidade da conversa**: exceder resulta em `400`, porque e uma propriedade
+  da requisicao, nao do canal;
+- lista vazia e recusada -- uma adicao que nao adiciona ninguem e erro de
+  cliente, nao sucesso;
+- IDs duplicados sao normalizados (canonicalizados e deduplicados), nao
+  recusados;
+- corpo limitado a 64 KiB pelo `maxBodyBytes` compartilhado;
+- orcamento de 10 chamadas por usuario por 60s, **compartilhado com a rota de
+  grupo** (acao `add_members`), para que trocar o tipo de conversa nao renda uma
+  segunda cota.
+
+### Semantica
+
+**Inclusao imediata.** O dominio nao tem estado de convite pendente -- nao ha
+tabela de convites e `chat.channel_members` nao tem coluna de status -- entao a
+pessoa passa a participar no commit. "Convidar" e apenas linguagem de interface.
+
+**Atomica.** Um unico `INSERT ... SELECT` decide elegibilidade e escreve na mesma
+sentenca; se qualquer ID nao for elegivel, a transacao inteira e revertida e
+ninguem e adicionado. Nao existe sucesso parcial.
+
+**Idempotente.** A PK `(channel_id, user_id)` com `ON CONFLICT DO NOTHING` e o
+arbitro: duplo clique, retry apos timeout e dois gestores adicionando a mesma
+pessoa simultaneamente convergem em uma linha. Quem ja participava e contado em
+`already_members`, nao tratado como erro.
+
+**Autorizacao reavaliada na transacao.** O ator autenticado e passado ate o
+store, que relê e bloqueia sua linha de `chat.workspace_members` exigindo
+`owner`/`admin` ativo **dentro da mesma transacao que insere**. A verificacao no
+service continua existindo apenas para recusar um chamador antes que a busca do
+canal revele se um ID existe; ela nao e o controle. Um papel rebaixado, uma
+membership suspensa ou removida entre as duas etapas resulta em `403`, sem
+persistir nenhuma membership e sem publicar evento.
+
+`#geral` e recusado: a participacao la e mantida pela sincronizacao de workspace.
+
+### Resposta `200`
+
+```json
+{ "data": { "added": 2, "already_members": 1, "member_count": 14 } }
+```
+
+`member_count` e o total apos o commit, lido na mesma transacao. O cliente
+atualiza o contador com esse valor em vez de incrementar um numero local, para
+nao divergir de uma adicao concorrente.
+
+### Erros
+
+| Status | Codigo                | Quando                                                                                           |
+| ------ | --------------------- | ------------------------------------------------------------------------------------------------ |
+| 400    | `bad_request`         | `channelID` invalido, JSON malformado, campo desconhecido, lista vazia, ID nao-UUID, acima de 25 |
+| 401    | `unauthorized`        | token ausente/invalido ou sessao inativa                                                         |
+| 403    | `forbidden`           | chamador nao e owner/admin, **ou** algum usuario nao e elegivel                                  |
+| 404    | `not_found`           | canal inexistente, arquivado, de outro workspace                                                 |
+| 415    | `bad_request`         | content type diferente de `application/json`                                                     |
+| 429    | `rate_limited`        | orcamento excedido                                                                               |
+| 503    | `service_unavailable` | handler nao conectado, ou limitador indisponivel (fail-closed)                                   |
+
+O `403` **nao** distingue "chamador sem permissao" de "usuario inelegivel", nem
+diz qual usuario, nem se ele esta suspenso, deletado, em outro workspace ou nao
+existe. Distinguir isso transformaria a rota em um oraculo de contas. Nenhuma
+resposta carrega SQL, nome de constraint, ID de usuario ou o valor recusado.
+
+### Busca contextual de candidatos
+
+| Metodo | Rota publica                                       |
+| ------ | -------------------------------------------------- |
+| GET    | `/api/chat/channels/{channelID}/member-candidates` |
+
+Parametros: `query` (2 a 64 caracteres) e `limit` opcional (padrao 20, maximo
+50, sempre clampado no servidor). Nada mais e aceito — workspace e ator vem da
+sessao, e um `workspace_id` na query string e simplesmente ignorado.
+
+Autorizacao: a mesma de `POST .../members` (`owner`/`admin` ativo), verificada
+**antes** de o canal ser lido. Isso e deliberado: a rota revela quem **nao** esta
+num canal, o que e um fato sobre a composicao de um canal privado.
+
+A resposta traz apenas `user_id` e `display_name`:
+
+```json
+{ "data": { "candidates": [{ "user_id": "...", "display_name": "Alvaro" }] } }
+```
+
+**Membros atuais sao excluidos por `NOT EXISTS` na propria consulta.** Isso
+importa porque `online_members` do painel e uma previa _filtrada por presenca_:
+um membro offline nao aparece nela. Usar essa lista para decidir elegibilidade
+fazia um membro existente ser ofertado como selecionavel. O cliente nao envia
+lista de membros e nao filtra por ela.
+
+A busca e um snapshot: alguem pode entrar entre a pesquisa e a confirmacao.
+`POST .../members` continua sendo a autoridade final e permanece idempotente —
+uma corrida legitima resulta em `added: 0`, nao em erro.
+
+### Evento em tempo real
+
+Apos o commit -- e somente apos -- o hub publica `members.added` na sala do
+canal:
+
+```json
+{
+  "type": "members.added",
+  "target_type": "channel",
+  "target_id": "...",
+  "members": { "actor_user_id": "...", "added_count": 2, "member_count": 14 }
+}
+```
+
+O evento **nao nomeia ninguem**: quem pode ver um roster e decisao por leitor,
+tomada pelo endpoint de detalhes, e nao por um broadcast enviado a todos os
+inscritos de uma vez. O cliente o trata como "sua visao esta desatualizada" e
+refaz o fetch, igual ao `pin.updated`.
+
+#### `conversation.available` (user-scoped)
+
+`members.added` vai para os **assinantes** do alvo — e quem acabou de ser
+adicionado nao e assinante ainda, entao nao o receberia. Por isso, apos o commit,
+o hub envia tambem:
+
+```json
+{ "type": "conversation.available", "target_type": "channel", "target_id": "..." }
+```
+
+diretamente as sessoes dos usuarios **efetivamente inseridos**, sem depender de
+subscription alguma.
+
+- Destinatarios vem do `RETURNING` da transacao (`AddedUserIDs`), nunca do
+  payload da requisicao: um `user_ids` que nomeia alguem que ja era membro nao
+  gera sinal para essa pessoa, e um retry com `added: 0` nao gera sinal nenhum.
+- Entregue apenas a sessoes do mesmo workspace, e a todas as sessoes vivas do
+  destinatario.
+- Nao carrega nomes, e-mails, papeis, conteudo nem qualquer identidade de
+  terceiros — em particular, nao nomeia as outras pessoas adicionadas na mesma
+  operacao. O unico ID presente e `recipient_user_id`, o proprio destinatario:
+  ele e a chave de roteamento entre instancias, e nomear o destinatario para o
+  destinatario nao revela nada. E um evento por destinatario, exatamente para
+  que nenhum deles aprenda sobre os outros.
+- **Nao concede acesso**: o cliente reage recarregando `GET /api/chat/sidebar`,
+  que reavalia a participacao no servidor.
+- Uma falha de publicacao pos-commit nao desfaz a membership; a sidebar fica
+  correta no proximo carregamento.
+
+E por isso que nao ha duplicacao entre HTTP e WebSocket: **ha um unico caminho de
+reconciliacao**, o refetch, que substitui a secao inteira em vez de anexar. A
+resposta HTTP e o evento chegando juntos custam um fetch a mais e nada mais.
+Nenhum evento e publicado quando a operacao falha ou quando ninguem foi
+adicionado.
+
+#### Entrega entre instancias
+
+Os dois eventos atravessam o `BroadcastBus`, porque a sessao interessada
+raramente esta no pod que executou a escrita. Cada um mantem seu escopo:
+
+|                              | `members.added`                     | `conversation.available`          |
+| ---------------------------- | ----------------------------------- | --------------------------------- |
+| Escopo                       | alvo (sala)                         | usuario                           |
+| Roteamento remoto            | assinantes do `(workspace, target)` | `recipient_user_id`               |
+| Exige subscription           | sim                                 | nao                               |
+| Reautorizacao no no receptor | por assinante, no fan-out           | do destinatario, antes da entrega |
+
+O barramento e uma fronteira de confianca: um envelope que chega por ele nomeia
+o proprio escopo, e nada disso foi decidido por quem o recebe. Por isso:
+
+- **Canonicalizacao estrita.** Tipo, workspace, alvo, tipo de alvo, `event_id` e
+  `source_instance_id` sao validados; UUIDs sao normalizados; campos de outros
+  tipos de evento sao descartados. Envelope invalido e derrubado sem entrega.
+- **Reautorizacao.** `members.added` reusa o caminho normal de broadcast, que ja
+  reavalia o acesso de cada assinante no fan-out. `conversation.available` e
+  reautorizado contra o alvo antes de chegar a qualquer sessao — a API da
+  sidebar nao e a unica barreira. Negacao, erro e timeout **falham fechado**.
+- **Sem eco e sem republicacao.** `source_instance_id` descarta a copia que
+  volta para quem publicou, e um evento recebido do barramento nunca e
+  republicado nele.
+
+Uma falha de publicacao no barramento e best-effort, como nos demais eventos:
+custa uma visao desatualizada ate o proximo refetch, nunca a membership que ja
+foi commitada.
