@@ -235,6 +235,60 @@ type DMConversation struct {
 	UpdatedAt   time.Time
 }
 
+// DMParticipantProfile is one participant of a group conversation as the
+// group-details panel renders them (issue #441).
+//
+// It carries a stable ID (for a deterministic avatar colour and for "this is
+// you"), the already-resolved visual name, an optional avatar URL and the live
+// presence status. E-mail, workspace role, join date and every other profile
+// attribute are deliberately absent.
+//
+// There is no Role field, unlike ChannelMemberProfile: chat.dm_members.role is
+// closed by CHECK to the single value 'member', so it carries no information a
+// panel could show. A group has no owner or moderator in this domain.
+//
+// Presence is decoration here, not a filter: unlike the channel panel — whose
+// list is defined as "the members who are online" — a group's participant list
+// is every active participant, and someone being offline never removes them
+// from it. Presence is therefore resolved for the returned page rather than
+// used to select it.
+type DMParticipantProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Presence    string
+}
+
+// DMDirectProfile is the other participant of a 1:1 conversation, as the
+// profile panel renders them (issue #443).
+//
+// It is a strictly larger projection than DMParticipantProfile by exactly one
+// field — Email — because the prototype's profile card shows the corporate
+// address and a participant row does not. Everything else auth.users holds
+// (auth_source, external_subject, status, last_login_at, email_verified_at,
+// the password credential, every session and device row) stays out: this is a
+// profile summary, not a directory record.
+//
+// Job title, department and time zone are deliberately absent as fields. No
+// column anywhere in auth.users, chat.workspace_members or any other table
+// stores them today, so there is nothing to project; inventing a field the
+// database cannot fill would only move the fabrication one layer down. The
+// panel renders "Não informado" for those rows, which is the truth.
+type DMDirectProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+	Email       string
+}
+
+// MaxDMDetailsParticipants bounds the participant page the group-details
+// endpoint returns.
+//
+// The panel shows a short preview, not the roster, so the response is capped
+// server-side and the total is reported separately. A client asking for more
+// gets this many.
+const MaxDMDetailsParticipants = 30
+
 // DMMember represents membership in a DM conversation.
 // LeftAt is zero when NULL in the database.
 type DMMember struct {
@@ -274,38 +328,6 @@ type DMCandidate struct {
 	UserID      string
 	DisplayName string
 }
-
-// DMParticipantProfile is one participant of a group conversation as the
-// group-details panel renders them (issue #441).
-//
-// It carries a stable ID (for a deterministic avatar colour and for "this is
-// you"), the already-resolved visual name, an optional avatar URL and the live
-// presence status. E-mail, workspace role, join date and every other profile
-// attribute are deliberately absent.
-//
-// There is no Role field, unlike ChannelMemberProfile: chat.dm_members.role is
-// closed by CHECK to the single value 'member', so it carries no information a
-// panel could show. A group has no owner or moderator in this domain.
-//
-// Presence is decoration here, not a filter: unlike the channel panel — whose
-// list is defined as "the members who are online" — a group's participant list
-// is every active participant, and someone being offline never removes them
-// from it. Presence is therefore resolved for the returned page rather than
-// used to select it.
-type DMParticipantProfile struct {
-	UserID      string
-	DisplayName string
-	AvatarURL   string
-	Presence    string
-}
-
-// MaxDMDetailsParticipants bounds the participant page the group-details
-// endpoint returns.
-//
-// The panel shows a short preview, not the roster, so the response is capped
-// server-side and the total is reported separately. A client asking for more
-// gets this many.
-const MaxDMDetailsParticipants = 30
 
 // CanReadChannel reports whether a user may read ch.
 // wm is the workspace membership (nil = non-member).

@@ -154,26 +154,47 @@ func ServeWSWithConfig(hub *Hub, logger *slog.Logger, workspaces WorkspaceResolv
 
 func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rejectCredentialQueryParams(w, r) {
+		h.logUpgrade(r, http.StatusBadRequest, "credentials_in_query")
 		return
 	}
 	userID, ok := requireAuthenticatedUser(w, r, h.userIDFromCtx)
 	if !ok {
+		h.logUpgrade(r, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
 	if h.hub == nil || h.workspaces == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "WebSocket not available")
+		h.logUpgrade(r, http.StatusServiceUnavailable, "websocket_not_wired")
 		return
 	}
 	workspaceID, ok := resolveWorkspace(w, r, h.workspaces)
 	if !ok {
+		h.logUpgrade(r, http.StatusInternalServerError, "workspace_unresolved")
 		return
 	}
 	if !h.limiter.acquire(userID) {
 		httputil.WriteError(w, http.StatusTooManyRequests, "too_many_connections", "connection limit reached")
+		h.logUpgrade(r, http.StatusTooManyRequests, "connection_limit_reached")
 		return
 	}
 	defer h.limiter.release(userID)
 	runConnection(w, r, h.hub, h.logger, userID, workspaceID, h.config)
+}
+
+// logUpgrade records the outcome of one upgrade attempt so an operator can tell
+// a rejection by this service apart from a proxy-level failure, which never
+// reaches this code at all (issue #449).
+//
+// reason is a fixed server-chosen string, never client input. The request ID is
+// the correlation key httputil.RequestID already put on the request and echoed
+// in the response header. Nothing here carries a token, a cookie, an Origin, a
+// user ID or any message content.
+func (h *wsHandler) logUpgrade(r *http.Request, status int, reason string) {
+	h.logger.InfoContext(r.Context(), "ws: upgrade rejected",
+		"status", status,
+		"reason", reason,
+		"request_id", httputil.RequestIDFromContext(r.Context()),
+	)
 }
 
 // rejectCredentialQueryParams returns true and writes 400 if any query parameter
@@ -239,8 +260,11 @@ func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slo
 		Subprotocols: []string{wsutil.NegotiatedSubprotocol},
 	})
 	if err != nil {
-		// websocket.Accept writes the error response itself.
-		logger.WarnContext(r.Context(), "ws: upgrade failed")
+		// websocket.Accept writes the error response itself. The library error
+		// can name internal state, so only the fact and the correlation ID are
+		// recorded.
+		logger.WarnContext(r.Context(), "ws: upgrade failed",
+			"request_id", httputil.RequestIDFromContext(r.Context()))
 		return
 	}
 	conn.SetReadLimit(maxInboundMessageBytes)
@@ -313,6 +337,9 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			if handleReactionClientError(c, msgErr) {
 				continue
 			}
+			if isCallClientMessage(msg.Type) && handleCallClientError(c, msg.Type, msg.CallID, msgErr) {
+				continue
+			}
 			if msg.Type == ClientMessageTypeSubscribe {
 				if c.ctx.Err() != nil || ctx.Err() != nil || errors.Is(msgErr, ErrClientNotRegistered) {
 					return
@@ -357,6 +384,7 @@ type clientErrorResponse struct {
 	Type       string `json:"type"`
 	Operation  string `json:"operation,omitempty"`
 	Code       string `json:"code"`
+	CallID     string `json:"call_id,omitempty"`
 	RetryAfter int    `json:"retry_after,omitempty"`
 }
 

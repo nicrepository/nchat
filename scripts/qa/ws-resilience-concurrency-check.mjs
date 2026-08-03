@@ -16,6 +16,9 @@
  *   QA_PASSWORD            Shared password for all three test accounts
  *
  * Optional env vars:
+ *   QA_WS_DIRECT_BASE_URL  In-cluster WS base URL reaching the Service directly
+ *                          (e.g. ws://chat-service.nchat-dev:8082). Enables the
+ *                          public-vs-direct handshake comparison in step 2.
  *   QA_CONCURRENT_N    Number of concurrent messages per test (default: 10)
  *   QA_TIMEOUT_MS      Per-operation timeout in milliseconds (default: 8000)
  *   PG_DSN             PostgreSQL DSN for optional persistence cross-check
@@ -43,6 +46,13 @@ const EMAIL2       = process.env.QA_USER2_EMAIL          ?? "";
 const EMAIL3       = process.env.QA_USER3_EMAIL          ?? "";
 const PASSWORD     = process.env.QA_PASSWORD             ?? "";
 const PG_DSN       = process.env.PG_DSN                  ?? "";
+/**
+ * Optional in-cluster WebSocket base URL, e.g. ws://chat-service.nchat-dev:8082.
+ * When set, step 2 probes the same handshake through the public host and
+ * straight at the Service, which is what separates a proxy-level 502 from a
+ * backend rejection (issue #449).
+ */
+const WS_DIRECT    = (process.env.QA_WS_DIRECT_BASE_URL ?? "").replace(/\/$/, "");
 const CONCURRENT_N = Math.max(1, parseInt(process.env.QA_CONCURRENT_N ?? "10", 10));
 const TIMEOUT_MS   = Math.min(30_000, Math.max(1000, parseInt(process.env.QA_TIMEOUT_MS ?? "8000", 10)));
 
@@ -301,6 +311,7 @@ function waitForClose(sock, timeoutMs = TIMEOUT_MS) {
 
 const RESULTS = {
   AUTH_NEGATIVE_OK:        false,
+  HANDSHAKE_ORIGIN_OK:     false,
   CHANNEL_CONCURRENCY_OK:  false,
   DM_CONCURRENCY_OK:       false,
   RECONNECT_OK:            false,
@@ -363,6 +374,37 @@ try {
   RESULTS.AUTH_NEGATIVE_OK = true;
   console.log("  ✓ AUTH_NEGATIVE_OK");
 } catch (e) { abort(`Auth negative tests: ${e.message}`); }
+
+// ---------------------------------------------------------------------------
+// Step 2b — Public vs direct handshake (optional; classifies the failing hop)
+// ---------------------------------------------------------------------------
+//
+// A rejection by chat-service is a typed status it chose (401/400/429/503). A
+// 502 or 503 is emitted by the proxy because the round trip to the pod failed,
+// and chat-service never saw the request. Probing both hops with the same
+// unauthenticated upgrade tells the two apart without any credential.
+
+if (WS_DIRECT) {
+  console.log("\nStep 2b: Public vs direct handshake...");
+  try {
+    const publicStatus = await upgradeStatus(WS_ENDPOINT);
+    const directStatus = await upgradeStatus(`${WS_DIRECT}/api/chat/ws`);
+    console.log(`  public → ${publicStatus}   direct → ${directStatus}`);
+
+    if (directStatus !== 401) {
+      console.log("  ✗ HANDSHAKE_ORIGIN: backend — chat-service did not answer 401 on the Service.");
+      console.log("    Inspect the pod: readiness, container port, router registration.");
+    } else if (publicStatus === 401) {
+      RESULTS.HANDSHAKE_ORIGIN_OK = true;
+      console.log("  ✓ HANDSHAKE_ORIGIN_OK — both hops reach the handler; any 502 is transient.");
+    } else {
+      console.log(`  ✗ HANDSHAKE_ORIGIN: proxy — backend answers 401, public answers ${publicStatus}.`);
+      console.log("    The Ingress/Traefik → Service → pod hop is what fails, not the application.");
+    }
+  } catch (e) { abort(`Handshake comparison: ${e.message}`); }
+} else {
+  console.log("\nStep 2b: skipped (QA_WS_DIRECT_BASE_URL not set).");
+}
 
 // ---------------------------------------------------------------------------
 // Step 3 — Channel concurrency
@@ -544,7 +586,10 @@ console.log("\n═════════════════════�
 console.log("WS RESILIENCE & CONCURRENCY — FINAL REPORT");
 console.log("═══════════════════════════════════════════════");
 for (const [key, val] of Object.entries(RESULTS)) {
-  const mark = key === "LOG_AUDIT_MANUAL" ? "⚠" : (val ? "✓" : "✗");
+  // HANDSHAKE_ORIGIN_OK is diagnostic and optional, so a false there is
+  // "not measured", not a failure of the suite.
+  const optional = key === "LOG_AUDIT_MANUAL" || (key === "HANDSHAKE_ORIGIN_OK" && !WS_DIRECT);
+  const mark = optional ? "⚠" : (val ? "✓" : "✗");
   console.log(`  ${mark} ${key}`);
 }
 console.log("═══════════════════════════════════════════════\n");

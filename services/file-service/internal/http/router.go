@@ -89,9 +89,10 @@ func registerAttachmentRoutes(
 	}
 	mux.Handle("POST "+RouteChannelAttachments, upload(handler.UploadToChannel))
 	mux.Handle("POST "+RouteDMAttachments, upload(handler.UploadToConversation))
-	// Listing a channel's recent attachments (issue #435) is a read, so it is
-	// authenticated but not counted against the upload budget.
+	// Listing a destination's recent attachments (issues #435 and #441) is a
+	// read, so it is authenticated but not counted against the upload budget.
 	mux.Handle("GET "+RouteChannelAttachments, authenticated(http.HandlerFunc(handler.ListChannelAttachments)))
+	mux.Handle("GET "+RouteDMAttachments, authenticated(http.HandlerFunc(handler.ListConversationAttachments)))
 	mux.Handle("GET "+RouteAttachment, authenticated(http.HandlerFunc(handler.GetMetadata)))
 	mux.Handle("GET "+RouteAttachmentContent, authenticated(http.HandlerFunc(handler.DownloadContent)))
 }

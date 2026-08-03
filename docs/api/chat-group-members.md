@@ -153,6 +153,11 @@ arquivada, de outro workspace, sem participacao ativa **ou do tipo `direct`** �
 todos colapsam na mesma resposta, entao a rota nao serve para descobrir quais
 UUIDs existem nem para distinguir um grupo de uma DM 1:1 que o chamador nao ve.
 
-No frontend, `GroupDetailsPanel` renderiza esse payload e integra a acao
-**Adicionar membros**, que abre o mesmo `AddMembersDialog` usado por canais. DM
-1:1 nao tem painel nem acao.
+No frontend, quem renderiza esse payload e integra a acao **Adicionar
+participantes** e o `ConversationDetailsPanel` — o mesmo painel unificado dos
+canais e das DMs 1:1, selecionado pelo discriminante `kind` — abrindo o mesmo
+`AddMembersDialog` usado por canais.
+
+A DM 1:1 tem painel (o perfil do outro participante), mas **nunca** a acao de
+adicionar: uma terceira pessoa converteria a conversa em grupo, o que esta fora
+do escopo desta issue.

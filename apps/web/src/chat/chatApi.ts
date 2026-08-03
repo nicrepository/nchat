@@ -15,13 +15,15 @@ import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
+  parseDMConversationType,
   type AddMembersResult,
   type Channel,
   type ChannelDetails,
   type ChannelMemberProfile,
   type GroupDetails,
-  type GroupParticipant,
+  type GroupParticipantProfile,
   type DMCandidate,
+  type DirectDetails,
   type DirectDMResult,
   type MessageBodyFormat,
   type MentionCandidate,
@@ -56,7 +58,8 @@ interface SidebarDMCounterpartResponse {
 
 interface SidebarDMResponse {
   id: string;
-  type: "direct" | "group";
+  /** Declared as the two documented values; validated as `unknown` anyway. */
+  type?: unknown;
   name: string;
   /** Absent on group DMs and on pre-counterpart server responses. */
   counterpart?: SidebarDMCounterpartResponse;
@@ -198,14 +201,35 @@ function mapSidebarCounterpart(raw: SidebarDMCounterpartResponse | undefined) {
   };
 }
 
-function mapSidebarDM(dm: SidebarDMResponse): DMConversation {
+/**
+ * Maps one sidebar conversation, or drops it.
+ *
+ * A conversation whose `type` this build does not recognise is not rendered at
+ * all. The alternative — treating "anything that is not a group" as a 1:1 — is
+ * what a `?:` here would mean, and it is actively unsafe: a 1:1 is the variant
+ * that gets a profile control and a request for a counterpart, so an unknown
+ * type would be handed a panel describing a person the conversation may not
+ * have.
+ *
+ * Dropping the single row rather than failing the whole payload matches the
+ * other list parsers in this file (channel members, group participants): the
+ * sidebar is a list of independent items, and one unrecognised conversation is
+ * no reason to leave the user without the rest of theirs.
+ */
+function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
+  const type = parseDMConversationType(dm.type);
+  if (type === undefined) return undefined;
   return {
     id: dm.id,
-    type: dm.type === "group" ? "group" : "1:1",
+    type,
     name: dm.name,
     participants: [],
-    counterpart: dm.type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
+    counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
   };
+}
+
+function mapSidebarDMs(raw: SidebarDMResponse[] | undefined): DMConversation[] {
+  return (raw ?? []).map(mapSidebarDM).filter((dm): dm is DMConversation => dm !== undefined);
 }
 
 // ── Exported API ──────────────────────────────────────────────────────────────
@@ -217,7 +241,7 @@ export async function fetchChannels(): Promise<Channel[]> {
 
 export async function fetchDMs(): Promise<DMConversation[]> {
   const sidebar = await fetchSidebar();
-  return (sidebar.dm_conversations ?? []).map(mapSidebarDM);
+  return mapSidebarDMs(sidebar.dm_conversations);
 }
 
 /**
@@ -232,7 +256,7 @@ export async function fetchSidebarData(): Promise<{
 }> {
   const sidebar = await fetchSidebar();
   const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
-  const dms = (sidebar.dm_conversations ?? []).map(mapSidebarDM);
+  const dms = mapSidebarDMs(sidebar.dm_conversations);
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
 }
 
@@ -1146,13 +1170,13 @@ interface GroupDetailsEnvelope {
   };
 }
 
-function mapGroupParticipant(raw: unknown): GroupParticipant | undefined {
+function mapGroupParticipant(raw: unknown): GroupParticipantProfile | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const participant = raw as GroupParticipantResponse;
   if (typeof participant.user_id !== "string" || participant.user_id === "") return undefined;
-  // Only the values the domain defines are accepted; anything else — including
-  // an absent field — leaves presence undefined rather than claiming "offline"
-  // on the server's behalf.
+  // Presence is decoration for a group: an unknown or missing value leaves the
+  // field absent, and the participant is still rendered. Unlike the channel
+  // panel, nothing here filters the list by it.
   const presence =
     participant.presence === "online" ||
     participant.presence === "away" ||
@@ -1170,8 +1194,8 @@ function mapGroupParticipant(raw: unknown): GroupParticipant | undefined {
 /**
  * Fetches the group-details payload for the panel.
  *
- * The server is the authority on access: a conversation the caller does not
- * participate in — and a 1:1, which this panel does not serve — both answer 404
+ * The server is the authority: a conversation the caller does not participate
+ * in — and a 1:1 conversation, which has no panel in this release — answers 404
  * and this rejects, so the panel shows its error state rather than a
  * half-rendered group.
  */
@@ -1187,16 +1211,156 @@ export async function fetchGroupDetails(
   const participants = Array.isArray(data.participants)
     ? data.participants
         .map(mapGroupParticipant)
-        .filter((participant): participant is GroupParticipant => participant !== undefined)
+        .filter((participant): participant is GroupParticipantProfile => participant !== undefined)
     : [];
   return {
     id: typeof data.id === "string" ? data.id : conversationId,
     name: typeof data.name === "string" ? data.name : "",
     createdAt: typeof data.created_at === "string" ? data.created_at : "",
-    // The server's total, never participants.length: that array is a capped
-    // preview and the group does not shrink because the page did.
+    // The server's total. Deriving it from the preview would under-report a
+    // group with more participants than the cap allows.
     participantCount: nonNegativeCount(data.participant_count),
     participants,
+    // Strict `=== true` (issue #398): an absent or malformed field leaves the
+    // add action hidden, so a server that predates it does not enable a flow it
+    // cannot authorize.
     canManageMembers: data.can_manage_members === true,
+  };
+}
+
+// ── Direct profile (issue #443) ──────────────────────────────────────────────
+
+interface DirectProfileEnvelope {
+  data?: unknown;
+}
+
+interface DirectProfileResponse {
+  user_id?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+  presence?: unknown;
+  email?: unknown;
+  job_title?: unknown;
+  department?: unknown;
+  timezone?: unknown;
+}
+
+/** A profile string the panel will render: text, trimmed, or absent. */
+function optionalText(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const value = raw.trim();
+  return value === "" ? undefined : value;
+}
+
+/**
+ * The error code for a 2xx whose body is not the agreed shape.
+ *
+ * Mirrors adminUsersApi's ERR_INVALID_RESPONSE so the app has one way to say
+ * "the transport succeeded and the contract did not", and callers keep handling
+ * a single error type.
+ */
+export const ERR_INVALID_RESPONSE = "invalid_response";
+
+function directProfileContractError(detail: string): ApiRequestError {
+  // The status is the one that actually came back — the request was a success,
+  // the payload was not, and conflating the two would let a broken contract
+  // read as a network failure or a denial.
+  return new ApiRequestError(
+    200,
+    ERR_INVALID_RESPONSE,
+    `Invalid direct profile response: ${detail}`,
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Fetches the 1:1 profile payload for the panel.
+ *
+ * The endpoint names only the conversation: which person is described is the
+ * server's decision, derived from the caller's own membership, so there is no
+ * user ID to tamper with here and none is sent. A conversation the caller does
+ * not participate in — and a group, which has its own endpoint — answers 404
+ * and this rejects, so the panel shows its error state rather than a
+ * half-rendered profile.
+ *
+ * Everything the response *claims* about itself is checked rather than assumed,
+ * and nothing is repaired:
+ *  - `kind` must literally be "direct". A missing, null, "group", "channel" or
+ *    unrecognised tag is rejected instead of being replaced with "direct" — the
+ *    tag is the only thing distinguishing a profile from a conversation
+ *    projection, and inventing it would let a group payload be rendered as a
+ *    person.
+ *  - `conversation_id` must be present and must equal the conversation that was
+ *    asked about. Echoing the request argument back would make a misrouted
+ *    response — A's request answered with B's profile — indistinguishable from
+ *    a correct one, which is exactly the failure this check exists to catch.
+ *  - `profile` must carry a real identity. "Não informado" rows must never be
+ *    able to stand in for "the server answered with nothing".
+ *
+ * The returned value is already the discriminated variant, so no caller has to
+ * (or gets to) attach the tag afterwards.
+ */
+export async function fetchDirectProfile(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<DirectDetails> {
+  const res = await authenticatedFetch<DirectProfileEnvelope>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/profile`,
+    { method: "GET", signal },
+  );
+  const data = res.data;
+  if (!isRecord(data)) {
+    throw directProfileContractError("data must be an object");
+  }
+  if (data.kind !== "direct") {
+    throw directProfileContractError(`kind must be "direct"`);
+  }
+  if (typeof data.conversation_id !== "string" || data.conversation_id === "") {
+    throw directProfileContractError("conversation_id must be a non-empty string");
+  }
+  if (data.conversation_id !== conversationId) {
+    // Deliberately without either ID in the message: the mismatch is the fact
+    // worth reporting, and repeating identifiers into an error string is how
+    // they end up in a log or a toast.
+    throw directProfileContractError("conversation_id does not match the requested conversation");
+  }
+  if (!isRecord(data.profile)) {
+    throw directProfileContractError("profile must be an object");
+  }
+  const raw = data.profile as DirectProfileResponse;
+  const userId = typeof raw.user_id === "string" ? raw.user_id : "";
+  const displayName = optionalText(raw.display_name);
+  if (userId === "") {
+    throw directProfileContractError("profile.user_id must be a non-empty string");
+  }
+  if (displayName === undefined) {
+    throw directProfileContractError("profile.display_name must be a non-empty string");
+  }
+  // Presence is only accepted as one of the values the domain defines; anything
+  // else — including a missing field — leaves it absent rather than "offline",
+  // which the UI must not claim on the server's behalf.
+  const presence =
+    raw.presence === "online" || raw.presence === "away" || raw.presence === "offline"
+      ? raw.presence
+      : undefined;
+  return {
+    kind: "direct",
+    conversationId: data.conversation_id,
+    profile: {
+      userId,
+      displayName,
+      avatarUrl: safeAvatarUrl(raw.avatar_url),
+      presence,
+      email: optionalText(raw.email),
+      // No column stores these yet, so today they are always absent. Reading
+      // them costs three lines and is what makes "when available" true rather
+      // than a promise for a later change.
+      jobTitle: optionalText(raw.job_title),
+      department: optionalText(raw.department),
+      timezone: optionalText(raw.timezone),
+    },
   };
 }

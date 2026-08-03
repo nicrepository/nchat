@@ -36,6 +36,9 @@ const (
 	pgDMAllowed             = "95000000-0000-4000-8000-000000000001"
 	pgDMNoParticipation     = "95000000-0000-4000-8000-000000000002"
 	pgDMCrossWorkspace      = "95000000-0000-4000-8000-000000000003"
+	pgCallActive            = "96000000-0000-4000-8000-000000000001"
+	pgCallRinging           = "96000000-0000-4000-8000-000000000002"
+	pgCallNonParticipant    = "96000000-0000-4000-8000-000000000003"
 	pgMissingResource       = "99000000-0000-4000-8000-000000000001"
 )
 
@@ -84,6 +87,9 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 	}{
 		{name: "active session and channel member allowed", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgChannelAllowed},
 		{name: "active session and DM participant allowed", kind: domain.ResourceKindDM, resourceID: pgDMAllowed, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgDMAllowed},
+		{name: "active call participant allowed", kind: domain.ResourceKindCall, resourceID: pgCallActive, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgCallActive},
+		{name: "ringing call denied", kind: domain.ResourceKindCall, resourceID: pgCallRinging, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		{name: "active call nonparticipant denied", kind: domain.ResourceKindCall, resourceID: pgCallNonParticipant, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "revoked session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionRevoked, wantErr: domain.ErrUnauthorized},
 		{name: "idle expired session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionIdleExpired, wantErr: domain.ErrUnauthorized},
 		{name: "absolute expired session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionAbsolute, wantErr: domain.ErrUnauthorized},
@@ -143,6 +149,7 @@ func resetAndMigrateMediaSchemas(t *testing.T, ctx context.Context, conn *pgx.Co
 		{domain: "chat", name: "000001_chat_domain_schema.up.sql"},
 		{domain: "chat", name: "000002_chat_enforce_channel_workspace_isolation.up.sql"},
 		{domain: "chat", name: "000003_chat_dm_conversations.up.sql"},
+		{domain: "chat", name: "000019_call_lifecycle.up.sql"},
 	} {
 		if _, err := conn.Exec(ctx, readRepositoryMigration(t, migration.domain, migration.name)); err != nil {
 			t.Fatalf("apply %s/%s: %v", migration.domain, migration.name, err)
@@ -210,6 +217,10 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001'),
 			('95000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000002'),
 			('95000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001');
+		INSERT INTO chat.calls (id, workspace_id, request_id, caller_id, callee_id, call_type, status, expires_at) VALUES
+			('96000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'video', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'audio', 'ringing', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000003', 'audio', 'active', now() + interval '30 seconds');
 		COMMIT;
 	`)
 	if err != nil {

@@ -188,9 +188,15 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("POST "+RouteDMMembers, authMiddleware(http.HandlerFunc(directMessages.AddParticipants)))
 		mux.Handle("GET "+RouteDMMemberCandidates, authMiddleware(http.HandlerFunc(directMessages.ParticipantCandidates)))
 		// Group details (issue #441) is a read, so it shares the listing budget
-		// rather than the write one: the panel refetches on every group switch.
+		// rather than the write one: the panel refetches on every conversation
+		// switch.
 		mux.Handle("GET "+RouteDMDetails, authMiddleware(
-			msgListLimiter.Middleware(http.HandlerFunc(directMessages.Details)),
+			msgListLimiter.Middleware(http.HandlerFunc(directMessages.GroupDetails)),
+		))
+		// The 1:1 profile panel (issue #443) is the same kind of read on the same
+		// resource, so it shares the same budget.
+		mux.Handle("GET "+RouteDMProfile, authMiddleware(
+			msgListLimiter.Middleware(http.HandlerFunc(directMessages.DirectProfile)),
 		))
 	}
 

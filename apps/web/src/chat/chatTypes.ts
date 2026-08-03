@@ -13,6 +13,27 @@ export interface Channel {
 
 export type DMType = "1:1" | "group";
 
+/**
+ * The wire values `chat.dm_conversations.type` is allowed to hold.
+ *
+ * The column is closed by CHECK to exactly these two, so anything else is not a
+ * conversation type this build knows how to render — a newer server, a proxy
+ * rewriting the payload, or a corrupted response. It is deliberately a lookup
+ * and not a default: `value === "group" ? "group" : "1:1"` turns every unknown
+ * value into a 1:1, which would hand an unrecognised conversation a profile
+ * panel and a request for a counterpart that may not exist.
+ */
+export function parseDMConversationType(value: unknown): DMType | undefined {
+  switch (value) {
+    case "direct":
+      return "1:1";
+    case "group":
+      return "group";
+    default:
+      return undefined;
+  }
+}
+
 export type AvatarColor = "purple" | "green" | "blue" | "rose" | "amber" | "teal";
 
 export type OnlineStatus = "online" | "away" | "offline";
@@ -54,9 +75,13 @@ export interface DMConversation {
  * The only input is `type`, the server-derived discriminator persisted as
  * `chat.dm_conversations.type` (CHECK IN ('direct','group')) — never the title,
  * the avatar, the initials or how many participants happen to be visible.
- * A single pass pushing each conversation into exactly one bucket is what makes
- * "every item in exactly one section, none duplicated, none dropped" a property
- * of the construction rather than of two filters agreeing with each other.
+ *
+ * Each known type is matched explicitly and anything else is dropped. The
+ * `default` is unreachable for a value that really is a `DMType`, but this
+ * function is reachable from JSON that was cast rather than parsed, and an
+ * `else` branch would silently file every unknown type under "Mensagens
+ * diretas" — the one bucket whose entries get a profile panel. Losing a row the
+ * UI cannot classify is the safe failure; misfiling it is not.
  */
 export function partitionDMs(dms: DMConversation[]): {
   directs: DMConversation[];
@@ -65,7 +90,16 @@ export function partitionDMs(dms: DMConversation[]): {
   const directs: DMConversation[] = [];
   const groups: DMConversation[] = [];
   for (const dm of dms) {
-    (dm.type === "group" ? groups : directs).push(dm);
+    switch (dm.type) {
+      case "1:1":
+        directs.push(dm);
+        break;
+      case "group":
+        groups.push(dm);
+        break;
+      default:
+        break;
+    }
   }
   return { directs, groups };
 }
@@ -287,20 +321,14 @@ export interface AddMembersResult {
   memberCount: number;
 }
 
-// ── Group details panel (issues #441, #398) ─────────────────────────────────
-
 /**
- * One participant of a group conversation, as the group panel renders them.
+ * One participant of a group conversation, as the details panel renders them.
  *
- * There is no `role`, unlike ChannelMemberProfile: chat.dm_members.role is
- * closed by CHECK to the single value "member", so a group has no role to show.
- *
- * `presence` is decoration, not a filter. A group lists every active
- * participant and being offline never removes anyone, so — unlike the channel
- * panel — an entry can legitimately be "offline". It is absent when the server
- * does not track presence at all, which the client must not render as offline.
+ * Deliberately without a role: chat.dm_members.role is closed by CHECK to
+ * 'member', so a group has no role to show. `presence` is decoration — it says
+ * whether this participant is connected and never decides whether they appear.
  */
-export interface GroupParticipant {
+export interface GroupParticipantProfile {
   userId: string;
   displayName: string;
   /** Absent when unset or when the stored URL is not a safe same-origin target. */
@@ -311,22 +339,91 @@ export interface GroupParticipant {
 /**
  * The group-details payload.
  *
- * `participantCount` is every active participant; `participants` is a capped
- * preview and its length must never be shown as the count.
+ * A group is a `chat.dm_conversations` row of type 'group', not a channel, so
+ * this carries no visibility, slug, category or description — the domain has
+ * none of them for conversations and none is invented here.
  *
- * Deliberately absent, because a group is not a channel: visibility
- * (public/private), slug, category and description. The domain has none of them
- * for chat.dm_conversations, and none is invented here.
+ * `participantCount` is every active participant and is never
+ * `participants.length`: that array is a capped preview.
  */
 export interface GroupDetails {
   id: string;
   name: string;
   createdAt: string; // ISO 8601
   participantCount: number;
-  participants: GroupParticipant[];
-  /** Same meaning and the same strict normalization as ChannelDetails'. */
+  participants: GroupParticipantProfile[];
+  /** Same meaning and the same strict normalization as ChannelDetails' (issue #398). */
   canManageMembers: boolean;
 }
+
+/**
+ * The other participant of a 1:1 DM, as the profile panel renders them
+ * (issue #443).
+ *
+ * Every field beyond `userId` and `displayName` is optional because every one
+ * of them can genuinely be missing, and absent means absent:
+ *  - `avatarUrl` is dropped when unset or when the stored URL is not a safe
+ *    same-origin target, and the initials fallback renders;
+ *  - `presence` is absent when the server does not track it, which the panel
+ *    must not read as "offline";
+ *  - `email` is absent when the server did not send one;
+ *  - `jobTitle`, `department` and `timezone` have no column anywhere in the
+ *    domain today, so the server never sends them. They are declared because
+ *    they are the prototype's rows and the panel renders "Não informado" for
+ *    each — the decision of what the row says lives in one place, and the day a
+ *    column exists the value flows through with no change here.
+ *
+ * `timezone` is an IANA name and is validated before use: an unknown or
+ * malformed one is treated as missing rather than fed to Intl.
+ */
+export interface DirectProfile {
+  userId: string;
+  displayName: string;
+  avatarUrl?: string;
+  presence?: OnlineStatus;
+  email?: string;
+  jobTitle?: string;
+  department?: string;
+  timezone?: string;
+}
+
+/**
+ * The 1:1 profile payload.
+ *
+ * Deliberately not a conversation projection: a direct conversation has no
+ * name, no visibility, no participant count and no roster worth showing — it
+ * has one other person.
+ *
+ * `kind` is part of the value rather than a tag the hook adds afterwards. The
+ * server states the variant, the client verifies it, and only a verified
+ * response can be constructed — so a payload that says "group" can never be
+ * relabelled as a profile on its way through. `conversationId` is likewise the
+ * value the server sent *after* it was checked against the conversation that
+ * was requested, never the request argument echoed back, which is what makes a
+ * misrouted response detectable instead of invisible.
+ */
+export interface DirectDetails {
+  kind: "direct";
+  conversationId: string;
+  profile: DirectProfile;
+}
+
+/**
+ * What the details panel is describing right now.
+ *
+ * The three shapes are discriminated by `kind`, mirroring the domain: a
+ * channel, a group and a 1:1 conversation are different aggregates with
+ * different vocabulary, so the panel switches on the tag rather than on
+ * optional fields that only one of them ever populates. In particular the
+ * direct variant carries no `participants`, which is what stops a profile
+ * panel from ever rendering a two-person roster.
+ */
+export type ConversationDetails =
+  | ({ kind: "channel" } & ChannelDetails)
+  | ({ kind: "group" } & GroupDetails)
+  // Already tagged by its own client, which validated the tag the server sent
+  // instead of asserting one — see DirectDetails.
+  | DirectDetails;
 
 /** Scan lifecycle of an attachment. Only "clean" is ever downloadable. */
 export type AttachmentStatus = "pending_scan" | "clean" | "rejected";

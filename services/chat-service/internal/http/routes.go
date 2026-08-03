@@ -38,12 +38,22 @@ const (
 	RouteChannelMessage          = "/api/chat/channels/{channelID}/messages/{messageID}"
 	RouteChannelReferences       = "/api/chat/channels/{channelID}/message-references"
 	RouteChannelMentions         = "/api/chat/channels/{channelID}/mentions"
-	// Issue #441/#398 group-details panel. Same prefix as the group's messages
-	// and pins, because a group is a chat.dm_conversations row and not a channel.
-	RouteDMDetails             = "/api/chat/dm/{conversationID}/details"
-	RouteDMMessages            = "/api/chat/dm/{conversationID}/messages"
-	RouteDMMessage             = "/api/chat/dm/{conversationID}/messages/{messageID}"
-	RouteDMReferences          = "/api/chat/dm/{conversationID}/message-references"
+	RouteDMMessages              = "/api/chat/dm/{conversationID}/messages"
+	RouteDMMessage               = "/api/chat/dm/{conversationID}/messages/{messageID}"
+	RouteDMReferences            = "/api/chat/dm/{conversationID}/message-references"
+	// Issue #441/#398 group-details panel. It lives under the DM prefix because a
+	// group *is* a chat.dm_conversations row (type='group'); a /channels/ route
+	// would name the wrong aggregate, and a separate /groups/ prefix would
+	// invent a resource the domain does not have.
+	RouteDMDetails = "/api/chat/dm/{conversationID}/details"
+	// Issue #443 profile panel for a 1:1 DM. A separate route from /details on
+	// purpose: what a direct conversation shows is one person's profile, not the
+	// conversation's own metadata, and the two payloads share no field beyond
+	// the conversation ID. Folding both into /details would make every group
+	// field optional and invite a client to read `participants` out of a direct
+	// conversation. There is no user ID in the path — the counterpart is
+	// resolved server-side from the caller's membership.
+	RouteDMProfile             = "/api/chat/dm/{conversationID}/profile"
 	RouteAllowedReactionEmojis = "/api/chat/reactions/allowed-emojis"
 	RouteMessageFavorite       = "/api/chat/messages/{messageID}/favorite"
 	RouteFavorites             = "/api/chat/favorites"

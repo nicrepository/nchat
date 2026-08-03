@@ -772,6 +772,14 @@ type fakeDMStore struct {
 	visibleConversation  domain.DMConversation
 	getVisibleErr        error
 
+	participants     storage.DMParticipantPage
+	participantsErr  error
+	participantCalls []dmParticipantCall
+
+	counterpart      domain.DMDirectProfile
+	counterpartErr   error
+	counterpartCalls []dmCounterpartCall
+
 	lastDirectInput   storage.CreateDirectConversationInput
 	lastGroupInput    storage.CreateGroupConversationInput
 	createDirectCalls int
@@ -782,9 +790,6 @@ type fakeDMStore struct {
 	groupCandidates       []domain.DMCandidate
 	groupCandidatesErr    error
 	candidateCalls        []groupCandidateCall
-	participantPage       storage.DMParticipantPage
-	participantPageErr    error
-	participantPageCalls  int
 	addParticipantsResult storage.AddMembersResult
 	addParticipantsErr    error
 	addParticipantsCalls  int
@@ -822,11 +827,6 @@ func (f *fakeDMStore) SearchGroupParticipantCandidates(
 	return f.groupCandidates, f.groupCandidatesErr
 }
 
-func (f *fakeDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
-	f.participantPageCalls++
-	return f.participantPage, f.participantPageErr
-}
-
 func (f *fakeDMStore) AddGroupParticipants(_ context.Context, input storage.AddGroupParticipantsInput) (storage.AddMembersResult, error) {
 	f.addParticipantsCalls++
 	f.lastAddParticipants = input
@@ -836,6 +836,59 @@ func (f *fakeDMStore) AddGroupParticipants(_ context.Context, input storage.AddG
 func (f *fakeDMStore) ListVisibleConversationsByUser(_ context.Context, _, _ string) ([]domain.DMConversation, error) {
 	f.listVisibleCalls++
 	return f.visibleConversations, f.listVisibleErr
+}
+
+// ListParticipantProfiles models the store contract: an already-authorised page
+// of the conversation's active participants, capped, plus the full total. The
+// total is deliberately independent of the page so a test can prove the panel
+// never reports the preview's length as the participant count.
+func (f *fakeDMStore) ListParticipantProfiles(
+	_ context.Context, workspaceID, conversationID string, limit int,
+) (storage.DMParticipantPage, error) {
+	f.participantCalls = append(f.participantCalls, dmParticipantCall{
+		workspaceID: workspaceID, conversationID: conversationID, limit: limit,
+	})
+	if f.participantsErr != nil {
+		return storage.DMParticipantPage{}, f.participantsErr
+	}
+	if limit <= 0 || limit > domain.MaxDMDetailsParticipants {
+		limit = domain.MaxDMDetailsParticipants
+	}
+	page := storage.DMParticipantPage{TotalCount: f.participants.TotalCount}
+	participants := f.participants.Participants
+	if len(participants) > limit {
+		participants = participants[:limit]
+	}
+	page.Participants = participants
+	return page, nil
+}
+
+type dmParticipantCall struct {
+	workspaceID    string
+	conversationID string
+	limit          int
+}
+
+// GetDirectCounterpartProfile models the store contract: identity resolution
+// for an already-authorised conversation. Every argument is recorded so a test
+// can prove the workspace and the caller reached the query — the two predicates
+// that stop a foreign conversation and a self-profile respectively.
+func (f *fakeDMStore) GetDirectCounterpartProfile(
+	_ context.Context, workspaceID, conversationID, callerID string,
+) (domain.DMDirectProfile, error) {
+	f.counterpartCalls = append(f.counterpartCalls, dmCounterpartCall{
+		workspaceID: workspaceID, conversationID: conversationID, callerID: callerID,
+	})
+	if f.counterpartErr != nil {
+		return domain.DMDirectProfile{}, f.counterpartErr
+	}
+	return f.counterpart, nil
+}
+
+type dmCounterpartCall struct {
+	workspaceID    string
+	conversationID string
+	callerID       string
 }
 
 func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {

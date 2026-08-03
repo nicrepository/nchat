@@ -458,6 +458,69 @@ func (s *DMService) GetConversation(ctx context.Context, input GetDMConversation
 	return conversation, nil
 }
 
+// DirectProfileInput asks for the 1:1 profile panel payload (issue #443).
+//
+// There is deliberately no user ID field. Which profile is shown is a
+// consequence of who the caller is and which conversation they opened — never
+// something the request states — so the endpoint cannot be turned into a
+// user-profile lookup by ID.
+type DirectProfileInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+}
+
+// DirectProfile is the panel payload for a 1:1 conversation: the conversation
+// it describes and the profile of the one other active participant.
+type DirectProfile struct {
+	Conversation domain.DMConversation
+	Profile      domain.DMDirectProfile
+}
+
+// GetDirectProfile returns the other participant's profile for a 1:1
+// conversation the caller participates in.
+//
+// Two checks, and the second is the one that counts.
+// GetVisibleConversationByID runs first so a group, a foreign workspace or an
+// unknown ID is refused before any profile query is issued, and so every
+// refusal is the same bare ErrNotFound the rest of the DM surface returns. But
+// its answer is never treated as the permission the profile is read under:
+// GetDirectCounterpartProfile re-establishes the caller's active membership in
+// the same statement that projects the counterpart, so a membership revoked in
+// between yields ErrNotFound instead of a name and an e-mail. Nothing from the
+// first read reaches the response.
+//
+// The conversation type is checked against the row the database returned and
+// never against anything the client said, in both queries.
+func (s *DMService) GetDirectProfile(ctx context.Context, input DirectProfileInput) (DirectProfile, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	callerID := strings.TrimSpace(input.CallerID)
+	conversation, err := s.dms.GetVisibleConversationByID(
+		ctx,
+		workspaceID,
+		strings.TrimSpace(input.ConversationID),
+		callerID,
+	)
+	if err != nil {
+		return DirectProfile{}, err
+	}
+	if conversation.Type != domain.DMConversationTypeDirect {
+		return DirectProfile{}, domain.ErrNotFound
+	}
+	profile, err := s.dms.GetDirectCounterpartProfile(ctx, workspaceID, conversation.ID, callerID)
+	if err != nil {
+		// ErrNotFound and ErrInconsistentDirectConversation are both passed
+		// through unwrapped: the first is a denial the handler folds into the
+		// common 404, the second is corrupt data it must report as a server
+		// error instead of disguising as one.
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInconsistentDirectConversation) {
+			return DirectProfile{}, err
+		}
+		return DirectProfile{}, fmt.Errorf("get direct counterpart profile: %w", err)
+	}
+	return DirectProfile{Conversation: conversation, Profile: profile}, nil
+}
+
 func normalizeGroupDMParticipants(callerID string, invited []string) ([]string, error) {
 	// Checked on the raw list, before any per-ID work, so an oversized payload is
 	// rejected without parsing every entry first.

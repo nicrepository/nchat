@@ -9,6 +9,7 @@ import {
   SECOND_CANDIDATE_NAME,
   channelDetailsFixture,
   createScenario,
+  directProfileFixture,
   groupDetailsFixture,
   installMessagingMocks,
   makeMessage,
@@ -76,7 +77,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     await expect(page.getByText("8 membros")).toBeHidden();
 
     await page.getByTestId("chat-details-toggle").click();
-    const panel = page.getByTestId("chat-channel-details");
+    const panel = page.getByTestId("chat-conversation-details");
     await expect(panel).toBeVisible();
     await expect(panel).toContainText("8 membros");
 
@@ -114,7 +115,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     await page.goto(`/chat/channel/${targetId}`);
 
     await page.getByTestId("chat-details-toggle").click();
-    const panel = page.getByTestId("chat-channel-details");
+    const panel = page.getByTestId("chat-conversation-details");
     await expect(panel).toContainText("Canal privado");
 
     await panel.getByTestId("chat-details-add-members").click();
@@ -157,7 +158,7 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     await page.goto(`/chat/channel/${targetId}`);
 
     await page.getByTestId("chat-details-toggle").click();
-    const panel = page.getByTestId("chat-channel-details");
+    const panel = page.getByTestId("chat-conversation-details");
     await expect(panel).toBeVisible();
     await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
   });
@@ -306,13 +307,13 @@ test.describe("adicionar membros a um grupo", () => {
     await expect(toggle).toHaveAccessibleName("Detalhes do grupo");
     await toggle.click();
 
-    const panel = page.getByTestId("chat-group-details");
+    const panel = page.getByTestId("chat-conversation-details");
     await expect(panel).toBeVisible();
     await expect(panel).toContainText("4 participantes");
-    // The group panel, never the channel one.
-    await expect(page.getByTestId("chat-channel-details")).toHaveCount(0);
+    // One panel, three vocabularies: the group's, never the channel's.
+    await expect(panel).toHaveAttribute("data-conversation-kind", "group");
 
-    await panel.getByTestId("chat-group-add-members").click();
+    await panel.getByTestId("chat-details-add-members").click();
     const dialog = page.getByRole("dialog", { name: "Adicionar membros" });
     await dialog.getByLabel("Pesquisar pessoa").fill("e2e");
     await dialog.getByRole("button", { name: new RegExp(SECOND_CANDIDATE_NAME) }).click();
@@ -338,26 +339,41 @@ test.describe("adicionar membros a um grupo", () => {
     await page.goto(`/chat/dm/${targetId}`);
 
     await page.getByTestId("chat-details-toggle").click();
-    const panel = page.getByTestId("chat-group-details");
+    const panel = page.getByTestId("chat-conversation-details");
     await expect(panel).toBeVisible();
-    await expect(panel.getByTestId("chat-group-add-members")).toHaveCount(0);
+    await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
   });
 
-  // A 1:1 has no panel at all: adding a third person would convert it.
-  test("DM 1:1 não oferece painel nem ação de detalhes", async ({ page }, testInfo) => {
-    const targetId = uniqueId(testInfo, "direct-no-details");
+  // A 1:1 does have a panel — the profile (issue #443) — but never the
+  // add-members action: a third person would convert the direct conversation
+  // into a group, which issue #398 deliberately does not do.
+  test("DM 1:1 abre o perfil e nunca oferece a ação de adicionar", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "direct-no-add-members");
     const scenario = createScenario({
       kind: "dm",
+      conversationType: "direct",
       targetId,
       targetName: "Juliane",
       messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Oi" })],
     });
+    scenario.directProfiles.set(
+      targetId,
+      directProfileFixture(targetId, {
+        user_id: "e2e-juliane",
+        display_name: "Juliane Lino",
+      }),
+    );
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/dm/${targetId}`);
 
     await expect(page.getByTestId("chat-msg-header")).toBeVisible();
-    await expect(page.getByTestId("chat-details-toggle")).toHaveCount(0);
-    await expect(page.getByTestId("chat-group-details")).toHaveCount(0);
+    await page.getByTestId("chat-details-toggle").click();
+
+    const panel = page.getByTestId("chat-conversation-details");
+    await expect(panel).toHaveAttribute("data-conversation-kind", "direct");
+    await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
+    // Not merely hidden behind a permission: a 1:1 has no such control at all.
+    await expect(panel.getByRole("button", { name: /Adicionar/ })).toHaveCount(0);
   });
 });
 
@@ -573,10 +589,10 @@ test.describe("candidatos excluem membros fora da prévia", () => {
     await page.goto(`/chat/dm/${targetId}`);
 
     await page.getByTestId("chat-details-toggle").click();
-    const panel = page.getByTestId("chat-group-details");
+    const panel = page.getByTestId("chat-conversation-details");
     await expect(panel).toContainText("35 participantes");
 
-    await panel.getByTestId("chat-group-add-members").click();
+    await panel.getByTestId("chat-details-add-members").click();
     const dialog = page.getByRole("dialog", { name: "Adicionar membros" });
     await dialog.getByLabel("Pesquisar pessoa").fill("e2e");
 

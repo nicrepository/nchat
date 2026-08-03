@@ -30,6 +30,14 @@ type fakeDMProvider struct {
 	lastSearchInput  service.SearchDMCandidatesInput
 	lastCreateInput  service.CreateDirectConversationInput
 	lastGroupInput   service.CreateGroupConversationInput
+	groupDetails     service.GroupDetails
+	groupDetailsErr  error
+	lastDetailsInput service.GroupDetailsInput
+	detailsCalls     int
+	directProfile    service.DirectProfile
+	directProfileErr error
+	lastProfileInput service.DirectProfileInput
+	profileCalls     int
 	searchCalls      int
 	createCalls      int
 	groupCreateCalls int
@@ -38,10 +46,6 @@ type fakeDMProvider struct {
 	participantCandidatesErr  error
 	participantCandidateCalls int
 	lastParticipantCandidates service.SearchGroupParticipantCandidatesInput
-	groupDetails              service.GroupDetails
-	groupDetailsErr           error
-	groupDetailsCalls         int
-	lastGroupDetails          service.GroupDetailsInput
 	addMembersResult          storage.AddMembersResult
 	addMembersErr             error
 	addMembersCalls           int
@@ -88,12 +92,6 @@ func (f *fakeDMProvider) SearchGroupParticipantCandidates(
 	return f.participantCandidates, f.participantCandidatesErr
 }
 
-func (f *fakeDMProvider) GetGroupDetails(_ context.Context, input service.GroupDetailsInput) (service.GroupDetails, error) {
-	f.groupDetailsCalls++
-	f.lastGroupDetails = input
-	return f.groupDetails, f.groupDetailsErr
-}
-
 func (f *fakeDMProvider) AddGroupParticipants(_ context.Context, input service.AddGroupParticipantsInput) (storage.AddMembersResult, error) {
 	f.addMembersCalls++
 	f.lastAddMembers = input
@@ -104,6 +102,22 @@ func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input servic
 	f.groupCreateCalls++
 	f.lastGroupInput = input
 	return f.groupOutput, f.groupErr
+}
+
+func (f *fakeDMProvider) GetGroupDetails(
+	_ context.Context, input service.GroupDetailsInput,
+) (service.GroupDetails, error) {
+	f.detailsCalls++
+	f.lastDetailsInput = input
+	return f.groupDetails, f.groupDetailsErr
+}
+
+func (f *fakeDMProvider) GetDirectProfile(
+	_ context.Context, input service.DirectProfileInput,
+) (service.DirectProfile, error) {
+	f.profileCalls++
+	f.lastProfileInput = input
+	return f.directProfile, f.directProfileErr
 }
 
 func dmTestHandler(provider *fakeDMProvider) *httpapi.DMHandler {

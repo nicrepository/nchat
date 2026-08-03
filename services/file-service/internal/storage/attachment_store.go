@@ -185,28 +185,35 @@ func (s *PGXAttachmentStore) GetAuthorized(
 	}, nil
 }
 
-// ListChannelAttachments returns a channel's most recent listable attachments.
+// Listing queries, one per destination kind.
 //
-// The caller's access to the channel has already been settled by
-// AuthorizeDestination, and both identifiers below come from that answer — the
-// workspace in particular is the destination row's own, never a request value.
-// Filtering on both is what keeps a channel UUID from another tenant from
-// selecting anything, even if the authorization ever regressed.
+// They are separate static constants rather than one query with a computed
+// predicate because each has to line up with its own partial index:
 //
-// The predicate and the order match idx_attachments_channel
-// (workspace_id, channel_id, created_at DESC WHERE destination_kind = 'channel'
-// AND deleted_at IS NULL), so this is an index scan of at most Limit rows and
-// never a table scan of a channel's history. id DESC breaks a created_at tie so
-// two attachments written in the same transaction always come back in the same
-// order.
-func (s *PGXAttachmentStore) ListChannelAttachments(
-	ctx context.Context, query service.ListDestinationAttachmentsQuery,
-) ([]service.ListedAttachment, error) {
-	if s == nil || s.pool == nil {
-		return nil, domain.ErrDependenciesUnavailable
-	}
-	limit := domain.NormalizeAttachmentListLimit(query.Limit)
-	rows, err := s.pool.Query(ctx, `
+//	idx_attachments_channel      (workspace_id, channel_id,      created_at DESC)
+//	                             WHERE destination_kind = 'channel' AND deleted_at IS NULL
+//	idx_attachments_conversation (workspace_id, conversation_id, created_at DESC)
+//	                             WHERE destination_kind = 'dm'      AND deleted_at IS NULL
+//
+// Two things make each index actually usable. The destination column is
+// compared directly — a COALESCE over both columns is an expression neither
+// index covers, so the planner would fall back to scanning and sorting the
+// workspace's attachments before applying LIMIT. And destination_kind is a
+// literal, so the partial index predicate is satisfied at plan time; as a bind
+// parameter the planner cannot prove it matches the index's WHERE clause and
+// would skip the index for that reason alone.
+//
+// With equality on (workspace_id, destination) the index also supplies
+// created_at DESC directly, so ORDER BY … LIMIT reads at most Limit index
+// entries instead of sorting the destination's whole history. The id DESC
+// tie-break only orders rows sharing a timestamp.
+//
+// The two share their parameter positions, so the caller passes the same
+// arguments in the same order whichever one it picks:
+//
+//	$1 workspace_id   $2 destination id   $3 listable statuses   $4 limit
+const (
+	listChannelAttachmentsQuery = `
 		SELECT a.id::text, a.status, a.original_filename,
 		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
 		FROM files.attachments AS a
@@ -216,11 +223,67 @@ func (s *PGXAttachmentStore) ListChannelAttachments(
 		  AND a.channel_id = $2
 		  AND a.status = ANY($3)
 		ORDER BY a.created_at DESC, a.id DESC
-		LIMIT $4`,
-		query.WorkspaceID, query.ChannelID, listableStatuses(), limit,
+		LIMIT $4`
+
+	listDMAttachmentsQuery = `
+		SELECT a.id::text, a.status, a.original_filename,
+		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
+		FROM files.attachments AS a
+		WHERE a.destination_kind = 'dm'
+		  AND a.deleted_at IS NULL
+		  AND a.workspace_id = $1
+		  AND a.conversation_id = $2
+		  AND a.status = ANY($3)
+		ORDER BY a.created_at DESC, a.id DESC
+		LIMIT $4`
+)
+
+// listAttachmentsQueryForKind picks one of the two constants above.
+//
+// It switches on the validated domain enum and returns one of two strings known
+// at compile time — no column name, table name or predicate is ever built from
+// a request value, so there is nothing here for a caller to influence.
+func listAttachmentsQueryForKind(kind domain.DestinationKind) (string, error) {
+	switch kind {
+	case domain.DestinationKindChannel:
+		return listChannelAttachmentsQuery, nil
+	case domain.DestinationKindDM:
+		return listDMAttachmentsQuery, nil
+	default:
+		return "", fmt.Errorf("%w: invalid destination kind", domain.ErrInvalidInput)
+	}
+}
+
+// ListDestinationAttachments returns a destination's most recent listable
+// attachments.
+//
+// The caller's access has already been settled by AuthorizeDestination, and
+// every identifier below comes from that answer — the workspace in particular
+// is the destination row's own, never a request value. Each query pins its own
+// destination_kind and compares its own destination column, so a channel UUID
+// cannot select a conversation's attachments (or the reverse) even if the
+// authorization above ever regressed: the two kinds do not share a predicate.
+//
+// Only the query string varies by kind. Scanning, mapping, error handling and
+// row cleanup are shared, so the two paths cannot drift.
+func (s *PGXAttachmentStore) ListDestinationAttachments(
+	ctx context.Context, query service.ListDestinationAttachmentsQuery,
+) ([]service.ListedAttachment, error) {
+	if s == nil || s.pool == nil {
+		return nil, domain.ErrDependenciesUnavailable
+	}
+	// Resolved before any database work, so an unknown kind never reaches the
+	// pool and never becomes an unfiltered read.
+	sql, err := listAttachmentsQueryForKind(query.Kind)
+	if err != nil {
+		return nil, err
+	}
+	limit := domain.NormalizeAttachmentListLimit(query.Limit)
+	rows, err := s.pool.Query(ctx, sql,
+		query.WorkspaceID, query.DestinationID, listableStatuses(), limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list channel attachments: %w", err)
+		return nil, fmt.Errorf("list destination attachments: %w", err)
 	}
 	defer rows.Close()
 
@@ -235,7 +298,7 @@ func (s *PGXAttachmentStore) ListChannelAttachments(
 			&record.ID, &status, &record.Filename,
 			&record.DetectedMIME, &record.Size, &createdAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan channel attachment: %w", err)
+			return nil, fmt.Errorf("scan destination attachment: %w", err)
 		}
 		attachmentStatus := domain.Status(status)
 		if !attachmentStatus.Valid() {
@@ -248,7 +311,7 @@ func (s *PGXAttachmentStore) ListChannelAttachments(
 		listed = append(listed, record)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate channel attachments: %w", err)
+		return nil, fmt.Errorf("iterate destination attachments: %w", err)
 	}
 	return listed, nil
 }

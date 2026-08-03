@@ -32,6 +32,12 @@ interface SidebarDMFixture {
   type: "direct" | "group";
   name: string;
   unread_count: number;
+  /**
+   * The other participant of a 1:1, as the real sidebar resolves it. Absent on
+   * groups and on legacy conversations whose counterpart could not be resolved
+   * — both are shapes the UI must cope with, so neither is defaulted here.
+   */
+  counterpart?: { user_id: string; display_name: string; avatar_url?: string };
 }
 
 export interface DMCandidateFixture {
@@ -164,6 +170,57 @@ export interface MessagingScenario {
   addMembersStatus: number;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
+  // Group-details payload per conversation id (issue #441).
+  groupDetails: Map<string, GroupDetailsFixture>;
+  // 1:1 profile payload per conversation id (issue #443).
+  directProfiles: Map<string, DirectProfileFixture>;
+  // Conversation attachments per conversation id, newest first.
+  conversationAttachments: Map<string, AttachmentFixture[]>;
+}
+
+export interface GroupParticipantFixture {
+  user_id: string;
+  display_name: string;
+  presence?: "online" | "away" | "offline";
+}
+
+/**
+ * A group's details. Deliberately without visibility, slug or description: a
+ * chat.dm_conversations row has none of them, and the panel must never show a
+ * channel's vocabulary for a group.
+ */
+export interface GroupDetailsFixture {
+  id: string;
+  type: "group";
+  name: string;
+  created_at: string;
+  /** Every active participant; may exceed participants.length. */
+  participant_count: number;
+  participants: GroupParticipantFixture[];
+}
+
+/**
+ * A 1:1 conversation's profile payload.
+ *
+ * Deliberately a profile and not a roster: the server has already decided which
+ * of the two participants the caller is looking at, so there is nothing here
+ * for a client to choose from. job_title, department and timezone are optional
+ * because no column stores them today — a fixture that always sent them would
+ * test a contract the server cannot honour.
+ */
+export interface DirectProfileFixture {
+  kind: "direct";
+  conversation_id: string;
+  profile: {
+    user_id: string;
+    display_name: string;
+    avatar_url?: string;
+    email?: string;
+    presence?: "online" | "away" | "offline";
+    job_title?: string;
+    department?: string;
+    timezone?: string;
+  };
 }
 
 export interface ChannelMemberFixture {
@@ -336,8 +393,20 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     options.kind === "dm" ? (options.conversationType ?? "direct") : undefined;
   const directDM: SidebarDMFixture =
     options.kind === "dm" && conversationType === "direct"
-      ? { id: options.targetId, type: "direct", name: options.targetName, unread_count: 0 }
-      : { id: "e2e-dm-other", type: "direct", name: OTHER_USER_NAME, unread_count: 0 };
+      ? {
+          id: options.targetId,
+          type: "direct",
+          name: options.targetName,
+          unread_count: 0,
+          counterpart: { user_id: OTHER_USER_ID, display_name: options.targetName },
+        }
+      : {
+          id: "e2e-dm-other",
+          type: "direct",
+          name: OTHER_USER_NAME,
+          unread_count: 0,
+          counterpart: { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME },
+        };
   const groupDM: SidebarDMFixture =
     options.kind === "dm" && conversationType === "group"
       ? { id: options.targetId, type: "group", name: options.targetName, unread_count: 0 }
@@ -376,6 +445,8 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     channelAttachments: new Map(),
     addMembersRequests: [],
     addMembersStatus: 200,
+    directProfiles: new Map(),
+    conversationAttachments: new Map(),
   };
 }
 
@@ -388,6 +459,44 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
  * because the two are independent: a channel keeps its size when nobody is
  * connected, and specs need to assert exactly that.
  */
+/**
+ * Default group-details payload for a conversation in the fixture sidebar.
+ *
+ * participantCount defaults to the number of participants but is overridable,
+ * because the two are independent: the preview is capped and the total is not.
+ */
+export function groupDetailsFixture(
+  conversation: { id: string; name: string },
+  participants: GroupParticipantFixture[],
+  participantCount = participants.length,
+): GroupDetailsFixture {
+  return {
+    id: conversation.id,
+    type: "group",
+    name: conversation.name,
+    created_at: "2024-03-04T15:00:00Z",
+    participant_count: participantCount,
+    participants,
+  };
+}
+
+/**
+ * Default 1:1 profile payload for a conversation in the fixture sidebar.
+ *
+ * Every field is overridable so a spec can exercise both a fully-populated card
+ * and today's real shape, which is an identity and little else.
+ */
+export function directProfileFixture(
+  conversationId: string,
+  profile: Partial<DirectProfileFixture["profile"]> & { user_id: string; display_name: string },
+): DirectProfileFixture {
+  return {
+    kind: "direct",
+    conversation_id: conversationId,
+    profile,
+  };
+}
+
 export function channelDetailsFixture(
   channel: { id: string; slug: string; display_name: string; type: "public" | "private" },
   onlineMembers: ChannelMemberFixture[],
@@ -587,13 +696,16 @@ async function installChannelDetailsMocks(
     });
   });
 
-  // GET /api/chat/dm/{id}/details (issues #441, #398). A conversation without a
-  // fixture is a 404, mirroring the server's refusal shape for a 1:1 or one the
-  // caller does not participate in.
   await page.route("**/api/chat/dm/*/details", async (route) => {
-    const conversationId = pathSegmentAfter(route.request().url(), "dm");
-    const details = conversationId ? scenario.groupDetails.get(conversationId) : undefined;
+    const conversationID = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationID || !assertConversationAccess(conversationID)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const details = scenario.groupDetails.get(conversationID);
     if (!details) {
+      // Mirrors the server: a 1:1 conversation and one the caller cannot reach
+      // are the same 404, so a spec cannot mistake "no panel" for "denied".
       await route.fulfill({ status: 404 });
       return;
     }
@@ -688,6 +800,46 @@ async function installChannelDetailsMocks(
           already_members: 0,
           member_count: details?.member_count ?? userIds.length,
         },
+      }),
+    });
+  });
+
+  // GET /api/chat/dm/{id}/profile. Mirrors the server: a conversation the
+  // caller cannot reach, and a group — which has no profile — are the same 404,
+  // so a spec cannot mistake "denied" for "this person has no attributes".
+  await page.route("**/api/chat/dm/*/profile", async (route) => {
+    const conversationID = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationID || !assertConversationAccess(conversationID)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const profile = scenario.directProfiles.get(conversationID);
+    if (!profile) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: profile }),
+    });
+  });
+
+  await page.route("**/api/files/dm/*/attachments**", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    const conversationID = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationID || !assertConversationAccess(conversationID)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: { attachments: scenario.conversationAttachments.get(conversationID) ?? [] },
       }),
     });
   });

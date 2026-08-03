@@ -12,6 +12,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
+import { _resetChatSocket, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -108,14 +109,21 @@ function subscribed(targetType: "channel" | "dm" = "channel", targetId = "ch-1")
 
 const OriginalWebSocket = global.WebSocket;
 
+// The shared connection is module state, so every test starts from a closed
+// socket with a jitter source that makes the backoff schedule exact:
+// random() === 0 puts each delay at the bottom of its equal-jitter window.
+const FIRST_RETRY_MS = RECONNECT_BASE_DELAY_MS / 2;
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   global.WebSocket = FakeWebSocket as any;
   setTokens("test-token");
+  _resetChatSocket(() => 0);
 });
 
 afterEach(() => {
+  _resetChatSocket();
   vi.useRealTimers();
   global.WebSocket = OriginalWebSocket;
   clearTokens();
@@ -523,7 +531,7 @@ describe("useChatWebSocket", () => {
 
     act(() => {
       oldSocket.close();
-      vi.advanceTimersByTime(250);
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
     });
     const currentSocket = FakeWebSocket.instances[1];
     act(() => currentSocket.simulateOpen());
@@ -1126,7 +1134,12 @@ describe("useChatWebSocket", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
 
     act(() => {
-      vi.advanceTimersByTime(250);
+      vi.advanceTimersByTime(FIRST_RETRY_MS - 1);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    act(() => {
+      vi.advanceTimersByTime(1);
     });
 
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -1135,40 +1148,41 @@ describe("useChatWebSocket", () => {
     expect(FakeWebSocket.instances[1].url).not.toContain("test-token");
   });
 
-  it("resets network backoff on every open independently of subscribe recovery", () => {
+  it("keeps backing off when a socket opens and drops before it is stable", () => {
     vi.useFakeTimers();
     renderHook(() =>
       useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
     );
 
     act(() => FakeWebSocket.instances[0].close());
-    act(() => vi.advanceTimersByTime(250));
+    act(() => vi.advanceTimersByTime(FIRST_RETRY_MS));
     const recoveredSocket = FakeWebSocket.instances[1];
-    act(() => recoveredSocket.simulateOpen());
-    act(() => {
-      recoveredSocket.simulateMessage({
-        type: "error",
-        operation: "subscribe",
-        code: "room_subscription_unavailable",
-      });
-      vi.advanceTimersByTime(250);
-      recoveredSocket.simulateMessage(subscribed());
-      recoveredSocket.close();
-    });
 
-    act(() => vi.advanceTimersByTime(249));
+    // Opens, then drops well before STABLE_CONNECTION_MS: the attempt counter
+    // must not be forgiven, so the next wait is the doubled one.
+    act(() => recoveredSocket.simulateOpen());
+    act(() => recoveredSocket.close());
+
+    act(() => vi.advanceTimersByTime(2 * FIRST_RETRY_MS - 1));
     expect(FakeWebSocket.instances).toHaveLength(2);
     act(() => vi.advanceTimersByTime(1));
     expect(FakeWebSocket.instances).toHaveLength(3);
+  });
 
-    const reconnectedSocket = FakeWebSocket.instances[2];
+  it("retries subscribe recovery on its own budget, independently of network backoff", () => {
+    vi.useFakeTimers();
+    renderHook(() =>
+      useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
+    );
+
+    const socket = FakeWebSocket.instances[0];
     act(() => {
-      reconnectedSocket.simulateOpen();
-      reconnectedSocket.simulateMessage(subscribed());
+      socket.simulateOpen();
+      socket.simulateMessage(subscribed());
     });
     for (const delay of [250, 500, 1_000]) {
       act(() =>
-        reconnectedSocket.simulateMessage({
+        socket.simulateMessage({
           type: "error",
           operation: "subscribe",
           code: "room_subscription_unavailable",
@@ -1176,7 +1190,7 @@ describe("useChatWebSocket", () => {
       );
       act(() => vi.advanceTimersByTime(delay));
     }
-    expect(subscriptionCount(reconnectedSocket)).toBe(4);
+    expect(subscriptionCount(socket)).toBe(4);
   });
 
   it("does not reconnect after cleanup", () => {
@@ -1207,7 +1221,7 @@ describe("useChatWebSocket", () => {
       ws.close();
       ws.onclose?.();
       ws.onclose?.();
-      vi.advanceTimersByTime(250);
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
     });
 
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -1288,7 +1302,7 @@ describe("useChatWebSocket", () => {
     global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
 
     act(() => {
-      vi.advanceTimersByTime(300);
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
     });
 
     expect(FakeWebSocket.instances).toHaveLength(1);

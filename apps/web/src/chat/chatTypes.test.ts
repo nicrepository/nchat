@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { partitionDMs, type DMConversation } from "./chatTypes";
+import { parseDMConversationType, partitionDMs, type DMConversation } from "./chatTypes";
 
 function dm(id: string, type: DMConversation["type"], name = id): DMConversation {
   return { id, type, name, participants: [] };
@@ -63,5 +63,64 @@ describe("partitionDMs", () => {
 
   it("yields two empty buckets for an empty list", () => {
     expect(partitionDMs([])).toEqual({ directs: [], groups: [] });
+  });
+
+  it("drops a conversation whose type is neither known variant", () => {
+    // Reachable from JSON that was cast rather than parsed. An `else` branch
+    // would file every one of these under directs — the bucket whose entries get
+    // a profile panel — so the switch drops them instead.
+    const unknown = [
+      "broadcast",
+      "",
+      "direct",
+      "1:1 ",
+      null,
+      undefined,
+      7,
+      { type: "1:1" },
+    ] as unknown as DMConversation["type"][];
+
+    const input = unknown.map((type, index) => ({
+      id: `bad-${index}`,
+      type,
+      name: "Desconhecida",
+      participants: [],
+    }));
+    const { directs, groups } = partitionDMs([dm("d", "1:1"), ...input, dm("g", "group")]);
+
+    expect(directs.map((c) => c.id)).toEqual(["d"]);
+    expect(groups.map((c) => c.id)).toEqual(["g"]);
+  });
+});
+
+describe("parseDMConversationType", () => {
+  it("maps the two documented wire values onto the internal ones", () => {
+    // chat.dm_conversations.type is CHECK'd to exactly these; "direct" is the
+    // wire spelling of the internal "1:1".
+    expect(parseDMConversationType("direct")).toBe("1:1");
+    expect(parseDMConversationType("group")).toBe("group");
+  });
+
+  it("refuses everything else instead of defaulting to a 1:1", () => {
+    for (const value of [
+      "broadcast",
+      "",
+      "  ",
+      "1:1",
+      "Direct",
+      "GROUP",
+      " direct",
+      null,
+      undefined,
+      0,
+      1,
+      true,
+      {},
+      [],
+      ["direct"],
+      { type: "direct" },
+    ]) {
+      expect(parseDMConversationType(value)).toBeUndefined();
+    }
   });
 });

@@ -18,6 +18,13 @@ var (
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
 	ErrInvalidMessageTarget      = errors.New("invalid message target")
+	// ErrInconsistentDirectConversation reports a chat.dm_conversations row of
+	// type 'direct' that does not resolve to exactly one other active
+	// participant. The domain says a direct conversation is a pair, so this is
+	// corrupt data, not a denial: it must surface as a server error an operator
+	// can see rather than as a 404 that would hide it among the legitimate
+	// refusals.
+	ErrInconsistentDirectConversation = errors.New("direct conversation does not have exactly one counterpart")
 	// ErrInvalidMessageReference is returned when a parent, forwarded_from, or
 	// referenced message ID fails validation. The error is intentionally generic so
 	// that callers cannot determine whether the referenced message exists.

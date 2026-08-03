@@ -147,6 +147,10 @@ type Hub struct {
 	presence        *PresenceTracker // optional; nil-safe throughout
 	reactionHandler ReactionHandler
 	reactionLimiter ReactionLimiter
+	callHandler     CallHandler
+	callLimiter     CallLimiter
+	callStartLimit  int
+	callStartWindow int
 
 	register        chan registerReq
 	unregister      chan *Client
@@ -917,6 +921,12 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if isCallEventType(evt.Type) {
+		evt, ok = canonicalizeCallEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 
 	// Remote bus payloads may contain body_text or legacy sender_email. Strip
 	// them so remote nodes route by IDs only; clients fetch by ID if needed.
@@ -941,7 +951,9 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	// Known event type required.
 	switch evt.Type {
 	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
-		EventTypeMembersAdded, EventTypeConversationAvailable:
+		EventTypeMembersAdded, EventTypeConversationAvailable,
+		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
+		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
 	default:
 		return Event{}, false
@@ -949,7 +961,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known target type required.
 	switch evt.TargetType {
-	case TargetTypeChannel, TargetTypeDM:
+	case TargetTypeChannel, TargetTypeDM, TargetTypeUser:
 		// OK
 	default:
 		return Event{}, false
@@ -1026,6 +1038,14 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 		return evt, true
 	}
 
+	// Call events (RF-23) route to a user through TargetTypeUser/TargetID rather
+	// than through RecipientUserID, and name no message. canonicalizeCallEvent
+	// has already asserted both, plus the whole call payload.
+	if isCallEventType(evt.Type) {
+		return evt, true
+	}
+
+	// Everything that remains is message-scoped.
 	mid, err := uuid.Parse(evt.MessageID)
 	if err != nil {
 		return Event{}, false
@@ -1228,6 +1248,10 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 		defer close(req.done)
 	}
 
+	if req.event.TargetType == TargetTypeUser {
+		h.handleUserBroadcast(req)
+		return
+	}
 	key := broadcastTargetKey(req.event)
 
 	subscriptions := h.broadcastSnapshot(key)
@@ -1244,6 +1268,8 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 		// Re-check authorization before delivery using a fresh bounded context.
 		// Using context.Background() (not the caller's context) ensures that a
 		// cancelled publish context does not affect the auth check or revocation.
+		// TargetTypeUser events never reach this loop: handleBroadcast routes them
+		// to handleUserBroadcast and returns before this point.
 		authCtx, cancel := context.WithTimeout(c.ctx, broadcastAuthTimeout)
 		allowed, authErr := h.authorizer.CanAccess(authCtx, c.userID, c.workspaceID, req.event.TargetType, req.event.TargetID)
 
@@ -1319,6 +1345,9 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 			return err
 		}
 		return nil
+	case ClientMessageTypeCallStart, ClientMessageTypeCallAccept, ClientMessageTypeCallDecline,
+		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallSync:
+		return h.handleCallMessage(ctx, c, msg)
 	default:
 		return fmt.Errorf("ws: unknown client message type %q", msg.Type)
 	}

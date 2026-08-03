@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
@@ -25,6 +26,8 @@ type dmProvider interface {
 	GetGroupDetails(ctx context.Context, input service.GroupDetailsInput) (service.GroupDetails, error)
 	// SearchGroupParticipantCandidates lists people not already in the group.
 	SearchGroupParticipantCandidates(ctx context.Context, input service.SearchGroupParticipantCandidatesInput) ([]domain.DMCandidate, error)
+	// GetDirectProfile is the 1:1 profile projection (issue #443).
+	GetDirectProfile(ctx context.Context, input service.DirectProfileInput) (service.DirectProfile, error)
 }
 
 type dmRateLimiter interface {
@@ -51,10 +54,17 @@ type DMHandler struct {
 	presence   presenceLookup
 }
 
-// WithPresence returns a handler that can annotate participants with presence.
-// Wired after the WebSocket hub exists, exactly like the channel handler's.
-// Without it the payload omits presence entirely rather than claiming "offline"
-// for everyone — "not tracked" and "offline" are different statements.
+func NewDMHandler(workspaces workspaceResolver, dms dmProvider, limiter dmRateLimiter) *DMHandler {
+	return &DMHandler{workspaces: workspaces, dms: dms, limiter: limiter}
+}
+
+// WithPresence returns a handler that annotates group participants with their
+// live presence. Wired after the WebSocket hub exists, exactly like the channel
+// handler's. Without it participants simply carry no presence.
+//
+// Presence here is decoration, never a filter: a group lists every active
+// participant, so an unwired or empty presence source changes what each row
+// says about itself and never who is in the list.
 func (h *DMHandler) WithPresence(presence presenceLookup) *DMHandler {
 	if h == nil {
 		return nil
@@ -62,10 +72,6 @@ func (h *DMHandler) WithPresence(presence presenceLookup) *DMHandler {
 	next := *h
 	next.presence = presence
 	return &next
-}
-
-func NewDMHandler(workspaces workspaceResolver, dms dmProvider, limiter dmRateLimiter) *DMHandler {
-	return &DMHandler{workspaces: workspaces, dms: dms, limiter: limiter}
 }
 
 // WithMembersBroadcast returns a handler that emits the post-commit members.added
@@ -107,6 +113,265 @@ type createGroupDMRequest struct {
 
 type createGroupDMResponse struct {
 	ConversationID string `json:"conversation_id"`
+}
+
+// ── Group details (issue #441) ───────────────────────────────────────────────
+
+// groupParticipantJSON is one participant of the panel's preview.
+//
+// It carries exactly what the panel renders: a stable ID (so the client can
+// mark "you" by identity rather than by name), the resolved display name, an
+// optional avatar URL and the live presence. E-mail, workspace role, join date
+// and every other profile attribute are deliberately absent — a details panel
+// is not a directory export.
+//
+// There is no role: chat.dm_members.role is closed by CHECK to 'member', so a
+// group has no role worth showing.
+type groupParticipantJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	// Presence is omitted when the server does not track it, so a client can
+	// tell "not tracked" from "tracked and offline". It never decides whether a
+	// participant appears.
+	Presence string `json:"presence,omitempty"`
+}
+
+// groupDetailsResponse is the panel payload for a group conversation.
+//
+// Deliberately absent, because a group is not a channel: there is no
+// visibility (public/private), no slug, no category and no description. The
+// domain has none of them for chat.dm_conversations, so none is invented here.
+//
+// participant_count is every active participant; participants is the capped
+// preview and its length must never be shown as the count.
+type groupDetailsResponse struct {
+	ID               string                 `json:"id"`
+	Type             string                 `json:"type"`
+	Name             string                 `json:"name"`
+	CreatedAt        string                 `json:"created_at"`
+	ParticipantCount int                    `json:"participant_count"`
+	Participants     []groupParticipantJSON `json:"participants"`
+	// CanManageMembers (issue #398) is always sent, so a client that predates it
+	// reads absent-as-false and hides the add action — the safe direction. It is
+	// a rendering hint: POST .../members re-derives the decision in its own
+	// transaction.
+	CanManageMembers bool `json:"can_manage_members"`
+}
+
+// GroupDetails handles GET /api/chat/dm/{conversationID}/details.
+//
+// The conversation ID comes from the path and is never trusted: the service
+// resolves the caller's participation against the server-side workspace before
+// any participant row is read, and a conversation the caller cannot reach is
+// answered with the same 404 as a missing one. A 1:1 conversation is refused
+// the same way — details for direct messages are out of scope for this issue.
+func (h *DMHandler) GroupDetails(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.dms == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "conversations not available")
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	details, err := h.dms.GetGroupDetails(r.Context(), service.GroupDetailsInput{
+		WorkspaceID:      workspaceID,
+		CallerID:         callerID,
+		ConversationID:   conversationID,
+		ParticipantLimit: domain.MaxDMDetailsParticipants,
+	})
+	if err != nil {
+		writeGroupDetailsError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, h.groupDetailsBody(workspaceID, details))
+}
+
+func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDetails) groupDetailsResponse {
+	// One batch presence read for the whole page — never one lookup per
+	// participant. The set only annotates rows the query already selected.
+	online := map[string]struct{}{}
+	if h.presence != nil {
+		for _, userID := range h.presence.OnlineUserIDs(workspaceID) {
+			online[userID] = struct{}{}
+		}
+	}
+	participants := make([]groupParticipantJSON, 0, len(details.Participants))
+	for _, participant := range details.Participants {
+		presence := ""
+		if h.presence != nil {
+			presence = presenceOffline
+			if _, isOnline := online[participant.UserID]; isOnline {
+				presence = presenceOnline
+			}
+		}
+		participants = append(participants, groupParticipantJSON{
+			UserID:      participant.UserID,
+			DisplayName: participant.DisplayName,
+			AvatarURL:   participant.AvatarURL,
+			Presence:    presence,
+		})
+	}
+	return groupDetailsResponse{
+		ID:               details.Conversation.ID,
+		Type:             string(details.Conversation.Type),
+		Name:             details.Conversation.Title,
+		CreatedAt:        details.Conversation.CreatedAt.UTC().Format(time.RFC3339),
+		ParticipantCount: details.ParticipantCount,
+		Participants:     participants,
+		CanManageMembers: details.CanManageMembers,
+	}
+}
+
+// writeGroupDetailsError folds every denial into the same 404. A caller must
+// not be able to tell "this conversation exists but is not yours" from "no such
+// conversation", nor a group from a 1:1 they cannot see.
+func writeGroupDetailsError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "conversation not found")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+// ── Direct profile (issue #443) ──────────────────────────────────────────────
+
+// directProfileJSON is the other participant of a 1:1 conversation.
+//
+// It is the group participant's shape plus the corporate e-mail, which the
+// prototype's profile card shows and a participant row does not. Nothing else
+// from auth.users appears: no phone, no auth_source, no external_subject, no
+// status, no last_login_at, no roles, no session or device data. A profile
+// summary is not a directory record and must not become one by accretion.
+//
+// job_title, department and timezone are absent rather than empty. No column in
+// the domain stores them today, so an empty string here would assert "this
+// person has no job title" instead of "this deployment does not record one" —
+// the client distinguishes the two by the key being missing and renders "Não
+// informado". When those columns exist they are added here and the panel starts
+// showing them with no further change.
+type directProfileJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	Email       string `json:"email,omitempty"`
+	// Presence is omitted when the server does not track it, so a client can
+	// tell "not tracked" from "tracked and offline".
+	Presence string `json:"presence,omitempty"`
+}
+
+// directProfileResponse is the panel payload for a 1:1 conversation.
+//
+// It carries a profile, not a participant list: a direct conversation's roster
+// is the caller plus one person, and shipping it as `participants` would invite
+// the client to pick a side. The server has already picked, and `kind` names
+// the variant so the client switches on a tag rather than guessing from which
+// fields happen to be present.
+type directProfileResponse struct {
+	Kind           string            `json:"kind"`
+	ConversationID string            `json:"conversation_id"`
+	Profile        directProfileJSON `json:"profile"`
+}
+
+// DirectProfile handles GET /api/chat/dm/{conversationID}/profile.
+//
+// Only the conversation is named, and it is not trusted: the service settles
+// the caller's participation against the server-side workspace, refuses
+// anything that is not a `direct` row, and resolves the counterpart from the
+// membership rows. There is no user ID anywhere in the request, so this cannot
+// be used to read an arbitrary person's profile, and a conversation the caller
+// cannot reach — including a group — answers the same 404 as a missing one.
+func (h *DMHandler) DirectProfile(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.dms == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "conversations not available")
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	result, err := h.dms.GetDirectProfile(r.Context(), service.DirectProfileInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeDirectProfileError(w, r, conversationID, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, directProfileResponse{
+		Kind:           "direct",
+		ConversationID: result.Conversation.ID,
+		Profile: directProfileJSON{
+			UserID:      result.Profile.UserID,
+			DisplayName: result.Profile.DisplayName,
+			AvatarURL:   result.Profile.AvatarURL,
+			Email:       result.Profile.Email,
+			Presence:    h.presenceOf(workspaceID, result.Profile.UserID),
+		},
+	})
+}
+
+// presenceOf reports the live presence of one user, or "" when presence is not
+// wired at all. A profile is a single person, so the batch read the group panel
+// needs would be one membership scan to answer one question; the set is
+// consulted directly instead.
+//
+// Presence never gates the profile: an unwired or empty source only changes
+// what this field says.
+func (h *DMHandler) presenceOf(workspaceID, userID string) string {
+	if h.presence == nil {
+		return ""
+	}
+	for _, online := range h.presence.OnlineUserIDs(workspaceID) {
+		if online == userID {
+			return presenceOnline
+		}
+	}
+	return presenceOffline
+}
+
+// writeDirectProfileError folds every denial into the same 404 — a caller must
+// not be able to tell "this conversation exists but is not yours" from "no such
+// conversation", nor a group from a 1:1 they cannot see.
+//
+// A conversation that is `direct` but does not resolve to exactly one
+// counterpart is the one case that is not a denial: it is corrupt data, so it
+// answers 500 and is logged with the conversation ID (an identifier the caller
+// already holds) and nothing else — no e-mail, no name, no participant IDs.
+func writeDirectProfileError(w http.ResponseWriter, r *http.Request, conversationID string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInconsistentDirectConversation):
+		slog.ErrorContext(r.Context(), "chat direct profile inconsistent conversation",
+			slog.String("conversation_id", conversationID))
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "conversation not found")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
 }
 
 func (h *DMHandler) SearchCandidates(w http.ResponseWriter, r *http.Request) {
@@ -297,127 +562,6 @@ func (h *DMHandler) AddParticipants(w http.ResponseWriter, r *http.Request) {
 		AlreadyMembers: result.AlreadyMembers,
 		MemberCount:    result.TotalCount,
 	})
-}
-
-// ── Group details (issue #441, extended by #398) ────────────────────────────
-
-// groupParticipantJSON is one participant of the group panel's list.
-//
-// No role field, unlike the channel panel: chat.dm_members.role is closed by
-// CHECK to the single value 'member', so a group has none to show. E-mail,
-// workspace role and join date are never serialized.
-type groupParticipantJSON struct {
-	UserID      string `json:"user_id"`
-	DisplayName string `json:"display_name"`
-	AvatarURL   string `json:"avatar_url,omitempty"`
-	// Omitted when the server does not track presence, so the client can tell
-	// "not tracked" from "offline".
-	Presence string `json:"presence,omitempty"`
-}
-
-// groupDetailsResponse is the panel payload for a group conversation.
-//
-// Deliberately absent, because a group is not a channel: visibility
-// (public/private), slug, category and description. The domain has none of them
-// for chat.dm_conversations, so none is invented here.
-//
-// participant_count is every active participant; participants is the capped
-// preview and its length must never be shown as the count.
-type groupDetailsResponse struct {
-	ID               string                 `json:"id"`
-	Type             string                 `json:"type"`
-	Name             string                 `json:"name"`
-	CreatedAt        string                 `json:"created_at"`
-	ParticipantCount int                    `json:"participant_count"`
-	Participants     []groupParticipantJSON `json:"participants"`
-	// Always sent, so a client that predates it reads absent-as-false and hides
-	// the add action — the safe direction.
-	CanManageMembers bool `json:"can_manage_members"`
-}
-
-// presenceOffline is the counterpart of presenceOnline for a list that is not
-// filtered by presence.
-const presenceOffline = "offline"
-
-// Details handles GET /api/chat/dm/{conversationID}/details.
-//
-// The conversation ID comes from the path and is never trusted: the service
-// resolves the caller's participation against the server-side workspace before
-// any participant row is read, and a conversation the caller cannot see — or a
-// 1:1 — is answered with the same 404 as a missing one.
-func (h *DMHandler) Details(w http.ResponseWriter, r *http.Request) {
-	if h.workspaces == nil || h.dms == nil {
-		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "direct messages not available")
-		return
-	}
-	conversationID := r.PathValue("conversationID")
-	if !validateTargetID(w, conversationID, "conversation_id") {
-		return
-	}
-	callerID := GetContextUserID(r)
-	if callerID == "" {
-		writeUnauthorized(w)
-		return
-	}
-	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
-	if !ok {
-		return
-	}
-	details, err := h.dms.GetGroupDetails(r.Context(), service.GroupDetailsInput{
-		WorkspaceID:      workspaceID,
-		CallerID:         callerID,
-		ConversationID:   conversationID,
-		ParticipantLimit: domain.MaxDMDetailsParticipants,
-	})
-	if err != nil {
-		// Every denial collapses into one 404 so the route cannot be used to
-		// discover which conversation UUIDs exist, nor to tell a group apart
-		// from a 1:1 the caller cannot see.
-		switch {
-		case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
-			httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "conversation not found")
-		default:
-			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
-		}
-		return
-	}
-	httputil.WriteJSON(w, http.StatusOK, h.groupDetailsBody(workspaceID, details))
-}
-
-func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDetails) groupDetailsResponse {
-	// One batch presence read for the whole page — never one lookup per
-	// participant. The set only annotates rows the query already selected.
-	online := map[string]struct{}{}
-	if h.presence != nil {
-		for _, userID := range h.presence.OnlineUserIDs(workspaceID) {
-			online[userID] = struct{}{}
-		}
-	}
-	participants := make([]groupParticipantJSON, 0, len(details.Participants))
-	for _, participant := range details.Participants {
-		presence := ""
-		if h.presence != nil {
-			presence = presenceOffline
-			if _, isOnline := online[participant.UserID]; isOnline {
-				presence = presenceOnline
-			}
-		}
-		participants = append(participants, groupParticipantJSON{
-			UserID:      participant.UserID,
-			DisplayName: participant.DisplayName,
-			AvatarURL:   participant.AvatarURL,
-			Presence:    presence,
-		})
-	}
-	return groupDetailsResponse{
-		ID:               details.Conversation.ID,
-		Type:             string(details.Conversation.Type),
-		Name:             details.Conversation.Title,
-		CreatedAt:        details.Conversation.CreatedAt.UTC().Format(time.RFC3339),
-		ParticipantCount: details.ParticipantCount,
-		Participants:     participants,
-		CanManageMembers: details.CanManageMembers,
-	}
 }
 
 // dmCandidateSearchAction is the shared limiter namespace for every candidate

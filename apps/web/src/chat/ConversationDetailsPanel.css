@@ -1,5 +1,6 @@
 /*
- * ChannelDetailsPanel — "Detalhes do canal" side panel (issue #435).
+ * ConversationDetailsPanel — side panel for a channel ("Detalhes do canal",
+ * issue #435) and for an ad-hoc group ("Detalhes do grupo", issue #441).
  *
  * The panel is a grid column of .chat-msg-area, not an overlay: the conversation
  * keeps its own column and simply narrows. Only below the layout's breakpoint
@@ -150,12 +151,34 @@
   font-size: 16px;
 }
 
-/* A disabled action stays visible and legible — it is an affordance that is not
-   available yet, not a control that has been hidden. */
-.chat-details__link-action:disabled,
-.chat-details__wide-action:disabled {
+/* An unavailable action stays visible and legible — it is an affordance that is
+   not available yet, not a control that has been hidden.
+
+   The selector is [aria-disabled], not :disabled: these buttons are deliberately
+   left in the tab order so the reason described by aria-describedby can actually
+   be reached and announced.
+
+   Nothing here removes the control from the pointer either. `pointer-events:
+   none` would make the button undiscoverable by hover and unhittable by touch
+   without making it any less activatable — activation is already prevented in
+   the component, which is where that belongs. */
+.chat-details__link-action[aria-disabled="true"],
+.chat-details__wide-action[aria-disabled="true"] {
   cursor: not-allowed;
-  opacity: 0.55;
+  /* Muted enough to read as unavailable, opaque enough to stay legible: at 0.8
+     both labels clear 4.5:1 against their surfaces, which 0.55 did not. A
+     focusable control is not "incidental" text and cannot rely on that
+     exemption. */
+  opacity: 0.8;
+}
+
+/* The UA focus ring is what a keyboard user has to find these by, so it is
+   stated explicitly rather than left to the browser default over a tinted
+   background. Deliberately not `outline: none`. */
+.chat-details__link-action:focus-visible,
+.chat-details__wide-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
 }
 
 /* ── Members ────────────────────────────────────────────────────────────── */
@@ -273,6 +296,122 @@
   color: var(--color-primary-strong, #5b21b6);
   font-size: 10px;
   font-weight: 700;
+}
+
+/* ── 1:1 profile (issue #443) ───────────────────────────────────────────── */
+
+/* The profile is centred and the conversation sections are not, so it is its
+   own block inside the same scrolling body rather than a variant of
+   .chat-details__section. Nothing above it changes. */
+.chat-details__profile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.chat-details__profile-avatar {
+  position: relative;
+  flex: none;
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 28px;
+  font-weight: 700;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+
+.chat-details__profile-presence {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 3px solid var(--color-surface, #fff);
+  background: var(--color-muted-2, #a39cb3);
+}
+
+.chat-details__profile-name {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+  /* A long name wraps inside the panel instead of widening it. */
+  overflow-wrap: anywhere;
+}
+
+.chat-details__profile-role {
+  margin: -8px 0 0;
+  font-size: 13px;
+  color: var(--color-muted, #7c7390);
+  overflow-wrap: anywhere;
+}
+
+.chat-details__profile-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-details__profile-status--online {
+  background: var(--color-success-tint, #dcfce7);
+  color: var(--color-success-ink, #166534);
+}
+
+.chat-details__status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-muted-2, #a39cb3);
+}
+
+.chat-details__profile-meta {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 18px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--color-surface-2, #faf8fd);
+  text-align: left;
+}
+
+.chat-details__profile-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.chat-details__profile-row-label {
+  flex: none;
+  color: var(--color-muted, #7c7390);
+}
+
+.chat-details__profile-row-value {
+  min-width: 0;
+  text-align: right;
+  font-weight: 500;
+  color: var(--color-ink, #16121f);
+  /* An e-mail or a zone name is one unbroken token; it must wrap rather than
+     push the panel into a horizontal scroll. */
+  overflow-wrap: anywhere;
 }
 
 /* ── Pinned message ─────────────────────────────────────────────────────── */

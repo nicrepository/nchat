@@ -205,7 +205,7 @@ func TestAddGroupParticipantsHonoursAStoreLevelAuthorizationRefusal(t *testing.T
 
 func TestGetGroupDetailsReturnsTheParticipantPage(t *testing.T) {
 	svc, dms := groupParticipantsFixture(t, domain.DMConversationTypeGroup)
-	dms.participantPage = storage.DMParticipantPage{
+	dms.participants = storage.DMParticipantPage{
 		Participants: []domain.DMParticipantProfile{{UserID: amTargetA, DisplayName: "Ana"}},
 		TotalCount:   12,
 	}
@@ -242,7 +242,7 @@ func TestGetGroupDetailsRefusesDirectConversation(t *testing.T) {
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
-	if dms.participantPageCalls != 0 {
+	if len(dms.participantCalls) != 0 {
 		t.Fatal("a 1:1 must never reach the participant query")
 	}
 }
@@ -260,7 +260,7 @@ func TestGetGroupDetailsChecksAccessBeforeReadingParticipants(t *testing.T) {
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
-	if dms.participantPageCalls != 0 {
+	if len(dms.participantCalls) != 0 {
 		t.Fatal("participants were read for a caller who was refused access")
 	}
 }
