@@ -485,6 +485,146 @@ func (h *Hub) PublishPinUpdated(ctx context.Context, workspaceID string, targetT
 	}
 }
 
+// PublishMembersAdded broadcasts that a channel or group gained participants
+// (issue #398).
+//
+// Callers must invoke it only after the membership transaction has committed:
+// the event tells subscribers their view is stale, and one sent for a write that
+// then rolled back would make every client refetch its way back to the state it
+// already had — or, worse, believe a member exists.
+//
+// Delivery follows the same route as pin.updated: the local broadcast queue
+// re-checks each subscriber's authorization at fan-out, and the bus publish is
+// best-effort for other instances. The payload carries no identities at all
+// (see MembersAddedPayload), so a subscriber who may read the target learns only
+// that it changed and by how much — never who was added.
+func (h *Hub) PublishMembersAdded(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID, actorUserID string,
+	addedCount, memberCount int,
+) {
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMembersAdded,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		Members: &MembersAddedPayload{
+			ActorUserID: actorUserID, AddedCount: addedCount, MemberCount: memberCount,
+		},
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal members.added event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: members bus publish failed", "target_type", string(targetType), "error", err)
+	}
+}
+
+// PublishConversationAvailable delivers a sidebar-invalidation signal to the
+// sessions of the given users, wherever those sessions are connected (#398).
+//
+// This is the one publish path in the hub that is not routed by subscription,
+// and the reason is structural: the people this concerns have just been added
+// to a channel or group they were not subscribed to, so the room broadcast that
+// tells existing members "this changed" reaches everyone except them.
+//
+// One event is published per recipient rather than one carrying a list. That is
+// what lets a receiving instance route without any shared subscription state —
+// it reads RecipientUserID and looks up that user's local sessions — and it is
+// also what keeps a recipient from learning who else was added, since no event
+// ever names more than the user it is addressed to.
+//
+// Delivery rules, identical locally and remotely:
+//   - only the userIDs passed in, which callers must take from the set the
+//     transaction actually inserted — never from the request payload;
+//   - only sessions in the same workspace;
+//   - all live sessions of each user, since any of them may show the sidebar.
+//
+// The payload names the conversation and nothing else, and it grants no access:
+// the client reacts by refetching the sidebar, which re-derives membership
+// server-side.
+//
+// A user with no live session anywhere is simply skipped; their sidebar is
+// correct on next load. Bus publication is best-effort, like every other
+// publish here: a failure costs a stale sidebar until the next refetch, never
+// the membership that was already committed.
+func (h *Hub) PublishConversationAvailable(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID string, userIDs []string,
+) {
+	if len(userIDs) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == "" {
+			continue
+		}
+		// De-duplicated so a repeated ID cannot produce two signals.
+		if _, done := seen[userID]; done {
+			continue
+		}
+		seen[userID] = struct{}{}
+
+		evt := Event{
+			SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeConversationAvailable,
+			WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+			RecipientUserID:  userID,
+			EventID:          uuid.New().String(),
+			SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC(),
+		}
+		data, err := json.Marshal(evt)
+		if err != nil {
+			h.logger.ErrorContext(ctx, "ws: marshal conversation.available event", "error", err)
+			continue
+		}
+
+		// Local sessions first, directly. The bus copy is suppressed on this
+		// instance by the SourceInstanceID echo check, so a recipient connected
+		// here is told exactly once.
+		h.deliverToLocalUserSessions(evt, data)
+
+		if err := h.bus.Publish(ctx, evt); err != nil {
+			// Deliberately no user ID in the log line.
+			h.logger.WarnContext(ctx, "ws: conversation.available bus publish failed",
+				"target_type", string(targetType), "error", err)
+		}
+	}
+}
+
+// deliverToLocalUserSessions enqueues data to every live session of
+// evt.RecipientUserID in evt.WorkspaceID on this instance.
+//
+// The workspace match matters as much as the user match: a session connected
+// under another workspace context must not be told about this one.
+//
+// A full outbox is skipped rather than dropping the connection — this is a
+// refresh hint, and losing it costs a stale sidebar until the next refetch,
+// which is not worth killing a session over.
+func (h *Hub) deliverToLocalUserSessions(evt Event, data []byte) {
+	if evt.RecipientUserID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.isShuttingDown() {
+		return
+	}
+	for _, client := range h.clients {
+		if client.workspaceID != evt.WorkspaceID || client.userID != evt.RecipientUserID {
+			continue
+		}
+		_ = client.enqueue(data)
+	}
+}
+
 // Shutdown stops the hub goroutine, cancels bus subscriptions, closes all
 // client connections, and closes the BroadcastBus. Blocks until the run
 // goroutine exits.
@@ -671,6 +811,21 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 		return
 	}
 
+	// User-scoped events are routed by recipient, not by subscription, so they
+	// must not enter the broadcast queue — that path would look for subscribers
+	// of the target, and the recipient is by definition not one.
+	//
+	// Delivering here also closes the republication loop: this returns without
+	// ever calling bus.Publish, so an event received from the bus is never sent
+	// back to it.
+	if canonical.Type == EventTypeConversationAvailable {
+		if !h.remoteRecipientMayAccess(canonical) {
+			return
+		}
+		h.deliverToLocalUserSessions(canonical, data)
+		return
+	}
+
 	select {
 	case h.remoteBcast <- broadcastReq{event: canonical, data: data}:
 	default:
@@ -680,6 +835,52 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 			"target_type", string(canonical.TargetType),
 		)
 	}
+}
+
+// remoteRecipientMayAccess decides whether a conversation.available that
+// arrived over the bus may be handed to its addressee's local sessions.
+//
+// Every other remote event is routed by subscription, and a subscription is
+// itself an authorization decision this hub made and re-checks at fan-out
+// (handleBroadcast). conversation.available has no such anchor: it names its own
+// recipient, and that name arrives from the bus. Without this check the whole
+// envelope — recipient, workspace, target — would be taken on the producer's
+// word, so anything able to publish could aim a metadata signal and a forced
+// refetch at any user it named.
+//
+// So the recipient's access is re-derived here from the authoritative record,
+// against the same SubscriptionAuthorizer the broadcast path uses. That is also
+// what makes the target kind safe: CanAccess resolves a channel through the
+// channels table and a DM through dm_members, and denies any other kind, so a
+// TargetType the producer chose cannot be used to have a group's ID checked as
+// something else.
+//
+// Fail-closed on all three failure shapes. A denial is the expected answer for a
+// membership that was removed. An error or a timeout is not evidence of access,
+// and a bus consumer must not block on the database, so both drop the event —
+// costing at most a stale sidebar until the next refetch, which the sidebar API
+// re-authorizes anyway.
+func (h *Hub) remoteRecipientMayAccess(evt Event) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), broadcastAuthTimeout)
+	defer cancel()
+
+	allowed, err := h.authorizer.CanAccess(ctx, evt.RecipientUserID, evt.WorkspaceID, evt.TargetType, evt.TargetID)
+	if err != nil {
+		// Metadata only: no recipient, no target, nothing that would turn the log
+		// into a record of who was added to what.
+		h.logger.WarnContext(ctx, "ws: remote conversation.available authorization failed; dropping",
+			"target_type", string(evt.TargetType),
+			"error", err,
+		)
+		return false
+	}
+	if !allowed {
+		h.logger.DebugContext(ctx, "ws: remote conversation.available denied; dropping",
+			"target_type", string(evt.TargetType),
+		)
+		return false
+	}
+	return true
 }
 
 // canonicalizeRemoteEvent validates and canonicalizes a remote bus event.
@@ -714,6 +915,12 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if evt.Type == EventTypeMembersAdded {
+		evt, ok = canonicalizeMembersEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 	if isCallEventType(evt.Type) {
 		evt, ok = canonicalizeCallEvent(evt)
 		if !ok {
@@ -744,6 +951,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	// Known event type required.
 	switch evt.Type {
 	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
+		EventTypeMembersAdded, EventTypeConversationAvailable,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
@@ -795,10 +1003,49 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 	}
 	evt.TargetID = tid.String()
 
+	// conversation.available is the one event that names a user rather than a
+	// message: it is routed to a recipient, not to a message's subscribers.
+	// Its recipient is required and must be a UUID; a message ID is not.
+	if evt.Type == EventTypeConversationAvailable {
+		rid, err := uuid.Parse(evt.RecipientUserID)
+		if err != nil {
+			return Event{}, false
+		}
+		evt.RecipientUserID = rid.String()
+		// Nothing else may ride along: strip every payload a sender might have
+		// attached, so a remote event can carry no identities or content.
+		evt.MessageID = ""
+		evt.Pin = nil
+		evt.Reaction = nil
+		evt.Members = nil
+		return evt, true
+	}
+
+	// No other event type may carry a recipient — that field is what makes
+	// delivery bypass subscriptions, so it must not appear where it is not
+	// expected.
+	if evt.RecipientUserID != "" {
+		return Event{}, false
+	}
+
+	// members.added is target-scoped like the message events, but it is about the
+	// target itself rather than about anything in it, so it has no message to
+	// name. A message_id on one is a shape this protocol does not produce.
+	if evt.Type == EventTypeMembersAdded {
+		if evt.MessageID != "" {
+			return Event{}, false
+		}
+		return evt, true
+	}
+
+	// Call events (RF-23) route to a user through TargetTypeUser/TargetID rather
+	// than through RecipientUserID, and name no message. canonicalizeCallEvent
+	// has already asserted both, plus the whole call payload.
 	if isCallEventType(evt.Type) {
 		return evt, true
 	}
-	// All currently supported event types are message-scoped.
+
+	// Everything that remains is message-scoped.
 	mid, err := uuid.Parse(evt.MessageID)
 	if err != nil {
 		return Event{}, false
@@ -827,6 +1074,40 @@ func canonicalizeReactionEvent(evt Event) (Event, bool) {
 	// TODO: this fetch-on-remote-event can cause a thundering herd in large
 	// channels. Propagate aggregates and actor_user_id through the bus before
 	// computing reacted_by_me optimistically without a REST round-trip.
+	evt.Reaction = nil
+	return evt, true
+}
+
+// canonicalizeMembersEvent validates a remote members.added event.
+//
+// The payload is retained rather than stripped, like pin.updated's and unlike
+// message.created's, because there is nothing in it to distrust with a body:
+// MembersAddedPayload is two counts and the actor, and it names none of the
+// people who were added (see its doc comment). Keeping it is what lets a remote
+// subscriber correct its member counter without waiting for the refetch, and
+// what makes a client's own write recognisable as an echo on any pod.
+//
+// The counts are still checked for a shape the publisher could actually have
+// produced: an add that changed nothing is never published, and the total after
+// a commit necessarily includes the people it just added. Anything else is a
+// forged or corrupted envelope, and the whole event is dropped — a remote node
+// must not render a count it was handed.
+//
+// Pin and Reaction are cleared: those belong to other event types, and an
+// envelope that carries both is not one this protocol emits.
+func canonicalizeMembersEvent(evt Event) (Event, bool) {
+	if evt.Members == nil {
+		return Event{}, false
+	}
+	if evt.Members.AddedCount <= 0 || evt.Members.MemberCount < evt.Members.AddedCount {
+		return Event{}, false
+	}
+	actorID, err := uuid.Parse(evt.Members.ActorUserID)
+	if err != nil {
+		return Event{}, false
+	}
+	evt.Members.ActorUserID = actorID.String()
+	evt.Pin = nil
 	evt.Reaction = nil
 	return evt, true
 }

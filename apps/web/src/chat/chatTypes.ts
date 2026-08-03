@@ -290,6 +290,35 @@ export interface ChannelDetails {
   memberCount: number;
   onlineCount: number;
   onlineMembers: ChannelMemberProfile[];
+  /**
+   * Whether the server would let this caller add participants (issue #398).
+   *
+   * A rendering hint, never a control: `POST .../members` re-derives the same
+   * decision from the session on every call, so hiding the action protects
+   * nobody and showing it grants nothing. It is normalized with a strict
+   * `=== true`, so an absent or malformed field leaves it false — a server that
+   * predates this field hides the action rather than enabling it.
+   */
+  canManageMembers: boolean;
+}
+
+// ── Add members (issue #398) ─────────────────────────────────────────────────
+
+/**
+ * What one add-members call actually changed, as the server reports it.
+ *
+ * `added` and `alreadyMembers` are separate so a retry stays legible: repeating
+ * an identical request reports the same people under `alreadyMembers` and adds
+ * nothing, which is neither a fresh success nor a failure.
+ *
+ * `memberCount` is the authoritative post-commit total. The panel sets its
+ * counter from it rather than incrementing a local number, so a concurrent add
+ * by someone else does not leave the two views disagreeing.
+ */
+export interface AddMembersResult {
+  added: number;
+  alreadyMembers: number;
+  memberCount: number;
 }
 
 /**
@@ -323,6 +352,8 @@ export interface GroupDetails {
   createdAt: string; // ISO 8601
   participantCount: number;
   participants: GroupParticipantProfile[];
+  /** Same meaning and the same strict normalization as ChannelDetails' (issue #398). */
+  canManageMembers: boolean;
 }
 
 /**

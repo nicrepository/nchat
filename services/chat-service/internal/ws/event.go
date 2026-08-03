@@ -25,7 +25,28 @@ const (
 	EventTypeReactionUpdated EventType = "reaction.updated"
 	// EventTypePinUpdated is emitted after a message is pinned or unpinned in a
 	// channel or DM (RF-05). Delivered to readable target subscribers only.
-	EventTypePinUpdated    EventType = "pin.updated"
+	EventTypePinUpdated EventType = "pin.updated"
+	// EventTypeMembersAdded is emitted after participants are added to a channel
+	// or group conversation (issue #398). Delivered to readable target
+	// subscribers only, and carries no identities — see MembersAddedPayload.
+	EventTypeMembersAdded EventType = "members.added"
+	// EventTypeConversationAvailable tells one user that a conversation they can
+	// now see exists (issue #398).
+	//
+	// It is the only user-scoped event in this protocol, and it has to be: a
+	// person who has just been added to a private channel or a group is by
+	// definition not subscribed to it, so a room broadcast reaches everyone
+	// except the one who needs it. It is delivered straight to that user's
+	// sessions instead.
+	//
+	// It is a pure invalidation signal — "refetch your sidebar" — and grants
+	// nothing on its own: the sidebar API re-derives membership server-side, so
+	// a client that receives this for a conversation it cannot read still sees
+	// nothing.
+	EventTypeConversationAvailable EventType = "conversation.available"
+
+	// Call lifecycle (RF-23). User-scoped like conversation.available in that
+	// they name a peer, but with their own payload and their own validation.
 	EventTypeCallRinging   EventType = "call.ringing"
 	EventTypeCallAccepted  EventType = "call.accepted"
 	EventTypeCallDeclined  EventType = "call.declined"
@@ -120,6 +141,32 @@ type ReactionPayload struct {
 // PinEventPayload carries a pin change (RF-05). It is route-plus-flag
 // only: clients refetch the authoritative pin list on receipt. No message body
 // travels on this event.
+// MembersAddedPayload signals that a channel or group gained participants
+// (issue #398).
+//
+// It names nobody. The added users' IDs, display names and avatars are all
+// deliberately absent: a subscriber's own read authorization decides what they
+// may see of a roster, and that decision belongs to the details endpoint, not to
+// a broadcast that is fanned out to every subscriber at once. Clients treat this
+// as "your view of this target is stale" and refetch, exactly as they already do
+// for pin.updated.
+//
+// Carrying no identities is also what makes the event idempotent. A refetch
+// replaces the panel's list wholesale rather than appending to it, so the HTTP
+// response and this event cannot combine into a duplicated member row, and a
+// retry that broadcasts twice costs one extra request and changes nothing.
+//
+// ActorUserID is exposed like PinEventPayload's, so a client can recognise the
+// echo of its own write. MemberCount is the authoritative post-commit total,
+// letting a subscriber correct its counter without waiting for the refetch.
+type MembersAddedPayload struct {
+	ActorUserID string `json:"actor_user_id"`
+	// AddedCount is how many participants were newly persisted, never who.
+	AddedCount int `json:"added_count"`
+	// MemberCount is the target's total active participants after the commit.
+	MemberCount int `json:"member_count"`
+}
+
 type PinEventPayload struct {
 	MessageID string `json:"message_id"`
 	// ActorUserID is the user who pinned/unpinned, exposed like sender_id so
@@ -177,7 +224,20 @@ type Event struct {
 	MessageUpdate *MessageUpdatedPayload `json:"message_update,omitempty"`
 	Reaction      *ReactionEventPayload  `json:"reaction,omitempty"`
 	Pin           *PinEventPayload       `json:"pin,omitempty"`
-	Call          *CallEventPayload      `json:"call,omitempty"`
+	Members       *MembersAddedPayload   `json:"members,omitempty"`
+	// RecipientUserID routes a user-scoped event to exactly one user.
+	//
+	// Set only for conversation.available, which is not delivered by
+	// subscription: the person it concerns has just been added to a target they
+	// do not subscribe to. Every other event routes by (workspace, target) and
+	// leaves this empty.
+	//
+	// It is the routing key across the distributed bus, so a receiving instance
+	// can find that user's local sessions without any shared subscription state.
+	// It is always a value the publishing transaction confirmed, never one taken
+	// from a request body.
+	RecipientUserID string            `json:"recipient_user_id,omitempty"`
+	Call            *CallEventPayload `json:"call,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`

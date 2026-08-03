@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -23,6 +24,14 @@ type MemberStore interface {
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	GetEligibleDMMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
+	// AddChannelMembers adds every user in userIDs to channelID, or none (issue
+	// #398). callerID is the authenticated actor: the transaction re-establishes
+	// their owner/admin membership itself rather than trusting the service's
+	// earlier check, so a role revoked in between persists nothing. Eligibility
+	// of the targets is decided by the same statement that writes. Returns
+	// domain.ErrForbidden — without naming anyone — for a revoked actor or an
+	// ineligible target.
+	AddChannelMembers(ctx context.Context, workspaceID, channelID, callerID string, userIDs []string) (AddMembersResult, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
 	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
 	// ListOnlineChannelMemberProfiles returns the channel's member totals plus up
@@ -34,6 +43,11 @@ type MemberStore interface {
 		ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
 	) (ChannelMemberPage, error)
 	SearchDMCandidates(ctx context.Context, workspaceID, callerID, prefix string, limit int) ([]domain.DMCandidate, error)
+	// SearchChannelMemberCandidates returns active workspace members who are not
+	// already active members of channelID (issue #398). The exclusion is a
+	// NOT EXISTS in the same statement, so the panel's capped preview is never
+	// used to decide who is offerable.
+	SearchChannelMemberCandidates(ctx context.Context, workspaceID, channelID, callerID, prefix string, limit int) ([]domain.DMCandidate, error)
 	// RemoveChannelMember deletes the channel membership for userID in channelID, scoped to
 	// workspaceID. Returns ErrCannotLeaveGeneralChannel if the channel has is_general=true.
 	// Returns nil when the membership does not exist (idempotent).
@@ -346,6 +360,197 @@ func (s *PGXMemberStore) AddChannelMember(ctx context.Context, channelID, userID
 	return m, nil
 }
 
+// AddMembersResult reports what one add-members call actually changed.
+//
+// Added and AlreadyMembers are reported separately because they are different
+// outcomes for the UI and, more importantly, because collapsing them would make
+// a retry indistinguishable from a first attempt. TotalCount is read after the
+// insert, inside the same transaction, so it is the count the caller's own write
+// produced rather than a value another writer may already have moved.
+type AddMembersResult struct {
+	Added          int
+	AlreadyMembers int
+	TotalCount     int
+	// AddedUserIDs is exactly who the transaction inserted — the RETURNING of
+	// the INSERT, never the requested list (issue #398).
+	//
+	// The distinction is the whole point: the request may carry someone who was
+	// already a participant, a duplicate, or a user who lost eligibility, and
+	// none of those results in a new membership. Fanning a "you were added"
+	// signal out to the input would tell people about conversations they were
+	// already in, or were never added to. len(AddedUserIDs) == Added.
+	AddedUserIDs []string
+}
+
+// AddChannelMembers adds every user in userIDs to channelID, or none.
+//
+// The eligibility test and the insert are one statement, not a check followed by
+// a write: a user suspended, deleted or removed from the workspace between the
+// service's validation and this call simply produces no row in the `eligible`
+// CTE. Because the row count is then compared against the requested count, that
+// mismatch aborts the whole transaction — there is no window in which some
+// members land and others do not.
+//
+// Eligibility mirrors the predicate the rest of the channel surface uses: active
+// workspace, active workspace membership, an active channel *in that same
+// workspace*, and an active, non-deleted auth.users row. The join on
+// chat.channels is what makes a channel UUID from another tenant resolve to
+// nothing here, so the scoping is in SQL rather than in a Go filter applied
+// afterwards.
+//
+// ON CONFLICT DO NOTHING is what makes the call safe to repeat and safe to run
+// concurrently: the (channel_id, user_id) primary key is the arbiter, so a
+// double click, a retry after a timeout, and two managers adding the same person
+// at the same moment all converge on one row instead of raising a unique
+// violation. A user who was already a member is therefore counted in
+// AlreadyMembers rather than treated as an error — re-adding somebody is
+// idempotent, not a conflict.
+//
+// Callers must pass canonicalised, de-duplicated IDs. A repeated ID would make
+// the requested count exceed what `eligible` can return and the whole batch
+// would be refused, which is a confusing way to report a client-side mistake;
+// the service de-duplicates before calling for that reason.
+func (s *PGXMemberStore) AddChannelMembers(
+	ctx context.Context, workspaceID, channelID, callerID string, userIDs []string,
+) (AddMembersResult, error) {
+	if len(userIDs) == 0 {
+		return AddMembersResult{}, domain.ErrNoMembersRequested
+	}
+	if strings.TrimSpace(callerID) == "" {
+		// A missing actor is a wiring bug, never an anonymous add.
+		return AddMembersResult{}, domain.ErrForbidden
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AddMembersResult{}, fmt.Errorf("begin add channel members: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Re-establish the actor's authority inside the transaction, before anything
+	// is written.
+	//
+	// The service checked this before the transaction opened; in between, the
+	// actor can be demoted from admin to member, suspended, or removed from the
+	// workspace outright, and without this they would still get to write
+	// memberships. Locking the row also serialises this against a concurrent
+	// role change rather than merely observing it.
+	//
+	// The role list is the SQL statement of domain.CanManageChannelMembers. The
+	// two must agree; the service's decision is deliberately not passed down as
+	// a boolean, because a boolean computed a moment ago is exactly the thing
+	// this query exists to distrust.
+	//
+	// FOR SHARE rather than FOR UPDATE, matching managerAuthorizedWorkspace in
+	// channel_category_store.go: demoting a role, suspending a membership and
+	// deleting it are all UPDATE/DELETE of that row, which take FOR NO KEY
+	// UPDATE and conflict with FOR SHARE — so a revocation is still serialised
+	// against an add in flight. Two managers adding people to the same channel
+	// have no reason to block each other, which FOR UPDATE would have made them
+	// do for no safety gained.
+	//
+	// Lock order across this file and dm_store.go is the same: conversation or
+	// channel scope first, then the actor's membership, then the target rows.
+	var actorAuthorized bool
+	err = tx.QueryRow(ctx, `
+		SELECT true
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		JOIN chat.channels c
+		  ON c.id = $2::uuid AND c.workspace_id = wm.workspace_id AND c.status = 'active'
+		WHERE wm.workspace_id = $1::uuid
+		  AND wm.user_id = $3::uuid
+		  AND wm.status = 'active'
+		  AND wm.role IN ('owner', 'admin')
+		FOR SHARE OF wm`,
+		workspaceID, channelID, callerID,
+	).Scan(&actorAuthorized)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Covers a revoked role, a suspended or removed membership, a
+			// disabled workspace and a channel that stopped being reachable.
+			// One answer for all of them, so the error cannot be used to tell
+			// which.
+			return AddMembersResult{}, domain.ErrForbidden
+		}
+		return AddMembersResult{}, fmt.Errorf("lock actor workspace membership: %w", err)
+	}
+
+	var eligible, inserted int
+	var addedUserIDs []string
+	err = tx.QueryRow(ctx, `
+		WITH eligible AS (
+			SELECT wm.user_id
+			FROM unnest($3::uuid[]) AS candidate(user_id)
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = $1::uuid
+			 AND wm.user_id = candidate.user_id
+			 AND wm.status = 'active'
+			JOIN chat.workspaces w
+			  ON w.id = wm.workspace_id AND w.status = 'active'
+			JOIN chat.channels c
+			  ON c.id = $2::uuid
+			 AND c.workspace_id = wm.workspace_id
+			 AND c.status = 'active'
+			JOIN auth.users u
+			  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		),
+		inserted AS (
+			INSERT INTO chat.channel_members (channel_id, user_id, role)
+			SELECT $2::uuid, user_id, $4
+			FROM eligible
+			ON CONFLICT (channel_id, user_id) DO NOTHING
+			RETURNING user_id
+		)
+		SELECT (SELECT count(*) FROM eligible),
+		       (SELECT count(*) FROM inserted),
+		       (SELECT COALESCE(array_agg(user_id::text), '{}') FROM inserted)`,
+		workspaceID, channelID, userIDs, string(domain.ChannelRoleMember),
+	).Scan(&eligible, &inserted, &addedUserIDs)
+	if err != nil {
+		return AddMembersResult{}, fmt.Errorf("add channel members: %w", err)
+	}
+	// Fewer eligible rows than requested means at least one user is not an active
+	// member of this workspace, or their account is gone, or the channel stopped
+	// being reachable. Which one is deliberately not said, and the transaction is
+	// rolled back so nothing partial survives.
+	if eligible != len(userIDs) {
+		return AddMembersResult{}, domain.ErrForbidden
+	}
+
+	var total int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM chat.channel_members cm
+		JOIN chat.channels c
+		  ON c.id = cm.channel_id AND c.workspace_id = $1::uuid AND c.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = c.workspace_id AND wm.user_id = cm.user_id AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE cm.channel_id = $2::uuid`,
+		workspaceID, channelID,
+	).Scan(&total); err != nil {
+		return AddMembersResult{}, fmt.Errorf("count channel members: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return AddMembersResult{}, fmt.Errorf("commit add channel members: %w", err)
+	}
+	committed = true
+	return AddMembersResult{
+		Added:          inserted,
+		AlreadyMembers: eligible - inserted,
+		TotalCount:     total,
+		AddedUserIDs:   addedUserIDs,
+	}, nil
+}
+
 func (s *PGXMemberStore) GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error) {
 	var m domain.ChannelMember
 	err := s.pool.QueryRow(ctx, `
@@ -564,6 +769,75 @@ func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, ca
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate dm candidates: %w", err)
+	}
+	return results, nil
+}
+
+// SearchChannelMemberCandidates lists people who could still be added to a
+// channel: active members of the workspace, with active accounts, who are not
+// already in it.
+//
+// The exclusion is a NOT EXISTS against chat.channel_members in this very
+// statement, and that is the point of the method. The panel's member section is
+// a *presence-filtered, capped preview* — an offline member is simply not in it
+// — so using it to decide who is offerable made existing members show up as
+// selectable. The database knows the full membership; the preview never did.
+//
+// Everything else mirrors SearchDMCandidates so the two searches cannot drift
+// about who counts as an eligible person: the workspace must be active, the
+// membership active, the account active and not deleted, and the caller must
+// still hold an active membership in the same workspace (the EXISTS below).
+// The caller is also excluded from their own results.
+//
+// Ordering is the same deterministic (lower(display_name), id) the rest of the
+// candidate surface uses, so paging is stable.
+func (s *PGXMemberStore) SearchChannelMemberCandidates(
+	ctx context.Context, workspaceID, channelID, callerID, prefix string, limit int,
+) ([]domain.DMCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.display_name
+		FROM chat.workspace_members wm
+		JOIN chat.workspaces w
+		  ON w.id = wm.workspace_id AND w.status = 'active'
+		JOIN auth.users u
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE wm.workspace_id = $1::uuid
+		  AND wm.status = 'active'
+		  AND wm.user_id <> $3::uuid
+		  AND left(lower(u.display_name), length($4)) = lower($4)
+		  AND EXISTS (
+		      SELECT 1
+		      FROM chat.workspace_members caller
+		      WHERE caller.workspace_id = wm.workspace_id
+		        AND caller.user_id = $3::uuid
+		        AND caller.status = 'active'
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM chat.channel_members cm
+		      JOIN chat.channels c
+		        ON c.id = cm.channel_id
+		       AND c.workspace_id = wm.workspace_id
+		      WHERE cm.channel_id = $2::uuid
+		        AND cm.user_id = wm.user_id
+		  )
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $5`, workspaceID, channelID, callerID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search channel member candidates: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]domain.DMCandidate, 0, limit)
+	for rows.Next() {
+		var candidate domain.DMCandidate
+		if err := rows.Scan(&candidate.UserID, &candidate.DisplayName); err != nil {
+			return nil, fmt.Errorf("scan channel member candidate: %w", err)
+		}
+		results = append(results, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate channel member candidates: %w", err)
 	}
 	return results, nil
 }

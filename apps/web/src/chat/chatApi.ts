@@ -16,6 +16,7 @@ import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
   parseDMConversationType,
+  type AddMembersResult,
   type Channel,
   type ChannelDetails,
   type ChannelMemberProfile,
@@ -266,6 +267,59 @@ export async function searchDMCandidates(
   const params = new URLSearchParams({ query: query.trim(), limit: "20" });
   const response = await authenticatedFetch<DMCandidateEnvelope>(
     `${CHAT_BASE}/dm-candidates?${params}`,
+    { method: "GET", signal },
+  );
+  return response.data.candidates.map((candidate) => ({
+    userId: candidate.user_id,
+    displayName: candidate.display_name,
+  }));
+}
+
+/**
+ * Searches people who can still be added to a channel (issue #398).
+ *
+ * Contextual on purpose. The workspace-wide search cannot know who is already
+ * in this channel, and the details panel's member list is a presence-filtered,
+ * capped preview — an offline member is simply not in it. Deciding eligibility
+ * from that made existing members show up as selectable. The server excludes
+ * current members in SQL, so the answer is complete regardless of what the
+ * panel happens to be showing.
+ *
+ * Only the query and an optional limit are sent; the workspace and the actor
+ * come from the session, and the channel is the path.
+ */
+export async function searchChannelMemberCandidates(
+  channelId: string,
+  query: string,
+  signal?: AbortSignal,
+): Promise<DMCandidate[]> {
+  const params = new URLSearchParams({ query: query.trim(), limit: "20" });
+  const response = await authenticatedFetch<DMCandidateEnvelope>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/member-candidates?${params}`,
+    { method: "GET", signal },
+  );
+  return response.data.candidates.map((candidate) => ({
+    userId: candidate.user_id,
+    displayName: candidate.display_name,
+  }));
+}
+
+/**
+ * Searches people who can still be added to a group (issue #398).
+ *
+ * The group counterpart, and needed for the same reason with a sharper edge:
+ * the group panel shows at most 30 participants, so in a larger group everyone
+ * past the 30th was invisible to the client-side exclusion and came back as
+ * selectable.
+ */
+export async function searchGroupParticipantCandidates(
+  conversationId: string,
+  query: string,
+  signal?: AbortSignal,
+): Promise<DMCandidate[]> {
+  const params = new URLSearchParams({ query: query.trim(), limit: "20" });
+  const response = await authenticatedFetch<DMCandidateEnvelope>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/member-candidates?${params}`,
     { method: "GET", signal },
   );
   return response.data.candidates.map((candidate) => ({
@@ -942,6 +996,7 @@ interface ChannelDetailsEnvelope {
     member_count?: unknown;
     online_member_count?: unknown;
     online_members?: unknown;
+    can_manage_members?: unknown;
   };
 }
 
@@ -1009,10 +1064,92 @@ export async function fetchChannelDetails(
     memberCount: nonNegativeCount(data.member_count),
     onlineCount: nonNegativeCount(data.online_member_count),
     onlineMembers,
+    // Strict `=== true`, exactly like can_write: an absent, null or truthy-ish
+    // field must never read as permission. A server that predates issue #398
+    // therefore leaves the action hidden, which is the safe direction, and the
+    // POST re-checks the real decision regardless of what this says.
+    canManageMembers: data.can_manage_members === true,
   };
 }
 
-// ── Group details (issue #441) ───────────────────────────────────────────────
+// ── Add members (issue #398) ─────────────────────────────────────────────────
+
+interface AddMembersEnvelope {
+  data: {
+    added?: unknown;
+    already_members?: unknown;
+    member_count?: unknown;
+  };
+}
+
+function mapAddMembersResult(envelope: AddMembersEnvelope): AddMembersResult {
+  const data = envelope.data;
+  return {
+    added: nonNegativeCount(data.added),
+    alreadyMembers: nonNegativeCount(data.already_members),
+    memberCount: nonNegativeCount(data.member_count),
+  };
+}
+
+/**
+ * Adds workspace members to an existing channel.
+ *
+ * Only the picked user IDs are sent. The workspace, the actor, the membership
+ * role and every eligibility verdict are derived from the session server-side,
+ * and chat-service rejects a body that carries them — so there is no field here
+ * through which the browser could claim a privilege. Nothing is checked on this
+ * side: de-duplication, the batch cap, who may add and who may be added are all
+ * decided by the server, and a caller it refuses gets a 403 or 404 rather than a
+ * locally-invented failure.
+ *
+ * The returned counts are the server's post-commit truth. The caller updates its
+ * member counter from `memberCount` instead of incrementing a local guess, which
+ * is what keeps the panel correct when someone else added people concurrently.
+ */
+export async function addChannelMembers(
+  channelId: string,
+  userIds: string[],
+  signal?: AbortSignal,
+): Promise<AddMembersResult> {
+  const response = await authenticatedFetch<AddMembersEnvelope>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/members`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: userIds }),
+      signal,
+    },
+  );
+  return mapAddMembersResult(response);
+}
+
+/**
+ * Adds workspace members to an existing group conversation.
+ *
+ * A separate route from the channel one because a group is a DM conversation,
+ * not a channel; the payload and the response are identical by design, so the
+ * selector that produces them does not need to know which it is talking to. A
+ * 1:1 conversation is answered 404 by the server — adding a third person would
+ * convert it into a group, which this flow deliberately does not do.
+ */
+export async function addGroupParticipants(
+  conversationId: string,
+  userIds: string[],
+  signal?: AbortSignal,
+): Promise<AddMembersResult> {
+  const response = await authenticatedFetch<AddMembersEnvelope>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/members`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: userIds }),
+      signal,
+    },
+  );
+  return mapAddMembersResult(response);
+}
+
+// ── Group details (issues #441, #398) ────────────────────────────────────────
 
 interface GroupParticipantResponse {
   user_id?: unknown;
@@ -1029,6 +1166,7 @@ interface GroupDetailsEnvelope {
     created_at?: unknown;
     participant_count?: unknown;
     participants?: unknown;
+    can_manage_members?: unknown;
   };
 }
 
@@ -1083,6 +1221,10 @@ export async function fetchGroupDetails(
     // group with more participants than the cap allows.
     participantCount: nonNegativeCount(data.participant_count),
     participants,
+    // Strict `=== true` (issue #398): an absent or malformed field leaves the
+    // add action hidden, so a server that predates it does not enable a flow it
+    // cannot authorize.
+    canManageMembers: data.can_manage_members === true,
   };
 }
 

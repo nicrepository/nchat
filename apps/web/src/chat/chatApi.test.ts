@@ -12,6 +12,8 @@ vi.mock("../lib/authClient", () => ({
 }));
 
 import {
+  addChannelMembers,
+  addGroupParticipants,
   createChannel,
   createGroupDM,
   deleteMessage,
@@ -43,7 +45,9 @@ import {
   resetAllowedReactionEmojisCache,
   resolveChannelMessageReferences,
   resolveDMMessageReferences,
+  searchChannelMemberCandidates,
   searchDMCandidates,
+  searchGroupParticipantCandidates,
   unfavoriteMessage,
   unpinMessage,
 } from "./chatApi";
@@ -1948,6 +1952,9 @@ describe("fetchChannelDetails", () => {
           presence: "online",
         },
       ],
+      // Absent from this payload, so it must be false: an add-members action is
+      // never enabled by a field the server did not send (issue #398).
+      canManageMembers: false,
     });
   });
 
@@ -2082,6 +2089,142 @@ describe("fetchChannelDetails", () => {
   });
 });
 
+// ── Add members (issue #398) ─────────────────────────────────────────────────
+
+describe("addChannelMembers", () => {
+  it("posts only the user IDs and maps the server's counts", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { added: 2, already_members: 1, member_count: 14 },
+    });
+
+    const result = await addChannelMembers("ch 1", ["u-1", "u-2"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/members", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["u-1", "u-2"] }),
+      signal: undefined,
+    });
+    expect(result).toEqual({ added: 2, alreadyMembers: 1, memberCount: 14 });
+  });
+
+  // The payload must carry nothing else. A workspace, an actor or a role in the
+  // body would be rejected by the server's strict decoder, and sending one would
+  // mean the client believes it has authority it does not.
+  it("sends no field other than user_ids", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { added: 1, already_members: 0, member_count: 2 } });
+
+    await addChannelMembers("ch-1", ["u-1"]);
+
+    const body = JSON.parse(mockAuthFetch.mock.calls[0][1].body as string);
+    expect(Object.keys(body)).toEqual(["user_ids"]);
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { added: 0, already_members: 0, member_count: 1 } });
+    const controller = new AbortController();
+
+    await addChannelMembers("ch-1", ["u-1"], controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  // A hostile or truncated payload must not produce NaN counters in the panel.
+  it("normalizes missing or invalid counts to zero", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { added: "2", already_members: null, member_count: -5 },
+    });
+
+    expect(await addChannelMembers("ch-1", ["u-1"])).toEqual({
+      added: 0,
+      alreadyMembers: 0,
+      memberCount: 0,
+    });
+  });
+
+  it.each([400, 401, 403, 404, 409, 413, 429, 500])(
+    "propagates HTTP %s to the caller",
+    async (status) => {
+      mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+      await expect(addChannelMembers("ch-1", ["u-1"])).rejects.toMatchObject({ status });
+    },
+  );
+
+  it("propagates an abort", async () => {
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    mockAuthFetch.mockRejectedValue(abort);
+
+    await expect(addChannelMembers("ch-1", ["u-1"])).rejects.toMatchObject({
+      name: "AbortError",
+    });
+  });
+});
+
+describe("addGroupParticipants", () => {
+  it("posts to the DM route with the same payload shape", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { added: 1, already_members: 0, member_count: 6 },
+    });
+
+    const result = await addGroupParticipants("dm 1", ["u-9"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm%201/members", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["u-9"] }),
+      signal: undefined,
+    });
+    expect(result).toEqual({ added: 1, alreadyMembers: 0, memberCount: 6 });
+  });
+
+  it.each([403, 404, 409, 429])("propagates HTTP %s to the caller", async (status) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+    await expect(addGroupParticipants("dm-1", ["u-1"])).rejects.toMatchObject({ status });
+  });
+});
+
+describe("fetchChannelDetails — can_manage_members", () => {
+  function detailsPayload(extra: Record<string, unknown>) {
+    return {
+      data: {
+        id: "ch-1",
+        slug: "infra",
+        display_name: "Infra",
+        type: "private",
+        created_at: "2024-01-12T09:30:00Z",
+        member_count: 3,
+        online_member_count: 0,
+        online_members: [],
+        ...extra,
+      },
+    };
+  }
+
+  it("accepts the permission only when the server sends exactly true", async () => {
+    mockAuthFetch.mockResolvedValue(detailsPayload({ can_manage_members: true }));
+
+    expect((await fetchChannelDetails("ch-1")).canManageMembers).toBe(true);
+  });
+
+  // Anything that is not literally true must read as "no permission": a truthy
+  // string or a missing field must never enable a control the server refuses.
+  it.each([
+    ["absent", undefined],
+    ["false", false],
+    ["null", null],
+    ["truthy string", "true"],
+    ["number one", 1],
+  ])("treats %s as no permission", async (_label, value) => {
+    const extra = value === undefined ? {} : { can_manage_members: value };
+    mockAuthFetch.mockResolvedValue(detailsPayload(extra));
+
+    expect((await fetchChannelDetails("ch-1")).canManageMembers).toBe(false);
+  });
+});
+
 describe("fetchGroupDetails (issue #441)", () => {
   it("maps the payload from the DM resource, not the channel one", async () => {
     mockAuthFetch.mockResolvedValueOnce({
@@ -2122,6 +2265,8 @@ describe("fetchGroupDetails (issue #441)", () => {
           presence: "online",
         },
       ],
+      // Absent in this payload, so the add action stays hidden (issue #398).
+      canManageMembers: false,
     });
   });
 
@@ -2197,6 +2342,31 @@ describe("fetchGroupDetails (issue #441)", () => {
     mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
 
     await expect(fetchGroupDetails("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  // The add-participants permission (issue #398), normalized exactly like the
+  // channel's: only a literal true enables the action.
+  it("accepts can_manage_members only when the server sends exactly true", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "conv-1", participant_count: 1, participants: [], can_manage_members: true },
+    });
+
+    expect((await fetchGroupDetails("conv-1")).canManageMembers).toBe(true);
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["false", false],
+    ["null", null],
+    ["truthy string", "true"],
+    ["number one", 1],
+  ])("treats can_manage_members %s as no permission", async (_label, value) => {
+    const extra = value === undefined ? {} : { can_manage_members: value };
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "conv-1", participant_count: 1, participants: [], ...extra },
+    });
+
+    expect((await fetchGroupDetails("conv-1")).canManageMembers).toBe(false);
   });
 });
 
@@ -2430,5 +2600,72 @@ describe("fetchDirectProfile (issue #443)", () => {
       method: "GET",
       signal: controller.signal,
     });
+  });
+});
+
+// ── Contextual candidate search (issue #398) ────────────────────────────────
+
+describe("searchChannelMemberCandidates", () => {
+  it("queries the channel-scoped route and maps the minimal payload", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { candidates: [{ user_id: "u-1", display_name: "Ana" }] },
+    });
+
+    const result = await searchChannelMemberCandidates("ch 1", "  an  ");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/ch%201/member-candidates?query=an&limit=20",
+      { method: "GET", signal: undefined },
+    );
+    expect(result).toEqual([{ userId: "u-1", displayName: "Ana" }]);
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { candidates: [] } });
+    const controller = new AbortController();
+
+    await searchChannelMemberCandidates("ch-1", "an", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  // The workspace is never sent: it is derived from the session server-side.
+  it("sends no workspace or actor", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { candidates: [] } });
+
+    await searchChannelMemberCandidates("ch-1", "an");
+
+    const url = mockAuthFetch.mock.calls[0][0] as string;
+    expect(url).not.toContain("workspace");
+    expect(url).not.toContain("actor");
+    expect(mockAuthFetch.mock.calls[0][1].body).toBeUndefined();
+  });
+
+  it.each([400, 401, 403, 404, 429, 500])("propagates HTTP %s", async (status) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+    await expect(searchChannelMemberCandidates("ch-1", "an")).rejects.toMatchObject({ status });
+  });
+});
+
+describe("searchGroupParticipantCandidates", () => {
+  it("queries the group-scoped route", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { candidates: [{ user_id: "u-9", display_name: "Bruno" }] },
+    });
+
+    const result = await searchGroupParticipantCandidates("dm 1", "br");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm%201/member-candidates?query=br&limit=20",
+      { method: "GET", signal: undefined },
+    );
+    expect(result).toEqual([{ userId: "u-9", displayName: "Bruno" }]);
+  });
+
+  it.each([403, 404, 429])("propagates HTTP %s", async (status) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+    await expect(searchGroupParticipantCandidates("dm-1", "br")).rejects.toMatchObject({ status });
   });
 });

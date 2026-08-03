@@ -152,6 +152,42 @@ export interface WSPinUpdatedEvent {
   };
 }
 
+/**
+ * A channel or group gained participants (issue #398).
+ *
+ * Names nobody by design: the server broadcasts only counts, because who may
+ * see a roster is a per-reader decision the details endpoint makes and a
+ * fan-out to every subscriber cannot. Receipt means "your view of this target
+ * is stale", so the handler refetches — exactly like pin.updated.
+ */
+export interface WSMembersAddedEvent {
+  type: "members.added";
+  target_type: "channel" | "dm";
+  target_id: string;
+  members?: {
+    actor_user_id: string;
+    added_count: number;
+    member_count: number;
+  };
+}
+
+/**
+ * A conversation the current user can now see (issue #398).
+ *
+ * The only user-scoped event in this protocol. It arrives *without* a
+ * subscription to its target, by design: it is sent to someone who has just
+ * been added to a channel or group and therefore cannot be subscribed to it
+ * yet. That is why its routing below sits before the subscription guard.
+ *
+ * It is an invalidation hint carrying no identities and granting no access —
+ * the client reacts by refetching the sidebar, which the server re-authorises.
+ */
+export interface WSConversationAvailableEvent {
+  type: "conversation.available";
+  target_type: "channel" | "dm";
+  target_id: string;
+}
+
 export interface WSClientErrorEvent {
   type: "error";
   operation?: string;
@@ -179,6 +215,8 @@ interface UseChatWebSocketOptions {
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
+  onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  onConversationAvailable?: (event: WSConversationAvailableEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
   onSubscriptionError?: (event: WSClientErrorEvent) => void;
   onSubscribed?: (event: WSSubscribedEvent) => void;
@@ -212,6 +250,8 @@ export function useChatWebSocket({
   onMessageUpdated,
   onReactionUpdated,
   onPinUpdated,
+  onMembersAdded,
+  onConversationAvailable,
   onReactionError,
   onSubscriptionError,
   onSubscribed,
@@ -237,6 +277,8 @@ export function useChatWebSocket({
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
   const onPinRef = useRef(onPinUpdated);
+  const onMembersRef = useRef(onMembersAdded);
+  const onConversationAvailableRef = useRef(onConversationAvailable);
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
@@ -249,6 +291,8 @@ export function useChatWebSocket({
     onMessageUpdatedRef.current = onMessageUpdated;
     onReactionRef.current = onReactionUpdated;
     onPinRef.current = onPinUpdated;
+    onMembersRef.current = onMembersAdded;
+    onConversationAvailableRef.current = onConversationAvailable;
     onReactionErrorRef.current = onReactionError;
     onSubscriptionErrorRef.current = onSubscriptionError;
     onSubscribedRef.current = onSubscribed;
@@ -397,6 +441,16 @@ export function useChatWebSocket({
           onReactionErrorRef.current?.(clientError);
           return;
         }
+        // Routed before the subscription guard on purpose: this event exists
+        // precisely for a target the client is not subscribed to yet, so
+        // requiring a subscription would drop the one message that tells a
+        // newly-added user their sidebar is stale.
+        if (d["type"] === "conversation.available" && incomingTargetId && incomingTargetType) {
+          onConversationAvailableRef.current?.(
+            normalizedData as unknown as WSConversationAvailableEvent,
+          );
+          return;
+        }
         if (!control.expected.has(incomingTargetKey)) return;
         if (d["type"] === "message.created") {
           onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
@@ -410,6 +464,8 @@ export function useChatWebSocket({
           onReactionRef.current?.(normalizedData as unknown as WSReactionUpdatedEvent);
         } else if (d["type"] === "pin.updated") {
           onPinRef.current?.(normalizedData as unknown as WSPinUpdatedEvent);
+        } else if (d["type"] === "members.added") {
+          onMembersRef.current?.(normalizedData as unknown as WSMembersAddedEvent);
         }
       },
 

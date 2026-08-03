@@ -462,6 +462,7 @@ beforeEach(() => {
   mockFetchChannelDetails.mockImplementation((channelId: string) =>
     Promise.resolve(channelDetailsFor(channelId)),
   );
+  mockFetchGroupDetails.mockRejectedValue(new Error("group details not stubbed for this test"));
   mockFetchChannelAttachments.mockResolvedValue([]);
   mockFetchGroupDetails.mockImplementation((conversationId: string) =>
     Promise.resolve(groupDetailsFor(conversationId)),

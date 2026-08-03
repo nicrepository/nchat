@@ -20,16 +20,28 @@ const (
 	// RF/issue #435 channel-details panel. Read-only projection of one channel
 	// the caller can already see; no workspace segment, for the same reason the
 	// category routes have none.
-	RouteChannelDetails        = "/api/chat/channels/{channelID}/details"
-	RouteChannelMessages       = "/api/chat/channels/{channelID}/messages"
-	RouteChannelMessageForward = "/api/chat/channels/{channelID}/messages/forward"
-	RouteChannelMessage        = "/api/chat/channels/{channelID}/messages/{messageID}"
-	RouteChannelReferences     = "/api/chat/channels/{channelID}/message-references"
-	RouteChannelMentions       = "/api/chat/channels/{channelID}/mentions"
-	RouteDMMessages            = "/api/chat/dm/{conversationID}/messages"
-	RouteDMMessage             = "/api/chat/dm/{conversationID}/messages/{messageID}"
-	RouteDMReferences          = "/api/chat/dm/{conversationID}/message-references"
-	// Issue #441 group-details panel. It lives under the DM prefix because a
+	RouteChannelDetails = "/api/chat/channels/{channelID}/details"
+	// Issue #398 add-members. Both routes sit under the aggregate they mutate —
+	// a channel's members under /channels, a group's under the DM prefix — because
+	// a group is a chat.dm_conversations row and not a channel. Neither carries a
+	// workspace segment, for the same reason none of the others does.
+	RouteChannelMembers = "/api/chat/channels/{channelID}/members"
+	// Issue #398 contextual candidate search. Scoped to the target conversation
+	// because "who can still be added" depends on who is already in it, and the
+	// panel's capped preview is not a membership list. Same prefix convention as
+	// /details and /members; the workspace is resolved from the session.
+	RouteChannelMemberCandidates = "/api/chat/channels/{channelID}/member-candidates"
+	RouteDMMemberCandidates      = "/api/chat/dm/{conversationID}/member-candidates"
+	RouteDMMembers               = "/api/chat/dm/{conversationID}/members"
+	RouteChannelMessages         = "/api/chat/channels/{channelID}/messages"
+	RouteChannelMessageForward   = "/api/chat/channels/{channelID}/messages/forward"
+	RouteChannelMessage          = "/api/chat/channels/{channelID}/messages/{messageID}"
+	RouteChannelReferences       = "/api/chat/channels/{channelID}/message-references"
+	RouteChannelMentions         = "/api/chat/channels/{channelID}/mentions"
+	RouteDMMessages              = "/api/chat/dm/{conversationID}/messages"
+	RouteDMMessage               = "/api/chat/dm/{conversationID}/messages/{messageID}"
+	RouteDMReferences            = "/api/chat/dm/{conversationID}/message-references"
+	// Issue #441/#398 group-details panel. It lives under the DM prefix because a
 	// group *is* a chat.dm_conversations row (type='group'); a /channels/ route
 	// would name the wrong aggregate, and a separate /groups/ prefix would
 	// invent a resource the domain does not have.

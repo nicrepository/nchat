@@ -155,6 +155,19 @@ export interface MessagingScenario {
   pinnedIds: Map<string, Set<string>>;
   // Channel-details payload per channel id (issue #435).
   channelDetails: Map<string, ChannelDetailsFixture>;
+  // Group-details payload per conversation id (issues #441, #398).
+  groupDetails: Map<string, GroupDetailsFixture>;
+  // The *complete* membership per target (issue #398), which the details
+  // fixtures deliberately do not carry: a channel preview shows only online
+  // members and a group preview is capped, and the point of the contextual
+  // search is that the server knows the rest.
+  channelMemberships: Map<string, Set<string>>;
+  groupMemberships: Map<string, Set<string>>;
+  // Add-members calls the app made, and the status the mock should answer with
+  // (issue #398). Recording the body is what lets a spec assert that only user
+  // IDs were sent.
+  addMembersRequests: Array<{ channelId: string; userIds: string[] }>;
+  addMembersStatus: number;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
   // Group-details payload per conversation id (issue #441).
@@ -184,6 +197,12 @@ export interface GroupDetailsFixture {
   /** Every active participant; may exceed participants.length. */
   participant_count: number;
   participants: GroupParticipantFixture[];
+  /**
+   * Whether the server would let this caller add participants (issue #398).
+   * Always sent, so a spec that omits it exercises the safe default: absent
+   * reads as false and the action stays hidden.
+   */
+  can_manage_members: boolean;
 }
 
 /**
@@ -229,6 +248,12 @@ export interface ChannelDetailsFixture {
   online_member_count: number;
   /** Presence-filtered, capped preview — never a general roster. */
   online_members: ChannelMemberFixture[];
+  /**
+   * Whether the server would let this caller add participants (issue #398).
+   * Always sent, so a spec that omits it exercises the safe default: absent
+   * reads as false and the action stays hidden.
+   */
+  can_manage_members: boolean;
 }
 
 export interface AttachmentFixture {
@@ -385,32 +410,32 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     dmCandidates: options.dmCandidates ?? [{ userId: OTHER_USER_ID, displayName: OTHER_USER_NAME }],
     pinnedIds: new Map(),
     channelDetails: new Map(),
-    channelAttachments: new Map(),
     groupDetails: new Map(),
+    channelMemberships: new Map(),
+    groupMemberships: new Map(),
+    channelAttachments: new Map(),
+    addMembersRequests: [],
+    addMembersStatus: 200,
     directProfiles: new Map(),
     conversationAttachments: new Map(),
   };
 }
 
 /**
- * Default channel-details payload for a channel in the fixture sidebar. Every
- * value is derived from the channel itself, so a spec that switches channels
- * sees genuinely different content without having to script both.
- *
- * memberCount defaults to the number of online members but is overridable,
- * because the two are independent: a channel keeps its size when nobody is
- * connected, and specs need to assert exactly that.
- */
-/**
  * Default group-details payload for a conversation in the fixture sidebar.
  *
  * participantCount defaults to the number of participants but is overridable,
  * because the two are independent: the preview is capped and the total is not.
+ *
+ * canManageMembers defaults to false (issue #398), matching the server's own
+ * strict normalization: a spec that says nothing about the permission exercises
+ * the safe default, where the add action stays hidden.
  */
 export function groupDetailsFixture(
   conversation: { id: string; name: string },
   participants: GroupParticipantFixture[],
   participantCount = participants.length,
+  canManageMembers = false,
 ): GroupDetailsFixture {
   return {
     id: conversation.id,
@@ -419,6 +444,7 @@ export function groupDetailsFixture(
     created_at: "2024-03-04T15:00:00Z",
     participant_count: participantCount,
     participants,
+    can_manage_members: canManageMembers,
   };
 }
 
@@ -439,10 +465,20 @@ export function directProfileFixture(
   };
 }
 
+/**
+ * Default channel-details payload for a channel in the fixture sidebar. Every
+ * value is derived from the channel itself, so a spec that switches channels
+ * sees genuinely different content without having to script both.
+ *
+ * memberCount defaults to the number of online members but is overridable,
+ * because the two are independent: a channel keeps its size when nobody is
+ * connected, and specs need to assert exactly that.
+ */
 export function channelDetailsFixture(
   channel: { id: string; slug: string; display_name: string; type: "public" | "private" },
   onlineMembers: ChannelMemberFixture[],
   memberCount = onlineMembers.length,
+  canManageMembers = false,
 ): ChannelDetailsFixture {
   return {
     id: channel.id,
@@ -453,6 +489,7 @@ export function channelDetailsFixture(
     member_count: memberCount,
     online_member_count: onlineMembers.length,
     online_members: onlineMembers,
+    can_manage_members: canManageMembers,
   };
 }
 
@@ -584,6 +621,58 @@ async function installChannelDetailsMocks(
     });
   });
 
+  // GET /api/chat/channels/{id}/member-candidates and the DM equivalent
+  // (issue #398).
+  //
+  // The mock excludes current members/participants itself, exactly as the real
+  // SQL does, so a spec can seed an offline member or a participant beyond the
+  // preview cap and assert the picker never offers them.
+  await page.route("**/api/chat/channels/*/member-candidates**", async (route) => {
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    if (!channelId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const current = scenario.channelMemberships.get(channelId) ?? new Set<string>();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          candidates: scenario.dmCandidates
+            .filter((candidate) => !current.has(candidate.userId))
+            .map((candidate) => ({
+              user_id: candidate.userId,
+              display_name: candidate.displayName,
+            })),
+        },
+      }),
+    });
+  });
+
+  await page.route("**/api/chat/dm/*/member-candidates**", async (route) => {
+    const conversationId = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationId) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const current = scenario.groupMemberships.get(conversationId) ?? new Set<string>();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          candidates: scenario.dmCandidates
+            .filter((candidate) => !current.has(candidate.userId))
+            .map((candidate) => ({
+              user_id: candidate.userId,
+              display_name: candidate.displayName,
+            })),
+        },
+      }),
+    });
+  });
+
   await page.route("**/api/chat/dm/*/details", async (route) => {
     const conversationID = pathSegmentAfter(route.request().url(), "dm");
     if (!conversationID || !assertConversationAccess(conversationID)) {
@@ -601,6 +690,94 @@ async function installChannelDetailsMocks(
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({ data: details }),
+    });
+  });
+
+  // POST /api/chat/dm/{id}/members (issue #398). Mutates the fixture so the
+  // panel's refetch observes the new participant, exactly as it would against
+  // the real service.
+  await page.route("**/api/chat/dm/*/members", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const conversationId = pathSegmentAfter(route.request().url(), "dm");
+    if (!conversationId) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const body = route.request().postDataJSON() as { user_ids?: string[] };
+    const userIds = body?.user_ids ?? [];
+    scenario.addMembersRequests.push({ channelId: conversationId, userIds });
+
+    if (scenario.addMembersStatus !== 200) {
+      await route.fulfill({
+        status: scenario.addMembersStatus,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "denied", message: "denied" } }),
+      });
+      return;
+    }
+    const details = scenario.groupDetails.get(conversationId);
+    if (details) {
+      details.participant_count += userIds.length;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          added: userIds.length,
+          already_members: 0,
+          member_count: details?.participant_count ?? userIds.length,
+        },
+      }),
+    });
+  });
+
+  // POST /api/chat/channels/{id}/members (issue #398).
+  //
+  // On success it mutates the scenario's own details fixture, so the panel's
+  // refetch observes the new member and the new count exactly as it would
+  // against the real service — a mock that returned counts without changing the
+  // fixture would let a broken refetch pass.
+  await page.route("**/api/chat/channels/*/members", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    if (!channelId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const body = route.request().postDataJSON() as { user_ids?: string[] };
+    const userIds = body?.user_ids ?? [];
+    scenario.addMembersRequests.push({ channelId, userIds });
+
+    if (scenario.addMembersStatus !== 200) {
+      await route.fulfill({
+        status: scenario.addMembersStatus,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "denied", message: "denied" } }),
+      });
+      return;
+    }
+
+    const details = scenario.channelDetails.get(channelId);
+    if (details) {
+      details.member_count += userIds.length;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          added: userIds.length,
+          already_members: 0,
+          member_count: details?.member_count ?? userIds.length,
+        },
+      }),
     });
   });
 

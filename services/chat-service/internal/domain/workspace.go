@@ -366,3 +366,40 @@ func CanManageWorkspace(wm *WorkspaceMember) bool {
 	}
 	return wm.Role == WorkspaceRoleOwner || wm.Role == WorkspaceRoleAdmin
 }
+
+// MaxAddMembersPerRequest bounds one add-members call (issue #398).
+//
+// A batch ceiling, not a conversation ceiling: it caps how many membership rows
+// and per-user eligibility joins a single accepted request can cost, so an
+// oversized payload is refused by one comparison instead of by the database.
+// It is deliberately below the 50-participant group maximum, so no single
+// request can fill a group from empty, and it is comfortably above what the
+// panel's selector produces in one human confirmation.
+const MaxAddMembersPerRequest = 25
+
+// CanManageChannelMembers reports whether a user may add participants to a
+// channel (issue #398).
+//
+// It is the workspace management gate — active owner or admin — reusing
+// CanManageWorkspace rather than restating it, exactly as channel update,
+// channel archival and channel categories do. The choice is not a new policy:
+// removing a member from a channel already takes owner or admin
+// (MemberService.RemoveMemberFromChannel), and docs/runbooks/
+// task-chat-channel-join-leave.md names the addition its "manager-add flow".
+// Adding and removing the same row are the same authority.
+//
+// Deliberately *not* "any member of the channel": that would let anyone with
+// read access to a private channel widen its audience, which is precisely the
+// property a private channel has. Deliberately not the per-channel 'moderator'
+// role either — nothing in this codebase ever assigns it, so gating on it would
+// be dead code standing in for a real check. This predicate is the named seam
+// to widen when RF-74 introduces a real moderation role; the divergence is
+// recorded in SECURITY.md.
+//
+// Group DM participation is a different question with a different answer and is
+// deliberately not routed through here: chat.dm_members.role is closed by CHECK
+// to the single value 'member', so a group has no manager to be, and a
+// workspace admin is not even a participant. See DMService.AddGroupParticipants.
+func CanManageChannelMembers(wm *WorkspaceMember) bool {
+	return CanManageWorkspace(wm)
+}

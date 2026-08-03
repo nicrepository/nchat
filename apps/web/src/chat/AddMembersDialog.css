@@ -1,0 +1,342 @@
+/*
+ * AddMembersDialog styles (issue #398).
+ *
+ * The same modal language as "Nova conversa" — backdrop, card, chips, result
+ * rows, footer — restated under its own class prefix rather than reused by
+ * borrowing .new-dm-dialog__* selectors. Sharing the class names would couple
+ * two dialogs that are edited for different reasons: a tweak to the creation
+ * flow's spacing would silently move this one. The tokens are the same, so they
+ * stay visually identical.
+ *
+ * Focus is always visible: the last rule applies to every control in the card,
+ * so a keyboard user can see where they are in the picker.
+ */
+
+.add-members__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 420;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.add-members {
+  --add-members-primary: #6d28d9;
+  --add-members-primary-strong: #5b21b6;
+  --add-members-border: #e8e3f0;
+  --add-members-muted: #7c7390;
+  width: min(500px, 100%);
+  max-height: min(640px, calc(100vh - 32px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--add-members-border);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+  color: #16121f;
+}
+
+.add-members__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 24px 16px;
+}
+
+.add-members__header h2 {
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+.add-members__header p {
+  margin: 5px 0 0;
+  color: var(--add-members-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.add-members__close {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--add-members-muted);
+  cursor: pointer;
+}
+
+.add-members__close:hover:not(:disabled) {
+  background: #f3ebfb;
+  color: var(--add-members-primary);
+}
+
+.add-members__close:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.add-members__search {
+  padding: 0 24px 18px;
+}
+
+.add-members__search label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #3d3550;
+}
+
+.add-members__search-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px;
+  border: 1px solid #d4cde3;
+  border-radius: 11px;
+  background: #faf8fd;
+  color: var(--add-members-muted);
+}
+
+.add-members__search-field:focus-within {
+  border-color: var(--add-members-primary);
+  box-shadow: 0 0 0 3px rgba(109, 40, 217, 0.12);
+  background: #fff;
+}
+
+.add-members__search-field .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.add-members__search-field input {
+  width: 100%;
+  min-width: 0;
+  height: 42px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #16121f;
+  font: inherit;
+  font-size: 14px;
+}
+
+.add-members__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 24px 14px;
+  padding: 0;
+  list-style: none;
+}
+
+.add-members__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px 4px 11px;
+  border-radius: 999px;
+  background: #f3ebfb;
+  color: var(--add-members-primary-strong);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.add-members__chip button {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.add-members__chip button:hover:not(:disabled) {
+  background: #e3d4f7;
+}
+
+.add-members__chip .material-symbols-outlined {
+  font-size: 15px;
+}
+
+.add-members__results {
+  min-height: 150px;
+  overflow-y: auto;
+  padding: 4px 14px 18px;
+  border-top: 1px solid var(--add-members-border);
+}
+
+.add-members__hint,
+.add-members__status {
+  margin: 0;
+  padding: 28px 12px;
+  color: var(--add-members-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.add-members__list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 8px 0 0;
+  list-style: none;
+}
+
+.add-members__list button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  color: #3d3550;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.add-members__list button:hover:not(:disabled) {
+  background: #f3ebfb;
+  color: var(--add-members-primary-strong);
+}
+
+.add-members__list button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.add-members__avatar {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.add-members__error {
+  margin: 18px 10px 0;
+  padding: 11px 12px;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  background: #fee2e2;
+  color: #991b1b;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.add-members__error button {
+  margin-left: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.add-members__error--submit {
+  margin: 0 24px 4px;
+}
+
+.add-members__footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 24px 18px;
+  border-top: 1px solid var(--add-members-border);
+}
+
+.add-members__footer-hint {
+  margin: 0;
+  margin-right: auto;
+  color: var(--add-members-muted);
+  font-size: 12.5px;
+}
+
+.add-members__cancel {
+  padding: 10px 16px;
+  border: 1px solid #d4cde3;
+  border-radius: 11px;
+  background: #fff;
+  color: #3d3550;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.add-members__cancel:hover:not(:disabled) {
+  background: #f7f3fc;
+}
+
+.add-members__cancel:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+.add-members__submit {
+  padding: 10px 18px;
+  border: 0;
+  border-radius: 11px;
+  background: var(--add-members-primary);
+  color: #fff;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.add-members__submit:hover:not(:disabled) {
+  background: var(--add-members-primary-strong);
+}
+
+.add-members__submit:disabled {
+  background: #cbc3da;
+  cursor: not-allowed;
+}
+
+.add-members button:focus-visible,
+.add-members input:focus-visible {
+  outline: 2px solid var(--add-members-primary);
+  outline-offset: 2px;
+}
+
+@media (max-width: 620px) {
+  .add-members__backdrop {
+    align-items: end;
+    padding: 0;
+  }
+
+  .add-members {
+    width: 100%;
+    max-height: min(78vh, 640px);
+    border-radius: 16px 16px 0 0;
+  }
+}

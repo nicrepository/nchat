@@ -210,11 +210,16 @@ test.describe("painel de detalhes do grupo", () => {
     await expect(panel.getByText("Nenhuma mensagem fixada neste grupo.")).toBeVisible();
     await expect(panel.getByText("Nenhum arquivo enviado neste grupo.")).toBeVisible();
     await expect(panel.getByText("Nenhum participante para exibir.")).toBeVisible();
-    // A ação de gestão fica visível e explicitamente indisponível.
-    // Indisponível pela semântica: o botão continua alcançável por teclado para
-    // que o motivo descrito por aria-describedby possa ser anunciado.
-    const addParticipants = panel.getByRole("button", { name: /Adicionar participantes/ });
-    await expect(addParticipants).toHaveAttribute("aria-disabled", "true");
-    expect(await addParticipants.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
+    // "Ver todos" continua visível e explicitamente indisponível: o botão segue
+    // alcançável por teclado para que o motivo descrito por aria-describedby
+    // possa ser anunciado.
+    const seeAll = panel.getByRole("button", { name: "Ver todos" }).first();
+    await expect(seeAll).toHaveAttribute("aria-disabled", "true");
+    expect(await seeAll.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
+
+    // "Adicionar participantes" deixou de ser um placeholder (issue #398): virou
+    // fluxo real, e esta fixture não concede a permissão, então a ação fica
+    // ausente — o padrão seguro. O fluxo em si é coberto por add-members.spec.ts.
+    await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
   });
 });
