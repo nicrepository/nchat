@@ -726,6 +726,137 @@ describe("useChatWebSocket", () => {
     );
   });
 
+  // The decisive property: it arrives for a target this client never subscribed
+  // to, which is the only situation it exists for.
+  it("routes conversation.available without a subscription to its target", () => {
+    const onConversationAvailable = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onConversationAvailable,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "conversation.available",
+        target_type: "channel",
+        target_id: "ch-never-subscribed",
+      }),
+    );
+    expect(onConversationAvailable).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "conversation.available",
+        target_id: "ch-never-subscribed",
+      }),
+    );
+  });
+
+  it("routes conversation.available for a dm target too", () => {
+    const onConversationAvailable = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onConversationAvailable,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "conversation.available",
+        target_type: "dm",
+        target_id: "dm-new",
+      }),
+    );
+    expect(onConversationAvailable).toHaveBeenCalledOnce();
+  });
+
+  // A malformed event must not be routed as if it named a conversation.
+  it("ignores conversation.available without a usable target", () => {
+    const onConversationAvailable = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onConversationAvailable,
+      }),
+    );
+    act(() => FakeWebSocket.instances[0].simulateMessage({ type: "conversation.available" }));
+    expect(onConversationAvailable).not.toHaveBeenCalled();
+  });
+
+  it("routes matching members.added events (issue #398)", () => {
+    const onMembersAdded = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMembersAdded,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "members.added",
+        target_type: "channel",
+        target_id: "ch-1",
+        members: { actor_user_id: "user-1", added_count: 2, member_count: 9 },
+      }),
+    );
+    expect(onMembersAdded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "members.added",
+        members: expect.objectContaining({ added_count: 2, member_count: 9 }),
+      }),
+    );
+  });
+
+  // The event carries counts only. If a server ever added identities, the
+  // handler must not start depending on them: the refetch is the contract.
+  it("delivers members.added even with no payload at all", () => {
+    const onMembersAdded = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMembersAdded,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "members.added",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+    expect(onMembersAdded).toHaveBeenCalledOnce();
+  });
+
+  it("ignores members.added for another target", () => {
+    const onMembersAdded = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMembersAdded,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "members.added",
+        target_type: "channel",
+        target_id: "ch-other",
+        members: { actor_user_id: "user-1", added_count: 1, member_count: 4 },
+      }),
+    );
+    expect(onMembersAdded).not.toHaveBeenCalled();
+  });
+
   it("routes every supported message.updated body format only for the active target", () => {
     const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
     renderHook(() =>

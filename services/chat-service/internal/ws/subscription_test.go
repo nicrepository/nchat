@@ -69,6 +69,18 @@ type fakeDMStore struct {
 func (f *fakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
 	return storage.CreateDirectConversationResult{}, nil
 }
+func (f *fakeDMStore) SearchGroupParticipantCandidates(_ context.Context, _, _, _, _ string, _ int) ([]domain.DMCandidate, error) {
+	return nil, nil
+}
+
+func (f *fakeDMStore) AddGroupParticipants(_ context.Context, _ storage.AddGroupParticipantsInput) (storage.AddMembersResult, error) {
+	return storage.AddMembersResult{}, nil
+}
+
+func (f *fakeDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
+	return storage.DMParticipantPage{}, nil
+}
+
 func (f *fakeDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil
 }

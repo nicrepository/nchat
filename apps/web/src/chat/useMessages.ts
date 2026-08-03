@@ -43,6 +43,7 @@ import {
   type WSMessageCreatedEvent,
   type WSMessageUpdatedEvent,
   type WSClientErrorEvent,
+  type WSMembersAddedEvent,
   type WSPinUpdatedEvent,
   type WSReactionUpdatedEvent,
 } from "./useChatWebSocket";
@@ -554,6 +555,14 @@ interface UseMessagesOptions {
   onOwnReactionConfirmed?: (emoji: string) => void;
   /** RF-05: called on a pin.updated event for the active target (refetch pins). */
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
+  /**
+   * Issue #398: called on a members.added event for the active target.
+   *
+   * Routed through this hook rather than a second socket because the connection
+   * and its subscriptions already live here; opening another one to hear about
+   * membership would double the WebSocket count per conversation.
+   */
+  onMembersAdded?: (event: WSMembersAddedEvent) => void;
   onMessageRemoved?: () => void;
 }
 
@@ -581,6 +590,7 @@ export function useMessages({
   focusMessageId,
   onOwnReactionConfirmed,
   onPinUpdated,
+  onMembersAdded,
   onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -1180,6 +1190,21 @@ export function useMessages({
     [kind, targetId],
   );
 
+  // Same ref treatment as the pin callback, and for the same reason: the panel
+  // recreates its handler on every render, and letting that restart the socket
+  // would drop and re-establish every subscription.
+  const onMembersAddedRef = useRef(onMembersAdded);
+  useLayoutEffect(() => {
+    onMembersAddedRef.current = onMembersAdded;
+  });
+  const handleMembersAdded = useCallback(
+    (event: WSMembersAddedEvent) => {
+      if (event.target_type !== kind || event.target_id !== targetId) return;
+      onMembersAddedRef.current?.(event);
+    },
+    [kind, targetId],
+  );
+
   const { toggleReaction: sendReactionToggle } = useChatWebSocket({
     kind,
     targetId,
@@ -1187,6 +1212,7 @@ export function useMessages({
     onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: handleReactionUpdated,
     onPinUpdated: handlePinUpdated,
+    onMembersAdded: handleMembersAdded,
     onReactionError: handleReactionError,
     onSubscriptionError: handleSubscriptionError,
     onSubscribed: handleSubscribed,
