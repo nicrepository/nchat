@@ -34,7 +34,7 @@ class FakeWebSocket {
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
 
   constructor(url: string, protocols?: string | string[]) {
     this.url = url;
@@ -46,10 +46,11 @@ class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close() {
+  /** code/reason default to a transient abnormal closure (1006). */
+  close(code = 1006, reason = "") {
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.(new CloseEvent("close", { code, reason }));
   }
 
   open() {
@@ -242,12 +243,172 @@ describe("chatSocket connection", () => {
 
     expect(vi.getTimerCount()).toBe(1);
     // Repeated close callbacks from the same dead socket must not pile up.
-    FakeWebSocket.instances[0].onclose?.();
-    FakeWebSocket.instances[0].onclose?.();
+    FakeWebSocket.instances[0].onclose?.(new CloseEvent("close", { code: 1006 }));
+    FakeWebSocket.instances[0].onclose?.(new CloseEvent("close", { code: 1006 }));
     expect(vi.getTimerCount()).toBe(1);
 
     vi.advanceTimersByTime(FIRST_RETRY_MS);
     expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  describe("close code 1008 (policy violation)", () => {
+    it("stops with no reconnect when 1008 arrives before open", () => {
+      acquireChatSocket({});
+      latest().close(1008, "rate limit exceeded");
+
+      expect(getChatSocketStatus()).toBe("failed");
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS * 4);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+
+    it("stops with no reconnect when 1008 arrives after a clean open", () => {
+      acquireChatSocket({});
+      latest().open();
+      latest().close(1008, "rate limit exceeded");
+
+      expect(getChatSocketStatus()).toBe("failed");
+      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS * 4);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+
+    it("does not reconnect regardless of the close reason text", () => {
+      acquireChatSocket({});
+      latest().open();
+      latest().close(1008, "some other policy reason");
+
+      expect(getChatSocketStatus()).toBe("failed");
+      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS * 4);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    });
+
+    it("cancels a pending reconnect timer when the fatal close arrives", () => {
+      acquireChatSocket({});
+      latest().close(1006);
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      latest().close(1008, "rate limit exceeded");
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(getChatSocketStatus()).toBe("failed");
+    });
+
+    it("never logs the reason text or any token", () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (import.meta.env as any).DEV = true;
+      const info = vi.spyOn(console, "info").mockImplementation(() => {});
+      acquireChatSocket({});
+      latest().open();
+      latest().close(1008, "rate limit exceeded");
+
+      for (const call of info.mock.calls) {
+        const serialized = JSON.stringify(call);
+        expect(serialized).not.toContain("rate limit exceeded");
+        expect(serialized).not.toContain("test-token");
+      }
+    });
+
+    it("allows a new connection after an explicit session change", () => {
+      acquireChatSocket({});
+      latest().open();
+      latest().close(1008, "rate limit exceeded");
+      expect(getChatSocketStatus()).toBe("failed");
+
+      setTokens("second-session-token");
+
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      expect(latest().protocols).toEqual(["second-session-token", "nchat.v1"]);
+    });
+
+    it("allows a new explicit acquire to open a fresh connection", () => {
+      const handle = acquireChatSocket({});
+      latest().open();
+      latest().close(1008, "rate limit exceeded");
+      expect(getChatSocketStatus()).toBe("failed");
+      handle.release();
+
+      acquireChatSocket({});
+      expect(FakeWebSocket.instances).toHaveLength(2);
+    });
+
+    it("ignores an implicit online event while failed and does not recreate the connection", () => {
+      vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+      const seen: ChatSocketStatus[] = [];
+      acquireChatSocket({ onStatus: (s) => seen.push(s) });
+      latest().open();
+      latest().close(1008, "rate limit exceeded");
+      expect(getChatSocketStatus()).toBe("failed");
+      seen.length = 0;
+
+      window.dispatchEvent(new Event("online"));
+      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS * 4);
+
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      expect(getChatSocketStatus()).toBe("failed");
+      expect(vi.getTimerCount()).toBe(0);
+      expect(seen).not.toContain("connecting");
+      expect(seen).not.toContain("reconnecting");
+    });
+
+    it("still recovers via online after the session changes post-failure", () => {
+      acquireChatSocket({});
+      latest().open();
+      latest().close(1008, "rate limit exceeded");
+      expect(getChatSocketStatus()).toBe("failed");
+
+      // An explicit new session clears the fatal state; a later implicit
+      // online event on the fresh connection must behave normally again.
+      setTokens("second-session-token");
+      expect(FakeWebSocket.instances).toHaveLength(2);
+
+      vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+      latest().close(1006);
+      expect(getChatSocketStatus()).toBe("disconnected");
+      // Offline holds the retry, so advancing time must not create a socket.
+      vi.advanceTimersByTime(RECONNECT_MAX_DELAY_MS * 4);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+
+      vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+      window.dispatchEvent(new Event("online"));
+      expect(FakeWebSocket.instances).toHaveLength(3);
+    });
+  });
+
+  it("still reconnects on an implicit online event after a transient (non-fatal) close", () => {
+    acquireChatSocket({});
+    latest().open();
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    latest().close(1006, "abnormal closure");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(getChatSocketStatus()).toBe("disconnected");
+
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    window.dispatchEvent(new Event("online"));
+
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(getChatSocketStatus()).not.toBe("failed");
+  });
+
+  it("keeps reconnecting on a transient 1006 close", () => {
+    acquireChatSocket({});
+    latest().open();
+    latest().close(1006, "abnormal closure");
+
+    vi.advanceTimersByTime(FIRST_RETRY_MS);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(getChatSocketStatus()).not.toBe("failed");
+  });
+
+  it("keeps reconnecting on a transient 1011 close", () => {
+    acquireChatSocket({});
+    latest().open();
+    latest().close(1011, "internal error");
+
+    vi.advanceTimersByTime(FIRST_RETRY_MS);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(getChatSocketStatus()).not.toBe("failed");
   });
 
   it("keeps doubling while a socket opens and drops before it is stable", () => {
