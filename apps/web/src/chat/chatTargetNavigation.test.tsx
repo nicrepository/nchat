@@ -388,7 +388,8 @@ describe("navigating between DM and channel targets", () => {
 
   it("leaves no subscription or timeline state after a fast A → B → C switch", async () => {
     renderAt(`/chat/channel/${secretChannelId}`);
-    expect(await within(header()).findByText("confidencial")).toBeInTheDocument();
+    const initialHeader = await screen.findByTestId("chat-msg-header");
+    expect(within(initialHeader).getByText("confidencial")).toBeInTheDocument();
     await waitFor(() =>
       expect(socket().subscriptions()).toContainEqual({
         type: "subscribe",

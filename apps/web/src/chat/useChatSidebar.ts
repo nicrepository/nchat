@@ -120,30 +120,37 @@ export function useChatSidebar() {
   const openedTargetKind = openedTarget?.kind;
   const openedTargetId = openedTarget?.targetId;
   const seenRealtimeMessageIds = useRef(new Set<string>());
+  const mountedRef = useRef(true);
+  const loadPromiseRef = useRef<Promise<void> | null>(null);
 
   const load = useCallback(() => {
-    let cancelled = false;
+    if (loadPromiseRef.current) return loadPromiseRef.current;
     dispatch({ type: "reload" });
 
-    fetchSidebarData()
+    const loading = fetchSidebarData()
       .then(({ currentUserId, channels, dms }) => {
-        if (!cancelled) dispatch({ type: "loaded", currentUserId, channels, dms });
+        if (mountedRef.current) dispatch({ type: "loaded", currentUserId, channels, dms });
       })
       .catch((err: unknown) => {
-        if (!cancelled) {
+        if (mountedRef.current) {
           const message =
             err instanceof Error ? err.message : "Não foi possível carregar os dados.";
           dispatch({ type: "error", error: message });
         }
+      })
+      .finally(() => {
+        if (loadPromiseRef.current === loading) loadPromiseRef.current = null;
       });
-
-    return () => {
-      cancelled = true;
-    };
+    loadPromiseRef.current = loading;
+    return loading;
   }, []);
 
   useEffect(() => {
-    return load();
+    mountedRef.current = true;
+    void load();
+    return () => {
+      mountedRef.current = false;
+    };
   }, [load]);
 
   /**
@@ -165,13 +172,6 @@ export function useChatSidebar() {
    */
   const refreshInFlight = useRef(false);
   const refreshQueued = useRef(false);
-  const mountedRef = useRef(true);
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
 
   const refreshSidebar = useCallback(() => {
     if (refreshInFlight.current) {
