@@ -106,6 +106,17 @@ type Config struct {
 	// object's data key. There is no default and no hardcoded fallback.
 	EncryptionMasterKey string
 
+	// EncryptionMasterKeyID is the non-secret identifier persisted with every
+	// wrapped data key, so a download knows which KEK opens it without trying
+	// any. It is required whenever uploads are enabled: without it a rotation
+	// could not tell the two generations of rows apart.
+	EncryptionMasterKeyID string
+
+	// EncryptionPreviousKeys are the KEKs kept only so objects wrapped before a
+	// rotation can still be read, as comma-separated "id:base64key" pairs. It is
+	// optional and empty by default; new uploads always use the active key.
+	EncryptionPreviousKeys string
+
 	// MalwareScanRequired keeps a fresh upload in pending_scan, which is not
 	// downloadable, until the asynchronous antimalware worker clears it. It
 	// defaults to true and must stay true wherever SECURITY.md applies. Setting
@@ -127,8 +138,13 @@ func Load() Config {
 	maxUploadBytes, maxUploadBytesInvalid := configuredInt64("FILE_MAX_UPLOAD_BYTES", domain.MaxMaxUploadBytes)
 
 	return Config{
-		ServiceName:                serviceName,
-		Env:                        platformconfig.GetString("APP_ENV", "development"),
+		ServiceName: serviceName,
+		// No default. An absent APP_ENV must stay absent: defaulting it to
+		// "development" would hand the malware-scan escape hatch to any
+		// deployment that simply forgot to set the variable, which is the
+		// opposite of failing closed. Every overlay and every .env example sets
+		// it explicitly, so the empty case only ever means "not configured".
+		Env:                        strings.TrimSpace(platformconfig.GetString("APP_ENV", "")),
 		Port:                       platformconfig.GetInt("PORT", defaultPort),
 		ReadHeaderTimeoutSeconds:   positiveInt("READ_HEADER_TIMEOUT_SECONDS", 5),
 		ReadTimeoutSeconds:         positiveInt("READ_TIMEOUT_SECONDS", defaultReadTimeoutSeconds),
@@ -145,6 +161,8 @@ func Load() Config {
 		AuthJWTAudience:            strings.TrimSpace(platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience)),
 		MaxUploadBytes:             maxUploadBytes,
 		EncryptionMasterKey:        platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY", ""),
+		EncryptionMasterKeyID:      platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY_ID", ""),
+		EncryptionPreviousKeys:     platformconfig.GetString("FILE_ENCRYPTION_PREVIOUS_KEYS", ""),
 		MalwareScanRequired:        scanRequired,
 		SeaweedFSFilerURL:          strings.TrimSpace(platformconfig.GetString("SEAWEEDFS_FILER_URL", "")),
 		SeaweedFSTimeoutSeconds:    positiveInt("SEAWEEDFS_TIMEOUT_SECONDS", defaultSeaweedFSTimeoutSeconds),
@@ -249,9 +267,17 @@ func (c Config) validateUploadDependencies() error {
 	if c.AuthJWTAudience == "" {
 		return errors.New("JWT audience is required")
 	}
-	if err := crypto.ValidateMasterKey(c.EncryptionMasterKey); err != nil {
-		// The key value itself never reaches the message.
-		return fmt.Errorf("FILE_ENCRYPTION_MASTER_KEY is invalid: %w", err)
+	// One check for the whole key ring: the active key, its id and any previous
+	// key kept for reading. It builds the ring the service will use, so a
+	// configuration that starts is a configuration that can wrap and unwrap.
+	// No key material and no key id value reaches the message.
+	if err := crypto.ValidateKeyring(
+		c.EncryptionMasterKeyID, c.EncryptionMasterKey, c.EncryptionPreviousKeys,
+	); err != nil {
+		return fmt.Errorf(
+			"FILE_ENCRYPTION_MASTER_KEY_ID / FILE_ENCRYPTION_MASTER_KEY / "+
+				"FILE_ENCRYPTION_PREVIOUS_KEYS are invalid: %w", err,
+		)
 	}
 	if !validFilerURL(c.SeaweedFSFilerURL) {
 		return errors.New("SEAWEEDFS_FILER_URL must be a valid HTTP or HTTPS URL without credentials")
@@ -259,36 +285,57 @@ func (c Config) validateUploadDependencies() error {
 	return nil
 }
 
-// validateScanPolicy refuses to disable the malware-scan gate outside a
-// development environment.
+// validateScanPolicy refuses to disable the malware-scan gate unless the
+// deployment has explicitly declared itself a development environment.
 //
 // SECURITY.md requires downloads to stay blocked until the scan approves them,
 // so FILE_MALWARE_SCAN_REQUIRED=false is a local-development affordance for a
-// cluster that has no scanner, never a deployment option. APP_ENV is a reliable
-// discriminator here: every Kubernetes overlay sets it explicitly
-// (infra/k8s/overlays/*/configmap-patch.yaml uses development, staging and
-// nchat-dev), so the check reads a value the deployment owns rather than
-// guessing from a hostname.
+// cluster that has no scanner, never a deployment option. APP_ENV is the
+// discriminator, and it has to be *stated*: every Kubernetes overlay sets it
+// (infra/k8s/base/configmap.yaml and infra/k8s/overlays/*/configmap-patch.yaml
+// use development, staging and nchat-dev) and so does every .env example.
 //
-// It fails closed: an APP_ENV this function does not recognise is treated as a
-// deployed environment and the escape hatch is refused.
+// The exception is granted by a positive match against a closed allowlist,
+// never by the absence of a production marker. An APP_ENV that is missing,
+// empty, whitespace, misspelled or simply unrecognised is treated as a deployed
+// environment and the escape hatch is refused.
 func (c Config) validateScanPolicy() error {
-	if c.MalwareScanRequired || isDevelopmentEnvironment(c.Env) {
+	if c.MalwareScanRequired || isExplicitDevelopmentEnvironment(c.Env) {
 		return nil
 	}
+	// The value is echoed because APP_ENV is an environment label, never a
+	// secret, and seeing the typo is what makes the failure actionable.
 	return fmt.Errorf(
-		"FILE_MALWARE_SCAN_REQUIRED may only be false in a development environment, got APP_ENV=%q",
-		c.Env,
+		"FILE_MALWARE_SCAN_REQUIRED may only be false when APP_ENV is explicitly one of "+
+			"%s, got APP_ENV=%q",
+		strings.Join(developmentEnvironments, ", "), c.Env,
 	)
 }
 
-func isDevelopmentEnvironment(env string) bool {
-	switch strings.ToLower(strings.TrimSpace(env)) {
-	case "development", "dev", "local", "test", "nchat-dev":
-		return true
-	default:
+// developmentEnvironments is the closed set of APP_ENV values that count as an
+// explicitly declared development environment. It is the only way the
+// malware-scan gate can be switched off, so it is deliberately short and is not
+// extended without a matching change to SECURITY.md.
+var developmentEnvironments = []string{"development", "dev", "local", "test", "nchat-dev"}
+
+// isExplicitDevelopmentEnvironment answers the one question the scan policy
+// asks. It is the single place that decides what "development" means, so the
+// rule cannot drift between call sites.
+//
+// Comparison is case-insensitive and ignores surrounding whitespace; nothing
+// else is inferred. In particular an empty or unknown value is false, not
+// "probably local".
+func isExplicitDevelopmentEnvironment(env string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(env))
+	if normalized == "" {
 		return false
 	}
+	for _, allowed := range developmentEnvironments {
+		if normalized == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // validFilerURL restricts the storage endpoint to a plain http/https origin

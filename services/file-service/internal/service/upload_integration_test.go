@@ -44,6 +44,9 @@ import (
 const (
 	testDatabaseURLEnv  = "FILE_TEST_DATABASE_URL"
 	testSeaweedFSURLEnv = "FILE_TEST_SEAWEEDFS_URL"
+
+	// integrationKeyID is the active key id every row this suite writes carries.
+	integrationKeyID = "kek-integration"
 )
 
 // integrationEnv holds the live dependencies plus the identifiers this run owns.
@@ -51,7 +54,7 @@ type integrationEnv struct {
 	pool        *pgxpool.Pool
 	store       *storage.PGXAttachmentStore
 	objects     *storage.SeaweedFSStore
-	kek         *crypto.KeyEncryptionKey
+	keys        *crypto.Keyring
 	workspaceID string
 	channelID   string
 	uploaderID  string
@@ -100,7 +103,7 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 		pool:        pool,
 		store:       storage.NewPGXAttachmentStore(pool),
 		objects:     objects,
-		kek:         integrationKEK(t),
+		keys:        integrationKeyring(t),
 		workspaceID: uuid.NewString(),
 		channelID:   uuid.NewString(),
 		uploaderID:  uuid.NewString(),
@@ -111,17 +114,19 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 	return env
 }
 
-func integrationKEK(t *testing.T) *crypto.KeyEncryptionKey {
+func integrationKeyring(t *testing.T) *crypto.Keyring {
 	t.Helper()
 	key := make([]byte, crypto.KeySize)
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	kek, err := crypto.NewKeyEncryptionKey(base64.StdEncoding.EncodeToString(key))
+	ring, err := crypto.NewKeyring(
+		integrationKeyID, base64.StdEncoding.EncodeToString(key), "",
+	)
 	if err != nil {
-		t.Fatalf("build kek: %v", err)
+		t.Fatalf("build keyring: %v", err)
 	}
-	return kek
+	return ring
 }
 
 // cleanup removes this run's rows and any object they still point at.
@@ -157,7 +162,7 @@ func (e *integrationEnv) newService(objects service.ObjectStore) *service.Attach
 		SessionExpiresAt: time.Now().Add(time.Hour),
 	}}
 	return service.NewAttachmentService(
-		authorizer, e.store, objects, e.kek,
+		authorizer, e.store, objects, e.keys,
 		domain.DefaultMaxUploadBytes, true, &countingOrphans{}, discardLogger(),
 	)
 }
@@ -342,20 +347,30 @@ func (e *integrationEnv) uploadWithFinalizeConflict(
 	// being consumed while the object is written — that is, after the row
 	// exists. Flipping the row's status there makes MarkUploaded find nothing
 	// pending, which is the failure that triggers compensation.
+	//
+	// The conflicting state has to be 'failed' rather than 'rejected': since
+	// migration 000002, attachments_dek_binding_complete_check requires the whole
+	// key binding in every state an upload can finish in, and this row has none
+	// yet. 'failed' is the one terminal state that legitimately never has it, so
+	// it is the only flip that a row still mid-upload can actually take.
 	trigger := &afterReadHook{
 		Reader: strings.NewReader(strings.Repeat("finalize-conflict-payload ", 64)),
 		hook: func() {
-			_, _ = e.pool.Exec(context.Background(),
-				`UPDATE files.attachments SET status = 'rejected'
-				  WHERE workspace_id = $1 AND status = 'pending_upload'`, e.workspaceID)
+			if _, err := e.pool.Exec(context.Background(),
+				`UPDATE files.attachments SET status = 'failed'
+				  WHERE workspace_id = $1 AND status = 'pending_upload'`, e.workspaceID); err != nil {
+				t.Errorf("stage the finalisation conflict: %v", err)
+			}
 		},
 	}
 	view, err := e.uploadContent(t, svc, trigger, "conflict.bin")
 	// Put the row back so the assertions describe the compensation, not the
 	// artificial conflict that triggered it.
-	_, _ = e.pool.Exec(context.Background(),
+	if _, restoreErr := e.pool.Exec(context.Background(),
 		`UPDATE files.attachments SET status = 'pending_upload'
-		  WHERE workspace_id = $1 AND status = 'rejected'`, e.workspaceID)
+		  WHERE workspace_id = $1 AND status = 'failed'`, e.workspaceID); restoreErr != nil {
+		t.Fatalf("restore the pending row: %v", restoreErr)
+	}
 	return view, err
 }
 
@@ -449,6 +464,9 @@ func TestIntegrationMarkUploadedOnlyAdvancesPendingRows(t *testing.T) {
 	err = env.store.MarkUploaded(context.Background(), service.UploadedAttachment{
 		ID: view.ID, Status: domain.StatusClean, DetectedMIME: "text/plain",
 		Size: 1, CiphertextSize: 1,
+		// A complete binding, so the guard being exercised is the SQL one on the
+		// previous state and not the caller-side completeness check.
+		WrappedDEK: []byte{1, 2, 3}, KEKKeyID: integrationKeyID,
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for a non-pending row, got %v", err)
@@ -467,11 +485,15 @@ func TestIntegrationDestinationExclusivityIsEnforcedByTheDatabase(t *testing.T) 
 		INSERT INTO files.attachments (
 			id, workspace_id, uploader_id, destination_kind,
 			channel_id, conversation_id, original_filename, declared_mime,
-			storage_provider, storage_object_key, envelope_version, wrapped_dek, status
+			storage_provider, storage_object_key, envelope_version, dek_wrap_version, status
 		) VALUES ($1, $2, $3, 'channel', $4, $5, 'x.bin', 'application/octet-stream',
-		          'seaweedfs', $6, 1, '\x00', 'pending_upload')`,
+		          'seaweedfs', $6, 1, $7, 'pending_upload')`,
 		attachmentID, env.workspaceID, env.uploaderID,
 		env.channelID, uuid.NewString(), "nchat/attachments/"+attachmentID,
+		// Supplied so the exclusivity CHECK is what fires: without it the row
+		// would be rejected earlier by the dek_wrap_version fence, and this test
+		// would stop covering the constraint it is about.
+		crypto.KeyWrapVersion,
 	)
 	if err == nil {
 		t.Fatal("the database must reject a row naming both destinations")
@@ -489,4 +511,74 @@ func TestIntegrationSuiteIsOptIn(t *testing.T) {
 	}
 	// When they are set, the environment must actually be usable.
 	newIntegrationEnv(t)
+}
+
+// The security regression, against real infrastructure: the size_bytes a real
+// PostgreSQL row carries is the size the real wrapped key authenticates, so an
+// attacker who edits that column cannot make the key open.
+//
+// The download use case cannot be driven here — GetAuthorized needs seeded
+// auth.user_sessions and chat tables, which this suite deliberately avoids — so
+// the check is made where the tampering would have to land: the persisted
+// binding, read straight back out of the database and handed to the same key
+// ring the service uses.
+func TestIntegrationPersistedBindingAuthenticatesTheStoredSize(t *testing.T) {
+	env := newIntegrationEnv(t)
+	svc := env.newService(env.objects)
+	payload := strings.Repeat("size-binding-payload ", 512)
+
+	view, err := env.upload(t, svc, payload)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	var (
+		wrappedDEK  []byte
+		keyID       string
+		wrapVersion int
+		size        int64
+	)
+	if err := env.pool.QueryRow(context.Background(), `
+		SELECT wrapped_dek, kek_key_id, dek_wrap_version, size_bytes
+		  FROM files.attachments WHERE id = $1`, view.ID,
+	).Scan(&wrappedDEK, &keyID, &wrapVersion, &size); err != nil {
+		t.Fatalf("read the persisted binding: %v", err)
+	}
+	if len(wrappedDEK) == 0 || keyID != integrationKeyID || wrapVersion != crypto.KeyWrapVersion {
+		t.Fatalf("incomplete persisted binding: key=%d bytes id=%q version=%d",
+			len(wrappedDEK), keyID, wrapVersion)
+	}
+	if size != int64(len(payload)) {
+		t.Fatalf("expected the counted size %d, got %d", len(payload), size)
+	}
+
+	binding := crypto.Binding{
+		AttachmentID:           uuid.MustParse(view.ID),
+		WorkspaceID:            uuid.MustParse(env.workspaceID),
+		PlaintextSize:          size,
+		KeyWrapVersion:         wrapVersion,
+		ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	}
+	if _, err := env.keys.Unwrap(wrappedDEK, keyID, binding); err != nil {
+		t.Fatalf("the persisted binding must open with the persisted size: %v", err)
+	}
+
+	// Every edit an attacker with write access to the row could make.
+	for name, tampered := range map[string]int64{
+		"halved":        size / 2,
+		"one byte less": size - 1,
+		"one byte more": size + 1,
+		"zero":          0,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := env.keys.Unwrap(wrappedDEK, keyID, withPlaintextSize(binding, tampered)); err == nil {
+				t.Fatalf("size %d must not open the key", tampered)
+			}
+		})
+	}
+}
+
+func withPlaintextSize(b crypto.Binding, size int64) crypto.Binding {
+	b.PlaintextSize = size
+	return b
 }

@@ -82,7 +82,9 @@ func (a *App) wireAttachments(
 	if err != nil {
 		return err
 	}
-	kek, err := crypto.NewKeyEncryptionKey(cfg.EncryptionMasterKey)
+	keys, err := crypto.NewKeyring(
+		cfg.EncryptionMasterKeyID, cfg.EncryptionMasterKey, cfg.EncryptionPreviousKeys,
+	)
 	if err != nil {
 		return err
 	}
@@ -126,7 +128,7 @@ func (a *App) wireAttachments(
 		storage.NewPGXDestinationAuthorizer(pool),
 		storage.NewPGXAttachmentStore(pool),
 		objects,
-		kek,
+		keys,
 		cfg.MaxUploadBytes,
 		cfg.MalwareScanRequired,
 		attachmentMetrics,

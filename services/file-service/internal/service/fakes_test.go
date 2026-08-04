@@ -24,17 +24,26 @@ const (
 	testWorkspaceID  = "44444444-4444-4444-8444-444444444444"
 )
 
-func testKEK(t *testing.T) *crypto.KeyEncryptionKey {
+// testKeyID is the active key id the fixture's key ring uses; it is what the
+// service must persist on every row it creates.
+const testKeyID = "kek-test-active"
+
+func testMasterKey(t *testing.T) string {
 	t.Helper()
 	key := make([]byte, crypto.KeySize)
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	kek, err := crypto.NewKeyEncryptionKey(base64.StdEncoding.EncodeToString(key))
+	return base64.StdEncoding.EncodeToString(key)
+}
+
+func testKeyring(t *testing.T) *crypto.Keyring {
+	t.Helper()
+	ring, err := crypto.NewKeyring(testKeyID, testMasterKey(t), "")
 	if err != nil {
-		t.Fatalf("build kek: %v", err)
+		t.Fatalf("build keyring: %v", err)
 	}
-	return kek
+	return ring
 }
 
 // fakeAuthorizer answers the destination question with a scripted result.
@@ -223,6 +232,13 @@ type fakeObjects struct {
 	putErr    error
 	openErr   error
 	deleteErr error
+
+	// shortPutBy makes Put report fewer bytes than it stored, which is how a
+	// store that accepted an incomplete envelope would look to the service.
+	shortPutBy int64
+	// opens counts Open calls, so a test can assert that a download that failed
+	// on metadata never reached storage at all.
+	opens int
 }
 
 func newFakeObjects() *fakeObjects {
@@ -242,12 +258,13 @@ func (o *fakeObjects) Put(_ context.Context, key string, body io.Reader) (int64,
 		return 0, o.putErr
 	}
 	o.objects[key] = content
-	return int64(len(content)), nil
+	return int64(len(content)) - o.shortPutBy, nil
 }
 
 func (o *fakeObjects) Open(_ context.Context, key string) (io.ReadCloser, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.opens++
 	if o.openErr != nil {
 		return nil, o.openErr
 	}
@@ -267,6 +284,12 @@ func (o *fakeObjects) Delete(_ context.Context, key string) error {
 	}
 	delete(o.objects, key)
 	return nil
+}
+
+func (o *fakeObjects) openCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.opens
 }
 
 func (o *fakeObjects) count() int {
@@ -324,7 +347,7 @@ type fixture struct {
 	store      *fakeStore
 	objects    *fakeObjects
 	orphans    *countingOrphans
-	kek        *crypto.KeyEncryptionKey
+	keys       *crypto.Keyring
 	service    *service.AttachmentService
 }
 
@@ -352,10 +375,10 @@ func newFixture(t *testing.T, options ...fixtureOptions) *fixture {
 		store:   newFakeStore(),
 		objects: newFakeObjects(),
 		orphans: &countingOrphans{},
-		kek:     testKEK(t),
+		keys:    testKeyring(t),
 	}
 	f.service = service.NewAttachmentService(
-		f.authorizer, f.store, f.objects, f.kek,
+		f.authorizer, f.store, f.objects, f.keys,
 		opts.maxUploadBytes, opts.scanRequired, f.orphans, discardLogger(),
 	)
 	return f
