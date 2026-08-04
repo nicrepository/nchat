@@ -21,7 +21,8 @@ export default function ChatShell() {
   const { state, retry } = useChatSidebar();
   const media = useCallMedia();
   const prepareMedia = media.prepare;
-  const calls = useCallSignaling(media);
+  const identityReady = state.status === "ready";
+  const calls = useCallSignaling(media, identityReady);
 
   const outletContext: ChatOutletContext = {
     currentUserId: state.status === "ready" ? state.currentUserId : "",
@@ -38,11 +39,12 @@ export default function ChatShell() {
     if (incomingRinging) void prepareMedia();
   }, [incomingRinging, prepareMedia]);
 
-  const participantId = calls.call
-    ? calls.call.caller_id === currentUserId
-      ? calls.call.callee_id
-      : calls.call.caller_id
-    : "";
+  const participantId =
+    identityReady && calls.call
+      ? calls.call.caller_id === currentUserId
+        ? calls.call.callee_id
+        : calls.call.caller_id
+      : "";
   const participant =
     state.status === "ready"
       ? state.dms.find((dm) => dm.counterpart?.userId === participantId)?.counterpart

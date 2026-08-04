@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
+import { issueCallToken } from "./callApi";
 import { fetchSidebarData } from "./chatApi";
 import ChatShell from "./ChatShell";
 import { _resetChatSocket } from "./chatSocket";
@@ -13,6 +14,7 @@ vi.mock("./chatApi", async () => {
   const actual = await vi.importActual<typeof import("./chatApi")>("./chatApi");
   return { ...actual, fetchSidebarData: vi.fn() };
 });
+vi.mock("./callApi", () => ({ issueCallToken: vi.fn() }));
 vi.mock("./useChatWebSocket", () => ({ useChatWebSocket: vi.fn() }));
 vi.mock("./useCallMedia", () => ({ useCallMedia: vi.fn() }));
 
@@ -75,6 +77,7 @@ const call = {
 } as const;
 
 const prepareMedia = vi.fn(async () => undefined);
+const connectMedia = vi.fn(async () => undefined);
 const OriginalWebSocket = global.WebSocket;
 
 beforeEach(() => {
@@ -83,6 +86,12 @@ beforeEach(() => {
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   setTokens("test-token");
   prepareMedia.mockClear();
+  connectMedia.mockClear();
+  vi.mocked(issueCallToken).mockReset();
+  vi.mocked(issueCallToken).mockResolvedValue({
+    token: "media-token",
+    expiresAt: "2026-08-03T12:05:00Z",
+  });
   vi.mocked(useCallMedia).mockReturnValue({
     status: "idle",
     microphoneEnabled: false,
@@ -102,7 +111,7 @@ beforeEach(() => {
     activateAudio: vi.fn(async () => undefined),
     prepare: prepareMedia,
     startAudio: vi.fn(async () => undefined),
-    connect: vi.fn(async () => undefined),
+    connect: connectMedia,
     stop: vi.fn(async () => undefined),
   });
 });
@@ -239,6 +248,83 @@ describe("ChatShell call identity bootstrap", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(syncCommands(socket)).toHaveLength(1);
     await waitFor(() => expect(prepareMedia).toHaveBeenCalledOnce());
+  });
+
+  it("keeps an active call without media until identity recovery succeeds", async () => {
+    const user = userEvent.setup();
+    const initialSidebar = deferredValue<Awaited<ReturnType<typeof fetchSidebarData>>>();
+    const failedRetry = deferredValue<Awaited<ReturnType<typeof fetchSidebarData>>>();
+    const successfulRetry = deferredValue<Awaited<ReturnType<typeof fetchSidebarData>>>();
+    vi.mocked(fetchSidebarData)
+      .mockReturnValueOnce(initialSidebar.promise)
+      .mockReturnValueOnce(failedRetry.promise)
+      .mockReturnValueOnce(successfulRetry.promise);
+
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatShell />
+      </MemoryRouter>,
+    );
+
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() =>
+      socket.simulateMessage({
+        type: "call.accepted",
+        event_id: "00000000-0000-4000-8000-000000000407",
+        target_type: "user",
+        target_id: currentUserId,
+        call: { ...call, status: "active", version: 2, accepted_at: call.occurred_at },
+      }),
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
+    expect(within(dialog).getByRole("status")).toHaveTextContent("Preparando chamada…");
+    expect(
+      within(dialog).queryByRole("button", { name: "Encerrar chamada" }),
+    ).not.toBeInTheDocument();
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(connectMedia).not.toHaveBeenCalled();
+
+    await act(async () => initialSidebar.reject(new Error("offline")));
+    const retry = within(dialog).getByRole("button", { name: "Tentar novamente" });
+    expect(retry).toHaveFocus();
+    await user.keyboard("{Enter}");
+    await user.keyboard("{Enter}");
+    expect(fetchSidebarData).toHaveBeenCalledTimes(2);
+    expect(issueCallToken).not.toHaveBeenCalled();
+
+    await act(async () => failedRetry.reject(new Error("still offline")));
+    expect(retry).toBeEnabled();
+    await user.keyboard("{Enter}");
+    expect(fetchSidebarData).toHaveBeenCalledTimes(3);
+
+    await act(async () =>
+      successfulRetry.resolve({
+        currentUserId,
+        channels: [],
+        dms: [
+          {
+            id: "00000000-0000-4000-8000-000000000406",
+            type: "1:1",
+            name: "Ana Lima",
+            participants: [],
+            counterpart: { userId: callerId, displayName: "Ana Lima" },
+          },
+        ],
+      }),
+    );
+
+    expect(
+      await screen.findByRole("dialog", { name: "Chamada de vídeo com Ana Lima" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Encerrar chamada" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Ativar microfone" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ativar câmera" })).toBeInTheDocument();
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(syncCommands(socket)).toHaveLength(1);
   });
 });
 

@@ -66,7 +66,7 @@ export interface CallController {
   clearTerminal: () => void;
 }
 
-export function useCallSignaling(media?: CallMediaBridge): CallController {
+export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): CallController {
   const [state, setState] = useState<CallState>(initialCallState);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +81,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
   const mediaRequestCallIdRef = useRef("");
   const mediaRetryPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
   const mediaRef = useRef(media);
+  const mediaEnabledRef = useRef(mediaEnabled);
 
   useEffect(() => {
     mediaRef.current = media;
@@ -88,6 +89,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
 
   const requestMedia = useCallback(async (call: Call) => {
     if (
+      !mediaEnabledRef.current ||
       call.status !== "active" ||
       mediaCallIdRef.current === call.call_id ||
       mediaRequestCallIdRef.current === call.call_id
@@ -97,7 +99,13 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
     mediaRequestCallIdRef.current = call.call_id;
     try {
       const result = await issueCallToken(call.call_id);
-      if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
+      if (
+        !mediaEnabledRef.current ||
+        callRef.current?.call_id !== call.call_id ||
+        callRef.current.status !== "active"
+      ) {
+        return;
+      }
       await mediaRef.current?.connect(call, result.token);
       if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
       mediaCallIdRef.current = call.call_id;
@@ -113,6 +121,12 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
   }, []);
 
   useEffect(() => {
+    mediaEnabledRef.current = mediaEnabled;
+    const call = callRef.current;
+    if (mediaEnabled && call?.status === "active") void requestMedia(call);
+  }, [mediaEnabled, requestMedia]);
+
+  useEffect(() => {
     let closed = false;
     // Call signalling shares the tab's single chat connection: a socket of its
     // own would double the per-user connection cost for no benefit, since both
@@ -124,6 +138,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
         const reconnect = reconnectRef.current;
         syncReconciliationRef.current = reconnect ? { generation, ...reconnect } : null;
         reconnectRef.current = null;
+        if (reconnect) setPending(true);
         // Once per generation: the server replays the caller's current call, so
         // a reconnection cannot leave a stale call on screen.
         handle.send({ type: "call.sync" });
@@ -138,6 +153,9 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
               ? syncReconciliationRef.current
               : null;
           const nextState = applyCallEvent({ call: currentCall }, event);
+          const replacesCurrentCall = Boolean(
+            reconciliation && currentCall && event.call.call_id !== currentCall.call_id,
+          );
           const confirmsCurrentCall = Boolean(
             reconciliation &&
             currentCall &&
@@ -145,16 +163,45 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
             event.call.version === currentCall.version &&
             event.call.status === currentCall.status,
           );
-          if (nextState.call === currentCall && !confirmsCurrentCall) return;
+          if (nextState.call === currentCall && !confirmsCurrentCall && !replacesCurrentCall)
+            return;
           syncReconciliationRef.current = null;
-          if (eventCompletesPending(pendingRef.current, event)) {
+          if (reconciliation) {
+            pendingRef.current = null;
+            setPending(false);
+          } else if (eventCompletesPending(pendingRef.current, event)) {
             pendingRef.current = null;
             setPending(false);
           }
           setError(null);
-          if (nextState.call !== currentCall) {
-            callRef.current = nextState.call;
-            setState(nextState);
+          const acceptedState = replacesCurrentCall ? { call: event.call } : nextState;
+          if (acceptedState.call !== currentCall) {
+            callRef.current = acceptedState.call;
+            setState(acceptedState);
+          }
+          if (replacesCurrentCall) {
+            mediaCallIdRef.current = "";
+            mediaRequestCallIdRef.current = "";
+            mediaRetryPromiseRef.current = null;
+            setMediaReady(false);
+            const cleanup =
+              currentCall && !isTerminalCall(currentCall.status) && !reconciliation?.mediaStopped
+                ? mediaRef.current?.stop()
+                : undefined;
+            if (event.call.status === "active") {
+              if (cleanup) {
+                void cleanup.then(() => {
+                  if (
+                    !closed &&
+                    generation === socketGenerationRef.current &&
+                    callRef.current?.call_id === event.call.call_id
+                  ) {
+                    return requestMedia(event.call);
+                  }
+                });
+              } else void requestMedia(event.call);
+            }
+            return;
           }
           if (event.call.status === "active") void requestMedia(event.call);
           if (nextState.call !== currentCall && isTerminalCall(event.call.status)) {
@@ -176,7 +223,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
                 : null;
             if (!reconciliation) return;
             syncReconciliationRef.current = null;
-            if (pendingRef.current) return;
+            pendingRef.current = null;
             const staleCall = callRef.current;
             callRef.current = null;
             setState(initialCallState);
@@ -190,6 +237,14 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
               void mediaRef.current?.stop();
             }
             return;
+          }
+          if (
+            operation === "call.sync" &&
+            syncReconciliationRef.current?.generation === generation
+          ) {
+            syncReconciliationRef.current = null;
+            pendingRef.current = null;
+            setPending(false);
           }
           if (errorMatchesPending(pendingRef.current, value)) {
             pendingRef.current = null;
@@ -251,6 +306,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
       setError("Conexão em tempo real indisponível.");
       return false;
     }
+    if (reconnectRef.current || syncReconciliationRef.current) return false;
     if (pendingRef.current) return false;
     pendingRef.current = {
       operation,

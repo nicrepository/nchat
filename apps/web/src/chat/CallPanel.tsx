@@ -86,21 +86,27 @@ export default function CallPanel({
   const active = call.status === "active";
   const video = call.call_type === "video";
   const ending = endingCallId === call.call_id && !calls.error;
-  const permissionRecovery = active && (media?.status === "permission-denied" || retryingMedia);
+  const activeReady = active && identityReady;
+  const permissionRecovery =
+    activeReady && (media?.status === "permission-denied" || retryingMedia);
   const retryingIdentity = retryingIdentityCallId === call.call_id;
   const identityRecovery =
-    call.status === "ringing" && (identityStatus === "error" || retryingIdentity);
-  const mediaDisabled = !active || !media || !["connected", "reconnecting"].includes(media.status);
+    (call.status === "ringing" || active) && (identityStatus === "error" || retryingIdentity);
+  const mediaDisabled =
+    !activeReady ||
+    calls.pending ||
+    !media ||
+    !["connected", "reconnecting"].includes(media.status);
   const error = media?.error ?? calls.error;
   const status =
-    active && media?.status === "connected"
-      ? media.hasRemoteMedia
-        ? "Em chamada"
-        : "Aguardando participante"
-      : active && media
-        ? mediaStatusLabels[media.status]
-        : call.status === "ringing" && !identityReady
-          ? "Preparando chamada…"
+    !identityReady && (call.status === "ringing" || active)
+      ? "Preparando chamada…"
+      : active && media?.status === "connected"
+        ? media.hasRemoteMedia
+          ? "Em chamada"
+          : "Aguardando participante"
+        : active && media
+          ? mediaStatusLabels[media.status]
           : incoming
             ? `${participantName} está chamando`
             : call.status === "ringing"
@@ -165,7 +171,7 @@ export default function CallPanel({
       </header>
 
       <main className={`call-panel__stage${video ? "" : " call-panel__stage--audio"}`}>
-        {video && active ? (
+        {video && activeReady ? (
           <section className="call-panel__remote" aria-label={`Vídeo de ${participantName}`}>
             <div
               ref={media?.bindRemoteMedia}
@@ -195,11 +201,13 @@ export default function CallPanel({
               size="remote"
             />
             <h1>{participantName}</h1>
-            {active && <div ref={media?.bindRemoteMedia} className="call-panel__audio-media" />}
+            {activeReady && (
+              <div ref={media?.bindRemoteMedia} className="call-panel__audio-media" />
+            )}
           </section>
         )}
 
-        {video && active && (
+        {video && activeReady && (
           <aside className="call-panel__local" aria-label="Sua pré-visualização">
             <div
               ref={media?.bindLocalMedia}
@@ -264,6 +272,7 @@ export default function CallPanel({
       <footer className="call-panel__controls" aria-label="Controles da chamada">
         {media &&
           (media.mediaLoading || media.audioStarting || media.audioActivationRequired) &&
+          identityReady &&
           (active || call.status === "ringing") && (
             <CallAction
               label={
@@ -314,7 +323,7 @@ export default function CallPanel({
             onClick={calls.cancel}
           />
         )}
-        {active && (
+        {activeReady && (
           <>
             <CallAction
               label={media?.microphoneEnabled ? "Desativar microfone" : "Ativar microfone"}
@@ -330,6 +339,7 @@ export default function CallPanel({
               shortLabel="Encerrar"
               icon="call_end"
               variant="danger"
+              autoFocus
               disabled={calls.pending || ending}
               onClick={endCall}
             />

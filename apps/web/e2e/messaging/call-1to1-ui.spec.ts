@@ -184,6 +184,85 @@ test.describe("chamada 1:1", () => {
     await expectCommandCount(page, "call.accept", 1);
   });
 
+  test("aguarda a identidade antes de iniciar mídia para chamada ativa", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "active-delayed-sidebar");
+    const participantName = "E2E Participante";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: participantName,
+      messages: [],
+    });
+    const initialSidebar = deferredValue<void>();
+    const retrySidebar = deferredValue<void>();
+    let sidebarRequests = 0;
+    let tokenRequests = 0;
+    await installMessagingMocks(page, scenario);
+    await page.route("**/api/chat/sidebar", async (route) => {
+      sidebarRequests += 1;
+      if (sidebarRequests === 1) {
+        await initialSidebar.promise;
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: "sidebar_unavailable" } }),
+        });
+        return;
+      }
+      await retrySidebar.promise;
+      await route.fallback();
+    });
+    await page.route("**/api/media/media/livekit/token", (route) => {
+      tokenRequests += 1;
+      return route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "media_unavailable" } }),
+      });
+    });
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+    const call = {
+      callId: uniqueId(testInfo, "active-delayed-call"),
+      requestId: uniqueId(testInfo, "active-delayed-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+    await emitCallEvent(page, callEvent(call, "active", 1));
+
+    const unresolvedDialog = page.getByRole("dialog", {
+      name: "Chamada de vídeo com Participante",
+    });
+    await expect(unresolvedDialog.getByRole("status")).toHaveText("Preparando chamada…");
+    await expect(unresolvedDialog.getByRole("button", { name: "Ativar microfone" })).toHaveCount(0);
+    await expect(unresolvedDialog.getByRole("button", { name: "Ativar câmera" })).toHaveCount(0);
+    await expect(unresolvedDialog.getByRole("button", { name: "Encerrar chamada" })).toHaveCount(0);
+    expect(tokenRequests).toBe(0);
+
+    initialSidebar.resolve();
+    const retry = unresolvedDialog.getByRole("button", { name: "Tentar novamente" });
+    await expect(retry).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => sidebarRequests).toBe(2);
+    await expect(retry).toBeDisabled();
+    await page.keyboard.press("Enter");
+    expect(sidebarRequests).toBe(2);
+    expect(tokenRequests).toBe(0);
+
+    retrySidebar.resolve();
+
+    const dialog = page.getByRole("dialog", {
+      name: `Chamada de vídeo com ${participantName}`,
+    });
+    await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeFocused();
+    await expect(dialog.getByRole("button", { name: "Ativar microfone" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Ativar câmera" })).toBeVisible();
+    await expect.poll(() => tokenRequests).toBe(1);
+    expect(await commandCount(page, "call.sync")).toBe(1);
+  });
+
   test("integra dialog, foco, teclado, controles e encerramento no desktop", async ({
     page,
   }, testInfo) => {

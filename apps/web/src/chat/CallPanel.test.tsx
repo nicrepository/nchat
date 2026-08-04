@@ -430,6 +430,28 @@ describe("CallPanel", () => {
     expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
   });
 
+  it("keeps an active call neutral and recoverable until identity is ready", () => {
+    const calls = controller("active");
+    render(
+      <CallPanel
+        calls={calls}
+        currentUserId=""
+        identityStatus="error"
+        retryIdentity={retryIdentity}
+        participantName="Participante"
+        media={media()}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível preparar a chamada");
+    expect(screen.getByRole("button", { name: "Tentar novamente" })).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Desativar microfone" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Encerrar chamada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Desativar câmera" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("call-remote-media")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("call-local-media")).not.toBeInTheDocument();
+  });
+
   it("waits for identity before showing outgoing call actions", () => {
     const calls = controller("ringing", currentUserId);
     const view = render(
