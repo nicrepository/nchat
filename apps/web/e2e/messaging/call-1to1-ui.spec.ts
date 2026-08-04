@@ -4,6 +4,7 @@ import {
   CURRENT_USER_ID,
   OTHER_USER_ID,
   createScenario,
+  fillComposer,
   installMessagingMocks,
   uniqueId,
 } from "../helpers/messagingApi";
@@ -39,6 +40,76 @@ test.afterEach(async ({ page }) => {
 });
 
 test.describe("chamada 1:1", () => {
+  test("mantém o chat utilizável quando call.sync não encontra chamada", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "call-sync-empty");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "E2E Participante",
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+
+    await expect(page.getByRole("dialog", { name: /Chamada/ })).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await fillComposer(page, "chat continua utilizável");
+  });
+
+  test("aguarda a identidade antes de oferecer ações da chamada recebida", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "call-delayed-sidebar");
+    const participantName = "E2E Participante";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: participantName,
+      messages: [],
+    });
+    const sidebar = deferredValue<void>();
+    await installMessagingMocks(page, scenario);
+    await page.route("**/api/chat/sidebar", async (route) => {
+      await sidebar.promise;
+      await route.fallback();
+    });
+
+    await page.goto("/chat/dm/" + targetId);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+    const call = {
+      callId: uniqueId(testInfo, "delayed-call"),
+      requestId: uniqueId(testInfo, "delayed-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+    await emitCallEvent(page, callEvent(call, "ringing", 1));
+
+    const unresolvedDialog = page.getByRole("dialog", {
+      name: "Chamada de vídeo com Participante",
+    });
+    await expect(unresolvedDialog).toBeVisible();
+    await expect(unresolvedDialog.getByRole("status")).toHaveText("Preparando chamada…");
+    await expect(unresolvedDialog.getByRole("button", { name: "Atender" })).toHaveCount(0);
+    await expect(unresolvedDialog.getByRole("button", { name: "Recusar" })).toHaveCount(0);
+    await expect(unresolvedDialog.getByRole("button", { name: "Cancelar chamada" })).toHaveCount(0);
+
+    sidebar.resolve();
+
+    const dialog = page.getByRole("dialog", {
+      name: "Chamada de vídeo com " + participantName,
+    });
+    const accept = dialog.getByRole("button", { name: "Atender" });
+    await expect(accept).toBeFocused();
+    await expect(dialog.getByRole("button", { name: "Recusar" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Cancelar chamada" })).toHaveCount(0);
+    expect(await commandCount(page, "call.sync")).toBe(1);
+    await page.keyboard.press("Enter");
+    await expectCommandCount(page, "call.accept", 1);
+  });
+
   test("integra dialog, foco, teclado, controles e encerramento no desktop", async ({
     page,
   }, testInfo) => {
@@ -201,6 +272,14 @@ async function openCallConversation(page: Page, testInfo: TestInfo, participantN
     requestId: uniqueId(testInfo, "request"),
     createdAt: "2026-08-03T12:00:00.000Z",
   } satisfies CallFixture;
+}
+
+function deferredValue<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function callEvent(call: CallFixture, status: CallStatus, version: number) {

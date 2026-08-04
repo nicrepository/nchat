@@ -73,7 +73,8 @@ export default function CallPanel({
     );
   }
 
-  const incoming = call.status === "ringing" && call.callee_id === currentUserId;
+  const identityReady = currentUserId !== "";
+  const incoming = identityReady && call.status === "ringing" && call.callee_id === currentUserId;
   const callId = call.call_id;
   const active = call.status === "active";
   const video = call.call_type === "video";
@@ -88,11 +89,13 @@ export default function CallPanel({
         : "Aguardando participante"
       : active && media
         ? mediaStatusLabels[media.status]
-        : incoming
-          ? `${participantName} está chamando`
-          : call.status === "ringing"
-            ? `Chamando ${participantName}…`
-            : terminalLabels[call.status as keyof typeof terminalLabels];
+        : call.status === "ringing" && !identityReady
+          ? "Preparando chamada…"
+          : incoming
+            ? `${participantName} está chamando`
+            : call.status === "ringing"
+              ? `Chamando ${participantName}…`
+              : terminalLabels[call.status as keyof typeof terminalLabels];
 
   function endCall() {
     if (!ending && calls.end()) setEndingCallId(callId);
@@ -241,7 +244,7 @@ export default function CallPanel({
               onClick={() => void media.activateAudio()}
             />
           )}
-        {incoming && (
+        {identityReady && incoming && (
           <>
             <CallAction
               label="Atender"
@@ -260,7 +263,7 @@ export default function CallPanel({
             />
           </>
         )}
-        {call.status === "ringing" && !incoming && (
+        {identityReady && call.status === "ringing" && !incoming && (
           <CallAction
             label="Cancelar chamada"
             icon="call_end"

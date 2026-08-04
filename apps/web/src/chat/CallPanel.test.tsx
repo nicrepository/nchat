@@ -337,6 +337,44 @@ describe("CallPanel", () => {
     expect(outgoing.cancel).toHaveBeenCalledOnce();
   });
 
+  it("waits for identity before showing incoming call actions", () => {
+    const calls = controller("ringing");
+    const view = render(<CallPanel calls={calls} currentUserId="" participantName="Ana Lima" />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("Preparando chamada…");
+    expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
+    expect(calls.accept).not.toHaveBeenCalled();
+    expect(calls.decline).not.toHaveBeenCalled();
+    expect(calls.cancel).not.toHaveBeenCalled();
+
+    view.rerender(
+      <CallPanel calls={calls} currentUserId={currentUserId} participantName="Ana Lima" />,
+    );
+
+    expect(screen.getByRole("button", { name: "Atender" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
+  });
+
+  it("waits for identity before showing outgoing call actions", () => {
+    const calls = controller("ringing", currentUserId);
+    const view = render(<CallPanel calls={calls} currentUserId="" participantName="Ana Lima" />);
+
+    expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
+
+    view.rerender(
+      <CallPanel calls={calls} currentUserId={currentUserId} participantName="Ana Lima" />,
+    );
+
+    expect(screen.getByRole("button", { name: "Cancelar chamada" })).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
+  });
+
   it("shows terminal status and clears it", () => {
     const calls = controller("timed_out");
     renderPanel(calls);

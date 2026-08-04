@@ -8,12 +8,41 @@ import {
   isTerminalCall,
   parseCallEvent,
   type Call,
+  type CallEvent,
   type CallState,
   type CallType,
 } from "./callState";
 import type { CallMediaSessionController } from "./useCallMedia";
 
 export type CallMediaBridge = Pick<CallMediaSessionController, "startAudio" | "connect" | "stop">;
+
+type CallOperation = "call.start" | "call.accept" | "call.decline" | "call.cancel" | "call.end";
+
+interface PendingCallCommand {
+  operation: CallOperation;
+  callId?: string;
+  requestId?: string;
+}
+
+function eventCompletesPending(pending: PendingCallCommand | null, event: CallEvent): boolean {
+  if (!pending) return false;
+  if (pending.operation === "call.start") {
+    return event.call.request_id === pending.requestId;
+  }
+  if (pending.callId !== event.call.call_id) return false;
+  if (isTerminalCall(event.call.status)) return true;
+  return pending.operation === "call.accept" && event.call.status === "active";
+}
+
+function errorMatchesPending(
+  pending: PendingCallCommand | null,
+  value: Record<string, unknown>,
+): boolean {
+  if (!pending || value["operation"] !== pending.operation) return false;
+  // Transition errors carry call_id. call.start errors do not echo request_id,
+  // so the single in-flight operation is the strongest available correlation.
+  return pending.callId === undefined || value["call_id"] === pending.callId;
+}
 
 export interface CallController {
   call: Call | null;
@@ -36,7 +65,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
   const [mediaReady, setMediaReady] = useState(false);
   const socketRef = useRef<ChatSocketHandle | null>(null);
   const callRef = useRef<Call | null>(null);
-  const pendingRef = useRef(false);
+  const pendingRef = useRef<PendingCallCommand | null>(null);
   const mediaCallIdRef = useRef("");
   const mediaRequestCallIdRef = useRef("");
   const mediaRetryPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
@@ -88,11 +117,13 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
         if (closed) return;
         const event = parseCallEvent(value);
         if (event) {
-          pendingRef.current = false;
-          setPending(false);
-          setError(null);
           const nextState = applyCallEvent({ call: callRef.current }, event);
           if (nextState.call === callRef.current) return;
+          if (eventCompletesPending(pendingRef.current, event)) {
+            pendingRef.current = null;
+            setPending(false);
+          }
+          setError(null);
           callRef.current = nextState.call;
           setState(nextState);
           if (event.call.status === "active") void requestMedia(event.call);
@@ -106,9 +137,13 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
           return;
         }
         if (value["type"] === "call.error") {
-          pendingRef.current = false;
-          setPending(false);
+          const operation = value["operation"];
           const code = value["code"];
+          if (operation === "call.sync" && code === "call_not_found") return;
+          if (errorMatchesPending(pendingRef.current, value)) {
+            pendingRef.current = null;
+            setPending(false);
+          }
           setError(
             code === "call_rate_limited"
               ? "Muitas tentativas de chamada. Aguarde um minuto."
@@ -133,16 +168,20 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
     };
   }, [requestMedia]);
 
-  const send = useCallback((payload: Record<string, unknown>) => {
+  const send = useCallback((operation: CallOperation, payload: Record<string, unknown>) => {
     const handle = socketRef.current;
     if (!handle) {
       setError("Conexão em tempo real indisponível.");
       return false;
     }
     if (pendingRef.current) return false;
-    pendingRef.current = true;
-    if (!handle.send(payload)) {
-      pendingRef.current = false;
+    pendingRef.current = {
+      operation,
+      ...(typeof payload["call_id"] === "string" ? { callId: payload["call_id"] } : {}),
+      ...(typeof payload["request_id"] === "string" ? { requestId: payload["request_id"] } : {}),
+    };
+    if (!handle.send({ type: operation, ...payload })) {
+      pendingRef.current = null;
       setPending(false);
       setError("Conexão em tempo real indisponível.");
       return false;
@@ -155,7 +194,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
   const transition = useCallback(
     (type: "call.accept" | "call.decline" | "call.cancel" | "call.end") => {
       const call = callRef.current;
-      return call ? send({ type, call_id: call.call_id }) : false;
+      return call ? send(type, { call_id: call.call_id }) : false;
     },
     [send],
   );
@@ -166,8 +205,7 @@ export function useCallSignaling(media?: CallMediaBridge): CallController {
     error,
     mediaReady,
     start: (targetUserId, callType) => {
-      const started = send({
-        type: "call.start",
+      const started = send("call.start", {
         request_id: crypto.randomUUID(),
         target_user_id: targetUserId,
         call_type: callType,

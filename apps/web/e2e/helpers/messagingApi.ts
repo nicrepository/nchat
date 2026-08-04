@@ -927,6 +927,20 @@ async function installWebSocketMock(
             return;
           }
           sentMessages.push(parsed);
+          if (parsed["type"] === "call.sync") {
+            queueMicrotask(() =>
+              this.onmessage?.(
+                new MessageEvent("message", {
+                  data: JSON.stringify({
+                    type: "call.error",
+                    operation: "call.sync",
+                    code: "call_not_found",
+                  }),
+                }),
+              ),
+            );
+            return;
+          }
           if (parsed["type"] === "subscribe" || parsed["type"] === "unsubscribe") {
             const kind = parsed["target_type"];
             const id = parsed["target_id"];

@@ -72,10 +72,12 @@ class FakeWebSocket {
   }
 }
 
+function sentMessages(socket: FakeWebSocket): Record<string, unknown>[] {
+  return socket.sentMessages.map((message) => JSON.parse(message) as Record<string, unknown>);
+}
+
 function callCommands(socket: FakeWebSocket): Record<string, unknown>[] {
-  return socket.sentMessages
-    .map((message) => JSON.parse(message) as Record<string, unknown>)
-    .filter((message) => message.type !== "call.sync");
+  return sentMessages(socket).filter((message) => message.type !== "call.sync");
 }
 
 const baseCall = {
@@ -169,6 +171,86 @@ afterEach(() => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("useCallSignaling", () => {
+  it("treats call.sync call_not_found as an empty normal state", () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    expect(sentMessages(socket)).toContainEqual({ type: "call.sync" });
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.call).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
+    expect(media.stop).not.toHaveBeenCalled();
+  });
+
+  it("does not let an empty call.sync response release another pending action", () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(false);
+    });
+    expect(callCommands(socket)).toHaveLength(1);
+  });
+
+  it.each([
+    ["call.accept", "call_not_found"],
+    ["call.sync", "call_unavailable"],
+  ])("keeps %s/%s as an actionable error", (operation, code) => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => socket.simulateMessage({ type: "call.error", operation, code }));
+
+    expect(result.current.error).toBe("Não foi possível concluir a ação da chamada.");
+  });
+
+  it("does not alter an active call for an empty call.sync response", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.call?.status).toBe("active");
+    expect(result.current.call?.version).toBe(2);
+    expect(result.current.error).toBeNull();
+    expect(media.stop).not.toHaveBeenCalled();
+  });
+
   it("keeps the first accepted action media preparation when accept is duplicated", () => {
     const media = mediaBridge();
     const { result } = renderHook(() => useCallSignaling(media));
@@ -250,7 +332,13 @@ describe("useCallSignaling", () => {
     act(() => {
       expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
     });
-    act(() => socket.simulateMessage({ type: "call.error", code: "call_invalid_state" }));
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_invalid_state",
+      }),
+    );
     act(() => {
       expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
     });
@@ -270,6 +358,106 @@ describe("useCallSignaling", () => {
 
     expect(result.current.call?.status).toBe("active");
     expect(result.current.call?.version).toBe(2);
+  });
+
+  it.each([
+    ["older", () => endedEvent(2)],
+    [
+      "another call",
+      () => ({
+        ...endedEvent(4),
+        call: {
+          ...endedEvent(4).call,
+          call_id: "00000000-0000-4000-8000-000000000599",
+        },
+      }),
+    ],
+    ["duplicate", () => activeEvent(3)],
+  ])("does not release a pending end for an %s event", async (_, staleEvent) => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+    expect(result.current.pending).toBe(true);
+    expect(media.stop).toHaveBeenCalledOnce();
+
+    act(() => socket.simulateMessage(staleEvent()));
+
+    expect(result.current.call?.status).toBe("active");
+    expect(result.current.pending).toBe(true);
+    act(() => {
+      expect(result.current.end()).toBe(false);
+    });
+    expect(callCommands(socket)).toHaveLength(1);
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a media error when a stale event is rejected", async () => {
+    vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+    const { result } = renderHook(() => useCallSignaling(mediaBridge()));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() =>
+      expect(result.current.error).toBe(
+        "Não foi possível preparar a mídia da chamada. Tente novamente.",
+      ),
+    );
+
+    act(() => socket.simulateMessage(ringingEvent(2)));
+
+    expect(result.current.error).toBe(
+      "Não foi possível preparar a mídia da chamada. Tente novamente.",
+    );
+  });
+
+  it("releases a pending end only for the current terminal event", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    act(() => socket.simulateMessage(endedEvent(4)));
+
+    expect(result.current.call?.status).toBe("ended");
+    expect(result.current.pending).toBe(false);
+    expect(media.stop).toHaveBeenCalledTimes(2);
+    act(() => socket.simulateMessage(endedEvent(5)));
+    expect(media.stop).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases pending for a correlated call.error", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("A chamada já mudou de estado.");
   });
 
   it("does not let a delayed event from a stale connection overwrite newer state", () => {
@@ -356,7 +544,13 @@ describe("useCallSignaling", () => {
     });
     expect(media.startAudio).toHaveBeenCalledOnce();
 
-    act(() => FakeWebSocket.instances[0].simulateMessage(ringingEvent(1)));
+    const requestId = callCommands(FakeWebSocket.instances[0])[0]?.["request_id"];
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        ...ringingEvent(1),
+        call: { ...ringingEvent(1).call, request_id: requestId },
+      }),
+    );
     act(() => {
       result.current.accept();
     });
