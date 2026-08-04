@@ -120,6 +120,13 @@ type fakeWorkspaceSettingsStore struct {
 	rateCalls    int
 	getErr       error
 	rateErr      error
+
+	// RF-32 upload limit fields (issue #458).
+	storedUploadBytes int64
+	lastUploadUser    string
+	lastUploadBytes   int64
+	uploadCalls       int
+	uploadErr         error
 }
 
 func (f *fakeWorkspaceSettingsStore) UpdateEditWindow(_ context.Context, workspaceID, _ string, seconds *int) (domain.Workspace, error) {
@@ -132,7 +139,9 @@ func (f *fakeWorkspaceSettingsStore) GetWorkspaceByID(_ context.Context, id stri
 	if f.getErr != nil {
 		return domain.Workspace{}, f.getErr
 	}
-	return domain.Workspace{ID: id, MessageRateLimitPerMinute: f.stored}, nil
+	return domain.Workspace{
+		ID: id, MessageRateLimitPerMinute: f.stored, MaxUploadBytes: f.storedUploadBytes,
+	}, nil
 }
 
 func (f *fakeWorkspaceSettingsStore) UpdateMessageRateLimit(_ context.Context, workspaceID, userID string, perMinute int) (domain.Workspace, error) {
@@ -144,6 +153,17 @@ func (f *fakeWorkspaceSettingsStore) UpdateMessageRateLimit(_ context.Context, w
 	f.lastRate = perMinute
 	f.stored = perMinute
 	return domain.Workspace{ID: workspaceID, MessageRateLimitPerMinute: perMinute}, nil
+}
+
+func (f *fakeWorkspaceSettingsStore) UpdateMaxUploadBytes(_ context.Context, workspaceID, userID string, maxBytes int64) (domain.Workspace, error) {
+	f.uploadCalls++
+	f.lastUploadUser = userID
+	if f.uploadErr != nil {
+		return domain.Workspace{}, f.uploadErr
+	}
+	f.lastUploadBytes = maxBytes
+	f.storedUploadBytes = maxBytes
+	return domain.Workspace{ID: workspaceID, MaxUploadBytes: maxBytes}, nil
 }
 
 func (f *fakeMentionProvider) SearchMentions(_ context.Context, in service.SearchMentionsInput) (service.SearchMentionsOutput, error) {

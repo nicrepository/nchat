@@ -238,6 +238,16 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceAntiSpam)),
 	))
 
+	// RF-32 attachment size policy (issue #458). Registered exactly like the
+	// anti-spam pair above: ordinary read/write budgets, and authorization
+	// enforced inside the handlers plus atomically in the UPDATE.
+	mux.Handle("GET "+RouteWorkspaceUploadLimit, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetWorkspaceUploadLimit)),
+	))
+	mux.Handle("PATCH "+RouteWorkspaceUploadLimit, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceUploadLimit)),
+	))
+
 	// Favorite endpoints (RF-06): per-user private bookmarks. The list endpoint
 	// only ever returns the authenticated caller's own favorites. Writes share
 	// msgPostLimiter so favoriting cannot exceed the general write quota.

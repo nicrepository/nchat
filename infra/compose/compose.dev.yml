@@ -146,6 +146,37 @@ services:
     networks:
       - nchat-dev
 
+  upload-guard:
+    # RF-32: streams attachment uploads to file-service under a static body cap.
+    # Traefik's only native cap buffers the whole body before forwarding, which
+    # would let an unauthenticated client fill the gateway's disk; nginx caps
+    # while streaming. See infra/k8s/base/services/upload-guard/README.md.
+    image: ${UPLOAD_GUARD_IMAGE}
+    container_name: nchat-upload-guard
+    restart: unless-stopped
+    profiles:
+      - gateway
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        envsubst '$$UPLOAD_GUARD_UPSTREAM $$UPLOAD_GUARD_PORT'
+        < /etc/nginx/templates/nginx.conf.template > /tmp/nginx.conf
+        && exec nginx -c /tmp/nginx.conf -g 'daemon off;'
+    environment:
+      # The services run on the host in local development, exactly as the
+      # Traefik routes above assume.
+      UPLOAD_GUARD_UPSTREAM: host.docker.internal:8083
+      UPLOAD_GUARD_PORT: "8080"
+    volumes:
+      # The same template the Kubernetes ConfigMap is generated from, so local
+      # and cluster cannot drift.
+      - ../k8s/base/services/upload-guard/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - nchat-dev
+
   traefik:
     image: ${TRAEFIK_IMAGE}
     container_name: nchat-traefik
@@ -162,6 +193,8 @@ services:
       - ../traefik/local/traefik.yml:/etc/traefik/traefik.yml:ro
       - ../traefik/local/dynamic.yml:/etc/traefik/dynamic.yml:ro
       - ../traefik/local/certs:/certs:ro
+    depends_on:
+      - upload-guard
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

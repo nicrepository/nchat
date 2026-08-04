@@ -66,14 +66,18 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultsMaxUploadToFiftyMiB(t *testing.T) {
+// FILE_MAX_UPLOAD_BYTES is a deployment ceiling, not the RF-32 limit (issue
+// #458): the limit is administrative and read per request from the destination
+// workspace. Defaulting the ceiling to the domain maximum is what keeps it from
+// binding out of the box, so the administrative value is what applies.
+func TestLoadDefaultsMaxUploadToTheDomainCeiling(t *testing.T) {
 	cfg := Load()
-	if cfg.MaxUploadBytes != domain.DefaultMaxUploadBytes {
-		t.Fatalf("expected the RF-32 default of %d, got %d",
-			domain.DefaultMaxUploadBytes, cfg.MaxUploadBytes)
+	if cfg.MaxUploadBytes != domain.MaxMaxUploadBytes {
+		t.Fatalf("expected the domain ceiling of %d, got %d",
+			domain.MaxMaxUploadBytes, cfg.MaxUploadBytes)
 	}
-	if cfg.MaxUploadBytes != 52428800 {
-		t.Fatalf("expected 50 MiB in bytes, got %d", cfg.MaxUploadBytes)
+	if cfg.MaxUploadBytes < domain.DefaultMaxUploadBytes {
+		t.Fatal("the ceiling must never narrow the RF-32 default on its own")
 	}
 }
 
@@ -151,6 +155,10 @@ func TestValidateRejectsUnusableUploadCaps(t *testing.T) {
 		{name: "negative", value: "-1"},
 		{name: "below the floor", value: strconv.FormatInt(domain.MinMaxUploadBytes-1, 10)},
 		{name: "above the ceiling", value: strconv.FormatInt(domain.MaxMaxUploadBytes+1, 10)},
+		// The ceiling shares the administrative policy's value space, so it is
+		// held to the same whole-MiB rule rather than to a looser one of its own.
+		{name: "not a whole MiB", value: "1572864"},
+		{name: "one byte above a whole MiB", value: strconv.FormatInt(domain.MinMaxUploadBytes+1, 10)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -162,7 +170,9 @@ func TestValidateRejectsUnusableUploadCaps(t *testing.T) {
 }
 
 func TestValidateAcceptsTheBoundsThemselves(t *testing.T) {
-	for _, value := range []int64{domain.MinMaxUploadBytes, domain.MaxMaxUploadBytes} {
+	for _, value := range []int64{
+		domain.MinMaxUploadBytes, domain.DefaultMaxUploadBytes, domain.MaxMaxUploadBytes,
+	} {
 		enableUploads(t)
 		t.Setenv("FILE_MAX_UPLOAD_BYTES", strconv.FormatInt(value, 10))
 		if err := Load().Validate(); err != nil {

@@ -824,12 +824,23 @@ func TestEffectiveMessageRateLimitPerMinute_NeverYieldsAnUnlimitedBudget(t *test
 // guardSettingsStub is a minimal storage.WorkspaceSettingsStore for driving the
 // admin PATCH against a real guard.
 type guardSettingsStub struct {
-	perMinute int
-	updateErr error
+	perMinute      int
+	maxUploadBytes int64
+	updateErr      error
 }
 
 func (s *guardSettingsStub) GetWorkspaceByID(_ context.Context, id string) (domain.Workspace, error) {
-	return domain.Workspace{ID: id, MessageRateLimitPerMinute: s.perMinute}, nil
+	return domain.Workspace{
+		ID: id, MessageRateLimitPerMinute: s.perMinute, MaxUploadBytes: s.maxUploadBytes,
+	}, nil
+}
+
+func (s *guardSettingsStub) UpdateMaxUploadBytes(_ context.Context, workspaceID, _ string, maxBytes int64) (domain.Workspace, error) {
+	if s.updateErr != nil {
+		return domain.Workspace{}, s.updateErr
+	}
+	s.maxUploadBytes = maxBytes
+	return domain.Workspace{ID: workspaceID, MaxUploadBytes: maxBytes}, nil
 }
 
 func (s *guardSettingsStub) UpdateEditWindow(_ context.Context, workspaceID, _ string, seconds *int) (domain.Workspace, error) {

@@ -14,8 +14,13 @@ const RouteMetrics = "/metrics"
 // RouterDependencies carries the wiring the attachment routes need. Every field
 // is absent while uploads are disabled, and the routes then answer 503.
 type RouterDependencies struct {
-	TokenValidator  accessTokenValidator
-	Attachments     AttachmentUseCases
+	TokenValidator accessTokenValidator
+	Attachments    AttachmentUseCases
+	// Admission is the cluster-wide concurrency control. The per-minute
+	// RateLimiter below counts request starts in one process; this one counts
+	// transfers in flight across every replica, which is what an attacker
+	// holding several slow uploads open actually consumes.
+	Admission       UploadAdmission
 	RateLimiter     *UserRateLimiter
 	ReadinessPinger Pinger
 	StoragePinger   Pinger
@@ -62,7 +67,11 @@ func NewRouter(cfg config.Config, logger *slog.Logger, dependencies ...RouterDep
 func registerAttachmentRoutes(
 	mux *http.ServeMux, cfg config.Config, logger *slog.Logger, deps RouterDependencies,
 ) {
-	handler := NewAttachmentHandler(deps.Attachments, cfg.MaxUploadBytes, deps.Metrics, logger)
+	handler := NewAttachmentHandler(
+		deps.Attachments, cfg.MaxUploadBytes,
+		deps.Admission, cfg.UploadRetryAfterSeconds,
+		deps.Metrics, logger,
+	)
 
 	// Every attachment route is registered in every configuration. A disabled or
 	// half-wired feature answers 503, so a misconfiguration is never mistaken

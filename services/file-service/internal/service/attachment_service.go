@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 )
@@ -44,8 +45,18 @@ type DestinationAuthInput struct {
 // AuthorizedDestination is the server's answer, including the canonical
 // workspace read from the destination row.
 type AuthorizedDestination struct {
-	ID               string
-	WorkspaceID      string
+	ID          string
+	WorkspaceID string
+	// MaxUploadBytes is the destination workspace's RF-32 attachment size
+	// policy, read from the same row in the same query as the workspace itself.
+	// It is never taken from the request, and resolving it costs no extra round
+	// trip, so the policy an upload is judged against is loaded exactly once,
+	// before the first byte is read.
+	//
+	// Zero means "no usable policy on the row" — a workspace written before
+	// migration 000020. Callers resolve it through uploadpolicy, which answers
+	// the default and never "no limit".
+	MaxUploadBytes   int64
 	SessionExpiresAt time.Time
 }
 
@@ -162,11 +173,32 @@ type OrphanObserver interface {
 	ObserveOrphanedObject()
 }
 
-// UploadInput is one attachment upload. Content is streamed, never buffered.
+// AuthorizeUploadInput asks whether a session may upload to a destination. It
+// carries nothing that comes from the request body.
+type AuthorizeUploadInput struct {
+	Destination domain.Destination
+	UserID      string
+	SessionID   string
+}
+
+// UploadTarget is a destination the caller is allowed to write to, with the
+// size policy that governs it.
+//
+// It is resolved before the body is touched, which is what lets the handler
+// authorise the caller and reserve cluster capacity while the request is still
+// nothing but headers. Every field is server-derived: the workspace and the
+// limit come from the destination row, the uploader from the validated session.
+type UploadTarget struct {
+	Destination    domain.Destination
+	WorkspaceID    string
+	UploaderID     string
+	MaxUploadBytes int64
+}
+
+// UploadInput is one attachment upload against an already authorised target.
+// Content is streamed, never buffered.
 type UploadInput struct {
-	Destination  domain.Destination
-	UserID       string
-	SessionID    string
+	Target       UploadTarget
 	Filename     string
 	DeclaredMIME string
 	Content      io.Reader
@@ -209,7 +241,9 @@ type AttachmentService struct {
 }
 
 // NewAttachmentService wires the use cases. maxUploadBytes is the validated
-// RF-32 cap; scanRequired decides the state a finished upload lands in.
+// deployment ceiling — the RF-32 limit itself is administrative and arrives per
+// request with the authorised destination; scanRequired decides the state a
+// finished upload lands in.
 func NewAttachmentService(
 	authorizer DestinationAuthorizer,
 	store AttachmentStore,
@@ -249,6 +283,11 @@ type uploadTarget struct {
 	uploaderID   string
 	filename     string
 	declaredMIME string
+	// maxUploadBytes is the limit this one upload is judged against: the
+	// destination workspace's administrative policy, narrowed by the deployment
+	// ceiling. Resolved once, here, so the policy cannot change underneath a
+	// transfer already in progress.
+	maxUploadBytes int64
 }
 
 // sniffedContent is the head of the stream plus the type detected from it.
@@ -265,16 +304,55 @@ type pendingAttachment struct {
 	objectKey string
 }
 
-// Upload authorises, encrypts and persists one attachment.
+// AuthorizeUpload resolves and authorises an upload destination without
+// touching the request body.
+//
+// It is split out of Upload deliberately. The handler must know the caller may
+// write here, and must know the policy that governs the destination, *before*
+// it reads a single byte — otherwise cluster capacity would be reserved for
+// callers who turn out to have no access, and an unauthorised client could make
+// the service read a body it was never going to accept. Everything this needs
+// is in the path and the validated session; nothing comes from the body.
+func (s *AttachmentService) AuthorizeUpload(
+	ctx context.Context, input AuthorizeUploadInput,
+) (UploadTarget, error) {
+	if !s.Ready() {
+		return UploadTarget{}, domain.ErrDependenciesUnavailable
+	}
+	uploaderID, sessionID, err := parsePrincipal(input.UserID, input.SessionID)
+	if err != nil {
+		return UploadTarget{}, err
+	}
+	authorized, err := s.authorizer.AuthorizeDestination(ctx, DestinationAuthInput{
+		Destination: input.Destination,
+		UserID:      uploaderID,
+		SessionID:   sessionID,
+	})
+	if err != nil {
+		return UploadTarget{}, err
+	}
+	return UploadTarget{
+		Destination: domain.Destination{Kind: input.Destination.Kind, ID: authorized.ID},
+		WorkspaceID: authorized.WorkspaceID,
+		UploaderID:  uploaderID,
+		// The workspace policy decides, the deployment ceiling can only narrow
+		// it, and a missing or out-of-range policy resolves to the default —
+		// never to "unlimited". Resolved once, here, so the policy cannot
+		// change underneath a transfer already in progress.
+		MaxUploadBytes: uploadpolicy.EffectiveUnder(authorized.MaxUploadBytes, s.maxUploadBytes),
+	}, nil
+}
+
+// Upload encrypts and persists one attachment into an already authorised
+// target.
 //
 // PostgreSQL and SeaweedFS cannot share a transaction, so the order is chosen
 // so that no partial failure can ever produce a downloadable attachment:
 //
-//  1. authorise, and derive the workspace from the destination row;
-//  2. reject an empty upload before anything is written anywhere;
-//  3. insert the row as pending_upload — not downloadable in any state;
-//  4. stream the encrypted object to storage;
-//  5. only then move the row to its post-upload state.
+//  1. reject an empty upload before anything is written anywhere;
+//  2. insert the row as pending_upload — not downloadable in any state;
+//  3. stream the encrypted object to storage;
+//  4. only then move the row to its post-upload state.
 //
 // The row is created only once the write is about to start, so a failure is
 // either before the row exists — nothing to undo — or after a write attempt,
@@ -284,12 +362,14 @@ func (s *AttachmentService) Upload(ctx context.Context, input UploadInput) (Atta
 	if !s.Ready() {
 		return AttachmentView{}, domain.ErrDependenciesUnavailable
 	}
-	target, err := s.authorizeUploadTarget(ctx, input)
+	target, err := s.resolveUploadTarget(input)
 	if err != nil {
 		return AttachmentView{}, err
 	}
 
-	source := &boundedSource{src: input.Content, remaining: s.maxUploadBytes}
+	// The cap belongs to the destination that was authorised before the body
+	// was touched, so it is already fixed when the first byte arrives.
+	source := &boundedSource{src: input.Content, remaining: target.maxUploadBytes}
 	content, err := sniffContent(source)
 	if err != nil {
 		return AttachmentView{}, err
@@ -307,34 +387,31 @@ func (s *AttachmentService) Upload(ctx context.Context, input UploadInput) (Atta
 	return s.finalizeUpload(ctx, target, pending, content, source, ciphertextSize)
 }
 
-// authorizeUploadTarget validates what the caller sent and resolves the
-// destination server-side. The workspace comes from the destination row, never
-// from the request.
-func (s *AttachmentService) authorizeUploadTarget(
-	ctx context.Context, input UploadInput,
-) (uploadTarget, error) {
+// resolveUploadTarget turns the already-authorised target plus the body-derived
+// display fields into the internal shape the rest of the pipeline uses.
+//
+// The filename is the only value here that comes from the request body, which
+// is why it is normalised at this point and not during authorization: it is not
+// known until the multipart part header has been read.
+func (s *AttachmentService) resolveUploadTarget(input UploadInput) (uploadTarget, error) {
 	filename, err := domain.NormalizeFilename(input.Filename)
 	if err != nil {
 		return uploadTarget{}, err
 	}
-	uploaderID, sessionID, err := parsePrincipal(input.UserID, input.SessionID)
-	if err != nil {
-		return uploadTarget{}, err
-	}
-	authorized, err := s.authorizer.AuthorizeDestination(ctx, DestinationAuthInput{
-		Destination: input.Destination,
-		UserID:      uploaderID,
-		SessionID:   sessionID,
-	})
-	if err != nil {
-		return uploadTarget{}, err
+	// A zero-valued target can only come from a caller that skipped
+	// AuthorizeUpload. It is refused rather than defaulted: a permissive
+	// fallback here would be an unauthenticated write with no size budget.
+	if input.Target.UploaderID == "" || input.Target.WorkspaceID == "" ||
+		input.Target.MaxUploadBytes <= 0 {
+		return uploadTarget{}, domain.ErrUnauthorized
 	}
 	return uploadTarget{
-		destination:  domain.Destination{Kind: input.Destination.Kind, ID: authorized.ID},
-		workspaceID:  authorized.WorkspaceID,
-		uploaderID:   uploaderID,
-		filename:     filename,
-		declaredMIME: domain.NormalizeDeclaredMIME(input.DeclaredMIME),
+		destination:    input.Target.Destination,
+		workspaceID:    input.Target.WorkspaceID,
+		uploaderID:     input.Target.UploaderID,
+		filename:       filename,
+		declaredMIME:   domain.NormalizeDeclaredMIME(input.DeclaredMIME),
+		maxUploadBytes: input.Target.MaxUploadBytes,
 	}, nil
 }
 
@@ -428,7 +505,9 @@ func (s *AttachmentService) finalizeUpload(
 	if !s.scanRequired {
 		status = domain.StatusClean
 	}
-	size := s.maxUploadBytes - source.remaining
+	// The budget the source started with is the target's, not the service's, so
+	// the recorded plaintext size stays correct whatever the workspace policy is.
+	size := target.maxUploadBytes - source.remaining
 
 	if err := s.store.MarkUploaded(ctx, UploadedAttachment{
 		ID:             pending.id.String(),
@@ -794,9 +873,9 @@ func uploadSourceError(err error) error {
 	}
 }
 
-// boundedSource enforces the RF-32 cap on the bytes actually read, regardless
-// of what Content-Length claimed, and remembers the first failure so the
-// service can tell a client-side stream problem from a storage problem.
+// boundedSource enforces the effective RF-32 cap on the bytes actually read,
+// regardless of what Content-Length claimed, and remembers the first failure so
+// the service can tell a client-side stream problem from a storage problem.
 type boundedSource struct {
 	src       io.Reader
 	remaining int64

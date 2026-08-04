@@ -1164,6 +1164,22 @@
   pointer-events: none;
 }
 
+/* RF-32 (issue #458): the composer is the attachment drop zone. */
+.chat-msg-area__composer-box--drag {
+  border-color: var(--color-primary, #6d28d9);
+  border-style: dashed;
+}
+
+.chat-msg-area__composer-upload {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--color-text-muted, #6b6580);
+}
+
 .chat-msg-area__composer-quote {
   display: flex;
   align-items: flex-start;

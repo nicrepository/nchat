@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: upload-guard
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/component: upload-guard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -80,12 +80,9 @@ func TestUploadToConversationRecordsTheDMDestination(t *testing.T) {
 		SessionExpiresAt: time.Now().Add(time.Hour),
 	}
 
-	view, err := f.service.Upload(context.Background(), service.UploadInput{
-		Destination: domain.Destination{Kind: domain.DestinationKindDM, ID: testConversation},
-		UserID:      testUserID, SessionID: testSessionID,
-		Filename: "notes.txt", DeclaredMIME: "text/plain",
-		Content: strings.NewReader("private notes"),
-	})
+	view, err := f.uploadTo(context.Background(),
+		domain.Destination{Kind: domain.DestinationKindDM, ID: testConversation},
+		strings.NewReader("private notes"), "notes.txt", "text/plain")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,13 +100,10 @@ func TestUploadToConversationRecordsTheDMDestination(t *testing.T) {
 // comes from the real bytes.
 func TestUploadDetectsTheContentTypeFromTheBytes(t *testing.T) {
 	f := newFixture(t)
-	view, err := f.service.Upload(context.Background(), service.UploadInput{
-		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
-		UserID:      testUserID, SessionID: testSessionID,
-		Filename:     "totally-an-image.png",
-		DeclaredMIME: "image/png",
-		Content:      strings.NewReader("<html><script>alert(1)</script></html>"),
-	})
+	view, err := f.uploadTo(context.Background(),
+		domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		strings.NewReader("<html><script>alert(1)</script></html>"),
+		"totally-an-image.png", "image/png")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -148,8 +142,11 @@ func TestUploadRejectsAnUnusableFilenameBeforeTouchingAnything(t *testing.T) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
 	}
 	assertNothingPersisted(t, f)
-	if len(f.authorizer.calls) != 0 {
-		t.Fatal("an invalid filename must be rejected before authorization")
+	// Authorization now runs first — it must, because it decides whether the
+	// body may be read at all — so the filename is rejected right after it and
+	// still before anything is written anywhere.
+	if len(f.authorizer.calls) != 1 {
+		t.Fatalf("expected exactly one authorization, got %d", len(f.authorizer.calls))
 	}
 }
 
@@ -239,10 +236,11 @@ func TestUploadRejectsANonUUIDPrincipal(t *testing.T) {
 		{user: testUserID, session: "not-a-uuid"},
 	}
 	for _, tt := range tests {
-		_, err := f.service.Upload(context.Background(), service.UploadInput{
+		// A malformed principal is refused during authorization, which is now the
+		// step that runs before the body is ever touched.
+		_, err := f.service.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
 			Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
 			UserID:      tt.user, SessionID: tt.session,
-			Filename: "x.txt", Content: strings.NewReader("data"),
 		})
 		if !errors.Is(err, domain.ErrUnauthorized) {
 			t.Fatalf("expected ErrUnauthorized, got %v", err)

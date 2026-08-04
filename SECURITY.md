@@ -170,6 +170,35 @@ contas.
 ## Regras para uploads
 
 - Definir limite de tamanho.
+  O limite maximo por arquivo e configuravel pelo admin do workspace
+  (`chat.workspaces.max_upload_bytes`, default 262144000 = 250 MiB, faixa de
+  1 a 512 MiB, somente multiplos exatos de 1 MiB) via
+  `PATCH /api/chat/workspaces/{id}/upload-limit`, que exige papel ativo de
+  `owner` ou `admin` — verificado no handler e novamente de forma atomica no
+  proprio `UPDATE`. Valor invalido e recusado, nunca arredondado nem ajustado
+  silenciosamente.
+  O **file-service e a unica fronteira de tamanho**: ele autentica, autoriza o
+  destino, rele a politica na mesma consulta e conta os bytes que efetivamente
+  le, entao nem o gateway nem o frontend sao controle de seguranca e contornar
+  qualquer um dos dois nao amplia o limite. `Content-Length` nunca decide. Um
+  upload recusado nao fica persistido, nao permanece no SeaweedFS e nunca
+  alcanca a fila do ClamAV.
+  O gateway aplica um **teto tecnico estatico** de 536879104 bytes (512 MiB +
+  8 KiB de overhead multipart) por meio de um upload guard nginx que limita o
+  corpo **enquanto o transmite**, somente nas duas rotas de upload. O middleware
+  `buffering` do Traefik e proibido: ele le o corpo inteiro antes da
+  autenticacao, o que permitiria a um cliente sem credencial esgotar o disco do
+  gateway. `make gateway-config-check` falha se ele voltar, se o teto divergir
+  das constantes Go, se o streaming for desligado ou se um upload deixar de
+  passar pelo guard.
+  Uploads simultaneos sao limitados **em todo o cluster** por vagas globais e por
+  usuario (`FILE_UPLOAD_MAX_CONCURRENT`, `FILE_UPLOAD_MAX_CONCURRENT_PER_USER`),
+  implementadas com session advisory locks do PostgreSQL e adquiridas **depois**
+  da autenticacao e da autorizacao e **antes** do primeiro byte do corpo. Excesso
+  do usuario responde 429, cluster cheio ou admission indisponivel respondem 503,
+  sempre com `Retry-After` e sem revelar capacidade interna. A indisponibilidade
+  falha fechada: nunca vira capacidade ilimitada.
+  Ver `docs/api/chat-upload-limit.md` e `docs/api/file-attachments.md`.
 - Validar tipo.
 - Armazenar fora do webroot.
 - Usar envelope encryption.

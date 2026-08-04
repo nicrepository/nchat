@@ -51,8 +51,9 @@ func (a *PGXDestinationAuthorizer) AuthorizeDestination(
 
 	var sessionExpiresAt pgtype.Timestamptz
 	var destinationID, workspaceID pgtype.Text
+	var maxUploadBytes pgtype.Int8
 	err := a.pool.QueryRow(ctx, query, input.SessionID, input.UserID, input.Destination.ID).
-		Scan(&sessionExpiresAt, &destinationID, &workspaceID)
+		Scan(&sessionExpiresAt, &destinationID, &workspaceID, &maxUploadBytes)
 	if err != nil {
 		return service.AuthorizedDestination{}, fmt.Errorf("authorize attachment destination: %w", err)
 	}
@@ -62,9 +63,13 @@ func (a *PGXDestinationAuthorizer) AuthorizeDestination(
 	if !destinationID.Valid || !workspaceID.Valid {
 		return service.AuthorizedDestination{}, domain.ErrNotFound
 	}
+	// An invalid value is left as zero rather than substituted here; the service
+	// resolves it through uploadpolicy.Effective, which answers the default and
+	// never "no limit".
 	return service.AuthorizedDestination{
 		ID:               destinationID.String,
 		WorkspaceID:      workspaceID.String,
+		MaxUploadBytes:   maxUploadBytes.Int64,
 		SessionExpiresAt: sessionExpiresAt.Time.UTC(),
 	}, nil
 }
@@ -82,7 +87,7 @@ func (a *PGXDestinationAuthorizer) AuthorizeDestination(
 // from another workspace can never be attributed to the caller's.
 const channelDestinationQuery = authsession.ActiveSessionCTE + `,
 	authorized_destination AS (
-		SELECT c.id, c.workspace_id
+		SELECT c.id, c.workspace_id, w.max_upload_bytes
 		FROM active_session AS active
 		JOIN chat.channels AS c ON c.id = $3
 		JOIN chat.workspaces AS w
@@ -99,13 +104,14 @@ const channelDestinationQuery = authsession.ActiveSessionCTE + `,
 	SELECT
 		(SELECT session_expires_at FROM active_session) AS session_expires_at,
 		(SELECT id::text FROM authorized_destination) AS destination_id,
-		(SELECT workspace_id::text FROM authorized_destination) AS workspace_id`
+		(SELECT workspace_id::text FROM authorized_destination) AS workspace_id,
+		(SELECT max_upload_bytes FROM authorized_destination) AS max_upload_bytes`
 
 // dmDestinationQuery requires active participation in the conversation, in an
 // active workspace the caller is still an active member of.
 const dmDestinationQuery = authsession.ActiveSessionCTE + `,
 	authorized_destination AS (
-		SELECT dc.id, dc.workspace_id
+		SELECT dc.id, dc.workspace_id, w.max_upload_bytes
 		FROM active_session AS active
 		JOIN chat.dm_conversations AS dc ON dc.id = $3
 		JOIN chat.workspaces AS w
@@ -123,4 +129,5 @@ const dmDestinationQuery = authsession.ActiveSessionCTE + `,
 	SELECT
 		(SELECT session_expires_at FROM active_session) AS session_expires_at,
 		(SELECT id::text FROM authorized_destination) AS destination_id,
-		(SELECT workspace_id::text FROM authorized_destination) AS workspace_id`
+		(SELECT workspace_id::text FROM authorized_destination) AS workspace_id,
+		(SELECT max_upload_bytes FROM authorized_destination) AS max_upload_bytes`

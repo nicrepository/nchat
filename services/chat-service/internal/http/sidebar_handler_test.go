@@ -674,3 +674,50 @@ func TestSidebarHandler_KeepsDeprecatedCanCreateChannelTrue(t *testing.T) {
 		})
 	}
 }
+
+// RF-32 (issue #458): the sidebar publishes the workspace's effective
+// attachment size limit, so a client can tell a user what fits before spending
+// their bandwidth. It is policy, not a capability — file-service re-reads the
+// same value on every upload.
+func TestSidebarHandler_PublishesTheWorkspaceUploadLimit(t *testing.T) {
+	v := makeTestValidator(t)
+
+	tests := []struct {
+		name   string
+		stored int64
+		want   int64
+	}{
+		{name: "configured policy", stored: 100 << 20, want: 100 << 20},
+		// A row written before migration 000020 reads as zero, which is not a
+		// limit: it must publish the RF-32 default rather than 0, which a client
+		// would read as "nothing may be uploaded".
+		{name: "unset policy reads as the default", stored: 0, want: domain.DefaultMaxUploadBytes},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &stubSidebarProvider{data: service.SidebarData{
+				Workspace: domain.Workspace{
+					ID: "ws-1", Name: "NIC Labs", Slug: "default",
+					Status: domain.WorkspaceStatusActive, MaxUploadBytes: tt.stored,
+				},
+			}}
+			rr := httptest.NewRecorder()
+			sidebarRouter(v, svc).ServeHTTP(rr, authGet(t))
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d; body: %s", rr.Code, rr.Body.String())
+			}
+			var envelope struct {
+				Data struct {
+					Workspace struct {
+						MaxUploadBytes int64 `json:"max_upload_bytes"`
+					} `json:"workspace"`
+				} `json:"data"`
+			}
+			mustDecode(t, rr, &envelope)
+			if envelope.Data.Workspace.MaxUploadBytes != tt.want {
+				t.Fatalf("expected %d, got %d", tt.want, envelope.Data.Workspace.MaxUploadBytes)
+			}
+		})
+	}
+}

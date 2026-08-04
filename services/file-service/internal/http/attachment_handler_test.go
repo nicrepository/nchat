@@ -64,6 +64,14 @@ type fakeUseCases struct {
 	uploadCall service.UploadInput
 	uploadBody []byte
 
+	authorizeTarget service.UploadTarget
+	authorizeErr    error
+	authorizeCalls  int
+
+	// uploadHook runs inside Upload, so a test can hold a request in flight and
+	// observe what its admission slot blocks.
+	uploadHook func()
+
 	metadataView service.AttachmentView
 	metadataErr  error
 
@@ -74,6 +82,35 @@ type fakeUseCases struct {
 	listViews []service.AttachmentView
 	listErr   error
 	listInput service.ListDestinationAttachmentsInput
+}
+
+// AuthorizeUpload stands in for the destination lookup the handler now performs
+// before it touches the body.
+func (f *fakeUseCases) AuthorizeUpload(
+	_ context.Context, input service.AuthorizeUploadInput,
+) (service.UploadTarget, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authorizeCalls++
+	if f.authorizeErr != nil {
+		return service.UploadTarget{}, f.authorizeErr
+	}
+	target := f.authorizeTarget
+	if target.UploaderID == "" {
+		target = service.UploadTarget{
+			Destination:    input.Destination,
+			WorkspaceID:    "11111111-1111-4111-8111-111111111111",
+			UploaderID:     input.UserID,
+			MaxUploadBytes: domain.DefaultMaxUploadBytes,
+		}
+	}
+	return target, nil
+}
+
+func (f *fakeUseCases) authorizeCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authorizeCalls
 }
 
 func (f *fakeUseCases) ListDestinationAttachments(
@@ -92,6 +129,13 @@ func (f *fakeUseCases) Upload(_ context.Context, input service.UploadInput) (ser
 	// Always drain the content: the real service streams it, so a body error
 	// must surface here exactly as it would in production.
 	body, readErr := io.ReadAll(input.Content)
+	f.mu.Lock()
+	hook := f.uploadHook
+	f.mu.Unlock()
+	if hook != nil {
+		// Outside the lock: the point is to hold the request, not the fake.
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.uploadCall, f.uploadBody = input, body
@@ -258,11 +302,17 @@ func TestUploadToChannelSucceeds(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
 	}
 	call := useCases.call()
-	if call.Destination.Kind != domain.DestinationKindChannel || call.Destination.ID != testChannelID {
-		t.Fatalf("unexpected destination %+v", call.Destination)
+	if call.Target.Destination.Kind != domain.DestinationKindChannel ||
+		call.Target.Destination.ID != testChannelID {
+		t.Fatalf("unexpected destination %+v", call.Target.Destination)
 	}
-	if call.UserID != testUserID || call.SessionID != testSessionID {
+	// The target reaches the service already authorised, and its uploader came
+	// from the validated token rather than from anything in the body.
+	if call.Target.UploaderID != testUserID {
 		t.Fatal("the principal must come from the validated token, never from the body")
+	}
+	if useCases.authorizeCallCount() != 1 {
+		t.Fatal("the destination must be authorised exactly once, before the body is read")
 	}
 	if call.Filename != "report.pdf" || call.DeclaredMIME != "application/pdf" {
 		t.Fatalf("unexpected part metadata %+v", call)
@@ -282,8 +332,8 @@ func TestUploadToDMSucceeds(t *testing.T) {
 	if response.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
 	}
-	if useCases.call().Destination.Kind != domain.DestinationKindDM {
-		t.Fatalf("unexpected destination kind %q", useCases.call().Destination.Kind)
+	if useCases.call().Target.Destination.Kind != domain.DestinationKindDM {
+		t.Fatalf("unexpected destination kind %q", useCases.call().Target.Destination.Kind)
 	}
 }
 
@@ -474,6 +524,27 @@ func TestUploadIsBoundedRegardlessOfContentLength(t *testing.T) {
 				t.Fatal("an over-sized body must never be accepted")
 			}
 		})
+	}
+}
+
+// A file exactly at the cap must survive the multipart framing around it.
+//
+// The body carries boundaries and part headers on top of the file, so a request
+// cap set to the file limit itself would refuse a legitimately sized file for
+// bytes the user did not send. The handler reserves multipartOverhead for
+// exactly this, and the authoritative count in the service is over the file's
+// own bytes, not the envelope's.
+func TestUploadAcceptsAFileExactlyAtTheCapDespiteMultipartFraming(t *testing.T) {
+	cfg := enabledConfig()
+	cfg.MaxUploadBytes = 4096
+	router := newTestRouter(t, readyUseCases(), cfg)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID),
+		fileOf(strings.Repeat("a", 4096))))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
 	}
 }
 

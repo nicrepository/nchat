@@ -105,6 +105,34 @@ http:
         - compress
       tls: {}
 
+    # RF-32: only the two attachment upload routes go through the upload guard,
+    # which caps the request body while streaming it. Higher priority than
+    # nchat-files below, and narrowed by method and path so nothing else — not
+    # health, not download, not listing — pays the extra hop or could be used to
+    # reach file-service around the cap.
+    nchat-files-upload:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      service: upload-guard
+      middlewares:
+        - security-headers
+        - upload-inflight
+        - strip-files-prefix
+
+    nchat-files-upload-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      service: upload-guard
+      middlewares:
+        - security-headers
+        - upload-inflight
+        - strip-files-prefix
+      tls: {}
+
     nchat-files:
       entryPoints:
         - web
@@ -262,6 +290,11 @@ http:
         servers:
           - url: http://host.docker.internal:8083
 
+    upload-guard:
+      loadBalancer:
+        servers:
+          - url: http://nchat-upload-guard:8080
+
     notification-service:
       loadBalancer:
         servers:
@@ -294,6 +327,25 @@ http:
 
     compress:
       compress: {}
+
+    # RF-32: a conservative ceiling on concurrent upload requests reaching the
+    # gateway, as infrastructure defence in depth.
+    #
+    # It is a total per router, not per source: the sources here sit behind
+    # corporate NAT and other proxies, so an IP-keyed limit would either punish
+    # a whole office sharing one address or be trivially spread across a v6
+    # prefix. A flat ceiling is honest about what it protects — the gateway —
+    # and leaves per-user fairness to the place that knows who the user is.
+    #
+    # It is deliberately above the cluster-wide slot count enforced by
+    # file-service (FILE_UPLOAD_MAX_CONCURRENT), so this never becomes the
+    # binding limit: file-service answers 429/503 with a code and a Retry-After,
+    # which is a far better answer than a proxy rejection. This middleware
+    # substitutes for none of authentication, authorization, the per-user limit,
+    # distributed admission control or the real stream cap.
+    upload-inflight:
+      inFlightReq:
+        amount: 16
 
     rewrite-auth-api-prefix:
       replacePathRegex:

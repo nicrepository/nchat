@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 )
 
 // Error categories. Handlers map these to HTTP statuses; nothing below ever
@@ -31,6 +32,25 @@ var (
 
 	ErrUploadsDisabled         = fmt.Errorf("%w: uploads disabled", ErrUnavailable)
 	ErrDependenciesUnavailable = fmt.Errorf("%w: dependencies unavailable", ErrUnavailable)
+
+	// Cluster-wide upload admission control.
+	//
+	// The three are distinct on purpose: the caller's own limit is the caller's
+	// to fix and is retryable soon (429), a full cluster is nobody's fault and
+	// is retryable later (503), and an admission backend that cannot answer
+	// fails closed rather than admitting an uncounted upload (503).
+
+	// ErrNoCapacity is the internal "every slot is taken" signal. It never
+	// reaches a handler on its own; callers translate it into one of the two
+	// below so the response says which resource ran out without saying how much
+	// of it exists.
+	ErrNoCapacity = errors.New("no upload capacity")
+	// ErrUserAtCapacity means this user already holds their concurrent uploads.
+	ErrUserAtCapacity = fmt.Errorf("%w: user upload concurrency reached", ErrNoCapacity)
+	// ErrClusterAtCapacity means every global upload slot is in use.
+	ErrClusterAtCapacity = fmt.Errorf("%w: cluster upload concurrency reached", ErrNoCapacity)
+	// ErrAdmissionUnavailable means admission could not be decided at all.
+	ErrAdmissionUnavailable = fmt.Errorf("%w: upload admission unavailable", ErrUnavailable)
 )
 
 // DestinationKind is the logical target an attachment belongs to. An attachment
@@ -106,14 +126,22 @@ func (s Status) Downloadable() bool {
 	return s == StatusClean
 }
 
-// Upload size bounds. The default is the RF-32 50 MiB. The floor and ceiling
-// are defensive: a cap below the floor would make the feature unusable through
-// a typo, and one above the ceiling would let a single request tie up a
-// service instance for an unbounded time and consume unbounded storage.
+// Upload size bounds (RF-32, issue #458).
+//
+// They are re-exported from libs/go/platform/uploadpolicy rather than restated.
+// The effective limit for an upload is an administrative value that chat-service
+// owns and this service enforces, so the two modules must agree on the default
+// and on the bounds by construction, not by two copies of the same numbers
+// staying in sync.
+//
+// The floor and the ceiling are defensive: a cap below the floor would make the
+// feature unusable through a typo, and one above the ceiling would let a single
+// request tie up a service instance for an unbounded time and consume unbounded
+// storage.
 const (
-	DefaultMaxUploadBytes int64 = 50 << 20  // 50 MiB
-	MinMaxUploadBytes     int64 = 1 << 20   // 1 MiB
-	MaxMaxUploadBytes     int64 = 512 << 20 // 512 MiB
+	DefaultMaxUploadBytes = uploadpolicy.DefaultMaxUploadBytes
+	MinMaxUploadBytes     = uploadpolicy.MinMaxUploadBytes
+	MaxMaxUploadBytes     = uploadpolicy.MaxMaxUploadBytes
 )
 
 // MaxFilenameBytes bounds the retained display name. It matches the column

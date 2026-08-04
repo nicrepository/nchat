@@ -245,6 +245,12 @@ type updateAntiSpamRequest struct {
 	MessageRateLimitPerMinute json.RawMessage `json:"message_rate_limit_per_minute"`
 }
 
+// updateUploadLimitRequest is the RF-32 admin payload, decoded exactly like the
+// anti-spam one above and for the same reasons.
+type updateUploadLimitRequest struct {
+	MaxUploadBytes json.RawMessage `json:"max_upload_bytes"`
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 // checkDeps returns false and writes 503 if either dependency is nil.
@@ -734,6 +740,92 @@ func (h *MessageHandler) UpdateWorkspaceAntiSpam(w http.ResponseWriter, r *http.
 	// the new limit without waiting out the TTL.
 	h.antiSpam.Invalidate(workspace.ID)
 	httputil.WriteJSON(w, http.StatusOK, antiSpamResponse(workspace))
+}
+
+// ── RF-32 attachment size policy (issue #458) ────────────────────────────────
+
+// uploadLimitJSON is the response body for both verbs. Like the anti-spam
+// payload it returns the bounds alongside the value so the admin UI renders and
+// validates against the server's numbers instead of restating them.
+//
+// The unit is bytes. Formatting into MB happens in the UI, at the presentation
+// edge, so no rounding ever reaches a comparison.
+type uploadLimitJSON struct {
+	WorkspaceID    string `json:"workspace_id"`
+	MaxUploadBytes int64  `json:"max_upload_bytes"`
+	Min            int64  `json:"min"`
+	Max            int64  `json:"max"`
+}
+
+func uploadLimitResponse(workspace domain.Workspace) uploadLimitJSON {
+	return uploadLimitJSON{
+		WorkspaceID:    workspace.ID,
+		MaxUploadBytes: domain.EffectiveMaxUploadBytes(workspace.MaxUploadBytes),
+		Min:            domain.MinMaxUploadBytes,
+		Max:            domain.MaxMaxUploadBytes,
+	}
+}
+
+// GetWorkspaceUploadLimit handles GET /api/chat/workspaces/{workspaceID}/upload-limit.
+//
+// Administrative read. Ordinary members do not need it: the effective limit
+// they must respect is published on GET /api/chat/sidebar, which they already
+// load, so this endpoint stays behind the same gate as the write.
+func (h *MessageHandler) GetWorkspaceUploadLimit(w http.ResponseWriter, r *http.Request) {
+	workspaceID, _, ok := h.authorizeWorkspaceAdmin(w, r)
+	if !ok {
+		return
+	}
+	workspace, err := h.settings.GetWorkspaceByID(r.Context(), workspaceID)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, uploadLimitResponse(workspace))
+}
+
+// UpdateWorkspaceUploadLimit handles PATCH /api/chat/workspaces/{workspaceID}/upload-limit.
+//
+// Validation runs after the membership check, so an unprivileged caller learns
+// nothing about which values the field accepts. The store applies the same RBAC
+// predicate atomically with the UPDATE, so this handler's check is defence in
+// depth rather than the only gate.
+//
+// No cache is invalidated here because none exists: file-service reads the
+// policy from the destination's own row in the query that authorises the upload,
+// once per request. An upload already in flight finishes under the policy it
+// started with; the next one sees the new value.
+func (h *MessageHandler) UpdateWorkspaceUploadLimit(w http.ResponseWriter, r *http.Request) {
+	workspaceID, userID, ok := h.authorizeWorkspaceAdmin(w, r)
+	if !ok {
+		return
+	}
+	var req updateUploadLimitRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	if req.MaxUploadBytes == nil {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request body")
+		return
+	}
+	var maxBytes int64
+	// json.Unmarshal into int64 rejects strings, decimals, booleans, null and
+	// values that overflow int64; domain.ValidMaxUploadBytes rejects 0,
+	// negatives, anything outside the policy range and anything that is not a
+	// whole number of MiB. The database CHECK repeats both halves. An invalid
+	// value is refused, never clamped or rounded into range.
+	if err := json.Unmarshal(req.MaxUploadBytes, &maxBytes); err != nil ||
+		!domain.ValidMaxUploadBytes(maxBytes) {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest,
+			"max_upload_bytes must be a whole number of MiB within the allowed range")
+		return
+	}
+	workspace, err := h.settings.UpdateMaxUploadBytes(r.Context(), workspaceID, userID, maxBytes)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, uploadLimitResponse(workspace))
 }
 
 // ── Channel endpoints ─────────────────────────────────────────────────────────

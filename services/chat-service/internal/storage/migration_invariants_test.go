@@ -528,3 +528,35 @@ func TestChatMigration_AddsMessageEditHistoryWithRollback(t *testing.T) {
 		t.Fatal("000013 rollback must preserve edited_at owned by 000004")
 	}
 }
+
+// RF-32 (issue #458): the attachment size policy is a whole number of MiB
+// inside a fixed range, and the column enforces both halves.
+//
+// The whole-MiB half is what stops a value like 1572864 (1.5 MiB) from ever
+// being stored: the admin UI edits whole MiB, so such a row could not be shown
+// there without being changed, and an ordinary save would then overwrite a
+// limit nobody edited. Refusing the value is the only non-destructive answer,
+// and this is the backstop behind uploadpolicy.Valid.
+func TestChatMigration_BoundsWorkspaceMaxUploadBytesToWholeMiB(t *testing.T) {
+	migration := readChatMigration(t, "000020_workspace_max_upload_bytes.up.sql")
+
+	for _, fragment := range []string{
+		"ADD COLUMN max_upload_bytes BIGINT NOT NULL DEFAULT 262144000",
+		"max_upload_bytes BETWEEN 1048576 AND 536870912",
+		"max_upload_bytes % 1048576 = 0",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("migration must contain %q", fragment)
+		}
+	}
+
+	// The default has to satisfy the constraint it ships with, or every row the
+	// column is added to would violate it.
+	const defaultBytes = 262144000
+	if defaultBytes%1048576 != 0 {
+		t.Fatal("the 250 MiB default must be a whole number of MiB")
+	}
+	if defaultBytes < 1048576 || defaultBytes > 536870912 {
+		t.Fatal("the default must sit inside the CHECK bounds")
+	}
+}

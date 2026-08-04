@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
 	"github.com/nicrepository/nchat/services/file-service/internal/storage"
@@ -25,6 +26,8 @@ const (
 )
 
 func text(value string) pgtype.Text { return pgtype.Text{String: value, Valid: true} }
+
+func bigint(value int64) pgtype.Int8 { return pgtype.Int8{Int64: value, Valid: true} }
 
 func timestamp(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
@@ -51,7 +54,7 @@ func TestAuthorizeDestinationReturnsCanonicalWorkspace(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
-				return valueRow{values: []any{timestamp(expiry), text(tt.id), text(testWorkspaceID)}}
+				return valueRow{values: []any{timestamp(expiry), text(tt.id), text(testWorkspaceID), bigint(uploadpolicy.DefaultMaxUploadBytes)}}
 			}}
 			authorizer := storage.NewPGXDestinationAuthorizer(pool)
 
@@ -92,7 +95,7 @@ func assertSessionScopedQuery(t *testing.T, pool *fakePool, destinationID string
 
 func TestChannelAuthorizationMatchesTheChatWritePolicy(t *testing.T) {
 	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
-		return valueRow{values: []any{timestamp(time.Now()), text(testChannelID), text(testWorkspaceID)}}
+		return valueRow{values: []any{timestamp(time.Now()), text(testChannelID), text(testWorkspaceID), bigint(uploadpolicy.DefaultMaxUploadBytes)}}
 	}}
 	if _, err := storage.NewPGXDestinationAuthorizer(pool).AuthorizeDestination(
 		context.Background(), destinationInput(domain.DestinationKindChannel, testChannelID),
@@ -117,7 +120,7 @@ func TestChannelAuthorizationMatchesTheChatWritePolicy(t *testing.T) {
 
 func TestDMAuthorizationRequiresActiveParticipation(t *testing.T) {
 	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
-		return valueRow{values: []any{timestamp(time.Now()), text(testConversation), text(testWorkspaceID)}}
+		return valueRow{values: []any{timestamp(time.Now()), text(testConversation), text(testWorkspaceID), bigint(uploadpolicy.DefaultMaxUploadBytes)}}
 	}}
 	if _, err := storage.NewPGXDestinationAuthorizer(pool).AuthorizeDestination(
 		context.Background(), destinationInput(domain.DestinationKindDM, testConversation),
@@ -140,7 +143,7 @@ func TestDMAuthorizationRequiresActiveParticipation(t *testing.T) {
 
 func TestAuthorizeDestinationRejectsInvalidSession(t *testing.T) {
 	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
-		return valueRow{values: []any{pgtype.Timestamptz{}, pgtype.Text{}, pgtype.Text{}}}
+		return valueRow{values: []any{pgtype.Timestamptz{}, pgtype.Text{}, pgtype.Text{}, pgtype.Int8{}}}
 	}}
 	_, err := storage.NewPGXDestinationAuthorizer(pool).AuthorizeDestination(
 		context.Background(), destinationInput(domain.DestinationKindChannel, testChannelID))
@@ -156,8 +159,8 @@ func TestAuthorizeDestinationHidesInvisibleDestinations(t *testing.T) {
 		name   string
 		values []any
 	}{
-		{name: "no destination", values: []any{timestamp(time.Now()), pgtype.Text{}, pgtype.Text{}}},
-		{name: "no workspace", values: []any{timestamp(time.Now()), text(testChannelID), pgtype.Text{}}},
+		{name: "no destination", values: []any{timestamp(time.Now()), pgtype.Text{}, pgtype.Text{}, pgtype.Int8{}}},
+		{name: "no workspace", values: []any{timestamp(time.Now()), text(testChannelID), pgtype.Text{}, pgtype.Int8{}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

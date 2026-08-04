@@ -72,5 +72,10 @@ const (
 	// the handler never trusts that ID, it checks the caller administers exactly
 	// that workspace and the UPDATE re-checks it atomically.
 	RouteWorkspaceAntiSpam = "/api/chat/workspaces/{workspaceID}/anti-spam"
-	RouteWS                = "/api/chat/ws"
+	// RF-32 attachment size policy (issue #458). Same placement and same
+	// reasoning as the anti-spam route above: the value is a chat-domain
+	// workspace setting, gated by workspace RBAC, and file-service reads it from
+	// the same database rather than from a client.
+	RouteWorkspaceUploadLimit = "/api/chat/workspaces/{workspaceID}/upload-limit"
+	RouteWS                   = "/api/chat/ws"
 )

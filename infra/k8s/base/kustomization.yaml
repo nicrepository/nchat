@@ -11,6 +11,7 @@ resources:
   - services/auth-service
   - services/chat-service
   - services/file-service
+  - services/upload-guard
   - services/notification-service
   - services/admin-service
   - services/search-service

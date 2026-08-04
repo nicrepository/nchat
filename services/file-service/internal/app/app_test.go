@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/nicrepository/nchat/services/file-service/internal/config"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
 	"github.com/nicrepository/nchat/services/file-service/internal/storage"
 )
 
@@ -48,6 +50,10 @@ func uploadsEnabledConfig(t *testing.T) config.Config {
 	cfg.SeaweedFSFilerURL = "http://seaweedfs-filer:8888"
 	cfg.SeaweedFSTimeoutSeconds = 30
 	cfg.MalwareScanRequired = true
+	cfg.DBMaxConnections = 10
+	cfg.UploadMaxConcurrent = 4
+	cfg.UploadMaxConcurrentPerUser = 2
+	cfg.UploadRetryAfterSeconds = 30
 	return cfg
 }
 
@@ -63,8 +69,23 @@ func (p *stubPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, err
 func (p *stubPool) Ping(context.Context) error { return nil }
 func (p *stubPool) Close()                     { p.closed = true }
 
-func openStub(pool *stubPool) func(context.Context, string, int) (storage.Pool, error) {
-	return func(context.Context, string, int) (storage.Pool, error) { return pool, nil }
+func openStub(pool *stubPool) func(context.Context, string, int, int) (storage.Pool, error) {
+	return func(context.Context, string, int, int) (storage.Pool, error) { return pool, nil }
+}
+
+// admissionStub stands in for the PostgreSQL-backed control, which needs a real
+// connection to pin a session lock to. Wiring, not admission behaviour, is what
+// these tests are about.
+func admissionStub() func(storage.Pool, storage.UploadAdmissionLimits, *slog.Logger) (httpapi.UploadAdmission, error) {
+	return func(storage.Pool, storage.UploadAdmissionLimits, *slog.Logger) (httpapi.UploadAdmission, error) {
+		return noopAdmission{}, nil
+	}
+}
+
+type noopAdmission struct{}
+
+func (noopAdmission) Acquire(context.Context, string, int64) (func(), error) {
+	return func() {}, nil
 }
 
 func noopShutdown(context.Context) error { return nil }
@@ -113,7 +134,7 @@ func TestNewRefusesAWeakJWTSecret(t *testing.T) {
 func TestNewWiresTheAttachmentRoutesWhenUploadsAreEnabled(t *testing.T) {
 	pool := &stubPool{}
 	application, err := newApp(uploadsEnabledConfig(t), appDependencies{
-		openDB: openStub(pool), tracingShutdown: noopShutdown,
+		openDB: openStub(pool), openAdmission: admissionStub(), tracingShutdown: noopShutdown,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -139,9 +160,10 @@ func TestNewWiresTheAttachmentRoutesWhenUploadsAreEnabled(t *testing.T) {
 func TestNewFailsWhenTheDatabaseIsUnreachable(t *testing.T) {
 	dbErr := errors.New("dial tcp db-primary.internal:5432: connection refused")
 	_, err := newApp(uploadsEnabledConfig(t), appDependencies{
-		openDB: func(context.Context, string, int) (storage.Pool, error) {
+		openDB: func(context.Context, string, int, int) (storage.Pool, error) {
 			return nil, dbErr
 		},
+		openAdmission:   admissionStub(),
 		tracingShutdown: noopShutdown,
 	})
 	if err == nil {
@@ -174,7 +196,7 @@ func TestNewFailsOnAnUnusableStorageClient(t *testing.T) {
 func TestShutdownIsIdempotent(t *testing.T) {
 	pool := &stubPool{}
 	application, err := newApp(uploadsEnabledConfig(t), appDependencies{
-		openDB: openStub(pool), tracingShutdown: noopShutdown,
+		openDB: openStub(pool), openAdmission: admissionStub(), tracingShutdown: noopShutdown,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

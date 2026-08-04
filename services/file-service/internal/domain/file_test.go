@@ -9,9 +9,9 @@ import (
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 )
 
-func TestDefaultMaxUploadBytesIsFiftyMiB(t *testing.T) {
-	if domain.DefaultMaxUploadBytes != 50*1024*1024 {
-		t.Fatalf("RF-32 default must be 50 MiB, got %d", domain.DefaultMaxUploadBytes)
+func TestDefaultMaxUploadBytesIsTwoHundredFiftyMiB(t *testing.T) {
+	if domain.DefaultMaxUploadBytes != 250*1024*1024 {
+		t.Fatalf("RF-32 default must be 250 MiB, got %d", domain.DefaultMaxUploadBytes)
 	}
 	if domain.MinMaxUploadBytes >= domain.DefaultMaxUploadBytes {
 		t.Fatal("minimum bound must be below the default")

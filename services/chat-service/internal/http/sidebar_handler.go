@@ -21,6 +21,14 @@ type sidebarWorkspaceJSON struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	Slug string `json:"slug"`
+	// MaxUploadBytes publishes the RF-32 attachment size policy (issue #458) to
+	// every member, not just administrators: a client needs it to tell a user
+	// what fits before spending their bandwidth on an upload that file-service
+	// will refuse. It is a policy number, not a capability — knowing it grants
+	// nothing, and file-service re-reads it from the destination's own row on
+	// every upload, so a client that ignores or edits this value changes only
+	// which error it receives.
+	MaxUploadBytes int64 `json:"max_upload_bytes"`
 }
 
 // sidebarChannelJSON is the JSON shape for a channel in the sidebar response.
@@ -117,9 +125,10 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body := sidebarResponseBody{
 		CurrentUserID: userID,
 		Workspace: sidebarWorkspaceJSON{
-			ID:   data.Workspace.ID,
-			Name: data.Workspace.Name,
-			Slug: data.Workspace.Slug,
+			ID:             data.Workspace.ID,
+			Name:           data.Workspace.Name,
+			Slug:           data.Workspace.Slug,
+			MaxUploadBytes: domain.EffectiveMaxUploadBytes(data.Workspace.MaxUploadBytes),
 		},
 		Channels:         mapChannels(data.Channels),
 		DMConvs:          mapDMs(data.DMs),

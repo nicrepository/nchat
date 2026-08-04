@@ -63,6 +63,10 @@ labels:
     includeTemplates: true
     pairs:
       app.kubernetes.io/instance: nchat-dev
+# NOTE: kustomize matches a replacement selector's kind and name as regular
+# expressions, so `kind: Ingress` also matches `IngressRoute` and a bare
+# `name: nchat-dev` also matches `nchat-dev-uploads`. Every selector below is
+# anchored so each replacement lands on exactly the resource it names.
 replacements:
   - source:
       kind: ConfigMap
@@ -70,25 +74,33 @@ replacements:
       fieldPath: data.NCHAT_DEV_HOST
     targets:
       - select:
-          kind: Certificate
-          name: nchat-dev-tls
+          kind: ^Certificate$
+          name: ^nchat-dev-tls$
         fieldPaths:
           - spec.dnsNames.0
       - select:
-          kind: Ingress
-          name: nchat-dev
+          kind: ^Ingress$
+          name: ^nchat-dev$
         fieldPaths:
           - spec.tls.0.hosts.0
           - spec.rules.0.host
       - select:
-          kind: Ingress
-          name: nchat-dev-livekit
+          kind: ^IngressRoute$
+          name: ^nchat-dev-uploads$
+        fieldPaths:
+          - spec.routes.0.match
+        options:
+          delimiter: "`"
+          index: 1
+      - select:
+          kind: ^Ingress$
+          name: ^nchat-dev-livekit$
         fieldPaths:
           - spec.tls.0.hosts.0
           - spec.rules.0.host
       - select:
-          kind: Ingress
-          name: nchat-dev-http
+          kind: ^Ingress$
+          name: ^nchat-dev-http$
         fieldPaths:
           - spec.rules.0.host
   - source:
