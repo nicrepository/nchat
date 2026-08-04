@@ -900,6 +900,7 @@ async function installWebSocketMock(
       sessionStorage.setItem("nchat_at", accessToken);
       const allowed = new Set(allowedTargets);
       const sockets = new Set<StableWebSocket>();
+      const sentMessages: Array<Record<string, unknown>> = [];
 
       class StableWebSocket {
         static readonly CONNECTING = 0;
@@ -925,6 +926,7 @@ async function installWebSocketMock(
           } catch {
             return;
           }
+          sentMessages.push(parsed);
           if (parsed["type"] === "subscribe" || parsed["type"] === "unsubscribe") {
             const kind = parsed["target_type"];
             const id = parsed["target_id"];
@@ -1026,6 +1028,20 @@ async function installWebSocketMock(
         const key = `${kind}:${targetId}`;
         return [...sockets].some((socket) => socket.subscriptions.has(key));
       };
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent = (event) => {
+        for (const socket of sockets) {
+          socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify(event) }));
+        }
+      };
+      (
+        window as unknown as {
+          __e2eWebSocketMessages: () => Array<Record<string, unknown>>;
+        }
+      ).__e2eWebSocketMessages = () => [...sentMessages];
 
       window.WebSocket = StableWebSocket as unknown as typeof WebSocket;
     },
