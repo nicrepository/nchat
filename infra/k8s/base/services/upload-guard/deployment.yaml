@@ -1,0 +1,121 @@
+# upload-guard — streaming request-body ceiling for attachment uploads.
+#
+# Traefik v3.6's only native body cap (the buffering middleware) reads the whole
+# body before forwarding it, which would let an unauthenticated client fill the
+# gateway's disk before file-service ever authenticates. nginx caps while
+# streaming, so it sits in front of the two upload routes and nothing else.
+# See the README beside this manifest.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upload-guard
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+    app.kubernetes.io/version: "0.0.0"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nchat
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: upload-guard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: upload-guard
+        app.kubernetes.io/version: "0.0.0"
+    spec:
+      # No service account token: the guard talks to one upstream and never to
+      # the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: upload-guard
+          # Pinned, unprivileged nginx: it listens on 8080 and runs as an
+          # ordinary user, so no capability is needed to bind the port.
+          image: nginxinc/nginx-unprivileged:1.27.4-alpine
+          imagePullPolicy: IfNotPresent
+          # The template is rendered once at start-up so one file serves both
+          # this overlay and the local gateway.
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              envsubst '$$UPLOAD_GUARD_UPSTREAM $$UPLOAD_GUARD_PORT'
+              < /etc/nginx/templates/nginx.conf.template > /tmp/nginx.conf
+              && exec nginx -c /tmp/nginx.conf -g 'daemon off;'
+          env:
+            - name: UPLOAD_GUARD_UPSTREAM
+              value: file-service:8083
+            - name: UPLOAD_GUARD_PORT
+              value: "8080"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/templates
+              readOnly: true
+            # The rendered config, the pid file and nginx's scratch paths all
+            # live here, which is what lets the root filesystem stay read-only.
+            # It is not request-body storage: proxy_request_buffering is off.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: upload-guard-config
+        - name: tmp
+          emptyDir: {}

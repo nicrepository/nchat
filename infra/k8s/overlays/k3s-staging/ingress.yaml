@@ -100,3 +100,82 @@ spec:
   replacePathRegex:
     regex: "^/api/auth/(.*)"
     replacement: "/auth/${1}"
+---
+# RF-32: the two attachment upload routes, and only those, go through the
+# upload guard. It caps the request body while streaming it, which Traefik's
+# buffering middleware cannot do without reading the whole body first — a
+# pre-authentication disk-exhaustion vector on exactly these routes.
+#
+# Everything else under /api/files (health, download, listing, metadata) stays
+# on the shared Ingress and reaches file-service directly, so nothing else pays
+# the extra hop. This Ingress is matched by method and exact path shape, so
+# there is no upload path that reaches file-service around the cap.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nchat-k3s-staging-uploads
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`staging.nchat.local`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      middlewares:
+        - name: upload-inflight
+        - name: strip-files-prefix
+      services:
+        - name: upload-guard
+          port: 8080
+  # IngressRoute TLS is a mapping, not the Ingress host list: the host the
+  # certificate must cover comes from the match rule above.
+  tls:
+    secretName: nchat-staging-tls
+---
+# Conservative ceiling on concurrent upload requests at the edge, as
+# infrastructure defence in depth.
+#
+# A total per router, not per source: these sources sit behind corporate NAT and
+# other proxies, so an IP-keyed limit would either punish a whole office sharing
+# one address or be trivially spread across an IPv6 prefix. It is deliberately
+# set above file-service's cluster-wide slot count so it never becomes the
+# binding limit — file-service answers 429/503 with a stable code and a
+# Retry-After, which is a better answer than a proxy rejection. It substitutes
+# for none of authentication, authorization, the per-user limit, distributed
+# admission control or the authoritative stream cap.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: upload-inflight
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  inFlightReq:
+    amount: 16
+---
+# Strips the public /api/files prefix before the request reaches the guard, so
+# the guard stays a dumb pipe and file-service receives the paths it registers.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-files-prefix
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  stripPrefix:
+    prefixes:
+      - /api/files
