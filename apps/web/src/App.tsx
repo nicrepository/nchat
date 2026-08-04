@@ -14,6 +14,7 @@ import ChatShell from "./chat/ChatShell";
 import ProfilePage from "./profile/ProfilePage";
 
 const AdminAntiSpamPage = lazy(() => import("./admin/AdminAntiSpamPage"));
+const AdminUploadLimitPage = lazy(() => import("./admin/AdminUploadLimitPage"));
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
 const LiveKitSpikePage = import.meta.env.DEV
@@ -106,6 +107,20 @@ export default function App() {
             <RequireAuth>
               <Suspense fallback={null}>
                 <AdminAntiSpamPage />
+              </Suspense>
+            </RequireAuth>
+          }
+        />
+        {/* RF-32 (issue #458). Same session gate and same reasoning as the
+            anti-spam route above: the policy behind this page is authorized
+            server-side, so reaching the route without the role shows errors
+            rather than the configuration. */}
+        <Route
+          path="/admin/upload-limit"
+          element={
+            <RequireAuth>
+              <Suspense fallback={null}>
+                <AdminUploadLimitPage />
               </Suspense>
             </RequireAuth>
           }

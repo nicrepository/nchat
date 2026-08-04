@@ -12,7 +12,9 @@
  * built from a filename or an ID anywhere in this file.
  */
 
+import { ApiRequestError } from "../lib/api";
 import { authenticatedFetch } from "../lib/authClient";
+import { formatUploadLimit } from "../lib/uploadLimit";
 import type { AttachmentStatus, ChannelAttachment } from "./chatTypes";
 
 const FILES_BASE = import.meta.env.VITE_FILES_API_BASE_URL ?? "/api/files";
@@ -79,4 +81,126 @@ export async function fetchConversationAttachments(
   return raw
     .map(mapAttachment)
     .filter((attachment): attachment is ChannelAttachment => attachment !== undefined);
+}
+
+// ── Upload (RF-32, issue #458) ───────────────────────────────────────────────
+
+export type AttachmentUploadErrorReason =
+  | "too_large"
+  | "unsupported"
+  | "forbidden"
+  | "unavailable"
+  | "unknown";
+
+/**
+ * A rejected upload, carrying a typed reason so the UI can show the right
+ * message instead of parsing whatever text came back. Mirrors
+ * AvatarUploadError in profileApi.ts, which solves the same problem for the
+ * avatar upload.
+ */
+export class AttachmentUploadError extends Error {
+  readonly reason: AttachmentUploadErrorReason;
+
+  constructor(reason: AttachmentUploadErrorReason, message: string) {
+    super(message);
+    this.name = "AttachmentUploadError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * The one message that has to name the limit, in the unit the policy is defined
+ * in. When the limit is unknown — the server published none — the message says
+ * so without inventing a number this client cannot know.
+ */
+export function tooLargeMessage(maxUploadBytes: number | null): string {
+  if (maxUploadBytes === null) return "O arquivo excede o limite permitido.";
+  return `O arquivo excede o limite permitido de ${formatUploadLimit(maxUploadBytes)}.`;
+}
+
+/**
+ * Turns a failed upload into a typed reason.
+ *
+ * The HTTP status leads and the error code only refines it. That ordering is
+ * deliberate: an oversized body can be refused by the gateway before it ever
+ * reaches file-service, and the gateway answers 413 with its own body — not the
+ * service's `{error:{code,message}}` envelope — so `code` is absent exactly when
+ * the size is the problem. Keying on the code alone would show a generic error
+ * for the one case the user can actually fix.
+ *
+ * No server text is ever surfaced: it may carry detail that does not belong in
+ * the UI.
+ */
+function mapUploadError(error: unknown, maxUploadBytes: number | null): AttachmentUploadError {
+  if (error instanceof ApiRequestError) {
+    if (error.status === 413 || error.code === "payload_too_large") {
+      return new AttachmentUploadError("too_large", tooLargeMessage(maxUploadBytes));
+    }
+    switch (error.status) {
+      case 415:
+        return new AttachmentUploadError("unsupported", "Formato de arquivo não suportado.");
+      case 401:
+      case 403:
+      case 404:
+        return new AttachmentUploadError("forbidden", "Você não pode enviar arquivos aqui.");
+      case 503:
+        return new AttachmentUploadError(
+          "unavailable",
+          "O envio de arquivos está indisponível no momento.",
+        );
+    }
+  }
+  return new AttachmentUploadError("unknown", "Não foi possível enviar o arquivo.");
+}
+
+/**
+ * Uploads one file to a channel or a conversation.
+ *
+ * `maxUploadBytes` is the workspace's effective limit, obtained from
+ * `fetchWorkspaceUploadLimit`, or null when the server published none. Checking
+ * `file.size` against it here saves the user from spending their upload
+ * bandwidth on a request that cannot succeed — it is not a control.
+ * file-service re-reads the policy from the destination's own row and counts
+ * the bytes it actually receives, so a caller that skips or edits this check is
+ * refused all the same, and its 413 wins over this estimate. A null limit
+ * therefore skips the pre-flight check and leaves the decision entirely to the
+ * service; it never means "no limit".
+ *
+ * The comparison is `>` on two integers: a file of exactly the limit is
+ * accepted, and nothing is rounded or coerced to a float on the way.
+ *
+ * Exactly one file per request, in the field named `file`: that is the contract
+ * the service accepts, and a second part is rejected server-side.
+ */
+export async function uploadAttachment(
+  target: { kind: "channel" | "dm"; id: string },
+  file: File,
+  maxUploadBytes: number | null,
+  signal?: AbortSignal,
+): Promise<ChannelAttachment> {
+  if (maxUploadBytes !== null && file.size > maxUploadBytes) {
+    throw new AttachmentUploadError("too_large", tooLargeMessage(maxUploadBytes));
+  }
+
+  const collection = target.kind === "channel" ? "channels" : "dm";
+  const form = new FormData();
+  form.append("file", file);
+
+  let body: { data: unknown };
+  try {
+    body = await authenticatedFetch<{ data: unknown }>(
+      `${FILES_BASE}/${collection}/${encodeURIComponent(target.id)}/attachments`,
+      { method: "POST", body: form, signal },
+    );
+  } catch (error) {
+    // An abort is the caller's own decision, not a failure to report.
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw mapUploadError(error, maxUploadBytes);
+  }
+
+  const attachment = mapAttachment(body.data);
+  if (!attachment) {
+    throw new AttachmentUploadError("unknown", "Não foi possível enviar o arquivo.");
+  }
+  return attachment;
 }

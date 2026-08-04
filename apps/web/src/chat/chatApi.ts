@@ -67,7 +67,7 @@ interface SidebarDMResponse {
 
 interface SidebarResponse {
   current_user_id: string;
-  workspace: { id: string; name: string; slug: string };
+  workspace: { id: string; name: string; slug: string; max_upload_bytes?: number };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
 }
@@ -258,6 +258,33 @@ export async function fetchSidebarData(): Promise<{
   const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
   const dms = mapSidebarDMs(sidebar.dm_conversations);
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
+}
+
+/**
+ * The workspace's effective attachment size limit, in bytes, or null when the
+ * server did not publish one (RF-32, issue #458).
+ *
+ * It rides on the sidebar payload the app already loads rather than on a
+ * dedicated request: the value is workspace-scoped policy, and the sidebar —
+ * which resolves the workspace from the caller's own session — is where the
+ * workspace itself comes from. The limit therefore always belongs to the
+ * workspace the session is in, and there is no path by which one workspace's
+ * policy can be read for another.
+ *
+ * A missing, non-integer, zero or negative value returns null rather than a
+ * compiled-in default. Substituting one would restate the administrative policy
+ * as a number this client invented, and a workspace whose limit is not 250 MiB
+ * would then be shown the wrong figure. Null means "unknown", the caller skips
+ * its pre-flight check, and file-service — which re-reads the policy on every
+ * upload — remains the only thing that decides.
+ */
+export async function fetchWorkspaceUploadLimit(): Promise<number | null> {
+  const sidebar = await fetchSidebar();
+  const raw = sidebar.workspace?.max_upload_bytes;
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw <= 0) {
+    return null;
+  }
+  return raw;
 }
 
 export async function searchDMCandidates(

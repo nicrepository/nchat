@@ -1291,6 +1291,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
           }
           onSend={handleSend}
+          // RF-32 (issue #458): the same composer serves channels and DMs, so
+          // one target prop covers both. It is the route's own kind and id —
+          // the very pair the composer is keyed by — so an attachment can never
+          // be posted to the destination the user just navigated away from.
+          uploadTarget={targetId ? { kind, id: targetId } : null}
+          // An upload adds a file to the destination, it does not create a
+          // message: the files section of the details panel is what renders it,
+          // so reconciling that is the whole of the success path.
+          onAttachmentUploaded={reloadOpenDetails}
         />
         {referenceSource && (
           <ReferenceDestinationDialog

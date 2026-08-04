@@ -10,7 +10,15 @@
  */
 
 import { EditorContent } from "@tiptap/react";
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
+import { useAttachmentUpload, type AttachmentUploadTarget } from "./useAttachmentUpload";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
@@ -53,6 +61,18 @@ export interface ChatComposerProps {
   referenceTargetLabel?: string;
   onCancelReference?: () => void;
   onSend: (body: string) => Promise<SendResult>;
+  /**
+   * Destination for attachments (RF-32, issue #458). One prop serves channels
+   * and DMs — the composer is already the single place both render — so the
+   * picker and the drop zone below need no per-kind branch.
+   *
+   * Absent means the composer has no attachment affordance at all, which is
+   * what keeps the existing composer tests and any non-conversation use
+   * unchanged.
+   */
+  uploadTarget?: AttachmentUploadTarget | null;
+  /** Called after a successful upload so the caller can refresh its file list. */
+  onAttachmentUploaded?: () => void;
 }
 
 export interface ComposerReplyPreview {
@@ -131,6 +151,8 @@ export default function ChatComposer({
   referenceTargetLabel = "Conversa",
   onCancelReference,
   onSend,
+  uploadTarget = null,
+  onAttachmentUploaded,
 }: ChatComposerProps) {
   const { editor, canSend, sending, handleSend } = useChatEditor({
     placeholder,
@@ -140,6 +162,49 @@ export default function ChatComposer({
     onSend,
   });
   const hadContextRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const upload = useAttachmentUpload(uploadTarget, onAttachmentUploaded);
+  const attachEnabled = uploadTarget !== null && !disabled;
+  const uploading = upload.status === "uploading";
+
+  // Both entry points funnel here, so there is exactly one place that decides
+  // whether a file may be taken and exactly one validation path behind it.
+  const acceptFile = (file: File | undefined) => {
+    if (!attachEnabled || !file) return;
+    upload.selectFile(file);
+  };
+
+  const handlePickerChange = (event: ChangeEvent<HTMLInputElement>) => {
+    acceptFile(event.target.files?.[0]);
+    // Clearing the value is what lets the same file be chosen again after a
+    // failure: without it the input reports no change and fires nothing.
+    event.target.value = "";
+  };
+
+  // Only a drag that actually carries files is intercepted. A text drag, or a
+  // drag from inside the editor, keeps its default browser behaviour.
+  const dragHasFiles = (event: DragEvent<HTMLDivElement>) =>
+    Array.from(event.dataTransfer?.types ?? []).includes("Files");
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!attachEnabled || !dragHasFiles(event)) return;
+    event.preventDefault();
+    setDragActive(true);
+  };
+
+  const handleDragLeave = () => setDragActive(false);
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!attachEnabled || !dragHasFiles(event)) return;
+    // Prevented only for a drop this composer handles, so the browser never
+    // navigates away to the dropped file.
+    event.preventDefault();
+    setDragActive(false);
+    // One file per request is the whole contract file-service accepts; a
+    // multi-file drop takes the first rather than silently starting several.
+    acceptFile(event.dataTransfer.files?.[0]);
+  };
 
   useEffect(() => {
     const hasContext = Boolean(replyPreview) || referencePreview.status !== "idle";
@@ -158,8 +223,12 @@ export default function ChatComposer({
   return (
     <div className="chat-msg-area__composer">
       <div
-        className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}`}
+        className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}${dragActive ? " chat-msg-area__composer-box--drag" : ""}`}
         onKeyDownCapture={handleKeyDownCapture}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        data-testid="chat-composer-box"
       >
         {replyPreview && (
           <div className="chat-msg-area__composer-quote" data-testid="chat-composer-quote">
@@ -201,8 +270,61 @@ export default function ChatComposer({
           )}
           <EditorContent editor={editor} />
         </div>
+        {uploadTarget && (upload.status !== "idle" || dragActive) && (
+          <div
+            className="chat-msg-area__composer-upload"
+            data-testid="chat-composer-upload-status"
+            role={upload.status === "failed" ? "alert" : "status"}
+          >
+            {dragActive && upload.status === "idle" && <span>Solte o arquivo para enviar.</span>}
+            {uploading && <span>Enviando arquivo…</span>}
+            {upload.status === "success" && <span>Arquivo enviado: {upload.uploadedName}</span>}
+            {upload.status === "failed" && <span>{upload.error}</span>}
+            {(upload.status === "failed" || upload.status === "success") && (
+              <button
+                type="button"
+                className="chat-msg-area__composer-quote-close"
+                aria-label="Dispensar aviso de anexo"
+                onClick={upload.dismiss}
+              >
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  close
+                </span>
+              </button>
+            )}
+          </div>
+        )}
         <div className="chat-msg-area__composer-bar">
           <ComposerToolbar editor={editor ?? null} disabled={disabled || sending} />
+          {uploadTarget && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                className="chat-msg-area__composer-file-input"
+                data-testid="chat-composer-file-input"
+                aria-label="Escolher arquivo para anexar"
+                hidden
+                onChange={handlePickerChange}
+              />
+              <button
+                type="button"
+                className="composer-toolbar__btn"
+                aria-label="Anexar arquivo"
+                disabled={!attachEnabled || uploading}
+                data-testid="chat-composer-attach-btn"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <span
+                  className="material-symbols-outlined"
+                  aria-hidden="true"
+                  style={{ fontSize: 18 }}
+                >
+                  attach_file
+                </span>
+              </button>
+            </>
+          )}
           <button
             type="button"
             className="chat-msg-area__send-btn"

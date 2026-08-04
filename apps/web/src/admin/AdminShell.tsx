@@ -94,7 +94,7 @@ function IconBell() {
 
 // ── Admin tab config ────────────────────────────────────────────────────────
 
-export type AdminTab = "overview" | "users" | "channels" | "anti-spam" | "audit";
+export type AdminTab = "overview" | "users" | "channels" | "anti-spam" | "upload-limit" | "audit";
 
 // href is set only for tabs backed by a real page; the rest render as disabled
 // placeholders. Hiding or disabling a tab is navigation, not authorization —
@@ -104,6 +104,7 @@ const ADMIN_TABS: { id: AdminTab; label: string; href?: string }[] = [
   { id: "users", label: "Usuários", href: "/admin/users" },
   { id: "channels", label: "Canais" },
   { id: "anti-spam", label: "Anti-spam", href: "/admin/anti-spam" },
+  { id: "upload-limit", label: "Limite de upload", href: "/admin/upload-limit" },
   { id: "audit", label: "Auditoria" },
 ];
 
