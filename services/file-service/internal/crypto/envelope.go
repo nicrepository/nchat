@@ -26,7 +26,9 @@
 //     associated data, so a chunk opened at a different position fails.
 //   - Substitution across objects: the attachment UUID is authenticated as
 //     associated data and the data key is per-object, so a chunk lifted from
-//     another attachment fails.
+//     another attachment fails. The wrapped data key is bound to the attachment,
+//     its workspace and the key-encryption key that sealed it, so moving a row
+//     between tenants or relabelling which key opened it fails too.
 //   - Truncation: the last chunk is the only one sealed with the final marker
 //     set. Dropping trailing chunks leaves a stream whose last chunk is not
 //     final, and the reader fails instead of returning a short plaintext.
@@ -35,26 +37,49 @@
 //
 // The format is versioned by the four-byte magic that opens the object and is
 // bound into every chunk's associated data.
+//
+// # Key rotation
+//
+// Key-encryption keys are held in a Keyring: exactly one active key, which every
+// new upload's data key is wrapped under, plus any number of previous keys kept
+// only so already-stored objects can still be read. The non-secret id of the key
+// that did the wrapping is returned by Wrap and persisted next to the wrapped
+// data key, and Unwrap selects by that id alone — an unknown id is refused and no
+// key is ever tried speculatively. Rotating therefore means re-wrapping a 32-byte
+// data key, never re-encrypting the object.
 package crypto
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 )
 
-// EnvelopeVersion is persisted with every attachment so a future format can be
-// introduced without re-encrypting existing objects.
+// EnvelopeVersion is the version of the NCF1 content stream, persisted with
+// every attachment so a future format can be introduced without re-encrypting
+// existing objects.
 const EnvelopeVersion = 1
+
+// KeyWrapVersion is the version of the wrapped-DEK format, persisted separately
+// from EnvelopeVersion because the two evolve independently: binding a new field
+// into the key's associated data changes nothing about the object's bytes.
+//
+// Version 1 was the NCD1 binding, which did not authenticate the plaintext
+// length. It is not supported: nothing was ever wrapped under it outside this
+// branch, and migration 000002 refuses to run against a non-empty table rather
+// than leaving rows only a removed parser could open.
+const KeyWrapVersion = 2
 
 const (
 	// ChunkSize is the plaintext size of every chunk but the last. It is part
@@ -71,19 +96,42 @@ const (
 	baseNonceSize = nonceSize - 4
 	headerSize    = len(magic) + baseNonceSize
 	blockSize     = ChunkSize + tagSize
+
+	// dekAADSize is the fixed width of the wrapped-key associated data, laid out
+	// in dekAAD. It is a constant precisely because no field is variable-length.
+	dekAADSize = 4 + 2 + 2 + 16 + 16 + sha256.Size + 8
 )
 
 var magic = [4]byte{'N', 'C', 'F', '1'}
 
-// dekAAD domain-separates key wrapping from content encryption, so a wrapped
-// data key can never be opened as, or replaced by, a content chunk.
-const dekAADPrefix = "nchat:file:dek:v1:"
+// dekMagic domain-separates key wrapping from content encryption, so a wrapped
+// data key can never be opened as, or replaced by, a content chunk. The trailing
+// digit tracks KeyWrapVersion, which is also authenticated as a field, so the
+// two can never disagree about which binding is in force.
+var dekMagic = [4]byte{'N', 'C', 'D', '2'}
+
+// maxKeyIDLength bounds the non-secret key id. It matches the CHECK on
+// files.attachments.kek_key_id, so a value the service accepts is a value the
+// column can hold, and it is comfortably longer than a dated label like
+// "kek-2026-08".
+const maxKeyIDLength = 64
+
+// keyIDPattern is the closed shape of a key id. It is persisted, logged and
+// compared, so it stays lowercase and free of separators used by the
+// configuration format.
+var keyIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 // Sentinel errors. None of them carries key material, plaintext or storage
 // detail; callers log the sentinel and nothing else.
 var (
-	// ErrInvalidKey rejects a master key of the wrong encoding or length.
+	// ErrInvalidKey rejects a master key of the wrong encoding or length, and a
+	// key id of the wrong shape.
 	ErrInvalidKey = errors.New("invalid encryption key")
+	// ErrUnknownKey rejects a wrapped data key whose key id is not configured.
+	// It is deliberately not ErrCiphertext: an operator who removed a key from
+	// the ring needs to see that in a log, and the two are never distinguishable
+	// to a client because the handler maps both to the same generic failure.
+	ErrUnknownKey = errors.New("unknown key encryption key")
 	// ErrCiphertext covers every integrity failure: a modified, truncated,
 	// reordered, duplicated or substituted object, a wrong key, and a
 	// malformed envelope. They are deliberately indistinguishable to a caller.
@@ -91,18 +139,210 @@ var (
 	// ErrStreamTooLong rejects a plaintext that would overflow the chunk
 	// counter before a nonce could repeat.
 	ErrStreamTooLong = errors.New("stream exceeds addressable chunks")
+	// ErrInvalidBinding rejects a binding this package cannot serialise: a
+	// negative plaintext length, or a version outside the wire encoding. It is a
+	// programming or data-integrity failure, never something a client causes.
+	ErrInvalidBinding = errors.New("invalid key binding")
+	// ErrUnsupportedVersion rejects a persisted format version this build does
+	// not implement. Versions are never tried in sequence and there is no
+	// fallback to an older binding.
+	ErrUnsupportedVersion = errors.New("unsupported envelope version")
 )
 
-// KeyEncryptionKey wraps and unwraps per-object data keys under the configured
-// master key. There is no default and no fallback: a nil KEK cannot encrypt.
-type KeyEncryptionKey struct {
+// Binding is the identity a wrapped data key is cryptographically tied to.
+// Every field is server-derived and stable for the lifetime of an attachment,
+// so all of them are available unchanged at upload and at download.
+//
+// Together with the key id — which enters the associated data as its SHA-256,
+// see dekAAD — these fields are the whole authenticated binding. Changing any
+// one of them in the database makes the wrapped data key fail to open, which is
+// the point:
+//
+//   - AttachmentID and WorkspaceID stop a row being lifted into another
+//     attachment or another tenant.
+//   - PlaintextSize stops the recorded length being edited. Without it, an
+//     attacker with write access to PostgreSQL could lower size_bytes, and the
+//     handler would publish that smaller Content-Length and serve a prefix that
+//     a client would accept as the whole file. Authenticating the length means
+//     the unwrap fails before any header is written.
+//   - KeyWrapVersion and ContentEnvelopeVersion stop a row being reinterpreted
+//     under a different format.
+type Binding struct {
+	AttachmentID uuid.UUID
+	WorkspaceID  uuid.UUID
+	// PlaintextSize is the number of plaintext bytes actually read from the
+	// upload stream — counted by the pipeline, never taken from Content-Length
+	// or from any other client-supplied value — and it is the plaintext length,
+	// not the size of the stored envelope.
+	PlaintextSize int64
+	// KeyWrapVersion is the version of this binding's own format, and
+	// ContentEnvelopeVersion the version of the NCF1 object it protects. They
+	// are separate fields because they version separate things.
+	KeyWrapVersion         int
+	ContentEnvelopeVersion int
+}
+
+// wireBinding is a Binding whose values have been checked and converted to the
+// exact widths dekAAD writes. Doing the conversion once, behind a validation
+// that rejects everything out of range, keeps the encoder free of casts that
+// could silently truncate.
+type wireBinding struct {
+	keyWrapVersion         uint16
+	contentEnvelopeVersion uint16
+	plaintextSize          uint64
+}
+
+// validate refuses any binding that cannot be encoded, and any version this
+// build does not implement. Wrap and Unwrap both go through it, so the two
+// directions cannot disagree about what is representable.
+func (b Binding) validate() (wireBinding, error) {
+	if b.PlaintextSize < 0 {
+		return wireBinding{}, fmt.Errorf("%w: plaintext size must not be negative", ErrInvalidBinding)
+	}
+	if b.KeyWrapVersion != KeyWrapVersion {
+		return wireBinding{}, fmt.Errorf(
+			"%w: key wrap version %d", ErrUnsupportedVersion, b.KeyWrapVersion,
+		)
+	}
+	if b.ContentEnvelopeVersion != EnvelopeVersion {
+		return wireBinding{}, fmt.Errorf(
+			"%w: content envelope version %d", ErrUnsupportedVersion, b.ContentEnvelopeVersion,
+		)
+	}
+	// Both versions are now known to equal a small constant, and the size is
+	// known to be non-negative, so neither conversion below can lose a value.
+	return wireBinding{
+		keyWrapVersion:         uint16(b.KeyWrapVersion),         //nolint:gosec // G115: checked equal to KeyWrapVersion above.
+		contentEnvelopeVersion: uint16(b.ContentEnvelopeVersion), //nolint:gosec // G115: checked equal to EnvelopeVersion above.
+		plaintextSize:          uint64(b.PlaintextSize),          //nolint:gosec // G115: checked non-negative above.
+	}, nil
+}
+
+// keyEncryptionKey wraps and unwraps per-object data keys under one master key.
+// It is never used directly outside this file: callers hold a Keyring, so a
+// wrapped key can only ever be opened through the id that identifies its key.
+type keyEncryptionKey struct {
 	aead cipher.AEAD
 }
 
-// NewKeyEncryptionKey decodes a standard-base64 master key and validates its
+// Keyring is the set of key-encryption keys this process may use: exactly one
+// active key, under which every new data key is wrapped, and zero or more
+// previous keys retained only for reading objects wrapped before a rotation.
+//
+// There is no default key and no fallback. A zero Keyring cannot encrypt, an
+// unknown key id is refused, and no key is ever tried speculatively.
+type Keyring struct {
+	activeID string
+	keys     map[string]*keyEncryptionKey
+}
+
+// NewKeyring builds the key ring from the active key and the previous keys kept
+// for reading.
+//
+// activeKey is standard base64 of exactly KeySize bytes. previous is the same
+// encoding, one "id:key" pair per comma-separated entry, and may be empty. Every
+// value is validated here and nothing is defaulted: a missing, mis-encoded,
+// wrong-length or duplicate entry is an error, never a weaker ring.
+//
+// The key material itself never reaches an error message.
+func NewKeyring(activeID, activeKey, previous string) (*Keyring, error) {
+	id, err := validateKeyID(activeID)
+	if err != nil {
+		return nil, err
+	}
+	active, err := newKeyEncryptionKey(activeKey)
+	if err != nil {
+		return nil, err
+	}
+	ring := &Keyring{activeID: id, keys: map[string]*keyEncryptionKey{id: active}}
+	if err := ring.addPrevious(previous); err != nil {
+		return nil, err
+	}
+	return ring, nil
+}
+
+// addPrevious parses the read-only half of the ring. An entry that repeats an id
+// already present — including the active one — is refused rather than silently
+// overriding it: which key opens an object must never depend on parse order.
+func (r *Keyring) addPrevious(previous string) error {
+	for _, entry := range strings.Split(previous, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		rawID, rawKey, found := strings.Cut(entry, ":")
+		if !found {
+			return fmt.Errorf("%w: previous keys must be id:key pairs", ErrInvalidKey)
+		}
+		id, err := validateKeyID(rawID)
+		if err != nil {
+			return err
+		}
+		if _, exists := r.keys[id]; exists {
+			return fmt.Errorf("%w: duplicate key id", ErrInvalidKey)
+		}
+		key, err := newKeyEncryptionKey(rawKey)
+		if err != nil {
+			return err
+		}
+		r.keys[id] = key
+	}
+	return nil
+}
+
+// ValidateKeyring reports whether the configured keys are usable. Configuration
+// validation uses it so a broken key is refused at start-up rather than at the
+// first upload; it builds the same ring New would, so the two cannot drift.
+func ValidateKeyring(activeID, activeKey, previous string) error {
+	_, err := NewKeyring(activeID, activeKey, previous)
+	return err
+}
+
+// ActiveKeyID is the non-secret id of the key new uploads are wrapped under.
+func (r *Keyring) ActiveKeyID() string {
+	if r == nil {
+		return ""
+	}
+	return r.activeID
+}
+
+// Wrap seals a data key under the active key and returns it with the id that
+// has to be persisted alongside it. The returned bytes are nonce || ciphertext
+// and are the only form persisted.
+func (r *Keyring) Wrap(dataKey []byte, binding Binding) (wrapped []byte, keyID string, err error) {
+	if r == nil || r.keys == nil {
+		return nil, "", fmt.Errorf("%w: key ring unavailable", ErrInvalidKey)
+	}
+	active, ok := r.keys[r.activeID]
+	if !ok {
+		return nil, "", fmt.Errorf("%w: key ring has no active key", ErrInvalidKey)
+	}
+	sealed, err := active.wrap(dataKey, r.activeID, binding)
+	if err != nil {
+		return nil, "", err
+	}
+	return sealed, r.activeID, nil
+}
+
+// Unwrap opens a wrapped data key using the key named by keyID and nothing else.
+// An id that is not on the ring yields ErrUnknownKey; every other failure —
+// wrong key, tampered bytes, another attachment, another workspace — yields
+// ErrCiphertext and is indistinguishable.
+func (r *Keyring) Unwrap(wrapped []byte, keyID string, binding Binding) ([]byte, error) {
+	if r == nil || r.keys == nil {
+		return nil, fmt.Errorf("%w: key ring unavailable", ErrInvalidKey)
+	}
+	key, ok := r.keys[keyID]
+	if !ok {
+		return nil, fmt.Errorf("%w: key id is not configured", ErrUnknownKey)
+	}
+	return key.unwrap(wrapped, keyID, binding)
+}
+
+// newKeyEncryptionKey decodes a standard-base64 master key and validates its
 // length. It never logs or echoes the key, and it fails closed: an absent,
 // mis-encoded or wrong-length key yields an error, never a weaker key.
-func NewKeyEncryptionKey(base64Key string) (*KeyEncryptionKey, error) {
+func newKeyEncryptionKey(base64Key string) (*keyEncryptionKey, error) {
 	key, err := decodeMasterKey(base64Key)
 	if err != nil {
 		return nil, err
@@ -111,15 +351,23 @@ func NewKeyEncryptionKey(base64Key string) (*KeyEncryptionKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &KeyEncryptionKey{aead: aead}, nil
+	return &keyEncryptionKey{aead: aead}, nil
 }
 
-// ValidateMasterKey reports whether a configured master key is usable, without
-// building or retaining a cipher. Configuration validation uses it so a broken
-// key is refused at start-up rather than at the first upload.
-func ValidateMasterKey(base64Key string) error {
-	_, err := decodeMasterKey(base64Key)
-	return err
+// validateKeyID accepts only the closed shape a persisted, logged and compared
+// identifier may have. The id is not secret, but it selects a key, so nothing
+// about it is inferred or normalised beyond trimming surrounding whitespace.
+func validateKeyID(keyID string) (string, error) {
+	trimmed := strings.TrimSpace(keyID)
+	if trimmed == "" {
+		return "", fmt.Errorf("%w: key id is required", ErrInvalidKey)
+	}
+	if len(trimmed) > maxKeyIDLength || !keyIDPattern.MatchString(trimmed) {
+		return "", fmt.Errorf(
+			"%w: key id must match %s", ErrInvalidKey, keyIDPattern.String(),
+		)
+	}
+	return trimmed, nil
 }
 
 func decodeMasterKey(base64Key string) ([]byte, error) {
@@ -147,33 +395,45 @@ func NewDataKey() ([]byte, error) {
 	return key, nil
 }
 
-// Wrap seals a data key for the given attachment. The returned value is
+// wrap seals a data key for one attachment under one key. The returned value is
 // nonce || ciphertext and is the only form persisted.
-func (k *KeyEncryptionKey) Wrap(dataKey []byte, attachmentID uuid.UUID) ([]byte, error) {
+func (k *keyEncryptionKey) wrap(dataKey []byte, keyID string, binding Binding) ([]byte, error) {
 	if k == nil || k.aead == nil {
 		return nil, fmt.Errorf("%w: key encryption key unavailable", ErrInvalidKey)
 	}
 	if len(dataKey) != KeySize {
 		return nil, fmt.Errorf("%w: data key must be %d bytes", ErrInvalidKey, KeySize)
 	}
+	wire, err := binding.validate()
+	if err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, nonceSize)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("generate wrap nonce: %w", err)
 	}
-	sealed := k.aead.Seal(nil, nonce, dataKey, dekAAD(attachmentID))
+	sealed := k.aead.Seal(nil, nonce, dataKey, dekAAD(keyID, binding, wire))
 	return append(nonce, sealed...), nil
 }
 
-// Unwrap opens a wrapped data key. A wrapped key bound to a different
-// attachment, or sealed under a different master key, fails with ErrCiphertext.
-func (k *KeyEncryptionKey) Unwrap(wrapped []byte, attachmentID uuid.UUID) ([]byte, error) {
+// unwrap opens a wrapped data key. A key bound to a different attachment, a
+// different workspace or a different key id, or sealed under different key
+// material, fails with ErrCiphertext.
+func (k *keyEncryptionKey) unwrap(wrapped []byte, keyID string, binding Binding) ([]byte, error) {
 	if k == nil || k.aead == nil {
 		return nil, fmt.Errorf("%w: key encryption key unavailable", ErrInvalidKey)
+	}
+	// The persisted versions decide which binding is reconstructed. An
+	// unsupported one stops here: no other version is attempted, and there is no
+	// fallback to the pre-size-binding format.
+	wire, err := binding.validate()
+	if err != nil {
+		return nil, err
 	}
 	if len(wrapped) < nonceSize+tagSize {
 		return nil, fmt.Errorf("%w: wrapped key is malformed", ErrCiphertext)
 	}
-	dataKey, err := k.aead.Open(nil, wrapped[:nonceSize], wrapped[nonceSize:], dekAAD(attachmentID))
+	dataKey, err := k.aead.Open(nil, wrapped[:nonceSize], wrapped[nonceSize:], dekAAD(keyID, binding, wire))
 	if err != nil {
 		return nil, fmt.Errorf("%w: wrapped key", ErrCiphertext)
 	}
@@ -183,8 +443,35 @@ func (k *KeyEncryptionKey) Unwrap(wrapped []byte, attachmentID uuid.UUID) ([]byt
 	return dataKey, nil
 }
 
-func dekAAD(attachmentID uuid.UUID) []byte {
-	return []byte(dekAADPrefix + attachmentID.String())
+// dekAAD binds a wrapped data key to both format versions, the attachment, its
+// workspace, the id of the key that sealed it and the exact plaintext length of
+// the object.
+//
+// The layout is fixed-width throughout, 80 bytes:
+//
+//	"NCD2"                          4  domain separation from a content chunk
+//	key wrap version                2  big endian
+//	content envelope version        2  big endian
+//	attachment id                  16  raw UUID
+//	workspace id                   16  raw UUID
+//	SHA-256(key id)                32
+//	plaintext size                  8  big endian, bytes
+//
+// Because nothing is variable-length, no two different bindings can produce the
+// same associated data and no length prefix is needed: a key id ending in a
+// UUID-shaped suffix cannot be made to look like another workspace, which a
+// textual join with separators would allow. The key id enters as a digest for
+// framing, not for secrecy — the id is public.
+func dekAAD(keyID string, binding Binding, wire wireBinding) []byte {
+	keyIDDigest := sha256.Sum256([]byte(keyID))
+	aad := make([]byte, 0, dekAADSize)
+	aad = append(aad, dekMagic[:]...)
+	aad = binary.BigEndian.AppendUint16(aad, wire.keyWrapVersion)
+	aad = binary.BigEndian.AppendUint16(aad, wire.contentEnvelopeVersion)
+	aad = append(aad, binding.AttachmentID[:]...)
+	aad = append(aad, binding.WorkspaceID[:]...)
+	aad = append(aad, keyIDDigest[:]...)
+	return binary.BigEndian.AppendUint64(aad, wire.plaintextSize)
 }
 
 // CiphertextSize returns the exact stored size for a plaintext of n bytes. It
@@ -288,7 +575,20 @@ func (r *encryptingReader) aad(final bool) []byte {
 // produced by NewEncryptingReader. Every integrity failure surfaces as
 // ErrCiphertext; a caller can never distinguish tampering from truncation from
 // a wrong key, and must never serve partial output as success.
-func NewDecryptingReader(src io.Reader, dataKey []byte, attachmentID uuid.UUID) (io.Reader, error) {
+//
+// plaintextSize is the length the caller believes the object has — in practice
+// the authenticated size from the wrapped data key's binding. It is an
+// invariant checked against the stream, never a limit that ends it: the reader
+// keeps consuming until the authenticated final frame, and only then does it
+// require the totals to agree. Returning io.EOF at plaintextSize instead would
+// turn a shortened length into a silently truncated file, which is exactly the
+// failure the binding exists to prevent.
+func NewDecryptingReader(
+	src io.Reader, dataKey []byte, attachmentID uuid.UUID, plaintextSize int64,
+) (io.Reader, error) {
+	if plaintextSize < 0 {
+		return nil, fmt.Errorf("%w: plaintext size must not be negative", ErrInvalidBinding)
+	}
 	aead, err := newAEAD(dataKey)
 	if err != nil {
 		return nil, err
@@ -297,6 +597,7 @@ func NewDecryptingReader(src io.Reader, dataKey []byte, attachmentID uuid.UUID) 
 		src:          src,
 		aead:         aead,
 		attachmentID: attachmentID,
+		expected:     plaintextSize,
 		block:        make([]byte, blockSize),
 		buf:          make([]byte, 0, ChunkSize),
 	}, nil
@@ -308,12 +609,16 @@ type decryptingReader struct {
 	attachmentID uuid.UUID
 	baseNonce    [baseNonceSize]byte
 	index        uint32
-	block        []byte
-	buf          []byte
-	offset       int
-	headerRead   bool
-	done         bool
-	err          error
+	// expected is the authenticated plaintext length; produced counts what the
+	// stream has actually yielded so far.
+	expected   int64
+	produced   int64
+	block      []byte
+	buf        []byte
+	offset     int
+	headerRead bool
+	done       bool
+	err        error
 }
 
 func (r *decryptingReader) Read(p []byte) (int, error) {
@@ -395,6 +700,16 @@ func (r *decryptingReader) open(block []byte, final bool) {
 		r.err = fmt.Errorf("%w: chunk %d", ErrCiphertext, r.index)
 		return
 	}
+	// The chunk is authentic, so the count it contributes is authentic too. Both
+	// comparisons are made before the bytes are handed out: an object longer
+	// than its recorded length fails as soon as it overruns, and one that is
+	// shorter fails when the authenticated end of the stream arrives early.
+	produced := r.produced + int64(len(plain))
+	if produced > r.expected || (final && produced != r.expected) {
+		r.err = fmt.Errorf("%w: plaintext length", ErrCiphertext)
+		return
+	}
+	r.produced = produced
 	r.buf = plain
 	r.index++
 }

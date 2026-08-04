@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/file-service/internal/config"
+	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
@@ -1007,5 +1009,81 @@ func TestDownloadFilenameCannotInjectHeaderParameters(t *testing.T) {
 				t.Fatalf("filename injected a parameter: %q", disposition)
 			}
 		})
+	}
+}
+
+// A row whose recorded size was edited fails at unwrap, inside the use case, so
+// the handler never gets a stream. The client must see a plain internal error:
+// no 200, no Content-Length, and above all no prefix of the file that could be
+// mistaken for the whole of it.
+func TestDownloadWithTamperedMetadataNeverProducesAPartialBody(t *testing.T) {
+	// The shapes the crypto layer reports for an edited size, an edited key id
+	// and an unknown wrapping version. All three must look identical from here.
+	for name, cause := range map[string]error{
+		"tampered size":       fmt.Errorf("unwrap attachment key: %w: wrapped key", crypto.ErrCiphertext),
+		"tampered key id":     fmt.Errorf("unwrap attachment key: %w: key id is not configured", crypto.ErrUnknownKey),
+		"unknown wrap format": fmt.Errorf("unwrap attachment key: %w: key wrap version 1", crypto.ErrUnsupportedVersion),
+	} {
+		t.Run(name, func(t *testing.T) {
+			useCases := readyUseCases()
+			useCases.downloadErr = cause
+			router := newTestRouter(t, useCases, enabledConfig())
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d", response.Code)
+			}
+			if got := errorCode(t, response); got != httputil.ErrCodeInternal {
+				t.Fatalf("expected the generic internal code, got %q", got)
+			}
+			// No length is published for a response that is not the file.
+			if value := response.Header().Get("Content-Length"); value != "" {
+				t.Fatalf("an error response must not declare a Content-Length, got %q", value)
+			}
+			if disposition := response.Header().Get("Content-Disposition"); disposition != "" {
+				t.Fatalf("an error response must not offer a download, got %q", disposition)
+			}
+			// The body is the error envelope, never file bytes.
+			body := response.Body.String()
+			if !strings.Contains(body, httputil.ErrCodeInternal) {
+				t.Fatalf("expected the error envelope, got %q", body)
+			}
+			// And it names none of the causes: size, key id and format version
+			// are indistinguishable to the caller.
+			for _, leak := range []string{
+				"size", "wrap", "key id", "kek", "dek", "nonce", "tag", "ciphertext", "version",
+			} {
+				if strings.Contains(strings.ToLower(body), leak) {
+					t.Fatalf("the response leaks the cryptographic cause %q: %s", leak, body)
+				}
+			}
+		})
+	}
+}
+
+// The success path still publishes exactly the authenticated length, so the
+// test above is not passing merely because downloads are broken.
+func TestDownloadPublishesTheAuthenticatedLengthOnSuccess(t *testing.T) {
+	payload := []byte("a verified attachment body")
+	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: "report.pdf", ContentType: "application/pdf", Size: int64(len(payload)),
+		Content: io.NopCloser(bytes.NewReader(payload)),
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, downloadRequest(t, uuid.NewString()))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
+		t.Fatalf("expected Content-Length %d, got %q", len(payload), got)
+	}
+	if response.Body.String() != string(payload) {
+		t.Fatalf("unexpected body %q", response.Body.String())
 	}
 }

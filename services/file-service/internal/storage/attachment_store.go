@@ -24,9 +24,20 @@ func NewPGXAttachmentStore(pool Pool) *PGXAttachmentStore {
 // and never taken from a request, and channel_id / conversation_id are filled
 // from the destination kind so the exclusivity CHECK can never be reached with
 // both set.
+//
+// dek_wrap_version is named in this INSERT even though no key exists yet. The
+// column is NOT NULL with no default, so naming it is what distinguishes this
+// build from the previous one at the database level: an INSERT emitted by a
+// file-service that predates migration 000002 omits the column and is rejected
+// by PostgreSQL rather than creating a row in a format nothing can open.
 func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment service.NewAttachment) error {
 	if s == nil || s.pool == nil {
 		return domain.ErrDependenciesUnavailable
+	}
+	// Refused before the statement so a mis-wired caller sees a domain error
+	// instead of a not-null violation surfacing as driver text.
+	if attachment.KeyWrapVersion <= 0 {
+		return fmt.Errorf("%w: attachment requires a key wrap version", domain.ErrInvalidInput)
 	}
 	var channelID, conversationID any
 	switch attachment.Destination.Kind {
@@ -44,14 +55,14 @@ func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment servi
 			channel_id, conversation_id,
 			original_filename, declared_mime,
 			storage_provider, storage_object_key,
-			envelope_version, wrapped_dek, status
+			envelope_version, dek_wrap_version, status
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		attachment.ID, attachment.WorkspaceID, attachment.UploaderID,
 		string(attachment.Destination.Kind), channelID, conversationID,
 		attachment.Filename, attachment.DeclaredMIME,
 		attachment.StorageProvider, attachment.StorageObjectKey,
-		attachment.EnvelopeVersion, attachment.WrappedDEK,
+		attachment.EnvelopeVersion, attachment.KeyWrapVersion,
 		string(domain.StatusPendingUpload),
 	)
 	if err != nil {
@@ -63,6 +74,12 @@ func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment servi
 // MarkUploaded moves a row out of pending_upload once the object is durable.
 // The WHERE clause pins the previous state, so a concurrent failure path that
 // already finalised or failed the row cannot be overwritten.
+//
+// The size and the key material are written by the same statement on purpose.
+// The wrapped key authenticates size_bytes, so the two are one fact: splitting
+// them across statements would leave a window where a row is downloadable with a
+// length its sealed key does not cover, which is precisely the state the binding
+// exists to make unrepresentable.
 func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.UploadedAttachment) error {
 	if s == nil || s.pool == nil {
 		return domain.ErrDependenciesUnavailable
@@ -70,18 +87,29 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 	if !update.Status.Valid() {
 		return fmt.Errorf("%w: invalid attachment status", domain.ErrInvalidInput)
 	}
+	// Refused here as well as in the CHECK: a finalising update without key
+	// material would otherwise reach the database only to violate a constraint,
+	// and the caller would learn about it as a driver error. The wrap version is
+	// not part of this: it was fixed when the row was created.
+	if len(update.WrappedDEK) == 0 || update.KEKKeyID == "" {
+		return fmt.Errorf("%w: attachment cannot be finalised without its key binding", domain.ErrInvalidInput)
+	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE files.attachments
 		   SET status = $2,
 		       detected_mime = $3,
 		       size_bytes = $4,
 		       ciphertext_size_bytes = $5,
+		       wrapped_dek = $6,
+		       kek_key_id = $7,
 		       uploaded_at = now(),
 		       updated_at = now()
 		 WHERE id = $1
-		   AND status = $6`,
+		   AND status = $8`,
 		update.ID, string(update.Status), update.DetectedMIME,
-		update.Size, update.CiphertextSize, string(domain.StatusPendingUpload),
+		update.Size, update.CiphertextSize,
+		update.WrappedDEK, update.KEKKeyID,
+		string(domain.StatusPendingUpload),
 	)
 	if err != nil {
 		return fmt.Errorf("mark attachment uploaded: %w", err)
@@ -143,6 +171,8 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		objectKey        pgtype.Text
 		envelopeVersion  pgtype.Int2
 		wrappedDEK       []byte
+		kekKeyID         pgtype.Text
+		keyWrapVersion   pgtype.Int2
 		createdAt        pgtype.Timestamptz
 	)
 	err := s.pool.QueryRow(ctx, authorizedAttachmentQuery,
@@ -150,7 +180,7 @@ func (s *PGXAttachmentStore) GetAuthorized(
 	).Scan(
 		&sessionExpiresAt, &id, &workspaceID, &destinationKind, &status,
 		&filename, &declaredMIME, &detectedMIME, &size, &objectKey,
-		&envelopeVersion, &wrappedDEK, &createdAt,
+		&envelopeVersion, &wrappedDEK, &kekKeyID, &keyWrapVersion, &createdAt,
 	)
 	if err != nil {
 		return service.StoredAttachment{}, fmt.Errorf("read authorized attachment: %w", err)
@@ -180,6 +210,13 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		StorageObjectKey: objectKey.String,
 		EnvelopeVersion:  int(envelopeVersion.Int16),
 		WrappedDEK:       wrappedDEK,
+		// A NULL key id means the row is still pending_upload: no key has been
+		// sealed for it yet. It stays empty rather than being defaulted to the
+		// active key, so a download fails closed instead of claiming a binding
+		// that was never produced. The wrap version is NOT NULL from creation,
+		// which is what fences out a writer running the previous build.
+		KEKKeyID:         kekKeyID.String,
+		KeyWrapVersion:   int(keyWrapVersion.Int16),
 		CreatedAt:        createdAt.Time.UTC(),
 		SessionExpiresAt: sessionExpiresAt.Time.UTC(),
 	}, nil
@@ -342,7 +379,7 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		SELECT a.id, a.workspace_id, a.destination_kind, a.status,
 		       a.original_filename, a.declared_mime, a.detected_mime,
 		       a.size_bytes, a.storage_object_key, a.envelope_version,
-		       a.wrapped_dek, a.created_at
+		       a.wrapped_dek, a.kek_key_id, a.dek_wrap_version, a.created_at
 		FROM files.attachments AS a
 		CROSS JOIN active_session AS active
 		WHERE a.id = $3
@@ -397,6 +434,8 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		authorized.storage_object_key,
 		authorized.envelope_version,
 		authorized.wrapped_dek,
+		authorized.kek_key_id,
+		authorized.dek_wrap_version,
 		authorized.created_at
 	FROM (SELECT 1) AS single_row
 	LEFT JOIN authorized ON true`

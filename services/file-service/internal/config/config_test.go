@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,12 +39,16 @@ func enableUploads(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://nchat@localhost:5432/nchat")
 	t.Setenv("AUTH_JWT_HMAC_SECRET", testJWTSecret(t))
 	t.Setenv("FILE_ENCRYPTION_MASTER_KEY", testMasterKey(t))
+	t.Setenv("FILE_ENCRYPTION_MASTER_KEY_ID", "kek-test-active")
 	t.Setenv("SEAWEEDFS_FILER_URL", "http://seaweedfs-filer:8888")
 }
 
 func TestLoadDefaults(t *testing.T) {
+	unsetAppEnv(t)
 	cfg := Load()
-	if cfg.ServiceName != "file-service" || cfg.Env != "development" || cfg.Port != 8083 {
+	// APP_ENV has no default on purpose: an absent value must stay absent so it
+	// cannot be mistaken for a declared development environment.
+	if cfg.ServiceName != "file-service" || cfg.Env != "" || cfg.Port != 8083 {
 		t.Fatalf("unexpected identity defaults: %+v", cfg)
 	}
 	if cfg.ReadHeaderTimeoutSeconds != 5 {
@@ -195,6 +200,13 @@ func TestValidateRequiresEveryUploadDependency(t *testing.T) {
 		{name: "missing master key", key: "FILE_ENCRYPTION_MASTER_KEY", value: "", message: "FILE_ENCRYPTION_MASTER_KEY"},
 		{name: "non base64 master key", key: "FILE_ENCRYPTION_MASTER_KEY", value: "%%%", message: "FILE_ENCRYPTION_MASTER_KEY"},
 		{name: "short master key", key: "FILE_ENCRYPTION_MASTER_KEY", value: base64.StdEncoding.EncodeToString(make([]byte, 16)), message: "FILE_ENCRYPTION_MASTER_KEY"},
+		{name: "31 byte master key", key: "FILE_ENCRYPTION_MASTER_KEY", value: base64.StdEncoding.EncodeToString(make([]byte, 31)), message: "FILE_ENCRYPTION_MASTER_KEY"},
+		{name: "33 byte master key", key: "FILE_ENCRYPTION_MASTER_KEY", value: base64.StdEncoding.EncodeToString(make([]byte, 33)), message: "FILE_ENCRYPTION_MASTER_KEY"},
+		{name: "missing key id", key: "FILE_ENCRYPTION_MASTER_KEY_ID", value: "", message: "FILE_ENCRYPTION_MASTER_KEY_ID"},
+		{name: "invalid key id", key: "FILE_ENCRYPTION_MASTER_KEY_ID", value: "Not A Key Id", message: "FILE_ENCRYPTION_MASTER_KEY_ID"},
+		{name: "malformed previous keys", key: "FILE_ENCRYPTION_PREVIOUS_KEYS", value: "no-separator-here", message: "FILE_ENCRYPTION_PREVIOUS_KEYS"},
+		{name: "previous key of the wrong length", key: "FILE_ENCRYPTION_PREVIOUS_KEYS", value: "kek-old:" + base64.StdEncoding.EncodeToString(make([]byte, 31)), message: "FILE_ENCRYPTION_PREVIOUS_KEYS"},
+		{name: "previous key shadowing the active id", key: "FILE_ENCRYPTION_PREVIOUS_KEYS", value: "kek-test-active:" + base64.StdEncoding.EncodeToString(make([]byte, 32)), message: "FILE_ENCRYPTION_PREVIOUS_KEYS"},
 		{name: "missing filer url", key: "SEAWEEDFS_FILER_URL", value: "", message: "SEAWEEDFS_FILER_URL"},
 		//nolint:gosec // G101: inert fixture asserting that a credentialed endpoint is refused.
 		{name: "filer url with credentials", key: "SEAWEEDFS_FILER_URL", value: "http://user:pass@filer:8888", message: "SEAWEEDFS_FILER_URL"},
@@ -217,6 +229,7 @@ func TestValidateNeverEchoesTheMasterKey(t *testing.T) {
 	secret := base64.StdEncoding.EncodeToString(make([]byte, 20))
 	enableUploads(t)
 	t.Setenv("FILE_ENCRYPTION_MASTER_KEY", secret)
+	t.Setenv("FILE_ENCRYPTION_PREVIOUS_KEYS", "kek-old:"+secret)
 
 	err := Load().Validate()
 	if err == nil {
@@ -224,6 +237,31 @@ func TestValidateNeverEchoesTheMasterKey(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatal("the configured key must never appear in an error message")
+	}
+}
+
+// A rotation in progress — one active key plus the previous one kept only for
+// reading — must start.
+func TestValidateAcceptsAKeyRingUnderRotation(t *testing.T) {
+	enableUploads(t)
+	t.Setenv("FILE_ENCRYPTION_PREVIOUS_KEYS", "kek-2026-01:"+testMasterKey(t))
+	cfg := Load()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.EncryptionMasterKeyID != "kek-test-active" {
+		t.Fatalf("unexpected active key id %q", cfg.EncryptionMasterKeyID)
+	}
+}
+
+// Uploads disabled means no key is required at all: the service stays
+// health-only exactly as before, instead of refusing to start.
+func TestValidateDoesNotRequireKeysWhileUploadsAreDisabled(t *testing.T) {
+	t.Setenv("FILE_UPLOADS_ENABLED", "false")
+	t.Setenv("FILE_ENCRYPTION_MASTER_KEY", "")
+	t.Setenv("FILE_ENCRYPTION_MASTER_KEY_ID", "")
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -246,24 +284,130 @@ func assertValidationError(t *testing.T, cfg Config, contains string) {
 	}
 }
 
+// unsetAppEnv removes APP_ENV for one test and restores whatever the machine
+// had afterwards. t.Setenv is called first purely to register that restoration,
+// so the suite never depends on the ambient environment.
+func unsetAppEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("APP_ENV", "placeholder-restored-by-cleanup")
+	if err := os.Unsetenv("APP_ENV"); err != nil {
+		t.Fatalf("unset APP_ENV: %v", err)
+	}
+}
+
 // SECURITY.md requires the scan gate to hold wherever it applies, so the escape
-// hatch must be refused outside a development environment. APP_ENV is what the
-// Kubernetes overlays set, so it is what the check reads.
-func TestValidateRefusesToDisableTheScanGateOutsideDevelopment(t *testing.T) {
-	deployed := []string{"staging", "production", "prod", "nchat-staging", "", "STAGING"}
-	for _, env := range deployed {
-		t.Run("refused in "+env, func(t *testing.T) {
+// hatch must be refused unless the deployment explicitly declares itself a
+// development environment.
+//
+// The rule is a positive match against an allowlist, not the absence of a
+// production marker: an APP_ENV that is missing, empty, whitespace, misspelled
+// or simply unknown must be refused exactly like APP_ENV=production.
+func TestValidateRefusesToDisableTheScanGateWithoutAnExplicitDevelopmentEnv(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		unset bool
+	}{
+		{name: "absent", unset: true},
+		{name: "empty", env: ""},
+		{name: "whitespace", env: "   "},
+		{name: "unknown", env: "unknown"},
+		{name: "production", env: "production"},
+		{name: "prod", env: "prod"},
+		{name: "staging", env: "staging"},
+		{name: "stage", env: "stage"},
+		{name: "STAGING", env: "STAGING"},
+		{name: "nchat-staging", env: "nchat-staging"},
+		{name: "homolog", env: "homolog"},
+		{name: "typo developmnt", env: "developmnt"},
+		{name: "near miss dev-environment", env: "dev-environment"},
+		{name: "prefix of a dev value", env: "development-like"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			enableUploads(t)
-			t.Setenv("APP_ENV", env)
+			if tt.unset {
+				unsetAppEnv(t)
+			} else {
+				t.Setenv("APP_ENV", tt.env)
+			}
 			t.Setenv("FILE_MALWARE_SCAN_REQUIRED", "false")
+
 			assertValidationError(t, Load(), "FILE_MALWARE_SCAN_REQUIRED")
+			// The message names the allowlist, so the failure is actionable
+			// without reading the source.
+			assertValidationError(t, Load(), "APP_ENV")
+			assertValidationError(t, Load(), "nchat-dev")
 		})
 	}
 }
 
+// The absent case is the regression this closes: before, an unset APP_ENV was
+// defaulted to "development" and silently granted the exception.
+func TestAbsentAppEnvIsNeverTreatedAsDevelopment(t *testing.T) {
+	unsetAppEnv(t)
+	if cfg := Load(); cfg.Env != "" {
+		t.Fatalf("an absent APP_ENV must stay empty, got %q", cfg.Env)
+	}
+	if isExplicitDevelopmentEnvironment("") {
+		t.Fatal("an empty APP_ENV must not count as a development environment")
+	}
+}
+
+// The allowlist is the single decision point, so it is asserted directly as
+// well as through Validate.
+func TestExplicitDevelopmentEnvironmentAllowlist(t *testing.T) {
+	for _, allowed := range []string{
+		"development", "dev", "local", "test", "nchat-dev",
+		"Development", "DEV", " local ", "NCHAT-DEV",
+	} {
+		if !isExplicitDevelopmentEnvironment(allowed) {
+			t.Fatalf("%q must be recognised as an explicit development environment", allowed)
+		}
+	}
+	for _, refused := range []string{
+		"", "   ", "\t", "unknown", "staging", "stage", "production", "prod",
+		"homolog", "developmnt", "dev-server", "localhost", "testing", "nchat-prod",
+	} {
+		if isExplicitDevelopmentEnvironment(refused) {
+			t.Fatalf("%q must not be recognised as a development environment", refused)
+		}
+	}
+}
+
+// The scan gate staying on is the safe combination, so an absent APP_ENV must
+// not block a service that never asked for the exception.
+func TestAbsentAppEnvIsFineWhileTheScanGateHolds(t *testing.T) {
+	enableUploads(t)
+	unsetAppEnv(t)
+	t.Setenv("FILE_MALWARE_SCAN_REQUIRED", "true")
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// With uploads disabled the service is health-only and validates nothing about
+// scanning or keys, whatever APP_ENV says.
+func TestHealthOnlyModeIsUnaffectedByAnAbsentAppEnv(t *testing.T) {
+	t.Setenv("FILE_UPLOADS_ENABLED", "false")
+	t.Setenv("FILE_MALWARE_SCAN_REQUIRED", "false")
+	unsetAppEnv(t)
+
+	cfg := Load()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("health-only mode must still start: %v", err)
+	}
+	if cfg.UploadsEnabled {
+		t.Fatal("uploads must stay disabled")
+	}
+}
+
 func TestValidateAllowsDisablingTheScanGateInDevelopment(t *testing.T) {
-	// The values the overlays and the local stack actually use.
-	for _, env := range []string{"development", "dev", "local", "test", "nchat-dev", "Development"} {
+	// The values the overlays and the local stack actually use, plus the
+	// case- and whitespace-insensitive forms of them.
+	for _, env := range []string{
+		"development", "dev", "local", "test", "nchat-dev", "Development", "DEV", " local ",
+	} {
 		t.Run("allowed in "+env, func(t *testing.T) {
 			enableUploads(t)
 			t.Setenv("APP_ENV", env)

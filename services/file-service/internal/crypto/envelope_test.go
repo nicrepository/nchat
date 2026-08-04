@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -23,13 +25,56 @@ func testMasterKey(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(key)
 }
 
-func newTestKEK(t *testing.T) *crypto.KeyEncryptionKey {
+// testKeyID is the active key id every ring in this file uses unless the case
+// is about rotation itself.
+const testKeyID = "kek-test-active"
+
+func newTestKeyring(t *testing.T) *crypto.Keyring {
 	t.Helper()
-	kek, err := crypto.NewKeyEncryptionKey(testMasterKey(t))
+	return newTestKeyringWith(t, testKeyID, testMasterKey(t), "")
+}
+
+func newTestKeyringWith(t *testing.T, activeID, activeKey, previous string) *crypto.Keyring {
+	t.Helper()
+	ring, err := crypto.NewKeyring(activeID, activeKey, previous)
 	if err != nil {
-		t.Fatalf("build kek: %v", err)
+		t.Fatalf("build keyring: %v", err)
 	}
-	return kek
+	return ring
+}
+
+// testBinding is a fresh, fully populated binding: a new attachment, a new
+// workspace, a plaintext length and the current pair of format versions.
+func testBinding() crypto.Binding {
+	return bindingOfSize(1024)
+}
+
+func bindingOfSize(size int64) crypto.Binding {
+	return crypto.Binding{
+		AttachmentID:           uuid.New(),
+		WorkspaceID:            uuid.New(),
+		PlaintextSize:          size,
+		KeyWrapVersion:         crypto.KeyWrapVersion,
+		ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	}
+}
+
+// withAttachment and withWorkspace copy a binding with one field changed, so a
+// test can express "the same key, claimed for something else" without restating
+// every field.
+func withAttachment(b crypto.Binding, id uuid.UUID) crypto.Binding {
+	b.AttachmentID = id
+	return b
+}
+
+func withWorkspace(b crypto.Binding, id uuid.UUID) crypto.Binding {
+	b.WorkspaceID = id
+	return b
+}
+
+func withSize(b crypto.Binding, size int64) crypto.Binding {
+	b.PlaintextSize = size
+	return b
 }
 
 func newTestDataKey(t *testing.T) []byte {
@@ -54,9 +99,11 @@ func encrypt(t *testing.T, plaintext []byte, dataKey []byte, id uuid.UUID) []byt
 	return ciphertext
 }
 
-func decrypt(t *testing.T, ciphertext []byte, dataKey []byte, id uuid.UUID) ([]byte, error) {
+// decrypt opens an envelope against the plaintext length the caller says it
+// should have — in production, the length authenticated by the wrapped data key.
+func decrypt(t *testing.T, ciphertext []byte, dataKey []byte, id uuid.UUID, size int64) ([]byte, error) {
 	t.Helper()
-	reader, err := crypto.NewDecryptingReader(bytes.NewReader(ciphertext), dataKey, id)
+	reader, err := crypto.NewDecryptingReader(bytes.NewReader(ciphertext), dataKey, id, size)
 	if err != nil {
 		return nil, err
 	}
@@ -72,9 +119,9 @@ func randomBytes(t *testing.T, n int) []byte {
 	return buf
 }
 
-// --- master key ---------------------------------------------------------
+// --- key ring -----------------------------------------------------------
 
-func TestNewKeyEncryptionKeyRejectsBadKeys(t *testing.T) {
+func TestNewKeyringRejectsBadActiveKeys(t *testing.T) {
 	tests := []struct {
 		name string
 		key  string
@@ -82,50 +129,98 @@ func TestNewKeyEncryptionKeyRejectsBadKeys(t *testing.T) {
 		{name: "empty", key: ""},
 		{name: "whitespace", key: "   "},
 		{name: "not base64", key: "not base64!!"},
-		{name: "short", key: base64.StdEncoding.EncodeToString(make([]byte, 16))},
-		{name: "long", key: base64.StdEncoding.EncodeToString(make([]byte, 64))},
+		{name: "31 bytes", key: base64.StdEncoding.EncodeToString(make([]byte, 31))},
+		{name: "33 bytes", key: base64.StdEncoding.EncodeToString(make([]byte, 33))},
+		{name: "16 bytes", key: base64.StdEncoding.EncodeToString(make([]byte, 16))},
+		{name: "64 bytes", key: base64.StdEncoding.EncodeToString(make([]byte, 64))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := crypto.NewKeyEncryptionKey(tt.key); !errors.Is(err, crypto.ErrInvalidKey) {
+			if _, err := crypto.NewKeyring(testKeyID, tt.key, ""); !errors.Is(err, crypto.ErrInvalidKey) {
 				t.Fatalf("expected ErrInvalidKey, got %v", err)
 			}
-			if err := crypto.ValidateMasterKey(tt.key); !errors.Is(err, crypto.ErrInvalidKey) {
-				t.Fatalf("expected ValidateMasterKey to reject, got %v", err)
+			if err := crypto.ValidateKeyring(testKeyID, tt.key, ""); !errors.Is(err, crypto.ErrInvalidKey) {
+				t.Fatalf("expected ValidateKeyring to reject, got %v", err)
 			}
 		})
 	}
 }
 
-func TestValidateMasterKeyAcceptsCorrectKey(t *testing.T) {
-	if err := crypto.ValidateMasterKey(testMasterKey(t)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestNewKeyringRejectsBadKeyIDs(t *testing.T) {
+	key := testMasterKey(t)
+	for _, keyID := range []string{
+		"", "   ", "Uppercase", "has space", "-leading-dash", "colon:inside",
+		"comma,inside", strings.Repeat("k", 65),
+	} {
+		t.Run(keyID, func(t *testing.T) {
+			if _, err := crypto.NewKeyring(keyID, key, ""); !errors.Is(err, crypto.ErrInvalidKey) {
+				t.Fatalf("expected ErrInvalidKey for key id %q, got %v", keyID, err)
+			}
+		})
 	}
 }
 
-func TestKeyEncryptionKeyMethodsFailClosedWhenNil(t *testing.T) {
-	var kek *crypto.KeyEncryptionKey
-	if _, err := kek.Wrap(make([]byte, crypto.KeySize), uuid.New()); !errors.Is(err, crypto.ErrInvalidKey) {
-		t.Fatalf("expected ErrInvalidKey from nil kek, got %v", err)
+func TestValidateKeyringAcceptsACorrectRing(t *testing.T) {
+	if err := crypto.ValidateKeyring(testKeyID, testMasterKey(t), ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, err := kek.Unwrap([]byte("x"), uuid.New()); !errors.Is(err, crypto.ErrInvalidKey) {
-		t.Fatalf("expected ErrInvalidKey from nil kek, got %v", err)
+	previous := "kek-2026-01:" + testMasterKey(t) + ", kek-2025-07:" + testMasterKey(t)
+	if err := crypto.ValidateKeyring(testKeyID, testMasterKey(t), previous); err != nil {
+		t.Fatalf("unexpected error for a rotating ring: %v", err)
+	}
+}
+
+func TestNewKeyringRejectsMalformedPreviousKeys(t *testing.T) {
+	key := testMasterKey(t)
+	tests := []struct {
+		name     string
+		previous string
+	}{
+		{name: "no separator", previous: key},
+		{name: "invalid id", previous: "BAD ID:" + key},
+		{name: "invalid key", previous: "kek-old:not base64!!"},
+		{name: "short key", previous: "kek-old:" + base64.StdEncoding.EncodeToString(make([]byte, 31))},
+		{name: "duplicate previous", previous: "kek-old:" + key + ",kek-old:" + testMasterKey(t)},
+		{name: "shadows the active key", previous: testKeyID + ":" + testMasterKey(t)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := crypto.NewKeyring(testKeyID, key, tt.previous); !errors.Is(err, crypto.ErrInvalidKey) {
+				t.Fatalf("expected ErrInvalidKey, got %v", err)
+			}
+		})
+	}
+}
+
+func TestKeyringMethodsFailClosedWhenNil(t *testing.T) {
+	var ring *crypto.Keyring
+	if id := ring.ActiveKeyID(); id != "" {
+		t.Fatalf("a nil ring must have no active key id, got %q", id)
+	}
+	if _, _, err := ring.Wrap(make([]byte, crypto.KeySize), testBinding()); !errors.Is(err, crypto.ErrInvalidKey) {
+		t.Fatalf("expected ErrInvalidKey from nil ring, got %v", err)
+	}
+	if _, err := ring.Unwrap([]byte("x"), testKeyID, testBinding()); !errors.Is(err, crypto.ErrInvalidKey) {
+		t.Fatalf("expected ErrInvalidKey from nil ring, got %v", err)
 	}
 }
 
 func TestWrapUnwrapRoundTrip(t *testing.T) {
-	kek := newTestKEK(t)
-	id := uuid.New()
+	ring := newTestKeyring(t)
+	binding := testBinding()
 	dataKey := newTestDataKey(t)
 
-	wrapped, err := kek.Wrap(dataKey, id)
+	wrapped, keyID, err := ring.Wrap(dataKey, binding)
 	if err != nil {
 		t.Fatalf("wrap: %v", err)
+	}
+	if keyID != testKeyID || keyID != ring.ActiveKeyID() {
+		t.Fatalf("wrap must report the active key id, got %q", keyID)
 	}
 	if bytes.Contains(wrapped, dataKey) {
 		t.Fatal("wrapped key must not contain the plaintext data key")
 	}
-	unwrapped, err := kek.Unwrap(wrapped, id)
+	unwrapped, err := ring.Unwrap(wrapped, keyID, binding)
 	if err != nil {
 		t.Fatalf("unwrap: %v", err)
 	}
@@ -135,50 +230,172 @@ func TestWrapUnwrapRoundTrip(t *testing.T) {
 }
 
 func TestWrapRejectsWrongSizedDataKey(t *testing.T) {
-	kek := newTestKEK(t)
-	if _, err := kek.Wrap(make([]byte, 16), uuid.New()); !errors.Is(err, crypto.ErrInvalidKey) {
+	ring := newTestKeyring(t)
+	if _, _, err := ring.Wrap(make([]byte, 16), testBinding()); !errors.Is(err, crypto.ErrInvalidKey) {
 		t.Fatalf("expected ErrInvalidKey, got %v", err)
 	}
 }
 
-func TestUnwrapIsBoundToTheAttachment(t *testing.T) {
-	kek := newTestKEK(t)
-	dataKey := newTestDataKey(t)
-	wrapped, err := kek.Wrap(dataKey, uuid.New())
+// The wrapped key is tied to the attachment, its workspace and the key id, so
+// none of the three can be swapped in the database and still open the object.
+func TestUnwrapIsBoundToTheAttachmentWorkspaceAndKeyID(t *testing.T) {
+	other := testMasterKey(t)
+	ring := newTestKeyringWith(t, testKeyID, testMasterKey(t), "kek-previous:"+other)
+	binding := testBinding()
+	wrapped, keyID, err := ring.Wrap(newTestDataKey(t), binding)
 	if err != nil {
 		t.Fatalf("wrap: %v", err)
 	}
-	if _, err := kek.Unwrap(wrapped, uuid.New()); !errors.Is(err, crypto.ErrCiphertext) {
-		t.Fatalf("expected ErrCiphertext for another attachment, got %v", err)
+
+	tests := []struct {
+		name    string
+		keyID   string
+		binding crypto.Binding
+	}{
+		{
+			name:    "another attachment",
+			keyID:   keyID,
+			binding: withAttachment(binding, uuid.New()),
+		},
+		{
+			name:    "another workspace",
+			keyID:   keyID,
+			binding: withWorkspace(binding, uuid.New()),
+		},
+		{
+			name:    "another configured key id",
+			keyID:   "kek-previous",
+			binding: binding,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ring.Unwrap(wrapped, tt.keyID, tt.binding); !errors.Is(err, crypto.ErrCiphertext) {
+				t.Fatalf("expected ErrCiphertext, got %v", err)
+			}
+		})
 	}
 }
 
 func TestUnwrapRejectsTamperedAndTruncatedKeys(t *testing.T) {
-	kek := newTestKEK(t)
-	id := uuid.New()
-	wrapped, err := kek.Wrap(newTestDataKey(t), id)
+	ring := newTestKeyring(t)
+	binding := testBinding()
+	wrapped, keyID, err := ring.Wrap(newTestDataKey(t), binding)
 	if err != nil {
 		t.Fatalf("wrap: %v", err)
 	}
 
 	tampered := append([]byte(nil), wrapped...)
 	tampered[len(tampered)-1] ^= 0xff
-	if _, err := kek.Unwrap(tampered, id); !errors.Is(err, crypto.ErrCiphertext) {
+	if _, err := ring.Unwrap(tampered, keyID, binding); !errors.Is(err, crypto.ErrCiphertext) {
 		t.Fatalf("expected ErrCiphertext for tampered key, got %v", err)
 	}
-	if _, err := kek.Unwrap(wrapped[:8], id); !errors.Is(err, crypto.ErrCiphertext) {
+	// The nonce is the first nonceSize bytes of the wrapped value.
+	nonceEdited := append([]byte(nil), wrapped...)
+	nonceEdited[0] ^= 0xff
+	if _, err := ring.Unwrap(nonceEdited, keyID, binding); !errors.Is(err, crypto.ErrCiphertext) {
+		t.Fatalf("expected ErrCiphertext for an edited wrap nonce, got %v", err)
+	}
+	if _, err := ring.Unwrap(wrapped[:8], keyID, binding); !errors.Is(err, crypto.ErrCiphertext) {
 		t.Fatalf("expected ErrCiphertext for truncated key, got %v", err)
 	}
 }
 
-func TestUnwrapRejectsAnotherMasterKey(t *testing.T) {
-	id := uuid.New()
-	wrapped, err := newTestKEK(t).Wrap(newTestDataKey(t), id)
+func TestUnwrapRejectsAnotherMasterKeyUnderTheSameID(t *testing.T) {
+	binding := testBinding()
+	wrapped, keyID, err := newTestKeyring(t).Wrap(newTestDataKey(t), binding)
 	if err != nil {
 		t.Fatalf("wrap: %v", err)
 	}
-	if _, err := newTestKEK(t).Unwrap(wrapped, id); !errors.Is(err, crypto.ErrCiphertext) {
+	// Same id, different key material: a deployment that regenerated the key
+	// without changing its label must not be able to open the old object.
+	if _, err := newTestKeyring(t).Unwrap(wrapped, keyID, binding); !errors.Is(err, crypto.ErrCiphertext) {
 		t.Fatalf("expected ErrCiphertext under a different master key, got %v", err)
+	}
+}
+
+// An id the ring does not have is refused outright. Nothing is tried, and the
+// error is distinguishable from a tampered ciphertext in the log — never to a
+// client, which sees the handler's generic failure either way.
+func TestUnwrapRejectsAnUnknownKeyID(t *testing.T) {
+	ring := newTestKeyring(t)
+	binding := testBinding()
+	wrapped, _, err := ring.Wrap(newTestDataKey(t), binding)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	for _, keyID := range []string{"", "kek-never-configured"} {
+		if _, err := ring.Unwrap(wrapped, keyID, binding); !errors.Is(err, crypto.ErrUnknownKey) {
+			t.Fatalf("expected ErrUnknownKey for %q, got %v", keyID, err)
+		}
+	}
+}
+
+// Rotation: a key moved from active to previous still opens what it wrapped,
+// and new wraps use the new active key. The object itself is never re-encrypted.
+func TestRotatedKeyStillOpensObjectsItWrapped(t *testing.T) {
+	firstKey, secondKey := testMasterKey(t), testMasterKey(t)
+	binding := testBinding()
+
+	before := newTestKeyringWith(t, "kek-first", firstKey, "")
+	dataKey := newTestDataKey(t)
+	wrapped, keyID, err := before.Wrap(dataKey, binding)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	if keyID != "kek-first" {
+		t.Fatalf("expected the first key id, got %q", keyID)
+	}
+
+	after := newTestKeyringWith(t, "kek-second", secondKey, "kek-first:"+firstKey)
+	if after.ActiveKeyID() != "kek-second" {
+		t.Fatalf("new uploads must use the new key, got %q", after.ActiveKeyID())
+	}
+	unwrapped, err := after.Unwrap(wrapped, keyID, binding)
+	if err != nil {
+		t.Fatalf("rotated ring must still open the old wrapped key: %v", err)
+	}
+	if !bytes.Equal(unwrapped, dataKey) {
+		t.Fatal("rotated ring returned a different data key")
+	}
+
+	// Rewrap without touching the object: the same data key under the new key.
+	rewrapped, newKeyID, err := after.Wrap(unwrapped, binding)
+	if err != nil {
+		t.Fatalf("rewrap: %v", err)
+	}
+	if newKeyID != "kek-second" {
+		t.Fatalf("rewrap must use the active key, got %q", newKeyID)
+	}
+	reopened, err := after.Unwrap(rewrapped, newKeyID, binding)
+	if err != nil {
+		t.Fatalf("unwrap after rewrap: %v", err)
+	}
+	if !bytes.Equal(reopened, dataKey) {
+		t.Fatal("rewrap changed the data key")
+	}
+
+	// A ring that no longer carries the old key refuses it instead of guessing.
+	retired := newTestKeyringWith(t, "kek-second", secondKey, "")
+	if _, err := retired.Unwrap(wrapped, keyID, binding); !errors.Is(err, crypto.ErrUnknownKey) {
+		t.Fatalf("expected ErrUnknownKey after retiring the key, got %v", err)
+	}
+}
+
+// Two attachments never share a wrapped data key, even under the same KEK.
+func TestWrapIsDistinctPerAttachment(t *testing.T) {
+	ring := newTestKeyring(t)
+	dataKey := newTestDataKey(t)
+	first, _, err := ring.Wrap(dataKey, testBinding())
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	second, _, err := ring.Wrap(dataKey, testBinding())
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("wrapping the same data key twice must not produce the same bytes")
 	}
 }
 
@@ -251,7 +468,7 @@ func TestContentRoundTripAcrossSizes(t *testing.T) {
 				t.Fatalf("envelope does not start with the version magic: %x", ciphertext[:min(4, len(ciphertext))])
 			}
 
-			got, err := decrypt(t, ciphertext, dataKey, id)
+			got, err := decrypt(t, ciphertext, dataKey, id, int64(size))
 			if err != nil {
 				t.Fatalf("decrypt: %v", err)
 			}
@@ -300,7 +517,8 @@ func TestChunksInsideOneObjectUseDistinctNonces(t *testing.T) {
 func TestDecryptRejectsTamperedCiphertext(t *testing.T) {
 	id := uuid.New()
 	dataKey := newTestDataKey(t)
-	ciphertext := encrypt(t, randomBytes(t, 2*crypto.ChunkSize+5), dataKey, id)
+	const plaintextSize = 2*crypto.ChunkSize + 5
+	ciphertext := encrypt(t, randomBytes(t, plaintextSize), dataKey, id)
 
 	positions := map[string]int{
 		"magic":       0,
@@ -312,7 +530,7 @@ func TestDecryptRejectsTamperedCiphertext(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tampered := append([]byte(nil), ciphertext...)
 			tampered[position] ^= 0xff
-			if _, err := decrypt(t, tampered, dataKey, id); !errors.Is(err, crypto.ErrCiphertext) {
+			if _, err := decrypt(t, tampered, dataKey, id, plaintextSize); !errors.Is(err, crypto.ErrCiphertext) {
 				t.Fatalf("expected ErrCiphertext, got %v", err)
 			}
 		})
@@ -322,7 +540,8 @@ func TestDecryptRejectsTamperedCiphertext(t *testing.T) {
 func TestDecryptRejectsTruncation(t *testing.T) {
 	id := uuid.New()
 	dataKey := newTestDataKey(t)
-	ciphertext := encrypt(t, randomBytes(t, 2*crypto.ChunkSize+5), dataKey, id)
+	const plaintextSize = 2*crypto.ChunkSize + 5
+	ciphertext := encrypt(t, randomBytes(t, plaintextSize), dataKey, id)
 
 	const headerSize = 12
 	blockSize := crypto.ChunkSize + 16
@@ -338,7 +557,7 @@ func TestDecryptRejectsTruncation(t *testing.T) {
 	}
 	for name, truncated := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decrypt(t, truncated, dataKey, id); !errors.Is(err, crypto.ErrCiphertext) {
+			if _, err := decrypt(t, truncated, dataKey, id, plaintextSize); !errors.Is(err, crypto.ErrCiphertext) {
 				t.Fatalf("expected ErrCiphertext, got %v", err)
 			}
 		})
@@ -349,7 +568,8 @@ func TestDecryptRejectsReorderedDuplicatedAndRemovedChunks(t *testing.T) {
 	id := uuid.New()
 	dataKey := newTestDataKey(t)
 	// Three full chunks plus a short final one gives room to shuffle.
-	ciphertext := encrypt(t, randomBytes(t, 3*crypto.ChunkSize+9), dataKey, id)
+	const plaintextSize = 3*crypto.ChunkSize + 9
+	ciphertext := encrypt(t, randomBytes(t, plaintextSize), dataKey, id)
 
 	const headerSize = 12
 	blockSize := crypto.ChunkSize + 16
@@ -368,7 +588,7 @@ func TestDecryptRejectsReorderedDuplicatedAndRemovedChunks(t *testing.T) {
 	}
 	for name, corrupted := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decrypt(t, corrupted, dataKey, id); !errors.Is(err, crypto.ErrCiphertext) {
+			if _, err := decrypt(t, corrupted, dataKey, id, plaintextSize); !errors.Is(err, crypto.ErrCiphertext) {
 				t.Fatalf("expected ErrCiphertext, got %v", err)
 			}
 		})
@@ -381,7 +601,7 @@ func TestDecryptRejectsSubstitutionFromAnotherAttachment(t *testing.T) {
 	ciphertext := encrypt(t, plaintext, dataKey, uuid.New())
 
 	// Same data key, different attachment id: the AAD binding must reject it.
-	if _, err := decrypt(t, ciphertext, dataKey, uuid.New()); !errors.Is(err, crypto.ErrCiphertext) {
+	if _, err := decrypt(t, ciphertext, dataKey, uuid.New(), int64(len(plaintext))); !errors.Is(err, crypto.ErrCiphertext) {
 		t.Fatalf("expected ErrCiphertext for a foreign attachment id, got %v", err)
 	}
 }
@@ -389,7 +609,7 @@ func TestDecryptRejectsSubstitutionFromAnotherAttachment(t *testing.T) {
 func TestDecryptRejectsWrongDataKey(t *testing.T) {
 	id := uuid.New()
 	ciphertext := encrypt(t, randomBytes(t, 4096), newTestDataKey(t), id)
-	if _, err := decrypt(t, ciphertext, newTestDataKey(t), id); !errors.Is(err, crypto.ErrCiphertext) {
+	if _, err := decrypt(t, ciphertext, newTestDataKey(t), id, 4096); !errors.Is(err, crypto.ErrCiphertext) {
 		t.Fatalf("expected ErrCiphertext, got %v", err)
 	}
 }
@@ -400,7 +620,7 @@ func TestDecryptRejectsUnsupportedEnvelopeMagic(t *testing.T) {
 	ciphertext := encrypt(t, randomBytes(t, 32), dataKey, id)
 	foreign := append([]byte("NCF9"), ciphertext[4:]...)
 
-	if _, err := decrypt(t, foreign, dataKey, id); !errors.Is(err, crypto.ErrCiphertext) {
+	if _, err := decrypt(t, foreign, dataKey, id, 32); !errors.Is(err, crypto.ErrCiphertext) {
 		t.Fatalf("expected ErrCiphertext, got %v", err)
 	}
 }
@@ -409,7 +629,7 @@ func TestReadersRejectInvalidDataKeys(t *testing.T) {
 	if _, err := crypto.NewEncryptingReader(bytes.NewReader(nil), make([]byte, 8), uuid.New()); !errors.Is(err, crypto.ErrInvalidKey) {
 		t.Fatalf("expected ErrInvalidKey, got %v", err)
 	}
-	if _, err := crypto.NewDecryptingReader(bytes.NewReader(nil), make([]byte, 8), uuid.New()); !errors.Is(err, crypto.ErrInvalidKey) {
+	if _, err := crypto.NewDecryptingReader(bytes.NewReader(nil), make([]byte, 8), uuid.New(), 0); !errors.Is(err, crypto.ErrInvalidKey) {
 		t.Fatalf("expected ErrInvalidKey, got %v", err)
 	}
 }
@@ -435,7 +655,7 @@ func TestDecryptingReaderPropagatesSourceErrors(t *testing.T) {
 	sourceErr := errors.New("storage exploded")
 	reader, err := crypto.NewDecryptingReader(
 		io.MultiReader(bytes.NewReader(ciphertext[:20]), &failingReader{err: sourceErr}),
-		dataKey, id,
+		dataKey, id, 2048,
 	)
 	if err != nil {
 		t.Fatalf("build reader: %v", err)
@@ -447,7 +667,7 @@ func TestDecryptingReaderPropagatesSourceErrors(t *testing.T) {
 
 func TestDecryptingReaderPropagatesHeaderReadErrors(t *testing.T) {
 	sourceErr := errors.New("storage exploded")
-	reader, err := crypto.NewDecryptingReader(&failingReader{err: sourceErr}, newTestDataKey(t), uuid.New())
+	reader, err := crypto.NewDecryptingReader(&failingReader{err: sourceErr}, newTestDataKey(t), uuid.New(), 0)
 	if err != nil {
 		t.Fatalf("build reader: %v", err)
 	}
@@ -462,7 +682,7 @@ func TestReadersReturnTheSameErrorOnRepeatedReads(t *testing.T) {
 	ciphertext := encrypt(t, randomBytes(t, 64), dataKey, id)
 	ciphertext[len(ciphertext)-1] ^= 0xff
 
-	reader, err := crypto.NewDecryptingReader(bytes.NewReader(ciphertext), dataKey, id)
+	reader, err := crypto.NewDecryptingReader(bytes.NewReader(ciphertext), dataKey, id, 64)
 	if err != nil {
 		t.Fatalf("build reader: %v", err)
 	}
@@ -489,7 +709,9 @@ func TestReadersTolerateTinyBuffers(t *testing.T) {
 		t.Fatalf("encrypt with a tiny buffer: %v", err)
 	}
 
-	decrypting, err := crypto.NewDecryptingReader(bytes.NewReader(ciphertext.Bytes()), dataKey, id)
+	decrypting, err := crypto.NewDecryptingReader(
+		bytes.NewReader(ciphertext.Bytes()), dataKey, id, int64(len(plaintext)),
+	)
 	if err != nil {
 		t.Fatalf("build reader: %v", err)
 	}
@@ -553,5 +775,200 @@ func sizeName(size int) string {
 		return "one byte over a chunk"
 	default:
 		return "several chunks"
+	}
+}
+
+// --- plaintext size binding ---------------------------------------------
+
+// The recorded plaintext length is authenticated, so an attacker with write
+// access to PostgreSQL cannot lower size_bytes and have the service serve a
+// prefix under a smaller Content-Length. Every one-byte deviation fails.
+func TestUnwrapIsBoundToThePlaintextSize(t *testing.T) {
+	ring := newTestKeyring(t)
+	const realSize = 5_000_000
+	binding := bindingOfSize(realSize)
+	wrapped, keyID, err := ring.Wrap(newTestDataKey(t), binding)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+
+	for name, size := range map[string]int64{
+		"zero":          0,
+		"one byte less": realSize - 1,
+		"one byte more": realSize + 1,
+		"halved":        realSize / 2,
+		"much larger":   realSize * 4,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ring.Unwrap(wrapped, keyID, withSize(binding, size)); !errors.Is(err, crypto.ErrCiphertext) {
+				t.Fatalf("expected ErrCiphertext for size %d, got %v", size, err)
+			}
+		})
+	}
+	if _, err := ring.Unwrap(wrapped, keyID, binding); err != nil {
+		t.Fatalf("the recorded size must still open the key: %v", err)
+	}
+}
+
+// The size occupies eight authenticated bytes, so a flip anywhere in the
+// big-endian encoding — including the high bytes a small file never uses — has
+// to fail. Testing every bit position proves the whole field is covered rather
+// than just its low byte.
+func TestUnwrapRejectsEverySingleBitFlipInTheSize(t *testing.T) {
+	ring := newTestKeyring(t)
+	const realSize int64 = 1 << 20
+	binding := bindingOfSize(realSize)
+	wrapped, keyID, err := ring.Wrap(newTestDataKey(t), binding)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	// Bit 63 would make the value negative, which is refused before the AEAD.
+	for bit := 0; bit < 63; bit++ {
+		flipped := realSize ^ (int64(1) << bit)
+		if flipped == realSize {
+			continue
+		}
+		if _, err := ring.Unwrap(wrapped, keyID, withSize(binding, flipped)); !errors.Is(err, crypto.ErrCiphertext) {
+			t.Fatalf("bit %d flipped to size %d was accepted: %v", bit, flipped, err)
+		}
+	}
+}
+
+// The size is serialised big-endian, in the last eight bytes of the associated
+// data. The check is behavioural rather than a byte comparison against a
+// literal: two sizes that are byte swaps of each other must not be
+// interchangeable, which is exactly what a little-endian encoder would break.
+func TestPlaintextSizeIsBigEndianInTheBinding(t *testing.T) {
+	ring := newTestKeyring(t)
+	// 0x0102 and 0x0201 share their bytes and differ only in order.
+	binding := bindingOfSize(0x0102)
+	wrapped, keyID, err := ring.Wrap(newTestDataKey(t), binding)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	if _, err := ring.Unwrap(wrapped, keyID, withSize(binding, 0x0201)); !errors.Is(err, crypto.ErrCiphertext) {
+		t.Fatalf("a byte-swapped size must not open the key, got %v", err)
+	}
+}
+
+func TestBindingRejectsANegativeSize(t *testing.T) {
+	ring := newTestKeyring(t)
+	binding := bindingOfSize(-1)
+	if _, _, err := ring.Wrap(newTestDataKey(t), binding); !errors.Is(err, crypto.ErrInvalidBinding) {
+		t.Fatalf("expected ErrInvalidBinding on wrap, got %v", err)
+	}
+	if _, err := ring.Unwrap(make([]byte, 64), testKeyID, binding); !errors.Is(err, crypto.ErrInvalidBinding) {
+		t.Fatalf("expected ErrInvalidBinding on unwrap, got %v", err)
+	}
+	// The largest representable length is fine: only negatives are refused, so
+	// there is no size a real counter could produce that cannot be bound.
+	if _, _, err := ring.Wrap(newTestDataKey(t), bindingOfSize(math.MaxInt64)); err != nil {
+		t.Fatalf("the maximum int64 size must be representable: %v", err)
+	}
+}
+
+// Both versions are authenticated and neither is guessed. An unknown one is
+// refused outright — there is no attempt to open the key under the previous
+// binding, because that would be a downgrade path.
+func TestBindingRejectsUnknownVersions(t *testing.T) {
+	ring := newTestKeyring(t)
+	binding := testBinding()
+	wrapped, keyID, err := ring.Wrap(newTestDataKey(t), binding)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+
+	tests := map[string]crypto.Binding{
+		"older key wrap version":  {KeyWrapVersion: crypto.KeyWrapVersion - 1, ContentEnvelopeVersion: crypto.EnvelopeVersion},
+		"newer key wrap version":  {KeyWrapVersion: crypto.KeyWrapVersion + 1, ContentEnvelopeVersion: crypto.EnvelopeVersion},
+		"absent key wrap version": {KeyWrapVersion: 0, ContentEnvelopeVersion: crypto.EnvelopeVersion},
+		"newer content version":   {KeyWrapVersion: crypto.KeyWrapVersion, ContentEnvelopeVersion: crypto.EnvelopeVersion + 1},
+		"absent content version":  {KeyWrapVersion: crypto.KeyWrapVersion, ContentEnvelopeVersion: 0},
+		"both versions unknown":   {KeyWrapVersion: 99, ContentEnvelopeVersion: 99},
+		"versions swapped over":   {KeyWrapVersion: crypto.EnvelopeVersion, ContentEnvelopeVersion: crypto.KeyWrapVersion},
+	}
+	for name, versions := range tests {
+		t.Run(name, func(t *testing.T) {
+			tampered := binding
+			tampered.KeyWrapVersion = versions.KeyWrapVersion
+			tampered.ContentEnvelopeVersion = versions.ContentEnvelopeVersion
+
+			if _, err := ring.Unwrap(wrapped, keyID, tampered); !errors.Is(err, crypto.ErrUnsupportedVersion) {
+				t.Fatalf("expected ErrUnsupportedVersion, got %v", err)
+			}
+			if _, _, err := ring.Wrap(newTestDataKey(t), tampered); !errors.Is(err, crypto.ErrUnsupportedVersion) {
+				t.Fatalf("expected ErrUnsupportedVersion on wrap, got %v", err)
+			}
+		})
+	}
+}
+
+// --- plaintext size as a stream invariant --------------------------------
+
+// The reader must not treat the expected size as a stopping point. If it did, a
+// lowered size_bytes would produce a complete-looking prefix instead of an
+// error, which is the whole attack.
+func TestDecryptingReaderDoesNotStopAtTheExpectedSize(t *testing.T) {
+	id := uuid.New()
+	dataKey := newTestDataKey(t)
+	plaintext := randomBytes(t, 3*crypto.ChunkSize+77)
+	ciphertext := encrypt(t, plaintext, dataKey, id)
+
+	// A size one byte short: the stream really contains more, and the reader has
+	// to say so rather than returning that one-byte-shorter prefix as a file.
+	got, err := decrypt(t, ciphertext, dataKey, id, int64(len(plaintext))-1)
+	if !errors.Is(err, crypto.ErrCiphertext) {
+		t.Fatalf("expected ErrCiphertext for an undersized expectation, got %v", err)
+	}
+	if int64(len(got)) >= int64(len(plaintext))-1 {
+		t.Fatalf("the reader returned %d bytes before failing; it must not complete a prefix", len(got))
+	}
+}
+
+func TestDecryptingReaderRejectsAnyMismatchedSize(t *testing.T) {
+	id := uuid.New()
+	dataKey := newTestDataKey(t)
+	plaintext := randomBytes(t, crypto.ChunkSize+11)
+	ciphertext := encrypt(t, plaintext, dataKey, id)
+	real := int64(len(plaintext))
+
+	for name, expected := range map[string]int64{
+		"zero":            0,
+		"one short":       real - 1,
+		"one long":        real + 1,
+		"chunk short":     real - crypto.ChunkSize,
+		"wildly too long": real * 10,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decrypt(t, ciphertext, dataKey, id, expected); !errors.Is(err, crypto.ErrCiphertext) {
+				t.Fatalf("expected ErrCiphertext, got %v", err)
+			}
+		})
+	}
+	if _, err := decrypt(t, ciphertext, dataKey, id, real); err != nil {
+		t.Fatalf("the real size must still decrypt: %v", err)
+	}
+}
+
+// An empty object is the one case where the expectation and the first frame
+// coincide, so it gets its own check in both directions.
+func TestDecryptingReaderChecksTheSizeOfAnEmptyObject(t *testing.T) {
+	id := uuid.New()
+	dataKey := newTestDataKey(t)
+	ciphertext := encrypt(t, nil, dataKey, id)
+
+	if got, err := decrypt(t, ciphertext, dataKey, id, 0); err != nil || len(got) != 0 {
+		t.Fatalf("an empty object must round trip: %d bytes, %v", len(got), err)
+	}
+	if _, err := decrypt(t, ciphertext, dataKey, id, 1); !errors.Is(err, crypto.ErrCiphertext) {
+		t.Fatalf("expected ErrCiphertext for a non-zero expectation, got %v", err)
+	}
+}
+
+func TestDecryptingReaderRejectsANegativeSize(t *testing.T) {
+	if _, err := crypto.NewDecryptingReader(
+		bytes.NewReader(nil), newTestDataKey(t), uuid.New(), -1,
+	); !errors.Is(err, crypto.ErrInvalidBinding) {
+		t.Fatalf("expected ErrInvalidBinding, got %v", err)
 	}
 }
