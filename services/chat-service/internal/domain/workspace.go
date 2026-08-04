@@ -4,6 +4,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 )
 
 type WorkspaceStatus string
@@ -89,9 +91,37 @@ type Workspace struct {
 	// messages one user may send in this workspace per minute. Never zero on a
 	// value read from the database — the column is NOT NULL with a CHECK.
 	MessageRateLimitPerMinute int
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	// MaxUploadBytes is the RF-32 attachment size policy: the largest single
+	// file that may be attached in this workspace, in bytes. chat-service owns
+	// the value; file-service is what enforces it. Never zero on a value read
+	// from the database — the column is NOT NULL with a CHECK.
+	MaxUploadBytes int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
+
+// RF-32 attachment size bounds (issue #458).
+//
+// They are re-exported from libs/go/platform/uploadpolicy rather than restated:
+// the value is decided here and enforced in file-service, so a second copy of
+// the numbers is exactly the drift the requirement forbids. The database CHECK
+// in migration 000020 mirrors the same two bounds.
+const (
+	DefaultMaxUploadBytes = uploadpolicy.DefaultMaxUploadBytes
+	MinMaxUploadBytes     = uploadpolicy.MinMaxUploadBytes
+	MaxMaxUploadBytes     = uploadpolicy.MaxMaxUploadBytes
+)
+
+// ValidMaxUploadBytes reports whether value is an acceptable RF-32 policy. Used
+// by the admin endpoint before touching the database, which enforces the same
+// bounds as a backstop.
+func ValidMaxUploadBytes(value int64) bool { return uploadpolicy.Valid(value) }
+
+// EffectiveMaxUploadBytes normalises a persisted policy into a value safe to
+// publish and enforce with. A zero or out-of-range value can only come from a
+// row written before migration 000020 or from a struct that was never
+// populated; in both cases the answer is the default, never "no limit".
+func EffectiveMaxUploadBytes(value int64) int64 { return uploadpolicy.Effective(value) }
 
 // RF-19 anti-spam bounds. These are the single source of truth: the database
 // CHECK in migration 000018, the admin endpoint validation and the frontend
