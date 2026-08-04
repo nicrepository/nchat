@@ -34,7 +34,8 @@ type App struct {
 }
 
 type appDependencies struct {
-	openDB          func(context.Context, string, int) (storage.Pool, error)
+	openDB          func(context.Context, string, int, int) (storage.Pool, error)
+	openAdmission   func(storage.Pool, storage.UploadAdmissionLimits, *slog.Logger) (httpapi.UploadAdmission, error)
 	tracingShutdown observability.ShutdownFunc
 }
 
@@ -43,7 +44,7 @@ type appDependencies struct {
 // unreachable database or an invalid storage endpoint is a start-up error, not
 // a runtime surprise on the first upload.
 func New(cfg config.Config) (*App, error) {
-	return newApp(cfg, appDependencies{openDB: storage.OpenDB})
+	return newApp(cfg, appDependencies{openDB: storage.OpenDBWithMaxConns, openAdmission: newUploadAdmission})
 }
 
 func newApp(cfg config.Config, deps appDependencies) (*App, error) {
@@ -91,12 +92,27 @@ func (a *App) wireAttachments(
 	if err != nil {
 		return err
 	}
-	if deps.openDB == nil {
+	if deps.openDB == nil || deps.openAdmission == nil {
 		return errDependenciesUnavailable
 	}
-	pool, err := deps.openDB(context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
+	pool, err := deps.openDB(
+		context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, cfg.DBMaxConnections,
+	)
 	if err != nil {
 		// The DSN and the driver message never reach the caller or the log.
+		return errDependenciesUnavailable
+	}
+	// Cluster-wide upload admission. It needs connections it can reserve for the
+	// duration of a transfer, which the per-statement Pool interface cannot
+	// express, so it is wired from the concrete pool. A pool that cannot supply
+	// them leaves admission unwired, and the routes then answer 503 rather than
+	// accepting uncounted uploads.
+	admission, err := deps.openAdmission(pool, storage.UploadAdmissionLimits{
+		Global:  cfg.UploadMaxConcurrent,
+		PerUser: cfg.UploadMaxConcurrentPerUser,
+	}, logger)
+	if err != nil {
+		pool.Close()
 		return errDependenciesUnavailable
 	}
 
@@ -116,6 +132,7 @@ func (a *App) wireAttachments(
 		attachmentMetrics,
 		logger,
 	)
+	routerDeps.Admission = admission
 	routerDeps.RateLimiter = limiter
 	routerDeps.ReadinessPinger = pool
 	routerDeps.StoragePinger = objects
@@ -148,4 +165,21 @@ func shutdownTracing(shutdown observability.ShutdownFunc) error {
 		return nil
 	}
 	return shutdown(context.Background())
+}
+
+// newUploadAdmission builds the PostgreSQL-backed admission control.
+//
+// It needs the concrete pool: a slot is a session advisory lock held on a
+// connection reserved for the whole upload, and the per-statement storage.Pool
+// interface has no way to lend one out. A pool that is not the pgx
+// implementation therefore cannot support admission, and saying so here keeps
+// the failure at start-up rather than on the first upload.
+func newUploadAdmission(
+	pool storage.Pool, limits storage.UploadAdmissionLimits, logger *slog.Logger,
+) (httpapi.UploadAdmission, error) {
+	lockPool, ok := storage.LockConnPoolFrom(pool)
+	if !ok {
+		return nil, errDependenciesUnavailable
+	}
+	return storage.NewPGXUploadAdmission(lockPool, limits, logger), nil
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 )
@@ -20,13 +21,35 @@ const (
 	defaultJWTIssuer   = "nchat-auth"
 	defaultJWTAudience = "nchat-api"
 
-	// Upload and download stream up to MaxUploadBytes, so the body timeouts are
-	// generous. Slow-request protection comes from ReadHeaderTimeoutSeconds and
-	// from the byte cap applied to the body, not from these.
+	// Upload and download stream up to the effective size limit, so the body
+	// timeouts are generous. Slow-request protection comes from
+	// ReadHeaderTimeoutSeconds and from the byte cap applied to the body, not
+	// from these.
 	defaultReadTimeoutSeconds  = 300
 	defaultWriteTimeoutSeconds = 300
 
 	defaultSeaweedFSTimeoutSeconds = 120
+
+	// Upload admission defaults. Conservative on purpose: each global slot is a
+	// reserved database connection and, at the 512 MiB ceiling, up to that much
+	// plaintext being streamed, encrypted and forwarded at once. Four slots put
+	// the theoretical worst case at 2 GiB of simultaneous transfers for the
+	// whole cluster.
+	defaultUploadMaxConcurrent        = 4
+	defaultUploadMaxConcurrentPerUser = 2
+	defaultUploadRetryAfterSeconds    = 30
+
+	// maxUploadMaxConcurrent is an operational ceiling, not a policy. Beyond it
+	// the reserved connections alone would outgrow any sensible pool.
+	maxUploadMaxConcurrent = 64
+
+	// dbConnectionHeadroom is how many connections must remain for ordinary
+	// queries while every upload slot is occupied — authorization, metadata
+	// writes, readiness probes. Without it a fully booked service would
+	// deadlock against its own pool.
+	dbConnectionHeadroom = 4
+
+	defaultDBMaxConnections = defaultUploadMaxConcurrent + dbConnectionHeadroom + 2
 )
 
 type Config struct {
@@ -43,12 +66,40 @@ type Config struct {
 
 	DatabaseURL             string
 	DBConnectTimeoutSeconds int
+	// DBMaxConnections bounds the pool. It matters here because admission
+	// control reserves one connection per in-flight upload, so the pool has to
+	// be big enough that a fully booked service can still run ordinary queries.
+	DBMaxConnections int
+
+	// UploadMaxConcurrent is how many uploads may be in flight across the whole
+	// cluster, and UploadMaxConcurrentPerUser how many of those one
+	// authenticated user may hold.
+	//
+	// These bound work already admitted, which the per-minute rate limiter
+	// cannot: that one counts request starts, in one process, so N replicas
+	// grant N budgets and a client holding several slow transfers open is never
+	// counted at all.
+	UploadMaxConcurrent        int
+	UploadMaxConcurrentPerUser int
+	// UploadRetryAfterSeconds is what a refused client is told to wait.
+	UploadRetryAfterSeconds int
 
 	AuthJWTHMACSecret string
 	AuthJWTIssuer     string
 	AuthJWTAudience   string
 
-	// MaxUploadBytes is the RF-32 configurable cap, defaulting to 50 MiB.
+	// MaxUploadBytes is the deployment ceiling for one attachment, in bytes.
+	//
+	// It is NOT the RF-32 product limit. Since issue #458 the limit an upload is
+	// judged against is administrative — chat.workspaces.max_upload_bytes, set
+	// through the admin endpoint and read per request — and this value only
+	// narrows it further for a cluster that cannot absorb the configured policy.
+	// It defaults to the domain ceiling, so out of the box it never binds and
+	// the administrative value is what applies.
+	//
+	// Neither control silently rewrites the other: the narrowing happens per
+	// request in uploadpolicy.EffectiveUnder and is documented, rather than
+	// being clamped into the database.
 	MaxUploadBytes int64
 
 	// EncryptionMasterKey is the standard-base64 32-byte KEK used to wrap each
@@ -73,7 +124,7 @@ type Config struct {
 func Load() Config {
 	uploadsEnabled, uploadsEnabledInvalid := configuredBool("FILE_UPLOADS_ENABLED", false)
 	scanRequired, scanRequiredInvalid := configuredBool("FILE_MALWARE_SCAN_REQUIRED", true)
-	maxUploadBytes, maxUploadBytesInvalid := configuredInt64("FILE_MAX_UPLOAD_BYTES", domain.DefaultMaxUploadBytes)
+	maxUploadBytes, maxUploadBytesInvalid := configuredInt64("FILE_MAX_UPLOAD_BYTES", domain.MaxMaxUploadBytes)
 
 	return Config{
 		ServiceName:                serviceName,
@@ -85,6 +136,10 @@ func Load() Config {
 		UploadsEnabled:             uploadsEnabled,
 		DatabaseURL:                strings.TrimSpace(platformconfig.GetString("DATABASE_URL", "")),
 		DBConnectTimeoutSeconds:    positiveInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
+		DBMaxConnections:           platformconfig.GetInt("FILE_DB_MAX_CONNECTIONS", defaultDBMaxConnections),
+		UploadMaxConcurrent:        platformconfig.GetInt("FILE_UPLOAD_MAX_CONCURRENT", defaultUploadMaxConcurrent),
+		UploadMaxConcurrentPerUser: platformconfig.GetInt("FILE_UPLOAD_MAX_CONCURRENT_PER_USER", defaultUploadMaxConcurrentPerUser),
+		UploadRetryAfterSeconds:    positiveInt("FILE_UPLOAD_RETRY_AFTER_SECONDS", defaultUploadRetryAfterSeconds),
 		AuthJWTHMACSecret:          platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
 		AuthJWTIssuer:              strings.TrimSpace(platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer)),
 		AuthJWTAudience:            strings.TrimSpace(platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience)),
@@ -116,22 +171,64 @@ func (c Config) Validate() error {
 	if err := c.validateUploadLimits(); err != nil {
 		return err
 	}
+	if err := c.validateUploadConcurrency(); err != nil {
+		return err
+	}
 	if err := c.validateScanPolicy(); err != nil {
 		return err
 	}
 	return c.validateUploadDependencies()
 }
 
-// validateUploadLimits checks the RF-32 cap. An explicitly configured value out
-// of bounds is an error rather than something silently corrected.
+// validateUploadLimits checks the deployment ceiling. An explicitly configured
+// value that is not an acceptable limit is an error rather than something
+// silently corrected.
+//
+// It reuses uploadpolicy.Valid rather than restating the bounds, so the ceiling
+// and the administrative policy live in exactly the same value space — the same
+// range and the same whole-MiB rule — and the two can never drift into a
+// configuration where the operator's knob accepts something the policy cannot.
 func (c Config) validateUploadLimits() error {
 	if c.maxUploadBytesInvalid {
 		return errors.New("FILE_MAX_UPLOAD_BYTES must be a valid integer")
 	}
-	if c.MaxUploadBytes < domain.MinMaxUploadBytes || c.MaxUploadBytes > domain.MaxMaxUploadBytes {
+	if !uploadpolicy.Valid(c.MaxUploadBytes) {
 		return fmt.Errorf(
-			"FILE_MAX_UPLOAD_BYTES must be between %d and %d bytes",
+			"FILE_MAX_UPLOAD_BYTES must be a whole number of MiB between %d and %d bytes",
 			domain.MinMaxUploadBytes, domain.MaxMaxUploadBytes,
+		)
+	}
+	return nil
+}
+
+// validateUploadConcurrency checks the cluster-wide admission limits and the
+// pool they draw connections from.
+//
+// Zero never means "unlimited" here: an upload control that can be switched off
+// by typing 0 is not a control, so a non-positive value is a start-up error.
+// The pool check is the one that is easy to get wrong — every occupied upload
+// slot is a reserved connection, so a pool sized at or below the slot count
+// would let a fully booked service starve its own authorization queries and
+// deadlock instead of answering 503.
+func (c Config) validateUploadConcurrency() error {
+	if c.UploadMaxConcurrent <= 0 || c.UploadMaxConcurrent > maxUploadMaxConcurrent {
+		return fmt.Errorf(
+			"FILE_UPLOAD_MAX_CONCURRENT must be between 1 and %d", maxUploadMaxConcurrent,
+		)
+	}
+	if c.UploadMaxConcurrentPerUser <= 0 {
+		return errors.New("FILE_UPLOAD_MAX_CONCURRENT_PER_USER must be greater than zero")
+	}
+	if c.UploadMaxConcurrentPerUser > c.UploadMaxConcurrent {
+		return errors.New(
+			"FILE_UPLOAD_MAX_CONCURRENT_PER_USER must not exceed FILE_UPLOAD_MAX_CONCURRENT",
+		)
+	}
+	if required := c.UploadMaxConcurrent + dbConnectionHeadroom; c.DBMaxConnections < required {
+		return fmt.Errorf(
+			"FILE_DB_MAX_CONNECTIONS must be at least %d: every in-flight upload reserves "+
+				"one connection and %d must remain for other queries",
+			required, dbConnectionHeadroom,
 		)
 	}
 	return nil

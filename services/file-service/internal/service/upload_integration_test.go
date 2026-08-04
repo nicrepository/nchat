@@ -166,13 +166,28 @@ func (e *integrationEnv) upload(
 	t *testing.T, svc *service.AttachmentService, body string,
 ) (service.AttachmentView, error) {
 	t.Helper()
+	return e.uploadContent(t, svc, strings.NewReader(body), "integration.bin")
+}
+
+// uploadContent runs the production sequence: authorise the destination without
+// reading anything, then stream into the authorised target.
+func (e *integrationEnv) uploadContent(
+	t *testing.T, svc *service.AttachmentService, content io.Reader, filename string,
+) (service.AttachmentView, error) {
+	t.Helper()
+	target, err := svc.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
+		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: e.channelID},
+		UserID:      e.uploaderID,
+		SessionID:   uuid.NewString(),
+	})
+	if err != nil {
+		return service.AttachmentView{}, err
+	}
 	return svc.Upload(context.Background(), service.UploadInput{
-		Destination:  domain.Destination{Kind: domain.DestinationKindChannel, ID: e.channelID},
-		UserID:       e.uploaderID,
-		SessionID:    uuid.NewString(),
-		Filename:     "integration.bin",
+		Target:       target,
+		Filename:     filename,
 		DeclaredMIME: "application/octet-stream",
-		Content:      strings.NewReader(body),
+		Content:      content,
 	})
 }
 
@@ -335,14 +350,7 @@ func (e *integrationEnv) uploadWithFinalizeConflict(
 				  WHERE workspace_id = $1 AND status = 'pending_upload'`, e.workspaceID)
 		},
 	}
-	view, err := svc.Upload(context.Background(), service.UploadInput{
-		Destination:  domain.Destination{Kind: domain.DestinationKindChannel, ID: e.channelID},
-		UserID:       e.uploaderID,
-		SessionID:    uuid.NewString(),
-		Filename:     "conflict.bin",
-		DeclaredMIME: "application/octet-stream",
-		Content:      trigger,
-	})
+	view, err := e.uploadContent(t, svc, trigger, "conflict.bin")
 	// Put the row back so the assertions describe the compensation, not the
 	// artificial conflict that triggered it.
 	_, _ = e.pool.Exec(context.Background(),

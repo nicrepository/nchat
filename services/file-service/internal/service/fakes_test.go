@@ -361,13 +361,30 @@ func newFixture(t *testing.T, options ...fixtureOptions) *fixture {
 	return f
 }
 
+// upload runs the two production steps in the production order: authorise the
+// destination without touching the body, then stream into the authorised
+// target. Tests exercise the same sequence the handler does.
 func (f *fixture) upload(ctx context.Context, content io.Reader, filename string) (service.AttachmentView, error) {
+	return f.uploadTo(ctx, domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		content, filename, "application/octet-stream")
+}
+
+func (f *fixture) uploadTo(
+	ctx context.Context, destination domain.Destination,
+	content io.Reader, filename, declaredMIME string,
+) (service.AttachmentView, error) {
+	target, err := f.service.AuthorizeUpload(ctx, service.AuthorizeUploadInput{
+		Destination: destination,
+		UserID:      testUserID,
+		SessionID:   testSessionID,
+	})
+	if err != nil {
+		return service.AttachmentView{}, err
+	}
 	return f.service.Upload(ctx, service.UploadInput{
-		Destination:  domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
-		UserID:       testUserID,
-		SessionID:    testSessionID,
+		Target:       target,
 		Filename:     filename,
-		DeclaredMIME: "application/octet-stream",
+		DeclaredMIME: declaredMIME,
 		Content:      content,
 	})
 }
