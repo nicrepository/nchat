@@ -53,6 +53,15 @@ spec:
             - secretRef:
                 name: nchat-secrets
                 optional: true
+            # RF-33 / RNF-17: the attachment envelope-encryption key ring, kept
+            # out of the shared nchat-secrets so that no other service receives
+            # it through its own envFrom. Optional for the same reason the shared
+            # one is: with FILE_UPLOADS_ENABLED=false the service is health-only
+            # and needs no key, and with uploads enabled a missing key stops
+            # start-up in Config.Validate rather than being silently defaulted.
+            - secretRef:
+                name: nchat-file-encryption
+                optional: true
           env:
             - name: PORT
               value: "8083"
