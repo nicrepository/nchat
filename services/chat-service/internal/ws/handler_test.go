@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1462,46 +1463,149 @@ func TestServeWS_ConnectionLimit_SlotReleasedOnClose(t *testing.T) {
 	_ = conn2.CloseNow()
 }
 
-// TestServeWS_InboundRateLimit_ClosesConnection verifies that a connection
-// sending more messages than the token bucket allows is closed by the server.
-func TestServeWS_InboundRateLimit_ClosesConnection(t *testing.T) {
-	hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-ratelimit")
+// TestServeWS_InboundRateLimit_ClosesConnectionAtConfiguredBurst verifies, for
+// each configured burst, that exactly that many immediate messages are
+// consumed and the next one is rejected with a policy-violation close (1008).
+// The burst=60 case matches the WS_INBOUND_BURST used by nchat-dev-server
+// (issue #455): InboundMessagesPerMinute is pinned to its default 60 in both
+// cases to prove burst and sustained rate are independent settings.
+func TestServeWS_InboundRateLimit_ClosesConnectionAtConfiguredBurst(t *testing.T) {
+	tests := []struct {
+		name  string
+		burst int
+	}{
+		{name: "burst_1", burst: 1},
+		{name: "burst_60_matches_nchat_dev_server", burst: 60},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hub := NewHub(&fakeAuthorizer{}, slog.Default(), NopBus{}, "test-ws-ratelimit-"+tt.name)
+			defer hub.Shutdown()
+
+			cfg := DefaultHandlerConfig()
+			cfg.InboundBurst = tt.burst
+			cfg.InboundMessagesPerMinute = 60 // sustained rate stays at its default in every case
+			srv := newTestWSServerWithConfig(t, hub, &fakeWorkspaceResolver{id: "ws-rl"}, "user-rl", cfg)
+
+			conn := dialWS(t, srv)
+
+			eventually(t, func() bool {
+				hub.mu.RLock()
+				defer hub.mu.RUnlock()
+				for _, c := range hub.clients {
+					if c.userID == "user-rl" {
+						return true
+					}
+				}
+				return false
+			}, 2*time.Second, "client registered before flood")
+
+			ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+			defer cancel()
+
+			ping, _ := json.Marshal(ClientMessage{Type: ClientMessageTypePing})
+			// Consume exactly the configured burst with no measurable time elapsed
+			// between writes, so refill contributes no extra token.
+			for i := 0; i < tt.burst; i++ {
+				if err := conn.Write(ctx, websocket.MessageText, ping); err != nil {
+					t.Fatalf("write message %d of %d within burst: %v", i+1, tt.burst, err)
+				}
+			}
+			// One more than the burst must exhaust the bucket and close the connection.
+			_ = conn.Write(ctx, websocket.MessageText, ping)
+
+			_, _, err := conn.Read(ctx)
+			if err == nil {
+				t.Fatal("expected connection to be closed after rate limit exceeded")
+			}
+			if status := websocket.CloseStatus(err); status != websocket.StatusPolicyViolation {
+				t.Fatalf("expected policy violation close status (1008), got %v from %v", status, err)
+			}
+		})
+	}
+}
+
+// TestServeWS_BootstrapBurst_CallSyncPlusSubscribesDoesNotTriggerRateLimit is a
+// regression test for issue #455: chatSocket's bootstrap sends 1 call.sync +
+// 12 subscribe messages immediately after open (13 messages). With the default
+// InboundBurst=10 this exceeded the bucket and closed the connection with
+// 1008, causing the client to reconnect and repeat the same burst forever.
+// WS_INBOUND_BURST=60 (used by nchat-dev-server) must accept the whole burst
+// without closing, while the sustained messages-per-minute rate is unchanged.
+func TestServeWS_BootstrapBurst_CallSyncPlusSubscribesDoesNotTriggerRateLimit(t *testing.T) {
+	const (
+		workspaceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+		userID      = "user-bootstrap"
+	)
+	auth := &fakeAuthorizer{}
+	targetIDs := make([]string, 12)
+	for i := range targetIDs {
+		targetIDs[i] = "550e8400-e29b-41d4-a716-44665544" + fmt.Sprintf("%04d", i)
+		auth.setAccess(userID, workspaceID, TargetTypeChannel, targetIDs[i], true)
+	}
+
+	hub := NewHub(auth, slog.Default(), NopBus{}, "test-ws-bootstrap")
 	defer hub.Shutdown()
 
-	// Use burst=1: the 2nd message exhausts the bucket (no seconds elapsed).
 	cfg := DefaultHandlerConfig()
-	cfg.InboundBurst = 1
-	srv := newTestWSServerWithConfig(t, hub, &fakeWorkspaceResolver{id: "ws-rl"}, "user-rl", cfg)
-
+	cfg.InboundBurst = 60 // matches WS_INBOUND_BURST in infra/k8s overlays/nchat-dev-server
+	srv := newTestWSServerWithConfig(t, hub, &fakeWorkspaceResolver{id: workspaceID}, userID, cfg)
 	conn := dialWS(t, srv)
-
-	eventually(t, func() bool {
-		hub.mu.RLock()
-		defer hub.mu.RUnlock()
-		for _, c := range hub.clients {
-			if c.userID == "user-rl" {
-				return true
-			}
-		}
-		return false
-	}, 2*time.Second, "client registered before flood")
 
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
 	defer cancel()
 
-	ping, _ := json.Marshal(ClientMessage{Type: ClientMessageTypePing})
-	// First message consumes the only token; second should trigger rate limit.
-	_ = conn.Write(ctx, websocket.MessageText, ping)
-	_ = conn.Write(ctx, websocket.MessageText, ping)
+	callSync, err := json.Marshal(ClientMessage{Type: ClientMessageTypeCallSync})
+	if err != nil {
+		t.Fatalf("marshal call.sync: %v", err)
+	}
+	if writeErr := conn.Write(ctx, websocket.MessageText, callSync); writeErr != nil {
+		t.Fatalf("write call.sync: %v", writeErr)
+	}
+	for _, targetID := range targetIDs {
+		subscribe, marshalErr := json.Marshal(ClientMessage{
+			Type: ClientMessageTypeSubscribe, TargetType: TargetTypeChannel, TargetID: targetID,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal subscribe: %v", marshalErr)
+		}
+		if writeErr := conn.Write(ctx, websocket.MessageText, subscribe); writeErr != nil {
+			t.Fatalf("write subscribe: %v", writeErr)
+		}
+	}
 
-	// Server must close the connection; the next read must return an error.
-	_, _, err := conn.Read(ctx)
-	if err == nil {
-		t.Fatal("expected connection to be closed after rate limit exceeded")
+	subscribedCount := 0
+	for i := 0; i < len(targetIDs)+1; i++ {
+		_, data, readErr := conn.Read(ctx)
+		if readErr != nil {
+			t.Fatalf("bootstrap burst closed the connection unexpectedly (message %d): %v", i, readErr)
+		}
+		var ack subscribeAcknowledgement
+		if json.Unmarshal(data, &ack) == nil && ack.Type == "subscribed" {
+			subscribedCount++
+		}
 	}
-	if status := websocket.CloseStatus(err); status != websocket.StatusPolicyViolation {
-		t.Fatalf("expected policy violation close status, got %v from %v", status, err)
+	if subscribedCount != len(targetIDs) {
+		t.Fatalf("expected %d subscribe acknowledgements, got %d", len(targetIDs), subscribedCount)
 	}
+
+	// The connection and its token bucket must still process further inbound
+	// messages after the burst, up to the sustained rate.
+	ping, _ := json.Marshal(ClientMessage{Type: ClientMessageTypePing})
+	if writeErr := conn.Write(ctx, websocket.MessageText, ping); writeErr != nil {
+		t.Fatalf("write ping after bootstrap burst: %v", writeErr)
+	}
+	eventually(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		for _, c := range hub.clients {
+			if c.userID == userID {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, "connection remains open and registered after bootstrap burst")
 }
 
 // TestServeWS_FloodInvalidMessages_ClosesConnection verifies that sending

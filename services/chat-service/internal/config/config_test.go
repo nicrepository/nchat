@@ -72,6 +72,27 @@ func TestLoad_InvalidWebSocketResourceControlsFallBackToDefaults(t *testing.T) {
 	}
 }
 
+// TestLoad_WSInboundBurst_IndependentOfSustainedRate is a regression test for
+// issue #455: nchat-dev-server sets WS_INBOUND_BURST=60 so the web client's
+// bootstrap burst (1 call.sync + 12 subscribe messages sent immediately after
+// open) is not closed with 1008, while WS_INBOUND_MESSAGES_PER_MINUTE stays at
+// its sustained-rate default because it is a separate, independent setting.
+func TestLoad_WSInboundBurst_IndependentOfSustainedRate(t *testing.T) {
+	t.Setenv("WS_INBOUND_BURST", "60")
+
+	cfg := Load()
+	wsDefaults := ws.DefaultHandlerConfig()
+	if cfg.WSInboundBurst != 60 {
+		t.Fatalf("expected WSInboundBurst=60 from env, got %d", cfg.WSInboundBurst)
+	}
+	if cfg.WSInboundMessagesPerMinute != wsDefaults.InboundMessagesPerMinute {
+		t.Fatalf(
+			"expected WSInboundMessagesPerMinute to stay at the sustained-rate default %d when only burst is overridden, got %d",
+			wsDefaults.InboundMessagesPerMinute, cfg.WSInboundMessagesPerMinute,
+		)
+	}
+}
+
 func TestLoad_ValkeyURL(t *testing.T) {
 	t.Setenv("VALKEY_URL", "valkey://localhost:6379")
 	cfg := Load()

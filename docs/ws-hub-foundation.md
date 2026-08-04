@@ -123,6 +123,23 @@ This prevents one slow or stalled client from blocking event delivery to all oth
 
 ---
 
+## Inbound Rate Limiting
+
+Each connection gets a per-connection token bucket (`readLoop` in `handler.go`) guarding inbound _control_ messages (subscribe, unsubscribe, ping, reaction.toggle, call.\*). Two independent settings control it:
+
+| Env var                          | Default | Meaning                                                     |
+| -------------------------------- | ------- | ----------------------------------------------------------- |
+| `WS_INBOUND_MESSAGES_PER_MINUTE` | `60`    | Sustained rate: tokens refilled per minute.                 |
+| `WS_INBOUND_BURST`               | `10`    | Bucket capacity: how many messages can arrive back-to-back. |
+
+Exceeding the bucket closes the connection with `StatusPolicyViolation` (close code 1008) and reason `"rate limit exceeded"`.
+
+**`nchat-dev-server` sets `WS_INBOUND_BURST=60`** (see `infra/k8s/overlays/nchat-dev-server/configmap-patch.yaml`). The web client's bootstrap sends 1 `call.sync` + one `subscribe` per sidebar item (12 observed) immediately after `open`, all counted against the same bucket; with the old default burst of 10 the server closed the connection with 1008 mid-bootstrap and the client reconnected and repeated the same burst, looping. Raising the burst does **not** change `WS_INBOUND_MESSAGES_PER_MINUTE`, so the sustained-rate protection against flooding is unchanged — only the initial capacity for a legitimate burst is larger (see issue #455).
+
+On the client, `chatSocket.ts` treats close code 1008 as a permanent rejection: it stops reconnecting and moves to the `"failed"` status instead of retrying with the same burst. Reconnection resumes only on an explicit new session (login) or a fresh `acquireChatSocket` call, never automatically.
+
+---
+
 ## Delivery Semantics
 
 **Best-effort, in-process, not durable.**
