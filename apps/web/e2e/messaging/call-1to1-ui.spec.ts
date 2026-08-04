@@ -31,7 +31,13 @@ test.beforeEach(async ({ page }) => {
       message.text() ===
         "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
       message.location().url.includes("/api/media/media/livekit/token");
-    if (!expectedTokenFailure) errors.push(`console.error: ${message.text()}`);
+    const expectedSidebarFailure =
+      message.text() ===
+        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)" &&
+      message.location().url.includes("/api/chat/sidebar");
+    if (!expectedTokenFailure && !expectedSidebarFailure) {
+      errors.push(`console.error: ${message.text()}`);
+    }
   });
 });
 
@@ -100,6 +106,74 @@ test.describe("chamada 1:1", () => {
 
     const dialog = page.getByRole("dialog", {
       name: "Chamada de vídeo com " + participantName,
+    });
+    const accept = dialog.getByRole("button", { name: "Atender" });
+    await expect(accept).toBeFocused();
+    await expect(dialog.getByRole("button", { name: "Recusar" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Cancelar chamada" })).toHaveCount(0);
+    expect(await commandCount(page, "call.sync")).toBe(1);
+    await page.keyboard.press("Enter");
+    await expectCommandCount(page, "call.accept", 1);
+  });
+
+  test("recupera a identidade dentro do dialog após falha da sidebar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "call-sidebar-retry");
+    const participantName = "E2E Participante";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: participantName,
+      messages: [],
+    });
+    const initialSidebar = deferredValue<void>();
+    const retrySidebar = deferredValue<void>();
+    let sidebarRequests = 0;
+    await installMessagingMocks(page, scenario);
+    await page.route("**/api/chat/sidebar", async (route) => {
+      sidebarRequests += 1;
+      if (sidebarRequests === 1) {
+        await initialSidebar.promise;
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: "sidebar_unavailable" } }),
+        });
+        return;
+      }
+      await retrySidebar.promise;
+      await route.fallback();
+    });
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+    const call = {
+      callId: uniqueId(testInfo, "sidebar-retry-call"),
+      requestId: uniqueId(testInfo, "sidebar-retry-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+    await emitCallEvent(page, callEvent(call, "ringing", 1));
+    initialSidebar.resolve();
+
+    const unresolvedDialog = page.getByRole("dialog", {
+      name: "Chamada de vídeo com Participante",
+    });
+    await expect(unresolvedDialog.getByRole("alert")).toContainText(
+      "Não foi possível preparar a chamada",
+    );
+    const retry = unresolvedDialog.getByRole("button", { name: "Tentar novamente" });
+    await expect(retry).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => sidebarRequests).toBe(2);
+    await expect(retry).toBeDisabled();
+    await page.keyboard.press("Enter");
+    expect(sidebarRequests).toBe(2);
+
+    retrySidebar.resolve();
+
+    const dialog = page.getByRole("dialog", {
+      name: `Chamada de vídeo com ${participantName}`,
     });
     const accept = dialog.getByRole("button", { name: "Atender" });
     await expect(accept).toBeFocused();

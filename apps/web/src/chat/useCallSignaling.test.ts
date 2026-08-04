@@ -484,6 +484,113 @@ describe("useCallSignaling", () => {
     expect(result.current.call?.version).toBe(2);
   });
 
+  it("reconciles a pending end as no active call after reconnect", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+    expect(result.current.pending).toBe(true);
+    expect(media.stop).toHaveBeenCalledOnce();
+
+    vi.useFakeTimers();
+    act(() => firstSocket.close());
+    expect(result.current.pending).toBe(false);
+    act(() => vi.advanceTimersByTime(FIRST_RETRY_MS));
+
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    expect(sentMessages(secondSocket)).toEqual([{ type: "call.sync" }]);
+    expect(callCommands(secondSocket)).toEqual([]);
+
+    act(() =>
+      secondSocket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.call).toBeNull();
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(media.stop).toHaveBeenCalledOnce();
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    expect(callCommands(secondSocket)).toHaveLength(1);
+    expect(callCommands(secondSocket)[0]?.["type"]).toBe("call.start");
+  });
+
+  it("keeps a newer active event when reconnect sync later reports no call", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      expect(result.current.accept()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => firstSocket.close());
+    expect(result.current.pending).toBe(false);
+    act(() => vi.advanceTimersByTime(FIRST_RETRY_MS));
+
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    expect(sentMessages(secondSocket)).toEqual([{ type: "call.sync" }]);
+    await act(async () => secondSocket.simulateMessage(activeEvent(2)));
+
+    expect(result.current.call?.status).toBe("active");
+    expect(result.current.pending).toBe(false);
+    expect(media.connect).toHaveBeenCalledOnce();
+    expect(callCommands(secondSocket)).toEqual([]);
+
+    act(() =>
+      secondSocket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.call?.status).toBe("active");
+    expect(media.connect).toHaveBeenCalledOnce();
+  });
+
+  it("restores media only after reconnect confirms the same active call", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => firstSocket.close());
+    expect(media.connect).toHaveBeenCalledOnce();
+    act(() => vi.advanceTimersByTime(FIRST_RETRY_MS));
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+
+    await act(async () => secondSocket.simulateMessage(activeEvent(3)));
+
+    expect(result.current.call?.status).toBe("active");
+    expect(result.current.pending).toBe(false);
+    expect(media.connect).toHaveBeenCalledTimes(2);
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(callCommands(secondSocket)).toEqual([]);
+  });
+
   it("requests media only once the call becomes active", () => {
     renderHook(() => useCallSignaling());
     act(() => FakeWebSocket.instances[0].simulateOpen());

@@ -36,6 +36,16 @@ const channelB = "22222222-2222-4222-8222-222222222222";
 const dmC = "33333333-3333-4333-8333-333333333333";
 const currentUserId = "me-1";
 
+function deferredValue<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function wrapper(path: string) {
   return function SidebarWrapper({ children }: PropsWithChildren) {
     return <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>;
@@ -81,6 +91,69 @@ function unreadCounts(state: ReturnType<typeof useChatSidebar>["state"]) {
     dmC: state.dms.find(({ id }) => id === dmC)?.unreadCount ?? 0,
   };
 }
+
+describe("useChatSidebar identity retry", () => {
+  beforeEach(() => {
+    mockFetchSidebarData.mockReset();
+    websocket.onMessageCreated = null;
+    websocket.onConversationAvailable = null;
+  });
+
+  it("shares one retry request and allows another attempt after failure", async () => {
+    mockFetchSidebarData.mockRejectedValueOnce(new Error("offline"));
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("error"));
+
+    const failedRetry = deferredValue<never>();
+    mockFetchSidebarData.mockReturnValue(failedRetry.promise);
+    let firstRetry!: ReturnType<typeof result.current.retry>;
+    let duplicateRetry!: ReturnType<typeof result.current.retry>;
+    act(() => {
+      firstRetry = result.current.retry();
+      duplicateRetry = result.current.retry();
+    });
+
+    expect(firstRetry).toBeInstanceOf(Promise);
+    expect(duplicateRetry).toBe(firstRetry);
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+    expect(result.current.state.status).toBe("loading");
+
+    failedRetry.reject(new Error("still offline"));
+    await act(async () => firstRetry);
+    expect(result.current.state.status).toBe("error");
+
+    mockFetchSidebarData.mockResolvedValueOnce({
+      currentUserId,
+      channels: [],
+      dms: [],
+    });
+    await act(async () => result.current.retry());
+
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(3);
+    expect(result.current.state.status).toBe("ready");
+  });
+
+  it("does not update after unmount while identity retry is pending", async () => {
+    mockFetchSidebarData.mockRejectedValueOnce(new Error("offline"));
+    const { result, unmount } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("error"));
+
+    const retry = deferredValue<{
+      currentUserId: string;
+      channels: [];
+      dms: [];
+    }>();
+    mockFetchSidebarData.mockReturnValueOnce(retry.promise);
+    const operation = result.current.retry();
+    unmount();
+    retry.resolve({ currentUserId, channels: [], dms: [] });
+    await operation;
+
+    expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("useChatSidebar realtime unread", () => {
   beforeEach(() => {

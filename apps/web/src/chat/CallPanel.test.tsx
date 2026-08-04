@@ -8,6 +8,7 @@ import type { CallController } from "./useCallSignaling";
 
 const currentUserId = "00000000-0000-4000-8000-000000000301";
 const otherUserId = "00000000-0000-4000-8000-000000000302";
+const retryIdentity = async () => undefined;
 
 function controller(
   status: "ringing" | "active" | "declined" | "cancelled" | "timed_out" | "ended",
@@ -67,6 +68,8 @@ function renderPanel(calls: CallController, mediaController?: ReturnType<typeof 
     <CallPanel
       calls={calls}
       currentUserId={currentUserId}
+      identityStatus="ready"
+      retryIdentity={retryIdentity}
       participantId={otherUserId}
       participantName="Ana Lima"
       participantAvatarUrl="/media/ana.png"
@@ -134,6 +137,8 @@ describe("CallPanel", () => {
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
         participantId={otherUserId}
         participantName="Ana Lima"
         media={media({ audioActivationRequired: false })}
@@ -195,6 +200,8 @@ describe("CallPanel", () => {
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
         participantId={otherUserId}
         participantName="Ana Lima"
         media={media()}
@@ -245,6 +252,8 @@ describe("CallPanel", () => {
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
         participantId={otherUserId}
         participantName="Ana Lima"
         media={media({ status: "idle", error: null })}
@@ -280,6 +289,8 @@ describe("CallPanel", () => {
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
         participantId={otherUserId}
         participantName="Ana Lima"
         media={media({ status: "connecting", microphoneEnabled: false, cameraEnabled: false })}
@@ -289,6 +300,8 @@ describe("CallPanel", () => {
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
         participantId={otherUserId}
         participantName="Ana Lima"
         media={media()}
@@ -329,6 +342,8 @@ describe("CallPanel", () => {
       <CallPanel
         calls={outgoing}
         currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
         participantId={otherUserId}
         participantName="Ana Lima"
       />,
@@ -339,7 +354,15 @@ describe("CallPanel", () => {
 
   it("waits for identity before showing incoming call actions", () => {
     const calls = controller("ringing");
-    const view = render(<CallPanel calls={calls} currentUserId="" participantName="Ana Lima" />);
+    const view = render(
+      <CallPanel
+        calls={calls}
+        currentUserId=""
+        identityStatus="loading"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+      />,
+    );
 
     expect(screen.getByRole("status")).toHaveTextContent("Preparando chamada…");
     expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
@@ -350,7 +373,13 @@ describe("CallPanel", () => {
     expect(calls.cancel).not.toHaveBeenCalled();
 
     view.rerender(
-      <CallPanel calls={calls} currentUserId={currentUserId} participantName="Ana Lima" />,
+      <CallPanel
+        calls={calls}
+        currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+      />,
     );
 
     expect(screen.getByRole("button", { name: "Atender" })).toHaveFocus();
@@ -358,16 +387,73 @@ describe("CallPanel", () => {
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
   });
 
+  it("keeps identity recovery accessible and deduplicated inside the dialog", async () => {
+    const user = userEvent.setup();
+    const calls = controller("ringing");
+    const retryOperation = deferredValue<void>();
+    const retryIdentity = vi.fn(() => retryOperation.promise);
+    const view = render(
+      <CallPanel
+        calls={calls}
+        currentUserId=""
+        identityStatus="error"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível preparar a chamada");
+    const retry = screen.getByRole("button", { name: "Tentar novamente" });
+    expect(retry).toHaveFocus();
+    await user.keyboard("{Enter}");
+    await user.click(retry);
+
+    expect(retryIdentity).toHaveBeenCalledOnce();
+    expect(retry).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
+
+    await act(async () => retryOperation.resolve());
+    expect(retry).toBeEnabled();
+
+    view.rerender(
+      <CallPanel
+        calls={calls}
+        currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Atender" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
+  });
+
   it("waits for identity before showing outgoing call actions", () => {
     const calls = controller("ringing", currentUserId);
-    const view = render(<CallPanel calls={calls} currentUserId="" participantName="Ana Lima" />);
+    const view = render(
+      <CallPanel
+        calls={calls}
+        currentUserId=""
+        identityStatus="loading"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+      />,
+    );
 
     expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
 
     view.rerender(
-      <CallPanel calls={calls} currentUserId={currentUserId} participantName="Ana Lima" />,
+      <CallPanel
+        calls={calls}
+        currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+      />,
     );
 
     expect(screen.getByRole("button", { name: "Cancelar chamada" })).toHaveFocus();

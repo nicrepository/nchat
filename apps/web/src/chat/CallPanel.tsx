@@ -8,6 +8,8 @@ import type { CallController } from "./useCallSignaling";
 interface CallPanelProps {
   calls: CallController;
   currentUserId: string;
+  identityStatus: "loading" | "ready" | "error";
+  retryIdentity: () => Promise<void>;
   participantId?: string;
   participantName: string;
   participantAvatarUrl?: string;
@@ -33,6 +35,8 @@ const mediaStatusLabels: Partial<Record<CallMediaStatus, string>> = {
 export default function CallPanel({
   calls,
   currentUserId,
+  identityStatus,
+  retryIdentity,
   participantId = "",
   participantName,
   participantAvatarUrl,
@@ -44,6 +48,8 @@ export default function CallPanel({
   const [endingCallId, setEndingCallId] = useState("");
   const [retryingMediaCallId, setRetryingMediaCallId] = useState("");
   const retryPromiseRef = useRef<Promise<void> | null>(null);
+  const [retryingIdentityCallId, setRetryingIdentityCallId] = useState("");
+  const identityRetryPromiseRef = useRef<Promise<void> | null>(null);
   const terminal = call && call.status in terminalLabels;
   const retryingMedia = Boolean(dialogCallId && retryingMediaCallId === dialogCallId);
 
@@ -60,6 +66,7 @@ export default function CallPanel({
     else dialog.setAttribute("open", "");
     return () => {
       retryPromiseRef.current = null;
+      identityRetryPromiseRef.current = null;
       if (dialog.open && typeof dialog.close === "function") dialog.close();
     };
   }, [dialogCallId]);
@@ -73,13 +80,16 @@ export default function CallPanel({
     );
   }
 
-  const identityReady = currentUserId !== "";
+  const identityReady = identityStatus === "ready" && currentUserId !== "";
   const incoming = identityReady && call.status === "ringing" && call.callee_id === currentUserId;
   const callId = call.call_id;
   const active = call.status === "active";
   const video = call.call_type === "video";
   const ending = endingCallId === call.call_id && !calls.error;
   const permissionRecovery = active && (media?.status === "permission-denied" || retryingMedia);
+  const retryingIdentity = retryingIdentityCallId === call.call_id;
+  const identityRecovery =
+    call.status === "ringing" && (identityStatus === "error" || retryingIdentity);
   const mediaDisabled = !active || !media || !["connected", "reconnecting"].includes(media.status);
   const error = media?.error ?? calls.error;
   const status =
@@ -113,6 +123,22 @@ export default function CallPanel({
       if (!operation || retryPromiseRef.current === operation) {
         retryPromiseRef.current = null;
         setRetryingMediaCallId("");
+      }
+    }
+  }
+
+  async function retryIdentityFromDialog() {
+    if (identityRetryPromiseRef.current) return;
+    setRetryingIdentityCallId(callId);
+    let operation: Promise<void> | null = null;
+    try {
+      operation = retryIdentity();
+      identityRetryPromiseRef.current = operation;
+      await operation;
+    } finally {
+      if (!operation || identityRetryPromiseRef.current === operation) {
+        identityRetryPromiseRef.current = null;
+        setRetryingIdentityCallId("");
       }
     }
   }
@@ -192,7 +218,22 @@ export default function CallPanel({
           </aside>
         )}
 
-        {permissionRecovery ? (
+        {identityRecovery ? (
+          <div className="call-panel__error" role="alert">
+            <span>
+              Não foi possível preparar a chamada. Verifique sua conexão e tente novamente.
+            </span>
+            <button
+              type="button"
+              autoFocus
+              aria-busy={retryingIdentity}
+              disabled={retryingIdentity}
+              onClick={() => void retryIdentityFromDialog()}
+            >
+              Tentar novamente
+            </button>
+          </div>
+        ) : permissionRecovery ? (
           <div className="call-panel__error" role="alert">
             <span>{mediaStatusLabels["permission-denied"]}</span>
             <button type="button" disabled={retryingMedia || calls.pending} onClick={retryMedia}>
@@ -208,7 +249,7 @@ export default function CallPanel({
           )
         )}
 
-        {error && !permissionRecovery && (
+        {error && !identityRecovery && !permissionRecovery && (
           <div className="call-panel__error" role="alert">
             <span>{error}</span>
             {active && (

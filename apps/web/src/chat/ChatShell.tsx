@@ -58,6 +58,8 @@ export default function ChatShell() {
       <CallPanel
         calls={calls}
         currentUserId={currentUserId}
+        identityStatus={state.status}
+        retryIdentity={retry}
         participantId={participantId}
         participantName={participantName}
         participantAvatarUrl={participant?.avatarUrl}
