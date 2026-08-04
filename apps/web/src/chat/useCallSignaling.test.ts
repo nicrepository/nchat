@@ -13,7 +13,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
-import { _resetChatSocket, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
+import { _resetChatSocket, MAX_CONSECUTIVE_FAILURES, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
 import { issueCallToken } from "./callApi";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useCallSignaling } from "./useCallSignaling";
@@ -432,9 +432,9 @@ describe("useCallSignaling", () => {
 
     expect(result.current.call?.status).toBe("ended");
     expect(result.current.pending).toBe(false);
-    expect(media.stop).toHaveBeenCalledTimes(2);
+    expect(media.stop).toHaveBeenCalledOnce();
     act(() => socket.simulateMessage(endedEvent(5)));
-    expect(media.stop).toHaveBeenCalledTimes(2);
+    expect(media.stop).toHaveBeenCalledOnce();
   });
 
   it("releases pending for a correlated call.error", async () => {
@@ -591,6 +591,288 @@ describe("useCallSignaling", () => {
     expect(callCommands(secondSocket)).toEqual([]);
   });
 
+  it("waits for terminal cleanup before requesting replacement call media", async () => {
+    const media = mediaBridge();
+    const cleanup = deferredValue<void>();
+    vi.mocked(media.stop).mockReturnValueOnce(cleanup.promise);
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      firstSocket.close();
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    const replacement = {
+      ...activeEvent(1),
+      call: {
+        ...activeEvent(1).call,
+        call_id: "00000000-0000-4000-8000-000000000598",
+        request_id: "00000000-0000-4000-8000-000000000597",
+      },
+    };
+    act(() => secondSocket.simulateMessage(replacement));
+
+    expect(result.current.call?.call_id).toBe(replacement.call.call_id);
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(issueCallToken).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      cleanup.resolve();
+      await cleanup.promise;
+      await Promise.resolve();
+    });
+
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
+    expect(media.connect).toHaveBeenCalledTimes(2);
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("keeps replacement media stopped and recoverable when previous cleanup fails", async () => {
+    const media = mediaBridge();
+    const cleanup = deferredValue<void>();
+    vi.mocked(media.stop).mockReturnValueOnce(cleanup.promise).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      firstSocket.close();
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    const replacement = {
+      ...activeEvent(1),
+      call: {
+        ...activeEvent(1).call,
+        call_id: "00000000-0000-4000-8000-000000000598",
+      },
+    };
+    act(() => secondSocket.simulateMessage(replacement));
+    expect(issueCallToken).toHaveBeenCalledOnce();
+
+    await act(async () => cleanup.reject(new Error("cleanup failed")));
+
+    expect(issueCallToken).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+    expect(result.current.error).toBe(
+      "Não foi possível liberar a mídia da chamada anterior. Tente novamente.",
+    );
+
+    await act(async () => result.current.retryMedia());
+
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
+    expect(media.connect).toHaveBeenCalledTimes(2);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("does not request replacement media when that call ends during cleanup", async () => {
+    const media = mediaBridge();
+    const cleanup = deferredValue<void>();
+    vi.mocked(media.stop).mockReturnValueOnce(cleanup.promise);
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      firstSocket.close();
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    const replacementCallId = "00000000-0000-4000-8000-000000000598";
+    act(() =>
+      secondSocket.simulateMessage({
+        ...activeEvent(1),
+        call: { ...activeEvent(1).call, call_id: replacementCallId },
+      }),
+    );
+    act(() =>
+      secondSocket.simulateMessage({
+        ...endedEvent(2),
+        call: { ...endedEvent(2).call, call_id: replacementCallId },
+      }),
+    );
+
+    await act(async () => {
+      cleanup.resolve();
+      await cleanup.promise;
+      await Promise.resolve();
+    });
+
+    expect(result.current.call?.status).toBe("ended");
+    expect(issueCallToken).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("only requests the latest replacement when another call wins during cleanup", async () => {
+    const media = mediaBridge();
+    const cleanup = deferredValue<void>();
+    vi.mocked(media.stop).mockReturnValueOnce(cleanup.promise);
+    const { result } = renderHook(() => useCallSignaling(media));
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      firstSocket.close();
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    const callB = "00000000-0000-4000-8000-000000000598";
+    act(() =>
+      secondSocket.simulateMessage({
+        ...activeEvent(1),
+        call: { ...activeEvent(1).call, call_id: callB },
+      }),
+    );
+    act(() => {
+      secondSocket.close();
+      vi.runOnlyPendingTimers();
+    });
+    const thirdSocket = FakeWebSocket.instances[2];
+    act(() => thirdSocket.simulateOpen());
+    const callC = "00000000-0000-4000-8000-000000000597";
+    act(() =>
+      thirdSocket.simulateMessage({
+        ...activeEvent(1),
+        call: { ...activeEvent(1).call, call_id: callC },
+      }),
+    );
+
+    await act(async () => {
+      cleanup.resolve();
+      await cleanup.promise;
+      await Promise.resolve();
+    });
+
+    expect(result.current.call?.call_id).toBe(callC);
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
+    expect(issueCallToken).toHaveBeenLastCalledWith(callC);
+    expect(media.connect).toHaveBeenCalledTimes(2);
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("does not request replacement media disabled while cleanup is pending", async () => {
+    const media = mediaBridge();
+    const cleanup = deferredValue<void>();
+    vi.mocked(media.stop).mockReturnValueOnce(cleanup.promise);
+    const { result, rerender } = renderHook(
+      ({ mediaEnabled }) => useCallSignaling(media, mediaEnabled),
+      { initialProps: { mediaEnabled: true } },
+    );
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      firstSocket.close();
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    const replacementCallId = "00000000-0000-4000-8000-000000000598";
+    act(() =>
+      secondSocket.simulateMessage({
+        ...activeEvent(1),
+        call: { ...activeEvent(1).call, call_id: replacementCallId },
+      }),
+    );
+    rerender({ mediaEnabled: false });
+
+    await act(async () => {
+      cleanup.resolve();
+      await cleanup.promise;
+      await Promise.resolve();
+    });
+
+    expect(result.current.call?.call_id).toBe(replacementCallId);
+    expect(issueCallToken).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+  });
+
+  it("waits for cleanup when replacement media becomes enabled", async () => {
+    const media = mediaBridge();
+    const cleanup = deferredValue<void>();
+    vi.mocked(media.stop).mockReturnValueOnce(cleanup.promise);
+    const { result, rerender } = renderHook(
+      ({ mediaEnabled }) => useCallSignaling(media, mediaEnabled),
+      { initialProps: { mediaEnabled: true } },
+    );
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      firstSocket.close();
+      vi.advanceTimersByTime(FIRST_RETRY_MS);
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    rerender({ mediaEnabled: false });
+    const replacementCallId = "00000000-0000-4000-8000-000000000598";
+    act(() =>
+      secondSocket.simulateMessage({
+        ...activeEvent(1),
+        call: { ...activeEvent(1).call, call_id: replacementCallId },
+      }),
+    );
+
+    rerender({ mediaEnabled: true });
+
+    expect(issueCallToken).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      cleanup.resolve();
+      await cleanup.promise;
+      await Promise.resolve();
+    });
+
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
+    expect(issueCallToken).toHaveBeenLastCalledWith(replacementCallId);
+    expect(media.connect).toHaveBeenCalledTimes(2);
+  });
+
   it("replaces a stale active call with the current generation sync result", async () => {
     const media = mediaBridge();
     const { result } = renderHook(() => useCallSignaling(media));
@@ -703,6 +985,110 @@ describe("useCallSignaling", () => {
     expect(callCommands(secondSocket)).toHaveLength(1);
   });
 
+  it("clears reconciliation pending when a reconnect drops before call.sync responds", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useCallSignaling());
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    act(() => {
+      firstSocket.close();
+      vi.runOnlyPendingTimers();
+    });
+
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    expect(result.current.pending).toBe(true);
+    expect(sentMessages(secondSocket)).toEqual([{ type: "call.sync" }]);
+    const staleMessage = secondSocket.onmessage;
+
+    act(() => secondSocket.close());
+
+    expect(result.current.pending).toBe(false);
+    act(() => vi.runOnlyPendingTimers());
+    const thirdSocket = FakeWebSocket.instances[2];
+    act(() => thirdSocket.simulateOpen());
+    expect(result.current.pending).toBe(true);
+    expect(sentMessages(thirdSocket)).toEqual([{ type: "call.sync" }]);
+
+    act(() =>
+      staleMessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            type: "call.error",
+            operation: "call.sync",
+            code: "call_not_found",
+          }),
+        }),
+      ),
+    );
+    expect(result.current.call?.status).toBe("active");
+    expect(result.current.pending).toBe(true);
+
+    act(() =>
+      thirdSocket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+    expect(result.current.call).toBeNull();
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("leaves reconciliation unlocked with an observable error after reconnect gives up", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useCallSignaling());
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    act(() => {
+      firstSocket.close();
+      vi.runOnlyPendingTimers();
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    expect(result.current.pending).toBe(true);
+    act(() => secondSocket.close());
+    expect(result.current.pending).toBe(false);
+
+    for (let attempt = 0; attempt < MAX_CONSECUTIVE_FAILURES; attempt += 1) {
+      act(() => vi.runOnlyPendingTimers());
+      const failedSocket = FakeWebSocket.instances.at(-1);
+      if (!failedSocket) throw new Error("Expected reconnect socket");
+      act(() => failedSocket.close());
+    }
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("Conexão em tempo real indisponível.");
+    act(() => {
+      expect(result.current.end()).toBe(false);
+    });
+    expect(callCommands(secondSocket)).toEqual([]);
+  });
+
+  it("does not reconnect after unmount following a second drop during reconciliation", () => {
+    vi.useFakeTimers();
+    const { result, unmount } = renderHook(() => useCallSignaling());
+    const firstSocket = FakeWebSocket.instances[0];
+    act(() => firstSocket.simulateOpen());
+    act(() => firstSocket.simulateMessage(activeEvent(3)));
+    act(() => {
+      firstSocket.close();
+      vi.runOnlyPendingTimers();
+    });
+    const secondSocket = FakeWebSocket.instances[1];
+    act(() => secondSocket.simulateOpen());
+    expect(result.current.pending).toBe(true);
+    act(() => secondSocket.close());
+    expect(result.current.pending).toBe(false);
+
+    unmount();
+    act(() => vi.runOnlyPendingTimers());
+
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
   it("requests media only once the call becomes active", () => {
     renderHook(() => useCallSignaling());
     act(() => FakeWebSocket.instances[0].simulateOpen());
@@ -808,7 +1194,137 @@ describe("useCallSignaling", () => {
     expect(media.stop).toHaveBeenCalledOnce();
 
     act(() => FakeWebSocket.instances[0].simulateMessage(endedEvent(3)));
-    expect(media.stop).toHaveBeenCalledTimes(2);
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("does not connect a late token after a locally accepted end", async () => {
+    const media = mediaBridge();
+    const token = deferredValue<{ token: string; expiresAt: string }>();
+    vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+    expect(media.stop).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+      await token.promise;
+    });
+
+    expect(media.connect).not.toHaveBeenCalled();
+    expect(result.current.error).toBeNull();
+    act(() => socket.simulateMessage(endedEvent(3)));
+    expect(result.current.call?.status).toBe("ended");
+
+    const nextCallId = "00000000-0000-4000-8000-000000000598";
+    act(() =>
+      socket.simulateMessage({
+        ...activeEvent(1),
+        call: {
+          ...activeEvent(1).call,
+          call_id: nextCallId,
+          request_id: "00000000-0000-4000-8000-000000000597",
+        },
+      }),
+    );
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    expect(media.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ call_id: nextCallId }),
+      "media-token",
+    );
+  });
+
+  it.each(["cancel", "decline"] as const)(
+    "does not connect a late token after a locally accepted %s",
+    async (action) => {
+      const media = mediaBridge();
+      const token = deferredValue<{ token: string; expiresAt: string }>();
+      vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+      const { result } = renderHook(() => useCallSignaling(media));
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      act(() => socket.simulateMessage(activeEvent(2)));
+      await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
+
+      act(() => {
+        expect(result.current[action]()).toBe(true);
+      });
+      expect(media.stop).toHaveBeenCalledOnce();
+
+      await act(async () => {
+        token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+        await token.promise;
+      });
+
+      expect(media.connect).not.toHaveBeenCalled();
+      expect(result.current.error).toBeNull();
+    },
+  );
+
+  it("allows a fresh media retry after the server rejects a terminal command", async () => {
+    const media = mediaBridge();
+    const token = deferredValue<{ token: string; expiresAt: string }>();
+    vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    await act(async () => {
+      token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+      await token.promise;
+    });
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("A chamada já mudou de estado.");
+    expect(media.connect).not.toHaveBeenCalled();
+
+    await act(async () => result.current.retryMedia());
+
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
+    expect(media.connect).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ call_id: baseCall.call_id }),
+      "media-token",
+    );
+    expect(result.current.error).toBeNull();
+  });
+
+  it("does not connect a late token after unmount", async () => {
+    const media = mediaBridge();
+    const token = deferredValue<{ token: string; expiresAt: string }>();
+    vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
+    const { unmount } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(2)));
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
+
+    unmount();
+    await act(async () => {
+      token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+      await token.promise;
+    });
+
+    expect(media.connect).not.toHaveBeenCalled();
   });
 
   it("ignores media side effects from a stale terminal event", async () => {

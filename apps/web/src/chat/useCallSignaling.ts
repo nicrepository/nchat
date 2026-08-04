@@ -25,7 +25,7 @@ interface PendingCallCommand {
 }
 
 interface ReconnectState {
-  mediaStopped: boolean;
+  mediaCleanup: Promise<boolean> | null;
 }
 
 interface SyncReconciliation extends ReconnectState {
@@ -79,7 +79,9 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   const syncReconciliationRef = useRef<SyncReconciliation | null>(null);
   const mediaCallIdRef = useRef("");
   const mediaRequestCallIdRef = useRef("");
+  const mediaRequestGenerationRef = useRef(0);
   const mediaRetryPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
+  const mediaCleanupPromiseRef = useRef<Promise<boolean> | null>(null);
   const mediaRef = useRef(media);
   const mediaEnabledRef = useRef(mediaEnabled);
 
@@ -96,34 +98,90 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     ) {
       return;
     }
+    const generation = mediaRequestGenerationRef.current;
     mediaRequestCallIdRef.current = call.call_id;
+    const current = () =>
+      mediaRequestGenerationRef.current === generation &&
+      mediaRequestCallIdRef.current === call.call_id &&
+      mediaEnabledRef.current &&
+      callRef.current?.call_id === call.call_id &&
+      callRef.current.status === "active";
     try {
+      if (!current()) return;
       const result = await issueCallToken(call.call_id);
+      if (!current()) return;
+      await mediaRef.current?.connect(call, result.token);
+      if (!current()) return;
+      mediaCallIdRef.current = call.call_id;
+      setMediaReady(true);
+      setError(null);
+    } catch {
+      if (!current()) return;
+      setMediaReady(false);
+      setError("Não foi possível preparar a mídia da chamada. Tente novamente.");
+    } finally {
       if (
+        mediaRequestGenerationRef.current === generation &&
+        mediaRequestCallIdRef.current === call.call_id
+      ) {
+        mediaRequestCallIdRef.current = "";
+      }
+    }
+  }, []);
+
+  const invalidateMediaRequest = useCallback(() => {
+    mediaRequestGenerationRef.current += 1;
+    mediaRequestCallIdRef.current = "";
+    mediaCallIdRef.current = "";
+    mediaRetryPromiseRef.current = null;
+    setMediaReady(false);
+  }, []);
+
+  const stopMedia = useCallback((): Promise<boolean> => {
+    invalidateMediaRequest();
+    const pending = mediaCleanupPromiseRef.current;
+    if (pending) return pending;
+    const stopping = (async () => {
+      try {
+        await mediaRef.current?.stop();
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    mediaCleanupPromiseRef.current = stopping;
+    void stopping.then(() => {
+      if (mediaCleanupPromiseRef.current === stopping) mediaCleanupPromiseRef.current = null;
+    });
+    return stopping;
+  }, [invalidateMediaRequest]);
+
+  useEffect(() => {
+    mediaEnabledRef.current = mediaEnabled;
+    const call = callRef.current;
+    if (!mediaEnabled || call?.status !== "active") return;
+    const cleanup = mediaCleanupPromiseRef.current;
+    if (!cleanup) {
+      void requestMedia(call);
+      return;
+    }
+    const mediaGeneration = mediaRequestGenerationRef.current;
+    void cleanup.then((cleaned) => {
+      if (
+        mediaRequestGenerationRef.current !== mediaGeneration ||
         !mediaEnabledRef.current ||
         callRef.current?.call_id !== call.call_id ||
         callRef.current.status !== "active"
       ) {
         return;
       }
-      await mediaRef.current?.connect(call, result.token);
-      if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
-      mediaCallIdRef.current = call.call_id;
-      setMediaReady(true);
-      setError(null);
-    } catch {
-      if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
-      setMediaReady(false);
-      setError("Não foi possível preparar a mídia da chamada. Tente novamente.");
-    } finally {
-      if (mediaRequestCallIdRef.current === call.call_id) mediaRequestCallIdRef.current = "";
-    }
-  }, []);
-
-  useEffect(() => {
-    mediaEnabledRef.current = mediaEnabled;
-    const call = callRef.current;
-    if (mediaEnabled && call?.status === "active") void requestMedia(call);
+      if (!cleaned) {
+        setMediaReady(false);
+        setError("Não foi possível liberar a mídia da chamada anterior. Tente novamente.");
+        return;
+      }
+      return requestMedia(call);
+    });
   }, [mediaEnabled, requestMedia]);
 
   useEffect(() => {
@@ -179,37 +237,41 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
             callRef.current = acceptedState.call;
             setState(acceptedState);
           }
+          let mediaCleanup = reconciliation?.mediaCleanup ?? mediaCleanupPromiseRef.current;
           if (replacesCurrentCall) {
-            mediaCallIdRef.current = "";
-            mediaRequestCallIdRef.current = "";
-            mediaRetryPromiseRef.current = null;
-            setMediaReady(false);
-            const cleanup =
-              currentCall && !isTerminalCall(currentCall.status) && !reconciliation?.mediaStopped
-                ? mediaRef.current?.stop()
-                : undefined;
-            if (event.call.status === "active") {
-              if (cleanup) {
-                void cleanup.then(() => {
-                  if (
-                    !closed &&
-                    generation === socketGenerationRef.current &&
-                    callRef.current?.call_id === event.call.call_id
-                  ) {
-                    return requestMedia(event.call);
-                  }
-                });
-              } else void requestMedia(event.call);
-            }
-            return;
+            if (currentCall && !isTerminalCall(currentCall.status)) {
+              if (mediaCleanup) invalidateMediaRequest();
+              else mediaCleanup = stopMedia();
+            } else invalidateMediaRequest();
           }
-          if (event.call.status === "active") void requestMedia(event.call);
+          if (event.call.status === "active") {
+            if (mediaCleanup) {
+              const mediaGeneration = mediaRequestGenerationRef.current;
+              void mediaCleanup.then((cleaned) => {
+                if (
+                  closed ||
+                  generation !== socketGenerationRef.current ||
+                  mediaRequestGenerationRef.current !== mediaGeneration ||
+                  !mediaEnabledRef.current ||
+                  callRef.current?.call_id !== event.call.call_id ||
+                  callRef.current.status !== "active"
+                ) {
+                  return;
+                }
+                if (!cleaned) {
+                  setMediaReady(false);
+                  setError(
+                    "Não foi possível liberar a mídia da chamada anterior. Tente novamente.",
+                  );
+                  return;
+                }
+                return requestMedia(event.call);
+              });
+            } else void requestMedia(event.call);
+          }
+          if (replacesCurrentCall) return;
           if (nextState.call !== currentCall && isTerminalCall(event.call.status)) {
-            mediaCallIdRef.current = "";
-            mediaRequestCallIdRef.current = "";
-            mediaRetryPromiseRef.current = null;
-            setMediaReady(false);
-            void mediaRef.current?.stop();
+            void stopMedia();
           }
           return;
         }
@@ -229,12 +291,9 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
             setState(initialCallState);
             setPending(false);
             setError(null);
-            mediaCallIdRef.current = "";
-            mediaRequestCallIdRef.current = "";
-            mediaRetryPromiseRef.current = null;
-            setMediaReady(false);
-            if (staleCall && !isTerminalCall(staleCall.status) && !reconciliation.mediaStopped) {
-              void mediaRef.current?.stop();
+            invalidateMediaRequest();
+            if (staleCall && !isTerminalCall(staleCall.status) && !reconciliation.mediaCleanup) {
+              void stopMedia();
             }
             return;
           }
@@ -264,22 +323,28 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
           return;
         }
         const pendingCommand = pendingRef.current;
-        const mediaStopped =
+        const reconciliation =
+          syncReconciliationRef.current?.generation === generation
+            ? syncReconciliationRef.current
+            : null;
+        const terminalCommand =
           pendingCommand?.operation === "call.decline" ||
           pendingCommand?.operation === "call.cancel" ||
           pendingCommand?.operation === "call.end";
-        reconnectRef.current = { mediaStopped };
+        let mediaCleanup = reconciliation?.mediaCleanup ?? mediaCleanupPromiseRef.current;
+        if (!mediaCleanup && terminalCommand) mediaCleanup = stopMedia();
+        reconnectRef.current = { mediaCleanup };
         syncReconciliationRef.current = null;
-        if (pendingCommand) {
+        if (pendingCommand || reconciliation) {
           pendingRef.current = null;
           setPending(false);
         }
-        if (mediaStopped) {
-          mediaCallIdRef.current = "";
-          mediaRequestCallIdRef.current = "";
-          mediaRetryPromiseRef.current = null;
-          setMediaReady(false);
-        }
+      },
+      onStatus: (status) => {
+        if (closed || status !== "failed") return;
+        pendingRef.current = null;
+        setPending(false);
+        setError("Conexão em tempo real indisponível.");
       },
     });
     socketRef.current = handle;
@@ -294,11 +359,19 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       syncReconciliationRef.current = null;
       mediaCallIdRef.current = "";
       mediaRequestCallIdRef.current = "";
+      mediaRequestGenerationRef.current += 1;
       mediaRetryPromiseRef.current = null;
+      mediaCleanupPromiseRef.current = null;
       handle.release();
-      void mediaRef.current?.stop();
+      void (async () => {
+        try {
+          await mediaRef.current?.stop();
+        } catch {
+          // The owner is gone; the media adapter already invalidated its session.
+        }
+      })();
     };
-  }, [requestMedia]);
+  }, [invalidateMediaRequest, requestMedia, stopMedia]);
 
   const send = useCallback((operation: CallOperation, payload: Record<string, unknown>) => {
     const handle = socketRef.current;
@@ -353,17 +426,17 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     },
     decline: () => {
       const declined = transition("call.decline");
-      if (declined) void mediaRef.current?.stop();
+      if (declined) void stopMedia();
       return declined;
     },
     cancel: () => {
       const cancelled = transition("call.cancel");
-      if (cancelled) void mediaRef.current?.stop();
+      if (cancelled) void stopMedia();
       return cancelled;
     },
     end: () => {
       const ended = transition("call.end");
-      if (ended) void mediaRef.current?.stop();
+      if (ended) void stopMedia();
       return ended;
     },
     retryMedia: () => {
@@ -373,21 +446,25 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       if (!call || call.status !== "active" || mediaRequestCallIdRef.current === call.call_id) {
         return Promise.resolve();
       }
-      mediaRequestCallIdRef.current = call.call_id;
-      mediaCallIdRef.current = "";
-      setMediaReady(false);
       setError(null);
-      const retrying = Promise.resolve(mediaRef.current?.stop())
-        .catch(() => undefined)
-        .then(() => {
-          if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") {
+      const cleanup = stopMedia();
+      const mediaGeneration = mediaRequestGenerationRef.current;
+      const retrying = cleanup
+        .then((cleaned) => {
+          if (
+            mediaRequestGenerationRef.current !== mediaGeneration ||
+            callRef.current?.call_id !== call.call_id ||
+            callRef.current.status !== "active"
+          ) {
             return;
           }
-          mediaRequestCallIdRef.current = "";
+          if (!cleaned) {
+            setError("Não foi possível liberar a mídia da chamada anterior. Tente novamente.");
+            return;
+          }
           return requestMedia(call);
         })
         .finally(() => {
-          if (mediaRequestCallIdRef.current === call.call_id) mediaRequestCallIdRef.current = "";
           if (mediaRetryPromiseRef.current?.promise === retrying) {
             mediaRetryPromiseRef.current = null;
           }
@@ -397,7 +474,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     },
     clearTerminal: () => {
       if (state.call && isTerminalCall(state.call.status)) {
-        void mediaRef.current?.stop();
+        void stopMedia();
         callRef.current = null;
         setState(initialCallState);
       }
