@@ -23,6 +23,7 @@ const (
 	testAttachmentID  = "55555555-5555-4555-8555-555555555555"
 	testConversation  = "66666666-6666-4666-8666-666666666666"
 	testStorageObject = "nchat/attachments/55555555-5555-4555-8555-555555555555"
+	testKEKKeyID      = "kek-test-active"
 )
 
 func text(value string) pgtype.Text { return pgtype.Text{String: value, Valid: true} }

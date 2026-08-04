@@ -26,7 +26,7 @@ func newAttachment(kind domain.DestinationKind, destinationID string) service.Ne
 		StorageProvider:  domain.StorageProviderSeaweedFS,
 		StorageObjectKey: testStorageObject,
 		EnvelopeVersion:  1,
-		WrappedDEK:       []byte{1, 2, 3},
+		KeyWrapVersion:   2,
 	}
 }
 
@@ -103,18 +103,33 @@ func TestCreatePendingWrapsDatabaseFailures(t *testing.T) {
 	}
 }
 
+// finalisedAttachment is the shape MarkUploaded requires: the sizes and the key
+// binding together, because the wrapped key authenticates the size.
+func finalisedAttachment(status domain.Status) service.UploadedAttachment {
+	return service.UploadedAttachment{
+		ID: testAttachmentID, Status: status,
+		DetectedMIME: "application/pdf", Size: 10, CiphertextSize: 42,
+		WrappedDEK: []byte{7, 7, 7}, KEKKeyID: testKEKKeyID,
+	}
+}
+
 func TestMarkUploadedOnlyAdvancesAPendingRow(t *testing.T) {
 	pool := &fakePool{exec: func(string, ...any) (pgconn.CommandTag, error) {
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	}}
-	err := storage.NewPGXAttachmentStore(pool).MarkUploaded(context.Background(), service.UploadedAttachment{
-		ID: testAttachmentID, Status: domain.StatusPendingScan,
-		DetectedMIME: "application/pdf", Size: 10, CiphertextSize: 42,
-	})
+	err := storage.NewPGXAttachmentStore(pool).MarkUploaded(context.Background(),
+		finalisedAttachment(domain.StatusPendingScan))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(pool.lastSQL, "AND status = $6") {
+	// The size and the key material must move in the same statement, so a row
+	// can never be downloadable with a length its sealed key does not cover.
+	for _, column := range []string{"size_bytes = $4", "wrapped_dek = $6", "kek_key_id = $7"} {
+		if !strings.Contains(pool.lastSQL, column) {
+			t.Fatalf("the finalising update must set %s", column)
+		}
+	}
+	if !strings.Contains(pool.lastSQL, "AND status = $8") {
 		t.Fatal("the update must pin the previous state so a compensated row cannot be revived")
 	}
 	if pool.lastArgs[len(pool.lastArgs)-1] != string(domain.StatusPendingUpload) {
@@ -135,7 +150,7 @@ func TestMarkUploadedReportsAMissingPendingRow(t *testing.T) {
 		return pgconn.NewCommandTag("UPDATE 0"), nil
 	}}
 	err := storage.NewPGXAttachmentStore(pool).MarkUploaded(context.Background(),
-		service.UploadedAttachment{ID: testAttachmentID, Status: domain.StatusClean})
+		finalisedAttachment(domain.StatusClean))
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -147,9 +162,71 @@ func TestMarkUploadedWrapsDatabaseFailures(t *testing.T) {
 		return pgconn.CommandTag{}, dbErr
 	}}
 	err := storage.NewPGXAttachmentStore(pool).MarkUploaded(context.Background(),
-		service.UploadedAttachment{ID: testAttachmentID, Status: domain.StatusClean})
+		finalisedAttachment(domain.StatusClean))
 	if !errors.Is(err, dbErr) {
 		t.Fatalf("expected the database error to be wrapped, got %v", err)
+	}
+}
+
+// A finalising update without the full binding never reaches the database. It
+// would violate attachments_dek_binding_complete_check there anyway; refusing it
+// here keeps the failure a domain error instead of driver text.
+func TestMarkUploadedRefusesAnIncompleteKeyBinding(t *testing.T) {
+	for name, mutate := range map[string]func(*service.UploadedAttachment){
+		"no wrapped key":    func(u *service.UploadedAttachment) { u.WrappedDEK = nil },
+		"empty wrapped key": func(u *service.UploadedAttachment) { u.WrappedDEK = []byte{} },
+		"no key id":         func(u *service.UploadedAttachment) { u.KEKKeyID = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			pool := &fakePool{}
+			update := finalisedAttachment(domain.StatusClean)
+			mutate(&update)
+
+			if err := storage.NewPGXAttachmentStore(pool).MarkUploaded(
+				context.Background(), update,
+			); !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("expected ErrInvalidInput, got %v", err)
+			}
+			if pool.lastSQL != "" {
+				t.Fatal("an incomplete binding must not reach the database")
+			}
+		})
+	}
+}
+
+// The pending insert must carry no key material: there is none yet.
+func TestCreatePendingWritesNoKeyMaterial(t *testing.T) {
+	pool := &fakePool{}
+	if err := storage.NewPGXAttachmentStore(pool).CreatePending(context.Background(),
+		newAttachment(domain.DestinationKindChannel, testChannelID)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, column := range []string{"wrapped_dek", "kek_key_id"} {
+		if strings.Contains(pool.lastSQL, column) {
+			t.Fatalf("the pending insert must not write %s", column)
+		}
+	}
+	// It must write the wrap version, though: that column is NOT NULL with no
+	// default, so naming it is the schema fence against the previous build.
+	if !strings.Contains(pool.lastSQL, "dek_wrap_version") {
+		t.Fatal("the pending insert must name dek_wrap_version")
+	}
+}
+
+// A caller that omits the wrap version never reaches the database: the not-null
+// violation would otherwise surface as driver text.
+func TestCreatePendingRequiresTheKeyWrapVersion(t *testing.T) {
+	pool := &fakePool{}
+	attachment := newAttachment(domain.DestinationKindChannel, testChannelID)
+	attachment.KeyWrapVersion = 0
+
+	if err := storage.NewPGXAttachmentStore(pool).CreatePending(
+		context.Background(), attachment,
+	); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if pool.lastSQL != "" {
+		t.Fatal("an attachment without a wrap version must not reach the database")
 	}
 }
 
@@ -192,6 +269,8 @@ func authorizedAttachmentRow(status domain.Status) []any {
 		text(testStorageObject),
 		pgtype.Int2{Int16: 1, Valid: true},
 		[]byte{9, 9, 9},
+		text(testKEKKeyID),
+		pgtype.Int2{Int16: 2, Valid: true},
 		timestamp(time.Now()),
 	}
 }
@@ -212,6 +291,11 @@ func TestGetAuthorizedReturnsTheStoredAttachment(t *testing.T) {
 	}
 	if record.StorageObjectKey != testStorageObject || record.EnvelopeVersion != 1 {
 		t.Fatalf("unexpected storage fields: %+v", record)
+	}
+	// The key id has to survive the read: without it the download cannot pick a
+	// key, and a row that lost it must fail closed rather than default to one.
+	if record.KEKKeyID != testKEKKeyID || record.KeyWrapVersion != 2 {
+		t.Fatalf("unexpected key binding: id=%q version=%d", record.KEKKeyID, record.KeyWrapVersion)
 	}
 	if record.Size != 1234 || record.Filename != "report.pdf" {
 		t.Fatalf("unexpected metadata: %+v", record)
