@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -29,9 +30,16 @@ type SidebarData struct {
 }
 
 // SidebarChannel carries server-derived destination eligibility.
+//
+// LastMessageAt is the channel's activity instant, nil when it has never been
+// written to (issue #414). It is carried through untouched from the authorized
+// listing query — this layer neither derives it nor substitutes created_at for
+// a missing one, because "has activity" and "was created" are two different
+// facts and the ordering rule needs to tell them apart.
 type SidebarChannel struct {
-	Channel  domain.Channel
-	CanWrite bool
+	Channel       domain.Channel
+	CanWrite      bool
+	LastMessageAt *time.Time
 }
 
 type sidebarChannelStore interface {
@@ -98,8 +106,9 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 	sidebarChannels := make([]SidebarChannel, 0, len(channels))
 	for _, access := range channels {
 		sidebarChannels = append(sidebarChannels, SidebarChannel{
-			Channel:  access.Channel,
-			CanWrite: domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+			Channel:       access.Channel,
+			CanWrite:      domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+			LastMessageAt: access.LastMessageAt,
 		})
 	}
 

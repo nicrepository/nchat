@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
 import { partitionDMs, type Channel, type CurrentUser, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
+import { sortByActivity } from "./sidebarOrder";
 
 /**
  * Placeholder user shown in the sidebar footer.
@@ -444,8 +445,26 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const activeDMId = activeType === "dm" ? activeId : undefined;
 
   // Derived on every render from the canonical list, so a refetch that reorders
-  // or replaces items cannot leave a stale copy behind in either section.
-  const { directs, groups } = partitionDMs(state.status === "ready" ? state.dms : []);
+  // or replaces items cannot leave a stale copy behind in either section, and
+  // each section is then ordered by its own activity and by nothing else's
+  // (issue #414). Three independent sorts over three disjoint lists: a busy
+  // channel cannot move a group, and a busy group cannot move a DM. Ordering
+  // here, on the rendered value rather than where the data arrives, means every
+  // source of change — first load, refetch, realtime activity — lands in the
+  // same order without each having to remember to re-apply it.
+  //
+  // `sortByActivity` copies before sorting, so neither the props nor the
+  // reducer's state array is ever reordered in place. Rows are keyed by
+  // conversation id (never by index), so React moves the existing DOM nodes
+  // instead of rewriting them: the selected row stays selected, focus stays on
+  // the element that had it, and the scroll position survives a reorder.
+  const channels = state.status === "ready" ? state.channels : undefined;
+  const dms = state.status === "ready" ? state.dms : undefined;
+  const orderedChannels = useMemo(() => sortByActivity(channels ?? []), [channels]);
+  const { orderedDirects, orderedGroups } = useMemo(() => {
+    const { directs, groups } = partitionDMs(dms ?? []);
+    return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
+  }, [dms]);
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -528,7 +547,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
           <>
             <Section labelId={CHANNELS_LABEL_ID} title="Canais">
               <ChannelList
-                channels={state.channels}
+                channels={orderedChannels}
                 activeChannelId={activeChannelId}
                 onSelect={handleChannelSelect}
                 labelId={CHANNELS_LABEL_ID}
@@ -537,7 +556,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
             <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
               <DMList
-                dms={directs}
+                dms={orderedDirects}
                 activeDMId={activeDMId}
                 onSelect={handleDMSelect}
                 labelId={DIRECTS_LABEL_ID}
@@ -547,7 +566,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
             <Section labelId={GROUPS_LABEL_ID} title="Grupos" spaced>
               <DMList
-                dms={groups}
+                dms={orderedGroups}
                 activeDMId={activeDMId}
                 onSelect={handleDMSelect}
                 labelId={GROUPS_LABEL_ID}

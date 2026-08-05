@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -51,9 +52,15 @@ type UpdateChannelInput struct {
 }
 
 // VisibleChannelAccess carries the membership used to evaluate channel policy.
+//
+// LastMessageAt is the created_at of the channel's newest message, or nil when
+// it has none (issue #414) — the same activity instant, with the same
+// guarantees, that domain.DMConversationWithParticipantIDs documents for
+// conversations.
 type VisibleChannelAccess struct {
 	Channel       domain.Channel
 	ChannelMember *domain.ChannelMember
+	LastMessageAt *time.Time
 }
 
 // ChannelStore is the persistence interface for channel operations.
@@ -428,13 +435,23 @@ func (s *PGXChannelStore) ListVisibleChannelsByUser(ctx context.Context, workspa
 
 // ListVisibleChannelAccessByUser returns visible channels and the caller's
 // optional channel membership in one query.
+//
+// Each row also carries the channel's activity instant (issue #414), resolved
+// by a lateral join in this same statement rather than by one read per channel:
+// the cost of the listing does not grow with a query per row however many
+// channels the user can see. The lateral hangs off rows the visibility
+// predicate has already admitted — the same predicate that decides whether the
+// channel appears at all — so a private channel the caller is not a member of
+// neither appears here nor has its activity read. It projects created_at and
+// nothing else; no message content, author or id is selected.
 func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, workspaceID, userID string) ([]VisibleChannelAccess, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id, c.workspace_id, COALESCE(c.category_id::text, ''), c.slug, c.display_name,
 		       c.type, c.status, c.is_general, c.position, COALESCE(c.created_by::text, ''),
 		       c.created_at, c.updated_at,
 		       COALESCE(cm.channel_id::text, ''), COALESCE(cm.user_id::text, ''),
-		       COALESCE(cm.role::text, '')
+		       COALESCE(cm.role::text, ''),
+		       lm.created_at AS last_message_at
 		FROM chat.channels c
 		JOIN chat.workspaces w
 		  ON c.workspace_id = w.id AND w.status = 'active'
@@ -442,6 +459,14 @@ func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, wo
 		  ON wm.workspace_id = c.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
 		LEFT JOIN chat.channel_members cm
 		  ON cm.channel_id = c.id AND cm.user_id = $2
+		LEFT JOIN LATERAL (
+		    SELECT m.created_at
+		    FROM chat.messages m
+		    WHERE m.workspace_id = c.workspace_id
+		      AND m.channel_id = c.id
+		    ORDER BY m.created_at DESC, m.id DESC
+		    LIMIT 1
+		) lm ON true
 		WHERE c.workspace_id = $1
 		  AND c.status = 'active'
 		  AND (c.is_general = true OR c.type = 'public' OR cm.channel_id IS NOT NULL)
@@ -457,11 +482,13 @@ func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, wo
 	for rows.Next() {
 		var ch domain.Channel
 		var memberChannelID, memberUserID, memberRole string
+		var lastMessageAt *time.Time
 		if err := rows.Scan(
 			&ch.ID, &ch.WorkspaceID, &ch.CategoryID, &ch.Slug, &ch.DisplayName,
 			(*string)(&ch.Type), (*string)(&ch.Status), &ch.IsGeneral, &ch.Position, &ch.CreatedBy,
 			&ch.CreatedAt, &ch.UpdatedAt,
 			&memberChannelID, &memberUserID, &memberRole,
+			&lastMessageAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan visible channel: %w", err)
 		}
@@ -473,7 +500,7 @@ func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, wo
 				Role:      domain.ChannelRole(memberRole),
 			}
 		}
-		accesses = append(accesses, VisibleChannelAccess{Channel: ch, ChannelMember: member})
+		accesses = append(accesses, VisibleChannelAccess{Channel: ch, ChannelMember: member, LastMessageAt: lastMessageAt})
 	}
 	return accesses, rows.Err()
 }

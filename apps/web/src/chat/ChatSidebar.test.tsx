@@ -1310,6 +1310,260 @@ describe("ChatSidebar — section classification", () => {
   });
 });
 
+// ── Activity ordering (ISSUE #414) ───────────────────────────────────────────
+// Three sections, three independent orders. These assert what is rendered, so
+// the fixtures are deliberately given in the *wrong* order: an assertion that
+// passed on input order would prove nothing.
+
+describe("ChatSidebar — activity ordering", () => {
+  const channel = (id: string, overrides: Partial<Channel> = {}): Channel => ({
+    id,
+    name: id,
+    type: "public",
+    canWrite: true,
+    ...overrides,
+  });
+  const dm = (id: string, type: "1:1" | "group", overrides: Partial<DMConversation> = {}) => ({
+    id,
+    type,
+    name: id,
+    participants: [],
+    ...overrides,
+  });
+
+  const section = (name: string) => screen.getByRole("region", { name });
+  // The accessible name, not the text content: a DM row also renders avatar
+  // initials, and this is about which rows are where, not how they look.
+  const optionNamesIn = (name: string) =>
+    within(section(name))
+      .queryAllByRole("option")
+      .map((option) => option.getAttribute("aria-label"));
+
+  const readyState = (channels: Channel[], dms: DMConversation[]) => ({
+    status: "ready" as const,
+    currentUserId: "user-a",
+    channels,
+    dms,
+  });
+
+  const renderState = (channels: Channel[], dms: DMConversation[], path = "/chat") =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <ChatSidebar state={readyState(channels, dms)} retry={() => {}} />
+      </MemoryRouter>,
+    );
+
+  it("orders channels by their own last message, newest first", () => {
+    renderState(
+      [
+        channel("quieto", { lastMessageAt: "2026-07-28T08:00:00Z" }),
+        channel("agitado", { lastMessageAt: "2026-07-30T18:00:00Z" }),
+        channel("medio", { lastMessageAt: "2026-07-29T09:00:00Z" }),
+      ],
+      [],
+    );
+
+    expect(optionNamesIn("Canais")).toEqual(["Canal agitado", "Canal medio", "Canal quieto"]);
+  });
+
+  it("orders direct messages independently of every other section", () => {
+    renderState(
+      [
+        channel("canal-antigo", { lastMessageAt: "2020-01-01T00:00:00Z" }),
+        channel("canal-novo", { lastMessageAt: "2026-08-01T00:00:00Z" }),
+      ],
+      [
+        dm("dm-antiga", "1:1", { lastMessageAt: "2026-07-01T00:00:00Z" }),
+        dm("dm-nova", "1:1", { lastMessageAt: "2026-07-31T00:00:00Z" }),
+        dm("grupo-antigo", "group", { lastMessageAt: "2026-07-02T00:00:00Z" }),
+        dm("grupo-novo", "group", { lastMessageAt: "2026-07-30T00:00:00Z" }),
+      ],
+    );
+
+    expect(optionNamesIn("Canais")).toEqual(["Canal canal-novo", "Canal canal-antigo"]);
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com dm-nova",
+      "Mensagem direta com dm-antiga",
+    ]);
+    expect(optionNamesIn("Grupos")).toEqual(["Grupo grupo-novo", "Grupo grupo-antigo"]);
+  });
+
+  it("keeps conversations without messages after every active one", () => {
+    // The empty conversations were created *after* both active ones were last
+    // written in, and must still sit behind them.
+    renderState(
+      [
+        channel("vazio-recente", { createdAt: "2026-08-02T00:00:00Z" }),
+        channel("ativo-antigo", {
+          createdAt: "2020-01-01T00:00:00Z",
+          lastMessageAt: "2024-05-05T00:00:00Z",
+        }),
+        channel("vazio-antigo", { createdAt: "2026-08-01T00:00:00Z" }),
+        channel("ativo-recente", {
+          createdAt: "2020-01-01T00:00:00Z",
+          lastMessageAt: "2026-07-30T00:00:00Z",
+        }),
+      ],
+      [],
+    );
+
+    expect(optionNamesIn("Canais")).toEqual([
+      "Canal ativo-recente",
+      "Canal ativo-antigo",
+      "Canal vazio-recente",
+      "Canal vazio-antigo",
+    ]);
+  });
+
+  // Two messages written inside the same millisecond are two different
+  // instants; the rendered order has to follow the microseconds and not fall
+  // through to the name/id tie-breakers.
+  it("orders by the microseconds when two messages share a millisecond", () => {
+    const { rerender } = renderState(
+      [
+        // Named so that an alphabetical tie-break would put "anterior" first.
+        channel("anterior", { lastMessageAt: "2026-08-04T12:00:00.900045Z" }),
+        channel("posterior", { lastMessageAt: "2026-08-04T12:00:00.900123Z" }),
+      ],
+      [
+        dm("dm-1", "1:1", { name: "Juliane", lastMessageAt: "2026-08-04T12:00:00.900045Z" }),
+        dm("dm-2", "1:1", { name: "Caio", lastMessageAt: "2026-08-04T12:00:00.900123Z" }),
+      ],
+      "/chat/dm/dm-1",
+    );
+
+    expect(optionNamesIn("Canais")).toEqual(["Canal posterior", "Canal anterior"]);
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com Caio",
+      "Mensagem direta com Juliane",
+    ]);
+    // Sections stay independent, and the open conversation stays selected.
+    expect(optionNamesIn("Grupos")).toEqual([]);
+    expect(screen.getByRole("option", { name: "Mensagem direta com Juliane" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // A message 78µs newer than the leader promotes the selected conversation.
+    rerender(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <ChatSidebar
+          state={readyState(
+            [
+              channel("anterior", { lastMessageAt: "2026-08-04T12:00:00.900045Z" }),
+              channel("posterior", { lastMessageAt: "2026-08-04T12:00:00.900123Z" }),
+            ],
+            [
+              dm("dm-1", "1:1", { name: "Juliane", lastMessageAt: "2026-08-04T12:00:00.900201Z" }),
+              dm("dm-2", "1:1", { name: "Caio", lastMessageAt: "2026-08-04T12:00:00.900123Z" }),
+            ],
+          )}
+          retry={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com Juliane",
+      "Mensagem direta com Caio",
+    ]);
+    // The channels did not move: a DM event is a DM event.
+    expect(optionNamesIn("Canais")).toEqual(["Canal posterior", "Canal anterior"]);
+    expect(screen.getByRole("option", { name: "Mensagem direta com Juliane" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("breaks ties by name and then by id", () => {
+    const sameInstant = "2026-07-30T10:00:00Z";
+    renderState(
+      [
+        channel("id-z", { name: "Zeta", lastMessageAt: sameInstant }),
+        channel("id-b", { name: "alfa", lastMessageAt: sameInstant }),
+        channel("id-a", { name: "Alfa", lastMessageAt: sameInstant }),
+      ],
+      [],
+    );
+
+    expect(optionNamesIn("Canais")).toEqual(["Canal Alfa", "Canal alfa", "Canal Zeta"]);
+  });
+
+  it("keeps the open conversation selected when its section is reordered", () => {
+    const before = [
+      dm("dm-1", "1:1", { name: "Juliane", lastMessageAt: "2026-07-30T10:00:00Z" }),
+      dm("dm-2", "1:1", { name: "Caio", lastMessageAt: "2026-07-29T10:00:00Z" }),
+    ];
+    const { rerender } = renderState([], before, "/chat/dm/dm-2");
+
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com Juliane",
+      "Mensagem direta com Caio",
+    ]);
+    const selected = screen.getByRole("option", { name: "Mensagem direta com Caio" });
+    expect(selected).toHaveAttribute("aria-selected", "true");
+    // Focus survives the move because rows are keyed by conversation id.
+    selected.focus();
+
+    rerender(
+      <MemoryRouter initialEntries={["/chat/dm/dm-2"]}>
+        <ChatSidebar
+          state={readyState(
+            [],
+            [
+              dm("dm-1", "1:1", { name: "Juliane", lastMessageAt: "2026-07-30T10:00:00Z" }),
+              dm("dm-2", "1:1", { name: "Caio", lastMessageAt: "2026-07-31T10:00:00Z" }),
+            ],
+          )}
+          retry={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(optionNamesIn("Mensagens diretas")).toEqual([
+      "Mensagem direta com Caio",
+      "Mensagem direta com Juliane",
+    ]);
+    const promoted = screen.getByRole("option", { name: "Mensagem direta com Caio" });
+    expect(promoted).toHaveAttribute("aria-selected", "true");
+    expect(promoted).toHaveFocus();
+  });
+
+  it("does not reorder the arrays it was given", () => {
+    const channels = [
+      channel("b", { lastMessageAt: "2026-07-01T00:00:00Z" }),
+      channel("a", { lastMessageAt: "2026-07-02T00:00:00Z" }),
+    ];
+    const dms = [
+      dm("dm-b", "1:1", { lastMessageAt: "2026-07-01T00:00:00Z" }),
+      dm("dm-a", "1:1", { lastMessageAt: "2026-07-02T00:00:00Z" }),
+    ];
+    renderState(channels, dms);
+
+    expect(channels.map((item) => item.id)).toEqual(["b", "a"]);
+    expect(dms.map((item) => item.id)).toEqual(["dm-b", "dm-a"]);
+  });
+
+  it("keeps keyboard navigation walking each section in rendered order", async () => {
+    const user = userEvent.setup();
+    renderState(
+      [
+        channel("canal-antigo", { lastMessageAt: "2026-07-01T00:00:00Z" }),
+        channel("canal-novo", { lastMessageAt: "2026-07-31T00:00:00Z" }),
+      ],
+      [dm("dm-1", "1:1", { name: "Juliane", lastMessageAt: "2026-07-02T00:00:00Z" })],
+    );
+
+    const trigger = screen.getByRole("button", { name: "Nova conversa" });
+    trigger.focus();
+
+    for (const label of ["Canal canal-novo", "Canal canal-antigo", "Mensagem direta com Juliane"]) {
+      await user.tab();
+      expect(screen.getByRole("option", { name: label })).toHaveFocus();
+    }
+  });
+});
+
 // ── Post-creation placement (ISSUE #396) ──────────────────────────────────────
 // Each creation mode lands in its own section, and it lands there because the
 // canonical refetch put it there — never because the UI kept a parallel list.

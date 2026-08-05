@@ -23,7 +23,8 @@ func channelCols() []string {
 }
 
 func visibleChannelAccessCols() []string {
-	return append(channelCols(), "member_channel_id", "member_user_id", "member_role")
+	// last_message_at is the issue #414 activity instant, nullable by contract.
+	return append(channelCols(), "member_channel_id", "member_user_id", "member_role", "last_message_at")
 }
 
 func TestPGXChannelStore_CreateChannel_Success(t *testing.T) {
@@ -274,8 +275,8 @@ func TestPGXChannelStore_ListVisibleChannelsByUser_ReturnsChannels(t *testing.T)
 	mock.ExpectQuery(`(?s)FROM chat\.channels c.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.workspace_id = c\.workspace_id.*wm\.user_id = \$2.*wm\.status = 'active'.*LEFT JOIN chat\.channel_members cm.*cm\.channel_id = c\.id.*cm\.user_id = \$2.*WHERE c\.workspace_id = \$1.*c\.status = 'active'.*c\.is_general = true OR c\.type = 'public' OR cm\.channel_id IS NOT NULL`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(visibleChannelAccessCols()).
-			AddRow("ch-geral", "ws-1", "", "geral", "Geral", "public", "active", true, 0, "", now, now, "", "", "").
-			AddRow("ch-pub", "ws-1", "", "pub", "Public", "public", "active", false, 1, "", now, now, "", "", ""))
+			AddRow("ch-geral", "ws-1", "", "geral", "Geral", "public", "active", true, 0, "", now, now, "", "", "", nil).
+			AddRow("ch-pub", "ws-1", "", "pub", "Public", "public", "active", false, 1, "", now, now, "", "", "", &now))
 
 	store := storage.NewPGXChannelStore(mock)
 	channels, err := store.ListVisibleChannelsByUser(context.Background(), "ws-1", "user-1")
@@ -322,8 +323,8 @@ func TestPGXChannelStore_ListVisibleChannelAccessByUser_ReturnsMembershipWithout
 	mock.ExpectQuery(`SELECT c.id, c.workspace_id`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(visibleChannelAccessCols()).
-			AddRow("ch-public", "ws-1", "", "public", "Public", "public", "active", false, 0, "", now, now, "", "", "").
-			AddRow("ch-private", "ws-1", "", "private", "Private", "private", "active", false, 1, "", now, now, "ch-private", "user-1", "member"))
+			AddRow("ch-public", "ws-1", "", "public", "Public", "public", "active", false, 0, "", now, now, "", "", "", nil).
+			AddRow("ch-private", "ws-1", "", "private", "Private", "private", "active", false, 1, "", now, now, "ch-private", "user-1", "member", &now))
 
 	store := storage.NewPGXChannelStore(mock)
 	accesses, err := store.ListVisibleChannelAccessByUser(context.Background(), "ws-1", "user-1")
@@ -335,6 +336,14 @@ func TestPGXChannelStore_ListVisibleChannelAccessByUser_ReturnsMembershipWithout
 	}
 	if accesses[1].ChannelMember == nil || accesses[1].ChannelMember.UserID != "user-1" {
 		t.Fatalf("expected real private membership, got %+v", accesses[1])
+	}
+	// The activity instant rides on the same row (issue #414): a channel that
+	// has never been written in reports none, and one that has reports when.
+	if accesses[0].LastMessageAt != nil {
+		t.Fatalf("expected no activity for the empty channel, got %v", accesses[0].LastMessageAt)
+	}
+	if accesses[1].LastMessageAt == nil || !accesses[1].LastMessageAt.Equal(now) {
+		t.Fatalf("expected the row's activity instant, got %v", accesses[1].LastMessageAt)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("expected one query for all channel memberships: %v", err)

@@ -48,6 +48,9 @@ interface SidebarChannelResponse {
   is_general: boolean;
   /** Optional only while pre-RF-08 sidebar responses remain in rolling deploys. */
   can_write?: unknown;
+  /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
+  created_at?: unknown;
+  last_message_at?: unknown;
 }
 
 interface SidebarDMCounterpartResponse {
@@ -63,6 +66,9 @@ interface SidebarDMResponse {
   name: string;
   /** Absent on group DMs and on pre-counterpart server responses. */
   counterpart?: SidebarDMCounterpartResponse;
+  /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
+  created_at?: unknown;
+  last_message_at?: unknown;
 }
 
 interface SidebarResponse {
@@ -115,12 +121,29 @@ async function fetchSidebar(): Promise<SidebarResponse> {
   return res.data;
 }
 
+/**
+ * Keeps a sidebar ordering timestamp only when the server really sent one
+ * (issue #414).
+ *
+ * Anything that is not a non-empty string — null, absent, a number, an object —
+ * becomes `null`, which the comparator reads as "no such instant". The value is
+ * not parsed here: `Date.parse` is applied at comparison time, where an
+ * unparseable string is handled by the same rule as a missing one. Substituting
+ * a client-side clock for a value the server did not send is exactly what this
+ * field must never do.
+ */
+function sidebarTimestamp(raw: unknown): string | null {
+  return typeof raw === "string" && raw !== "" ? raw : null;
+}
+
 function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
   return {
     id: ch.id,
     name: ch.display_name || ch.slug,
     type: ch.type,
     canWrite: ch.can_write === true,
+    createdAt: sidebarTimestamp(ch.created_at),
+    lastMessageAt: sidebarTimestamp(ch.last_message_at),
   };
 }
 
@@ -225,6 +248,8 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     name: dm.name,
     participants: [],
     counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
+    createdAt: sidebarTimestamp(dm.created_at),
+    lastMessageAt: sidebarTimestamp(dm.last_message_at),
   };
 }
 
