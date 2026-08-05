@@ -345,12 +345,26 @@ type DMMember struct {
 // whatever auth.users stores; the client decides whether it is renderable and
 // falls back to initials. The counterpart's e-mail, status, auth source and
 // external subject are never carried here.
+// LastMessageAt is the created_at of the newest message persisted in the
+// conversation, or nil when it has none (issue #414). It is the conversation's
+// activity instant and nothing else: a timestamp the database assigned when the
+// message row was written, never a client-supplied value, never the moment an
+// event was published or received, and never touched by an edit, a reaction or
+// a rename. Nil is a real answer — "no activity yet" — and is what makes an
+// empty conversation orderable *after* every conversation that has activity,
+// rather than being folded into created_at and competing with it.
+//
+// It carries no content: not the body, the author, the kind or the message id.
+// Its visibility is the conversation's own — it is produced by the same
+// authorized listing query, so a conversation the caller may not read never
+// reaches this struct to have an activity instant read off it.
 type DMConversationWithParticipantIDs struct {
 	DMConversation
 	ParticipantIDs         []string
 	CounterpartUserID      string
 	CounterpartDisplayName string
 	CounterpartAvatarURL   string
+	LastMessageAt          *time.Time
 }
 
 // DMCandidate is the minimal profile data exposed when starting a direct DM.

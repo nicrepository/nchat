@@ -18,7 +18,17 @@ export const THIRD_CANDIDATE_NAME = "E2E Candidata Três";
 type TargetKind = "channel" | "dm";
 type ConversationAccessGuard = (targetId: string) => boolean;
 
-interface SidebarChannelFixture {
+/**
+ * The two ordering keys the real sidebar sorts each section by (issue #414).
+ * Optional here because most specs do not care where a row lands, and the app
+ * must render a payload that carries neither.
+ */
+interface SidebarActivityFixture {
+  created_at?: string;
+  last_message_at?: string | null;
+}
+
+interface SidebarChannelFixture extends SidebarActivityFixture {
   id: string;
   slug: string;
   display_name: string;
@@ -27,7 +37,7 @@ interface SidebarChannelFixture {
   unread_count: number;
 }
 
-interface SidebarDMFixture {
+interface SidebarDMFixture extends SidebarActivityFixture {
   id: string;
   type: "direct" | "group";
   name: string;

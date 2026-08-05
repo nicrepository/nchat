@@ -420,7 +420,7 @@ func TestPGXDMStore_GetVisibleConversationByID_SuccessAndDatabaseError(t *testin
 // ── ListVisibleConversationsWithParticipantIDs tests ──────────────────────────
 
 func dmWithParticipantCols() []string {
-	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids", "counterpart_user_id", "counterpart_display_name", "counterpart_avatar_url"}
+	return []string{"id", "workspace_id", "type", "title", "status", "created_by", "created_at", "updated_at", "participant_ids", "counterpart_user_id", "counterpart_display_name", "counterpart_avatar_url", "last_message_at"}
 }
 
 func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly(t *testing.T) {
@@ -436,7 +436,7 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 	mock.ExpectQuery(`(?s)counterpart_display_name.*counterpart_avatar_url.*FROM chat\.dm_conversations dc.*JOIN chat\.workspaces w.*JOIN chat\.workspace_members wm.*wm\.user_id = \$2.*JOIN chat\.dm_members dm.*dm\.user_id = \$2`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}, "user-2", "Juliane Lino", "/media/avatars/juliane.png"))
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", "user-2"}, "user-2", "Juliane Lino", "/media/avatars/juliane.png", &now))
 
 	store := storage.NewPGXDMStore(mock)
 	convs, err := store.ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
@@ -461,6 +461,10 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_ReturnsMemberOnly
 	if convs[0].CounterpartAvatarURL != "/media/avatars/juliane.png" {
 		t.Fatalf("expected counterpart avatar url, got %q", convs[0].CounterpartAvatarURL)
 	}
+	// The activity instant (issue #414) is resolved in this same statement.
+	if convs[0].LastMessageAt == nil || !convs[0].LastMessageAt.Equal(now) {
+		t.Fatalf("expected the row's activity instant, got %v", convs[0].LastMessageAt)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}
@@ -482,7 +486,7 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_SingleQueryForMan
 	for i, name := range want {
 		id := fmt.Sprintf("dm-%d", i)
 		peer := fmt.Sprintf("user-%d", i+2)
-		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", peer}, peer, name, "")
+		rows.AddRow(id, "ws-1", "direct", "", "active", "user-1", now, now, []string{"user-1", peer}, peer, name, "", nil)
 	}
 	// The ORDER BY is asserted here so that adding counterpart columns can never
 	// silently reorder the sidebar.
@@ -521,7 +525,7 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounter
 	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*LEFT JOIN LATERAL.*dc\.type = 'direct'`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, []string{"user-1", "user-2", "user-3"}, "", "", ""))
+			AddRow("dm-grp", "ws-1", "group", "Equipe Infra", "active", "user-1", now, now, []string{"user-1", "user-2", "user-3"}, "", "", "", nil))
 
 	convs, err := storage.NewPGXDMStore(mock).ListVisibleConversationsWithParticipantIDs(context.Background(), "ws-1", "user-1")
 	if err != nil {
@@ -535,6 +539,11 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_GroupHasNoCounter
 	}
 	if convs[0].Title != "Equipe Infra" {
 		t.Fatalf("group DM must keep its title, got %q", convs[0].Title)
+	}
+	// A group with no messages reports no activity, never its creation instant
+	// dressed up as one (issue #414).
+	if convs[0].LastMessageAt != nil {
+		t.Fatalf("expected no activity instant, got %v", convs[0].LastMessageAt)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -594,8 +603,8 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_PropagatesRowFail
 	}{
 		{name: "scan", rows: pgxmock.NewRows([]string{"id"}).AddRow("dm-1")},
 		{name: "rows", rows: pgxmock.NewRows(dmWithParticipantCols()).
-			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}, "user-2", "Ana", "").
-			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}, "user-3", "Bruno", "").
+			AddRow("dm-1", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-2"}, "user-2", "Ana", "", nil).
+			AddRow("dm-2", "ws-1", "direct", "", "active", "user-1", time.Now(), time.Now(), []string{"user-1", "user-3"}, "user-3", "Bruno", "", nil).
 			RowError(1, errors.New("rows failed"))},
 	} {
 		t.Run(test.name, func(t *testing.T) {

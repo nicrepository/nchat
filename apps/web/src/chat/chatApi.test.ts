@@ -222,8 +222,22 @@ describe("fetchChannels", () => {
 
     const channels = await fetchChannels();
     expect(channels).toHaveLength(2);
-    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public", canWrite: true });
-    expect(channels[1]).toEqual({ id: "ch-2", name: "eng", type: "private", canWrite: false });
+    expect(channels[0]).toEqual({
+      id: "ch-1",
+      name: "geral",
+      type: "public",
+      canWrite: true,
+      createdAt: null,
+      lastMessageAt: null,
+    });
+    expect(channels[1]).toEqual({
+      id: "ch-2",
+      name: "eng",
+      type: "private",
+      canWrite: false,
+      createdAt: null,
+      lastMessageAt: null,
+    });
   });
 
   it("fails closed when can_write is missing or unexpected", async () => {
@@ -320,7 +334,14 @@ describe("fetchDMs", () => {
 
     const dms = await fetchDMs();
     expect(dms).toHaveLength(1);
-    expect(dms[0]).toEqual({ id: "dm-1", type: "1:1", name: "Juliane Lino", participants: [] });
+    expect(dms[0]).toEqual({
+      id: "dm-1",
+      type: "1:1",
+      name: "Juliane Lino",
+      participants: [],
+      createdAt: null,
+      lastMessageAt: null,
+    });
   });
 
   it("maps the counterpart identity of a 1:1 DM", async () => {
@@ -589,9 +610,23 @@ describe("fetchSidebarData", () => {
 
     const { channels, dms } = await fetchSidebarData();
     expect(channels).toHaveLength(1);
-    expect(channels[0]).toEqual({ id: "ch-1", name: "geral", type: "public", canWrite: true });
+    expect(channels[0]).toEqual({
+      id: "ch-1",
+      name: "geral",
+      type: "public",
+      canWrite: true,
+      createdAt: null,
+      lastMessageAt: null,
+    });
     expect(dms).toHaveLength(1);
-    expect(dms[0]).toEqual({ id: "dm-1", type: "1:1", name: "Juliane", participants: [] });
+    expect(dms[0]).toEqual({
+      id: "dm-1",
+      type: "1:1",
+      name: "Juliane",
+      participants: [],
+      createdAt: null,
+      lastMessageAt: null,
+    });
     expect(mockAuthFetch).toHaveBeenCalledTimes(1);
   });
 
@@ -601,6 +636,84 @@ describe("fetchSidebarData", () => {
     );
     const { dms } = await fetchSidebarData();
     expect(dms[0].type).toBe("group");
+  });
+
+  // ISSUE #414 — the two ordering keys travel on the items the sidebar already
+  // loads, and an empty conversation reports no activity rather than borrowing
+  // its creation instant.
+  it("maps the activity timestamps of channels and conversations", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            can_write: true,
+            created_at: "2026-01-01T00:00:00Z",
+            last_message_at: "2026-07-30T10:00:00Z",
+          },
+          {
+            id: "ch-2",
+            slug: "vazio",
+            display_name: "vazio",
+            type: "public",
+            can_write: true,
+            created_at: "2026-07-31T00:00:00Z",
+            last_message_at: null,
+          },
+        ],
+        dms: [
+          {
+            id: "dm-1",
+            type: "direct",
+            name: "Juliane",
+            created_at: "2026-02-02T00:00:00Z",
+            last_message_at: "2026-07-29T18:00:00Z",
+          },
+        ],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0]).toMatchObject({
+      createdAt: "2026-01-01T00:00:00Z",
+      lastMessageAt: "2026-07-30T10:00:00Z",
+    });
+    expect(channels[1]).toMatchObject({
+      createdAt: "2026-07-31T00:00:00Z",
+      lastMessageAt: null,
+    });
+    expect(dms[0]).toMatchObject({
+      createdAt: "2026-02-02T00:00:00Z",
+      lastMessageAt: "2026-07-29T18:00:00Z",
+    });
+  });
+
+  // A server that predates the field, or a payload where it is not a string,
+  // must not be turned into an invented instant.
+  it("treats a missing or non-string activity timestamp as absent", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            can_write: true,
+            last_message_at: 1_754_000_000,
+          },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Juliane" }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0]?.lastMessageAt).toBeNull();
+    expect(channels[0]?.createdAt).toBeNull();
+    expect(dms[0]?.lastMessageAt).toBeNull();
   });
 
   it("returns empty arrays when sidebar lists are empty", async () => {
