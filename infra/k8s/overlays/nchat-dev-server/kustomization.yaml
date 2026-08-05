@@ -63,10 +63,12 @@ labels:
     includeTemplates: true
     pairs:
       app.kubernetes.io/instance: nchat-dev
-# NOTE: kustomize matches a replacement selector's kind and name as regular
-# expressions, so `kind: Ingress` also matches `IngressRoute` and a bare
-# `name: nchat-dev` also matches `nchat-dev-uploads`. Every selector below is
-# anchored so each replacement lands on exactly the resource it names.
+# NOTE: a replacement target's select.kind/select.name match the resource's
+# exact Kind and metadata.name (resid.ResId.IsSelectedBy does a plain string
+# comparison, not a regex) — so `kind: Ingress` cannot match `IngressRoute`
+# and `name: nchat-dev` cannot match `nchat-dev-uploads`. Anchoring these
+# values (e.g. `^Ingress$`) would instead break the match: it compares the
+# literal anchored string against the unanchored Kind/name and never equals.
 replacements:
   - source:
       kind: ConfigMap
@@ -74,33 +76,33 @@ replacements:
       fieldPath: data.NCHAT_DEV_HOST
     targets:
       - select:
-          kind: ^Certificate$
-          name: ^nchat-dev-tls$
+          kind: Certificate
+          name: nchat-dev-tls
         fieldPaths:
           - spec.dnsNames.0
       - select:
-          kind: ^Ingress$
-          name: ^nchat-dev$
+          kind: Ingress
+          name: nchat-dev
         fieldPaths:
           - spec.tls.0.hosts.0
           - spec.rules.0.host
       - select:
-          kind: ^IngressRoute$
-          name: ^nchat-dev-uploads$
+          kind: IngressRoute
+          name: nchat-dev-uploads
         fieldPaths:
           - spec.routes.0.match
         options:
           delimiter: "`"
           index: 1
       - select:
-          kind: ^Ingress$
-          name: ^nchat-dev-livekit$
+          kind: Ingress
+          name: nchat-dev-livekit
         fieldPaths:
           - spec.tls.0.hosts.0
           - spec.rules.0.host
       - select:
-          kind: ^Ingress$
-          name: ^nchat-dev-http$
+          kind: Ingress
+          name: nchat-dev-http
         fieldPaths:
           - spec.rules.0.host
   - source:

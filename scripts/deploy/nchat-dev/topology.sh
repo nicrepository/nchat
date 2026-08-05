@@ -3,6 +3,24 @@
 # The caller must enable: set -Eeuo pipefail.
 
 NCHAT_DEV_TOPOLOGY_KEYS_RE='^(NCHAT_DEV_NODE_IP|NCHAT_DEV_NODE_CIDR|NCHAT_DEV_HOST|NCHAT_DEV_PUBLIC_URL|LIVEKIT_API_PORT|LIVEKIT_API_URL|LIVEKIT_RTC_TCP_PORT|LIVEKIT_RTC_UDP_PORT|TURN_LISTEN_PORT|TURN_RELAY_MIN_PORT|TURN_RELAY_MAX_PORT)$'
+# Full RFC 1123 hostname: 1-63 char labels, alphanumeric with interior
+# hyphens only (no leading/trailing hyphen or dot, no empty label), joined by
+# single dots, 253 chars overall. `[a-z0-9.-]+` alone accepts underscores'
+# absence but still lets through leading/trailing dots/hyphens and empty
+# labels, which is not a valid Ingress/Certificate host.
+NCHAT_DEV_HOSTNAME_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+
+is_rfc1123_hostname() {
+  # Bash's [[ =~ ]] uses the libc regex engine, which is sensitive to
+  # LC_CTYPE/LC_COLLATE: under some UTF-8 locales (e.g. pt_BR.utf8),
+  # [a-z0-9] ranges also match accented/multibyte characters like "é",
+  # letting non-ASCII hosts through. `local LC_ALL=C` scopes the C locale to
+  # this function only (and anything it calls), forcing byte-wise ASCII
+  # matching without affecting any other script's locale.
+  local host="$1"
+  local LC_ALL=C
+  [[ "$host" =~ $NCHAT_DEV_HOSTNAME_RE && "${#host}" -le 253 ]]
+}
 
 load_nchat_dev_topology() {
   local file="$1" key value octet
@@ -26,7 +44,7 @@ load_nchat_dev_topology() {
     ((10#$octet <= 255)) || return 1
   done
   [[ "$NCHAT_DEV_NODE_CIDR" == "$NCHAT_DEV_NODE_IP/32" ]] || return 1
-  [[ "$NCHAT_DEV_HOST" =~ ^[a-z0-9.-]+$ ]] || return 1
+  is_rfc1123_hostname "$NCHAT_DEV_HOST" || return 1
   [[ "$NCHAT_DEV_PUBLIC_URL" == "https://$NCHAT_DEV_HOST" ]] || return 1
   local port
   for port in "$LIVEKIT_API_PORT" "$LIVEKIT_RTC_TCP_PORT" "$LIVEKIT_RTC_UDP_PORT" \
@@ -90,13 +108,13 @@ prepare_nchat_dev_topology() {
   local source_file="${NCHAT_DEV_TOPOLOGY_FILE:-}"
 
   if [[ -n "$source_file" ]]; then
-    load_nchat_dev_topology "$source_file"
-    install -m 0600 "$source_file" "$destination"
+    load_nchat_dev_topology "$source_file" || return 1
+    install -m 0600 "$source_file" "$destination" || return 1
   elif [[ -n "${NCHAT_DEV_NODE_IP:-}" || -n "${NCHAT_DEV_NODE_CIDR:-}" || -n "${NCHAT_DEV_HOST:-}" ]]; then
-    materialize_nchat_dev_topology "$example" "$destination"
-  elif [[ -f "$local_file" ]]; then
-    load_nchat_dev_topology "$local_file"
-    install -m 0600 "$local_file" "$destination"
+    materialize_nchat_dev_topology "$example" "$destination" || return 1
+  elif [[ -e "$local_file" ]]; then
+    load_nchat_dev_topology "$local_file" || return 1
+    install -m 0600 "$local_file" "$destination" || return 1
   else
     echo "error: provide NCHAT_DEV_TOPOLOGY_FILE or nchat-dev environment variables" >&2
     return 1

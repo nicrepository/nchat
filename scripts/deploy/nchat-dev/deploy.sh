@@ -45,12 +45,20 @@ trap cleanup EXIT
 trap on_error ERR
 
 require_prerequisites() {
-  local command actual_kustomize
+  local command actual_kustomize verb resource
   for command in curl grep kustomize kubectl; do
     command -v "$command" >/dev/null
   done
   [[ "$(kubectl config current-context)" == nchat-dev-deployer ]]
-  [[ "$(kubectl auth can-i patch deployments -n nchat-dev)" == yes ]]
+  require_kubernetes_permission patch deployments nchat-dev
+  # RF-32/#455 added IngressRoute/nchat-dev-uploads to the rendered overlay;
+  # verify the deployer can manage it (and the plain Ingresses it ships
+  # alongside) before any kustomize build, so a missing grant fails here
+  # instead of mid-apply.
+  for verb in get create patch update; do
+    require_kubernetes_permission "$verb" ingressroutes.traefik.io nchat-dev
+    require_kubernetes_permission "$verb" ingresses.networking.k8s.io nchat-dev
+  done
   actual_kustomize="$(kustomize version)"
   [[ "$actual_kustomize" == "$KUSTOMIZE_VERSION" ]]
 }
