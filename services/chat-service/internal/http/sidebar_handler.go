@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -32,6 +33,21 @@ type sidebarWorkspaceJSON struct {
 }
 
 // sidebarChannelJSON is the JSON shape for a channel in the sidebar response.
+//
+// CreatedAt and LastMessageAt are the two ordering keys the sidebar sorts each
+// section by (issue #414), and they are two fields rather than one pre-resolved
+// COALESCE on purpose: a conversation that has never been written to must sort
+// *after* every conversation that has activity, however recently it was
+// created, and a single collapsed value cannot express that distinction. Both
+// come from the database — created_at from the channel row, last_message_at
+// from the newest message's own created_at — so the order a client computes is
+// the order the persisted state dictates, identical on every reload.
+//
+// LastMessageAt is a pointer so an empty channel serialises as an explicit
+// null: absent-because-empty is a fact the client needs, not a value to guess
+// at. It is the only thing said about that message — no body, author, kind or
+// id — because ordering is all the sidebar does with it, and a preview is
+// deliberately out of scope.
 type sidebarChannelJSON struct {
 	ID          string `json:"id"`
 	Slug        string `json:"slug"`
@@ -39,6 +55,10 @@ type sidebarChannelJSON struct {
 	Type        string `json:"type"`
 	IsGeneral   bool   `json:"is_general"`
 	CanWrite    bool   `json:"can_write"`
+	// RFC 3339 UTC, with the sub-second fraction kept — see formatSidebarTime
+	// for why these two keep a precision the detail endpoints do not need.
+	CreatedAt     string  `json:"created_at"`
+	LastMessageAt *string `json:"last_message_at"`
 }
 
 // sidebarDMCounterpartJSON is the identity of the other participant of a 1:1
@@ -59,11 +79,16 @@ type sidebarDMCounterpartJSON struct {
 // Counterpart is present only for direct conversations whose other participant
 // could be resolved; group conversations never carry one, and Name stays the
 // group title for them.
+// created_at and last_message_at carry the same meaning, the same nullability
+// and the same deliberate minimalism as their sidebarChannelJSON counterparts,
+// so one ordering rule serves all three sections.
 type sidebarDMJSON struct {
-	ID          string                    `json:"id"`
-	Type        string                    `json:"type"` // "direct" | "group"
-	Name        string                    `json:"name"` // computed display name
-	Counterpart *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
+	ID            string                    `json:"id"`
+	Type          string                    `json:"type"` // "direct" | "group"
+	Name          string                    `json:"name"` // computed display name
+	Counterpart   *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
+	CreatedAt     string                    `json:"created_at"`
+	LastMessageAt *string                   `json:"last_message_at"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -150,12 +175,14 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 	for _, sidebarChannel := range channels {
 		ch := sidebarChannel.Channel
 		out = append(out, sidebarChannelJSON{
-			ID:          ch.ID,
-			Slug:        ch.Slug,
-			DisplayName: ch.DisplayName,
-			Type:        string(ch.Type),
-			IsGeneral:   ch.IsGeneral,
-			CanWrite:    sidebarChannel.CanWrite,
+			ID:            ch.ID,
+			Slug:          ch.Slug,
+			DisplayName:   ch.DisplayName,
+			Type:          string(ch.Type),
+			IsGeneral:     ch.IsGeneral,
+			CanWrite:      sidebarChannel.CanWrite,
+			CreatedAt:     formatSidebarTime(ch.CreatedAt),
+			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
 		})
 	}
 	return out
@@ -167,13 +194,47 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 	for _, dm := range dms {
 		name := computeDMName(dm.Type, dm.Title, dm.CounterpartDisplayName)
 		out = append(out, sidebarDMJSON{
-			ID:          dm.ID,
-			Type:        string(dm.Type),
-			Name:        name,
-			Counterpart: mapDMCounterpart(dm, name),
+			ID:            dm.ID,
+			Type:          string(dm.Type),
+			Name:          name,
+			Counterpart:   mapDMCounterpart(dm, name),
+			CreatedAt:     formatSidebarTime(dm.CreatedAt),
+			LastMessageAt: formatSidebarTimePtr(dm.LastMessageAt),
 		})
 	}
 	return out
+}
+
+// formatSidebarTime renders an instant as RFC 3339 in UTC, so a client parses
+// one shape whatever the server's zone is, and keeps whatever sub-second
+// precision the value carries.
+//
+// The fraction is not cosmetic here, which is why this is RFC3339Nano and not
+// RFC3339 like the detail endpoints. chat.messages.created_at is a TIMESTAMPTZ
+// and holds microseconds; the query picks the newest message by
+// (created_at, id), so two conversations written in the same second are
+// genuinely ordered. Truncating to whole seconds would publish them as the same
+// instant and hand the decision to the name/id tie-breakers — a different order
+// from the one the database actually has, and one that could disagree with what
+// the WebSocket event (which never truncated) already showed.
+//
+// RFC3339Nano drops trailing zeros, so ".900000000" is emitted as ".9" and a
+// whole second carries no fraction at all. Those are the same instant written
+// three ways, and the client compares instants rather than strings.
+func formatSidebarTime(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+// formatSidebarTimePtr keeps "there is no such instant" distinguishable from
+// "the instant is the zero time": nil stays nil and serialises as JSON null,
+// rather than becoming year 1 — a value that would sort as very old activity
+// instead of as no activity at all.
+func formatSidebarTimePtr(value *time.Time) *string {
+	if value == nil {
+		return nil
+	}
+	formatted := formatSidebarTime(*value)
+	return &formatted
 }
 
 // mapDMCounterpart exposes the other participant of a direct conversation.

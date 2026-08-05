@@ -14,8 +14,9 @@ respondem `503 service_unavailable` -- nunca `404`, para que uma configuracao
 incompleta nao seja confundida com rota inexistente.
 
 Com `FILE_UPLOADS_ENABLED=true` o servico so inicia se `DATABASE_URL`,
-`AUTH_JWT_HMAC_SECRET`, `FILE_ENCRYPTION_MASTER_KEY` e `SEAWEEDFS_FILER_URL`
-estiverem presentes e validos. Ver `services/file-service/.env.example`.
+`AUTH_JWT_HMAC_SECRET`, `FILE_ENCRYPTION_MASTER_KEY`,
+`FILE_ENCRYPTION_MASTER_KEY_ID` e `SEAWEEDFS_FILER_URL` estiverem presentes e
+validos. Ver `services/file-service/.env.example`.
 
 ## Contrato
 
@@ -541,11 +542,21 @@ Com `FILE_MALWARE_SCAN_REQUIRED=true` (default, exigido por SECURITY.md) um
 upload termina em `pending_scan` e o download responde `409` ate o worker
 antimalware (fora do escopo desta issue) marcar `clean`.
 
-O valor `false` e recusado na inicializacao quando `APP_ENV` nao e um valor de
-desenvolvimento (`development`, `dev`, `local`, `test`, `nchat-dev`), que e
-exatamente o que os overlays Kubernetes definem em
-`infra/k8s/overlays/*/configmap-patch.yaml`. A verificacao falha fechada: um
-`APP_ENV` desconhecido e tratado como ambiente implantado e o valor e rejeitado.
+O valor `false` so e aceito quando `APP_ENV` **declara explicitamente** um
+ambiente de desenvolvimento. A regra e uma correspondencia positiva contra uma
+allowlist fechada -- `development`, `dev`, `local`, `test`, `nchat-dev` --
+ignorando maiusculas e espacos ao redor, e nada mais e inferido.
+
+`APP_ENV` **nao tem default**. Ausente, vazio, so espacos, desconhecido ou com
+erro de digitacao (`developmnt`) sao todos tratados como ambiente implantado e o
+valor e recusado na inicializacao. Isso e deliberado: assumir `development` na
+ausencia da variavel entregaria a excecao a qualquer deploy que simplesmente
+esquecesse de defini-la.
+
+Todos os overlays ja definem a variavel (`infra/k8s/base/configmap.yaml` e
+`infra/k8s/overlays/*/configmap-patch.yaml`), e os `.env` locais precisam
+declarar `APP_ENV=development`. Com `FILE_MALWARE_SCAN_REQUIRED=true` (default)
+nada disso e exigido.
 
 ## Envelope encryption
 
@@ -553,8 +564,10 @@ O conteudo e cifrado no file-service antes de ir para o SeaweedFS:
 
 - DEK de 32 bytes aleatoria por objeto (`crypto/rand`), nunca derivada de nome,
   id, timestamp ou senha;
-- DEK protegida com AES-256-GCM sob a KEK de `FILE_ENCRYPTION_MASTER_KEY`, com
-  AAD ligada ao id do anexo; so a forma protegida e persistida;
+- DEK protegida com AES-256-GCM sob a KEK ativa, com AAD binaria de campos de
+  largura fixa (80 bytes) ligando versao do wrapping, versao do conteudo, id do
+  anexo, id do workspace, digest do id da KEK e **tamanho plaintext**; so a
+  forma protegida e persistida;
 - conteudo em chunks de 64 KiB, cada um selado com AES-256-GCM sob a DEK;
 - nonce = 8 bytes aleatorios por objeto + contador big-endian de 32 bits por
   chunk, entao nenhum par (chave, nonce) se repete;
@@ -562,16 +575,89 @@ O conteudo e cifrado no file-service antes de ir para o SeaweedFS:
   marcador de ultimo chunk.
 
 Isso detecta alteracao, truncamento, reordenacao, duplicacao e substituicao de
-chunks, e tambem substituicao do objeto inteiro por outro anexo. O formato e
-versionado (`envelope_version` na tabela) para permitir evolucao sem recifrar o
-que ja existe.
+chunks, e tambem substituicao do objeto inteiro por outro anexo. Como o
+workspace entra na AAD da DEK, mover uma linha de tenant tambem torna o objeto
+ilegivel. O formato do conteudo e versionado (`envelope_version` na tabela) para
+permitir evolucao sem recifrar o que ja existe.
+
+### Tamanho autenticado
+
+`size_bytes` faz parte da AAD da DEK protegida. A consequencia operacional:
+
+- o tamanho e **contado** durante o streaming, a partir dos bytes realmente
+  lidos do corpo. `Content-Length` da requisicao nunca alimenta esse numero;
+- ele e plaintext, nao ciphertext;
+- a DEK so e protegida **depois** que o envelope NCF1 foi fechado e o tamanho e
+  um fato, nunca uma promessa. Ate esse momento a linha esta em
+  `pending_upload` com `wrapped_dek` NULL e nao pode ser aberta;
+- reduzir `size_bytes` diretamente no PostgreSQL faz o unwrap falhar **antes**
+  de qualquer header. Sem isso, o servidor publicaria um `Content-Length` menor
+  e entregaria um prefixo que o cliente aceitaria como o arquivo inteiro;
+- `Content-Length` so e emitido depois de um unwrap bem-sucedido, isto e, depois
+  de o proprio tamanho ter sido autenticado;
+- o reader de download carrega o mesmo tamanho como invariante independente: ele
+  nao para de ler ao atingi-lo, continua ate o frame final autenticado e exige
+  que os totais coincidam. Um `EOF` em `expectedSize` seria justamente a
+  truncagem silenciosa que o binding existe para impedir.
+
+A versao do wrapping (`dek_wrap_version`) e independente de `envelope_version`:
+adicionar um campo a AAD da chave nao altera nenhum byte dos objetos ja
+armazenados. Uma versao desconhecida e recusada; nao ha tentativa em sequencia
+nem fallback para a AAD anterior.
+
+Nao existe fallback para plaintext em nenhum caminho. Falha de autenticacao,
+KEK ausente, DEK corrompida ou envelope malformado terminam em erro; o cliente
+recebe sempre a mesma falha generica e nunca aprende qual etapa falhou.
 
 Detalhes e referencia da construcao em
 `services/file-service/internal/crypto/envelope.go`.
 
+### Chaves e rotacao
+
+A KEK nunca esta no banco nem no SeaweedFS. Ela vem do Secret
+`nchat-file-encryption`, injetado por `envFrom` **somente** no Deployment do
+file-service -- deliberadamente fora de `nchat-secrets`, que todos os servicos
+montam. Os templates vazios estao em `infra/k8s/secrets/templates/`; valores
+reais so existem como SealedSecret.
+
+O processo mantem um chaveiro: uma chave ativa, usada em todo upload novo, e
+zero ou mais chaves anteriores mantidas apenas para leitura
+(`FILE_ENCRYPTION_PREVIOUS_KEYS`). Cada linha guarda em `kek_key_id` o
+identificador **nao secreto** da chave que protegeu sua DEK, entao o download
+seleciona a chave por esse id. Um id desconhecido e recusado; nenhuma chave e
+testada especulativamente, e `kek_key_id` nulo (linha ainda em `pending_upload`)
+falha fechado em vez de assumir a chave ativa.
+
+Nao existe compatibilidade com o formato de wrapping anterior a migration
+`000002`, por escolha: um parser antigo seria um caminho de downgrade. A propria
+migration recusa rodar se `files.attachments` tiver qualquer linha, entao esse
+estado nao chega a existir em producao.
+
+Rotacionar troca a KEK e re-protege apenas a DEK de 32 bytes: o objeto no
+SeaweedFS nao e lido nem reescrito. O procedimento, as limitacoes (o job de
+rewrap em lote ainda nao existe) e a validacao de arquivo grande estao em
+`docs/runbooks/file-service-envelope-encryption.md`.
+
 ## Persistencia
 
-`files.attachments` (migration `migrations/files/000001_file_attachments`). O id
+`files.attachments` (migrations `migrations/files/000001_file_attachments` e
+`000002_attachment_dek_binding`). A `000002` adquire `ACCESS EXCLUSIVE` antes de
+qualquer verificacao e **aborta se a tabela nao estiver vazia**; alem disso
+`dek_wrap_version` e `NOT NULL` sem `DEFAULT` e e preenchida ja no INSERT
+pendente, entao um binario anterior a migration nao consegue inserir depois do
+commit -- ver o runbook.
+
+O **rollback da `000002` tambem exige a tabela vazia**, pela mesma verificacao
+sob `ACCESS EXCLUSIVE`. Remover `kek_key_id` e `dek_wrap_version` nao converte
+DEK nenhuma: as chaves continuam protegidas sob o binding atual, e o formato
+anterior nao consegue reconstruir a AAD. Um rollback com attachments existentes
+concluiria no schema e deixaria todos os downloads indisponiveis, entao ele falha
+fechado. Rewrap reverso nao foi implementado e permanece fora de escopo.
+
+Esta protecao nao altera o formato criptografico: NCF1, a AAD atual e o binding
+de `size_bytes` seguem exatamente como descritos acima.
+
+O id
 publico e um UUID aleatorio (nao enumeravel). A chave do objeto no SeaweedFS e
 derivada apenas desse UUID e nunca sai do servidor. Exatamente um destino por
 linha e garantido por CHECK, nao por convencao de aplicacao.

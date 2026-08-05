@@ -3,6 +3,7 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -538,7 +539,7 @@ func TestUploadWithoutDependenciesIsUnavailable(t *testing.T) {
 
 func TestNewAttachmentServiceToleratesANilLogger(t *testing.T) {
 	svc := service.NewAttachmentService(
-		&fakeAuthorizer{}, &fakeStore{}, newFakeObjects(), testKEK(t),
+		&fakeAuthorizer{}, &fakeStore{}, newFakeObjects(), testKeyring(t),
 		domain.DefaultMaxUploadBytes, true, nil, nil,
 	)
 	if !svc.Ready() {
@@ -567,7 +568,11 @@ func storedAttachment(t *testing.T, f *fixture, payload []byte, status domain.St
 		Size:             uploaded[0].Size,
 		StorageObjectKey: created[0].StorageObjectKey,
 		EnvelopeVersion:  created[0].EnvelopeVersion,
-		WrappedDEK:       created[0].WrappedDEK,
+		// The key material comes from the finalising update, not from the
+		// pending insert: it does not exist until the upload has finished.
+		WrappedDEK:       uploaded[0].WrappedDEK,
+		KEKKeyID:         uploaded[0].KEKKeyID,
+		KeyWrapVersion:   created[0].KeyWrapVersion,
 		CreatedAt:        time.Now().UTC(),
 		SessionExpiresAt: time.Now().Add(time.Hour),
 	}
@@ -829,3 +834,276 @@ func assertCompensated(t *testing.T, f *fixture) {
 		t.Fatalf("expected one cleanup delete, got %d", len(f.objects.deletedKeys()))
 	}
 }
+
+// --- key identity and rotation -----------------------------------------
+
+// Every row records which key-encryption key sealed its data key. Without it a
+// rotation could not tell the two generations of rows apart, and a download
+// would have to guess.
+func TestUploadPersistsTheActiveKeyID(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.upload(context.Background(), bytes.NewReader([]byte("payload")), "report.pdf"); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	created, uploaded, _ := f.store.snapshot()
+	// The pending row carries no key material at all — it cannot, because the
+	// binding authenticates a length nothing knows yet.
+	if len(created) != 1 || len(uploaded) != 1 {
+		t.Fatalf("unexpected lifecycle: created=%d uploaded=%d", len(created), len(uploaded))
+	}
+	if uploaded[0].KEKKeyID != testKeyID {
+		t.Fatalf("expected the active key id %q, got %q", testKeyID, uploaded[0].KEKKeyID)
+	}
+	// The wrap version is fixed on the pending row, not at finalisation: it is
+	// the schema fence, and a fence that engaged only at the end would let a
+	// writer running the previous build create the row first.
+	if created[0].KeyWrapVersion != crypto.KeyWrapVersion {
+		t.Fatalf("expected key wrap version %d on the pending row, got %d",
+			crypto.KeyWrapVersion, created[0].KeyWrapVersion)
+	}
+	if len(uploaded[0].WrappedDEK) == 0 {
+		t.Fatal("finalisation must persist the wrapped data key")
+	}
+}
+
+// A key id this deployment does not have is refused outright: nothing is tried,
+// and the object is not served under any other key.
+func TestDownloadRejectsAnUnknownKeyID(t *testing.T) {
+	f := newFixture(t)
+	f.store.authorized = storedAttachment(t, f, []byte("payload"), domain.StatusClean)
+	for _, keyID := range []string{"", "kek-never-configured"} {
+		f.store.authorized.KEKKeyID = keyID
+
+		_, err := f.service.Download(context.Background(), downloadInput(f.store.authorized.ID))
+		if !errors.Is(err, crypto.ErrUnknownKey) {
+			t.Fatalf("expected ErrUnknownKey for %q, got %v", keyID, err)
+		}
+		// It must not read like a client mistake or a missing attachment.
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInvalidInput) {
+			t.Fatalf("a missing key must not be reported as a client error: %v", err)
+		}
+	}
+}
+
+// A row moved to another workspace — by a compromised database, a bad restore
+// or a buggy admin query — must stop being readable, because the workspace is
+// bound into the wrapped data key.
+func TestDownloadRejectsARowMovedToAnotherWorkspace(t *testing.T) {
+	f := newFixture(t)
+	f.store.authorized = storedAttachment(t, f, []byte("payload"), domain.StatusClean)
+	f.store.authorized.WorkspaceID = uuid.NewString()
+
+	if _, err := f.service.Download(context.Background(),
+		downloadInput(f.store.authorized.ID)); !errors.Is(err, crypto.ErrCiphertext) {
+		t.Fatalf("expected ErrCiphertext for a relocated row, got %v", err)
+	}
+}
+
+// The wrapped data key of one attachment must not open another's, even though
+// both were sealed under the same key-encryption key.
+func TestDownloadRejectsAWrappedKeyFromAnotherAttachment(t *testing.T) {
+	f := newFixture(t)
+	first := storedAttachment(t, f, []byte("first payload"), domain.StatusClean)
+	f.store.created = nil
+	f.store.uploaded = nil
+	second := storedAttachment(t, f, []byte("second payload"), domain.StatusClean)
+
+	first.WrappedDEK = second.WrappedDEK
+	f.store.authorized = first
+	if _, err := f.service.Download(context.Background(),
+		downloadInput(first.ID)); !errors.Is(err, crypto.ErrCiphertext) {
+		t.Fatalf("expected ErrCiphertext for a foreign wrapped key, got %v", err)
+	}
+}
+
+// Nothing that identifies or protects the key material may reach the client
+// projection, on either the metadata or the listing path.
+func TestPublicProjectionCarriesNoKeyMaterial(t *testing.T) {
+	f := newFixture(t)
+	f.store.authorized = storedAttachment(t, f, []byte("payload"), domain.StatusPendingScan)
+
+	view, err := f.service.Metadata(context.Background(), downloadInput(f.store.authorized.ID))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, forbidden := range []string{
+		testKeyID, f.store.authorized.StorageObjectKey, "dek", "kek", "wrapped", "envelope", "nonce",
+	} {
+		if strings.Contains(strings.ToLower(string(encoded)), strings.ToLower(forbidden)) {
+			t.Fatalf("the client projection must not mention %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+// --- authenticated plaintext size ---------------------------------------
+
+// The attack this closes: an attacker with write access to PostgreSQL lowers
+// size_bytes, the handler publishes that smaller Content-Length, and the client
+// accepts a prefix as the whole file. The size is part of the wrapped key's
+// binding, so the unwrap fails and no stream is ever opened.
+func TestDownloadRejectsATamperedSize(t *testing.T) {
+	payload := bytes.Repeat([]byte("attachment payload "), 5000)
+	real := int64(len(payload))
+
+	for name, size := range map[string]int64{
+		"halved":        real / 2,
+		"one byte less": real - 1,
+		"one byte more": real + 1,
+		"zero":          0,
+		"inflated":      real * 3,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.store.authorized = storedAttachment(t, f, payload, domain.StatusClean)
+			f.store.authorized.Size = size
+
+			_, err := f.service.Download(context.Background(), downloadInput(f.store.authorized.ID))
+			if !errors.Is(err, crypto.ErrCiphertext) {
+				t.Fatalf("expected ErrCiphertext for size %d, got %v", size, err)
+			}
+			// Nothing may be read from storage: the failure happens on metadata,
+			// before the object is touched and long before any header is written.
+			if opened := f.objects.openCount(); opened != 0 {
+				t.Fatalf("the object was opened %d times despite a failed unwrap", opened)
+			}
+		})
+	}
+}
+
+// The honest size still works, and the bytes still round trip. Without this the
+// test above could pass on a service that simply refused every download.
+func TestDownloadAcceptsTheAuthenticatedSize(t *testing.T) {
+	f := newFixture(t)
+	payload := bytes.Repeat([]byte("attachment payload "), 5000)
+	f.store.authorized = storedAttachment(t, f, payload, domain.StatusClean)
+
+	download, err := f.service.Download(context.Background(), downloadInput(f.store.authorized.ID))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = download.Content.Close() }()
+	got, err := io.ReadAll(download.Content)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("download returned different bytes than were uploaded")
+	}
+	if download.Size != int64(len(payload)) {
+		t.Fatalf("expected size %d, got %d", len(payload), download.Size)
+	}
+}
+
+// The persisted wrap version selects the binding; an unknown one is refused
+// rather than tried against the format this build implements.
+func TestDownloadRejectsAnUnknownKeyWrapVersion(t *testing.T) {
+	f := newFixture(t)
+	f.store.authorized = storedAttachment(t, f, []byte("payload"), domain.StatusClean)
+	for _, version := range []int{0, crypto.KeyWrapVersion - 1, crypto.KeyWrapVersion + 1, 99} {
+		f.store.authorized.KeyWrapVersion = version
+
+		_, err := f.service.Download(context.Background(), downloadInput(f.store.authorized.ID))
+		if !errors.Is(err, crypto.ErrUnsupportedVersion) {
+			t.Fatalf("expected ErrUnsupportedVersion for %d, got %v", version, err)
+		}
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInvalidInput) {
+			t.Fatalf("an unsupported version must not read as a client error: %v", err)
+		}
+	}
+}
+
+// --- finalisation ordering and compensation -----------------------------
+
+// The pending row exists while the object is being written, and it carries no
+// key material at all. A row that cannot be opened is the only safe
+// intermediate state.
+func TestPendingRowCarriesNoKeyMaterialUntilFinalisation(t *testing.T) {
+	f := newFixture(t)
+	// The finalising update fails, so the row is observed exactly as it was
+	// written by CreatePending.
+	f.store.uploadErr = errors.New("update failed")
+
+	if _, err := f.upload(context.Background(),
+		bytes.NewReader([]byte("payload")), "report.pdf"); err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	created, uploaded, _ := f.store.snapshot()
+	if len(created) != 1 || len(uploaded) != 0 {
+		t.Fatalf("unexpected lifecycle: created=%d uploaded=%d", len(created), len(uploaded))
+	}
+	// NewAttachment carries no key material — the pending insert cannot, because
+	// the binding authenticates a length nothing knows yet — but it does carry
+	// the wrap version, which is the fence.
+	if created[0].EnvelopeVersion != crypto.EnvelopeVersion {
+		t.Fatalf("unexpected envelope version %d", created[0].EnvelopeVersion)
+	}
+	if created[0].KeyWrapVersion != crypto.KeyWrapVersion {
+		t.Fatalf("the pending row must carry the wrap version, got %d", created[0].KeyWrapVersion)
+	}
+}
+
+// The size that is sealed is the size that was read, not anything the client
+// said. The declared Content-Length here is a lie an order of magnitude out.
+func TestFinalizedSizeCountsTheBytesActuallyRead(t *testing.T) {
+	f := newFixture(t)
+	payload := bytes.Repeat([]byte("x"), 4096)
+
+	if _, err := f.uploadTo(context.Background(),
+		domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		&lyingReader{Reader: bytes.NewReader(payload)}, "report.pdf", "application/octet-stream",
+	); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	_, uploaded, _ := f.store.snapshot()
+	if uploaded[0].Size != int64(len(payload)) {
+		t.Fatalf("expected the counted size %d, got %d", len(payload), uploaded[0].Size)
+	}
+	// And the sealed key really is bound to that number: the download only works
+	// because the two agree.
+	created, _, _ := f.store.snapshot()
+	f.store.authorized = service.StoredAttachment{
+		ID: created[0].ID, WorkspaceID: testWorkspaceID, Kind: domain.DestinationKindChannel,
+		Status: domain.StatusPendingScan, Filename: created[0].Filename, Size: uploaded[0].Size,
+		StorageObjectKey: created[0].StorageObjectKey, EnvelopeVersion: created[0].EnvelopeVersion,
+		WrappedDEK: uploaded[0].WrappedDEK, KEKKeyID: uploaded[0].KEKKeyID,
+		KeyWrapVersion: created[0].KeyWrapVersion,
+	}
+	f.store.authorized.Status = domain.StatusClean
+	if _, err := f.service.Download(context.Background(), downloadInput(created[0].ID)); err != nil {
+		t.Fatalf("the counted size must be the sealed size: %v", err)
+	}
+}
+
+// A store that reports a byte count the plaintext cannot produce means the
+// object is not a complete NCF1 stream. The upload fails and compensates rather
+// than sealing a key against a length the stored bytes do not have.
+func TestUploadCompensatesWhenTheStoredEnvelopeSizeIsWrong(t *testing.T) {
+	f := newFixture(t)
+	f.objects.shortPutBy = 1
+
+	if _, err := f.upload(context.Background(),
+		bytes.NewReader([]byte("payload")), "report.pdf"); err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	_, uploaded, _ := f.store.snapshot()
+	if len(uploaded) != 0 {
+		t.Fatal("no row may be finalised when the stored envelope is not the expected size")
+	}
+	if f.objects.count() != 0 {
+		t.Fatal("the incomplete object must be deleted")
+	}
+	if f.store.statusOf(t, f.store.onlyRowID(t)) != domain.StatusFailed {
+		t.Fatal("the row must end failed")
+	}
+}
+
+// lyingReader claims a length it does not have. Nothing in the pipeline reads
+// it, which is the point: only the counted bytes reach the binding.
+type lyingReader struct{ io.Reader }
+
+func (r *lyingReader) Len() int    { return 1 << 30 }
+func (r *lyingReader) Size() int64 { return 1 << 30 }

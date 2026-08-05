@@ -414,9 +414,15 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Disposition", contentDisposition(download.Filename))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Accept-Ranges", "none")
-	// The size is the authenticated plaintext length recorded at upload, so it
-	// is only correct while the stream verifies; a mismatch aborts the response
-	// below rather than being padded over.
+	// Publishing a length is only safe because Download has already returned.
+	// The recorded size is part of the wrapped data key's associated data, so
+	// reaching this line means the unwrap succeeded against exactly this number:
+	// a size_bytes edited in the database fails above, before any status line or
+	// header is written, instead of becoming a smaller Content-Length that would
+	// let a prefix pass for the whole file.
+	//
+	// The reader carries the same length as an independent invariant, so a
+	// stream that stops producing bytes early still aborts the response below.
 	w.Header().Set("Content-Length", strconv.FormatInt(download.Size, 10))
 	w.WriteHeader(http.StatusOK)
 

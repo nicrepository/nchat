@@ -1,9 +1,11 @@
+import { useEffect } from "react";
 import { Outlet } from "react-router";
 
 import "./ChatShell.css";
 import CallPanel from "./CallPanel";
 import ChatSidebar from "./ChatSidebar";
 import type { CallType } from "./callState";
+import { useCallMedia } from "./useCallMedia";
 import { useCallSignaling } from "./useCallSignaling";
 import type { Channel, DMConversation } from "./chatTypes";
 import { useChatSidebar } from "./useChatSidebar";
@@ -17,7 +19,10 @@ export interface ChatOutletContext {
 
 export default function ChatShell() {
   const { state, retry } = useChatSidebar();
-  const calls = useCallSignaling();
+  const media = useCallMedia();
+  const prepareMedia = media.prepare;
+  const identityReady = state.status === "ready";
+  const calls = useCallSignaling(media, identityReady);
 
   const outletContext: ChatOutletContext = {
     currentUserId: state.status === "ready" ? state.currentUserId : "",
@@ -27,16 +32,24 @@ export default function ChatShell() {
   };
 
   const currentUserId = state.status === "ready" ? state.currentUserId : "";
-  const participantId = calls.call
-    ? calls.call.caller_id === currentUserId
-      ? calls.call.callee_id
-      : calls.call.caller_id
-    : "";
-  const participantName =
+  const incomingRinging =
+    calls.call?.status === "ringing" && calls.call.callee_id === currentUserId;
+
+  useEffect(() => {
+    if (incomingRinging) void prepareMedia();
+  }, [incomingRinging, prepareMedia]);
+
+  const participantId =
+    identityReady && calls.call
+      ? calls.call.caller_id === currentUserId
+        ? calls.call.callee_id
+        : calls.call.caller_id
+      : "";
+  const participant =
     state.status === "ready"
-      ? (state.dms.find((dm) => dm.counterpart?.userId === participantId)?.counterpart
-          ?.displayName ?? "Participante")
-      : "Participante";
+      ? state.dms.find((dm) => dm.counterpart?.userId === participantId)?.counterpart
+      : undefined;
+  const participantName = participant?.displayName ?? "Participante";
 
   return (
     <div className="chat-app" data-testid="chat-shell">
@@ -44,7 +57,16 @@ export default function ChatShell() {
       <main className="chat-app__main" aria-label="Área de mensagens">
         <Outlet context={outletContext} />
       </main>
-      <CallPanel calls={calls} currentUserId={currentUserId} participantName={participantName} />
+      <CallPanel
+        calls={calls}
+        currentUserId={currentUserId}
+        identityStatus={state.status}
+        retryIdentity={retry}
+        participantId={participantId}
+        participantName={participantName}
+        participantAvatarUrl={participant?.avatarUrl}
+        media={media}
+      />
     </div>
   );
 }

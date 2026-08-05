@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
@@ -298,6 +299,56 @@ func TestSidebarService_ActiveMember_ReturnsChannelsAndDMs(t *testing.T) {
 	// the handler's job to turn it into a display name.
 	if data.DMs[0].CounterpartDisplayName != "Juliane Lino" {
 		t.Fatalf("expected counterpart name to reach the caller, got %q", data.DMs[0].CounterpartDisplayName)
+	}
+}
+
+// ISSUE #414 — the activity instant is decided by the storage query, which is
+// where authorization is applied. This layer forwards it and, in particular,
+// does not substitute created_at for a channel that has no messages: "never
+// written in" has to survive the trip so the client can order on it.
+func TestSidebarService_ForwardsActivityWithoutSubstitutingCreation(t *testing.T) {
+	lastMessage := time.Date(2026, 7, 30, 18, 0, 0, 0, time.UTC)
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	accesses := []storage.VisibleChannelAccess{
+		{
+			Channel:       domain.Channel{ID: "ch-active", WorkspaceID: sidebarWsID, Slug: "geral", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, CreatedAt: created},
+			LastMessageAt: &lastMessage,
+		},
+		{
+			Channel: domain.Channel{ID: "ch-empty", WorkspaceID: sidebarWsID, Slug: "vazio", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, CreatedAt: created},
+		},
+	}
+	dms := []domain.DMConversationWithParticipantIDs{
+		{
+			DMConversation: domain.DMConversation{ID: "dm-active", Type: domain.DMConversationTypeDirect, CreatedAt: created},
+			LastMessageAt:  &lastMessage,
+		},
+		{
+			DMConversation: domain.DMConversation{ID: "dm-empty", Type: domain.DMConversationTypeGroup, CreatedAt: created},
+		},
+	}
+	svc := newSidebarService(
+		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+		&sidebarFakeMemberStore{member: activeMember()},
+		&sidebarFakeChannelStore{accesses: accesses},
+		&sidebarFakeDMStore{dms: dms},
+	)
+
+	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := data.Channels[0].LastMessageAt; got == nil || !got.Equal(lastMessage) {
+		t.Fatalf("expected the channel's activity instant to reach the caller, got %v", got)
+	}
+	if data.Channels[1].LastMessageAt != nil {
+		t.Fatalf("a channel with no messages must report none, got %v", data.Channels[1].LastMessageAt)
+	}
+	if got := data.DMs[0].LastMessageAt; got == nil || !got.Equal(lastMessage) {
+		t.Fatalf("expected the conversation's activity instant to reach the caller, got %v", got)
+	}
+	if data.DMs[1].LastMessageAt != nil {
+		t.Fatalf("a conversation with no messages must report none, got %v", data.DMs[1].LastMessageAt)
 	}
 }
 

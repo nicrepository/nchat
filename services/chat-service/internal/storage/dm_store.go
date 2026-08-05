@@ -74,6 +74,14 @@ type DMStore interface {
 	// visible to userID, each annotated with the full list of active member user
 	// IDs and, for direct 1:1 conversations, the display name of the other
 	// participant as seen by userID. A single SQL query (no N+1) is used.
+	//
+	// Each row also carries LastMessageAt, the conversation's activity instant
+	// (issue #414). It is resolved by a lateral join inside this same statement,
+	// not by a follow-up read per conversation: one query answers the whole list
+	// however many conversations it holds. The lateral is attached to rows the
+	// membership joins have already admitted, so it can only ever describe a
+	// conversation this caller may read, and it selects created_at alone — no
+	// body, author or message id travels with it.
 	ListVisibleConversationsWithParticipantIDs(ctx context.Context, workspaceID, userID string) ([]domain.DMConversationWithParticipantIDs, error)
 	GetVisibleConversationByID(ctx context.Context, workspaceID, conversationID, userID string) (domain.DMConversation, error)
 	// GetDirectCounterpartProfile authorises callerID for conversationID and
@@ -720,7 +728,8 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 		       ) AS participant_ids,
 		       COALESCE(cp.user_id, '')      AS counterpart_user_id,
 		       COALESCE(cp.display_name, '') AS counterpart_display_name,
-		       COALESCE(cp.avatar_url, '')   AS counterpart_avatar_url
+		       COALESCE(cp.avatar_url, '')   AS counterpart_avatar_url,
+		       lm.created_at                 AS last_message_at
 		FROM chat.dm_conversations dc
 		JOIN chat.workspaces w
 		  ON w.id = dc.workspace_id AND w.status = 'active'
@@ -744,6 +753,14 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 		    ORDER BY other.user_id
 		    LIMIT 1
 		) cp ON true
+		LEFT JOIN LATERAL (
+		    SELECT m.created_at
+		    FROM chat.messages m
+		    WHERE m.workspace_id = dc.workspace_id
+		      AND m.dm_conversation_id = dc.id
+		    ORDER BY m.created_at DESC, m.id DESC
+		    LIMIT 1
+		) lm ON true
 		WHERE dc.workspace_id = $1
 		  AND dc.status = 'active'
 		ORDER BY dc.updated_at DESC, dc.created_at DESC`,
@@ -762,6 +779,7 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 			&c.Title, (*string)(&c.Status), &c.CreatedBy,
 			&c.CreatedAt, &c.UpdatedAt, &c.ParticipantIDs,
 			&c.CounterpartUserID, &c.CounterpartDisplayName, &c.CounterpartAvatarURL,
+			&c.LastMessageAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan visible dm conversation with participants: %w", err)
 		}

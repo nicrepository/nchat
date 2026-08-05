@@ -30,7 +30,13 @@ const compensationTimeout = 10 * time.Second
 // Failure codes persisted on a failed row. They are short, closed and
 // sanitised: no driver text, no storage host, no key material.
 const (
-	failureStorageWrite     = "storage_write"
+	failureStorageWrite = "storage_write"
+	// failureEnvelopeIncomplete records a stored object whose size is not the
+	// envelope the counted plaintext must produce.
+	failureEnvelopeIncomplete = "envelope_incomplete"
+	// failureKeyWrap records a data key that could not be sealed against the
+	// final binding, which leaves the object unopenable and so unusable.
+	failureKeyWrap          = "key_wrap"
 	failureMetadataFinalize = "metadata_finalize"
 )
 
@@ -76,16 +82,35 @@ type NewAttachment struct {
 	StorageProvider  string
 	StorageObjectKey string
 	EnvelopeVersion  int
-	WrappedDEK       []byte
+	// KeyWrapVersion is the version of the wrapped key's binding format, tracked
+	// separately from the content envelope's version.
+	//
+	// It is supplied here, on the pending row, rather than at finalisation even
+	// though no key exists yet. The column is NOT NULL with no default, so an
+	// INSERT that omits it fails: that is the schema fence migration 000002
+	// installs against a file-service still running the previous build, and a
+	// fence that only engaged at finalisation would let such a build create the
+	// row in the first place.
+	KeyWrapVersion int
 }
 
-// UploadedAttachment finalises a row once its object is durable.
+// UploadedAttachment finalises a row once its object is durable. It carries the
+// key material as well as the sizes, because the two are inseparable: the
+// wrapped key authenticates Size, so persisting them apart would allow a row
+// whose recorded length and whose sealed length disagree.
+//
+// The wrap version is absent by design: it was fixed when the row was created.
 type UploadedAttachment struct {
 	ID             string
 	Status         domain.Status
 	DetectedMIME   string
 	Size           int64
 	CiphertextSize int64
+	WrappedDEK     []byte
+	// KEKKeyID names the key-encryption key that sealed WrappedDEK. It is not
+	// secret and it is what makes rotation possible: a download selects the key
+	// by this id instead of trying the ones it has.
+	KEKKeyID string
 }
 
 // AttachmentAuthInput identifies an attachment read attempt.
@@ -109,6 +134,8 @@ type StoredAttachment struct {
 	StorageObjectKey string
 	EnvelopeVersion  int
 	WrappedDEK       []byte
+	KEKKeyID         string
+	KeyWrapVersion   int
 	CreatedAt        time.Time
 	SessionExpiresAt time.Time
 }
@@ -233,7 +260,7 @@ type AttachmentService struct {
 	authorizer     DestinationAuthorizer
 	store          AttachmentStore
 	objects        ObjectStore
-	kek            *crypto.KeyEncryptionKey
+	keys           *crypto.Keyring
 	maxUploadBytes int64
 	scanRequired   bool
 	orphans        OrphanObserver
@@ -248,7 +275,7 @@ func NewAttachmentService(
 	authorizer DestinationAuthorizer,
 	store AttachmentStore,
 	objects ObjectStore,
-	kek *crypto.KeyEncryptionKey,
+	keys *crypto.Keyring,
 	maxUploadBytes int64,
 	scanRequired bool,
 	orphans OrphanObserver,
@@ -261,7 +288,7 @@ func NewAttachmentService(
 		authorizer:     authorizer,
 		store:          store,
 		objects:        objects,
-		kek:            kek,
+		keys:           keys,
 		maxUploadBytes: maxUploadBytes,
 		scanRequired:   scanRequired,
 		orphans:        orphans,
@@ -272,7 +299,7 @@ func NewAttachmentService(
 // Ready reports whether every dependency the use cases need is wired.
 func (s *AttachmentService) Ready() bool {
 	return s != nil && s.authorizer != nil && s.store != nil &&
-		s.objects != nil && s.kek != nil && s.maxUploadBytes > 0
+		s.objects != nil && s.keys != nil && s.maxUploadBytes > 0
 }
 
 // uploadTarget is the authorised destination of an upload, with every value
@@ -297,11 +324,19 @@ type sniffedContent struct {
 }
 
 // pendingAttachment is a row in pending_upload whose object write has been
-// started. It carries no key material: the data key lives only inside the
-// encrypting stream and is never held alongside the row it protects.
+// started.
+//
+// It carries the data key, in process memory only, for the length of one
+// request. That is unavoidable now that the key is wrapped at the end of the
+// upload rather than the beginning: the wrapped form authenticates the plaintext
+// length, which is not known until the last byte has been read. The key is never
+// written anywhere in this state — the row's wrapped_dek stays NULL until
+// finalisation, so a pending row can never yield a downloadable object.
 type pendingAttachment struct {
-	id        uuid.UUID
-	objectKey string
+	id          uuid.UUID
+	workspaceID uuid.UUID
+	objectKey   string
+	dataKey     []byte
 }
 
 // AuthorizeUpload resolves and authorises an upload destination without
@@ -440,13 +475,16 @@ func (s *AttachmentService) preparePendingAttachment(
 	ctx context.Context, target uploadTarget, content sniffedContent, source io.Reader,
 ) (pendingAttachment, io.Reader, error) {
 	attachmentID := uuid.New()
+	workspaceID, err := uuid.Parse(target.workspaceID)
+	if err != nil {
+		// The workspace comes from the destination row, so an unparseable one is
+		// a data-integrity problem. It is refused rather than encrypted under a
+		// binding that could not be reproduced at download.
+		return pendingAttachment{}, nil, fmt.Errorf("invalid authorized workspace id")
+	}
 	dataKey, err := crypto.NewDataKey()
 	if err != nil {
 		return pendingAttachment{}, nil, fmt.Errorf("prepare attachment key: %w", err)
-	}
-	wrappedDEK, err := s.kek.Wrap(dataKey, attachmentID)
-	if err != nil {
-		return pendingAttachment{}, nil, fmt.Errorf("wrap attachment key: %w", err)
 	}
 	encrypted, err := crypto.NewEncryptingReader(
 		io.MultiReader(bytes.NewReader(content.head), source), dataKey, attachmentID,
@@ -456,9 +494,15 @@ func (s *AttachmentService) preparePendingAttachment(
 	}
 
 	pending := pendingAttachment{
-		id:        attachmentID,
-		objectKey: domain.StorageObjectKey(attachmentID),
+		id:          attachmentID,
+		workspaceID: workspaceID,
+		objectKey:   domain.StorageObjectKey(attachmentID),
+		dataKey:     dataKey,
 	}
+	// The row is created without any key material. It cannot be: the wrapped
+	// form authenticates the plaintext length, which nothing knows yet. A
+	// pending row therefore has wrapped_dek NULL and is not openable by
+	// construction, rather than carrying a placeholder that would be.
 	if err := s.store.CreatePending(ctx, NewAttachment{
 		ID:               attachmentID.String(),
 		WorkspaceID:      target.workspaceID,
@@ -469,7 +513,7 @@ func (s *AttachmentService) preparePendingAttachment(
 		StorageProvider:  domain.StorageProviderSeaweedFS,
 		StorageObjectKey: pending.objectKey,
 		EnvelopeVersion:  crypto.EnvelopeVersion,
-		WrappedDEK:       wrappedDEK,
+		KeyWrapVersion:   crypto.KeyWrapVersion,
 	}); err != nil {
 		// The insert failed, so no row and no object exist: nothing to undo.
 		return pendingAttachment{}, nil, fmt.Errorf("persist attachment metadata: %w", err)
@@ -493,6 +537,13 @@ func (s *AttachmentService) persistEncryptedObject(
 
 // finalizeUpload advances the row once the object is durable. Only here can an
 // attachment leave pending_upload for a post-upload state.
+//
+// This is also where the data key is wrapped, and it cannot happen earlier. The
+// wrapped form authenticates the plaintext length, so it can only be produced
+// once the stream has been read to its end and that length is a fact rather than
+// a claim. The whole result — size, wrapped key, key id, wrap version, state —
+// lands in one UPDATE, so there is no window in which a row is downloadable
+// while any part of its binding is missing or stale.
 func (s *AttachmentService) finalizeUpload(
 	ctx context.Context,
 	target uploadTarget,
@@ -507,7 +558,31 @@ func (s *AttachmentService) finalizeUpload(
 	}
 	// The budget the source started with is the target's, not the service's, so
 	// the recorded plaintext size stays correct whatever the workspace policy is.
+	// It counts the bytes actually read from the body; Content-Length never
+	// reaches this number, and neither does anything else the client sent.
 	size := target.maxUploadBytes - source.remaining
+
+	// What storage accepted must be exactly the envelope this plaintext produces.
+	// A mismatch means the object is not the complete, closed NCF1 stream — a
+	// short write that still reported success, or a store that transformed the
+	// body — so the upload is failed and compensated instead of being sealed
+	// against a length the stored bytes do not have.
+	if want := crypto.CiphertextSize(size); ciphertextSize != want {
+		return AttachmentView{}, s.compensatePersistedObject(ctx, pending, failureEnvelopeIncomplete,
+			fmt.Errorf("stored envelope is %d bytes, expected %d", ciphertextSize, want))
+	}
+
+	wrappedDEK, keyID, err := s.keys.Wrap(pending.dataKey, crypto.Binding{
+		AttachmentID:           pending.id,
+		WorkspaceID:            pending.workspaceID,
+		PlaintextSize:          size,
+		KeyWrapVersion:         crypto.KeyWrapVersion,
+		ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	})
+	if err != nil {
+		return AttachmentView{}, s.compensatePersistedObject(ctx, pending, failureKeyWrap,
+			fmt.Errorf("wrap attachment key: %w", err))
+	}
 
 	if err := s.store.MarkUploaded(ctx, UploadedAttachment{
 		ID:             pending.id.String(),
@@ -515,6 +590,8 @@ func (s *AttachmentService) finalizeUpload(
 		DetectedMIME:   content.detectedMIME,
 		Size:           size,
 		CiphertextSize: ciphertextSize,
+		WrappedDEK:     wrappedDEK,
+		KEKKeyID:       keyID,
 	}); err != nil {
 		return AttachmentView{}, s.compensatePersistedObject(ctx, pending, failureMetadataFinalize,
 			fmt.Errorf("finalize attachment metadata: %w", err))
@@ -683,7 +760,26 @@ func (s *AttachmentService) openDecryptedContent(
 	if err != nil {
 		return nil, fmt.Errorf("invalid stored attachment id")
 	}
-	dataKey, err := s.kek.Unwrap(record.WrappedDEK, attachmentID)
+	workspaceID, err := uuid.Parse(record.WorkspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid stored workspace id")
+	}
+	// The key is selected by the id persisted with the row, never searched for:
+	// an id this deployment does not have configured is an operational failure,
+	// not something to work around by trying the keys it does have.
+	//
+	// record.Size is part of the binding, so this call is also the check on the
+	// recorded length. It runs before the object is opened and long before the
+	// handler writes a status line or a Content-Length, which is what stops an
+	// edited size_bytes from ever reaching a client as a shorter, complete
+	// looking file.
+	dataKey, err := s.keys.Unwrap(record.WrappedDEK, record.KEKKeyID, crypto.Binding{
+		AttachmentID:           attachmentID,
+		WorkspaceID:            workspaceID,
+		PlaintextSize:          record.Size,
+		KeyWrapVersion:         record.KeyWrapVersion,
+		ContentEnvelopeVersion: record.EnvelopeVersion,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("unwrap attachment key: %w", err)
 	}
@@ -691,7 +787,11 @@ func (s *AttachmentService) openDecryptedContent(
 	if err != nil {
 		return nil, err
 	}
-	plaintext, err := crypto.NewDecryptingReader(body, dataKey, attachmentID)
+	// The same length is handed to the reader as a second, independent check:
+	// the binding proves the number was not edited, and the reader proves the
+	// stored stream really produces it, all the way to the authenticated final
+	// frame.
+	plaintext, err := crypto.NewDecryptingReader(body, dataKey, attachmentID, record.Size)
 	if err != nil {
 		_ = body.Close()
 		return nil, fmt.Errorf("prepare attachment envelope: %w", err)

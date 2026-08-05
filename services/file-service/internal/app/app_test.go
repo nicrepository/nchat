@@ -47,6 +47,7 @@ func uploadsEnabledConfig(t *testing.T) config.Config {
 	cfg.AuthJWTIssuer = "nchat-auth"
 	cfg.AuthJWTAudience = "nchat-api"
 	cfg.EncryptionMasterKey = randomBase64Key(t)
+	cfg.EncryptionMasterKeyID = "kek-test-active"
 	cfg.SeaweedFSFilerURL = "http://seaweedfs-filer:8888"
 	cfg.SeaweedFSTimeoutSeconds = 30
 	cfg.MalwareScanRequired = true
@@ -230,5 +231,64 @@ func TestShutdownPropagatesTracingErrors(t *testing.T) {
 func TestShutdownTracingHelperToleratesNil(t *testing.T) {
 	if err := shutdownTracing(nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// Startup, not just Validate: an unsafe combination must stop the process, and
+// the readiness endpoint must never come up to serve it.
+//
+// This is the regression from the review — an absent APP_ENV used to default to
+// "development" and grant the malware-scan exception to any deployment that had
+// simply forgotten the variable.
+func TestNewRefusesToDisableTheScanGateWithoutAnExplicitDevelopmentEnv(t *testing.T) {
+	for name, env := range map[string]string{
+		"absent":     "",
+		"unknown":    "unknown",
+		"production": "production",
+		"staging":    "staging",
+		"typo":       "developmnt",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := uploadsEnabledConfig(t)
+			cfg.Env = env
+			cfg.MalwareScanRequired = false
+
+			application, err := newApp(cfg, appDependencies{
+				openDB: openStub(&stubPool{}), openAdmission: admissionStub(),
+				tracingShutdown: noopShutdown,
+			})
+			if err == nil {
+				_ = application.Shutdown(context.Background())
+				t.Fatalf("APP_ENV=%q must not allow the scan gate to be disabled", env)
+			}
+			if application != nil {
+				t.Fatal("no application may be returned for an unsafe configuration")
+			}
+			if !strings.Contains(err.Error(), "FILE_MALWARE_SCAN_REQUIRED") {
+				t.Fatalf("expected the scan-policy error, got %v", err)
+			}
+		})
+	}
+}
+
+// The safe pairing still starts, so the check above is not passing because the
+// service refuses everything.
+func TestNewStartsWithTheScanGateDisabledInADeclaredDevelopmentEnv(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.Env = "development"
+	cfg.MalwareScanRequired = false
+
+	application, err := newApp(cfg, appDependencies{
+		openDB: openStub(&stubPool{}), openAdmission: admissionStub(), tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("a declared development environment must start: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	response := httptest.NewRecorder()
+	application.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected a healthy service, got %d", response.Code)
 	}
 }

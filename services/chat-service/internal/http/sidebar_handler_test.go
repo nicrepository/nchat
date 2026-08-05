@@ -137,6 +137,201 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 	}
 }
 
+// ISSUE #414 — the sidebar publishes two ordering keys per item, and nothing
+// else about the message it points at.
+func TestSidebarHandler_SerializesActivityTimestamps(t *testing.T) {
+	v := makeTestValidator(t)
+	// Microseconds, because chat.messages.created_at is a TIMESTAMPTZ and holds
+	// them: the sidebar orders by this value, so a fraction dropped on the wire
+	// is an ordering decision silently handed to the name/id tie-breakers.
+	created := time.Date(2026, 8, 4, 12, 0, 0, 900123000, time.UTC)
+	// Deliberately in a non-UTC zone: the wire format must not depend on where
+	// the server happens to be, and converting must not cost the fraction.
+	lastMessage := time.Date(2026, 8, 4, 9, 0, 0, 900123000, time.FixedZone("BRT", -3*60*60))
+	svc := &stubSidebarProvider{data: service.SidebarData{
+		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+		Channels: []service.SidebarChannel{
+			{
+				Channel:       domain.Channel{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic, CreatedAt: created},
+				CanWrite:      true,
+				LastMessageAt: &lastMessage,
+			},
+			{
+				Channel:  domain.Channel{ID: "ch-2", Slug: "vazio", DisplayName: "vazio", Type: domain.ChannelTypePublic, CreatedAt: created},
+				CanWrite: true,
+			},
+		},
+		DMs: []domain.DMConversationWithParticipantIDs{
+			{
+				DMConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect, CreatedAt: created},
+				LastMessageAt:  &lastMessage,
+			},
+			{
+				DMConversation: domain.DMConversation{ID: "dm-2", Type: domain.DMConversationTypeGroup, Title: "Equipe", CreatedAt: created},
+			},
+		},
+	}}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rr.Code, rr.Body.String())
+	}
+	// Captured before decoding, which drains the recorder's buffer.
+	raw := rr.Body.String()
+	type activityJSON struct {
+		ID            string  `json:"id"`
+		CreatedAt     string  `json:"created_at"`
+		LastMessageAt *string `json:"last_message_at"`
+	}
+	var envelope struct {
+		Data struct {
+			Channels []activityJSON `json:"channels"`
+			DMs      []activityJSON `json:"dm_conversations"`
+		} `json:"data"`
+	}
+	mustDecode(t, rr, &envelope)
+
+	items := append(append([]activityJSON{}, envelope.Data.Channels...), envelope.Data.DMs...)
+	if len(items) != 4 {
+		t.Fatalf("expected 4 sidebar items, got %d", len(items))
+	}
+	for _, item := range items {
+		if item.CreatedAt != "2026-08-04T12:00:00.900123Z" {
+			t.Fatalf("%s: expected an RFC 3339 UTC created_at keeping its fraction, got %q", item.ID, item.CreatedAt)
+		}
+	}
+	for _, item := range []activityJSON{items[0], items[2]} {
+		if item.LastMessageAt == nil {
+			t.Fatalf("%s: expected a last_message_at", item.ID)
+		}
+		// 09:00.900123-03:00 rendered in UTC, so a client parses one shape and
+		// the microseconds survive the conversion.
+		if *item.LastMessageAt != "2026-08-04T12:00:00.900123Z" {
+			t.Fatalf("%s: expected an RFC 3339 UTC last_message_at keeping its fraction, got %q", item.ID, *item.LastMessageAt)
+		}
+	}
+	for _, item := range []activityJSON{items[1], items[3]} {
+		if item.LastMessageAt != nil {
+			t.Fatalf("%s: expected a null last_message_at, got %q", item.ID, *item.LastMessageAt)
+		}
+	}
+	// The key must be present-and-null rather than omitted: a client has to be
+	// able to tell "no activity" from "this server does not report activity".
+	if !strings.Contains(raw, `"last_message_at":null`) {
+		t.Fatalf("expected an explicit null last_message_at in the payload: %s", raw)
+	}
+}
+
+// Two messages written inside the same second are two different instants that
+// the query already distinguishes, and the payload has to keep saying so. The
+// whole-second cases are here too: RFC3339Nano drops trailing zeros, so the
+// same instant is written several ways and none of them may lose information.
+func TestSidebarHandler_ActivityFractionSurvivesSerialization(t *testing.T) {
+	v := makeTestValidator(t)
+	for _, test := range []struct {
+		name  string
+		value time.Time
+		want  string
+	}{
+		{name: "microseconds", value: time.Date(2026, 8, 4, 12, 0, 0, 900123000, time.UTC), want: "2026-08-04T12:00:00.900123Z"},
+		{name: "same second, earlier", value: time.Date(2026, 8, 4, 12, 0, 0, 100456000, time.UTC), want: "2026-08-04T12:00:00.100456Z"},
+		{name: "sub millisecond apart", value: time.Date(2026, 8, 4, 12, 0, 0, 900045000, time.UTC), want: "2026-08-04T12:00:00.900045Z"},
+		{name: "nanoseconds", value: time.Date(2026, 8, 4, 12, 0, 0, 100123456, time.UTC), want: "2026-08-04T12:00:00.100123456Z"},
+		// Trailing zeros are dropped; .900000000 and .9 are the same instant.
+		{name: "trailing zeros dropped", value: time.Date(2026, 8, 4, 12, 0, 0, 900000000, time.UTC), want: "2026-08-04T12:00:00.9Z"},
+		{name: "whole second carries no fraction", value: time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC), want: "2026-08-04T12:00:00Z"},
+		{name: "offset normalized to UTC", value: time.Date(2026, 8, 4, 9, 0, 0, 900123000, time.FixedZone("BRT", -3*60*60)), want: "2026-08-04T12:00:00.900123Z"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			svc := &stubSidebarProvider{data: service.SidebarData{
+				Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+				Channels: []service.SidebarChannel{
+					{
+						Channel:       domain.Channel{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic, CreatedAt: test.value},
+						CanWrite:      true,
+						LastMessageAt: &test.value,
+					},
+				},
+				DMs: []domain.DMConversationWithParticipantIDs{
+					{
+						DMConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect, CreatedAt: test.value},
+						LastMessageAt:  &test.value,
+					},
+				},
+			}}
+			rr := httptest.NewRecorder()
+			sidebarRouter(v, svc).ServeHTTP(rr, authGet(t))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rr.Code)
+			}
+			var envelope struct {
+				Data struct {
+					Channels []struct {
+						CreatedAt     string  `json:"created_at"`
+						LastMessageAt *string `json:"last_message_at"`
+					} `json:"channels"`
+					DMs []struct {
+						CreatedAt     string  `json:"created_at"`
+						LastMessageAt *string `json:"last_message_at"`
+					} `json:"dm_conversations"`
+				} `json:"data"`
+			}
+			mustDecode(t, rr, &envelope)
+
+			channel, dm := envelope.Data.Channels[0], envelope.Data.DMs[0]
+			for field, got := range map[string]string{
+				"channel created_at": channel.CreatedAt,
+				"dm created_at":      dm.CreatedAt,
+			} {
+				if got != test.want {
+					t.Fatalf("%s: expected %q, got %q", field, test.want, got)
+				}
+			}
+			for field, got := range map[string]*string{
+				"channel last_message_at": channel.LastMessageAt,
+				"dm last_message_at":      dm.LastMessageAt,
+			} {
+				if got == nil {
+					t.Fatalf("%s: expected a value", field)
+				}
+				if *got != test.want {
+					t.Fatalf("%s: expected %q, got %q", field, test.want, *got)
+				}
+			}
+		})
+	}
+}
+
+// The activity metadata must not become a message preview by the back door.
+func TestSidebarHandler_CarriesNoMessageContent(t *testing.T) {
+	v := makeTestValidator(t)
+	lastMessage := time.Date(2026, 7, 30, 18, 0, 0, 0, time.UTC)
+	svc := &stubSidebarProvider{data: service.SidebarData{
+		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
+		Channels: []service.SidebarChannel{
+			{Channel: domain.Channel{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic}, CanWrite: true, LastMessageAt: &lastMessage},
+		},
+		DMs: []domain.DMConversationWithParticipantIDs{
+			{DMConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect}, LastMessageAt: &lastMessage},
+		},
+	}}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authGet(t))
+
+	body := rr.Body.String()
+	for _, forbidden := range []string{
+		"body_text", "body_format", "sender_id", "sender_display_name", "message_id",
+		"last_message", "preview", "kind", "is_removed",
+	} {
+		if strings.Contains(body, `"`+forbidden+`"`) {
+			t.Fatalf("sidebar payload must not carry %q: %s", forbidden, body)
+		}
+	}
+}
+
 func TestSidebarHandler_EmptyData_ReturnsEmptyArrays(t *testing.T) {
 	v := makeTestValidator(t)
 	svc := &stubSidebarProvider{data: service.SidebarData{
@@ -503,15 +698,17 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 	}
 	mustDecode(t, rr, &raw)
 	for _, dm := range raw.Data.DMs {
-		for _, key := range []string{"id", "type", "name"} {
+		// created_at and last_message_at (issue #414) are the two ordering keys;
+		// they say when, never what, who or which message.
+		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at"} {
 			if _, ok := dm[key]; !ok {
 				t.Fatalf("missing expected DM field %q in %v", key, dm)
 			}
 		}
 		counterpart, hasCounterpart := dm["counterpart"]
-		wantFields := 3
+		wantFields := 5
 		if hasCounterpart {
-			wantFields = 4
+			wantFields = 6
 		}
 		if len(dm) != wantFields {
 			t.Fatalf("expected exactly %d DM fields, got %d: %v", wantFields, len(dm), dm)

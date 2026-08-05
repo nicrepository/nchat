@@ -2,7 +2,30 @@
 
 export type ChannelType = "public" | "private";
 
-export interface Channel {
+/**
+ * The two ordering keys the sidebar sorts a section by (issue #414).
+ *
+ * `lastMessageAt` is when the newest message of this conversation was
+ * persisted, as the server states it, and `null` when there is none. Null is
+ * not "unknown" and not "very old": it is what puts a conversation nobody has
+ * written in behind every conversation somebody has, however recently it was
+ * created. The two fields therefore stay separate instead of collapsing into
+ * one `lastMessageAt ?? createdAt`, which would let a brand-new empty
+ * conversation outrank an active one.
+ *
+ * Both are optional so a payload from a server that predates the fields parses
+ * unchanged: such items simply order by name and id, which is what they did
+ * before. Neither is ever produced by this client — a browser clock has no
+ * standing here.
+ */
+export interface ConversationActivity {
+  /** Server timestamp of the newest persisted message; null when there is none. */
+  lastMessageAt?: string | null;
+  /** Server creation timestamp; the fallback key for conversations without messages. */
+  createdAt?: string | null;
+}
+
+export interface Channel extends ConversationActivity {
   id: string;
   name: string;
   type: ChannelType;
@@ -60,7 +83,7 @@ export interface DMCounterpart {
   avatarUrl?: string;
 }
 
-export interface DMConversation {
+export interface DMConversation extends ConversationActivity {
   id: string;
   type: DMType;
   name: string;
