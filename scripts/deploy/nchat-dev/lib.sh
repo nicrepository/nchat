@@ -61,6 +61,23 @@ validate_commit_sha() {
   [[ "${1:-}" =~ ^[a-f0-9]{40}$ ]]
 }
 
+# Fails fast, before any kustomize build or kubectl apply, if the active
+# kubectl identity lacks a required verb on a namespaced resource. Never
+# passes --as: it must reflect the credential the workflow actually runs as,
+# not an impersonated one, so the check can't diverge from the real apply.
+require_kubernetes_permission() {
+  local verb="$1" resource="$2" namespace="$3" answer status
+  if answer="$(kubectl auth can-i "$verb" "$resource" -n "$namespace" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -ne 0 || "$answer" != yes ]]; then
+    echo "Kubernetes permission preflight failed: $verb $resource in namespace $namespace." >&2
+    return 1
+  fi
+}
+
 validate_digest_artifacts() {
   local artifacts_dir="$1" image file digest index
   local expected=()
@@ -108,8 +125,55 @@ validate_rendered_overlay() {
   local overlay="$1" output="$2"
   kustomize build "$overlay" >"$output"
   [[ -s "$output" ]] || return 1
-  if grep -En 'sha-placeholder|image: .*:(latest|main|master)(@|$)' "$output"; then
-    echo "Rendered manifest contains a forbidden mutable image reference." >&2
+  validate_rendered_placeholders "$output"
+}
+
+rendered_overlay_placeholder_matches() {
+  grep -Eno 'REPLACE_ME_[A-Z0-9_]+' "$1"
+}
+
+format_rendered_placeholder_matches() {
+  local output="$1" matches="$2" line token
+  while IFS=: read -r line token; do
+    [[ "$line" =~ ^[0-9]+$ && "$token" =~ ^REPLACE_ME_[A-Z0-9_]+$ ]] || return 1
+    printf '%s:%s:%s\n' "$output" "$line" "$token" || return 1
+  done <<<"$matches"
+}
+
+validate_rendered_placeholders() {
+  local output="$1" mutable_matches placeholder_matches formatted status
+  if mutable_matches="$(grep -En 'sha-placeholder|image: .*:(latest|main|master)(@|$)' "$output" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) echo "Rendered manifest contains a forbidden mutable image reference." >&2; return 1 ;;
+    1) ;;
+    *) echo "Unable to inspect rendered manifest: $output." >&2; return 1 ;;
+  esac
+  # Fail fast on any unresolved topology placeholder before it reaches
+  # kubectl apply. Report only the file and matched token, never the full
+  # line, since a line could belong to a Secret/SealedSecret resource.
+  if placeholder_matches="$(rendered_overlay_placeholder_matches "$output" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    1) return 0 ;;
+    0) ;;
+    *) echo "Unable to inspect rendered manifest: $output." >&2; return 1 ;;
+  esac
+  if ! formatted="$(format_rendered_placeholder_matches "$output" "$placeholder_matches")"; then
+    echo "Unable to format unresolved placeholders for rendered manifest: $output." >&2
     return 1
   fi
+  if [[ -n "$formatted" ]]; then
+    printf '%s\n' "$formatted" >&2
+    echo "Rendered manifest $output contains unresolved REPLACE_ME_* placeholders (see tokens above)." >&2
+    return 1
+  fi
+  echo "Unable to format unresolved placeholders for rendered manifest: $output." >&2
+  return 1
 }

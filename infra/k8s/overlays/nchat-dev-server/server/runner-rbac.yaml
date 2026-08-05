@@ -133,6 +133,7 @@ rules:
       - traefik.io
     resources:
       - middlewares
+      - ingressroutes
     verbs:
       - get
       - list
