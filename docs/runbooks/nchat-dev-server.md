@@ -217,10 +217,21 @@ valores em issues ou logs, estas variables não secretas:
 
 - `NCHAT_DEV_NODE_IP`;
 - `NCHAT_DEV_NODE_CIDR`, exatamente o mesmo IP com `/32`;
-- `NCHAT_DEV_HOST`.
+- `NCHAT_DEV_HOST`, que deve ser um hostname RFC 1123 completo: rótulos de 1 a
+  63 caracteres alfanuméricos com hífen apenas internamente (nunca inicial ou
+  final), sem rótulo vazio, sem ponto inicial/final e com no máximo 253
+  caracteres no total. Maiúsculas, `_`, espaços e quebras de linha são
+  rejeitados.
 
 O workflow falha antes da renderização se alguma estiver ausente ou inválida. As
 variables não substituem Secrets; credenciais continuam em SealedSecrets.
+
+Além da validação de `NCHAT_DEV_HOST`, o deploy falha antes de qualquer
+`kubectl apply` se o manifesto renderizado (`data.yaml`, `migrations.yaml` ou
+`application.yaml`) ainda contiver um placeholder não resolvido no formato
+`REPLACE_ME_[A-Z0-9_]+` — não apenas `REPLACE_ME_HOST`. A mensagem de erro
+aponta arquivo e linha do token, nunca o conteúdo completo da linha (que pode
+pertencer a um Secret/SealedSecret).
 
 ## 5. Namespace, RBAC e PVs
 
@@ -283,6 +294,23 @@ kubectl get pv nchat-dev-postgres nchat-dev-valkey nchat-dev-seaweedfs \
 
 Os PVs são deliberadamente cluster-scoped e não pertencem ao workflow. Nunca altere
 `Retain` para `Delete` neste ambiente.
+
+O Role `nchat-dev-deployer` inclui `get/list/watch/create/patch/update` em
+`ingressroutes.traefik.io`, necessário desde que o overlay passou a incluir
+`IngressRoute/nchat-dev-uploads` (RF-32/#455). Sem esse grant, o apply falha a
+meio caminho com `cannot get resource "ingressroutes"`. Valide com:
+
+```bash
+# [srv-apps-01]
+kubectl auth can-i get ingressroutes.traefik.io -n nchat-dev --as=nchat-dev-deployer
+kubectl auth can-i create ingressroutes.traefik.io -n nchat-dev --as=nchat-dev-deployer
+kubectl auth can-i patch ingressroutes.traefik.io -n nchat-dev --as=nchat-dev-deployer
+kubectl auth can-i update ingressroutes.traefik.io -n nchat-dev --as=nchat-dev-deployer
+```
+
+Todos devem responder `yes`. O deploy também verifica isso, sob a identidade real
+do runner (sem `--as`), antes de renderizar qualquer overlay — uma permissão
+ausente falha o deploy imediatamente, sem aplicar nenhum recurso.
 
 ## 6. Usuário e kubeconfig do runner
 
@@ -1106,6 +1134,14 @@ Proibições explícitas para rollback em servidor compartilhado:
 
 Para falha de dados, não apague PVC, PV ou diretórios. Preserve os PVs `Retain` e
 restaure somente por procedimento de backup validado.
+
+> Um `apply` parcial anterior (ex.: falha após alguns recursos terem sido
+> aplicados) não é revertido automaticamente por nenhum mecanismo deste
+> workflow. O `rollout undo` acima só cobre `Deployment`s; Ingress, Certificate,
+> IngressRoute e ConfigMap aplicados antes da falha permanecem no estado em que
+> o `apply` parcial os deixou até o próximo deploy bem-sucedido os sobrescrever.
+> Revise manualmente o estado desses recursos (seção 17) após qualquer falha de
+> deploy antes de assumir que o ambiente está consistente.
 
 ## 19. Rotação e TLS local
 
