@@ -46,6 +46,7 @@ export default function CallPanel({
   const dialogCallId = call?.call_id;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [endingCallId, setEndingCallId] = useState("");
+  const [decliningCallId, setDecliningCallId] = useState("");
   const [retryingMediaCallId, setRetryingMediaCallId] = useState("");
   const retryPromiseRef = useRef<Promise<void> | null>(null);
   const [activatingMediaCallId, setActivatingMediaCallId] = useState("");
@@ -89,6 +90,11 @@ export default function CallPanel({
   const active = call.status === "active";
   const video = call.call_type === "video";
   const ending = endingCallId === call.call_id && !calls.error;
+  // RF-23: Recusar must stay clickable while accept()'s own permission
+  // preflight is pending — calls.pending is shared across every operation
+  // so it can't gate this button. It's only disabled by its own in-flight
+  // decline (the incoming footer only renders while status is "ringing").
+  const declining = decliningCallId === call.call_id && !calls.error;
   const activeReady = active && identityReady;
   // A restored/reconciled call never opens the browser permission prompt on
   // its own (RF-23): it stays active in signaling but requires this explicit
@@ -122,6 +128,10 @@ export default function CallPanel({
 
   function endCall() {
     if (!ending && calls.end()) setEndingCallId(callId);
+  }
+
+  function declineCall() {
+    if (!declining && calls.decline()) setDecliningCallId(callId);
   }
 
   async function retryMedia() {
@@ -348,8 +358,9 @@ export default function CallPanel({
               label="Recusar"
               icon="call_end"
               variant="danger"
-              disabled={calls.pending}
-              onClick={calls.decline}
+              aria-busy={declining}
+              disabled={declining}
+              onClick={declineCall}
             />
           </>
         )}
@@ -443,6 +454,7 @@ interface CallActionProps {
   muted?: boolean;
   autoFocus?: boolean;
   disabled?: boolean;
+  "aria-busy"?: boolean;
   onClick: () => unknown;
 }
 
@@ -455,6 +467,7 @@ function CallAction({
   muted,
   autoFocus,
   disabled,
+  "aria-busy": ariaBusy,
   onClick,
 }: CallActionProps) {
   return (
@@ -465,6 +478,7 @@ function CallAction({
       }`}
       aria-label={label}
       aria-pressed={pressed}
+      aria-busy={ariaBusy}
       autoFocus={autoFocus}
       disabled={disabled}
       onClick={onClick}

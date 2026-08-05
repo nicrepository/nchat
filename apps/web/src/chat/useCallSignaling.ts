@@ -451,7 +451,22 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   const transition = useCallback(
     (type: "call.decline" | "call.cancel" | "call.end") => {
       const call = callRef.current;
-      return call ? send(type, { call_id: call.call_id }) : false;
+      if (!call) return false;
+      if (
+        type === "call.decline" &&
+        call.status === "ringing" &&
+        pendingRef.current?.operation === "call.accept" &&
+        pendingRef.current.callId === call.call_id
+      ) {
+        // RF-23: the user must be able to decline while accept()'s own
+        // getUserMedia preflight is still awaiting the native prompt. Null
+        // out the captured pendingCommand here (identity, not just the
+        // ref) so sendGated's `pendingRef.current !== pendingCommand` check
+        // rejects it whenever the prompt resolves — no call.accept, no
+        // stale setPending/setError clobbering the decline below.
+        pendingRef.current = null;
+      }
+      return send(type, { call_id: call.call_id });
     },
     [send],
   );

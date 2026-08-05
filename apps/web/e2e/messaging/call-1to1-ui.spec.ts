@@ -567,7 +567,98 @@ test.describe("permissões de mídia (RF-23)", () => {
         { audio: true, video: true },
       ]);
   });
+
+  test("mantém Recusar habilitado durante o preflight de accept e nunca envia call.accept após a recusa", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "perm-decline-during-accept");
+    const participantName = "E2E Participante";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: participantName,
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await instrumentGetUserMediaHold(page);
+    await stubMediaToken(page);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+    const call = {
+      callId: uniqueId(testInfo, "decline-during-accept-call"),
+      requestId: uniqueId(testInfo, "decline-during-accept-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+    await emitCallEvent(page, callEvent(call, "ringing", 1));
+
+    const dialog = page.getByRole("dialog", { name: `Chamada de vídeo com ${participantName}` });
+    const accept = dialog.getByRole("button", { name: "Atender" });
+    const decline = dialog.getByRole("button", { name: "Recusar" });
+    await expect(accept).toBeFocused();
+
+    await accept.click();
+    // Wait for accept()'s own getUserMedia preflight to actually be in
+    // flight (held open, simulating the native prompt) before asserting.
+    await expect.poll(() => getUserMediaCalls(page)).toEqual([{ audio: true, video: true }]);
+    await expect(accept).toBeDisabled();
+    await expect(decline).toBeEnabled();
+
+    await decline.click();
+
+    await expectCommandCount(page, "call.decline", 1);
+    expect(await commandCount(page, "call.accept")).toBe(0);
+
+    // The held getUserMedia call resolves late, well after decline: it must
+    // never let a stale accept preflight send call.accept or connect media.
+    await resolveHeldGetUserMedia(page);
+    await page.waitForFunction(
+      () =>
+        (window as unknown as { __e2eGetUserMediaSettled?: boolean }).__e2eGetUserMediaSettled ===
+        true,
+    );
+    expect(await commandCount(page, "call.accept")).toBe(0);
+  });
 });
+
+async function instrumentGetUserMediaHold(page: Page) {
+  // Holds every getUserMedia() call open until the test explicitly resolves
+  // it (RF-23: simulates the native camera/microphone prompt staying open
+  // indefinitely while the user clicks Recusar).
+  await page.addInitScript(() => {
+    const target = window as unknown as {
+      __e2eGetUserMediaCalls: MediaStreamConstraints[];
+      __e2eResolveGetUserMedia?: () => void;
+      __e2eGetUserMediaSettled?: boolean;
+    };
+    target.__e2eGetUserMediaCalls = [];
+    target.__e2eGetUserMediaSettled = false;
+    const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = (constraints?: MediaStreamConstraints) => {
+      target.__e2eGetUserMediaCalls.push(constraints ?? {});
+      return new Promise<MediaStream>((resolve, reject) => {
+        target.__e2eResolveGetUserMedia = () => {
+          original(constraints).then(
+            (stream) => {
+              target.__e2eGetUserMediaSettled = true;
+              resolve(stream);
+            },
+            (error) => {
+              target.__e2eGetUserMediaSettled = true;
+              reject(error);
+            },
+          );
+        };
+      });
+    };
+  });
+}
+
+async function resolveHeldGetUserMedia(page: Page) {
+  await page.evaluate(() => {
+    (window as unknown as { __e2eResolveGetUserMedia?: () => void }).__e2eResolveGetUserMedia?.();
+  });
+}
 
 async function instrumentGetUserMedia(page: Page, initialDeny: boolean) {
   await page.addInitScript((deny) => {

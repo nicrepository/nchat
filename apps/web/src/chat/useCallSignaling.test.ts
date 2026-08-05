@@ -1918,6 +1918,173 @@ describe("useCallSignaling media permission gating", () => {
   });
 });
 
+// ── RF-23: decline must stay available while accept's own permission
+// preflight is still pending, so the user is never trapped behind an
+// indefinite native camera/microphone prompt. ───────────────────────────────
+
+describe("useCallSignaling decline during accept preflight (RF-23)", () => {
+  it("declines a ringing call while accept's permission preflight is still pending", async () => {
+    const permission = deferredValue<{ ok: true }>();
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(permission.promise);
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+
+    act(() => {
+      expect(result.current.accept()).toBe(true);
+    });
+    expect(result.current.pending).toBe(true);
+    expect(callCommands(socket)).toEqual([]);
+
+    let declined = false;
+    act(() => {
+      declined = result.current.decline();
+    });
+
+    expect(declined).toBe(true);
+    expect(callCommands(socket)).toEqual([{ type: "call.decline", call_id: baseCall.call_id }]);
+
+    // The stale accept preflight resolves afterwards: it must never send
+    // call.accept nor connect media, even though permission was granted.
+    await act(async () => permission.resolve({ ok: true }));
+
+    expect(callCommands(socket)).toEqual([{ type: "call.decline", call_id: baseCall.call_id }]);
+    expect(media.connect).not.toHaveBeenCalled();
+  });
+
+  it("sends call.decline exactly once even on a double click during accept preflight", async () => {
+    const permission = deferredValue<{ ok: true }>();
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(permission.promise);
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      result.current.accept();
+    });
+
+    let firstDecline = false;
+    let secondDecline = true;
+    act(() => {
+      firstDecline = result.current.decline();
+      secondDecline = result.current.decline();
+    });
+
+    expect(firstDecline).toBe(true);
+    expect(secondDecline).toBe(false);
+    expect(callCommands(socket).filter((m) => m["type"] === "call.decline")).toHaveLength(1);
+
+    await act(async () => permission.resolve({ ok: true }));
+    expect(callCommands(socket).filter((m) => m["type"] === "call.accept")).toHaveLength(0);
+  });
+
+  it("does not let decline bypass the pending guard for an unrelated in-flight operation", () => {
+    // Only a pending call.accept for the currently displayed call is ever
+    // invalidated by decline; any other in-flight operation (e.g. cancel)
+    // keeps decline blocked exactly like send()'s normal dedup guard.
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      expect(result.current.cancel()).toBe(true);
+    });
+    expect(callCommands(socket)).toEqual([{ type: "call.cancel", call_id: baseCall.call_id }]);
+
+    let declined = true;
+    act(() => {
+      declined = result.current.decline();
+    });
+
+    expect(declined).toBe(false);
+    expect(callCommands(socket)).toEqual([{ type: "call.cancel", call_id: baseCall.call_id }]);
+  });
+
+  it("keeps a terminal event authoritative while accept's preflight is pending", async () => {
+    const permission = deferredValue<{ ok: true }>();
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(permission.promise);
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      result.current.accept();
+    });
+
+    act(() =>
+      socket.simulateMessage({
+        ...endedEvent(2),
+        type: "call.cancelled",
+        call: { ...endedEvent(2).call, status: "cancelled" },
+      }),
+    );
+
+    expect(result.current.call?.status).toBe("cancelled");
+    expect(result.current.pending).toBe(false);
+
+    await act(async () => permission.resolve({ ok: true }));
+    expect(callCommands(socket)).toEqual([]);
+  });
+
+  it("does not let the stale accept preflight clear a newer operation's pending state", async () => {
+    const permission = deferredValue<{ ok: true }>();
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(permission.promise);
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      result.current.accept();
+    });
+    act(() => {
+      expect(result.current.decline()).toBe(true);
+    });
+    expect(result.current.pending).toBe(true);
+
+    await act(async () => permission.resolve({ ok: true }));
+
+    // decline's own request is still awaiting server confirmation.
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() =>
+      socket.simulateMessage({
+        ...endedEvent(2),
+        type: "call.declined",
+        call: { ...endedEvent(2).call, status: "declined" },
+      }),
+    );
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("does not let a stale accept preflight denial replace a newer operation's error", async () => {
+    const permission = deferredValue<{ ok: false; kind: "permission_denied"; message: string }>();
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(permission.promise);
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      result.current.accept();
+    });
+    act(() => {
+      expect(result.current.decline()).toBe(true);
+    });
+
+    await act(async () =>
+      permission.resolve({
+        ok: false,
+        kind: "permission_denied",
+        message: "Acesso à câmera e ao microfone foi negado ou bloqueado.",
+      }),
+    );
+
+    expect(result.current.error).toBeNull();
+  });
+});
+
 // ── RF-23: a restored/reconciled active call requires explicit activation ────
 
 describe("useCallSignaling restored call activation", () => {

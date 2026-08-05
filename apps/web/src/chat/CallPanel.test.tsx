@@ -365,6 +365,20 @@ describe("CallPanel", () => {
     expect(screen.getByRole("button", { name: "Recusar" })).toBeEnabled();
   });
 
+  it("keeps Recusar enabled while accept's own permission preflight is pending (RF-23)", async () => {
+    const user = userEvent.setup();
+    const calls = controller("ringing");
+    calls.pending = true;
+    renderPanel(calls);
+
+    expect(screen.getByRole("button", { name: "Atender" })).toBeDisabled();
+    const decline = screen.getByRole("button", { name: "Recusar" });
+    expect(decline).toBeEnabled();
+
+    await user.click(decline);
+    expect(calls.decline).toHaveBeenCalledOnce();
+  });
+
   it("surfaces a denied outgoing-call permission as an accessible toast with no call created", () => {
     const calls: CallController = {
       call: null,
