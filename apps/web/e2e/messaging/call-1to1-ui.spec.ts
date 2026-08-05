@@ -257,8 +257,15 @@ test.describe("chamada 1:1", () => {
       name: `Chamada de vídeo com ${participantName}`,
     });
     await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeFocused();
-    await expect(dialog.getByRole("button", { name: "Ativar microfone" })).toBeVisible();
-    await expect(dialog.getByRole("button", { name: "Ativar câmera" })).toBeVisible();
+    // RF-23: an active call restored this way (never locally started or
+    // accepted by this tab) must not request media on its own, however long
+    // identity took to resolve — only the explicit activation click may.
+    expect(tokenRequests).toBe(0);
+    const activate = dialog.getByRole("button", { name: "Permitir câmera e microfone" });
+    await expect(activate).toBeVisible();
+
+    await activate.click();
+
     await expect.poll(() => tokenRequests).toBe(1);
     expect(await commandCount(page, "call.sync")).toBe(1);
   });
@@ -400,6 +407,211 @@ test.describe("chamada 1:1", () => {
   });
 });
 
+test.describe("permissões de mídia (RF-23)", () => {
+  test("chamada de áudio solicita apenas o microfone e envia call.start após a permissão", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "perm-audio");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "E2E Participante",
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await instrumentGetUserMedia(page, false);
+    await stubMediaToken(page);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+
+    await page.getByRole("button", { name: "Iniciar chamada de áudio" }).click();
+
+    await expectCommandCount(page, "call.start", 1);
+    expect(await getUserMediaCalls(page)).toEqual([{ audio: true, video: false }]);
+  });
+
+  test("chamada de vídeo solicita câmera e microfone antes de enviar call.start", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "perm-video");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "E2E Participante",
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await instrumentGetUserMedia(page, false);
+    await stubMediaToken(page);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+
+    await page.getByRole("button", { name: "Iniciar chamada de vídeo" }).click();
+
+    await expectCommandCount(page, "call.start", 1);
+    expect(await getUserMediaCalls(page)).toEqual([{ audio: true, video: true }]);
+  });
+
+  test("permissão negada não cria a chamada e permite tentar novamente após liberar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "perm-denied");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "E2E Participante",
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await instrumentGetUserMedia(page, true);
+    await stubMediaToken(page);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+
+    const audioButton = page.getByRole("button", { name: "Iniciar chamada de áudio" });
+    await audioButton.click();
+
+    await expect(page.getByRole("alert")).toBeVisible();
+    expect(await commandCount(page, "call.start")).toBe(0);
+    await expect(page.getByRole("dialog", { name: /Chamada/ })).toHaveCount(0);
+    await expect(audioButton).toBeEnabled();
+
+    await allowGetUserMedia(page);
+    await audioButton.click();
+
+    await expectCommandCount(page, "call.start", 1);
+  });
+
+  test("chamada de áudio restaurada exige ativação explícita e solicita apenas o microfone", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "perm-restored-audio");
+    const participantName = "E2E Participante";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: participantName,
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await instrumentGetUserMedia(page, false);
+    await stubMediaToken(page);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+    const call = {
+      callId: uniqueId(testInfo, "restored-audio-call"),
+      requestId: uniqueId(testInfo, "restored-audio-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+    // Pushed directly as "active" (no local accept in this tab): the exact
+    // shape of a call restored by reload, reconnect, or call.sync.
+    await emitCallEvent(page, callEvent(call, "active", 1, "audio"));
+
+    const dialog = page.getByRole("dialog", { name: `Chamada de áudio com ${participantName}` });
+    await expect(dialog).toBeVisible();
+    const activate = dialog.getByRole("button", { name: "Permitir microfone" });
+    await expect(activate).toBeVisible();
+    expect(await getUserMediaCalls(page)).toEqual([]);
+
+    await activate.click();
+
+    await expect.poll(() => getUserMediaCalls(page)).toEqual([{ audio: true, video: false }]);
+  });
+
+  test("nega a ativação de uma chamada restaurada e permite tentar novamente", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "perm-restored-denied");
+    const participantName = "E2E Participante";
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: participantName,
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await instrumentGetUserMedia(page, true);
+    await stubMediaToken(page);
+
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
+    const call = {
+      callId: uniqueId(testInfo, "restored-denied-call"),
+      requestId: uniqueId(testInfo, "restored-denied-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+    await emitCallEvent(page, callEvent(call, "active", 1));
+
+    const dialog = page.getByRole("dialog", { name: `Chamada de vídeo com ${participantName}` });
+    const activate = dialog.getByRole("button", { name: "Permitir câmera e microfone" });
+    await activate.click();
+
+    await expect(dialog.getByRole("alert")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeVisible();
+
+    await allowGetUserMedia(page);
+    await dialog.getByRole("button", { name: "Permitir câmera e microfone" }).click();
+
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+    await expect
+      .poll(() => getUserMediaCalls(page))
+      .toEqual([
+        { audio: true, video: true },
+        { audio: true, video: true },
+      ]);
+  });
+});
+
+async function instrumentGetUserMedia(page: Page, initialDeny: boolean) {
+  await page.addInitScript((deny) => {
+    const target = window as unknown as {
+      __e2eGetUserMediaCalls: MediaStreamConstraints[];
+      __e2eDenyGetUserMedia: boolean;
+    };
+    target.__e2eGetUserMediaCalls = [];
+    target.__e2eDenyGetUserMedia = deny;
+    const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = (constraints?: MediaStreamConstraints) => {
+      target.__e2eGetUserMediaCalls.push(constraints ?? {});
+      if (target.__e2eDenyGetUserMedia) {
+        return Promise.reject(new DOMException("denied by e2e", "NotAllowedError"));
+      }
+      return original(constraints);
+    };
+  }, initialDeny);
+}
+
+async function getUserMediaCalls(page: Page): Promise<MediaStreamConstraints[]> {
+  return page.evaluate(
+    () =>
+      (window as unknown as { __e2eGetUserMediaCalls?: MediaStreamConstraints[] })
+        .__e2eGetUserMediaCalls ?? [],
+  );
+}
+
+async function allowGetUserMedia(page: Page) {
+  await page.evaluate(() => {
+    (window as unknown as { __e2eDenyGetUserMedia: boolean }).__e2eDenyGetUserMedia = false;
+  });
+}
+
+async function stubMediaToken(page: Page) {
+  await page.route("**/api/media/media/livekit/token", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "media_unavailable" } }),
+    }),
+  );
+}
+
 async function openCallConversation(page: Page, testInfo: TestInfo, participantName: string) {
   const targetId = uniqueId(testInfo, "call-dm");
   const callId = uniqueId(testInfo, "call");
@@ -410,13 +622,7 @@ async function openCallConversation(page: Page, testInfo: TestInfo, participantN
     messages: [],
   });
   await installMessagingMocks(page, scenario);
-  await page.route("**/api/media/media/livekit/token", (route) =>
-    route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({ error: { code: "media_unavailable" } }),
-    }),
-  );
+  await stubMediaToken(page);
   await page.goto(`/chat/dm/${targetId}`);
   await expect(page.getByTestId("chat-shell")).toBeVisible();
   await expect.poll(() => commandCount(page, "call.sync")).toBe(1);
@@ -435,7 +641,12 @@ function deferredValue<T>() {
   return { promise, resolve };
 }
 
-function callEvent(call: CallFixture, status: CallStatus, version: number) {
+function callEvent(
+  call: CallFixture,
+  status: CallStatus,
+  version: number,
+  callType: "audio" | "video" = "video",
+) {
   const eventType =
     status === "ringing" ? "call.ringing" : status === "active" ? "call.accepted" : "call.ended";
   return {
@@ -448,7 +659,7 @@ function callEvent(call: CallFixture, status: CallStatus, version: number) {
       request_id: call.requestId,
       caller_id: OTHER_USER_ID,
       callee_id: CURRENT_USER_ID,
-      call_type: "video",
+      call_type: callType,
       status,
       version,
       created_at: call.createdAt,

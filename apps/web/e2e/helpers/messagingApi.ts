@@ -593,6 +593,14 @@ export async function installMessagingMocks(
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
     origin: "http://localhost:5173",
   });
+  // RF-23: call.start/call.accept now run a real getUserMedia() preflight.
+  // Grant camera/microphone so that preflight resolves deterministically
+  // against the fake devices configured in playwright.config.ts; tests that
+  // exercise the denied path override navigator.mediaDevices.getUserMedia
+  // directly instead of revoking this context-level grant.
+  await page.context().grantPermissions(["camera", "microphone"], {
+    origin: "http://localhost:5173",
+  });
   await installWebSocketMock(page, scenario, assertConversationAccess);
   await installSidebarMocks(page, scenario);
   await installInteractionMocks(page, scenario, assertConversationAccess);
