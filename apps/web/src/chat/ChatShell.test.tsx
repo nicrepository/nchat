@@ -8,6 +8,7 @@ import { issueCallToken } from "./callApi";
 import { fetchSidebarData } from "./chatApi";
 import ChatShell from "./ChatShell";
 import { _resetChatSocket } from "./chatSocket";
+import { requestMediaPermission } from "./mediaPermission";
 import { useCallMedia } from "./useCallMedia";
 
 vi.mock("./chatApi", async () => {
@@ -17,6 +18,7 @@ vi.mock("./chatApi", async () => {
 vi.mock("./callApi", () => ({ issueCallToken: vi.fn() }));
 vi.mock("./useChatWebSocket", () => ({ useChatWebSocket: vi.fn() }));
 vi.mock("./useCallMedia", () => ({ useCallMedia: vi.fn() }));
+vi.mock("./mediaPermission", () => ({ requestMediaPermission: vi.fn() }));
 
 class FakeWebSocket {
   static readonly OPEN = 1;
@@ -92,6 +94,8 @@ beforeEach(() => {
     token: "media-token",
     expiresAt: "2026-08-03T12:05:00Z",
   });
+  vi.mocked(requestMediaPermission).mockReset();
+  vi.mocked(requestMediaPermission).mockResolvedValue({ ok: true });
   vi.mocked(useCallMedia).mockReturnValue({
     status: "idle",
     microphoneEnabled: false,
@@ -315,12 +319,22 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(
-      await screen.findByRole("dialog", { name: "Chamada de vídeo com Ana Lima" }),
-    ).toBeVisible();
+    const dialogAfterRecovery = await screen.findByRole("dialog", {
+      name: "Chamada de vídeo com Ana Lima",
+    });
+    expect(dialogAfterRecovery).toBeVisible();
     expect(screen.getByRole("button", { name: "Encerrar chamada" })).toHaveFocus();
-    expect(screen.getByRole("button", { name: "Ativar microfone" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Ativar câmera" })).toBeInTheDocument();
+
+    // This call reached "active" via a raw push, never through this hook's
+    // own start()/accept() preflight, so RF-23 requires an explicit gesture
+    // before any getUserMedia/LiveKit connection — no auto-connect here.
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(connectMedia).not.toHaveBeenCalled();
+    const activate = screen.getByRole("button", { name: "Permitir câmera e microfone" });
+
+    await user.click(activate);
+
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledExactlyOnceWith("video"));
     await waitFor(() => expect(issueCallToken).toHaveBeenCalledOnce());
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     expect(FakeWebSocket.instances).toHaveLength(1);

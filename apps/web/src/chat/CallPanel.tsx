@@ -46,12 +46,16 @@ export default function CallPanel({
   const dialogCallId = call?.call_id;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [endingCallId, setEndingCallId] = useState("");
+  const [decliningCallId, setDecliningCallId] = useState("");
   const [retryingMediaCallId, setRetryingMediaCallId] = useState("");
   const retryPromiseRef = useRef<Promise<void> | null>(null);
+  const [activatingMediaCallId, setActivatingMediaCallId] = useState("");
+  const activateMediaPromiseRef = useRef<Promise<void> | null>(null);
   const [retryingIdentityCallId, setRetryingIdentityCallId] = useState("");
   const identityRetryPromiseRef = useRef<Promise<void> | null>(null);
   const terminal = call && call.status in terminalLabels;
   const retryingMedia = Boolean(dialogCallId && retryingMediaCallId === dialogCallId);
+  const activatingMedia = Boolean(dialogCallId && activatingMediaCallId === dialogCallId);
 
   useEffect(() => {
     if (!terminal) return;
@@ -86,9 +90,18 @@ export default function CallPanel({
   const active = call.status === "active";
   const video = call.call_type === "video";
   const ending = endingCallId === call.call_id && !calls.error;
+  // RF-23: Recusar must stay clickable while accept()'s own permission
+  // preflight is pending — calls.pending is shared across every operation
+  // so it can't gate this button. It's only disabled by its own in-flight
+  // decline (the incoming footer only renders while status is "ringing").
+  const declining = decliningCallId === call.call_id && !calls.error;
   const activeReady = active && identityReady;
+  // A restored/reconciled call never opens the browser permission prompt on
+  // its own (RF-23): it stays active in signaling but requires this explicit
+  // action before any getUserMedia/LiveKit connection happens.
+  const activationNeeded = activeReady && calls.mediaActivationRequired;
   const permissionRecovery =
-    activeReady && (media?.status === "permission-denied" || retryingMedia);
+    activeReady && !activationNeeded && (media?.status === "permission-denied" || retryingMedia);
   const retryingIdentity = retryingIdentityCallId === call.call_id;
   const identityRecovery =
     (call.status === "ringing" || active) && (identityStatus === "error" || retryingIdentity);
@@ -117,6 +130,10 @@ export default function CallPanel({
     if (!ending && calls.end()) setEndingCallId(callId);
   }
 
+  function declineCall() {
+    if (!declining && calls.decline()) setDecliningCallId(callId);
+  }
+
   async function retryMedia() {
     if (retryPromiseRef.current || calls.pending) return;
     setRetryingMediaCallId(callId);
@@ -129,6 +146,22 @@ export default function CallPanel({
       if (!operation || retryPromiseRef.current === operation) {
         retryPromiseRef.current = null;
         setRetryingMediaCallId("");
+      }
+    }
+  }
+
+  async function activateMedia() {
+    if (activateMediaPromiseRef.current || calls.pending) return;
+    setActivatingMediaCallId(callId);
+    let operation: Promise<void> | null = null;
+    try {
+      operation = calls.activateMedia();
+      activateMediaPromiseRef.current = operation;
+      await operation;
+    } finally {
+      if (!operation || activateMediaPromiseRef.current === operation) {
+        activateMediaPromiseRef.current = null;
+        setActivatingMediaCallId("");
       }
     }
   }
@@ -248,6 +281,23 @@ export default function CallPanel({
               Tentar mídia novamente
             </button>
           </div>
+        ) : activationNeeded ? (
+          <div className="call-panel__error" role={calls.error ? "alert" : "status"}>
+            <span>
+              {calls.error ??
+                (video
+                  ? "Ative sua câmera e o microfone para continuar a chamada."
+                  : "Ative seu microfone para continuar a chamada.")}
+            </span>
+            <button
+              type="button"
+              aria-busy={activatingMedia}
+              disabled={activatingMedia || calls.pending}
+              onClick={() => void activateMedia()}
+            >
+              {video ? "Permitir câmera e microfone" : "Permitir microfone"}
+            </button>
+          </div>
         ) : (
           status && (
             <p className="call-panel__status" role="status" aria-live="polite">
@@ -257,7 +307,7 @@ export default function CallPanel({
           )
         )}
 
-        {error && !identityRecovery && !permissionRecovery && (
+        {error && !identityRecovery && !permissionRecovery && !activationNeeded && (
           <div className="call-panel__error" role="alert">
             <span>{error}</span>
             {active && (
@@ -308,8 +358,9 @@ export default function CallPanel({
               label="Recusar"
               icon="call_end"
               variant="danger"
-              disabled={calls.pending}
-              onClick={calls.decline}
+              aria-busy={declining}
+              disabled={declining}
+              onClick={declineCall}
             />
           </>
         )}
@@ -403,6 +454,7 @@ interface CallActionProps {
   muted?: boolean;
   autoFocus?: boolean;
   disabled?: boolean;
+  "aria-busy"?: boolean;
   onClick: () => unknown;
 }
 
@@ -415,6 +467,7 @@ function CallAction({
   muted,
   autoFocus,
   disabled,
+  "aria-busy": ariaBusy,
   onClick,
 }: CallActionProps) {
   return (
@@ -425,6 +478,7 @@ function CallAction({
       }`}
       aria-label={label}
       aria-pressed={pressed}
+      aria-busy={ariaBusy}
       autoFocus={autoFocus}
       disabled={disabled}
       onClick={onClick}

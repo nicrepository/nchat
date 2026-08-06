@@ -31,12 +31,14 @@ function controller(
     pending: false,
     error: null,
     mediaReady: false,
+    mediaActivationRequired: false,
     start: vi.fn(() => true),
     accept: vi.fn(() => true),
     decline: vi.fn(() => true),
     cancel: vi.fn(() => true),
     end: vi.fn(() => true),
     retryMedia: vi.fn(async () => undefined),
+    activateMedia: vi.fn(async () => undefined),
     clearTerminal: vi.fn(),
   };
 }
@@ -350,6 +352,56 @@ describe("CallPanel", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Cancelar chamada" }));
     expect(outgoing.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces a denied accept permission as an accessible alert while the call stays ringing", () => {
+    const calls = controller("ringing");
+    calls.error =
+      "Acesso ao microfone foi negado ou bloqueado. Libere a permissão e tente novamente.";
+    renderPanel(calls);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Acesso ao microfone foi negado");
+    expect(screen.getByRole("button", { name: "Atender" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Recusar" })).toBeEnabled();
+  });
+
+  it("keeps Recusar enabled while accept's own permission preflight is pending (RF-23)", async () => {
+    const user = userEvent.setup();
+    const calls = controller("ringing");
+    calls.pending = true;
+    renderPanel(calls);
+
+    expect(screen.getByRole("button", { name: "Atender" })).toBeDisabled();
+    const decline = screen.getByRole("button", { name: "Recusar" });
+    expect(decline).toBeEnabled();
+
+    await user.click(decline);
+    expect(calls.decline).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces a denied outgoing-call permission as an accessible toast with no call created", () => {
+    const calls: CallController = {
+      call: null,
+      pending: false,
+      error: "Acesso à câmera e ao microfone foi negado ou bloqueado.",
+      mediaReady: false,
+      mediaActivationRequired: false,
+      start: vi.fn(() => true),
+      accept: vi.fn(() => true),
+      decline: vi.fn(() => true),
+      cancel: vi.fn(() => true),
+      end: vi.fn(() => true),
+      retryMedia: vi.fn(async () => undefined),
+      activateMedia: vi.fn(async () => undefined),
+      clearTerminal: vi.fn(),
+    };
+
+    renderPanel(calls);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Acesso à câmera e ao microfone foi negado ou bloqueado.",
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("waits for identity before showing incoming call actions", () => {
