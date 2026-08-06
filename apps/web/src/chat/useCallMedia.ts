@@ -71,6 +71,15 @@ const initialState: MediaState = {
   pendingControl: null,
 };
 
+// Unique identity for one control operation. Compared by reference (===),
+// never by its "control" field alone, so a toggle from a superseded session
+// or generation can never be mistaken for the currently pending one.
+interface PendingMediaOperation {
+  readonly control: "microphone" | "camera";
+  readonly session: LiveKitSession;
+  readonly generation: number;
+}
+
 export function useCallMedia(
   loadSessionFactory: LiveKitSessionLoader = loadLiveKitSessionFactory,
 ): CallMediaSessionController {
@@ -90,7 +99,16 @@ export function useCallMedia(
   const disconnectPromiseRef = useRef<Promise<void> | null>(null);
   const connectedCallIdRef = useRef("");
   const audioActivationRequiredRef = useRef(false);
-  const pendingControlRef = useRef<"microphone" | "camera" | null>(null);
+  // Identity of the in-flight control operation (not just its kind): guards
+  // against a stale toggle from a superseded session/generation clearing or
+  // overwriting the pending state that belongs to a newer operation (RF-23
+  // race: toggle on session A resolves after stop()+reconnect created B).
+  const pendingControlRef = useRef<PendingMediaOperation | null>(null);
+  // Authoritative local microphone state: only ever written from the
+  // adapter's onMicrophoneStateChanged callback (SDK-confirmed), never from
+  // toggle intent. toggleMicrophone reads this ref (not React state) to
+  // avoid acting on a stale closure.
+  const microphoneEnabledRef = useRef(false);
   const localContainerRef = useRef<HTMLDivElement | null>(null);
   const remoteContainerRef = useRef<HTMLDivElement | null>(null);
   const localElementRef = useRef<HTMLMediaElement | null>(null);
@@ -166,6 +184,11 @@ export function useCallMedia(
             audioActivationRequired,
             ...(canPlaybackAudio ? { error: null } : {}),
           });
+        },
+        onMicrophoneStateChanged(enabled) {
+          if (!current()) return;
+          microphoneEnabledRef.current = enabled;
+          update({ microphoneEnabled: enabled });
         },
       };
     },
@@ -245,6 +268,7 @@ export function useCallMedia(
     connectedCallIdRef.current = "";
     pendingControlRef.current = null;
     audioActivationRequiredRef.current = false;
+    microphoneEnabledRef.current = false;
     generationRef.current += 1;
     clearElements();
     update(initialState);
@@ -318,6 +342,7 @@ export function useCallMedia(
       const generation = generationRef.current;
       const connecting = (async () => {
         let session: LiveKitSession | null = null;
+        microphoneEnabledRef.current = false;
         update({
           ...initialState,
           status: "connecting",
@@ -337,7 +362,9 @@ export function useCallMedia(
           await session.enableMicrophone();
           if (sessionRef.current !== session || generationRef.current !== generation) return;
           connectedCallIdRef.current = call.call_id;
-          update({ status: "connected", microphoneEnabled: true, error: null });
+          // microphoneEnabled itself was already confirmed by
+          // onMicrophoneStateChanged as part of enableMicrophone() above.
+          update({ status: "connected", error: null });
         } catch (error) {
           if (generationRef.current === generation) {
             if (session && sessionRef.current === session) {
@@ -347,6 +374,7 @@ export function useCallMedia(
               await session.disconnect().catch(() => undefined);
             }
             connectedCallIdRef.current = "";
+            microphoneEnabledRef.current = false;
             const denied = mediaErrorKind(error)?.endsWith("_denied") ?? false;
             update({
               ...initialState,
@@ -375,39 +403,52 @@ export function useCallMedia(
   const toggleMicrophone = useCallback(async () => {
     const session = sessionRef.current;
     if (!session || pendingControlRef.current) return;
-    pendingControlRef.current = "microphone";
+    const operation: PendingMediaOperation = {
+      control: "microphone",
+      session,
+      generation: generationRef.current,
+    };
+    pendingControlRef.current = operation;
     update({ pendingControl: "microphone", error: null });
     try {
-      const enabled = !state.microphoneEnabled;
-      await session.setMicrophoneEnabled(enabled);
-      if (sessionRef.current === session) update({ microphoneEnabled: enabled });
+      // Intent is the inverse of the last SDK-confirmed state (ref), never a
+      // stale React closure: onMicrophoneStateChanged keeps the ref current,
+      // including corrections from reconnection or a remote/server mute.
+      await session.setMicrophoneEnabled(!microphoneEnabledRef.current);
+      // The confirmed value itself is applied by onMicrophoneStateChanged,
+      // which fires synchronously inside setMicrophoneEnabled above.
     } catch (error) {
-      if (sessionRef.current === session) {
+      if (pendingControlRef.current === operation) {
         update({ error: mediaErrorMessage(error, "microphone") });
       }
     } finally {
-      if (pendingControlRef.current === "microphone") {
+      if (pendingControlRef.current === operation) {
         pendingControlRef.current = null;
         update({ pendingControl: null });
       }
     }
-  }, [state.microphoneEnabled, update]);
+  }, [update]);
 
   const toggleCamera = useCallback(async () => {
     const session = sessionRef.current;
     if (!session || pendingControlRef.current) return;
-    pendingControlRef.current = "camera";
+    const operation: PendingMediaOperation = {
+      control: "camera",
+      session,
+      generation: generationRef.current,
+    };
+    pendingControlRef.current = operation;
     update({ pendingControl: "camera", error: null });
     try {
       const enabled = !state.cameraEnabled;
       await session.setCameraEnabled(enabled);
-      if (sessionRef.current === session) update({ cameraEnabled: enabled });
+      if (pendingControlRef.current === operation) update({ cameraEnabled: enabled });
     } catch (error) {
-      if (sessionRef.current === session) {
+      if (pendingControlRef.current === operation) {
         update({ error: mediaErrorMessage(error, "camera") });
       }
     } finally {
-      if (pendingControlRef.current === "camera") {
+      if (pendingControlRef.current === operation) {
         pendingControlRef.current = null;
         update({ pendingControl: null });
       }

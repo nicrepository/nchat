@@ -4,9 +4,11 @@ import {
   RoomEvent,
   Track,
   type LocalTrackPublication,
+  type Participant,
   type RemoteParticipant,
   type RemoteTrack,
   type RemoteTrackPublication,
+  type TrackPublication,
 } from "livekit-client";
 
 export type SpikeMediaErrorKind =
@@ -33,6 +35,12 @@ export interface LiveKitSpikeSessionCallbacks {
   onReconnecting(): void;
   onReconnected(): void;
   onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
+  // Authoritative signal for the local microphone publication only (never
+  // fired for a remote participant or for a non-microphone source). Fired
+  // after enableMicrophone()/setMicrophoneEnabled() confirm the publication,
+  // whenever the SDK reports RoomEvent.TrackMuted/TrackUnmuted for the local
+  // mic, and after Reconnected resyncs the publication's real state.
+  onMicrophoneStateChanged(enabled: boolean): void;
 }
 
 export interface LiveKitSpikeSession {
@@ -69,7 +77,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .on(RoomEvent.Disconnected, this.onDisconnected)
       .on(RoomEvent.Reconnecting, this.onReconnecting)
       .on(RoomEvent.Reconnected, this.onReconnected)
-      .on(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged);
+      .on(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged)
+      .on(RoomEvent.TrackMuted, this.onTrackMuted)
+      .on(RoomEvent.TrackUnmuted, this.onTrackUnmuted);
   }
 
   async connect(serverUrl: string, token: string): Promise<void> {
@@ -112,7 +122,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     }
     if (this.disposed) {
       await this.disableMicrophoneAfterInterruptedEnable();
+      return;
     }
+    this.notifyMicrophoneState();
   }
 
   async setCameraEnabled(enabled: boolean): Promise<void> {
@@ -146,9 +158,11 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     } catch (error) {
       throw mediaError("microphone", error);
     }
-    if (this.disposed && enabled) {
-      await this.disableMicrophoneAfterInterruptedEnable();
+    if (this.disposed) {
+      if (enabled) await this.disableMicrophoneAfterInterruptedEnable();
+      return;
     }
+    this.notifyMicrophoneState();
   }
 
   disconnect(): Promise<void> {
@@ -203,12 +217,45 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   };
 
   private readonly onReconnected = (): void => {
-    if (!this.disposed) this.callbacks.onReconnected();
+    if (this.disposed) return;
+    // The publication may have been muted/unmuted server-side, or recreated,
+    // while the signal connection was down: never assume the pre-reconnect
+    // React state still matches the SDK after Reconnected.
+    this.notifyMicrophoneState();
+    this.callbacks.onReconnected();
   };
 
   private readonly onAudioPlaybackChanged = (canPlaybackAudio: boolean): void => {
     if (!this.disposed) this.callbacks.onAudioPlaybackChanged(canPlaybackAudio);
   };
+
+  private readonly onTrackMuted = (
+    publication: TrackPublication,
+    participant: Participant,
+  ): void => {
+    if (this.disposed || !this.isLocalMicrophone(publication, participant)) return;
+    this.callbacks.onMicrophoneStateChanged(false);
+  };
+
+  private readonly onTrackUnmuted = (
+    publication: TrackPublication,
+    participant: Participant,
+  ): void => {
+    if (this.disposed || !this.isLocalMicrophone(publication, participant)) return;
+    this.callbacks.onMicrophoneStateChanged(true);
+  };
+
+  private isLocalMicrophone(publication: TrackPublication, participant: Participant): boolean {
+    return (
+      participant === this.room.localParticipant && publication.source === Track.Source.Microphone
+    );
+  }
+
+  private notifyMicrophoneState(): void {
+    if (this.disposed) return;
+    const publication = this.room.localParticipant.getTrackPublication(Track.Source.Microphone);
+    this.callbacks.onMicrophoneStateChanged(publication ? !publication.isMuted : false);
+  }
 
   private async dispose(): Promise<void> {
     try {
@@ -228,7 +275,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .off(RoomEvent.Disconnected, this.onDisconnected)
       .off(RoomEvent.Reconnecting, this.onReconnecting)
       .off(RoomEvent.Reconnected, this.onReconnected)
-      .off(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged);
+      .off(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged)
+      .off(RoomEvent.TrackMuted, this.onTrackMuted)
+      .off(RoomEvent.TrackUnmuted, this.onTrackUnmuted);
   }
 
   private removeRemoteTrack(track: RemoteTrack): void {

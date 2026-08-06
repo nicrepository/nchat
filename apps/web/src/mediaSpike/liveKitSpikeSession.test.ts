@@ -15,8 +15,11 @@ const liveKitMock = vi.hoisted(() => {
     Reconnecting: "reconnecting",
     Reconnected: "reconnected",
     AudioPlaybackStatusChanged: "audioPlaybackChanged",
+    TrackMuted: "trackMuted",
+    TrackUnmuted: "trackUnmuted",
   } as const;
   const kinds = { Audio: "audio", Video: "video" } as const;
+  const sources = { Camera: "camera", Microphone: "microphone" } as const;
   const permissionDenied = "permission-denied";
   const rooms: MockRoom[] = [];
 
@@ -26,6 +29,7 @@ const liveKitMock = vi.hoisted(() => {
     readonly localParticipant = {
       setCameraEnabled: vi.fn(async (): Promise<unknown> => undefined),
       setMicrophoneEnabled: vi.fn(async (): Promise<unknown> => undefined),
+      getTrackPublication: vi.fn((): unknown => undefined),
     };
     readonly connect = vi.fn(async (): Promise<unknown> => undefined);
     readonly startAudio = vi.fn(async () => undefined);
@@ -57,6 +61,7 @@ const liveKitMock = vi.hoisted(() => {
   return {
     events,
     kinds,
+    sources,
     permissionDenied,
     rooms,
     MockRoom,
@@ -75,7 +80,7 @@ vi.mock("livekit-client", () => ({
   },
   Room: liveKitMock.MockRoom,
   RoomEvent: liveKitMock.events,
-  Track: { Kind: liveKitMock.kinds },
+  Track: { Kind: liveKitMock.kinds, Source: liveKitMock.sources },
 }));
 
 function callbacks(): LiveKitSpikeSessionCallbacks {
@@ -87,7 +92,12 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onReconnecting: vi.fn(),
     onReconnected: vi.fn(),
     onAudioPlaybackChanged: vi.fn(),
+    onMicrophoneStateChanged: vi.fn(),
   };
+}
+
+function micPublication(isMuted: boolean) {
+  return { isMuted, source: liveKitMock.sources.Microphone };
 }
 
 function createTrack(
@@ -539,5 +549,190 @@ describe("createLiveKitSpikeSession", () => {
     for (const event of Object.values(liveKitMock.events)) {
       expect(room.listeners.get(event)).toHaveLength(0);
     }
+  });
+
+  describe("local microphone state", () => {
+    it("enableMicrophone reports the confirmed local state", async () => {
+      const { handlers, room, session } = setup();
+      room.localParticipant.getTrackPublication.mockReturnValue(micPublication(false));
+
+      await session.enableMicrophone();
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(true);
+    });
+
+    it("setMicrophoneEnabled(false) confirms the local microphone is muted", async () => {
+      const { handlers, room, session } = setup();
+      room.localParticipant.getTrackPublication.mockReturnValue(micPublication(true));
+
+      await session.setMicrophoneEnabled(false);
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(false);
+    });
+
+    it("setMicrophoneEnabled(true) confirms the local microphone is enabled", async () => {
+      const { handlers, room, session } = setup();
+      room.localParticipant.getTrackPublication.mockReturnValue(micPublication(false));
+
+      await session.setMicrophoneEnabled(true);
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(true);
+    });
+
+    it("notifies false when RoomEvent.TrackMuted targets the local microphone", () => {
+      const { handlers, room } = setup();
+
+      room.emit(
+        liveKitMock.events.TrackMuted,
+        micPublication(true),
+        room.localParticipant as never,
+      );
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(false);
+    });
+
+    it("notifies true when RoomEvent.TrackUnmuted targets the local microphone", () => {
+      const { handlers, room } = setup();
+
+      room.emit(
+        liveKitMock.events.TrackUnmuted,
+        micPublication(false),
+        room.localParticipant as never,
+      );
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(true);
+    });
+
+    it("ignores RoomEvent.TrackMuted for a remote participant's microphone", () => {
+      const { handlers, room } = setup();
+
+      room.emit(liveKitMock.events.TrackMuted, micPublication(true), { sid: "participant-b" });
+
+      expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+    });
+
+    it("ignores RoomEvent.TrackUnmuted for a remote participant's microphone", () => {
+      const { handlers, room } = setup();
+
+      room.emit(liveKitMock.events.TrackUnmuted, micPublication(false), { sid: "participant-b" });
+
+      expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+    });
+
+    it("ignores a local mute/unmute event for the camera source", () => {
+      const { handlers, room } = setup();
+      const cameraPublication = { isMuted: true, source: liveKitMock.sources.Camera };
+
+      room.emit(liveKitMock.events.TrackMuted, cameraPublication, room.localParticipant as never);
+      room.emit(liveKitMock.events.TrackUnmuted, cameraPublication, room.localParticipant as never);
+
+      expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+    });
+
+    it("preserves the mute/unmute sequence across five consecutive cycles", async () => {
+      const { handlers, room, session } = setup();
+      const expected: boolean[] = [];
+      for (let cycle = 0; cycle < 5; cycle += 1) {
+        const enabled = cycle % 2 === 0;
+        room.localParticipant.getTrackPublication.mockReturnValueOnce(micPublication(!enabled));
+        await session.setMicrophoneEnabled(enabled);
+        expected.push(enabled);
+      }
+
+      expect(
+        vi.mocked(handlers.onMicrophoneStateChanged).mock.calls.map(([value]) => value),
+      ).toEqual(expected);
+    });
+
+    it("ignores TrackMuted/TrackUnmuted emitted after disposal", async () => {
+      const { handlers, room, session } = setup();
+      await session.disconnect();
+      vi.clearAllMocks();
+
+      room.emit(
+        liveKitMock.events.TrackMuted,
+        micPublication(true),
+        room.localParticipant as never,
+      );
+      room.emit(
+        liveKitMock.events.TrackUnmuted,
+        micPublication(false),
+        room.localParticipant as never,
+      );
+
+      expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+    });
+
+    it("removes the TrackMuted/TrackUnmuted listeners on disconnect", async () => {
+      const { room, session } = setup();
+
+      await session.disconnect();
+
+      expect(room.listeners.get(liveKitMock.events.TrackMuted)).toHaveLength(0);
+      expect(room.listeners.get(liveKitMock.events.TrackUnmuted)).toHaveLength(0);
+    });
+
+    it("does not touch remote elements when the local microphone is muted", async () => {
+      const { handlers, room, session } = setup();
+      const remoteAudio = document.createElement("audio");
+      remoteAudio.play = vi.fn(async () => undefined);
+      const remoteTrack = createTrack("audio", remoteAudio);
+      room.emit(liveKitMock.events.TrackSubscribed, remoteTrack, {}, { sid: "participant-b" });
+      await Promise.resolve();
+      vi.mocked(handlers.onElementRemoved).mockClear();
+      room.localParticipant.getTrackPublication.mockReturnValue(micPublication(true));
+
+      await session.setMicrophoneEnabled(false);
+
+      expect(handlers.onElementRemoved).not.toHaveBeenCalled();
+      expect(remoteTrack.detach).not.toHaveBeenCalled();
+    });
+
+    it("resyncs the effective microphone state after Reconnected", () => {
+      const { handlers, room } = setup();
+      room.localParticipant.getTrackPublication.mockReturnValue(micPublication(true));
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(false);
+      expect(handlers.onReconnected).toHaveBeenCalledOnce();
+    });
+
+    it("reports a disabled state when the microphone publication is absent", async () => {
+      const { handlers, room, session } = setup();
+      room.localParticipant.getTrackPublication.mockReturnValue(undefined);
+
+      await session.setMicrophoneEnabled(true);
+
+      expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(false);
+    });
+  });
+
+  describe("two independent rooms (isolation)", () => {
+    // No real LiveKit media server is available in this test environment, so
+    // two genuinely independent participants cannot be exercised end-to-end
+    // (see e2e/messaging/call-1to1-ui.spec.ts for the documented e2e gap).
+    // This simulates the next best thing: two separate adapter instances,
+    // each backed by its own mocked Room/localParticipant, to prove muting
+    // one never touches the other's participant or elements.
+    it("muting participant A's microphone never calls B's localParticipant or touches B's elements", async () => {
+      const a = setup();
+      const b = setup();
+      const remoteVideoOnB = document.createElement("video");
+      const remoteTrackOnB = createTrack("video", remoteVideoOnB);
+      b.room.emit(liveKitMock.events.TrackSubscribed, remoteTrackOnB, {}, { sid: "participant-a" });
+      a.room.localParticipant.getTrackPublication.mockReturnValue(micPublication(true));
+
+      await a.session.setMicrophoneEnabled(false);
+
+      expect(a.room.localParticipant.setMicrophoneEnabled).toHaveBeenCalledWith(false);
+      expect(b.room.localParticipant.setMicrophoneEnabled).not.toHaveBeenCalled();
+      expect(b.room.localParticipant.setCameraEnabled).not.toHaveBeenCalled();
+      expect(b.room.disconnect).not.toHaveBeenCalled();
+      expect(b.room.startAudio).not.toHaveBeenCalled();
+      expect(b.handlers.onElementRemoved).not.toHaveBeenCalled();
+      expect(b.handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+      expect(remoteTrackOnB.detach).not.toHaveBeenCalled();
+    });
   });
 });
