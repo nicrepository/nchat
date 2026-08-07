@@ -202,6 +202,196 @@ has_exact_ingress_first_rule_host() {
   ' <<<"$document"
 }
 
+# has_exact_certificate_first_dns_name DOCUMENT HOST
+# Passes iff spec.dnsNames[0] == HOST exactly.
+# Accepts both indentless and indented sequence items.
+# Rejects: wrong value, port/suffix, second item correct with first wrong,
+# value under another field, value in wrong Certificate, duplicate dnsNames.
+has_exact_certificate_first_dns_name() {
+  awk -v host="$2" '
+    function indent(line,    i) { i=1; while (substr(line,i,1)==" ") i++; return i-1 }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    {
+      lv = indent($0)
+      if ($0 ~ /^spec:[[:space:]]*$/ && lv == 0) {
+        spec_count++; in_spec=1; spec_lv=lv; child_lv=-1; in_dns=0
+        next
+      }
+      if (in_spec && lv <= spec_lv) in_spec=0
+      if (!in_spec) next
+      if (child_lv < 0 && lv > spec_lv) child_lv=lv
+      if (lv == child_lv && $0 ~ /^[[:space:]]*dnsNames:[[:space:]]*$/) {
+        dns_count++; in_dns=1; dns_lv=lv; awaiting_first=1; first_lv=-1
+        next
+      }
+      if (!in_dns) next
+      if (awaiting_first) {
+        if ($0 !~ /^[[:space:]]*-[[:space:]]+[^[:space:]]/) { invalid=1; in_dns=0; next }
+        val=$0; sub(/^[[:space:]]*-[[:space:]]+/, "", val)
+        if (val != host) { invalid=1; in_dns=0; next }
+        awaiting_first=0; first_lv=lv; first_seen=1
+        next
+      }
+      # A second sequence item at the same or parent level ends the list
+      if (lv <= dns_lv) { in_dns=0; next }
+      if (lv == first_lv && $0 ~ /^[[:space:]]*-[[:space:]]+/) { duplicate=1; in_dns=0; next }
+    }
+    END { exit !(spec_count==1 && dns_count==1 && first_seen && !invalid && !duplicate) }
+  ' <<< "$1"
+}
+
+# has_exact_ingress_first_tls_host DOCUMENT HOST
+# Passes iff spec.tls[0].hosts[0] == HOST exactly.
+# Accepts both indentless and indented sequences.
+# Rejects: value only in rules, first-item wrong with second correct,
+# hosts under an unrelated field.
+has_exact_ingress_first_tls_host() {
+  awk -v host="$2" '
+    function indent(line,    i) { i=1; while (substr(line,i,1)==" ") i++; return i-1 }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    {
+      lv = indent($0)
+      if ($0 ~ /^spec:[[:space:]]*$/ && lv == 0) {
+        spec_count++; in_spec=1; spec_lv=lv; child_lv=-1; in_tls=0
+        next
+      }
+      if (in_spec && lv <= spec_lv) in_spec=0
+      if (!in_spec) next
+      if (child_lv < 0 && lv > spec_lv) child_lv=lv
+      # tls: must be a direct child of spec
+      if (lv == child_lv && $0 ~ /^[[:space:]]*tls:[[:space:]]*$/) {
+        tls_count++; in_tls=1; tls_lv=lv; await_tls_item=1; tls_item_lv=-1
+        in_hosts=0; await_host=0; host_item_lv=-1
+        next
+      }
+      if (in_tls && lv <= tls_lv && !($0 ~ /^[[:space:]]*-[[:space:]]/)) { in_tls=0; next }
+      if (!in_tls) next
+      # first tls list item
+      if (await_tls_item) {
+        if ($0 !~ /^[[:space:]]*-[[:space:]]/) { invalid=1; in_tls=0; next }
+        tls_item_lv=lv; await_tls_item=0
+        # strip leading "- " to get the rest of this line
+        rest=$0; sub(/^[[:space:]]*-[[:space:]]+/, "", rest)
+        if (rest == "hosts:" || rest ~ /^hosts:[[:space:]]*$/) {
+          in_hosts=1; hosts_lv=tls_item_lv; await_host=1; host_item_lv=-1
+        }
+        next
+      }
+      # still inside tls[0]
+      if (lv <= tls_lv) { in_tls=0; next }
+      if (tls_item_lv >= 0 && lv == tls_item_lv && $0 ~ /^[[:space:]]*-[[:space:]]*/) {
+        # second tls item — stop
+        in_tls=0; next
+      }
+      # look for hosts: key inside tls[0]
+      if (!in_hosts && $0 ~ /^[[:space:]]*hosts:[[:space:]]*$/) {
+        in_hosts=1; hosts_lv=lv; await_host=1; host_item_lv=-1
+        next
+      }
+      if (!in_hosts) next
+      if (await_host) {
+        if ($0 !~ /^[[:space:]]*-[[:space:]]+[^[:space:]]/) { invalid=1; in_hosts=0; next }
+        val=$0; sub(/^[[:space:]]*-[[:space:]]+/, "", val)
+        if (val != host) { invalid=1; in_hosts=0; next }
+        await_host=0; host_item_lv=lv; first_seen=1
+        next
+      }
+      if (host_item_lv >= 0 && lv == host_item_lv && $0 ~ /^[[:space:]]*-[[:space:]]/) {
+        duplicate=1; in_hosts=0; next
+      }
+    }
+    END { exit !(spec_count==1 && tls_count==1 && first_seen && !invalid && !duplicate) }
+  ' <<< "$1"
+}
+
+# has_exact_ingressroute_first_match DOCUMENT HOST
+# Passes iff spec.routes[0].match == exact expected string (with HOST).
+# Accepts indentation variation before the match: key.
+# Rejects: different host/method/path, match on another route, match in
+# another IngressRoute.
+has_exact_ingressroute_first_match() {
+  local expected="Host(\`$2\`) && Method(\`POST\`) && PathRegexp(\`^/api/files/(channels|dm)/[^/]+/attachments$\`)"
+  awk -v expected="$expected" '
+    function indent(line,    i) { i=1; while (substr(line,i,1)==" ") i++; return i-1 }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    {
+      lv = indent($0)
+      if ($0 ~ /^spec:[[:space:]]*$/ && lv == 0) {
+        spec_count++; in_spec=1; spec_lv=lv; child_lv=-1; in_routes=0
+        next
+      }
+      if (in_spec && lv <= spec_lv) in_spec=0
+      if (!in_spec) next
+      if (child_lv < 0 && lv > spec_lv) child_lv=lv
+      if (lv == child_lv && $0 ~ /^[[:space:]]*routes:[[:space:]]*$/) {
+        routes_count++; in_routes=1; routes_lv=lv; await_item=1; item_lv=-1
+        child2_lv=-1; match_seen=0
+        next
+      }
+      if (!in_routes) next
+      if (lv <= routes_lv && !($0 ~ /^[[:space:]]*-[[:space:]]/)) { in_routes=0; next }
+      if (await_item) {
+        if ($0 !~ /^[[:space:]]*-[[:space:]]/) { invalid=1; in_routes=0; next }
+        item_lv=lv; await_item=0
+        # inline match on first item line?
+        rest=$0; sub(/^[[:space:]]*-[[:space:]]+/, "", rest)
+        if (rest ~ /^match:[[:space:]]+/) {
+          val=rest; sub(/^match:[[:space:]]+/, "", val)
+          if (val == expected) match_seen=1; else invalid=1
+        }
+        next
+      }
+      # inside first route item
+      if (item_lv >= 0 && lv == item_lv && $0 ~ /^[[:space:]]*-[[:space:]]/) {
+        # second route item — stop tracking
+        in_routes=0; next
+      }
+      if (lv <= routes_lv) { in_routes=0; next }
+      # a match: key at child level inside first route item
+      if (child2_lv < 0 && lv > item_lv) child2_lv=lv
+      if (lv == child2_lv && $0 ~ /^[[:space:]]*match:[[:space:]]+/) {
+        val=$0; sub(/^[[:space:]]*match:[[:space:]]+/, "", val)
+        if (match_seen) { duplicate=1 }
+        else if (val == expected) match_seen=1
+        else invalid=1
+        next
+      }
+    }
+    END { exit !(spec_count==1 && routes_count==1 && match_seen && !invalid && !duplicate) }
+  ' <<< "$1"
+}
+
+# has_exact_key_value DOCUMENT KEY VALUE
+# Passes iff data.KEY == VALUE exactly, key is a direct child of data:,
+# there is exactly one data: block, and no duplicate keys.
+# Rejects: key under metadata/annotations, URL with port or extra path,
+# duplicate keys.
+has_exact_key_value() {
+  awk -v key="$2" -v val="$3" '
+    function indent(line,    i) { i=1; while (substr(line,i,1)==" ") i++; return i-1 }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    {
+      lv = indent($0)
+      if ($0 ~ /^data:[[:space:]]*$/ && lv == 0) {
+        data_count++; in_data=1; data_lv=lv; child_lv=-1
+        next
+      }
+      if (in_data && lv <= data_lv) in_data=0
+      if (!in_data) next
+      if (child_lv < 0 && lv > data_lv) child_lv=lv
+      if (lv == child_lv) {
+        pat="^[[:space:]]*" key ":[[:space:]]+"
+        if ($0 ~ pat) {
+          found_count++
+          v=$0; sub(/^[[:space:]]*[^:]+:[[:space:]]+/, "", v)
+          if (v == val) match_count++
+        }
+      }
+    }
+    END { exit !(data_count==1 && found_count==1 && match_count==1) }
+  ' <<< "$1"
+}
+
 validate_ingress_host_assertion_contract() {
   local fixture="$TEMP_DIR/ingress-host-assertion.yaml" document host='nchat-dev.example.invalid'
   cat >"$fixture" <<EOF
@@ -262,14 +452,157 @@ EOF
   ! has_exact_ingress_first_rule_host "$document" "$host" || fail "host in another Ingress was accepted"
 }
 
+validate_certificate_dns_assertion_contract() {
+  local host='nchat-dev.example.invalid'
+  # indentless sequence (Kustomize v5.7.1 style)
+  has_exact_certificate_first_dns_name $'spec:\n  dnsNames:\n  - nchat-dev.example.invalid' "$host" \
+    || fail "Certificate indentless dnsNames rejected"
+  # indented sequence (original style)
+  has_exact_certificate_first_dns_name $'spec:\n  dnsNames:\n    - nchat-dev.example.invalid' "$host" \
+    || fail "Certificate indented dnsNames rejected"
+  # first item wrong, second correct -> must fail
+  ! has_exact_certificate_first_dns_name \
+    $'spec:\n  dnsNames:\n  - wrong.example.invalid\n  - nchat-dev.example.invalid' "$host" \
+    || fail "Certificate first-wrong second-correct dnsNames accepted"
+  # value correct but in wrong field, not dnsNames -> must fail
+  ! has_exact_certificate_first_dns_name \
+    $'spec:\n  secretName: nchat-dev.example.invalid' "$host" \
+    || fail "Certificate value in non-dnsNames field accepted"
+  # value in a different Certificate document (yaml_document isolates, but guard the helper itself)
+  ! has_exact_certificate_first_dns_name \
+    $'spec:\n  issuerRef:\n    name: nchat-dev.example.invalid' "$host" \
+    || fail "Certificate value in nested non-dnsNames field accepted"
+  # duplicate dnsNames keys -> must fail
+  ! has_exact_certificate_first_dns_name \
+    $'spec:\n  dnsNames:\n  - nchat-dev.example.invalid\n  dnsNames:\n  - nchat-dev.example.invalid' "$host" \
+    || fail "Certificate duplicate dnsNames keys accepted"
+  # value correct but with port suffix -> must fail
+  ! has_exact_certificate_first_dns_name \
+    $'spec:\n  dnsNames:\n  - nchat-dev.example.invalid:443' "$host" \
+    || fail "Certificate host with port accepted"
+  # value correct but with extra suffix -> must fail
+  ! has_exact_certificate_first_dns_name \
+    $'spec:\n  dnsNames:\n  - nchat-dev.example.invalid.attacker.example' "$host" \
+    || fail "Certificate host with suffix accepted"
+}
+
+validate_ingress_tls_assertion_contract() {
+  local host='nchat-dev.example.invalid'
+  # indentless hosts list
+  has_exact_ingress_first_tls_host \
+    $'spec:\n  tls:\n  - hosts:\n    - nchat-dev.example.invalid' "$host" \
+    || fail "Ingress TLS indentless hosts rejected"
+  # indented hosts list
+  has_exact_ingress_first_tls_host \
+    $'spec:\n  tls:\n  - hosts:\n      - nchat-dev.example.invalid' "$host" \
+    || fail "Ingress TLS indented hosts rejected"
+  # host only in rules, not in tls -> must fail
+  ! has_exact_ingress_first_tls_host \
+    $'spec:\n  rules:\n  - host: nchat-dev.example.invalid' "$host" \
+    || fail "Ingress TLS: host only in rules was accepted"
+  # first tls.hosts wrong, second correct -> must fail
+  ! has_exact_ingress_first_tls_host \
+    $'spec:\n  tls:\n  - hosts:\n    - wrong.example.invalid\n    - nchat-dev.example.invalid' "$host" \
+    || fail "Ingress TLS: first hosts wrong second correct accepted"
+  # hosts under unrelated field -> must fail
+  ! has_exact_ingress_first_tls_host \
+    $'spec:\n  unrelated:\n  - hosts:\n    - nchat-dev.example.invalid' "$host" \
+    || fail "Ingress TLS: hosts under unrelated field accepted"
+}
+
+validate_ingress_http_assertion_contract() {
+  local host='nchat-dev.example.invalid'
+  # rules[0].host correct -> passes
+  has_exact_ingress_first_rule_host \
+    $'spec:\n  rules:\n  - host: nchat-dev.example.invalid' "$host" \
+    || fail "Ingress HTTP: correct rules[0].host rejected"
+  # host nested under http sub-object -> must fail
+  ! has_exact_ingress_first_rule_host \
+    $'spec:\n  rules:\n  - http:\n      host: nchat-dev.example.invalid' "$host" \
+    || fail "Ingress HTTP: host nested under http accepted"
+  # host only in rules[1] -> must fail
+  ! has_exact_ingress_first_rule_host \
+    $'spec:\n  rules:\n  - http:\n      paths: []\n  - host: nchat-dev.example.invalid' "$host" \
+    || fail "Ingress HTTP: host only in rules[1] accepted"
+}
+
+validate_ingressroute_match_assertion_contract() {
+  local host='nchat-dev.example.invalid'
+  local expected="Host(\`$host\`) && Method(\`POST\`) && PathRegexp(\`^/api/files/(channels|dm)/[^/]+/attachments$\`)"
+  # correct match with two-space indentation
+  has_exact_ingressroute_first_match \
+    $'spec:\n  routes:\n  - match: Host(`nchat-dev.example.invalid`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)' \
+    "$host" || fail "IngressRoute: two-space match rejected"
+  # correct match with four-space indentation
+  has_exact_ingressroute_first_match \
+    $'spec:\n  routes:\n    - match: Host(`nchat-dev.example.invalid`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)' \
+    "$host" || fail "IngressRoute: four-space match rejected"
+  # wrong Method -> must fail
+  ! has_exact_ingressroute_first_match \
+    $'spec:\n  routes:\n  - match: Host(`nchat-dev.example.invalid`) && Method(`GET`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)' \
+    "$host" || fail "IngressRoute: wrong Method accepted"
+  # wrong PathRegexp -> must fail
+  ! has_exact_ingressroute_first_match \
+    $'spec:\n  routes:\n  - match: Host(`nchat-dev.example.invalid`) && Method(`POST`) && PathRegexp(`^/other$`)' \
+    "$host" || fail "IngressRoute: wrong PathRegexp accepted"
+  # wrong hostname -> must fail
+  ! has_exact_ingressroute_first_match \
+    $'spec:\n  routes:\n  - match: Host(`wrong.example.invalid`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)' \
+    "$host" || fail "IngressRoute: wrong hostname accepted"
+  # match on second route only -> must fail
+  ! has_exact_ingressroute_first_match \
+    $'spec:\n  routes:\n  - kind: Rule\n  - match: Host(`nchat-dev.example.invalid`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)' \
+    "$host" || fail "IngressRoute: match on route[1] accepted"
+}
+
+validate_configmap_key_value_assertion_contract() {
+  local host='nchat-dev.example.invalid'
+  # correct key in data -> passes
+  has_exact_key_value \
+    $'data:\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid' \
+    AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
+    || fail "ConfigMap: correct key in data rejected"
+  # correct key with two-space indent -> passes
+  has_exact_key_value \
+    $'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nchat-config\ndata:\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid\n  OTHER_KEY: other-value' \
+    AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
+    || fail "ConfigMap: correct key among siblings rejected"
+  # key under metadata annotations -> must fail
+  ! has_exact_key_value \
+    $'metadata:\n  annotations:\n    AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid\ndata:\n  OTHER: value' \
+    AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
+    || fail "ConfigMap: key under metadata annotations accepted"
+  # URL with port -> must fail
+  ! has_exact_key_value \
+    $'data:\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid:443' \
+    AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
+    || fail "ConfigMap: URL with port accepted"
+  # URL with path -> must fail
+  ! has_exact_key_value \
+    $'data:\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid/extra' \
+    AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
+    || fail "ConfigMap: URL with path accepted"
+  # duplicate key -> must fail
+  ! has_exact_key_value \
+    $'data:\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid' \
+    AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
+    || fail "ConfigMap: duplicate key accepted"
+}
+
 assert_rendered_replacements() {
   local rendered="$1" host="$2" document
-  document="$(yaml_document "$rendered" Certificate nchat-dev-tls)"; grep -Fqx "    - $host" <<<"$document" && ! grep -q REPLACE_ME_HOST <<<"$document" || fail "Certificate/nchat-dev-tls hostname replacement failed"
-  document="$(yaml_document "$rendered" Ingress nchat-dev)"; [[ "$(grep -Fc "$host" <<<"$document")" -eq 2 ]] && has_exact_ingress_first_rule_host "$document" "$host" && grep -Fqx "        - $host" <<<"$document" || fail "Ingress/nchat-dev hostname targets failed"
-  document="$(yaml_document "$rendered" Ingress nchat-dev-http)"; [[ "$(grep -Fc "$host" <<<"$document")" -eq 1 ]] && grep -Fqx "    - host: $host" <<<"$document" || fail "Ingress/nchat-dev-http hostname target failed"
-  document="$(yaml_document "$rendered" Ingress nchat-dev-livekit)"; [[ "$(grep -Fc "$host" <<<"$document")" -eq 2 ]] && grep -Fqx "    - host: $host" <<<"$document" && grep -Fqx "        - $host" <<<"$document" || fail "Ingress/nchat-dev-livekit hostname targets failed"
-  document="$(yaml_document "$rendered" IngressRoute nchat-dev-uploads)"; grep -Fqx "      match: Host(\`$host\`) && Method(\`POST\`) && PathRegexp(\`^/api/files/(channels|dm)/[^/]+/attachments$\`)" <<<"$document" && [[ "$(grep -Fc "$host" <<<"$document")" -eq 1 ]] || fail "IngressRoute/nchat-dev-uploads match replacement failed"
-  document="$(yaml_document "$rendered" ConfigMap nchat-config)"; grep -Fqx "  AUTH_PUBLIC_WEB_BASE_URL: https://$host" <<<"$document" || fail "ConfigMap/nchat-config public URL replacement failed"
+  document="$(yaml_document "$rendered" Certificate nchat-dev-tls)"
+  has_exact_certificate_first_dns_name "$document" "$host" || fail "Certificate/nchat-dev-tls hostname replacement failed"
+  document="$(yaml_document "$rendered" Ingress nchat-dev)"
+  has_exact_ingress_first_rule_host "$document" "$host" && has_exact_ingress_first_tls_host "$document" "$host" || fail "Ingress/nchat-dev hostname targets failed"
+  document="$(yaml_document "$rendered" Ingress nchat-dev-http)"
+  has_exact_ingress_first_rule_host "$document" "$host" || fail "Ingress/nchat-dev-http hostname target failed"
+  document="$(yaml_document "$rendered" Ingress nchat-dev-livekit)"
+  has_exact_ingress_first_rule_host "$document" "$host" && has_exact_ingress_first_tls_host "$document" "$host" || fail "Ingress/nchat-dev-livekit hostname targets failed"
+  document="$(yaml_document "$rendered" IngressRoute nchat-dev-uploads)"
+  has_exact_ingressroute_first_match "$document" "$host" || fail "IngressRoute/nchat-dev-uploads match replacement failed"
+  document="$(yaml_document "$rendered" ConfigMap nchat-config)"
+  has_exact_key_value "$document" AUTH_PUBLIC_WEB_BASE_URL "https://$host" || fail "ConfigMap/nchat-config public URL replacement failed"
   ! grep -q REPLACE_ME_HOST "$rendered" || fail "rendered manifest still contains REPLACE_ME_HOST"
 }
 
@@ -585,6 +918,11 @@ validate_commit_sha 'abc' && fail "invalid commit SHA accepted"
 validate_topology_contract
 validate_kustomize_pin_contract
 validate_ingress_host_assertion_contract
+validate_certificate_dns_assertion_contract
+validate_ingress_tls_assertion_contract
+validate_ingress_http_assertion_contract
+validate_ingressroute_match_assertion_contract
+validate_configmap_key_value_assertion_contract
 validate_hostname_unicode_locale_and_boundaries
 validate_image_inventory
 validate_rbac_preflight

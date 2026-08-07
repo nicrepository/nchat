@@ -16,7 +16,15 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        // Calls request real getUserMedia() permission (RF-23 preflight).
+        // Fake devices keep that deterministic without a physical camera/mic;
+        // permissions are granted per test via context.grantPermissions.
+        launchOptions: {
+          args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+        },
+      },
     },
   ],
   webServer: {

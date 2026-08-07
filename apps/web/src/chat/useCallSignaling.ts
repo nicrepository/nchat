@@ -12,6 +12,7 @@ import {
   type CallState,
   type CallType,
 } from "./callState";
+import { requestMediaPermission } from "./mediaPermission";
 import type { CallMediaSessionController } from "./useCallMedia";
 
 export type CallMediaBridge = Pick<CallMediaSessionController, "startAudio" | "connect" | "stop">;
@@ -32,6 +33,17 @@ interface SyncReconciliation extends ReconnectState {
   generation: number;
 }
 
+// A call is only "consented" when this hook itself drove it there via a
+// gesture-gated start()/accept()/activateMedia() preflight — never merely
+// because an event reported status "active". Scoped to one call_id + type so
+// it can't leak to a call that replaces this one, and cleared by
+// invalidateMediaRequest (call ends, gets replaced, or sync finds nothing)
+// and by unmount. Never persisted.
+interface LocalMediaAuthorization {
+  callId: string;
+  callType: CallType;
+}
+
 function eventCompletesPending(pending: PendingCallCommand | null, event: CallEvent): boolean {
   if (!pending) return false;
   if (pending.operation === "call.start") {
@@ -40,6 +52,10 @@ function eventCompletesPending(pending: PendingCallCommand | null, event: CallEv
   if (pending.callId !== event.call.call_id) return false;
   if (isTerminalCall(event.call.status)) return true;
   return pending.operation === "call.accept" && event.call.status === "active";
+}
+
+function isAuthorizedFor(auth: LocalMediaAuthorization | null, call: Call): boolean {
+  return auth !== null && auth.callId === call.call_id && auth.callType === call.call_type;
 }
 
 function errorMatchesPending(
@@ -57,12 +73,14 @@ export interface CallController {
   pending: boolean;
   error: string | null;
   mediaReady: boolean;
+  mediaActivationRequired: boolean;
   start: (targetUserId: string, callType: CallType) => boolean;
   accept: () => boolean;
   decline: () => boolean;
   cancel: () => boolean;
   end: () => boolean;
   retryMedia: () => Promise<void>;
+  activateMedia: () => Promise<void>;
   clearTerminal: () => void;
 }
 
@@ -84,6 +102,9 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   const mediaCleanupPromiseRef = useRef<Promise<boolean> | null>(null);
   const mediaRef = useRef(media);
   const mediaEnabledRef = useRef(mediaEnabled);
+  const localAuthorizationRef = useRef<LocalMediaAuthorization | null>(null);
+  const activateMediaPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
+  const [mediaActivationRequired, setMediaActivationRequired] = useState(false);
 
   useEffect(() => {
     mediaRef.current = media;
@@ -93,6 +114,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     if (
       !mediaEnabledRef.current ||
       call.status !== "active" ||
+      !isAuthorizedFor(localAuthorizationRef.current, call) ||
       mediaCallIdRef.current === call.call_id ||
       mediaRequestCallIdRef.current === call.call_id
     ) {
@@ -134,7 +156,10 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     mediaRequestCallIdRef.current = "";
     mediaCallIdRef.current = "";
     mediaRetryPromiseRef.current = null;
+    activateMediaPromiseRef.current = null;
+    localAuthorizationRef.current = null;
     setMediaReady(false);
+    setMediaActivationRequired(false);
   }, []);
 
   const stopMedia = useCallback((): Promise<boolean> => {
@@ -160,6 +185,10 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     mediaEnabledRef.current = mediaEnabled;
     const call = callRef.current;
     if (!mediaEnabled || call?.status !== "active") return;
+    if (!isAuthorizedFor(localAuthorizationRef.current, call)) {
+      setMediaActivationRequired(true);
+      return;
+    }
     const cleanup = mediaCleanupPromiseRef.current;
     if (!cleanup) {
       void requestMedia(call);
@@ -228,6 +257,21 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
             pendingRef.current = null;
             setPending(false);
           } else if (eventCompletesPending(pendingRef.current, event)) {
+            // The only two places local media authorization is ever granted:
+            // our own call.start reaching the callee (ringing echoes our
+            // request_id) or our own call.accept reaching the server
+            // (confirmed by the call going active). A reconciled/restored
+            // call never takes this branch, so it can never self-authorize.
+            const completedOperation = pendingRef.current?.operation;
+            if (
+              completedOperation === "call.start" ||
+              (completedOperation === "call.accept" && event.call.status === "active")
+            ) {
+              localAuthorizationRef.current = {
+                callId: event.call.call_id,
+                callType: event.call.call_type,
+              };
+            }
             pendingRef.current = null;
             setPending(false);
           }
@@ -245,7 +289,12 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
             } else invalidateMediaRequest();
           }
           if (event.call.status === "active") {
-            if (mediaCleanup) {
+            if (!isAuthorizedFor(localAuthorizationRef.current, event.call)) {
+              // Restored/reconciled active call: never a getUserMedia/connect
+              // consequence of just seeing "active". The UI must offer an
+              // explicit activation action instead (see activateMedia below).
+              setMediaActivationRequired(true);
+            } else if (mediaCleanup) {
               const mediaGeneration = mediaRequestGenerationRef.current;
               void mediaCleanup.then((cleaned) => {
                 if (
@@ -362,6 +411,8 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       mediaRequestGenerationRef.current += 1;
       mediaRetryPromiseRef.current = null;
       mediaCleanupPromiseRef.current = null;
+      activateMediaPromiseRef.current = null;
+      localAuthorizationRef.current = null;
       handle.release();
       void (async () => {
         try {
@@ -398,20 +449,130 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   }, []);
 
   const transition = useCallback(
-    (type: "call.accept" | "call.decline" | "call.cancel" | "call.end") => {
+    (type: "call.decline" | "call.cancel" | "call.end") => {
       const call = callRef.current;
-      return call ? send(type, { call_id: call.call_id }) : false;
+      if (!call) return false;
+      if (
+        type === "call.decline" &&
+        call.status === "ringing" &&
+        pendingRef.current?.operation === "call.accept" &&
+        pendingRef.current.callId === call.call_id
+      ) {
+        // RF-23: the user must be able to decline while accept()'s own
+        // getUserMedia preflight is still awaiting the native prompt. Null
+        // out the captured pendingCommand here (identity, not just the
+        // ref) so sendGated's `pendingRef.current !== pendingCommand` check
+        // rejects it whenever the prompt resolves — no call.accept, no
+        // stale setPending/setError clobbering the decline below.
+        pendingRef.current = null;
+      }
+      return send(type, { call_id: call.call_id });
     },
     [send],
   );
+
+  // Reserves the pending slot synchronously (so a double click or a
+  // simultaneous audio/video click is rejected immediately, same as send()),
+  // then runs a getUserMedia preflight tied to the click before call.start or
+  // call.accept ever reaches the server or LiveKit connects. Denial clears the
+  // reservation without sending anything. A stale preflight (superseded,
+  // declined, terminated, or unmounted while the browser prompt was open) is
+  // detected by comparing pendingRef against the object captured here: any
+  // event, close, or unmount that ends this attempt already nulls it out.
+  const sendGated = useCallback(
+    (
+      operation: "call.start" | "call.accept",
+      callType: CallType,
+      payload: Record<string, unknown>,
+    ): boolean => {
+      const handle = socketRef.current;
+      if (!handle) {
+        setError("Conexão em tempo real indisponível.");
+        return false;
+      }
+      if (reconnectRef.current || syncReconciliationRef.current) return false;
+      if (pendingRef.current) return false;
+      const pendingCommand: PendingCallCommand = {
+        operation,
+        ...(typeof payload["call_id"] === "string" ? { callId: payload["call_id"] } : {}),
+        ...(typeof payload["request_id"] === "string" ? { requestId: payload["request_id"] } : {}),
+      };
+      pendingRef.current = pendingCommand;
+      setPending(true);
+      setError(null);
+      void (async () => {
+        const result = await requestMediaPermission(callType);
+        if (pendingRef.current !== pendingCommand) return;
+        if (!result.ok) {
+          pendingRef.current = null;
+          setPending(false);
+          setError(result.message);
+          return;
+        }
+        const currentHandle = socketRef.current;
+        if (!currentHandle || !currentHandle.send({ type: operation, ...payload })) {
+          pendingRef.current = null;
+          setPending(false);
+          setError("Conexão em tempo real indisponível.");
+        }
+      })();
+      return true;
+    },
+    [],
+  );
+
+  // Explicit user gesture that grants local authorization for a call this
+  // hook never itself started or accepted (restored via reload, reconnect,
+  // or call.sync). Runs the same preflight as start()/accept(); only on
+  // success does the call become authorized and requestMedia proceed.
+  const activateMedia = useCallback((): Promise<void> => {
+    const call = callRef.current;
+    const pendingActivation = activateMediaPromiseRef.current;
+    if (call && pendingActivation?.callId === call.call_id) return pendingActivation.promise;
+    if (!call || call.status !== "active" || isAuthorizedFor(localAuthorizationRef.current, call)) {
+      return Promise.resolve();
+    }
+    setError(null);
+    const activating = (async () => {
+      const result = await requestMediaPermission(call.call_type);
+      if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active") return;
+      if (!result.ok) {
+        setError(result.message);
+        return;
+      }
+      // If a previous call's media is still tearing down (e.g. this call
+      // replaced one that was ending), wait for it exactly like the
+      // automatic authorized path does, instead of overlapping sessions.
+      const pendingCleanup = mediaCleanupPromiseRef.current;
+      if (pendingCleanup) {
+        const cleaned = await pendingCleanup;
+        if (callRef.current?.call_id !== call.call_id || callRef.current.status !== "active")
+          return;
+        if (!cleaned) {
+          setError("Não foi possível liberar a mídia da chamada anterior. Tente novamente.");
+          return;
+        }
+      }
+      localAuthorizationRef.current = { callId: call.call_id, callType: call.call_type };
+      setMediaActivationRequired(false);
+      await requestMedia(call);
+    })().finally(() => {
+      if (activateMediaPromiseRef.current?.promise === activating) {
+        activateMediaPromiseRef.current = null;
+      }
+    });
+    activateMediaPromiseRef.current = { callId: call.call_id, promise: activating };
+    return activating;
+  }, [requestMedia]);
 
   return {
     call: state.call,
     pending,
     error,
     mediaReady,
+    mediaActivationRequired,
     start: (targetUserId, callType) => {
-      const started = send("call.start", {
+      const started = sendGated("call.start", callType, {
         request_id: crypto.randomUUID(),
         target_user_id: targetUserId,
         call_type: callType,
@@ -420,7 +581,9 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       return started;
     },
     accept: () => {
-      const accepted = transition("call.accept");
+      const call = callRef.current;
+      if (!call) return false;
+      const accepted = sendGated("call.accept", call.call_type, { call_id: call.call_id });
       if (accepted) void mediaRef.current?.startAudio();
       return accepted;
     },
@@ -462,6 +625,10 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
             setError("Não foi possível liberar a mídia da chamada anterior. Tente novamente.");
             return;
           }
+          // stopMedia() above invalidated authorization along with every
+          // other piece of media state; retrying is itself the explicit
+          // gesture that re-authorizes this exact call for this attempt.
+          localAuthorizationRef.current = { callId: call.call_id, callType: call.call_type };
           return requestMedia(call);
         })
         .finally(() => {
@@ -472,6 +639,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       mediaRetryPromiseRef.current = { callId: call.call_id, promise: retrying };
       return retrying;
     },
+    activateMedia,
     clearTerminal: () => {
       if (state.call && isTerminalCall(state.call.status)) {
         void stopMedia();
