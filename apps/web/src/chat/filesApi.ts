@@ -15,7 +15,7 @@
 import { ApiRequestError } from "../lib/api";
 import { authenticatedFetch } from "../lib/authClient";
 import { formatUploadLimit } from "../lib/uploadLimit";
-import type { AttachmentStatus, ChannelAttachment } from "./chatTypes";
+import type { AttachmentPreviewStatus, AttachmentStatus, ChannelAttachment } from "./chatTypes";
 
 const FILES_BASE = import.meta.env.VITE_FILES_API_BASE_URL ?? "/api/files";
 
@@ -25,6 +25,7 @@ interface AttachmentResponse {
   contentType?: unknown;
   size?: unknown;
   status?: unknown;
+  previewStatus?: unknown;
   createdAt?: unknown;
 }
 
@@ -42,6 +43,17 @@ function attachmentStatus(raw: unknown): AttachmentStatus {
   return raw === "clean" || raw === "rejected" ? raw : "pending_scan";
 }
 
+/**
+ * Accepts only the four states the preview contract defines. Anything else —
+ * an older server that publishes no field at all, or a state this build does
+ * not know — degrades to "unsupported", which is the conservative reading: the
+ * UI shows the icon and the download action, and never promises a preview that
+ * may not exist.
+ */
+function attachmentPreviewStatus(raw: unknown): AttachmentPreviewStatus {
+  return raw === "pending" || raw === "ready" || raw === "failed" ? raw : "unsupported";
+}
+
 function mapAttachment(raw: unknown): ChannelAttachment | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const item = raw as AttachmentResponse;
@@ -52,6 +64,7 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
     contentType: typeof item.contentType === "string" ? item.contentType : "",
     size: typeof item.size === "number" && Number.isFinite(item.size) ? item.size : 0,
     status: attachmentStatus(item.status),
+    previewStatus: attachmentPreviewStatus(item.previewStatus),
     createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
   };
 }
@@ -81,6 +94,37 @@ export async function fetchConversationAttachments(
   return raw
     .map(mapAttachment)
     .filter((attachment): attachment is ChannelAttachment => attachment !== undefined);
+}
+
+// ── Inline preview (RF-31, issue #464) ───────────────────────────────────────
+
+/**
+ * Fetches one attachment's preview image.
+ *
+ * The bytes come back as a Blob because that is the only shape a browser can
+ * turn into something an `<img>` will render without a URL that carries
+ * credentials. The request itself is an ordinary authenticated one: the bearer
+ * token travels in the header, exactly as it does for the listing, and never in
+ * a query string where it would land in history, logs and referrers.
+ *
+ * There is deliberately no URL built here that anyone could hold on to. The
+ * server refuses this route without a valid session and re-checks the
+ * attachment's visibility and its scan state on every call, so a preview is
+ * never more durable, or more shareable, than the caller's own access.
+ *
+ * A preview that is not servable answers 409 and a caller that cannot see the
+ * attachment answers 404 — both surface as ApiRequestError, and both mean the
+ * same thing to the UI: draw the fallback.
+ */
+export async function fetchAttachmentPreview(
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  return authenticatedFetch<Blob>(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}/preview`,
+    { method: "GET", signal },
+    (response) => response.blob(),
+  );
 }
 
 // ── Upload (RF-32, issue #458) ───────────────────────────────────────────────

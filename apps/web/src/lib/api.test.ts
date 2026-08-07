@@ -159,3 +159,46 @@ describe("apiFetch", () => {
     expect(err instanceof Error).toBe(true);
   });
 });
+
+describe("apiFetch response parser", () => {
+  // The preview route (RF-31) returns an image, which the JSON rules below the
+  // parser would otherwise discard as undefined.
+  it("hands a successful response to the caller's parser", async () => {
+    const body = "jpeg-bytes";
+    const response = new Response(body, {
+      status: 200,
+      headers: { "content-type": "image/jpeg" },
+    });
+    mockFetch.mockResolvedValue(response);
+
+    const parse = vi.fn((r: Response) => r.blob());
+    const parsed = await apiFetch<Blob>(
+      "/api/files/attachments/a-1/preview",
+      { method: "GET" },
+      parse,
+    );
+
+    // The parser sees the response itself, and its result is what the caller
+    // gets — not the undefined the non-JSON branch would have returned.
+    expect(parse).toHaveBeenCalledWith(response);
+    expect(parsed).toBeInstanceOf(Blob);
+    expect(parsed.size).toBe(body.length);
+  });
+
+  // Error bodies stay on the one path that knows the services' envelope: a
+  // parser must never be handed a failure to interpret.
+  it("does not reach the parser for an error response", async () => {
+    const parse = vi.fn();
+    mockFetch.mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "preview_not_available", message: "no" } }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(
+      apiFetch("/api/files/attachments/a-1/preview", { method: "GET" }, parse),
+    ).rejects.toMatchObject({ status: 409, code: "preview_not_available" });
+    expect(parse).not.toHaveBeenCalled();
+  });
+});

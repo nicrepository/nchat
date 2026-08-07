@@ -53,6 +53,9 @@ describe("authenticatedFetch", () => {
         expect.objectContaining({
           headers: expect.objectContaining({ authorization: "Bearer my_at" }),
         }),
+        // The optional response parser, absent for an ordinary JSON call and
+        // forwarded unchanged when a caller needs the raw body (RF-31 preview).
+        undefined,
       );
     });
 
