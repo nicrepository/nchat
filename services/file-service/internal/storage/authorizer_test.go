@@ -23,6 +23,7 @@ const (
 	testAttachmentID  = "55555555-5555-4555-8555-555555555555"
 	testConversation  = "66666666-6666-4666-8666-666666666666"
 	testStorageObject = "nchat/attachments/55555555-5555-4555-8555-555555555555"
+	testPreviewObject = "77777777-7777-4777-8777-777777777777"
 	testKEKKeyID      = "kek-test-active"
 )
 

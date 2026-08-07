@@ -239,6 +239,10 @@ type fakeObjects struct {
 	// opens counts Open calls, so a test can assert that a download that failed
 	// on metadata never reached storage at all.
 	opens int
+	// opened records the keys, so a test can assert *which* object was read and
+	// not merely that one was — the difference between "storage was touched" and
+	// "storage was asked for the key the domain derives".
+	opened []string
 }
 
 func newFakeObjects() *fakeObjects {
@@ -265,6 +269,7 @@ func (o *fakeObjects) Open(_ context.Context, key string) (io.ReadCloser, error)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.opens++
+	o.opened = append(o.opened, key)
 	if o.openErr != nil {
 		return nil, o.openErr
 	}
@@ -296,6 +301,12 @@ func (o *fakeObjects) count() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return len(o.objects)
+}
+
+func (o *fakeObjects) openedKeys() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.opened...)
 }
 
 func (o *fakeObjects) deletedKeys() []string {

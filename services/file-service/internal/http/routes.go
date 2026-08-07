@@ -21,4 +21,12 @@ const (
 	// attachment's scan state without starting a transfer.
 	RouteAttachment        = "/attachments/{attachmentID}"
 	RouteAttachmentContent = "/attachments/{attachmentID}/content"
+
+	// RF-31 inline preview. It is a third resource rather than a mode of the
+	// content route, because it is a different object with a different type,
+	// different headers and a different availability: an attachment can be
+	// downloadable and have no preview, and a preview is never a substitute for
+	// the file. A query parameter on /content would have made both of those
+	// invisible to a router, a cache and a log.
+	RouteAttachmentPreview = "/attachments/{attachmentID}/preview"
 )

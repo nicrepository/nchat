@@ -81,6 +81,10 @@ type fakeUseCases struct {
 	downloadErr error
 	lastInput   service.AttachmentAuthInput
 
+	preview     service.Download
+	previewErr  error
+	previewCall service.AttachmentAuthInput
+
 	listViews []service.AttachmentView
 	listErr   error
 	listInput service.ListDestinationAttachmentsInput
@@ -168,6 +172,16 @@ func (f *fakeUseCases) Download(_ context.Context, input service.AttachmentAuthI
 		return service.Download{}, f.downloadErr
 	}
 	return f.download, nil
+}
+
+func (f *fakeUseCases) Preview(_ context.Context, input service.AttachmentAuthInput) (service.Download, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.previewCall = input
+	if f.previewErr != nil {
+		return service.Download{}, f.previewErr
+	}
+	return f.preview, nil
 }
 
 func (f *fakeUseCases) Ready() bool {
@@ -357,6 +371,9 @@ func TestUploadResponseExposesOnlyTheClientProjection(t *testing.T) {
 	allowed := map[string]bool{
 		"id": true, "filename": true, "contentType": true,
 		"size": true, "status": true, "destinationKind": true, "createdAt": true,
+		// The preview state is a client concern and carries nothing internal:
+		// it is one of four words, never an object id, a key or a URL.
+		"previewStatus": true,
 	}
 	for field := range envelope.Data {
 		if !allowed[field] {
