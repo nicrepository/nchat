@@ -163,6 +163,9 @@ export default function LiveKitSpikePage({
         if (isAttemptCurrent(attempt)) setStatus("connected");
       },
       onAudioPlaybackChanged: () => undefined,
+      onMicrophoneStateChanged(enabled) {
+        if (isAttemptCurrent(attempt)) setMicrophoneEnabledState(enabled);
+      },
     };
   }
 

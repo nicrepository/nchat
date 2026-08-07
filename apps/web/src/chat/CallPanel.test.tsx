@@ -160,6 +160,49 @@ describe("CallPanel", () => {
     expect(screen.getByRole("button", { name: "Ativando áudio da chamada" })).toBeDisabled();
   });
 
+  it("disables only the microphone control while a microphone operation is pending", () => {
+    const calls = controller("active", currentUserId);
+    renderPanel(calls, media({ pendingControl: "microphone" }));
+
+    expect(screen.getByRole("button", { name: "Desativar microfone" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Desativar câmera" })).toBeEnabled();
+  });
+
+  it("does not disable the microphone control while only the camera operation is pending", () => {
+    const calls = controller("active", currentUserId);
+    renderPanel(calls, media({ pendingControl: "camera" }));
+
+    expect(screen.getByRole("button", { name: "Desativar microfone" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Desativar câmera" })).toBeDisabled();
+  });
+
+  it("re-enables the microphone control once a recoverable error clears pendingControl", () => {
+    const calls = controller("active", currentUserId);
+    renderPanel(
+      calls,
+      media({
+        pendingControl: null,
+        error: "Não foi possível acessar ou alterar o microfone.",
+        microphoneEnabled: true,
+      }),
+    );
+
+    const micButton = screen.getByRole("button", { name: "Desativar microfone" });
+    expect(micButton).toBeEnabled();
+    expect(micButton).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("keeps the microphone label bound only to the local microphoneEnabled prop, distinct from audio activation", () => {
+    const calls = controller("active", currentUserId);
+    renderPanel(calls, media({ microphoneEnabled: false, audioActivationRequired: true }));
+
+    expect(screen.getByRole("button", { name: "Ativar microfone" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Ativar áudio da chamada" })).toBeInTheDocument();
+  });
+
   it("shows camera-off fallbacks for remote and local video", () => {
     const calls = controller("active", currentUserId);
     renderPanel(

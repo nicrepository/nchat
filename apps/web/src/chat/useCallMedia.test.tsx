@@ -19,6 +19,7 @@ interface SessionCallbacks {
   onReconnecting(): void;
   onReconnected(): void;
   onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
+  onMicrophoneStateChanged(enabled: boolean): void;
 }
 
 class FakeSession {
@@ -26,9 +27,16 @@ class FakeSession {
   readonly startAudio = vi.fn(async (): Promise<void> => undefined);
   readonly connect = vi.fn(async (): Promise<void> => undefined);
   readonly enableCamera = vi.fn(async (): Promise<void> => undefined);
-  readonly enableMicrophone = vi.fn(async (): Promise<void> => undefined);
+  // Mirrors the real adapter contract: confirming the effective microphone
+  // state is a side effect of these calls (via onMicrophoneStateChanged),
+  // never a value the caller assumes locally.
+  readonly enableMicrophone = vi.fn(async (): Promise<void> => {
+    this.callbacks.onMicrophoneStateChanged(true);
+  });
   readonly setCameraEnabled = vi.fn(async (): Promise<void> => undefined);
-  readonly setMicrophoneEnabled = vi.fn(async (): Promise<void> => undefined);
+  readonly setMicrophoneEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
+    this.callbacks.onMicrophoneStateChanged(enabled);
+  });
   readonly disconnect = vi.fn(async (): Promise<void> => undefined);
 
   constructor(callbacks: SessionCallbacks) {
@@ -165,7 +173,12 @@ describe("useCallMedia", () => {
     session.setMicrophoneEnabled.mockImplementationOnce(
       () =>
         new Promise<void>((resolve) => {
-          resolveMicrophone = resolve;
+          resolveMicrophone = () => {
+            // The SDK confirms the effective state before the operation
+            // settles: the mock mirrors that ordering.
+            session.callbacks.onMicrophoneStateChanged(false);
+            resolve();
+          };
         }),
     );
 
@@ -499,5 +512,454 @@ describe("useCallMedia", () => {
 
     expect(view.factory).toHaveBeenCalledOnce();
     expect(view.getSession().connect).toHaveBeenCalledOnce();
+  });
+
+  describe("authoritative microphone state", () => {
+    it("starts false before any session confirms a state", () => {
+      const view = setup();
+      expect(view.result.current.microphoneEnabled).toBe(false);
+    });
+
+    it("toggles both directions using the confirmed ref, not a stale closure", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      expect(view.result.current.microphoneEnabled).toBe(true);
+
+      await act(() => view.result.current.toggleMicrophone());
+      expect(view.getSession().setMicrophoneEnabled).toHaveBeenLastCalledWith(false);
+      expect(view.result.current.microphoneEnabled).toBe(false);
+
+      await act(() => view.result.current.toggleMicrophone());
+      expect(view.getSession().setMicrophoneEnabled).toHaveBeenLastCalledWith(true);
+      expect(view.result.current.microphoneEnabled).toBe(true);
+    });
+
+    it("preserves the correct sequence across ten consecutive toggles", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+
+      for (let cycle = 0; cycle < 10; cycle += 1) {
+        const expected = !view.result.current.microphoneEnabled;
+        await act(() => view.result.current.toggleMicrophone());
+        expect(view.result.current.microphoneEnabled).toBe(expected);
+        expect(view.getSession().setMicrophoneEnabled).toHaveBeenLastCalledWith(expected);
+      }
+      expect(view.getSession().setMicrophoneEnabled).toHaveBeenCalledTimes(10);
+    });
+
+    it("reflects a local TrackMuted-equivalent callback without a toggle in flight", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+
+      act(() => view.getSession().callbacks.onMicrophoneStateChanged(false));
+
+      expect(view.result.current.microphoneEnabled).toBe(false);
+    });
+
+    it("reflects a local TrackUnmuted-equivalent callback without a toggle in flight", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      act(() => view.getSession().callbacks.onMicrophoneStateChanged(false));
+
+      act(() => view.getSession().callbacks.onMicrophoneStateChanged(true));
+
+      expect(view.result.current.microphoneEnabled).toBe(true);
+    });
+
+    it("never changes microphoneEnabled from remote track element callbacks", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const remoteAudio = document.createElement("audio");
+
+      act(() => {
+        view.getSession().callbacks.onRemoteElement(remoteAudio);
+      });
+      expect(view.result.current.microphoneEnabled).toBe(true);
+
+      act(() => {
+        view.getSession().callbacks.onElementRemoved(remoteAudio);
+      });
+      expect(view.result.current.microphoneEnabled).toBe(true);
+    });
+
+    it("keeps the last confirmed state when muting fails", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      view.getSession().setMicrophoneEnabled.mockRejectedValueOnce({
+        kind: "microphone_unavailable",
+      });
+
+      await act(() => view.result.current.toggleMicrophone());
+
+      expect(view.result.current.microphoneEnabled).toBe(true);
+      expect(view.result.current.error).toBe("Não foi possível acessar ou alterar o microfone.");
+      expect(view.result.current.pendingControl).toBeNull();
+    });
+
+    it("keeps the last confirmed state when unmuting fails", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      await act(() => view.result.current.toggleMicrophone());
+      expect(view.result.current.microphoneEnabled).toBe(false);
+      view.getSession().setMicrophoneEnabled.mockRejectedValueOnce({
+        kind: "microphone_unavailable",
+      });
+
+      await act(() => view.result.current.toggleMicrophone());
+
+      expect(view.result.current.microphoneEnabled).toBe(false);
+      expect(view.result.current.pendingControl).toBeNull();
+    });
+
+    it("ignores a stale toggle result after stop", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const toggling = deferred<void>();
+      session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
+
+      let toggle!: Promise<void>;
+      act(() => {
+        toggle = view.result.current.toggleMicrophone();
+      });
+      await act(() => view.result.current.stop());
+      await act(async () => {
+        session.callbacks.onMicrophoneStateChanged(false);
+        toggling.resolve();
+        await toggle;
+      });
+
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.microphoneEnabled).toBe(false);
+      expect(view.result.current.pendingControl).toBeNull();
+    });
+
+    it("ignores a stale toggle result after unmount", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const toggling = deferred<void>();
+      session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
+
+      const toggle = view.result.current.toggleMicrophone();
+      view.unmount();
+      session.callbacks.onMicrophoneStateChanged(false);
+      toggling.resolve();
+      await toggle;
+
+      expect(session.disconnect).toHaveBeenCalledOnce();
+    });
+
+    it("ignores a stale session's callback once a new call replaces it", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const sessionA = view.getSession();
+      const toggling = deferred<void>();
+      sessionA.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
+
+      let staleToggle!: Promise<void>;
+      act(() => {
+        staleToggle = view.result.current.toggleMicrophone();
+      });
+      await act(() => view.result.current.stop());
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000900" },
+          "fresh-token",
+        ),
+      );
+      expect(view.result.current.microphoneEnabled).toBe(true);
+
+      await act(async () => {
+        sessionA.callbacks.onMicrophoneStateChanged(false);
+        toggling.resolve();
+        await staleToggle;
+      });
+
+      expect(view.sessions).toHaveLength(2);
+      expect(view.result.current.microphoneEnabled).toBe(true);
+    });
+
+    it("resyncs to the real state once Reconnected fires", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+
+      act(() => session.callbacks.onReconnecting());
+      // Resync happens before the hook is told the connection is restored,
+      // mirroring the adapter's own notifyMicrophoneState-then-onReconnected
+      // ordering: the server may have muted the track while disconnected.
+      act(() => {
+        session.callbacks.onMicrophoneStateChanged(false);
+        session.callbacks.onReconnected();
+      });
+
+      expect(view.result.current.status).toBe("connected");
+      expect(view.result.current.microphoneEnabled).toBe(false);
+    });
+
+    it("starts a new call with the freshly confirmed state after stop", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      await act(() => view.result.current.toggleMicrophone());
+      expect(view.result.current.microphoneEnabled).toBe(false);
+
+      await act(() => view.result.current.stop());
+      expect(view.result.current.microphoneEnabled).toBe(false);
+
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000901" },
+          "fresh-token",
+        ),
+      );
+
+      expect(view.result.current.microphoneEnabled).toBe(true);
+    });
+
+    it("does not leave pendingControl stuck after onDisconnected fires mid-toggle", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const toggling = deferred<void>();
+      session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
+
+      let toggle!: Promise<void>;
+      act(() => {
+        toggle = view.result.current.toggleMicrophone();
+      });
+      act(() => session.callbacks.onDisconnected());
+      expect(view.result.current.status).toBe("error");
+
+      await act(async () => {
+        session.callbacks.onMicrophoneStateChanged(false);
+        toggling.resolve();
+        await toggle;
+      });
+
+      expect(view.result.current.pendingControl).toBeNull();
+    });
+
+    it("keeps remote media attached while the local microphone is toggled", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const remoteAudio = document.createElement("audio");
+      act(() => session.callbacks.onRemoteElement(remoteAudio));
+      expect(view.result.current.hasRemoteMedia).toBe(true);
+
+      await act(() => view.result.current.toggleMicrophone());
+
+      expect(view.result.current.hasRemoteMedia).toBe(true);
+    });
+
+    it("never calls startAudio as part of toggleMicrophone", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      session.startAudio.mockClear();
+
+      await act(() => view.result.current.toggleMicrophone());
+
+      expect(session.startAudio).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("pendingControl operation isolation across sessions", () => {
+    it("does not let A's late microphone toggle clear B's pending microphone control", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const sessionA = view.getSession();
+      const togglingA = deferred<void>();
+      sessionA.setMicrophoneEnabled.mockReturnValueOnce(togglingA.promise);
+
+      let toggleA!: Promise<void>;
+      act(() => {
+        toggleA = view.result.current.toggleMicrophone();
+      });
+      await act(() => view.result.current.stop());
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000910" },
+          "fresh-token",
+        ),
+      );
+      const sessionB = view.getSession();
+      expect(sessionB).not.toBe(sessionA);
+
+      const togglingB = deferred<void>();
+      sessionB.setMicrophoneEnabled.mockReturnValueOnce(togglingB.promise);
+      let toggleB!: Promise<void>;
+      act(() => {
+        toggleB = view.result.current.toggleMicrophone();
+      });
+      expect(view.result.current.pendingControl).toBe("microphone");
+
+      // A duplicate click while B's toggle is still in flight must stay a
+      // no-op: only one setMicrophoneEnabled call for B, ever.
+      await act(() => view.result.current.toggleMicrophone());
+      expect(sessionB.setMicrophoneEnabled).toHaveBeenCalledTimes(1);
+
+      // A's stale operation resolves after B's has already taken the
+      // pendingControl slot. Its finally must not clear B's pending state.
+      await act(async () => {
+        sessionA.callbacks.onMicrophoneStateChanged(false);
+        togglingA.resolve();
+        await toggleA;
+      });
+      expect(view.result.current.pendingControl).toBe("microphone");
+
+      // Only when B's own toggle settles does pendingControl clear.
+      await act(async () => {
+        togglingB.resolve();
+        await toggleB;
+      });
+      expect(view.result.current.pendingControl).toBeNull();
+    });
+
+    it("does not let A's late camera toggle clear B's pending camera control", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const sessionA = view.getSession();
+      const togglingA = deferred<void>();
+      sessionA.setCameraEnabled.mockReturnValueOnce(togglingA.promise);
+
+      let toggleA!: Promise<void>;
+      act(() => {
+        toggleA = view.result.current.toggleCamera();
+      });
+      await act(() => view.result.current.stop());
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000911" },
+          "fresh-token",
+        ),
+      );
+      const sessionB = view.getSession();
+      expect(sessionB).not.toBe(sessionA);
+
+      const togglingB = deferred<void>();
+      sessionB.setCameraEnabled.mockReturnValueOnce(togglingB.promise);
+      let toggleB!: Promise<void>;
+      act(() => {
+        toggleB = view.result.current.toggleCamera();
+      });
+      expect(view.result.current.pendingControl).toBe("camera");
+
+      await act(() => view.result.current.toggleCamera());
+      expect(sessionB.setCameraEnabled).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        togglingA.resolve();
+        await toggleA;
+      });
+      expect(view.result.current.pendingControl).toBe("camera");
+      // B's cameraEnabled must reflect only its own operation, never A's.
+      expect(view.result.current.cameraEnabled).toBe(true);
+
+      await act(async () => {
+        togglingB.resolve();
+        await toggleB;
+      });
+      expect(view.result.current.pendingControl).toBeNull();
+      expect(view.result.current.cameraEnabled).toBe(false);
+    });
+
+    it("does not let A's late toggle error overwrite B's state while B is still pending", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const sessionA = view.getSession();
+      const togglingA = deferred<void>();
+      sessionA.setMicrophoneEnabled.mockReturnValueOnce(togglingA.promise);
+
+      let toggleA!: Promise<void>;
+      act(() => {
+        toggleA = view.result.current.toggleMicrophone();
+      });
+      await act(() => view.result.current.stop());
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000912" },
+          "fresh-token",
+        ),
+      );
+      const sessionB = view.getSession();
+      const togglingB = deferred<void>();
+      sessionB.setMicrophoneEnabled.mockReturnValueOnce(togglingB.promise);
+      let toggleB!: Promise<void>;
+      act(() => {
+        toggleB = view.result.current.toggleMicrophone();
+      });
+
+      // A's stale operation fails after B has taken over the pending slot.
+      await act(async () => {
+        togglingA.reject({ kind: "microphone_unavailable" });
+        await toggleA.catch(() => undefined);
+      });
+      expect(view.result.current.error).toBeNull();
+      expect(view.result.current.pendingControl).toBe("microphone");
+
+      await act(async () => {
+        sessionB.callbacks.onMicrophoneStateChanged(false);
+        togglingB.resolve();
+        await toggleB;
+      });
+      expect(view.result.current.error).toBeNull();
+      expect(view.result.current.pendingControl).toBeNull();
+      expect(view.result.current.microphoneEnabled).toBe(false);
+    });
+
+    it("still clears pendingControl on stop even without a new session replacing it", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const toggling = deferred<void>();
+      session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
+
+      let toggle!: Promise<void>;
+      act(() => {
+        toggle = view.result.current.toggleMicrophone();
+      });
+      expect(view.result.current.pendingControl).toBe("microphone");
+
+      await act(() => view.result.current.stop());
+      expect(view.result.current.pendingControl).toBeNull();
+
+      await act(async () => {
+        toggling.resolve();
+        await toggle;
+      });
+      expect(view.result.current.pendingControl).toBeNull();
+    });
+
+    it("keeps the confirmed microphone state coming only from the LiveKit callback, even across the A/B race", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const sessionA = view.getSession();
+      const togglingA = deferred<void>();
+      sessionA.setMicrophoneEnabled.mockReturnValueOnce(togglingA.promise);
+
+      let toggleA!: Promise<void>;
+      act(() => {
+        toggleA = view.result.current.toggleMicrophone();
+      });
+      await act(() => view.result.current.stop());
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000913" },
+          "fresh-token",
+        ),
+      );
+      expect(view.result.current.microphoneEnabled).toBe(true);
+
+      await act(async () => {
+        // A's stale callback must be ignored (generation guard), not just
+        // its pendingControl bookkeeping.
+        sessionA.callbacks.onMicrophoneStateChanged(false);
+        togglingA.resolve();
+        await toggleA;
+      });
+      expect(view.result.current.microphoneEnabled).toBe(true);
+    });
   });
 });
