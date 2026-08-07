@@ -1789,6 +1789,10 @@ func (unreachableObjects) Open(context.Context, string) (io.ReadCloser, error) {
 	return nil, errors.New("storage unavailable")
 }
 
+func (unreachableObjects) OpenRange(context.Context, string, int64) (io.ReadCloser, error) {
+	return nil, errors.New("storage unavailable")
+}
+
 func (unreachableObjects) Delete(context.Context, string) error {
 	return errors.New("storage unavailable")
 }

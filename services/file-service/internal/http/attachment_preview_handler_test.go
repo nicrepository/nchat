@@ -2,7 +2,6 @@ package httpapi_test
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,7 +32,7 @@ func servablePreview(useCases *fakeUseCases, body string) {
 		Filename:    "diagram.png",
 		ContentType: domain.PreviewContentType,
 		Size:        int64(len(body)),
-		Content:     io.NopCloser(strings.NewReader(body)),
+		Content:     seekableContent([]byte(body)),
 	}
 }
 

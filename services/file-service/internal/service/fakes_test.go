@@ -243,6 +243,10 @@ type fakeObjects struct {
 	// not merely that one was — the difference between "storage was touched" and
 	// "storage was asked for the key the domain derives".
 	opened []string
+	// rangeOffsets records every ranged read's starting byte, which is how a
+	// test proves a seek was answered by reading from the offset rather than
+	// from the beginning.
+	rangeOffsets []int64
 }
 
 func newFakeObjects() *fakeObjects {
@@ -278,6 +282,34 @@ func (o *fakeObjects) Open(_ context.Context, key string) (io.ReadCloser, error)
 		return nil, domain.ErrNotFound
 	}
 	return io.NopCloser(bytes.NewReader(content)), nil
+}
+
+// OpenRange serves the object from an offset, like the filer's Range support.
+// It records the offsets it was asked for, so a test can prove that reading a
+// byte range never pulled the bytes before it.
+func (o *fakeObjects) OpenRange(_ context.Context, key string, offset int64) (io.ReadCloser, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.opens++
+	o.opened = append(o.opened, key)
+	o.rangeOffsets = append(o.rangeOffsets, offset)
+	if o.openErr != nil {
+		return nil, o.openErr
+	}
+	content, ok := o.objects[key]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	if offset < 0 || offset > int64(len(content)) {
+		return nil, domain.ErrInvalidInput
+	}
+	return io.NopCloser(bytes.NewReader(content[offset:])), nil
+}
+
+func (o *fakeObjects) rangeReads() []int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int64(nil), o.rangeOffsets...)
 }
 
 func (o *fakeObjects) Delete(_ context.Context, key string) error {

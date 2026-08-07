@@ -378,6 +378,17 @@ func parseListLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 // Nothing is served inline. Every response carries an attachment disposition
 // and nosniff, so an uploaded HTML, SVG or script file is downloaded, never
 // rendered in the origin the API is served from.
+//
+// # Byte ranges (RF-31)
+//
+// A byte range is served when one is asked for, which is what lets a video be
+// played and seeked instead of downloaded whole. Every gate above stays exactly
+// where it was, and none of them can see a Range header: the caller is
+// authenticated, the attachment's visibility is re-checked, the malware scan is
+// confirmed clean and the data key is unwrapped against the authenticated
+// length — all of it before this function decides anything about ranges. A
+// range is therefore never an alternative way in; it only narrows what an
+// already-authorised read returns.
 func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	principal, ok := AuthenticatedPrincipal(r)
@@ -387,18 +398,6 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 	}
 	if !h.Ready() {
 		writeAttachmentError(w, domain.ErrDependenciesUnavailable)
-		return
-	}
-	// Range is refused outright rather than partially honoured. Serving a byte
-	// range requires seeking into an authenticated chunk stream, which this
-	// envelope version does not support; answering a range with the whole body,
-	// or with an unverified slice, would be worse than refusing.
-	if r.Header.Get("Range") != "" {
-		w.Header().Set("Accept-Ranges", "none")
-		h.metrics.observeDownload("range_rejected")
-		h.logAttachment(r, startedAt, "download", errCodeRangeUnsup, http.StatusRequestedRangeNotSatisfiable, "")
-		httputil.WriteError(w, http.StatusRequestedRangeNotSatisfiable, errCodeRangeUnsup,
-			"range requests are not supported")
 		return
 	}
 
@@ -419,30 +418,125 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", download.ContentType)
 	w.Header().Set("Content-Disposition", contentDisposition(download.Filename))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Accept-Ranges", "none")
+	// Set here rather than left to the global security headers, and set before
+	// anything is written so it covers the partial responses too. Attachment
+	// content is private and its visibility is re-evaluated on every request —
+	// losing access to a channel must stop the bytes — and no shared cache can
+	// make that decision. A 206 is the case that most needs saying so: a
+	// misconfigured proxy caching one range of one user's video would serve it
+	// to the next caller who asked for the same bytes. Same policy as /preview,
+	// for the same reason.
+	w.Header().Set("Cache-Control", "private, no-store")
+
+	if hasMultipleRanges(r) {
+		h.refuseMultiRange(w, r, startedAt, download.Size)
+		return
+	}
+
+	// net/http owns the range contract from here: parsing, 206, Content-Range,
+	// Accept-Ranges, 416 with `bytes */size`, and every malformed, reversed,
+	// overflowing or unsatisfiable form. Reimplementing that is how range
+	// parsers grow off-by-one and overflow bugs, and none of it needs to know
+	// anything about this service.
+	//
+	// The name is empty and the modification time is zero on purpose: the type
+	// is already set above and must not be re-derived from a filename, and an
+	// attachment has no meaningful modtime to publish — a zero one suppresses
+	// Last-Modified and the conditional handling that would come with it.
+	//
 	// Publishing a length is only safe because Download has already returned.
 	// The recorded size is part of the wrapped data key's associated data, so
-	// reaching this line means the unwrap succeeded against exactly this number:
+	// reaching this line means the unwrap succeeded against exactly that number:
 	// a size_bytes edited in the database fails above, before any status line or
 	// header is written, instead of becoming a smaller Content-Length that would
 	// let a prefix pass for the whole file.
-	//
-	// The reader carries the same length as an independent invariant, so a
-	// stream that stops producing bytes early still aborts the response below.
-	w.Header().Set("Content-Length", strconv.FormatInt(download.Size, 10))
-	w.WriteHeader(http.StatusOK)
+	recorder := &responseRecorder{ResponseWriter: w}
+	http.ServeContent(recorder, r, "", time.Time{}, download.Content)
 
-	if !streamExactly(w, download) {
-		// Headers are already committed, so the status cannot be corrected. The
-		// short body makes net/http drop the connection without a valid
-		// terminator, which is what stops a truncated or tampered object from
-		// being accepted as a complete file.
-		h.metrics.observeDownload("stream_failed")
-		h.logAttachment(r, startedAt, "download", "stream_failed", http.StatusOK, r.PathValue("attachmentID"))
-		return
+	result := recorder.result()
+	h.metrics.observeDownload(result)
+	h.logAttachment(r, startedAt, "download", result, recorder.status, r.PathValue("attachmentID"))
+}
+
+// hasMultipleRanges reports whether the request asks for more than one byte
+// range. A comma is the only separator the grammar has, so its presence is the
+// whole test.
+func hasMultipleRanges(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Range"), ",")
+}
+
+// refuseMultiRange answers a request for several ranges at once.
+//
+// Only a single range is served, and the refusal is deliberate rather than a
+// gap. Each range costs its own storage request and its own chunk decryption,
+// so honouring a list would let one cheap request fan out into arbitrarily many
+// expensive ones — the amplification a byte-serving route most needs to avoid.
+// Nothing legitimate is lost: media elements request one range at a time, and a
+// client that wants several can ask for them one at a time like any other.
+//
+// 416 carries `Content-Range: bytes */size`, so a client learns the real length
+// and can retry with a single satisfiable range.
+func (h *AttachmentHandler) refuseMultiRange(
+	w http.ResponseWriter, r *http.Request, startedAt time.Time, size int64,
+) {
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+	h.metrics.observeDownload(errCodeRangeUnsup)
+	h.logAttachment(r, startedAt, "download", errCodeRangeUnsup,
+		http.StatusRequestedRangeNotSatisfiable, "")
+	httputil.WriteError(w, http.StatusRequestedRangeNotSatisfiable, errCodeRangeUnsup,
+		"only a single byte range is supported")
+}
+
+// responseRecorder observes what net/http actually sent, so the route can keep
+// reporting the same operational facts it did when it wrote the response
+// itself: which outcome it was, and whether the body arrived in full.
+//
+// A body that stops short still matters. The length was authenticated before
+// any header was written, so a stream that produces fewer bytes is an integrity
+// failure; the status cannot be corrected by then, and the short body is what
+// makes net/http drop the connection without a valid terminator instead of
+// letting a truncated object pass for a complete file.
+type responseRecorder struct {
+	http.ResponseWriter
+	status   int
+	written  int64
+	promised int64
+}
+
+func (w *responseRecorder) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+		// Read back rather than computed: for a 206 this is the length of the
+		// segment net/http chose, which is the only number the body can be
+		// checked against.
+		w.promised, _ = strconv.ParseInt(w.Header().Get("Content-Length"), 10, 64)
 	}
-	h.metrics.observeDownload("served")
-	h.logAttachment(r, startedAt, "download", "served", http.StatusOK, r.PathValue("attachmentID"))
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseRecorder) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.written += int64(n)
+	return n, err
+}
+
+// result names the outcome for metrics and logs. The labels are a closed set and
+// carry no identifier, no length and no range.
+func (w *responseRecorder) result() string {
+	switch {
+	case w.status == http.StatusRequestedRangeNotSatisfiable:
+		return "range_unsatisfiable"
+	case w.written != w.promised:
+		return "stream_failed"
+	case w.status == http.StatusPartialContent:
+		return "partial"
+	default:
+		return "served"
+	}
 }
 
 // GetPreview handles GET /attachments/{attachmentID}/preview.
