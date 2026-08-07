@@ -522,3 +522,141 @@ func TestDEKBindingDownMigrationIsScopedAndTransactional(t *testing.T) {
 		}
 	}
 }
+
+const previewsUpMigration = "000003_attachment_previews.up.sql"
+const previewsDownMigration = "000003_attachment_previews.down.sql"
+
+// Unlike 000002, this migration must be able to run against a populated table:
+// every column it adds is nullable or defaulted, so a file-service that
+// predates it keeps inserting and finalising rows successfully. A guard here
+// would be a deployment ordering requirement bought for nothing.
+func TestPreviewMigrationAddsOnlyOptionalColumns(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, previewsUpMigration))
+
+	for _, column := range []string{
+		"preview_status", "preview_object_id", "preview_size_bytes",
+		"preview_wrapped_dek", "preview_kek_key_id",
+		"preview_envelope_version", "preview_dek_wrap_version",
+		"preview_attempts", "preview_next_attempt_at",
+	} {
+		if !strings.Contains(up, column) {
+			t.Fatalf("expected column %q", column)
+		}
+	}
+	// The only NOT NULL columns carry a DEFAULT, which is what keeps the
+	// previous build's INSERT valid after this migration commits.
+	for _, notNull := range []string{
+		"preview_status           TEXT        NOT NULL DEFAULT 'pending'",
+		"preview_attempts         SMALLINT    NOT NULL DEFAULT 0",
+	} {
+		if !strings.Contains(up, notNull) {
+			t.Fatalf("expected %q so the previous build can still write rows", notNull)
+		}
+	}
+	if strings.Contains(up, "LOCK TABLE") || strings.Contains(up, "RAISE EXCEPTION") {
+		t.Fatal("a purely additive migration needs no lock and no emptiness guard")
+	}
+}
+
+// A preview is servable only if everything needed to open it is present. The
+// CHECK is what makes "ready but unopenable" unrepresentable, so a client can
+// never be handed a broken image instead of its fallback.
+func TestPreviewMigrationRequiresTheWholeBindingWhenReady(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, previewsUpMigration))
+
+	if !strings.Contains(up, "attachments_preview_complete_check") {
+		t.Fatal("expected a completeness CHECK for a ready preview")
+	}
+	for _, column := range []string{
+		"preview_object_id IS NOT NULL",
+		"preview_size_bytes IS NOT NULL",
+		"preview_wrapped_dek IS NOT NULL",
+		"preview_kek_key_id IS NOT NULL",
+		"preview_envelope_version IS NOT NULL",
+		"preview_dek_wrap_version IS NOT NULL",
+	} {
+		if !strings.Contains(up, column) {
+			t.Fatalf("the completeness CHECK must require %q", column)
+		}
+	}
+	// Two attachments pointing at one preview object would make deleting either
+	// one strand the other.
+	if !strings.Contains(up, "attachments_preview_object_id_unique") {
+		t.Fatal("preview objects must be unique per attachment")
+	}
+}
+
+// The states are the client contract: waiting, available, never available, and
+// failed. Anything outside that set would reach a UI that cannot draw it.
+func TestPreviewMigrationConstrainsTheStatusSet(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, previewsUpMigration))
+	if !strings.Contains(up, "preview_status IN ('pending', 'ready', 'unsupported', 'failed')") {
+		t.Fatal("the preview status set must be closed by CHECK")
+	}
+	for _, status := range []domain.PreviewStatus{
+		domain.PreviewStatusPending, domain.PreviewStatusReady,
+		domain.PreviewStatusUnsupported, domain.PreviewStatusFailed,
+	} {
+		if !strings.Contains(up, "'"+string(status)+"'") {
+			t.Fatalf("the CHECK must allow the domain status %q", status)
+		}
+	}
+	// The wrap version is pinned to the one this build implements, exactly like
+	// the attachment's own column.
+	want := fmt.Sprintf("preview_dek_wrap_version = %d", crypto.KeyWrapVersion)
+	if !strings.Contains(up, want) {
+		t.Fatalf("expected the preview wrap version to be pinned to %q", want)
+	}
+}
+
+// The worker's queue has to be an index, not a scan: the claim runs on every
+// replica every few seconds against a table that grows with every upload.
+func TestPreviewMigrationIndexesTheWorkerQueue(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, previewsUpMigration))
+	if !strings.Contains(up, "idx_attachments_preview_pending") {
+		t.Fatal("expected an index for the preview queue")
+	}
+	if !strings.Contains(up, "WHERE preview_status = 'pending'") {
+		t.Fatal("the queue index must be partial, so it is empty when there is no backlog")
+	}
+}
+
+// The rollback drops derived data only. It must not need an emptiness guard and
+// must not reach outside the files schema.
+func TestPreviewDownMigrationDropsOnlyDerivedState(t *testing.T) {
+	down := readFilesMigration(t, previewsDownMigration)
+	statements := sqlOnly(down)
+
+	if !strings.Contains(statements, "DROP INDEX IF EXISTS files.idx_attachments_preview_pending") {
+		t.Fatal("the down migration must drop the queue index")
+	}
+	for _, column := range []string{
+		"DROP COLUMN IF EXISTS preview_status",
+		"DROP COLUMN IF EXISTS preview_object_id",
+		"DROP COLUMN IF EXISTS preview_wrapped_dek",
+	} {
+		if !strings.Contains(statements, column) {
+			t.Fatalf("the down migration must remove %q", column)
+		}
+	}
+	// Nothing that would touch an attachment, its object or another schema.
+	for _, forbidden := range []string{
+		"DROP SCHEMA", "DROP DATABASE", "TRUNCATE", "DROP EXTENSION",
+		"DROP TABLE", "DELETE FROM", "UPDATE files.attachments SET status",
+		"chat.", "auth.",
+	} {
+		if strings.Contains(statements, forbidden) {
+			t.Fatalf("the down migration must not contain %q", forbidden)
+		}
+	}
+	// Dropping columns the attachment itself depends on would take downloads
+	// with it, which is exactly what this rollback must not do.
+	for _, kept := range []string{"wrapped_dek", "kek_key_id", "storage_object_key"} {
+		if strings.Contains(statements, "DROP COLUMN IF EXISTS "+kept) {
+			t.Fatalf("the down migration must not drop %q", kept)
+		}
+	}
+	if !strings.Contains(down, "BEGIN;") || !strings.Contains(down, "COMMIT;") {
+		t.Fatal("the down migration must be transactional")
+	}
+}

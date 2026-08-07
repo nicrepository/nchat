@@ -104,4 +104,8 @@ func registerAttachmentRoutes(
 	mux.Handle("GET "+RouteDMAttachments, authenticated(http.HandlerFunc(handler.ListConversationAttachments)))
 	mux.Handle("GET "+RouteAttachment, authenticated(http.HandlerFunc(handler.GetMetadata)))
 	mux.Handle("GET "+RouteAttachmentContent, authenticated(http.HandlerFunc(handler.DownloadContent)))
+	// The preview is authenticated exactly like the content it is derived from,
+	// and is not rate limited for the same reason the listing is not: it is a
+	// read, and the upload budget exists to protect writes.
+	mux.Handle("GET "+RouteAttachmentPreview, authenticated(http.HandlerFunc(handler.GetPreview)))
 }

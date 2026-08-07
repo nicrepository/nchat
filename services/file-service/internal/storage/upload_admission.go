@@ -47,6 +47,14 @@ import (
 type LockConn interface {
 	// TryLock takes the lock without waiting, reporting whether it got it.
 	TryLock(ctx context.Context, key int64) (bool, error)
+	// Lock waits for the lock instead of refusing when it is held.
+	//
+	// Admission control never wants this — a caller that has to queue for an
+	// upload slot is a caller holding an unread request body open — but mutual
+	// exclusion does: the attachment fence (RF-31) needs a scan verdict to
+	// *wait* for a render in progress rather than skip it. The wait ends when
+	// ctx does, because pgx cancels the running query.
+	Lock(ctx context.Context, key int64) error
 	// Unlock releases a lock this connection holds.
 	//
 	// The boolean is as load-bearing as the error: pg_advisory_unlock returns

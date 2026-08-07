@@ -60,6 +60,22 @@ func (c *pgxLockConn) TryLock(ctx context.Context, key int64) (bool, error) {
 	return acquired, nil
 }
 
+// Lock waits until the advisory lock is available.
+//
+// pg_advisory_lock blocks in the server, so the wait costs this connection and
+// nothing else — no polling, no sleep, and no busy loop in Go. Cancelling ctx
+// cancels the query, which is what lets a shutdown or a job deadline abandon a
+// wait instead of inheriting it.
+func (c *pgxLockConn) Lock(ctx context.Context, key int64) error {
+	if c.conn == nil {
+		return errors.New("take advisory lock: connection already returned")
+	}
+	if _, err := c.conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		return fmt.Errorf("take advisory lock: %w", err)
+	}
+	return nil
+}
+
 // Unlock releases one lock and reports whether the session actually held it.
 //
 // pg_advisory_unlock returns a boolean, and it is scanned rather than discarded:

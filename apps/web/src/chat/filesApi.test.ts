@@ -36,6 +36,7 @@ describe("fetchChannelAttachments", () => {
             contentType: "application/pdf",
             size: 2048,
             status: "clean",
+            previewStatus: "ready",
             createdAt: "2026-07-15T12:00:00Z",
           },
           {
@@ -59,9 +60,43 @@ describe("fetchChannelAttachments", () => {
       contentType: "application/pdf",
       size: 2048,
       status: "clean",
+      previewStatus: "ready",
       createdAt: "2026-07-15T12:00:00Z",
     });
     expect(attachments[1].status).toBe("rejected");
+    // A server that publishes no preview state at all is read as "there is
+    // none", never as one the UI could try to load.
+    expect(attachments[1].previewStatus).toBe("unsupported");
+  });
+
+  it("keeps every preview state the contract defines and refuses the rest", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        attachments: [
+          { id: "a-1", previewStatus: "pending" },
+          { id: "a-2", previewStatus: "ready" },
+          { id: "a-3", previewStatus: "failed" },
+          { id: "a-4", previewStatus: "unsupported" },
+          { id: "a-5", previewStatus: "READY" },
+          { id: "a-6", previewStatus: 7 },
+          { id: "a-7" },
+        ],
+      },
+    });
+
+    const attachments = await fetchConversationAttachments({ kind: "channel", id: "ch-1" }, 5);
+
+    expect(attachments.map((item) => item.previewStatus)).toEqual([
+      "pending",
+      "ready",
+      "failed",
+      "unsupported",
+      // Anything outside the closed set falls back to the icon, never to a
+      // preview the client would then fail to load.
+      "unsupported",
+      "unsupported",
+      "unsupported",
+    ]);
   });
 
   it("never promotes an unrecognised status to clean", async () => {

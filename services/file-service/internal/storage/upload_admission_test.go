@@ -104,6 +104,23 @@ type fakeLockConn struct {
 	discarded bool
 }
 
+// Lock is the blocking acquire the attachment fence uses. Admission control
+// never calls it, so the fake refuses it: a test that reaches this has wired
+// the wrong primitive into an upload slot.
+func (c *fakeLockConn) Lock(ctx context.Context, key int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	acquired, err := c.TryLock(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return errors.New("fake lock conn cannot wait for a held lock")
+	}
+	return nil
+}
+
 func (c *fakeLockConn) TryLock(ctx context.Context, key int64) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

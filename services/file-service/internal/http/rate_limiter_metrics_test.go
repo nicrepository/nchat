@@ -140,6 +140,9 @@ func TestAttachmentMetricsAreExportedWithBoundedLabels(t *testing.T) {
 	metrics := observability.NewMetrics(obsCfg)
 	attachmentMetrics := httpapi.NewAttachmentMetrics(metrics)
 	attachmentMetrics.ObserveOrphanedObject()
+	// The preview worker's outcome vocabulary is closed and decided in the
+	// service, so it can never become an unbounded label.
+	attachmentMetrics.ObservePreview("failed")
 
 	useCases := readyUseCases()
 	limiter := httpapi.NewUserRateLimiter(100, time.Minute)
@@ -177,6 +180,7 @@ func TestAttachmentMetricsAreExportedWithBoundedLabels(t *testing.T) {
 		"nchat_file_uploads_total",
 		"nchat_file_downloads_total",
 		"nchat_file_orphaned_objects_total",
+		"nchat_file_previews_total",
 	} {
 		if !strings.Contains(body, metric) {
 			t.Fatalf("expected %s to be exported:\n%s", metric, body)
@@ -195,4 +199,49 @@ func TestAttachmentMetricsAreExportedWithBoundedLabels(t *testing.T) {
 func TestNilAttachmentMetricsAreSafe(t *testing.T) {
 	var metrics *httpapi.AttachmentMetrics
 	metrics.ObserveOrphanedObject()
+	metrics.ObservePreview("ready")
+	metrics.ObserveCleanup("removed")
+}
+
+// The two workers export two series. They used to share one, which made a
+// storage outage — every cleanup delete failing, counted as "retry" — read on
+// the preview dashboard as previews failing to render.
+func TestCleanupAndPreviewOutcomesAreSeparateSeries(t *testing.T) {
+	t.Setenv("PROMETHEUS_METRICS_ENABLED", "true")
+	metrics := observability.NewMetrics(observability.LoadConfig("file-service"))
+	attachments := httpapi.NewAttachmentMetrics(metrics)
+
+	// "retry" exists in both vocabularies and means different things: a render
+	// that will be attempted again, and a delete storage refused.
+	attachments.ObservePreview("retry")
+	attachments.ObserveCleanup("retry")
+	attachments.ObserveCleanup("removed")
+
+	limiter := httpapi.NewUserRateLimiter(100, time.Minute)
+	t.Cleanup(limiter.Stop)
+	router := httpapi.NewRouter(enabledConfig(), platformlog.New("file-service", "test"),
+		httpapi.RouterDependencies{
+			TokenValidator: staticValidator{token: testToken},
+			Attachments:    readyUseCases(),
+			RateLimiter:    limiter,
+			Observability:  metrics,
+			Metrics:        attachments,
+		})
+	exported := httptest.NewRecorder()
+	router.ServeHTTP(exported, httptest.NewRequest(http.MethodGet, httpapi.RouteMetrics, nil))
+	body := exported.Body.String()
+
+	for _, sample := range []string{
+		`nchat_file_previews_total{result="retry"} 1`,
+		`nchat_file_object_cleanups_total{result="retry"} 1`,
+		`nchat_file_object_cleanups_total{result="removed"} 1`,
+	} {
+		if !strings.Contains(body, sample) {
+			t.Fatalf("expected %q in the exported metrics:\n%s", sample, body)
+		}
+	}
+	// The cleanup worker's own outcome must never appear as a preview result.
+	if strings.Contains(body, `nchat_file_previews_total{result="removed"}`) {
+		t.Fatalf("a cleanup result reached the preview counter:\n%s", body)
+	}
 }

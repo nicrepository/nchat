@@ -16,6 +16,14 @@ const {
   addGroupParticipants: vi.fn(),
 }));
 
+// The RF-31 thumbnail fetches through filesApi. The panel's own tests are about
+// the list, so the fetch is stubbed here and asserted in AttachmentThumbnail's
+// tests; leaving it real would make every file row hit the network.
+const mockFetchAttachmentPreview = vi.hoisted(() => vi.fn());
+vi.mock("./filesApi", () => ({
+  fetchAttachmentPreview: mockFetchAttachmentPreview,
+}));
+
 vi.mock("./chatApi", () => ({
   searchChannelMemberCandidates,
   searchGroupParticipantCandidates,
@@ -108,6 +116,7 @@ function attachment(overrides: Partial<ChannelAttachment> = {}): ChannelAttachme
     contentType: "application/pdf",
     size: 2.4 * 1024 * 1024,
     status: "clean",
+    previewStatus: "unsupported",
     createdAt: "2026-07-15T12:24:00.000Z",
     ...overrides,
   };
@@ -1716,5 +1725,34 @@ describe("ConversationDetailsPanel — troca de conversa", () => {
     );
 
     expect(screen.queryByText(/pessoas? adicionada/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel attachment previews (RF-31)", () => {
+  it("shows a thumbnail for a ready preview and the icon for everything else", async () => {
+    mockFetchAttachmentPreview.mockResolvedValue(new Blob(["jpeg-bytes"]));
+    const createObjectURL = vi.fn(() => "blob:preview-1");
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+
+    renderPanel({
+      state: state({
+        files: {
+          status: "ready",
+          data: [
+            attachment({ id: "a-ready", filename: "foto.png", previewStatus: "ready" }),
+            attachment({ id: "a-plain", filename: "planilha.xlsx", previewStatus: "unsupported" }),
+          ],
+        },
+      }),
+    });
+
+    const thumbs = await screen.findAllByTestId("chat-details-file-thumb");
+    expect(thumbs).toHaveLength(1);
+    expect(thumbs[0]).toHaveAttribute("alt", "Pré-visualização de foto.png");
+    // The attachment with no preview kept the icon, and was never requested.
+    expect(mockFetchAttachmentPreview).toHaveBeenCalledTimes(1);
+    expect(mockFetchAttachmentPreview).toHaveBeenCalledWith("a-ready", expect.any(AbortSignal));
+
+    vi.unstubAllGlobals();
   });
 });

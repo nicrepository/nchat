@@ -37,6 +37,11 @@ const (
 	// information the caller did not already have.
 	errCodeNotScanned = "file_not_scanned"
 	errCodeRangeUnsup = "range_not_supported"
+	// errCodePreviewUnavailable tells the client there is no preview to read
+	// right now. It says nothing about why: the attachment's own metadata
+	// carries previewStatus, so a client already knows whether to wait or to
+	// draw its fallback, and this route never has to describe internal state.
+	errCodePreviewUnavailable = "preview_not_available"
 )
 
 // UploadAdmission bounds how many uploads are in flight across the cluster.
@@ -58,6 +63,7 @@ type AttachmentUseCases interface {
 	Upload(ctx context.Context, input service.UploadInput) (service.AttachmentView, error)
 	Metadata(ctx context.Context, input service.AttachmentAuthInput) (service.AttachmentView, error)
 	Download(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
+	Preview(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
 	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) ([]service.AttachmentView, error)
 	Ready() bool
 }
@@ -426,8 +432,7 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Length", strconv.FormatInt(download.Size, 10))
 	w.WriteHeader(http.StatusOK)
 
-	written, copyErr := io.Copy(w, download.Content)
-	if copyErr != nil || written != download.Size {
+	if !streamExactly(w, download) {
 		// Headers are already committed, so the status cannot be corrected. The
 		// short body makes net/http drop the connection without a valid
 		// terminator, which is what stops a truncated or tampered object from
@@ -438,6 +443,80 @@ func (h *AttachmentHandler) DownloadContent(w http.ResponseWriter, r *http.Reque
 	}
 	h.metrics.observeDownload("served")
 	h.logAttachment(r, startedAt, "download", "served", http.StatusOK, r.PathValue("attachmentID"))
+}
+
+// GetPreview handles GET /attachments/{attachmentID}/preview.
+//
+// This is the one response in the service that is served inline, and it is safe
+// to be exactly because of what it contains: a JPEG this service encoded from
+// pixels it decoded itself. The uploaded bytes are never echoed here, so an
+// HTML, SVG or script upload cannot arrive as something a browser will run —
+// there is no path by which it becomes a preview at all. nosniff is set anyway,
+// so even the declared type cannot be second-guessed.
+//
+// Authorization is the download's, not a lighter version of it: the same
+// visibility query, and the same refusal to serve anything the malware scan has
+// not cleared. A preview is a rendering of the file, so it can never be the way
+// around a gate the file itself is behind.
+func (h *AttachmentHandler) GetPreview(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	if !h.Ready() {
+		writeAttachmentError(w, domain.ErrDependenciesUnavailable)
+		return
+	}
+
+	preview, err := h.useCases.Preview(r.Context(), service.AttachmentAuthInput{
+		AttachmentID: r.PathValue("attachmentID"),
+		UserID:       principal.UserID,
+		SessionID:    principal.SessionID,
+	})
+	if err != nil {
+		status, code := attachmentErrorStatus(err)
+		h.metrics.ObservePreview(code)
+		h.logAttachment(r, startedAt, "preview", code, status, "")
+		writeAttachmentError(w, err)
+		return
+	}
+	defer func() { _ = preview.Content.Close() }()
+
+	w.Header().Set("Content-Type", preview.ContentType)
+	// No filename is offered. The bytes are not the uploaded file, so naming
+	// them after it would be wrong, and a preview is meant to be rendered
+	// rather than saved.
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Accept-Ranges", "none")
+	// Not cached anywhere. A preview is derived from content whose visibility is
+	// re-evaluated on every request — losing access to a channel must stop the
+	// thumbnails too — and a shared cache has no way to make that decision.
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Length", strconv.FormatInt(preview.Size, 10))
+	w.WriteHeader(http.StatusOK)
+
+	result := "served"
+	if !streamExactly(w, preview) {
+		// Headers are already committed, so the status cannot be corrected — the
+		// short body is what stops a truncated object being accepted as whole.
+		result = "stream_failed"
+	}
+	h.metrics.ObservePreview(result)
+	h.logAttachment(r, startedAt, "preview", result, http.StatusOK, r.PathValue("attachmentID"))
+}
+
+// streamExactly copies a decrypted body and reports whether exactly the
+// promised number of bytes arrived.
+//
+// Both callers need the same guarantee: the length was authenticated before any
+// header was written, so a stream that produces fewer bytes is an integrity
+// failure and the response has to end short rather than complete.
+func streamExactly(w io.Writer, download service.Download) bool {
+	written, err := io.Copy(w, download.Content)
+	return err == nil && written == download.Size
 }
 
 // Unavailable answers every attachment route while the feature is disabled or
@@ -564,6 +643,8 @@ func attachmentErrorStatus(err error) (int, string) {
 		return http.StatusNotFound, httputil.ErrCodeNotFound
 	case errors.Is(err, domain.ErrNotDownloadable):
 		return http.StatusConflict, errCodeNotScanned
+	case errors.Is(err, domain.ErrPreviewUnavailable):
+		return http.StatusConflict, errCodePreviewUnavailable
 	case errors.Is(err, domain.ErrUnavailable):
 		return http.StatusServiceUnavailable, errCodeServiceUnavailable
 	default:
@@ -573,12 +654,19 @@ func attachmentErrorStatus(err error) (int, string) {
 
 func writeAttachmentError(w http.ResponseWriter, err error) {
 	status, code := attachmentErrorStatus(err)
-	httputil.WriteError(w, status, code, attachmentErrorMessage(status))
+	httputil.WriteError(w, status, code, attachmentErrorMessage(status, code))
 }
 
-// attachmentErrorMessage keeps response text constant per status. The
+// attachmentErrorMessage keeps response text constant per outcome. The
 // underlying error never reaches the client.
-func attachmentErrorMessage(status int) string {
+//
+// The code refines the status for the one status that carries two meanings:
+// 409 is both "not scanned yet" and "no preview", and a client that asked for a
+// preview must not be told the file is awaiting a scan when it is not.
+func attachmentErrorMessage(status int, code string) string {
+	if code == errCodePreviewUnavailable {
+		return "attachment preview is not available"
+	}
 	switch status {
 	case http.StatusRequestEntityTooLarge:
 		return "file exceeds the configured size limit"

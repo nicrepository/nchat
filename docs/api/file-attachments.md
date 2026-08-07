@@ -3,9 +3,10 @@
 Upload, consulta e download autenticados de arquivos e imagens em canais e DMs.
 O conteudo e cifrado com envelope encryption antes de chegar ao SeaweedFS.
 
-Fora de escopo nesta fase: preview/thumbnail (RF-31), worker completo do ClamAV,
-politica de retencao (RF-34), URLs publicas, upload resumivel, deduplicacao,
-criptografia E2E MLS de anexos e Range requests.
+Fora de escopo nesta fase: worker completo do ClamAV, politica de retencao
+(RF-34), URLs publicas, upload resumivel, deduplicacao, criptografia E2E MLS de
+anexos e Range requests. Preview de video (com Range) tambem continua fora: o
+RF-31 implementado aqui cobre **imagem e primeira pagina de PDF**.
 
 ## Habilitacao
 
@@ -32,6 +33,7 @@ exigem `Authorization: Bearer <access-token>`.
 | GET    | `/api/files/dm/{conversationID}/attachments`    | anexos recentes da conversa |
 | GET    | `/api/files/attachments/{attachmentID}`         | metadados                   |
 | GET    | `/api/files/attachments/{attachmentID}/content` | download do conteudo        |
+| GET    | `/api/files/attachments/{attachmentID}/preview` | preview inline (RF-31)      |
 
 O destino vem da rota, nunca do corpo. Nao existe forma de request que nomeie
 canal e DM ao mesmo tempo, e o workspace nunca e aceito do cliente: ele e
@@ -57,6 +59,7 @@ Resposta `201`:
     "contentType": "application/pdf",
     "size": 184320,
     "status": "pending_scan",
+    "previewStatus": "pending",
     "destinationKind": "channel",
     "createdAt": "2026-07-28T12:00:00Z"
   }
@@ -442,6 +445,7 @@ Resposta `200` (mesma forma nas duas rotas; `destinationKind` reflete a rota):
         "contentType": "application/pdf",
         "size": 184320,
         "status": "clean",
+        "previewStatus": "ready",
         "destinationKind": "channel",
         "createdAt": "2026-07-28T12:00:00Z"
       }
@@ -452,8 +456,8 @@ Resposta `200` (mesma forma nas duas rotas; `destinationKind` reflete a rota):
 
 Campos: `id`, `filename` (nome normalizado, so para exibicao), `contentType`
 (tipo **detectado** no upload), `size` (plaintext, bytes), `status` (estado do
-scan) e `createdAt` (RFC3339 UTC). `destinationKind` e `channel` ou `dm`,
-conforme a rota.
+scan), `previewStatus` (estado do preview, ver "Preview inline") e `createdAt`
+(RFC3339 UTC). `destinationKind` e `channel` ou `dm`, conforme a rota.
 
 #### Ordenacao, limite e estados
 
@@ -516,6 +520,680 @@ reordenado ou substituido), a resposta e abortada com corpo menor que o
 `Content-Length` declarado. O cliente ve uma transferencia quebrada, nunca um
 arquivo parcial tratado como completo.
 
+## Preview inline (RF-31, issue #464)
+
+Thumbnail de imagem e **primeira pagina** de PDF, gerados de forma assincrona e
+armazenados como objeto proprio, cifrado do mesmo jeito que o anexo original.
+
+### O upload nao espera pela renderizacao
+
+O `POST` de upload responde assim que o objeto esta duravel. A mesma `UPDATE`
+que finaliza o anexo grava `preview_status`, entao o job ja nasce agendado: nao
+existe segunda escrita que um restart possa perder, nem fila separada que possa
+divergir da linha.
+
+Um worker em cada replica faz claim das linhas devidas
+(`FOR UPDATE SKIP LOCKED` + lease em `preview_next_attempt_at`), le o anexo pelo
+mesmo caminho que o download usa, renderiza com limites, cifra o resultado e
+grava o estado com `UPDATE ... WHERE preview_status = 'pending'`. Duas
+tentativas simultaneas nao produzem dois previews: a perdedora apaga o proprio
+objeto.
+
+### Estados
+
+`previewStatus` aparece no upload, nos metadados e na listagem:
+
+| Estado        | Significado                             | O que o cliente faz       |
+| ------------- | --------------------------------------- | ------------------------- |
+| `pending`     | aguardando o scan, ou sendo gerado      | icone; reler metadado     |
+| `ready`       | preview existe e pode ser pedido        | requisitar `/preview`     |
+| `unsupported` | nunca havera preview para este conteudo | icone + botao de download |
+| `failed`      | a geracao falhou                        | icone + botao de download |
+
+`unsupported` e `failed` sao ausencias com o **mesmo fallback** para o usuario e
+significados diferentes para operacao: a primeira e esperada, a segunda e
+incidente. O anexo continua integro e baixavel nos dois casos.
+
+`pending` cobre duas situacoes que o cliente trata igual: o scan ainda nao
+aprovou o arquivo (ver "Relacao com o scan de malware") ou a renderizacao ainda
+nao rodou. Em nenhuma das duas ha o que exibir, entao o painel mostra o icone.
+
+### Como o PDF e renderizado
+
+PDFium compilado para **WebAssembly**, executado pelo wazero
+(`github.com/klippa-app/go-pdfium`, MIT; `github.com/tetratelabs/wazero`,
+Apache-2.0). Nao ha binario de sistema, subprocesso, shell nem caminho de
+arquivo em lugar nenhum do fluxo.
+
+A escolha e de contencao, nao de conveniencia: parser de PDF e superficie
+historica de bugs de memoria, e as alternativas (pdftoppm/ImageMagick no
+container, ou PDFium via cgo) exigiriam abandonar
+`CGO_ENABLED=0` + `gcr.io/distroless/static` e ainda deixariam o parser rodando
+no mesmo espaco de memoria do servico. No sandbox WebAssembly ele tem memoria
+linear propria (teto de 128 MiB), nao alcanca a memoria do host, e um crash e
+um valor de erro em vez de um sinal. O contexto do job e o contexto do modulo,
+entao o timeout realmente interrompe a renderizacao.
+
+O runtime usado e o **interpretador** do wazero, nao o compilador: para uma
+pagina, interpretar custa ~180 MiB e ~0,5 s, contra ~280 MiB e ~3,5 s
+compilando. O sandbox e criado e destruido por render, entao o custo so existe
+quando ha PDF e o consumo em regime permanente do file-service nao muda.
+
+**Impacto operacional:** o `limits.memory` do Deployment do file-service passou
+de 256Mi para 512Mi (`infra/k8s/base/services/file-service/deployment.yaml`) por
+causa desse pico transitorio. Uma replica renderiza um preview por vez, entao o
+pico nao cresce com a fila.
+
+### Leitura do preview
+
+```bash
+curl https://nchat.local:8443/api/files/attachments/$ID/preview \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+Headers da resposta: `Content-Type: image/jpeg`, `Content-Disposition: inline`,
+`X-Content-Type-Options: nosniff`, `Accept-Ranges: none`,
+`Cache-Control: private, no-store`, `Content-Length`.
+
+`inline` aqui e seguro **porque os bytes nao sao o arquivo enviado**: sao um
+raster que o proprio servico codificou a partir de pixels que ele decodificou.
+Um upload de HTML, SVG ou script nao tem caminho para virar preview -- nao esta
+na allowlist -- entao nao existe conteudo do usuario sendo servido inline. O
+nome do arquivo tambem nao e ecoado: a resposta nao e o arquivo.
+
+Nao ha URL publica, URL assinada nem token: a rota exige `Bearer` e reautoriza a
+cada chamada. `no-store` existe porque a visibilidade e reavaliada por request
+-- perder acesso ao canal precisa apagar tambem as miniaturas, e um cache
+compartilhado nao sabe decidir isso.
+
+| Status | Codigo                  | Quando                                            |
+| ------ | ----------------------- | ------------------------------------------------- |
+| 200    | -                       | anexo `clean`, visivel, com preview `ready`       |
+| 401    | `unauthorized`          | token invalido ou sessao inativa                  |
+| 404    | `not_found`             | anexo inexistente, removido ou fora do alcance    |
+| 409    | `file_not_scanned`      | anexo existe e e visivel, mas nao esta `clean`    |
+| 409    | `preview_not_available` | sem preview servivel (pending/unsupported/failed) |
+| 503    | `service_unavailable`   | storage indisponivel ou objeto ausente            |
+
+Os dois `409` tem mensagens diferentes de proposito: um cliente que pediu
+preview nao pode ser informado de que o arquivo esta aguardando scan quando nao
+esta. Qual das tres ausencias e a real vem do `previewStatus` do metadado, nao
+desta rota -- ela nunca descreve estado interno.
+
+### Relacao com o scan de malware
+
+O worker de preview e o unico componente que **descriptografa um anexo e entrega
+os bytes a um parser**. O gate de scan aqui protege, portanto, **o proprio
+servidor que roda o parser** -- nao apenas quem baixaria o arquivo. Por isso a
+regra e uma so e vale nos dois momentos:
+
+- **Geracao:** o claim exige `status = 'clean'`. `pending_scan` (ainda sem
+  veredito), `rejected` (veredito contrario), `pending_upload` e `failed`
+  (uploads que nao terminaram) nao sao elegiveis. A condicao esta **dentro da
+  UPDATE atomica do claim**, nao em uma checagem anterior que poderia ficar
+  obsoleta entre a leitura e a descriptografia.
+- **Entrega:** a rota de preview aplica o mesmo gate do download. Um anexo que
+  virar `rejected` depois de o preview existir deixa de servi-lo no mesmo
+  instante, porque a autorizacao consulta o `status` atual a cada requisicao.
+
+Entre o claim e a publicacao existe uma janela -- a renderizacao leva tempo e um
+veredito pode chegar no meio dela. Por isso o `UPDATE` que publica **reafirma**
+`status = 'clean'`: se o scan condenou o arquivo durante a renderizacao, nenhuma
+linha e atualizada, o worker e informado disso e o objeto intermediario e
+apagado. A janela e fechada, nao apenas estreita.
+
+#### Como os vereditos sao gravados
+
+Um veredito de rejeicao **nao** e um `UPDATE` de `status`. Ele e uma operacao de
+dominio -- `MarkScanRejected`, em `PGXAttachmentStore` -- que grava, em **uma
+unica statement PostgreSQL**:
+
+- `status = 'rejected'`;
+- `preview_status = 'unsupported'`, **somente** se era `pending`;
+- `preview_next_attempt_at = NULL`, pelo mesmo criterio.
+
+As duas coisas andam juntas porque separa-las produz uma linha que nenhum codigo
+consegue concluir: o claim exige `clean`, entao o worker nunca mais olha para
+ela, e o preview continua `pending`, entao nada nunca a finaliza. A linha ficaria
+agendada para sempre. `status` e as colunas de preview vivem na mesma linha, logo
+uma statement basta -- nao ha transacao nem CTE, e nao existe janela entre as
+duas escritas porque nao existem duas escritas.
+
+Detalhes do contrato:
+
+- **estados aceitos:** `pending_scan` (veredito comum), `clean` (rescan, ou
+  veredito durante a renderizacao) e `rejected` (repeticao do veredito, e
+  reparo de linha deixada em `rejected + pending` por build anterior).
+  `pending_upload`, `failed` e `deleted` nao aceitam veredito;
+- **escopo:** id **e** workspace; um veredito nunca atravessa tenant;
+- **zero linhas** e erro (`not_found`), nunca sucesso silencioso;
+- **idempotente:** repetir o veredito deixa o mesmo estado e o reporta;
+- **preview terminal e preservado:** `ready`, `failed` e `unsupported` nao sao
+  reescritos. Um preview `ready` continua existindo internamente e **deixa de
+  ser entregavel**, porque a entrega le o `status` atual do anexo, nao o do
+  preview -- ver "`ready` interno nao significa entregavel";
+- **`preview_attempts` e preservado:** e historico de auditoria, e um veredito
+  nao desfaz trabalho que aconteceu.
+
+O veredito **limpo** tem a operacao simetrica, `MarkScanClean`, tambem em uma
+unica statement:
+
+- **estados aceitos:** `pending_scan` (a transicao real) e `clean` (repeticao
+  idempotente do mesmo veredito);
+- **`rejected` esta fora:** uma aprovacao atrasada, repetida ou forjada **nunca**
+  reabre um arquivo condenado. A rejeicao e final nessa direcao;
+- **`deleted_at IS NULL`:** um anexo removido nao volta a circular por um
+  veredito que chegou tarde;
+- **`pending_upload` e `failed` estao fora:** nao existe objeto armazenado que
+  possa ter sido escaneado;
+- **nao toca nenhuma coluna de preview:** o upload ja deixou o job agendado
+  (`preview_status = 'pending'`, `preview_next_attempt_at = now()`), entao a
+  linha se torna reivindicavel no instante em que o status vira `clean` -- sem
+  segunda escrita e sem janela entre os dois fatos;
+- **escopo, zero linhas e idempotencia:** identicos aos da rejeicao.
+
+`MarkScanClean` e a **unica** forma de um anexo virar `clean`. Ela nao e
+alcancavel por nenhuma rota HTTP: nao existe endpoint, campo de request ou valor
+vindo do cliente que decida veredito de scan, nem para o dono do arquivo, nem
+para admin de workspace. Quem pudesse escolher `clean` poderia colocar um
+arquivo nao verificado na frente do parser de PDF.
+
+> **O produtor do veredito ainda nao existe.** Nao ha ClamAV neste repositorio:
+> nem cliente, nem container em `infra/compose`, nem manifest em `infra/k8s`,
+> nem configuracao. O ADR 0002 e `docs/architecture/provisional-stack.md`
+> registram o ClamAV como item **planejado e nao iniciado** (Sprint 3), e o
+> runbook do dev-env registra "sem ClamAV". As duas operacoes canonicas
+> (`MarkScanClean` e `MarkScanRejected`) existem, sao atomicas e estao cobertas
+> por teste de integracao contra PostgreSQL real -- o que falta e o worker que
+> as chama. Enquanto ele nao existir, **em ambiente com scan obrigatorio nenhum
+> preview e gerado**, por falha fechada. Ver "Estado do fluxo padrao" abaixo.
+
+#### Como a remocao e gravada
+
+Remover um anexo tambem finaliza o preview na **mesma statement**
+(`MarkAttachmentDeleted`), pelo mesmo motivo: gravar so `deleted_at` deixaria um
+job agendado que nenhum claim consegue selecionar (o claim exige
+`deleted_at IS NULL`) e que nada nunca conclui.
+
+- `deleted_at = COALESCE(deleted_at, now())` -- repetir a remocao converge sem
+  mover o instante em que o anexo foi removido, que e a data de onde uma
+  politica de retencao vai contar. Como a statement tambem alcanca uma linha ja
+  removida, ela **repara** uma que tenha ficado com preview `pending`;
+- `preview_status = 'pending'` vira `unsupported` e o agendamento e limpo;
+- preview terminal (`ready`, `failed`, `unsupported`) e preservado como
+  **registro** de que um preview existiu;
+- se o preview era `ready`, o **objeto** dele e enfileirado para remocao na mesma
+  statement (ver "Objeto do preview e reclamado na invalidacao");
+- `status` **nao** e reescrito: remocao e veredito sao fatos diferentes, e um
+  arquivo rejeitado que foi removido continua sendo um arquivo condenado. Todos
+  os caminhos de leitura ja filtram por `deleted_at`.
+
+Nao existe rota de remocao neste servico ainda -- a operacao vive aqui porque o
+_lifecycle_ e responsabilidade deste pacote, e o consumidor futuro (retencao,
+RF-34, ou uma acao de remocao) deve grava-la por ela.
+
+#### Fence entre scan e render
+
+O claim exige `clean`, mas um claim e um instante e uma renderizacao e um
+intervalo. Entre os dois um veredito pode chegar -- e reler o status logo antes
+do parser nao resolve, so estreita a janela para os microssegundos entre a
+leitura e a chamada.
+
+A exclusao e feita com **advisory lock do PostgreSQL**, por anexo:
+
+| Lado               | Lock                                | Duracao              |
+| ------------------ | ----------------------------------- | -------------------- |
+| preview worker     | `pg_advisory_lock` (sessao)         | revalidacao + render |
+| rejeicao / remocao | `pg_advisory_xact_lock` (transacao) | um `UPDATE`          |
+
+Os dois disputam o **mesmo** lock: o PostgreSQL nao distingue quem o tomou. O
+worker usa lock de sessao em uma conexao dedicada porque uma renderizacao dura
+dezenas de segundos e nenhuma transacao deveria; as invalidacoes usam lock de
+transacao porque sao uma statement so -- e porque tomar lock de sessao ali
+exigiria uma segunda conexao do pool enquanto se segura um lock, que e
+exatamente a forma de travar o pool quando varias invalidacoes concorrem.
+
+Dentro da fence o worker **revalida** `clean`, `deleted_at IS NULL`,
+`preview_status = 'pending'` e o token do claim antes de abrir e descriptografar
+qualquer coisa. Como nada pode mudar a linha enquanto a fence estiver tomada,
+essa revalidacao nao envelhece.
+
+As duas ordens possiveis, e nenhuma terceira:
+
+1. **invalidacao primeiro** -- ela commita, o worker pega a fence depois, a
+   revalidacao falha, nada e descriptografado e o parser nao e chamado;
+2. **render primeiro** -- o worker segura a fence, a invalidacao espera, o
+   render termina com o anexo ainda logicamente `clean`, e o veredito commita em
+   seguida. O preview eventualmente produzido deixa de ser entregavel pelo gate
+   de malware, e o **objeto** dele e reclamado pela propria statement do
+   veredito (ver "Objeto do preview e reclamado na invalidacao").
+
+A fence e liberada em sucesso, erro, timeout e cancelamento. Uma conexao que nao
+confirma o unlock e descartada, entao o PostgreSQL solta o lock quando o backend
+morre -- um worker que caiu nunca deixa um anexo travado.
+
+##### As duas ordens convergem
+
+Vale ser explicito sobre o que a fence **nao** garante, porque a leitura oposta
+ja causou confusao: como o worker segura a fence durante o render **e** a
+publicacao, e a rejeicao espera essa mesma fence, nao existe intercalacao em que
+o veredito commite entre "render terminou" e "`MarkPreviewReady` gravou". Na
+ordem 2 o worker **publica** e so entao a rejeicao commita, deixando
+`rejected + ready`.
+
+Isso nao e um furo, e a garantia nao depende de qual lado ganha: as duas ordens
+terminam no mesmo lugar.
+
+| Ordem                                    | `MarkPreviewReady` | Objeto                    |
+| ---------------------------------------- | ------------------ | ------------------------- |
+| veredito antes do claim/fence            | nem e chamado      | nunca existiu             |
+| worker publica, veredito commita depois  | grava              | enfileirado pelo veredito |
+| fence perdida, veredito durante o render | **recusado**       | apagado na compensacao    |
+
+A terceira linha e a unica em que a re-assercao de `status = 'clean'` dentro do
+`UPDATE` de publicacao decide algo -- e ela e alcancavel em producao: o lock de
+sessao vive em uma conexao, entao perder essa conexao devolve a fence enquanto o
+worker continua renderizando, sem ter como perceber. E por isso que a
+re-assercao e defesa em profundidade real, e nao decoracao.
+
+Os testes correspondentes rodam pelo `PreviewService.ProcessDue` -- o caminho de
+producao -- e nao chamando `ClaimDuePreviews` e `MarkPreviewReady` direto. A
+distincao importa: um teste que reivindica e publica na mao prova que as
+_statements_ recusam o que devem, mas nao diz nada sobre o fluxo conseguir
+chegar la.
+
+#### Fencing de claim
+
+Lease e uma promessa sobre tempo, e tempo e justamente o que um worker travado
+nao garante. Por isso `preview_attempts` -- incrementado atomicamente pelo claim
+e devolvido no job -- e tambem o **token de fencing**: publicar e concluir
+exigem que ele ainda seja o atual.
+
+Sem isso, a tentativa 1 cujo lease expirou poderia gravar `failed` depois de a
+tentativa 2 ter comecado, encerrando o job dela e fazendo-a descartar um preview
+valido. Com isso, a tentativa antiga nao encontra linha, e aprende que perdeu a
+posse.
+
+Uma invalidacao (rejeicao ou remocao) invalida todo token pendente sem precisar
+conhecer nenhum: a linha deixa de estar `pending`, e nenhuma conclusao encontra
+linha.
+
+#### Cleanup duravel de objetos
+
+O objeto do preview e enviado ao SeaweedFS **antes** de a linha que aponta para
+ele poder ser gravada -- a chave protegida autentica o objeto. Quando a
+publicacao e recusada, o objeto precisa ser removido; e quando esse `Delete`
+falha, a chave nao pode viver so em um log.
+
+A chave vai para `files.object_cleanup_jobs` (migration `000004`), com
+`object_key` **UNIQUE** (enfileirar de novo nao cria job novo). Um worker drena
+a fila a cada 30 s com o mesmo padrao do preview -- claim com
+`FOR UPDATE SKIP LOCKED`, lease, e token de tentativa para concluir. O job so e
+apagado **depois** de o objeto sumir.
+
+- objeto ja ausente e sucesso idempotente;
+- objeto **entregavel** nunca e apagado -- o worker checa antes e encerra o job
+  por estar errado, nao por ter dado certo. Ver a definicao de "referenciado"
+  logo abaixo;
+- nao ha teto de tentativas: desistir nao removeria o objeto, so faria ninguem
+  mais saber dele;
+- a metrica de orfao passa a significar o unico vazamento restante: storage
+  recusou o delete **e** o banco recusou a fila.
+
+O worker tem contador proprio, `nchat_file_object_cleanups_total`, com rotulo
+`result` em `removed` / `referenced` / `retry`. Ele **nao** escreve em
+`nchat_file_previews_total`: as duas series respondem perguntas diferentes
+(previews sendo produzidos vs. storage sendo recuperado) e a palavra `retry`
+existe nas duas com sentidos distintos -- no cleanup e um `Delete` recusado pelo
+storage, no preview e uma renderizacao que sera tentada de novo. Compartilhar o
+contador fazia uma indisponibilidade de storage aparecer como preview falhando
+a renderizar.
+
+##### Objeto do preview e reclamado na invalidacao
+
+"Referenciado" e o **gate de entrega**, nao "apontado por alguma linha":
+
+```
+preview_status = 'ready' AND status = 'clean' AND deleted_at IS NULL
+```
+
+Um preview `ready` sob um anexo `rejected` ou removido e inalcancavel por
+construcao -- todo caminho de leitura filtra pelo `status` e pela visibilidade do
+anexo -- mas a linha continuava apontando para a chave. Com a definicao antiga o
+worker classificava o job como `referenced` e o encerrava **sem apagar nada**: o
+objeto ficava sem dono e sem job, um vazamento permanente.
+
+Por isso as duas transicoes que tornam um preview inentregavel enfileiram a
+chave dele **na mesma statement** que as grava:
+
+- `MarkScanRejected` -- um rescan pode condenar um arquivo cujo preview ja foi
+  publicado;
+- `MarkAttachmentDeleted` -- o anexo sumiu, e um preview e artefato derivado sem
+  valor proprio.
+
+Mesma statement, nao apenas mesma transacao: a mudanca de estado e o job que a
+compensa ficam visiveis juntos ou nao ficam. Nao existe janela em que o objeto
+esteja inentregavel e sem job, nem em que exista job para um preview ainda sendo
+servido. `ON CONFLICT DO NOTHING` faz um veredito repetido enfileirar uma vez so.
+
+O objeto **do anexo** nao segue essa regra e a diferenca e deliberada: ele e o
+arquivo do usuario, e por quanto tempo um arquivo removido e retido e decisao de
+politica (RF-34). Um preview e derivado -- sem o anexo, nada pode servi-lo nem
+regenerar um uso para ele, e mante-lo e acumulo puro.
+
+A expressao que deriva a chave em SQL e um unico fragmento
+(`previewObjectKeyExpr`), usado pelas tres statements, porque uma copia que
+divergisse de `domain.PreviewObjectKey` nao falharia alto: enfileiraria chaves
+que nao casam com objeto nenhum e leria previews vivos como nao referenciados.
+`TestIntegrationPreviewObjectKeyExprMatchesDomain` compara as duas contra o banco
+real.
+
+#### Estado do fluxo padrao
+
+| Etapa                        | Existe? |
+| ---------------------------- | ------- |
+| upload -> `pending_scan`     | sim     |
+| operacao canonica `clean`    | sim     |
+| operacao canonica `rejected` | sim     |
+| operacao canonica de remocao | sim     |
+| **worker ClamAV que decide** | **nao** |
+| claim -> render -> `ready`   | sim     |
+
+Com `FILE_MALWARE_SCAN_REQUIRED=true` e sem o worker, a cadeia para na quarta
+linha: os anexos sao enviados, listados e ficam em `pending_scan`, e o preview
+permanece `pending`. Isso e falha fechada e nao regressao -- mas significa que o
+**RF-31 so entrega preview de ponta a ponta em producao depois da tarefa do
+ClamAV (RF-33)**. Em desenvolvimento declarado o fluxo e completo hoje, porque o
+upload ja finaliza em `clean`.
+
+**Consequencia operacional, explicita:** com `FILE_MALWARE_SCAN_REQUIRED=true`
+(default) e sem o worker do ClamAV (RF-33, fora de escopo), todo upload termina
+em `pending_scan` e **nenhum preview e gerado**. Isso e falha fechada, nao
+regressao: a alternativa seria mandar conteudo nao verificado para um parser de
+PDF, que e exatamente o risco que este desenho existe para conter. Os anexos
+continuam sendo enviados, listados e -- quando o scan aprovar -- baixados
+normalmente.
+
+Em ambiente de desenvolvimento explicitamente declarado
+(`FILE_MALWARE_SCAN_REQUIRED=false` com `APP_ENV` na allowlist fechada), o
+upload ja finaliza em `clean` e o preview e gerado. Nao existe chave separada
+para o preview: ele herda a mesma politica, e um `APP_ENV` ausente, vazio ou
+desconhecido continua sendo tratado como ambiente implantado e recusado na
+inicializacao.
+
+> O scan de malware reduz o risco de conteudo conhecido, mas **nao** substitui
+> sandbox, limites de recursos, atualizacao de dependencias e isolamento do
+> container. Um arquivo `clean` nao e um arquivo comprovadamente seguro: e um
+> arquivo em que o scanner nao reconheceu nada. Por isso as defesas abaixo
+> valem mesmo depois da aprovacao.
+
+### Isolamento do renderizador
+
+| Propriedade                     | Valor                                                              |
+| ------------------------------- | ------------------------------------------------------------------ |
+| PDF                             | PDFium compilado para WebAssembly, sobre wazero                    |
+| Imagem                          | decoders da biblioteca padrao do Go                                |
+| cgo                             | ausente (`CGO_ENABLED=0` em toda a imagem)                         |
+| Subprocesso / shell             | ausente -- nenhum `exec`, nenhum `sh`                              |
+| Filesystem do modulo WASM       | **nenhum** -- `FSConfig` vazio, zero preopens                      |
+| Rede do modulo WASM             | nenhuma -- nenhum socket concedido                                 |
+| stdout/stderr do modulo         | descartados (nao vao para o log do servico)                        |
+| Variaveis de ambiente no modulo | nenhuma                                                            |
+| Memoria linear maxima           | 2048 paginas = 128 MiB, teto rigido                                |
+| Timeout por job                 | 45 s, propagado como contexto do modulo                            |
+| Concorrencia                    | 1 render por replica (claim de 1 job por passagem)                 |
+| Ciclo de vida                   | sandbox criado e destruido por render, inclusive em erro e timeout |
+
+`FSConfig` merece destaque: o `go-pdfium` **monta a raiz do host (`/`) em modo
+leitura e escrita** quando esse campo fica nulo. O servico passa um `FSConfig`
+vazio explicitamente, e existe teste de regressao para isso -- um "simplificar o
+struct" reabriria o buraco silenciosamente.
+
+O modulo WASM e o embutido no proprio go-pdfium, com versao fixada em
+`go.mod`/`go.sum`. Nada e baixado em runtime e o cliente nunca escolhe qual
+modulo roda.
+
+### Limites de conteudo
+
+| Limite                    | Valor                               |
+| ------------------------- | ----------------------------------- |
+| Bytes lidos da fonte      | 20 MiB (acima disso: `unsupported`) |
+| Pixels da imagem de fonte | 40 MP, verificados **no header**    |
+| Dimensao de saida         | 512 px na maior aresta              |
+| Paginas de PDF            | somente a primeira                  |
+| Formato de saida          | JPEG reencodado pelo servidor       |
+| Tentativas do renderer    | 3 por anexo, no total               |
+
+Formatos **aceitos**: `image/jpeg`, `image/png`, `image/gif`, `application/pdf`.
+
+Formatos **explicitamente nao aceitos**: SVG (e markup com script, nao imagem),
+HTML, XML, documentos do Office, arquivos compactados, video, audio, `image/webp`
+e `image/tiff`. Nao ha decoder para eles no binario: um tipo fora da allowlist
+nunca chega a um parser, e a decisao usa o tipo **detectado do conteudo** --
+extensao e `Content-Type` do cliente nao decidem nada.
+
+### Recuperacao e concorrencia
+
+| Constante              | Valor | Papel                                    |
+| ---------------------- | ----- | ---------------------------------------- |
+| Jobs por claim         | 1     | uma renderizacao por replica de cada vez |
+| Timeout do job         | 45 s  | teto de uma renderizacao                 |
+| Margem do lease        | 30 s  | cleanup e escrita terminal desacoplados  |
+| Lease                  | 75 s  | derivado: timeout + margem               |
+| Tentativas do renderer | 3     | orcamento de CPU por anexo               |
+
+O lease e **derivado** do timeout, nunca escolhido ao lado dele, e existe uma
+verificacao em tempo de compilacao que quebra o build se essa relacao for
+violada. Um lease menor que o trabalho que protege entregaria a mesma linha a
+dois workers.
+
+O claim **nao** tem teto de tentativas, e isso e deliberado: o estado que diz
+"desisti" e ele proprio uma escrita no PostgreSQL. Se o banco estiver
+indisponivel exatamente nesse momento, uma elegibilidade limitada por tentativas
+deixaria a linha presa em `pending` para sempre. Quem tem orcamento e o
+**renderizador**: passado o limite, o claim ainda acontece, mas nao
+descriptografa nada -- so finaliza a linha. Uma passagem de recuperacao custa um
+`UPDATE`, nao uma renderizacao.
+
+### Container
+
+O `Deployment` do file-service roda sem root (uid/gid 65532), com
+`allowPrivilegeEscalation: false`, `capabilities: drop: [ALL]`,
+`seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true` e
+`automountServiceAccountToken: false`. O unico caminho gravavel e um `emptyDir`
+em `/tmp` com `sizeLimit: 64Mi` -- nada no servico escreve la, mas a raiz e
+somente leitura e o runtime precisa que o caminho exista. Ha `requests`/`limits`
+de CPU, memoria e `ephemeral-storage`.
+
+**Risco residual registrado:** o repositorio ainda nao tem base de
+`NetworkPolicy` de **egress** (as policies atuais so tratam ingress), entao o
+egress do file-service nao esta restrito a PostgreSQL, SeaweedFS e DNS. Criar
+uma policy isolada sem cluster para validar quebraria o ambiente, entao isso
+fica como hardening separado. Nenhum componente do preview abre conexao de rede
+-- o modulo WASM nao tem socket algum --, mas a contencao pos-comprometimento do
+processo Go permanece incompleta ate essa policy existir.
+
+### Persistencia
+
+Colunas `preview_*` em `files.attachments` (migration
+`migrations/files/000003_attachment_previews`). Todas nullable ou com `DEFAULT`,
+entao a migration e puramente aditiva: um file-service anterior a ela continua
+inserindo e finalizando linhas normalmente, e por isso ela nao precisa de lock
+nem de guarda de tabela vazia como a `000002`.
+
+O objeto do preview e cifrado com **DEK propria** e binding proprio: o
+`preview_object_id` e um UUID aleatorio novo, e e ele que entra na AAD do
+envelope e da chave. Preview e original sao, portanto, criptograficamente
+disjuntos -- nenhum dos dois pode ser aberto como o outro ou substituido por
+ele. A chave do objeto (`nchat/previews/<preview_object_id>`) e derivada desse
+UUID e nunca sai do servidor.
+
+Um `CHECK` exige que `preview_status = 'ready'` implique objeto, tamanho, chave
+protegida, id da KEK e as duas versoes de formato presentes: "ready mas
+inabrivel" nao e um estado representavel.
+
+**Rollback:** a `down` da `000003` roda com a tabela populada, porque so remove
+dado **derivado** -- anexos, objetos originais e chaves ficam intactos e o
+download continua funcionando byte a byte. Os objetos sob `nchat/previews/`
+sobrevivem e ficam sem referencia; limpar o prefixo e passo operacional apos o
+rollback, deliberadamente fora da migration.
+
+### Observabilidade
+
+`nchat_file_previews_total{result}` com o conjunto fechado `ready`,
+`unsupported`, `failed`, `retry`. `failed` subindo e incidente; `unsupported`
+subindo e so usuario enviando formato que ninguem renderiza.
+
+Log por job: `attachment_id`, `result`, `attempt`, `duration_ms`. Nunca
+filename, conteudo, tipo de um arquivo especifico, chave de objeto, mensagem do
+renderizador ou material de chave.
+
+### Frontend
+
+O painel de arquivos (`apps/web/src/chat/ConversationDetailsPanel.tsx`) mostra a
+miniatura no lugar do icone quando -- e somente quando -- o anexo esta `clean`
+**e** `previewStatus` e `ready`. Qualquer outra combinacao mantem o icone: e o
+mesmo fallback para `pending`, `unsupported`, `failed` e para erro HTTP.
+
+Toda a logica vive em `AttachmentThumbnail.tsx`, um componente pequeno com o
+hook que possui o ciclo de vida da URL:
+
+- os bytes sao buscados com `authenticatedFetch`, isto e, com o token no
+  **header**; nunca em query string, onde ele entraria em historico, logs e
+  referrers;
+- a resposta vem como `Blob` e vira um object URL valido apenas neste documento
+  -- nao existe URL publica, assinada ou reutilizavel;
+- a URL e revogada quando o anexo muda, quando o componente desmonta, quando uma
+  resposta nova substitui a anterior e quando o `<img>` falha ao decodificar;
+- uma resposta que chega depois da troca de anexo e descartada sem virar URL;
+- falha de rede ou HTTP nao e repetida: um `409` responderia igual todas as
+  vezes, e re-tentar a cada render seria um laco;
+- o nome do arquivo entra apenas como `alt`, como texto que o React escapa --
+  nunca markup, nunca parte de uma URL.
+
+`filesApi.ts` valida `previewStatus` contra o conjunto fechado e degrada
+qualquer valor desconhecido -- e a ausencia do campo -- para `unsupported`, entao
+um servidor antigo resulta em icone, nunca em uma tentativa de carregar preview
+inexistente.
+
+**Reconciliacao ate `clean` + `ready`.** O preview e produzido depois que o
+upload responde, entao um painel ja aberto veria o estado inicial
+indefinidamente. Esse estado inicial e `status: "pending_scan"` com
+`previewStatus: "pending"` -- e o scan de malware e obrigatorio, entao **todo**
+upload passa por ele. O painel reconsulta **somente a listagem de anexos**
+enquanto houver ao menos um anexo cujo estado ainda possa mudar sozinho:
+
+| `status`       | `previewStatus`        | Reconcilia | Por que                                          |
+| -------------- | ---------------------- | ---------- | ------------------------------------------------ |
+| `pending_scan` | `pending`              | sim        | o scan pode aprovar, e entao o worker renderiza  |
+| `clean`        | `pending`              | sim        | o worker ainda pode terminar                     |
+| `clean`        | `ready`                | nao        | e o destino                                      |
+| `clean`        | `failed`/`unsupported` | nao        | nao ha o que esperar                             |
+| `rejected`     | qualquer               | nao        | nunca sera reivindicado pelo worker              |
+| `pending_scan` | terminal               | nao        | o preview ja acabou; so a entrega aguarda o scan |
+
+O predicado cobre todas as combinacoes, inclusive as que o servico nao produz
+(ver a tabela canonica em "Estados"): decidir "nao ha nada a esperar" a partir
+do par completo e o que impede um estado inesperado de virar um timer eterno.
+
+Esse predicado e `isPreviewWorkPending` (`useAttachmentPreview.ts`), separado de
+`canShowPreview`, que continua exigindo `clean` **e** `ready`. Os dois nunca sao
+verdadeiros ao mesmo tempo: **a reconciliacao nunca pede os bytes**. Enquanto o
+anexo estiver em `pending_scan`, nenhuma requisicao a `/preview` e emitida --
+seria respondida `409` e violaria o gate documentado em "Relacao com o scan de
+malware".
+
+O ciclo:
+
+- e unico por painel -- um timer, nunca um por anexo;
+- so agenda a proxima consulta quando a anterior termina, entao requisicoes nao
+  se sobrepoem nem se acumulam;
+- para assim que nada mais puder mudar sozinho, no unmount e na troca de
+  conversa (a requisicao em voo e abortada);
+- em falha transitoria mantem a lista visivel e tenta de novo no proximo passo
+  da cadencia, sem transformar o painel em estado de erro.
+
+**A janela e finita.** Renderizar e uma espera limitada (o worker reivindica em
+ate 10 s e renderiza em ~1 s); _esperar pelo scan_ nao e -- um scanner parado,
+inalcancavel ou ainda nao implantado (ver "Estado do fluxo padrao") nunca da
+veredito. Por isso:
+
+- a cadencia comeca em 5 s (`previewReconcileIntervalMs`), **dobra** a cada
+  consulta que nao observa mudanca e para em 30 s
+  (`previewReconcileMaxIntervalMs`);
+- a janela termina depois de 12 consultas sem mudanca
+  (`previewReconcileMaxAttempts`), aproximadamente 5 minutos de observacao;
+- o contador e por **estado observado**, nao por painel: qualquer mudanca na
+  lista -- `pending_scan` virando `clean`, `pending` virando `ready`, um anexo
+  saindo da lista -- reinicia a cadencia, entao uma espera longa pelo scan nao
+  consome o orcamento da renderizacao seguinte.
+
+Atingir o limite nao e erro: o icone de fallback ja e o que esta na tela, o
+arquivo continua listado e baixavel quando liberado, e ha dois caminhos de volta
+-- uma atualizacao explicita (`reload`, o mesmo usado apos mudanca de membros) ou
+fechar e reabrir o painel. Ambos abrem uma janela nova.
+
+Quando a listagem volta com `clean` + `ready`, o fluxo existente busca o Blob uma
+unica vez para aquele anexo.
+
+**Revogacao de uma thumbnail ja exibida.** Um rescan pode condenar um arquivo
+que **ja tem preview** e que o usuario **ja esta vendo**. O backend continua
+correto -- a rota reaplica o gate e responde `409` -- mas isso vale para a
+_proxima_ requisicao: os bytes que ele ja entregou estao na pagina, dentro de
+uma object URL viva, e nenhuma decisao do servidor os tira de la. Somente o
+cliente pode remover o que ele mesmo esta exibindo, e so consegue perceber isso
+se continuar perguntando.
+
+Por isso o mesmo agendador tem **dois modos**, e nunca dois timers:
+
+| Modo        | Enquanto                     | Cadencia                             | Limite       |
+| ----------- | ---------------------------- | ------------------------------------ | ------------ |
+| _geracao_   | algum `isPreviewWorkPending` | 5 s dobrando ate 30 s                | 12 consultas |
+| _revogacao_ | algum `canShowPreview`       | 30 s (`previewRevalidateIntervalMs`) | nenhum       |
+
+Os limites sao diferentes porque o custo de desistir e diferente. Desistir da
+geracao atrasa uma miniatura. Desistir da revogacao devolve a tela para conteudo
+que ja foi revogado -- entao esse ciclo **nao tem orcamento de tentativas** e nao
+para enquanto houver algo exibido. O modo de geracao tem precedencia enquanto
+tiver trabalho, e quando o orcamento dele se esgota o painel **cai para o modo de
+revogacao** em vez de parar: um upload travado em `pending_scan` na mesma lista
+nao pode desligar a vigilancia de uma thumbnail exibida.
+
+O que mantem o custo baixo nao e um limite, e a cadencia e a visibilidade: com a
+aba oculta o ciclo e desarmado por completo (`visibilitychange`), porque uma aba
+oculta nao esta exibindo nada; ao voltar, o timer e rearmado e a defasagem
+maxima e a propria cadencia. E o mesmo padrao de revalidacao que
+`useMessages` ja usa para mensagens referenciadas.
+
+Ao observar a listagem atualizada, a thumbnail e removida **imediatamente**
+quando o anexo deixa de satisfazer `clean` + `ready`, o que inclui:
+
+- `rejected`, em qualquer `previewStatus` -- **inclusive `rejected + ready`**,
+  que e um estado interno valido e **nunca** entregavel (ver "`ready` interno nao
+  significa entregavel");
+- volta para `pending_scan`;
+- `previewStatus` virando `failed` ou `unsupported`;
+- ausencia do anexo na listagem atual -- que e como o cliente enxerga um
+  soft-delete, ja que a listagem nao inclui linhas removidas. A resposta
+  **substitui** a lista inteira, nunca faz merge, entao um anexo removido nao
+  sobrevive no estado renderizado.
+
+Em todos esses casos, no unmount e na troca de conversa: a object URL e revogada,
+o estado local do preview e limpo, o fallback volta, uma requisicao em voo e
+abortada e uma resposta que chegue depois e descartada sem virar URL. Nenhuma
+nova leitura de `/preview` e feita -- perder elegibilidade nunca e motivo para
+pedir de novo. Enquanto o anexo permanecer `clean + ready`, a vigilancia **nao**
+rebusca os bytes: a listagem e relida, os metadados sao iguais, e a mesma object
+URL continua valendo.
+
+Isso nao transforma o frontend em controle de autorizacao. A autoridade continua
+sendo o backend, que bloqueia toda leitura nova de um anexo rejeitado; o que o
+cliente adiciona e a unica coisa que o backend nao pode fazer sozinho, que e
+parar de exibir bytes que ele proprio ja recebeu enquanto o acesso era valido.
+`clean` tambem nao significa seguranca absoluta -- significa que o scanner
+aprovou naquele momento, e e exatamente por isso que um rescan posterior precisa
+chegar a tela.
+
 ## Autorizacao
 
 A autorizacao acontece inteiramente no servidor, em uma unica consulta SQL que
@@ -537,6 +1215,72 @@ de um canal ou de uma DM passa a valer no proximo download, sem cache.
 
 `pending_upload` -> `pending_scan` -> `clean` | `rejected`; `failed` e `deleted`
 sao terminais. O cliente nunca define o estado. Somente `clean` pode ser baixado.
+
+O `previewStatus` e um eixo **separado**, mas nao independente: ele e
+subordinado ao `status` (ver "Preview inline"). Em ambientes com malware scan
+obrigatorio, o worker de preview somente reivindica anexos cujo `status` seja
+`clean`, e o `UPDATE` que publica o preview revalida `clean` atomicamente. Um
+preview, portanto, **so pode ser criado enquanto o anexo esta aprovado** -- essa
+e a invariavel, e ela e sobre o momento da criacao.
+
+O que acontece **depois** e diferente e precisa ser dito com precisao: um rescan
+pode condenar um arquivo que ja tinha preview. Nesse caso o `previewStatus`
+continua `ready` internamente, porque a rejeicao preserva estados terminais de
+preview. `ready` interno **nao** significa entregavel -- ver "`ready` interno
+nao significa entregavel", em "Preview inline".
+
+Enquanto o scan nao aprovar, o anexo nao e elegivel para processamento e o
+`previewStatus` permanece `pending` (ou `unsupported`, quando o tipo detectado
+nunca teria preview). Uma **rejeicao** finaliza atomicamente um preview
+`pending` como `unsupported` e limpa o agendamento, e uma **remocao** faz o
+mesmo (ver "Como os vereditos sao gravados" e "Como a remocao e gravada"), entao
+`rejected + pending` e `deleted + pending` nao sao estados que o servico
+produza. As combinacoes possiveis sao:
+
+| `status`       | `previewStatus` possivel                    | Preview entregavel? |
+| -------------- | ------------------------------------------- | ------------------- |
+| `pending_scan` | `pending` ou `unsupported`                  | nao                 |
+| `rejected`     | `unsupported`, `failed` ou `ready`          | **nao**             |
+| `clean`        | `pending`, `ready`, `unsupported`, `failed` | so com `ready`      |
+
+Uma linha removida (`deleted_at` preenchido) nao entrega preview em nenhuma
+combinacao: ela nao e visivel para o chamador.
+
+#### `ready` interno nao significa entregavel
+
+`previewStatus` descreve o **estado interno** do preview, nao a permissao de
+acesso a ele. As duas coisas sao decididas em lugares diferentes, e confundi-las
+e o erro que esta secao existe para evitar.
+
+Um preview `ready` sob um anexo `rejected` **pode existir**, e o servico nao o
+apaga: o anexo estava `clean` quando o preview foi gerado, um rescan o condenou
+depois, e a rejeicao preserva estados terminais de preview (ver "Como os
+vereditos sao gravados"). O mesmo vale para um anexo removido.
+
+Isso **nao** viola scan-before-render: o preview so foi produzido enquanto o
+anexo estava aprovado, e nenhum byte chegou ao parser antes disso. O que muda
+depois e a **entrega**:
+
+- `GET /api/files/attachments/{id}/preview` reaplica o gate de malware e a
+  visibilidade -- anexo `rejected` responde `409`, anexo removido responde `404`;
+- o download responde igual;
+- o frontend so pede preview para `clean + ready`, entao nem chega a tentar;
+- e se a thumbnail **ja estava na tela** quando a rejeicao aconteceu, o frontend
+  a remove e revoga a object URL ao observar o novo estado -- ver "Revogacao de
+  uma thumbnail ja exibida". Esta e a unica parte que o backend nao pode fazer
+  sozinho: ele bloqueia toda leitura nova, mas nao recolhe bytes que ja
+  entregou;
+- o objeto **do anexo** continua no SeaweedFS conforme a politica de lifecycle e
+  retencao (RF-34), que e quem decide destruicao -- nao o veredito;
+- o objeto **do preview** nao: ele e enfileirado para remocao pela propria
+  statement do veredito, porque um preview e artefato derivado que ninguem mais
+  pode servir (ver "Objeto do preview e reclamado na invalidacao"). Por isso
+  `preview_status` continuar `ready` e um **registro** de que um preview
+  existiu, nao a promessa de que os bytes ainda estao la.
+
+Em resumo: **`rejected + ready` e um estado interno possivel e inofensivo**;
+`rejected` **nunca** e entregavel. A afirmacao "ready nunca coexiste com
+rejected" seria falsa e nao esta neste documento.
 
 Com `FILE_MALWARE_SCAN_REQUIRED=true` (default, exigido por SECURITY.md) um
 upload termina em `pending_scan` e o download responde `409` ate o worker
@@ -743,6 +1487,11 @@ FILE_TEST_DATABASE_URL='postgresql://nchat:<senha>@localhost:5432/nchat_test?ssl
 FILE_TEST_SEAWEEDFS_URL='http://localhost:8888' \
   go test ./services/file-service/internal/service/ -run Integration -v
 ```
+
+A mesma invocacao cobre a geracao de preview (RF-31): `-run Integration` inclui
+`preview_integration_test.go`, que sobe uma imagem e um PDF reais, roda o job
+contra a fila do PostgreSQL, e reabre o objeto de preview do SeaweedFS usando
+apenas o binding persistido.
 
 O DSN precisa apontar para um banco `*_test` -- mesma guarda das suites de
 integracao do chat-service. Cada execucao inventa o proprio workspace UUID e

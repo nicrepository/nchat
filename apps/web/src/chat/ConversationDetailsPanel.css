@@ -475,6 +475,19 @@
   font-size: 18px;
 }
 
+/* The RF-31 thumbnail stands exactly where the file icon would, so a preview
+   appearing or failing to appear never reflows the row. object-fit keeps a
+   portrait scan and a wide screenshot in the same square without stretching
+   either. */
+.chat-details__file-thumb {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm, 6px);
+  object-fit: cover;
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
 .chat-details__file-text {
   flex: 1;
   min-width: 0;

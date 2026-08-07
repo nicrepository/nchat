@@ -451,6 +451,26 @@ export type ConversationDetails =
 /** Scan lifecycle of an attachment. Only "clean" is ever downloadable. */
 export type AttachmentStatus = "pending_scan" | "clean" | "rejected";
 
+/**
+ * Inline preview lifecycle (RF-31).
+ *
+ * It is what decides which of three things the UI draws, and the three are
+ * deliberately distinguishable:
+ *
+ * - `pending`: a preview is being produced; show a placeholder and re-read the
+ *   metadata later. The upload never waits for this.
+ * - `ready`: a preview exists and may be requested. It is still subject to the
+ *   attachment's own `status`: nothing that is not `clean` is served.
+ * - `unsupported`: there will never be a preview for this content — an expected
+ *   absence, not an error.
+ * - `failed`: a preview could not be produced. The user sees the same fallback
+ *   as `unsupported`; the difference matters to operators, not to the UI.
+ *
+ * The fallback for the last three is identical and is the whole contract: the
+ * file icon and the download action, which never depended on a preview.
+ */
+export type AttachmentPreviewStatus = "pending" | "ready" | "unsupported" | "failed";
+
 export interface ChannelAttachment {
   id: string;
   filename: string;
@@ -458,5 +478,6 @@ export interface ChannelAttachment {
   /** Plaintext size in bytes. */
   size: number;
   status: AttachmentStatus;
+  previewStatus: AttachmentPreviewStatus;
   createdAt: string; // ISO 8601
 }

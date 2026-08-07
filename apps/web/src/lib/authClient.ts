@@ -1,5 +1,5 @@
 import { refresh, type TokenResponse } from "../auth/authApi";
-import { ApiRequestError, apiFetch } from "./api";
+import { ApiRequestError, apiFetch, type ResponseParser } from "./api";
 import { clearTokens, getAccessToken, setTokens } from "./authSession";
 
 /**
@@ -93,14 +93,22 @@ export function _resetState(): void {
  *     - Concurrent waiter (AT === newTokens.accessToken): falls through to retry.
  *     - External session change (logout / newer login): throws original 401.
  */
-export async function authenticatedFetch<T>(url: string, init: RequestInit): Promise<T> {
+export async function authenticatedFetch<T>(
+  url: string,
+  init: RequestInit,
+  parse?: ResponseParser<T>,
+): Promise<T> {
   const originalAccessToken = getAccessToken();
 
   try {
-    return await apiFetch<T>(url, {
-      ...init,
-      headers: buildHeaders(init.headers, originalAccessToken),
-    });
+    return await apiFetch<T>(
+      url,
+      {
+        ...init,
+        headers: buildHeaders(init.headers, originalAccessToken),
+      },
+      parse,
+    );
   } catch (err) {
     if (!(err instanceof ApiRequestError) || err.status !== 401 || isAuthUrl(url)) {
       throw err;
@@ -117,10 +125,14 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
         rotation.fromAccessToken === originalAccessToken &&
         currentAccessToken === rotation.toAccessToken
       ) {
-        return apiFetch<T>(url, {
-          ...init,
-          headers: buildHeaders(init.headers, currentAccessToken),
-        });
+        return apiFetch<T>(
+          url,
+          {
+            ...init,
+            headers: buildHeaders(init.headers, currentAccessToken),
+          },
+          parse,
+        );
       }
       // Token changed due to logout or a different-session login: throw original 401.
       throw err;
@@ -173,6 +185,10 @@ export async function authenticatedFetch<T>(url: string, init: RequestInit): Pro
 
     // Retry the original request once with the current access token.
     const newAccessToken = getAccessToken();
-    return apiFetch<T>(url, { ...init, headers: buildHeaders(init.headers, newAccessToken) });
+    return apiFetch<T>(
+      url,
+      { ...init, headers: buildHeaders(init.headers, newAccessToken) },
+      parse,
+    );
   }
 }
