@@ -22,6 +22,11 @@ const {
 const mockFetchAttachmentPreview = vi.hoisted(() => vi.fn());
 vi.mock("./filesApi", () => ({
   fetchAttachmentPreview: mockFetchAttachmentPreview,
+  // The panel renders AttachmentVideo for every file row. This panel's tests are
+  // about the rows themselves, not about playback, so content is never
+  // available here and every player falls back — which is exactly what a row
+  // must survive.
+  fetchAttachmentContent: () => Promise.reject(new Error("not used")),
 }));
 
 vi.mock("./chatApi", () => ({
