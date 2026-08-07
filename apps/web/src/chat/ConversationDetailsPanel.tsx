@@ -27,6 +27,10 @@
  * - Attachments are metadata only. Nothing here links to content: the download
  *   endpoint needs an Authorization header and refuses anything the scan has
  *   not cleared, so the panel does not pretend a file is retrievable by URL.
+ *   The one exception is the RF-31 thumbnail, and it is not an exception to the
+ *   rule: AttachmentThumbnail fetches the bytes through the authenticated
+ *   client and shows them from an object URL scoped to this document, so there
+ *   is still no address anyone could share or reuse.
  *
  * The panel is a layout sibling of the conversation, never a modal and never a
  * route: it renders beside the messages so opening it cannot unmount the
@@ -37,6 +41,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
+import AttachmentThumbnail from "./AttachmentThumbnail";
 import RichTextRenderer from "./RichTextRenderer";
 import type {
   AddMembersResult,
@@ -832,11 +837,19 @@ function ConversationBody({
             <ul className="chat-details__files" aria-label="Arquivos recentes">
               {files.data.map((file) => (
                 <li key={file.id} className="chat-details__file">
-                  <span className="chat-details__file-icon" aria-hidden="true">
-                    <span className="material-symbols-outlined">
-                      {fileIconFor(file.contentType)}
-                    </span>
-                  </span>
+                  {/* The thumbnail owns its own fetch and object URL; the icon
+                      stays exactly as it was and is what shows whenever there
+                      is no preview to show. */}
+                  <AttachmentThumbnail
+                    attachment={file}
+                    fallback={
+                      <span className="chat-details__file-icon" aria-hidden="true">
+                        <span className="material-symbols-outlined">
+                          {fileIconFor(file.contentType)}
+                        </span>
+                      </span>
+                    }
+                  />
                   <span className="chat-details__file-text">
                     {/* A filename is text. It is never a URL and never markup. */}
                     <span className="chat-details__file-name">{file.filename}</span>

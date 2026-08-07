@@ -32,7 +32,7 @@ func destinationQuery(
 
 func attachmentRowValues(id, status, filename, mime string, size int64, createdAt time.Time) []any {
 	return []any{
-		id, status, filename, mime, size,
+		id, status, text(string(domain.PreviewStatusReady)), filename, mime, size,
 		pgtype.Timestamptz{Time: createdAt, Valid: true},
 	}
 }

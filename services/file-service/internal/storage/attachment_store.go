@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/nicrepository/nchat/libs/go/platform/authsession"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
@@ -14,7 +15,32 @@ import (
 // PGXAttachmentStore persists attachment metadata in files.attachments.
 type PGXAttachmentStore struct {
 	pool Pool
+	// fence serialises the two invalidations against a render in progress. It
+	// is the transaction half of the same lock the preview worker holds.
+	// Nil is only ever the case for the read and upload paths, which never
+	// invalidate anything; the invalidating operations refuse to run without it
+	// rather than proceeding unfenced.
+	fence TransactionFence
 }
+
+// NewFencedAttachmentStore builds the store used by the lifecycle operations.
+//
+// The fence is a constructor argument rather than an optional setter because
+// the two invalidations must not be reachable without it: a rejection that runs
+// unfenced can commit while a renderer is already holding the plaintext, which
+// is precisely the containment failure the fence exists to close.
+func NewFencedAttachmentStore(pool Pool, fence TransactionFence) *PGXAttachmentStore {
+	return &PGXAttachmentStore{pool: pool, fence: fence}
+}
+
+// The scan-verdict contract is asserted here rather than left to whichever
+// caller happens to wire it: the antimalware worker (RF-33) does not exist yet,
+// so nothing else in this build would notice the method drifting away from the
+// interface the future worker has to program against.
+var (
+	_ service.ScanResultStore        = (*PGXAttachmentStore)(nil)
+	_ service.AttachmentRemovalStore = (*PGXAttachmentStore)(nil)
+)
 
 func NewPGXAttachmentStore(pool Pool) *PGXAttachmentStore {
 	return &PGXAttachmentStore{pool: pool}
@@ -94,6 +120,15 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 	if len(update.WrappedDEK) == 0 || update.KEKKeyID == "" {
 		return fmt.Errorf("%w: attachment cannot be finalised without its key binding", domain.ErrInvalidInput)
 	}
+	// The preview job is scheduled by this same statement (RF-31). Only the two
+	// states an upload can decide are accepted: 'pending' queues the work,
+	// 'unsupported' says up front that there will never be a preview. 'ready'
+	// is refused here because no preview exists yet, and 'failed' because
+	// nothing has been attempted.
+	if update.PreviewStatus != domain.PreviewStatusPending &&
+		update.PreviewStatus != domain.PreviewStatusUnsupported {
+		return fmt.Errorf("%w: invalid initial preview status", domain.ErrInvalidInput)
+	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE files.attachments
 		   SET status = $2,
@@ -102,6 +137,8 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 		       ciphertext_size_bytes = $5,
 		       wrapped_dek = $6,
 		       kek_key_id = $7,
+		       preview_status = $9,
+		       preview_next_attempt_at = CASE WHEN $9 = 'pending' THEN now() ELSE NULL END,
 		       uploaded_at = now(),
 		       updated_at = now()
 		 WHERE id = $1
@@ -110,6 +147,7 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 		update.Size, update.CiphertextSize,
 		update.WrappedDEK, update.KEKKeyID,
 		string(domain.StatusPendingUpload),
+		string(update.PreviewStatus),
 	)
 	if err != nil {
 		return fmt.Errorf("mark attachment uploaded: %w", err)
@@ -143,6 +181,376 @@ func (s *PGXAttachmentStore) MarkFailed(ctx context.Context, attachmentID, failu
 	return nil
 }
 
+// markScanRejectedQuery applies an antimalware verdict of "rejected" and
+// finishes the row's preview lifecycle in the same statement.
+//
+// # Why one statement and not two
+//
+// status and the preview columns live on the same row, so this needs no
+// transaction and no writable CTE — a single UPDATE is already atomic, and
+// choosing anything looser would be choosing a window. That window is not
+// theoretical: setting status = 'rejected' on its own leaves the row in a state
+// no code can ever leave. ClaimDuePreviews requires status = 'clean', so the
+// preview worker will never look at it again; preview_status stays 'pending',
+// so nothing ever concludes it. The row would sit there, scheduled, forever.
+//
+// # What the CASE expressions are for
+//
+// Only a preview that is still *pending* is finalised. Every SET expression
+// reads the row as it was before the update, so all three branches decide on
+// the same pre-update preview_status:
+//
+//   - pending  -> unsupported, and its schedule is cleared. "Unsupported" is
+//     the honest terminal state: this content will never have a preview,
+//     because the only path to one requires a clean verdict it will not get;
+//   - ready, failed, unsupported -> untouched. They are already terminal, and
+//     rewriting them would lose the distinction between "we tried and could
+//     not" and "we were never allowed to try". A ready preview keeps existing
+//     and stops being servable, because delivery reads the attachment's status,
+//     not the preview's.
+//
+// preview_attempts is deliberately not reset: it is what an operator reads to
+// see how much work a row consumed, and a verdict does not undo that history.
+//
+// # Which rows it accepts
+//
+//   - pending_scan: the ordinary verdict, on a file awaiting one;
+//   - clean: a rescan reversing an earlier approval, or a verdict landing while
+//     the preview worker holds the row;
+//   - rejected: the same verdict arriving twice, and — the reason this is not
+//     merely tolerated but required — a row already left in the broken
+//     rejected+pending state by an earlier build. Re-applying the verdict
+//     repairs it, which is why the repair needs no migration and no sweep.
+//
+// pending_upload, failed and deleted are excluded: an upload that never
+// finished has no stored object to have been scanned, and a deleted row is not
+// a live attachment. deleted_at is checked for the same reason.
+//
+// # Why the cleanup job is in this statement
+//
+// A rescan can condemn a file whose preview was already published. The preview
+// object then belongs to nothing: it can never be served again — delivery reads
+// the attachment's status — but it is still sitting in SeaweedFS, and nothing
+// would ever remove it. The row still pointed at the key, so the cleanup worker
+// used to see it as referenced and drop the job.
+//
+// So the verdict enqueues it, here, in the same statement. Not the same
+// transaction — the same statement, which is stronger and needs no ordering
+// argument: the state change and the job that compensates for it become visible
+// together or not at all. There is no window in which the object is unservable
+// and unqueued, and none in which a job exists for a preview still being served.
+//
+// The CTE reads the *post*-update preview_status on purpose. A preview that was
+// pending has no object to reclaim and becomes unsupported; only one that says
+// ready has published bytes, and it stays ready — the audit record that a
+// preview once existed — while its object goes. ON CONFLICT DO NOTHING keeps a
+// repeated verdict from queueing the key twice.
+const markScanRejectedQuery = `
+	WITH rejected AS (
+		UPDATE files.attachments
+		   SET status = 'rejected',
+		       preview_status = CASE
+		           WHEN preview_status = 'pending' THEN 'unsupported'
+		           ELSE preview_status
+		       END,
+		       preview_next_attempt_at = CASE
+		           WHEN preview_status = 'pending' THEN NULL
+		           ELSE preview_next_attempt_at
+		       END,
+		       updated_at = now()
+		 WHERE id = $1
+		   AND workspace_id = $2
+		   AND deleted_at IS NULL
+		   AND status IN ('pending_scan', 'clean', 'rejected')
+		RETURNING status, preview_status, preview_object_id
+	), orphaned AS (
+		INSERT INTO files.object_cleanup_jobs (object_key)
+		SELECT ` + previewObjectKeyExpr + `
+		  FROM rejected
+		 WHERE preview_object_id IS NOT NULL
+		   AND preview_status = 'ready'
+		ON CONFLICT (object_key) DO NOTHING
+	)
+	SELECT status, preview_status FROM rejected`
+
+// MarkScanRejected records an antimalware rejection and finalises the preview.
+//
+// The two facts move together or not at all. A row that comes back from this
+// call is condemned *and* concluded: it cannot be claimed (the claim requires
+// clean), cannot be published (MarkPreviewReady re-checks clean and pending),
+// and is no longer scheduled for anything.
+//
+// It returns what the row now is, read back from the statement that wrote it.
+// No row matched means the attachment does not exist, belongs to another
+// workspace, is deleted, or was never in a state a scan verdict applies to —
+// all reported as ErrNotFound, the same way GetAuthorized refuses to
+// distinguish "absent" from "not yours".
+func (s *PGXAttachmentStore) MarkScanRejected(
+	ctx context.Context, rejection service.ScanRejection,
+) (service.ScanRejectionOutcome, error) {
+	// Fenced: a verdict must not commit while a renderer is already holding
+	// this attachment's plaintext. Acquiring waits for a render in progress, so
+	// the two possible orderings are the only two outcomes — reject then no
+	// render, or render then reject — and never both at once.
+	return s.applyFencedTransition(ctx, rejection.AttachmentID, markScanRejectedQuery,
+		rejection.WorkspaceID,
+		"a scan verdict needs an attachment and its workspace",
+		"attachment cannot take a scan verdict")
+}
+
+// markScanCleanQuery records an antimalware verdict of "clean".
+//
+// This is the one transition that makes content reachable: it is what lets a
+// download be served and what makes a preview claimable, so it is written as
+// narrowly as the rejection is written thoroughly.
+//
+// # What it does not touch
+//
+// Nothing about the preview. That is not an omission — it is the design. An
+// upload that finished with a previewable type left preview_status = 'pending'
+// and preview_next_attempt_at = now(), so the row becomes claimable the instant
+// its status turns clean, with no second write and therefore no window in which
+// the status says clean and the schedule says otherwise. A preview that had
+// already reached a terminal state stays there: an approval is news about the
+// file, not about a render that already happened.
+//
+// # Which rows it accepts
+//
+//   - pending_scan: the real transition, the only way an attachment becomes
+//     downloadable;
+//   - clean: the same verdict arriving twice, which must converge rather than
+//     fail — a scanner retrying after a lost acknowledgement is normal.
+//
+// Every other state is excluded, and each exclusion is a security property:
+//
+//   - rejected is absent, so a stale or replayed approval can never reopen a
+//     file the scanner condemned. Rejection is final in this direction;
+//   - pending_upload and failed are absent, so an upload that never completed
+//     cannot be approved — there is no stored object that was scanned;
+//   - deleted_at IS NULL, so a removed attachment cannot be brought back into
+//     circulation by a verdict that arrived late.
+const markScanCleanQuery = `
+	UPDATE files.attachments
+	   SET status = 'clean',
+	       updated_at = now()
+	 WHERE id = $1
+	   AND workspace_id = $2
+	   AND deleted_at IS NULL
+	   AND status IN ('pending_scan', 'clean')
+	RETURNING status, preview_status`
+
+// MarkScanClean records that the antimalware scan found nothing.
+//
+// It is the counterpart of MarkScanRejected and the only path to a clean
+// status. Nothing in the HTTP surface reaches it: there is no route, no request
+// field and no client value anywhere that decides a scan verdict, because a
+// caller who could choose "clean" could put an unscanned file in front of the
+// PDF parser.
+//
+// No row matched means the verdict was not recorded — the attachment does not
+// exist, is another workspace's, is deleted, or is in a state no approval
+// applies to, rejection included. All are reported as ErrNotFound, and never as
+// success.
+func (s *PGXAttachmentStore) MarkScanClean(
+	ctx context.Context, approval service.ScanApproval,
+) (service.AttachmentLifecycleState, error) {
+	return s.applyLifecycleTransition(ctx, markScanCleanQuery,
+		approval.AttachmentID, approval.WorkspaceID,
+		"a scan verdict needs an attachment and its workspace",
+		"attachment cannot take a clean verdict")
+}
+
+// markAttachmentDeletedQuery removes an attachment and finishes a preview that
+// was still pending, in the same statement.
+//
+// The reason it is one statement is the reason the rejection is: status and the
+// preview columns live on the same row, and writing only deleted_at leaves a
+// queued preview job that no claim can ever select — ClaimDuePreviews requires
+// deleted_at IS NULL — and that nothing ever concludes. The row would stay
+// pending forever, scheduled, for an attachment that no longer exists.
+//
+// deleted_at uses COALESCE rather than an unconditional now(): a second removal
+// must converge without moving the moment the attachment was removed, which is
+// the timestamp a retention policy will one day count from. Because the
+// statement therefore matches an already-deleted row, it also repairs one left
+// with a pending preview by a caller that only wrote deleted_at.
+//
+// status is deliberately untouched. Deletion and the scan verdict are different
+// facts about the row: a file that was rejected and then removed is still a
+// file the scanner condemned, and every read path already gates on deleted_at,
+// not on the status. A preview that had reached a terminal state — ready
+// included — keeps that state, because it is the record that a preview once
+// existed; what does not survive is its *object*, which the CTE below reclaims.
+//
+// # Why the object is reclaimed and the attachment's is not
+//
+// They are not the same kind of thing. The attachment's object is the user's
+// file, and how long a removed file is retained is a policy decision (RF-34)
+// that this statement has no business making. A preview is a derived artefact
+// with no independent value: once the attachment it was derived from is gone,
+// nothing can ever serve it, nothing can ever regenerate a use for it, and
+// keeping it is pure accumulation. Leaving it behind was a permanent leak —
+// unreachable to every read path and invisible to the cleanup worker, which saw
+// the row still pointing at the key and called it referenced.
+//
+// Same statement, same reasoning as the rejection: the removal and the job that
+// reclaims its object commit together or not at all.
+const markAttachmentDeletedQuery = `
+	WITH removed AS (
+		UPDATE files.attachments
+		   SET deleted_at = COALESCE(deleted_at, now()),
+		       preview_status = CASE
+		           WHEN preview_status = 'pending' THEN 'unsupported'
+		           ELSE preview_status
+		       END,
+		       preview_next_attempt_at = CASE
+		           WHEN preview_status = 'pending' THEN NULL
+		           ELSE preview_next_attempt_at
+		       END,
+		       updated_at = now()
+		 WHERE id = $1
+		   AND workspace_id = $2
+		RETURNING status, preview_status, preview_object_id
+	), orphaned AS (
+		INSERT INTO files.object_cleanup_jobs (object_key)
+		SELECT ` + previewObjectKeyExpr + `
+		  FROM removed
+		 WHERE preview_object_id IS NOT NULL
+		   AND preview_status = 'ready'
+		ON CONFLICT (object_key) DO NOTHING
+	)
+	SELECT status, preview_status FROM removed`
+
+// MarkAttachmentDeleted soft-deletes an attachment and finalises a preview that
+// was still pending.
+//
+// Both facts move together or not at all, so there is no state in which an
+// attachment is gone and a render is still queued for it. Repeating the removal
+// converges: the deletion timestamp is kept, the preview stays terminal, and
+// the same state is reported.
+func (s *PGXAttachmentStore) MarkAttachmentDeleted(
+	ctx context.Context, removal service.AttachmentRemoval,
+) (service.AttachmentLifecycleState, error) {
+	// Fenced for the same reason a rejection is: a removal that commits while a
+	// renderer holds the plaintext would leave the parser working on content
+	// the system has already decided nobody may see.
+	return s.applyFencedTransition(ctx, removal.AttachmentID, markAttachmentDeletedQuery,
+		removal.WorkspaceID,
+		"a removal needs an attachment and its workspace",
+		"attachment cannot be removed")
+}
+
+// applyFencedTransition takes the attachment fence and applies the transition
+// under it, so no invalidation can overlap a render.
+//
+// # Why this side uses a transaction-scoped lock
+//
+// The preview worker holds a *session* lock, on a connection it keeps for the
+// length of a render, because a render is tens of seconds long and no
+// transaction should be. An invalidation is the opposite shape: one indexed
+// UPDATE, over in milliseconds. So it takes the same lock in the same lock
+// space with pg_advisory_xact_lock, inside a transaction that also carries the
+// UPDATE — the two conflict with each other exactly as two session locks would,
+// because PostgreSQL does not distinguish them by holder.
+//
+// That is not a stylistic choice. Taking a session lock here would mean holding
+// one pooled connection for the lock and asking for a *second* to run the
+// statement: with several invalidations racing, every connection can end up
+// held by a waiter while the holder waits for a connection that will never come
+// free. One connection, one transaction, no ordering to get wrong.
+//
+// The lock is released by the commit, and by the rollback if anything fails, so
+// there is no path that leaves an attachment fenced.
+//
+// # One id, not two
+//
+// The attachment is named once and used twice — to derive the fence key and as
+// the statement's $1 — because those two must be the same row or the fence
+// protects nothing. An earlier signature took them as separate parameters; every
+// caller passed the same value, but nothing said they had to, and a caller that
+// eventually did not would take the lock on A while the UPDATE modified B. That
+// is not a defect a test finds later, so the signature carries the invariant
+// instead.
+func (s *PGXAttachmentStore) applyFencedTransition(
+	ctx context.Context, attachmentID, query, workspaceID, invalidInput, notApplicable string,
+) (service.AttachmentLifecycleState, error) {
+	if s == nil || s.pool == nil {
+		return service.AttachmentLifecycleState{}, domain.ErrDependenciesUnavailable
+	}
+	if s.fence == nil {
+		// Fail closed. An unfenced invalidation is not a degraded mode, it is
+		// the bug: it can commit underneath a running parser.
+		return service.AttachmentLifecycleState{}, fmt.Errorf(
+			"%w: %s", domain.ErrDependenciesUnavailable, errFenceUnavailable)
+	}
+	// Validated before anything is locked, so a malformed request cannot make a
+	// legitimate one wait.
+	if attachmentID == "" || workspaceID == "" {
+		return service.AttachmentLifecycleState{}, fmt.Errorf(
+			"%w: %s", domain.ErrInvalidInput, invalidInput)
+	}
+	key, err := attachmentFenceKey(attachmentID)
+	if err != nil {
+		return service.AttachmentLifecycleState{}, err
+	}
+	return s.fence.WithinTransaction(ctx, key, func(tx TransactionalQuerier) (service.AttachmentLifecycleState, error) {
+		return scanLifecycleTransition(ctx, tx, query, attachmentID, workspaceID, notApplicable)
+	})
+}
+
+// applyLifecycleTransition runs one conditional lifecycle statement and reads
+// the resulting state back from it.
+//
+// The three lifecycle operations — approve, reject, remove — differ only in
+// their statement. Sharing the execution keeps them identical where they must
+// be: the same tenant scoping, the same refusal to treat "no row matched" as
+// success, and the same validation of what came back.
+func (s *PGXAttachmentStore) applyLifecycleTransition(
+	ctx context.Context, query, attachmentID, workspaceID, invalidInput, notApplicable string,
+) (service.AttachmentLifecycleState, error) {
+	if s == nil || s.pool == nil {
+		return service.AttachmentLifecycleState{}, domain.ErrDependenciesUnavailable
+	}
+	if attachmentID == "" || workspaceID == "" {
+		return service.AttachmentLifecycleState{}, fmt.Errorf(
+			"%w: %s", domain.ErrInvalidInput, invalidInput)
+	}
+	return scanLifecycleTransition(ctx, s.pool, query, attachmentID, workspaceID, notApplicable)
+}
+
+// TransactionalQuerier is the sliver of pgx a lifecycle statement needs. It is
+// satisfied by both a pool and a transaction, which is what lets the fenced and
+// unfenced paths share one implementation of the statement.
+type TransactionalQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// scanLifecycleTransition runs the statement and reads the resulting state back.
+func scanLifecycleTransition(
+	ctx context.Context, q TransactionalQuerier, query, attachmentID, workspaceID, notApplicable string,
+) (service.AttachmentLifecycleState, error) {
+	var status, previewStatus pgtype.Text
+	err := q.QueryRow(ctx, query, attachmentID, workspaceID).Scan(&status, &previewStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Never silently a success: a transition that matched nothing has
+			// not been recorded, and the caller has to be able to tell.
+			return service.AttachmentLifecycleState{}, fmt.Errorf(
+				"%w: %s", domain.ErrNotFound, notApplicable)
+		}
+		return service.AttachmentLifecycleState{}, fmt.Errorf("apply attachment transition: %w", err)
+	}
+
+	state := service.AttachmentLifecycleState{
+		Status:        domain.Status(status.String),
+		PreviewStatus: previewStatusOf(previewStatus),
+	}
+	if !state.Status.Valid() {
+		return service.AttachmentLifecycleState{}, errors.New("attachment has an unknown status")
+	}
+	return state, nil
+}
+
 // GetAuthorized returns an attachment only if the caller's session is still
 // active and the caller can currently reach the attachment's destination. The
 // membership check is re-evaluated on every read, so revoking access takes
@@ -174,6 +582,14 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		kekKeyID         pgtype.Text
 		keyWrapVersion   pgtype.Int2
 		createdAt        pgtype.Timestamptz
+
+		previewStatus          pgtype.Text
+		previewObjectID        pgtype.Text
+		previewSize            pgtype.Int8
+		previewWrappedDEK      []byte
+		previewKEKKeyID        pgtype.Text
+		previewEnvelopeVersion pgtype.Int2
+		previewKeyWrapVersion  pgtype.Int2
 	)
 	err := s.pool.QueryRow(ctx, authorizedAttachmentQuery,
 		input.SessionID, input.UserID, input.AttachmentID,
@@ -181,6 +597,8 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		&sessionExpiresAt, &id, &workspaceID, &destinationKind, &status,
 		&filename, &declaredMIME, &detectedMIME, &size, &objectKey,
 		&envelopeVersion, &wrappedDEK, &kekKeyID, &keyWrapVersion, &createdAt,
+		&previewStatus, &previewObjectID, &previewSize, &previewWrappedDEK,
+		&previewKEKKeyID, &previewEnvelopeVersion, &previewKeyWrapVersion,
 	)
 	if err != nil {
 		return service.StoredAttachment{}, fmt.Errorf("read authorized attachment: %w", err)
@@ -219,6 +637,17 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		KeyWrapVersion:   int(keyWrapVersion.Int16),
 		CreatedAt:        createdAt.Time.UTC(),
 		SessionExpiresAt: sessionExpiresAt.Time.UTC(),
+
+		// The preview columns are NULL until one exists, which the CHECK ties
+		// to preview_status: an unknown or absent status therefore reads as
+		// "no preview", never as a preview with missing material.
+		PreviewStatus:          previewStatusOf(previewStatus),
+		PreviewObjectID:        previewObjectID.String,
+		PreviewSize:            previewSize.Int64,
+		PreviewWrappedDEK:      previewWrappedDEK,
+		PreviewKEKKeyID:        previewKEKKeyID.String,
+		PreviewEnvelopeVersion: int(previewEnvelopeVersion.Int16),
+		PreviewKeyWrapVersion:  int(previewKeyWrapVersion.Int16),
 	}, nil
 }
 
@@ -251,7 +680,7 @@ func (s *PGXAttachmentStore) GetAuthorized(
 //	$1 workspace_id   $2 destination id   $3 listable statuses   $4 limit
 const (
 	listChannelAttachmentsQuery = `
-		SELECT a.id::text, a.status, a.original_filename,
+		SELECT a.id::text, a.status, a.preview_status, a.original_filename,
 		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
 		FROM files.attachments AS a
 		WHERE a.destination_kind = 'channel'
@@ -263,7 +692,7 @@ const (
 		LIMIT $4`
 
 	listDMAttachmentsQuery = `
-		SELECT a.id::text, a.status, a.original_filename,
+		SELECT a.id::text, a.status, a.preview_status, a.original_filename,
 		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
 		FROM files.attachments AS a
 		WHERE a.destination_kind = 'dm'
@@ -327,12 +756,13 @@ func (s *PGXAttachmentStore) ListDestinationAttachments(
 	listed := make([]service.ListedAttachment, 0, limit)
 	for rows.Next() {
 		var (
-			record    service.ListedAttachment
-			status    string
-			createdAt pgtype.Timestamptz
+			record        service.ListedAttachment
+			status        string
+			previewStatus pgtype.Text
+			createdAt     pgtype.Timestamptz
 		)
 		if err := rows.Scan(
-			&record.ID, &status, &record.Filename,
+			&record.ID, &status, &previewStatus, &record.Filename,
 			&record.DetectedMIME, &record.Size, &createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan destination attachment: %w", err)
@@ -344,6 +774,7 @@ func (s *PGXAttachmentStore) ListDestinationAttachments(
 			return nil, errors.New("attachment has an unknown status")
 		}
 		record.Status = attachmentStatus
+		record.PreviewStatus = previewStatusOf(previewStatus)
 		record.CreatedAt = createdAt.Time.UTC()
 		listed = append(listed, record)
 	}
@@ -351,6 +782,18 @@ func (s *PGXAttachmentStore) ListDestinationAttachments(
 		return nil, fmt.Errorf("iterate destination attachments: %w", err)
 	}
 	return listed, nil
+}
+
+// previewStatusOf maps a stored preview state onto the domain enum, failing
+// closed: a NULL — which only a row written before migration 000003 can have —
+// and any value outside the closed set both read as "unsupported", the state
+// that makes a client draw its fallback. It never invents "ready".
+func previewStatusOf(stored pgtype.Text) domain.PreviewStatus {
+	status := domain.PreviewStatus(stored.String)
+	if !stored.Valid || !status.Valid() {
+		return domain.PreviewStatusUnsupported
+	}
+	return status
 }
 
 // listableStatuses is the closed set the listing selects, derived from the
@@ -379,7 +822,10 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		SELECT a.id, a.workspace_id, a.destination_kind, a.status,
 		       a.original_filename, a.declared_mime, a.detected_mime,
 		       a.size_bytes, a.storage_object_key, a.envelope_version,
-		       a.wrapped_dek, a.kek_key_id, a.dek_wrap_version, a.created_at
+		       a.wrapped_dek, a.kek_key_id, a.dek_wrap_version, a.created_at,
+		       a.preview_status, a.preview_object_id, a.preview_size_bytes,
+		       a.preview_wrapped_dek, a.preview_kek_key_id,
+		       a.preview_envelope_version, a.preview_dek_wrap_version
 		FROM files.attachments AS a
 		CROSS JOIN active_session AS active
 		WHERE a.id = $3
@@ -436,6 +882,13 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		authorized.wrapped_dek,
 		authorized.kek_key_id,
 		authorized.dek_wrap_version,
-		authorized.created_at
+		authorized.created_at,
+		authorized.preview_status,
+		authorized.preview_object_id::text,
+		authorized.preview_size_bytes,
+		authorized.preview_wrapped_dek,
+		authorized.preview_kek_key_id,
+		authorized.preview_envelope_version,
+		authorized.preview_dek_wrap_version
 	FROM (SELECT 1) AS single_row
 	LEFT JOIN authorized ON true`

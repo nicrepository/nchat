@@ -15,7 +15,25 @@ export class ApiRequestError extends Error {
   }
 }
 
-export async function apiFetch<T>(url: string, init: RequestInit): Promise<T> {
+/**
+ * Reads a successful response into the shape the caller wants.
+ *
+ * It exists for the responses that are not JSON — today the attachment preview,
+ * which is an image. Without it those callers would have to reimplement the
+ * bearer-token injection and the refresh-and-retry dance in authClient just to
+ * reach `response.blob()`, and a second copy of that logic is the last thing
+ * this codebase needs.
+ *
+ * Only the success path is pluggable. Error bodies stay on the one path that
+ * knows how to read the services' `{error:{code,message}}` envelope.
+ */
+export type ResponseParser<T> = (response: Response) => Promise<T>;
+
+export async function apiFetch<T>(
+  url: string,
+  init: RequestInit,
+  parse?: ResponseParser<T>,
+): Promise<T> {
   let response: Response;
   // Headers merges case-insensitively, which a plain object spread does not: a
   // caller-normalized "content-type" next to the literal "Content-Type" default
@@ -50,6 +68,13 @@ export async function apiFetch<T>(url: string, init: RequestInit): Promise<T> {
       // leave defaults
     }
     throw new ApiRequestError(response.status, code, message);
+  }
+
+  // A caller that knows how to read this response reads it. The JSON rules
+  // below are the default, not a filter the parser has to survive: an image
+  // response would fall through them as undefined.
+  if (parse) {
+    return parse(response);
   }
 
   const contentType = response.headers.get("content-type") ?? "";

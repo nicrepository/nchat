@@ -101,8 +101,15 @@ type NewAttachment struct {
 //
 // The wrap version is absent by design: it was fixed when the row was created.
 type UploadedAttachment struct {
-	ID             string
-	Status         domain.Status
+	ID     string
+	Status domain.Status
+	// PreviewStatus schedules the preview job, or declares up front that there
+	// will never be one. It is written by the same UPDATE that finishes the
+	// upload, which is what makes the job durable without a queue: an
+	// attachment that exists and can be previewed is, by that same statement,
+	// already scheduled, so no restart can lose the work and no second write
+	// can disagree with the first.
+	PreviewStatus  domain.PreviewStatus
 	DetectedMIME   string
 	Size           int64
 	CiphertextSize int64
@@ -138,6 +145,21 @@ type StoredAttachment struct {
 	KeyWrapVersion   int
 	CreatedAt        time.Time
 	SessionExpiresAt time.Time
+
+	// Preview state (RF-31). The preview is a separate stored object with its
+	// own identity and its own data key, so it carries its own binding
+	// alongside the attachment's; nothing here is shared with the fields above
+	// except the workspace.
+	//
+	// Every one of them is empty unless PreviewStatus is ready, which the
+	// database CHECK enforces, so a partially written preview cannot be served.
+	PreviewStatus          domain.PreviewStatus
+	PreviewObjectID        string
+	PreviewSize            int64
+	PreviewWrappedDEK      []byte
+	PreviewKEKKeyID        string
+	PreviewEnvelopeVersion int
+	PreviewKeyWrapVersion  int
 }
 
 // ListDestinationAttachmentsQuery is a resolved, already-authorised listing
@@ -158,12 +180,105 @@ type ListDestinationAttachmentsQuery struct {
 // never needs them, and not selecting them means they cannot leak through a
 // listing bug.
 type ListedAttachment struct {
-	ID           string
-	Status       domain.Status
-	Filename     string
-	DetectedMIME string
-	Size         int64
-	CreatedAt    time.Time
+	ID            string
+	Status        domain.Status
+	PreviewStatus domain.PreviewStatus
+	Filename      string
+	DetectedMIME  string
+	Size          int64
+	CreatedAt     time.Time
+}
+
+// ScanRejection names the attachment a malware scan has condemned.
+//
+// It carries identifiers and nothing else on purpose. The caller does not get
+// to say what the row should look like afterwards — not the preview state, not
+// the schedule, not the attempt count — because the whole point of the
+// operation is that the transition is decided in one place and applied in one
+// statement. A verdict is an input; the resulting state is not.
+type ScanRejection struct {
+	AttachmentID string
+	// WorkspaceID scopes the write to one tenant. The scanner reads the row it
+	// is ruling on, so it always has this, and requiring it means a verdict can
+	// never be applied across workspaces even if an id were confused.
+	WorkspaceID string
+}
+
+// ScanApproval names the attachment a malware scan has cleared.
+//
+// It is a distinct type from ScanRejection even though the fields match: these
+// are the two verdicts, they move the row in opposite directions, and a
+// compiler that cannot tell them apart is one refactor away from applying the
+// wrong one. Like a rejection, it carries identifiers only — the caller states
+// what the scanner found, never what the row should become.
+type ScanApproval struct {
+	AttachmentID string
+	WorkspaceID  string
+}
+
+// AttachmentRemoval names the attachment being taken out of its destination.
+type AttachmentRemoval struct {
+	AttachmentID string
+	WorkspaceID  string
+}
+
+// AttachmentLifecycleState is the pair of states a lifecycle operation leaves
+// behind, read back from the statement that wrote it so it describes the row as
+// it actually stands rather than as the caller assumed.
+type AttachmentLifecycleState struct {
+	Status        domain.Status
+	PreviewStatus domain.PreviewStatus
+}
+
+// ScanRejectionOutcome is the rejection's result. It is an alias rather than a
+// second struct: the three lifecycle operations report the same two facts, and
+// duplicating the type would only invite them to drift.
+type ScanRejectionOutcome = AttachmentLifecycleState
+
+// ScanResultStore persists an antimalware verdict.
+//
+// It is separate from AttachmentStore because it answers to a different caller:
+// the antimalware worker (RF-33), which is **not implemented in this repository
+// yet** — there is no ClamAV client, container or configuration anywhere in the
+// tree, and the ADR lists it as its own planned task. When it exists, it is the
+// one component that may call either method here, and it must record a verdict
+// *only* through them, never with an UPDATE of its own.
+//
+// That rule is what these two operations exist to enforce. A rejection that set
+// the status without finishing the preview leaves a row nothing can ever
+// complete: not clean, so the preview worker skips it forever, and still
+// pending, so no state machine concludes it. An approval written loosely is
+// worse — it is the one transition that makes content renderable, so it must be
+// impossible to reach from a state that was never scanned, from a rejection, or
+// from a deleted row.
+//
+// Neither method is reachable from any HTTP route. There is deliberately no
+// endpoint, no request field and no client-supplied value anywhere in this
+// service that can produce a clean verdict: a user who could would be a user
+// who can put an unscanned file in front of the renderer.
+type ScanResultStore interface {
+	// MarkScanClean records that the scanner found nothing, in one atomic
+	// statement. It is the only way an attachment becomes downloadable and the
+	// only way its preview becomes claimable.
+	MarkScanClean(ctx context.Context, approval ScanApproval) (AttachmentLifecycleState, error)
+	// MarkScanRejected condemns an attachment and finalises its preview in one
+	// atomic statement. It is idempotent: applying the same verdict twice
+	// leaves the same state and reports it, rather than failing.
+	MarkScanRejected(ctx context.Context, rejection ScanRejection) (ScanRejectionOutcome, error)
+}
+
+// AttachmentRemovalStore takes an attachment out of its destination.
+//
+// Removal is not implemented as a use case in this service yet — there is no
+// route and no retention job (RF-34) — but the operation exists here because
+// the *lifecycle* is this package's responsibility and getting it wrong is what
+// the preview state machine cannot survive: a row removed while its preview was
+// still pending would keep a queued job that no claim can select, exactly like
+// a rejection that only wrote the status.
+type AttachmentRemovalStore interface {
+	// MarkAttachmentDeleted soft-deletes an attachment and finalises a preview
+	// that was still pending, in one atomic statement.
+	MarkAttachmentDeleted(ctx context.Context, removal AttachmentRemoval) (AttachmentLifecycleState, error)
 }
 
 // AttachmentStore is the metadata half of attachment persistence.
@@ -235,11 +350,18 @@ type UploadInput struct {
 // identifiers, workspace-internal wiring and every byte of key material are
 // absent by construction: this struct is the only thing handlers serialise.
 type AttachmentView struct {
-	ID              string    `json:"id"`
-	Filename        string    `json:"filename"`
-	ContentType     string    `json:"contentType"`
-	Size            int64     `json:"size"`
-	Status          string    `json:"status"`
+	ID          string `json:"id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"contentType"`
+	Size        int64  `json:"size"`
+	Status      string `json:"status"`
+	// PreviewStatus tells the client which of three things to draw: a preview
+	// it may request, a spinner while one is being produced, or the icon and
+	// download button that stand in for both kinds of absence. It is the whole
+	// fallback contract, which is why it is on every projection rather than
+	// only on the preview route: a client never has to probe for a preview to
+	// discover there is none.
+	PreviewStatus   string    `json:"previewStatus"`
 	DestinationKind string    `json:"destinationKind"`
 	CreatedAt       time.Time `json:"createdAt"`
 }
@@ -584,9 +706,14 @@ func (s *AttachmentService) finalizeUpload(
 			fmt.Errorf("wrap attachment key: %w", err))
 	}
 
+	// Decided from the detected type and the counted size, both facts by now.
+	// An attachment nothing can render never enters the worker's queue.
+	previewStatus := domain.InitialPreviewStatus(content.detectedMIME, size)
+
 	if err := s.store.MarkUploaded(ctx, UploadedAttachment{
 		ID:             pending.id.String(),
 		Status:         status,
+		PreviewStatus:  previewStatus,
 		DetectedMIME:   content.detectedMIME,
 		Size:           size,
 		CiphertextSize: ciphertextSize,
@@ -602,6 +729,7 @@ func (s *AttachmentService) finalizeUpload(
 		ContentType:     content.detectedMIME,
 		Size:            size,
 		Status:          string(status),
+		PreviewStatus:   string(previewStatus),
 		DestinationKind: string(target.destination.Kind),
 		CreatedAt:       time.Now().UTC(),
 	}, nil
@@ -632,6 +760,7 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 		ContentType:     contentType(record),
 		Size:            record.Size,
 		Status:          string(record.Status),
+		PreviewStatus:   string(record.PreviewStatus),
 		DestinationKind: string(record.Kind),
 		CreatedAt:       record.CreatedAt,
 	}, nil
@@ -700,6 +829,7 @@ func (s *AttachmentService) ListDestinationAttachments(
 			ContentType:     contentType,
 			Size:            record.Size,
 			Status:          string(record.Status),
+			PreviewStatus:   string(record.PreviewStatus),
 			DestinationKind: string(destination.Kind),
 			CreatedAt:       record.CreatedAt,
 		})
@@ -744,10 +874,112 @@ func (s *AttachmentService) downloadableAttachment(
 	if !record.Status.Downloadable() {
 		return StoredAttachment{}, domain.ErrNotDownloadable
 	}
-	if record.EnvelopeVersion != crypto.EnvelopeVersion {
-		return StoredAttachment{}, fmt.Errorf("unsupported envelope version %d", record.EnvelopeVersion)
-	}
 	return record, nil
+}
+
+// Preview returns the inline preview of an attachment the caller may read
+// (RF-31).
+//
+// It is the download path's authorization, unchanged and re-evaluated here:
+// the same query decides visibility, and Status.Downloadable decides delivery,
+// so a preview can never be served for an attachment whose content could not
+// be. That ordering is what keeps the malware-scan gate closed — a rendering of
+// a file is still that file's content, and this route must not become the way
+// around a scan that has not approved it.
+//
+// A caller that may read the attachment but has no preview to read gets
+// ErrPreviewUnavailable, whatever the reason. Which reason it is comes from the
+// attachment's own metadata, so this route never has to explain itself and
+// never becomes a way to probe internal state.
+func (s *AttachmentService) Preview(ctx context.Context, input AttachmentAuthInput) (Download, error) {
+	if !s.Ready() {
+		return Download{}, domain.ErrDependenciesUnavailable
+	}
+	record, err := s.downloadableAttachment(ctx, input)
+	if err != nil {
+		return Download{}, err
+	}
+	if !record.PreviewStatus.Servable() {
+		return Download{}, domain.ErrPreviewUnavailable
+	}
+	object, err := previewObject(record)
+	if err != nil {
+		return Download{}, err
+	}
+	content, err := s.openEncryptedObject(ctx, object)
+	if err != nil {
+		return Download{}, err
+	}
+	return Download{
+		Filename: record.Filename,
+		// Never the attachment's own type: the bytes are a raster this service
+		// produced, and saying so is what makes them safe to render inline.
+		ContentType: domain.PreviewContentType,
+		Size:        record.PreviewSize,
+		Content:     content,
+	}, nil
+}
+
+// encryptedObject is one stored NCF1 object together with everything needed to
+// open it. An attachment's content and its preview are two of these: separate
+// identities, separate data keys, separate lengths, one code path.
+type encryptedObject struct {
+	// objectID is the identity the envelope's chunks and the wrapped key's
+	// binding are both tied to. For content it is the attachment id; for a
+	// preview it is that preview's own id, which is what makes the two objects
+	// impossible to substitute for one another.
+	objectID        string
+	workspaceID     string
+	objectKey       string
+	size            int64
+	wrappedDEK      []byte
+	kekKeyID        string
+	envelopeVersion int
+	keyWrapVersion  int
+}
+
+func contentObject(record StoredAttachment) encryptedObject {
+	return encryptedObject{
+		objectID:        record.ID,
+		workspaceID:     record.WorkspaceID,
+		objectKey:       record.StorageObjectKey,
+		size:            record.Size,
+		wrappedDEK:      record.WrappedDEK,
+		kekKeyID:        record.KEKKeyID,
+		envelopeVersion: record.EnvelopeVersion,
+		keyWrapVersion:  record.KeyWrapVersion,
+	}
+}
+
+// previewObject builds the preview's descriptor. The storage key is derived
+// from the preview id rather than read from the database: there is no column
+// holding a path, so no stored value can redirect a read.
+//
+// It returns an error rather than an object with an empty key, so a descriptor
+// that could not name its object cannot exist. A row that says `ready` without a
+// usable preview id is corrupt metadata, and the honest answer for it is the one
+// this route already gives for every other absence — the caller asked for a
+// preview and there is none to serve. Reporting it as a generic failure instead
+// would turn a row-level inconsistency into a 500, which tells the client
+// nothing and pages someone for a file that simply has no preview.
+//
+// Nothing is repaired, guessed at or deleted here: the row is left exactly as it
+// is for an operator to look at, and the invalid id never appears in a response.
+func previewObject(record StoredAttachment) (encryptedObject, error) {
+	previewID, err := uuid.Parse(record.PreviewObjectID)
+	if err != nil {
+		return encryptedObject{}, domain.ErrPreviewUnavailable
+	}
+	return encryptedObject{
+		objectID:        record.PreviewObjectID,
+		workspaceID:     record.WorkspaceID,
+		objectKey:       domain.PreviewObjectKey(previewID),
+		size:            record.PreviewSize,
+		wrappedDEK:      record.PreviewWrappedDEK,
+		kekKeyID:        record.PreviewKEKKeyID,
+		envelopeVersion: record.PreviewEnvelopeVersion,
+		keyWrapVersion:  record.PreviewKeyWrapVersion,
+	}, nil
 }
 
 // openDecryptedContent turns an authorised row into a verified plaintext
@@ -756,11 +988,42 @@ func (s *AttachmentService) downloadableAttachment(
 func (s *AttachmentService) openDecryptedContent(
 	ctx context.Context, record StoredAttachment,
 ) (io.ReadCloser, error) {
-	attachmentID, err := uuid.Parse(record.ID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid stored attachment id")
+	return s.openEncryptedObject(ctx, contentObject(record))
+}
+
+// openEncryptedObject unwraps an object's data key and returns a verifying
+// plaintext reader.
+//
+// The version check comes first and there is no fallback: a persisted format
+// this build does not implement is refused rather than guessed at. The unwrap
+// then runs before storage is touched and long before a handler writes a status
+// line, which is what stops an edited length from ever reaching a client as a
+// shorter, complete-looking file.
+func (s *AttachmentService) openEncryptedObject(
+	ctx context.Context, object encryptedObject,
+) (io.ReadCloser, error) {
+	return openEncryptedObject(ctx, s.keys, s.objects, s.logger, object)
+}
+
+// openEncryptedObject is the free function behind the method, so the preview
+// worker — which has the same key ring and the same object store but no request
+// and no session — opens an attachment exactly the way a download does, rather
+// than through a second implementation that could drift from it.
+func openEncryptedObject(
+	ctx context.Context,
+	keys *crypto.Keyring,
+	objects ObjectStore,
+	logger *slog.Logger,
+	object encryptedObject,
+) (io.ReadCloser, error) {
+	if object.envelopeVersion != crypto.EnvelopeVersion {
+		return nil, fmt.Errorf("unsupported envelope version %d", object.envelopeVersion)
 	}
-	workspaceID, err := uuid.Parse(record.WorkspaceID)
+	objectID, err := uuid.Parse(object.objectID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid stored object id")
+	}
+	workspaceID, err := uuid.Parse(object.workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid stored workspace id")
 	}
@@ -768,22 +1031,22 @@ func (s *AttachmentService) openDecryptedContent(
 	// an id this deployment does not have configured is an operational failure,
 	// not something to work around by trying the keys it does have.
 	//
-	// record.Size is part of the binding, so this call is also the check on the
-	// recorded length. It runs before the object is opened and long before the
+	// The recorded size is part of the binding, so this call is also the check
+	// on that length. It runs before the object is opened and long before the
 	// handler writes a status line or a Content-Length, which is what stops an
-	// edited size_bytes from ever reaching a client as a shorter, complete
-	// looking file.
-	dataKey, err := s.keys.Unwrap(record.WrappedDEK, record.KEKKeyID, crypto.Binding{
-		AttachmentID:           attachmentID,
+	// edited size from ever reaching a client as a shorter, complete looking
+	// file.
+	dataKey, err := keys.Unwrap(object.wrappedDEK, object.kekKeyID, crypto.Binding{
+		AttachmentID:           objectID,
 		WorkspaceID:            workspaceID,
-		PlaintextSize:          record.Size,
-		KeyWrapVersion:         record.KeyWrapVersion,
-		ContentEnvelopeVersion: record.EnvelopeVersion,
+		PlaintextSize:          object.size,
+		KeyWrapVersion:         object.keyWrapVersion,
+		ContentEnvelopeVersion: object.envelopeVersion,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("unwrap attachment key: %w", err)
 	}
-	body, err := s.openStoredObject(ctx, record)
+	body, err := openStoredObject(ctx, objects, logger, object)
 	if err != nil {
 		return nil, err
 	}
@@ -791,7 +1054,7 @@ func (s *AttachmentService) openDecryptedContent(
 	// the binding proves the number was not edited, and the reader proves the
 	// stored stream really produces it, all the way to the authenticated final
 	// frame.
-	plaintext, err := crypto.NewDecryptingReader(body, dataKey, attachmentID, record.Size)
+	plaintext, err := crypto.NewDecryptingReader(body, dataKey, objectID, object.size)
 	if err != nil {
 		_ = body.Close()
 		return nil, fmt.Errorf("prepare attachment envelope: %w", err)
@@ -802,19 +1065,19 @@ func (s *AttachmentService) openDecryptedContent(
 // openStoredObject fetches the ciphertext, translating a missing object into an
 // operational failure rather than a client-visible 404: metadata says the object
 // exists, so reporting "not found" would describe storage to the caller.
-func (s *AttachmentService) openStoredObject(
-	ctx context.Context, record StoredAttachment,
+func openStoredObject(
+	ctx context.Context, objects ObjectStore, logger *slog.Logger, object encryptedObject,
 ) (io.ReadCloser, error) {
-	body, err := s.objects.Open(ctx, record.StorageObjectKey)
+	body, err := objects.Open(ctx, object.objectKey)
 	if err == nil {
 		return body, nil
 	}
 	if !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
 	}
-	s.logger.LogAttrs(ctx, slog.LevelError, "attachment object missing in storage",
-		slog.String("attachment_id", record.ID),
-		slog.String("workspace_id", record.WorkspaceID),
+	logger.LogAttrs(ctx, slog.LevelError, "attachment object missing in storage",
+		slog.String("object_id", object.objectID),
+		slog.String("workspace_id", object.workspaceID),
 	)
 	return nil, fmt.Errorf("%w: attachment object unavailable", domain.ErrUnavailable)
 }

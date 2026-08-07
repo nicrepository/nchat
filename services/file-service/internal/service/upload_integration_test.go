@@ -51,8 +51,13 @@ const (
 
 // integrationEnv holds the live dependencies plus the identifiers this run owns.
 type integrationEnv struct {
-	pool        *pgxpool.Pool
+	pool *pgxpool.Pool
+	// store serves the request paths; lifecycle is the same store wired with
+	// the attachment fence, which the invalidations require and the read and
+	// upload paths do not.
 	store       *storage.PGXAttachmentStore
+	lifecycle   *storage.PGXAttachmentStore
+	fence       storage.AttachmentFencing
 	objects     *storage.SeaweedFSStore
 	keys        *crypto.Keyring
 	workspaceID string
@@ -99,9 +104,21 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 		t.Skipf("SeaweedFS at %s is not reachable: %v", testSeaweedFSURLEnv, err)
 	}
 
+	lockPool, ok := storage.LockConnPoolFrom(pool)
+	if !ok {
+		t.Fatal("the integration pool must be able to lend lock connections")
+	}
+	txPool, ok := storage.TransactionPoolFrom(pool)
+	if !ok {
+		t.Fatal("the integration pool must be able to open transactions")
+	}
+	fence := storage.NewPGXAttachmentFence(lockPool, txPool, discardLogger())
+
 	env := &integrationEnv{
 		pool:        pool,
+		fence:       fence,
 		store:       storage.NewPGXAttachmentStore(pool),
+		lifecycle:   storage.NewFencedAttachmentStore(pool, fence),
 		objects:     objects,
 		keys:        integrationKeyring(t),
 		workspaceID: uuid.NewString(),
@@ -130,23 +147,49 @@ func integrationKeyring(t *testing.T) *crypto.Keyring {
 }
 
 // cleanup removes this run's rows and any object they still point at.
+//
+// Both objects are collected: an attachment's own, and the preview a job may
+// have produced from it. The preview key is derived rather than stored, so it
+// is rebuilt from the id the row carries.
 func (e *integrationEnv) cleanup(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 	rows, err := e.pool.Query(ctx,
-		`SELECT storage_object_key FROM files.attachments WHERE workspace_id = $1`, e.workspaceID)
+		`SELECT storage_object_key, preview_object_id::text
+		   FROM files.attachments WHERE workspace_id = $1`, e.workspaceID)
 	if err == nil {
 		var keys []string
 		for rows.Next() {
-			var key string
-			if scanErr := rows.Scan(&key); scanErr == nil {
+			var (
+				key       string
+				previewID *string
+			)
+			if scanErr := rows.Scan(&key, &previewID); scanErr == nil {
 				keys = append(keys, key)
+				if previewID != nil {
+					if parsed, parseErr := uuid.Parse(*previewID); parseErr == nil {
+						keys = append(keys, domain.PreviewObjectKey(parsed))
+					}
+				}
 			}
 		}
 		rows.Close()
 		for _, key := range keys {
 			_ = e.objects.Delete(ctx, key)
 		}
+	}
+	// The cleanup queue is not scoped to a workspace — a job is only an object
+	// key — so this run's jobs are removed by matching the keys its own rows
+	// produced. Without it, jobs accumulate across runs and a later test that
+	// reads the queue sees another test's leftovers.
+	if _, err := e.pool.Exec(ctx, `
+		DELETE FROM files.object_cleanup_jobs
+		 WHERE object_key IN (
+			SELECT 'nchat/previews/' || preview_object_id::text
+			  FROM files.attachments
+			 WHERE workspace_id = $1 AND preview_object_id IS NOT NULL
+		 )`, e.workspaceID); err != nil {
+		t.Errorf("cleanup queue: %v", err)
 	}
 	if _, err := e.pool.Exec(ctx,
 		`DELETE FROM files.attachments WHERE workspace_id = $1`, e.workspaceID); err != nil {
@@ -464,9 +507,11 @@ func TestIntegrationMarkUploadedOnlyAdvancesPendingRows(t *testing.T) {
 	err = env.store.MarkUploaded(context.Background(), service.UploadedAttachment{
 		ID: view.ID, Status: domain.StatusClean, DetectedMIME: "text/plain",
 		Size: 1, CiphertextSize: 1,
-		// A complete binding, so the guard being exercised is the SQL one on the
-		// previous state and not the caller-side completeness check.
+		// A complete binding and a valid initial preview state, so the guard
+		// being exercised is the SQL one on the previous state and not one of
+		// the caller-side completeness checks.
 		WrappedDEK: []byte{1, 2, 3}, KEKKeyID: integrationKeyID,
+		PreviewStatus: domain.PreviewStatusUnsupported,
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for a non-pending row, got %v", err)
