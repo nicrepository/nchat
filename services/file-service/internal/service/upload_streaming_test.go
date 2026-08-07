@@ -118,6 +118,17 @@ func (p *probeObjectStore) Open(_ context.Context, key string) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(content)), nil
 }
 
+func (p *probeObjectStore) OpenRange(_ context.Context, key string, offset int64) (io.ReadCloser, error) {
+	content, ok := p.objects[key]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	if offset < 0 || offset > int64(len(content)) {
+		return nil, domain.ErrInvalidInput
+	}
+	return io.NopCloser(bytes.NewReader(content[offset:])), nil
+}
+
 func (p *probeObjectStore) Delete(_ context.Context, key string) error {
 	delete(p.objects, key)
 	return nil

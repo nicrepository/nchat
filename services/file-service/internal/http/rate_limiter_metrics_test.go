@@ -1,7 +1,6 @@
 package httpapi_test
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,7 +163,7 @@ func TestAttachmentMetricsAreExportedWithBoundedLabels(t *testing.T) {
 
 	useCases.download = service.Download{
 		Filename: "report.pdf", ContentType: "application/pdf",
-		Size: 7, Content: io.NopCloser(strings.NewReader("payload")),
+		Size: 7, Content: seekableContent([]byte("payload")),
 	}
 	download := httptest.NewRecorder()
 	router.ServeHTTP(download, downloadRequest(t, uuid.NewString()))

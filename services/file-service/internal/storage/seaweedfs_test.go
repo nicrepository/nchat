@@ -323,3 +323,93 @@ func TestNilStoreFailsClosed(t *testing.T) {
 type errReader struct{ err error }
 
 func (r *errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// --- ranged reads (RF-31) -----------------------------------------------
+
+func TestOpenRangeAsksTheFilerForTheOffset(t *testing.T) {
+	const object = "attachments/aa/bb/object"
+	content := []byte("0123456789abcdefghij")
+	var gotRange string
+	store, _ := newTestStore(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Range", "bytes 5-19/20")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(content[5:])
+	}))
+
+	body, err := store.OpenRange(context.Background(), object, 5)
+	if err != nil {
+		t.Fatalf("open range: %v", err)
+	}
+	defer func() { _ = body.Close() }()
+
+	if gotRange != "bytes=5-" {
+		t.Fatalf("expected an open-ended range from 5, got %q", gotRange)
+	}
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, content[5:]) {
+		t.Fatalf("unexpected body %q", got)
+	}
+}
+
+// A store that ignores the Range header answers 200 with the object from byte
+// zero. Those bytes decrypted at the requested offset would be garbage, or a
+// chunk opened at the wrong index, so the response is refused outright and
+// never used as if it had been a range.
+func TestOpenRangeRefusesAResponseThatIsNotPartial(t *testing.T) {
+	store, _ := newTestStore(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("the whole object from the start"))
+	}))
+
+	if _, err := store.OpenRange(context.Background(), "attachments/aa/bb/object", 5); !errors.Is(
+		err, domain.ErrUnavailable,
+	) {
+		t.Fatalf("expected ErrUnavailable, got %v", err)
+	}
+}
+
+func TestOpenRangeMapsAMissingObject(t *testing.T) {
+	store, _ := newTestStore(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	if _, err := store.OpenRange(context.Background(), "attachments/aa/bb/object", 0); !errors.Is(
+		err, domain.ErrNotFound,
+	) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// The offset is the service's own arithmetic, never a client value, so a
+// negative one is a programming error and is refused rather than sent.
+func TestOpenRangeRefusesANegativeOffset(t *testing.T) {
+	store, _ := newTestStore(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("a negative offset must never reach the filer")
+	}))
+
+	if _, err := store.OpenRange(context.Background(), "attachments/aa/bb/object", -1); !errors.Is(
+		err, domain.ErrInvalidInput,
+	) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+// The key is validated exactly as it is for every other operation, so a ranged
+// read cannot become a path traversal.
+func TestOpenRangeValidatesTheObjectKey(t *testing.T) {
+	store, _ := newTestStore(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("an invalid key must never reach the filer")
+	}))
+
+	for _, key := range []string{"../etc/passwd", "attachments/../../secret", "HTTP://evil"} {
+		if _, err := store.OpenRange(context.Background(), key, 0); !errors.Is(
+			err, domain.ErrInvalidInput,
+		) {
+			t.Fatalf("key %q: expected ErrInvalidInput, got %v", key, err)
+		}
+	}
+}

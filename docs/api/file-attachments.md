@@ -4,9 +4,9 @@ Upload, consulta e download autenticados de arquivos e imagens em canais e DMs.
 O conteudo e cifrado com envelope encryption antes de chegar ao SeaweedFS.
 
 Fora de escopo nesta fase: worker completo do ClamAV, politica de retencao
-(RF-34), URLs publicas, upload resumivel, deduplicacao, criptografia E2E MLS de
-anexos e Range requests. Preview de video (com Range) tambem continua fora: o
-RF-31 implementado aqui cobre **imagem e primeira pagina de PDF**.
+(RF-34), URLs publicas, upload resumivel, deduplicacao e criptografia E2E MLS de
+anexos. O RF-31 implementado aqui cobre **thumbnail de imagem, primeira pagina
+de PDF e preview inline de video com HTTP Range**.
 
 ## Habilitacao
 
@@ -495,30 +495,109 @@ Headers da resposta:
 - `Content-Type`: tipo detectado no upload;
 - `Content-Disposition: attachment; filename="..."; filename*=UTF-8''...`;
 - `X-Content-Type-Options: nosniff`;
-- `Accept-Ranges: none`;
+- `Accept-Ranges: bytes`;
+- `Cache-Control: private, no-store` -- inclusive nas respostas `206`, porque a
+  visibilidade e reavaliada a cada request e nenhum cache compartilhado pode
+  tomar essa decisao;
 - `Content-Length`: tamanho autenticado do plaintext.
 
 Nada e servido inline. HTML, SVG e JavaScript enviados como anexo sao baixados,
 nunca renderizados na origem da API.
 
-Range requests sao recusadas com `416 range_not_supported`. Servir um intervalo
-exigiria pular para o meio de um stream autenticado por chunks, o que esta
-versao do envelope nao suporta; responder com o corpo inteiro ou com uma fatia
-nao verificada seria pior do que recusar.
-
 | Status | Codigo                | Quando                                         |
 | ------ | --------------------- | ---------------------------------------------- |
 | 200    | -                     | anexo `clean` e visivel ao usuario             |
+| 206    | -                     | `Range` valido e satisfazivel                  |
 | 401    | `unauthorized`        | token invalido ou sessao inativa               |
 | 404    | `not_found`           | anexo inexistente, removido ou fora do alcance |
 | 409    | `file_not_scanned`    | anexo existe e e visivel, mas nao esta `clean` |
-| 416    | `range_not_supported` | header `Range` presente                        |
+| 416    | `range_not_supported` | mais de um intervalo por request               |
+| 416    | -                     | intervalo unico invalido ou fora do arquivo    |
 | 503    | `service_unavailable` | storage indisponivel ou objeto ausente         |
 
 Se a integridade falhar no meio do stream (objeto alterado, truncado,
 reordenado ou substituido), a resposta e abortada com corpo menor que o
 `Content-Length` declarado. O cliente ve uma transferencia quebrada, nunca um
 arquivo parcial tratado como completo.
+
+### HTTP Range (RF-31)
+
+Esta rota aceita `Range: bytes=...`, que e o que permite reproduzir e navegar um
+video sem baixar o arquivo inteiro.
+
+```bash
+curl -r 1048576-1049599 https://nchat.local:8443/api/files/attachments/$ID/content \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+Formas aceitas: `bytes=inicio-fim`, `bytes=inicio-` e `bytes=-sufixo`. Um
+intervalo valido responde `206` com `Content-Range: bytes inicio-fim/total`,
+`Content-Length` apenas do segmento e o `Content-Type` original -- os mesmos
+headers de seguranca da resposta completa, incluindo `Content-Disposition:
+attachment` e `nosniff`.
+
+O parsing e o de `net/http` (`http.ServeContent`), nao um parser proprio, entao
+limites invertidos, numeros fora de `int64`, unidades desconhecidas e intervalos
+que comecam depois do fim do arquivo sao tratados la. Consequencias observaveis:
+
+- intervalo que comeca em/apos o tamanho: `416` com `Content-Range: bytes */N`;
+- intervalo malformado: `416` sem `Content-Range`, corpo `text/plain` -- nao o
+  envelope `{error:{code,message}}` do restante da API;
+- `bytes=` sem nenhum intervalo, e qualquer `Range` em arquivo de tamanho zero:
+  header ignorado, resposta `200` normal;
+- `bytes=-0`: `206` com corpo vazio.
+
+**Multiplos intervalos nao sao suportados.** Cada intervalo custa uma leitura
+propria no storage e uma decifragem propria, entao uma lista permitiria que um
+request barato virasse muitos caros. `Range` contendo virgula responde `416
+range_not_supported` com `Content-Range: bytes */N`; nenhuma resposta
+`multipart/byteranges` e produzida. Players de midia pedem um intervalo por vez.
+
+#### Range e o gate de malware scan
+
+`Range` nao e um caminho alternativo de acesso. Autenticacao, autorizacao do
+anexo e o gate de scan sao resolvidos **antes** de o header ser lido: um
+`Range: bytes=0-1` sobre anexo `pending_scan` responde `409`, sobre anexo
+invisivel responde `404`, e sobre requisicao sem token responde `401` -- nenhum
+byte sai em qualquer um dos casos.
+
+#### Range e envelope encryption
+
+O formato NCF1 permite acesso aleatorio sem mudanca alguma: todo chunk exceto o
+ultimo tem exatamente 64 KiB de plaintext e ocupa um numero constante de bytes
+armazenados, e nenhum chunk depende do anterior (nonce = `baseNonce||indice`, e
+o indice entra na associated data). Logo o chunk que contem um offset, e onde
+ele comeca no objeto, sao aritmetica pura.
+
+Servir um intervalo custa **uma leitura ranged no SeaweedFS** (mais uma unica
+leitura de 12 bytes do header por download, reaproveitada nos seeks seguintes) e
+a decifragem de no maximo 64 KiB extras -- os bytes do chunk que precedem o
+offset. Nada antes do offset e lido ou decifrado.
+
+Garantias preservadas: cada chunk entregue continua autenticado contra a
+identidade do objeto, o proprio indice e a versao do formato, e o
+`plaintextSize` continua autenticado no wrapped DEK antes de qualquer header
+sair. Uma unica garantia nao se aplica a leitura parcial, por construcao: um
+intervalo que nao alcanca o frame final nao detecta truncamento da cauda do
+objeto. Os bytes servidos continuam autenticos e na posicao correta.
+
+#### Limitacao conhecida: o cliente web ainda nao usa Range
+
+O `<video>` do navegador nao consegue enviar `Authorization: Bearer`, e as
+alternativas que permitiriam isso sao todas piores -- token na URL vaza por
+historico, logs e referrer, e uma rota publica perderia a autorizacao por
+request e o gate de scan. O cliente web portanto busca o arquivo pelo cliente
+autenticado normal e reproduz de um blob URL, o que carrega o arquivo inteiro
+antes de comecar.
+
+Por isso o player inline e limitado a **50 MiB** (`MAX_INLINE_VIDEO_BYTES` em
+`apps/web/src/chat/attachmentVideo.ts`); acima disso nao ha player e o arquivo
+continua sendo apenas um arquivo. O limite e conforto de cliente, nao controle:
+o servidor decide o que pode ser lido, com ou sem `Range`.
+
+O caminho de evolucao e um service worker na frente da rota de conteudo, que
+adicionaria o header e deixaria o `<video>` falar `Range` diretamente com o
+servico. O suporte a `Range` documentado acima ja esta pronto para isso.
 
 ## Preview inline (RF-31, issue #464)
 
@@ -602,7 +681,8 @@ na allowlist -- entao nao existe conteudo do usuario sendo servido inline. O
 nome do arquivo tambem nao e ecoado: a resposta nao e o arquivo.
 
 Nao ha URL publica, URL assinada nem token: a rota exige `Bearer` e reautoriza a
-cada chamada. `no-store` existe porque a visibilidade e reavaliada por request
+cada chamada. Esta rota nao aceita `Range` (`Accept-Ranges: none`): o preview e
+um JPEG pequeno e nao ha caso de uso para servi-lo em partes. `no-store` existe porque a visibilidade e reavaliada por request
 -- perder acesso ao canal precisa apagar tambem as miniaturas, e um cache
 compartilhado nao sabe decidir isso.
 

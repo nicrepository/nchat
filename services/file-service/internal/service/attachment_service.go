@@ -305,6 +305,10 @@ type ListDestinationAttachmentsInput struct {
 type ObjectStore interface {
 	Put(ctx context.Context, key string, body io.Reader) (int64, error)
 	Open(ctx context.Context, key string) (io.ReadCloser, error)
+	// OpenRange returns the object from a byte offset to its end. It is what
+	// makes serving an HTTP byte range possible without reading — or
+	// decrypting — everything before it.
+	OpenRange(ctx context.Context, key string, offset int64) (io.ReadCloser, error)
 	Delete(ctx context.Context, key string) error
 }
 
@@ -368,11 +372,18 @@ type AttachmentView struct {
 
 // Download is an authorised, decrypted content stream. Closing Content closes
 // the underlying storage response.
+//
+// Content seeks as well as reads, which is what lets a handler answer an HTTP
+// byte range without a second code path: a seek moves a plaintext cursor and
+// costs nothing until the next read, which then opens storage at the one chunk
+// the offset lands in. Seeking is a capability of the stream, never a relaxation
+// of anything above it — the authorization, the scan gate and the key unwrap
+// have all already happened by the time this struct exists.
 type Download struct {
 	Filename    string
 	ContentType string
 	Size        int64
-	Content     io.ReadCloser
+	Content     io.ReadSeekCloser
 }
 
 // AttachmentService owns the upload and download use cases, including the
@@ -987,7 +998,7 @@ func previewObject(record StoredAttachment) (encryptedObject, error) {
 // modified or truncated object fails mid-stream instead of being served whole.
 func (s *AttachmentService) openDecryptedContent(
 	ctx context.Context, record StoredAttachment,
-) (io.ReadCloser, error) {
+) (io.ReadSeekCloser, error) {
 	return s.openEncryptedObject(ctx, contentObject(record))
 }
 
@@ -1001,7 +1012,7 @@ func (s *AttachmentService) openDecryptedContent(
 // shorter, complete-looking file.
 func (s *AttachmentService) openEncryptedObject(
 	ctx context.Context, object encryptedObject,
-) (io.ReadCloser, error) {
+) (io.ReadSeekCloser, error) {
 	return openEncryptedObject(ctx, s.keys, s.objects, s.logger, object)
 }
 
@@ -1015,7 +1026,7 @@ func openEncryptedObject(
 	objects ObjectStore,
 	logger *slog.Logger,
 	object encryptedObject,
-) (io.ReadCloser, error) {
+) (io.ReadSeekCloser, error) {
 	if object.envelopeVersion != crypto.EnvelopeVersion {
 		return nil, fmt.Errorf("unsupported envelope version %d", object.envelopeVersion)
 	}
@@ -1046,20 +1057,19 @@ func openEncryptedObject(
 	if err != nil {
 		return nil, fmt.Errorf("unwrap attachment key: %w", err)
 	}
-	body, err := openStoredObject(ctx, objects, logger, object)
-	if err != nil {
+	// The stream is opened here, eagerly, exactly as it always was: a missing or
+	// unreachable object has to fail now — while the caller can still turn it
+	// into a status code — and never halfway through a response. Only a *seek*
+	// away from the start defers work, and by then this open has already proved
+	// the object is there.
+	reader := &rangeReader{
+		ctx: ctx, objects: objects, logger: logger,
+		object: object, dataKey: dataKey, objectID: objectID,
+	}
+	if err := reader.openAt(0); err != nil {
 		return nil, err
 	}
-	// The same length is handed to the reader as a second, independent check:
-	// the binding proves the number was not edited, and the reader proves the
-	// stored stream really produces it, all the way to the authenticated final
-	// frame.
-	plaintext, err := crypto.NewDecryptingReader(body, dataKey, objectID, object.size)
-	if err != nil {
-		_ = body.Close()
-		return nil, fmt.Errorf("prepare attachment envelope: %w", err)
-	}
-	return readCloser{Reader: plaintext, closer: body}, nil
+	return reader, nil
 }
 
 // openStoredObject fetches the ciphertext, translating a missing object into an
@@ -1280,12 +1290,3 @@ func sourceFailure(err error) error {
 	}
 	return fmt.Errorf("%w: upload stream failed", domain.ErrInvalidInput)
 }
-
-// readCloser pairs a decrypting reader with the storage stream underneath it,
-// so a handler closing the response body closes the connection too.
-type readCloser struct {
-	io.Reader
-	closer io.Closer
-}
-
-func (r readCloser) Close() error { return r.closer.Close() }

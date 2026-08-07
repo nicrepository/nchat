@@ -97,6 +97,12 @@ const (
 	headerSize    = len(magic) + baseNonceSize
 	blockSize     = ChunkSize + tagSize
 
+	// EnvelopeHeaderSize is the number of leading bytes of a stored object that
+	// carry the version magic and the base nonce. It is exported because random
+	// access needs it: a reader that starts at a later chunk still has to know
+	// the base nonce, which lives only here.
+	EnvelopeHeaderSize = headerSize
+
 	// dekAADSize is the fixed width of the wrapped-key associated data, laid out
 	// in dekAAD. It is a constant precisely because no field is variable-length.
 	dekAADSize = 4 + 2 + 2 + 16 + 16 + sha256.Size + 8
@@ -485,6 +491,78 @@ func CiphertextSize(plaintextSize int64) int64 {
 	return int64(headerSize) + fullChunks*int64(blockSize) + remainder + tagSize
 }
 
+// ChunkLocation maps a plaintext offset onto the stored envelope.
+//
+// Random access is possible at all because every chunk but the last holds
+// exactly ChunkSize plaintext bytes and is stored as exactly blockSize bytes,
+// so the chunk holding any offset — and where that chunk starts in the object —
+// are pure arithmetic. Nothing has to be decrypted to find them, and no chunk
+// depends on the one before it: the nonce is baseNonce||index and the
+// associated data names the index outright.
+//
+// It returns the index of the chunk containing plaintextOffset, the byte offset
+// of that chunk inside the stored object, and how many plaintext bytes of that
+// chunk precede the requested offset and must be discarded.
+//
+// plaintextOffset must not be negative. An offset at or past the end of the
+// plaintext still names a real chunk — the final one — because the writer always
+// closes the stream with a short chunk, empty when the length is a whole
+// multiple of ChunkSize.
+func ChunkLocation(plaintextOffset int64) (chunkIndex uint32, ciphertextOffset, skip int64) {
+	if plaintextOffset < 0 {
+		plaintextOffset = 0
+	}
+	index := plaintextOffset / ChunkSize
+	// An index this large cannot exist: the writer refuses to seal a stream whose
+	// counter would reach MaxUint32, so no stored object addresses that far.
+	if index > math.MaxUint32 {
+		index = math.MaxUint32
+	}
+	return uint32(index), //nolint:gosec // G115: clamped to MaxUint32 above.
+		int64(headerSize) + index*int64(blockSize),
+		plaintextOffset % ChunkSize
+}
+
+// NewChunkReader returns a plaintext reader over an envelope's chunks starting
+// at firstChunk, for a caller that has already read the object's header and is
+// supplying the ciphertext from ChunkLocation's offset.
+//
+// It is the random-access form of NewDecryptingReader and gives up exactly one
+// guarantee, unavoidably: a reader that stops before the authenticated final
+// frame cannot notice that the object's tail was truncated. Everything else
+// holds unchanged — every chunk it does yield is authenticated against the
+// object's id, its own index in the stream and the format version, so a chunk
+// moved, duplicated, lifted from another object or edited in any byte fails.
+//
+// The header's own bytes are not authenticated directly, and do not need to be:
+// an edited base nonce simply makes every chunk's tag fail to verify.
+func NewChunkReader(
+	header []byte, chunks io.Reader, dataKey []byte,
+	objectID uuid.UUID, plaintextSize int64, firstChunk uint32,
+) (io.Reader, error) {
+	reader, err := newDecryptingReader(chunks, dataKey, objectID, plaintextSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(header) != headerSize || string(header[:len(magic)]) != string(magic[:]) {
+		return nil, fmt.Errorf("%w: unsupported envelope", ErrCiphertext)
+	}
+	// Every chunk before the first one requested is a full chunk, by the format's
+	// own definition, so the plaintext already skipped is exact rather than
+	// assumed. Seeding the counter with it keeps the length invariant meaningful:
+	// a stream that runs past the authenticated size, or ends short of it, still
+	// fails.
+	produced := int64(firstChunk) * ChunkSize
+	if produced > plaintextSize {
+		return nil, fmt.Errorf("%w: chunk beyond plaintext length", ErrCiphertext)
+	}
+	copy(reader.baseNonce[:], header[len(magic):])
+	reader.headerRead = true
+	reader.index = firstChunk
+	reader.produced = produced
+	return reader, nil
+}
+
 // NewEncryptingReader returns a reader that yields the encrypted envelope for
 // src. Nothing is buffered beyond a single chunk, so a 50 MiB upload costs
 // 64 KiB of memory. Errors from src are propagated unchanged so a caller can
@@ -586,6 +664,12 @@ func (r *encryptingReader) aad(final bool) []byte {
 func NewDecryptingReader(
 	src io.Reader, dataKey []byte, attachmentID uuid.UUID, plaintextSize int64,
 ) (io.Reader, error) {
+	return newDecryptingReader(src, dataKey, attachmentID, plaintextSize)
+}
+
+func newDecryptingReader(
+	src io.Reader, dataKey []byte, attachmentID uuid.UUID, plaintextSize int64,
+) (*decryptingReader, error) {
 	if plaintextSize < 0 {
 		return nil, fmt.Errorf("%w: plaintext size must not be negative", ErrInvalidBinding)
 	}

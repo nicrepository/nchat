@@ -695,7 +695,7 @@ func TestDownloadServesTheContentWithSafeHeaders(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.download = service.Download{
 		Filename: "relatório final.pdf", ContentType: "application/pdf",
-		Size: int64(len(payload)), Content: io.NopCloser(bytes.NewReader(payload)),
+		Size: int64(len(payload)), Content: seekableContent(payload),
 	}
 	router := newTestRouter(t, useCases, enabledConfig())
 	response := httptest.NewRecorder()
@@ -714,8 +714,15 @@ func TestDownloadServesTheContentWithSafeHeaders(t *testing.T) {
 	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Fatalf("expected nosniff, got %q", got)
 	}
-	if got := response.Header().Get("Accept-Ranges"); got != "none" {
-		t.Fatalf("expected Accept-Ranges none, got %q", got)
+	if got := response.Header().Get("Accept-Ranges"); got != "bytes" {
+		t.Fatalf("expected Accept-Ranges bytes, got %q", got)
+	}
+	// Attachment content is private and re-authorised on every request, so no
+	// shared cache may keep it. Asserted on the route itself rather than on the
+	// global middleware: this response must carry the policy whoever else is in
+	// the chain.
+	if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("expected private, no-store, got %q", got)
 	}
 	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
 		t.Fatalf("unexpected content length %q", got)
@@ -745,7 +752,7 @@ func TestDownloadNeverServesActiveContentInline(t *testing.T) {
 			payload := []byte("<script>alert(1)</script>")
 			useCases.download = service.Download{
 				Filename: "payload.html", ContentType: contentType,
-				Size: int64(len(payload)), Content: io.NopCloser(bytes.NewReader(payload)),
+				Size: int64(len(payload)), Content: seekableContent(payload),
 			}
 			router := newTestRouter(t, useCases, enabledConfig())
 			response := httptest.NewRecorder()
@@ -766,7 +773,7 @@ func TestDownloadEscapesAQuotedFilename(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.download = service.Download{
 		Filename: `evil";attachment;x=".pdf`, ContentType: "application/pdf",
-		Size: 1, Content: io.NopCloser(strings.NewReader("x")),
+		Size: 1, Content: seekableContent([]byte("x")),
 	}
 	router := newTestRouter(t, useCases, enabledConfig())
 	response := httptest.NewRecorder()
@@ -783,7 +790,7 @@ func TestDownloadFallsBackWhenTheFilenameHasNoASCII(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.download = service.Download{
 		Filename: "relatório", ContentType: "application/pdf",
-		Size: 1, Content: io.NopCloser(strings.NewReader("x")),
+		Size: 1, Content: seekableContent([]byte("x")),
 	}
 	router := newTestRouter(t, useCases, enabledConfig())
 	response := httptest.NewRecorder()
@@ -794,23 +801,274 @@ func TestDownloadFallsBackWhenTheFilenameHasNoASCII(t *testing.T) {
 	}
 }
 
-func TestDownloadRejectsRangeRequests(t *testing.T) {
+// --- byte ranges (RF-31) ------------------------------------------------
+
+// rangePayload is deliberately long enough that a range is a genuine subset and
+// short enough to compare byte for byte.
+var rangePayload = []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+
+// rangeResponse performs one download with the given Range header. An empty
+// header sends none at all, which is not the same request as an empty one.
+func rangeResponse(t *testing.T, header string, payload []byte) *httptest.ResponseRecorder {
+	t.Helper()
 	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: "clip.mp4", ContentType: "video/mp4",
+		Size: int64(len(payload)), Content: seekableContent(payload),
+	}
 	router := newTestRouter(t, useCases, enabledConfig())
 	request := downloadRequest(t, uuid.NewString())
-	request.Header.Set("Range", "bytes=0-99")
+	if header != "" {
+		request.Header.Set("Range", header)
+	}
 	response := httptest.NewRecorder()
-
 	router.ServeHTTP(response, request)
+	return response
+}
+
+// A request with no Range is unchanged by the feature: the whole file, 200, and
+// the same safe headers it has always carried. Only Accept-Ranges moves, and it
+// has to — a client learns that seeking is possible from nowhere else.
+func TestDownloadWithoutRangeStillServesTheWholeFile(t *testing.T) {
+	response := rangeResponse(t, "", rangePayload)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	if !bytes.Equal(response.Body.Bytes(), rangePayload) {
+		t.Fatal("expected the complete body")
+	}
+	if got := response.Header().Get("Accept-Ranges"); got != "bytes" {
+		t.Fatalf("expected Accept-Ranges bytes, got %q", got)
+	}
+	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(rangePayload)) {
+		t.Fatalf("unexpected length %q", got)
+	}
+	if response.Header().Get("Content-Range") != "" {
+		t.Fatal("a full response must not carry Content-Range")
+	}
+}
+
+// The bytes returned are exactly the bytes asked for — the property everything
+// else in the contract exists to describe.
+func TestDownloadServesTheRequestedByteRange(t *testing.T) {
+	last := len(rangePayload) - 1
+	tests := []struct {
+		name   string
+		header string
+		want   []byte
+		rng    string
+	}{
+		{"first byte", "bytes=0-0", rangePayload[:1], "bytes 0-0/36"},
+		{"leading run", "bytes=0-9", rangePayload[:10], "bytes 0-9/36"},
+		{"interior run", "bytes=10-19", rangePayload[10:20], "bytes 10-19/36"},
+		{"open ended", "bytes=30-", rangePayload[30:], "bytes 30-35/36"},
+		{"suffix", "bytes=-6", rangePayload[30:], "bytes 30-35/36"},
+		{"last byte", "bytes=35-35", rangePayload[last:], "bytes 35-35/36"},
+		{"whole file", "bytes=0-35", rangePayload, "bytes 0-35/36"},
+		// An end past the file is clamped, not refused: the client gets what
+		// exists and Content-Range tells it what that was.
+		{"end beyond size", "bytes=30-9999", rangePayload[30:], "bytes 30-35/36"},
+		// A suffix longer than the file is the whole file.
+		{"suffix beyond size", "bytes=-9999", rangePayload, "bytes 0-35/36"},
+		{"spaces are tolerated", "bytes= 5-9 ", rangePayload[5:10], "bytes 5-9/36"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := rangeResponse(t, tt.header, rangePayload)
+
+			if response.Code != http.StatusPartialContent {
+				t.Fatalf("expected 206, got %d: %s", response.Code, response.Body.String())
+			}
+			if !bytes.Equal(response.Body.Bytes(), tt.want) {
+				t.Fatalf("expected %q, got %q", tt.want, response.Body.Bytes())
+			}
+			if got := response.Header().Get("Content-Range"); got != tt.rng {
+				t.Fatalf("expected Content-Range %q, got %q", tt.rng, got)
+			}
+			if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len(tt.want)) {
+				t.Fatalf("expected the segment's length, got %q", got)
+			}
+			// A partial response is still the attachment: the type and the
+			// headers that keep it from being rendered do not change with it.
+			if got := response.Header().Get("Content-Type"); got != "video/mp4" {
+				t.Fatalf("unexpected content type %q", got)
+			}
+			if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("expected nosniff, got %q", got)
+			}
+			// A partial response is the case that most needs the policy: a
+			// proxy caching one range of one caller's video would hand it to
+			// the next caller asking for the same bytes.
+			if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+				t.Fatalf("expected private, no-store, got %q", got)
+			}
+			if !strings.HasPrefix(response.Header().Get("Content-Disposition"), "attachment;") {
+				t.Fatal("a range must not become an inline response")
+			}
+		})
+	}
+}
+
+// A range that starts at or past the end of the file overlaps nothing. It is
+// refused with the length, so a client that guessed wrong can correct itself
+// without a second probing request.
+func TestDownloadRefusesRangesPastTheEnd(t *testing.T) {
+	for _, header := range []string{"bytes=36-", "bytes=36-40", "bytes=100-200"} {
+		t.Run(header, func(t *testing.T) {
+			response := rangeResponse(t, header, rangePayload)
+
+			if response.Code != http.StatusRequestedRangeNotSatisfiable {
+				t.Fatalf("expected 416, got %d", response.Code)
+			}
+			if got := response.Header().Get("Content-Range"); got != "bytes */36" {
+				t.Fatalf("expected bytes */36, got %q", got)
+			}
+		})
+	}
+}
+
+// Nothing a client can put in a Range header may produce a slice of the file.
+// Reversed bounds, junk, a foreign unit and numbers far beyond int64 all end the
+// same way: refused, with no part of the content in the body.
+func TestDownloadRefusesMalformedRanges(t *testing.T) {
+	headers := []string{
+		"bytes=20-10",
+		"bytes=-5-10",
+		"bytes=-",
+		"bytes=abc-def",
+		"bytes=99999999999999999999-",
+		"bytes=0-99999999999999999999",
+		"items=0-9",
+		"0-9",
+	}
+	for _, header := range headers {
+		t.Run(header, func(t *testing.T) {
+			response := rangeResponse(t, header, rangePayload)
+
+			if response.Code != http.StatusRequestedRangeNotSatisfiable {
+				t.Fatalf("expected 416, got %d", response.Code)
+			}
+			if bytes.Contains(response.Body.Bytes(), rangePayload[:4]) {
+				t.Fatal("a refused range must not return content")
+			}
+		})
+	}
+}
+
+// `bytes=-0` asks for the last zero bytes. net/http answers it as an empty 206
+// rather than a 416; the body is empty either way, so nothing is disclosed and
+// nothing is read. Asserted so the behaviour is a recorded decision rather than
+// something a future reader has to rediscover.
+func TestDownloadAnswersAZeroLengthSuffixWithNoContent(t *testing.T) {
+	response := rangeResponse(t, "bytes=-0", rangePayload)
+
+	if response.Body.Len() != 0 {
+		t.Fatalf("expected an empty body, got %q", response.Body.Bytes())
+	}
+}
+
+// A header naming no range at all is not a request for part of the file, so it
+// is ignored and the whole file is served — the same answer as sending no
+// header.
+func TestDownloadIgnoresAnEmptyRangeSet(t *testing.T) {
+	response := rangeResponse(t, "bytes=", rangePayload)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	if !bytes.Equal(response.Body.Bytes(), rangePayload) {
+		t.Fatal("expected the complete body")
+	}
+}
+
+// Only one range per request. Each one costs its own storage read and its own
+// chunk decryption, so a list is refused rather than turned into a fan-out.
+func TestDownloadRefusesMultipleRanges(t *testing.T) {
+	response := rangeResponse(t, "bytes=0-9,20-29", rangePayload)
 
 	if response.Code != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("expected 416, got %d", response.Code)
 	}
-	if errorCode(t, response) != "range_not_supported" {
-		t.Fatalf("unexpected code %q", errorCode(t, response))
+	if got := errorCode(t, response); got != "range_not_supported" {
+		t.Fatalf("unexpected code %q", got)
 	}
-	if response.Header().Get("Accept-Ranges") != "none" {
-		t.Fatal("expected Accept-Ranges none")
+	if got := response.Header().Get("Content-Range"); got != "bytes */36" {
+		t.Fatalf("expected bytes */36, got %q", got)
+	}
+	if strings.Contains(response.Header().Get("Content-Type"), "multipart/byteranges") {
+		t.Fatal("multipart/byteranges must never be produced")
+	}
+}
+
+// An empty attachment has no satisfiable range. net/http deliberately ignores
+// the header rather than refusing, because clients that attach a Range to every
+// request would otherwise fail on a zero-byte file. The response is an empty
+// 200, which is the right answer to "give me this file" either way.
+func TestDownloadRangeOnAnEmptyAttachment(t *testing.T) {
+	response := rangeResponse(t, "bytes=0-0", nil)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	if response.Body.Len() != 0 {
+		t.Fatal("an empty attachment has no bytes to serve")
+	}
+	if response.Header().Get("Content-Range") != "" {
+		t.Fatal("an ignored range must not produce Content-Range")
+	}
+}
+
+// The regression the whole feature has to survive: a range is not a second way
+// in. Every refusal the download already makes is made before a Range header is
+// so much as looked at, so not even two bytes of a file the scan has not
+// cleared — or of one the caller cannot see — can be extracted.
+func TestRangeCannotBypassTheScanGateOrAuthorization(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"scan pending", domain.ErrNotDownloadable, http.StatusConflict},
+		{"scan rejected", domain.ErrNotDownloadable, http.StatusConflict},
+		{"not visible", domain.ErrNotFound, http.StatusNotFound},
+		{"session expired", domain.ErrUnauthorized, http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useCases := readyUseCases()
+			useCases.downloadErr = tt.err
+			router := newTestRouter(t, useCases, enabledConfig())
+			request := downloadRequest(t, uuid.NewString())
+			request.Header.Set("Range", "bytes=0-1")
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			if response.Code != tt.want {
+				t.Fatalf("expected %d, got %d", tt.want, response.Code)
+			}
+			if response.Header().Get("Content-Range") != "" {
+				t.Fatal("a refused request must not describe the object")
+			}
+			if bytes.Contains(response.Body.Bytes(), rangePayload[:2]) {
+				t.Fatal("a refused request must not leak content")
+			}
+		})
+	}
+}
+
+// An unauthenticated caller is refused before anything else, Range or not.
+func TestRangeRequiresAuthentication(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	request := httptest.NewRequest(http.MethodGet, "/attachments/"+uuid.NewString()+"/content", nil)
+	request.Header.Set("Range", "bytes=0-1")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
 	}
 }
 
@@ -855,9 +1113,10 @@ func TestDownloadAbortsWhenTheStreamFails(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.download = service.Download{
 		Filename: "report.pdf", ContentType: "application/pdf", Size: 100,
-		Content: io.NopCloser(&failingReader{
-			data: []byte("partial"), err: errors.New("ciphertext authentication failed"),
-		}),
+		Content: &failingReader{
+			size: 100, data: []byte("partial"),
+			err: errors.New("ciphertext authentication failed"),
+		},
 	}
 	router := newTestRouter(t, useCases, enabledConfig())
 	response := httptest.NewRecorder()
@@ -970,11 +1229,27 @@ func TestNewRouterToleratesANilLogger(t *testing.T) {
 	}
 }
 
+// failingReader is a body that measures like a whole object and then fails
+// part-way through, which is what an integrity failure looks like to a handler
+// that has already committed its headers.
 type failingReader struct {
+	size int64
 	data []byte
 	err  error
 	read int
 }
+
+// Seek reports the declared length so http.ServeContent measures this stream
+// exactly as it measures a real one. Nothing is repositioned: the test only
+// reads forward, and the failure under test is in Read.
+func (r *failingReader) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekEnd {
+		return r.size + offset, nil
+	}
+	return offset, nil
+}
+
+func (r *failingReader) Close() error { return nil }
 
 func (r *failingReader) Read(p []byte) (int, error) {
 	if r.read >= len(r.data) {
@@ -1004,7 +1279,7 @@ func TestDownloadFilenameCannotInjectHeaderParameters(t *testing.T) {
 			useCases := readyUseCases()
 			useCases.download = service.Download{
 				Filename: tt.filename, ContentType: "application/pdf",
-				Size: 1, Content: io.NopCloser(strings.NewReader("x")),
+				Size: 1, Content: seekableContent([]byte("x")),
 			}
 			router := newTestRouter(t, useCases, enabledConfig())
 			response := httptest.NewRecorder()
@@ -1087,7 +1362,7 @@ func TestDownloadPublishesTheAuthenticatedLengthOnSuccess(t *testing.T) {
 	useCases := readyUseCases()
 	useCases.download = service.Download{
 		Filename: "report.pdf", ContentType: "application/pdf", Size: int64(len(payload)),
-		Content: io.NopCloser(bytes.NewReader(payload)),
+		Content: seekableContent(payload),
 	}
 	router := newTestRouter(t, useCases, enabledConfig())
 	response := httptest.NewRecorder()
@@ -1103,4 +1378,15 @@ func TestDownloadPublishesTheAuthenticatedLengthOnSuccess(t *testing.T) {
 	if response.Body.String() != string(payload) {
 		t.Fatalf("unexpected body %q", response.Body.String())
 	}
+}
+
+// contentStream is the seekable body a Download carries. Tests build one from
+// bytes so http.ServeContent measures and slices it exactly as it does in
+// production — a body that only reads would never exercise the range contract.
+type contentStream struct{ *bytes.Reader }
+
+func (contentStream) Close() error { return nil }
+
+func seekableContent(payload []byte) io.ReadSeekCloser {
+	return contentStream{bytes.NewReader(payload)}
 }

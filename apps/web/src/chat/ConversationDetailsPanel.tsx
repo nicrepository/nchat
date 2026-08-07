@@ -27,10 +27,11 @@
  * - Attachments are metadata only. Nothing here links to content: the download
  *   endpoint needs an Authorization header and refuses anything the scan has
  *   not cleared, so the panel does not pretend a file is retrievable by URL.
- *   The one exception is the RF-31 thumbnail, and it is not an exception to the
- *   rule: AttachmentThumbnail fetches the bytes through the authenticated
- *   client and shows them from an object URL scoped to this document, so there
- *   is still no address anyone could share or reuse.
+ *   The RF-31 thumbnail and video player look like exceptions and are not:
+ *   AttachmentThumbnail and AttachmentVideo fetch their bytes through the
+ *   authenticated client and show them from an object URL scoped to this
+ *   document, so there is still no address anyone could share or reuse, and
+ *   neither is drawn for a file the scan has not cleared.
  *
  * The panel is a layout sibling of the conversation, never a modal and never a
  * route: it renders beside the messages so opening it cannot unmount the
@@ -42,6 +43,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
 import AttachmentThumbnail from "./AttachmentThumbnail";
+import AttachmentVideo from "./AttachmentVideo";
 import RichTextRenderer from "./RichTextRenderer";
 import type {
   AddMembersResult,
@@ -866,6 +868,11 @@ function ConversationBody({
                       )}
                     </span>
                   </span>
+                  {/* The player is a sibling of the row rather than part of it,
+                      so it wraps onto its own line and a file that is not a
+                      playable video renders nothing at all — the row keeps its
+                      icon, its size and its status untouched. */}
+                  <AttachmentVideo attachment={file} />
                 </li>
               ))}
             </ul>

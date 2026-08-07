@@ -143,6 +143,48 @@ func (s *SeaweedFSStore) Open(ctx context.Context, key string) (io.ReadCloser, e
 	return response.Body, nil
 }
 
+// OpenRange returns the stored ciphertext stream from offset to the end of the
+// object. The caller owns closing it, and closing early is the normal case: a
+// reader that only needs one chunk stops reading and the connection is dropped,
+// so the filer never sends more than the transfer window ahead.
+//
+// A response that is not 206 is refused rather than used. That check is the
+// whole point of the method: a store that ignored the Range header would answer
+// 200 with the object from byte zero, and those bytes decrypted at the offset
+// the caller asked about would be silent garbage — or, worse, a chunk opened at
+// the wrong index. There is no fallback to reading from the start.
+func (s *SeaweedFSStore) OpenRange(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("%w: negative storage offset", domain.ErrInvalidInput)
+	}
+	target, err := s.objectURL(key)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build storage request: %w", err)
+	}
+	// The offset is derived from the envelope's fixed chunk geometry, never from
+	// a client header, so this value is the service's own arithmetic.
+	request.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+
+	response, err := s.client.Do(request)
+	if err != nil {
+		return nil, storageRequestError("read", err)
+	}
+	if response.StatusCode == http.StatusNotFound {
+		drainAndClose(response)
+		return nil, domain.ErrNotFound
+	}
+	if response.StatusCode != http.StatusPartialContent {
+		drainAndClose(response)
+		return nil, fmt.Errorf("%w: storage range read returned status %d",
+			domain.ErrUnavailable, response.StatusCode)
+	}
+	return response.Body, nil
+}
+
 // Delete removes an object. An already-absent object is a success: Delete is
 // the compensation path and must be idempotent.
 func (s *SeaweedFSStore) Delete(ctx context.Context, key string) error {

@@ -127,6 +127,37 @@ export async function fetchAttachmentPreview(
   );
 }
 
+/**
+ * Fetches one attachment's decrypted content.
+ *
+ * Same authentication and the same server-side gates as every other route here:
+ * the bearer token travels in the header, never in a query string, and the
+ * server re-checks the attachment's visibility and its scan state on every call.
+ * No URL is built that anyone could hold on to or share.
+ *
+ * The bytes come back as a Blob because that is the only shape a browser can
+ * turn into something a media element will play without a URL that carries
+ * credentials. That is also this function's limit, and the reason its caller
+ * caps what it will ask for: a Blob is the whole file in memory, so the server's
+ * byte-range support — which exists precisely so a player can seek without
+ * downloading everything — is not what is being used here. See
+ * MAX_INLINE_VIDEO_BYTES in AttachmentVideo.
+ *
+ * A file the scan has not cleared answers 409 and one the caller cannot see
+ * answers 404 — both surface as ApiRequestError, and both mean the same thing to
+ * the UI: there is nothing to play.
+ */
+export async function fetchAttachmentContent(
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  return authenticatedFetch<Blob>(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}/content`,
+    { method: "GET", signal },
+    (response) => response.blob(),
+  );
+}
+
 // ── Upload (RF-32, issue #458) ───────────────────────────────────────────────
 
 export type AttachmentUploadErrorReason =

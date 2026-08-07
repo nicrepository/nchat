@@ -8,7 +8,7 @@ vi.mock("../lib/authClient", () => ({
   authenticatedFetch: (...args: unknown[]) => mockAuthFetch(...args),
 }));
 
-import { fetchConversationAttachments, uploadAttachment } from "./filesApi";
+import { fetchAttachmentContent, fetchConversationAttachments, uploadAttachment } from "./filesApi";
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -308,5 +308,40 @@ describe("uploadAttachment", () => {
     await expect(
       uploadAttachment({ kind: "channel", id: "ch-1" }, fileOfSize(1024), LIMIT),
     ).rejects.toBeInstanceOf(DOMException);
+  });
+});
+
+describe("fetchAttachmentContent", () => {
+  it("requests the content route with an encoded id and no credential in the URL", async () => {
+    mockAuthFetch.mockResolvedValueOnce(new Blob(["bytes"]));
+
+    await fetchAttachmentContent("a 1");
+
+    const [url, init, parse] = mockAuthFetch.mock.calls[0];
+    expect(url).toBe("/api/files/attachments/a%201/content");
+    expect(url).not.toContain("?");
+    expect(url).not.toMatch(/token|bearer|authorization/i);
+    expect(init).toEqual({ method: "GET", signal: undefined });
+    // The response is read as a Blob: that is the only shape a media element
+    // can be given without a URL that carries credentials.
+    expect(parse).toBeTypeOf("function");
+  });
+
+  it("passes the abort signal through so a request can be cancelled", async () => {
+    mockAuthFetch.mockResolvedValueOnce(new Blob(["bytes"]));
+    const controller = new AbortController();
+
+    await fetchAttachmentContent("a-1", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1]).toEqual({
+      method: "GET",
+      signal: controller.signal,
+    });
+  });
+
+  it("propagates a refusal so the caller can draw its fallback", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(409, "file_not_scanned", "nope"));
+
+    await expect(fetchAttachmentContent("a-1")).rejects.toBeInstanceOf(ApiRequestError);
   });
 });
