@@ -1,23 +1,14 @@
 /**
  * Inline attachment preview loading (RF-31, issue #464).
  *
- * # Why an object URL at all
- *
- * The preview route requires an Authorization header, and `<img src>` cannot
- * send one. The alternatives are worse than they look: a token in the query
- * string leaks through history, logs and referrers, and a signed public URL
- * would outlive the access it was minted under. So the bytes are fetched like
- * any other authenticated request and wrapped in a blob URL that exists only in
- * this document, for as long as a component shows it.
- *
- * That URL is a resource, not a string: every one created here is revoked when
- * the attachment changes, when the component unmounts, when a newer response
- * replaces it, and when the image turns out not to be renderable. A missed
- * revoke is a leak the page keeps until it is closed.
+ * The preview route requires an Authorization header and `<img src>` cannot
+ * send one, so the bytes are fetched like any other authenticated request and
+ * shown through an object URL. That URL is a resource with a lifetime, and
+ * owning it is useAttachmentBlobUrl's job — this module decides only *which*
+ * attachments have a preview to load and what to load for them.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-
+import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchAttachmentPreview } from "./filesApi";
 import type { ChannelAttachment } from "./chatTypes";
 
@@ -84,62 +75,10 @@ export interface AttachmentPreview {
  * or the request failed — which is exactly when the caller draws its fallback.
  */
 export function useAttachmentPreview(attachment: ChannelAttachment): AttachmentPreview {
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  // The URL is kept in a ref as well as in state because revoking is a side
-  // effect on the *previous* value, and cleanup functions and error callbacks
-  // both need it without re-reading a rendered value that may already be stale.
-  const currentUrl = useRef<string | null>(null);
-
-  const replaceUrl = useCallback((next: string | null) => {
-    if (currentUrl.current !== null) {
-      URL.revokeObjectURL(currentUrl.current);
-    }
-    currentUrl.current = next;
-    setPreviewUrl(next);
-  }, []);
-
-  const { id } = attachment;
-  const eligible = canShowPreview(attachment);
-
-  useEffect(() => {
-    // Nothing to load, and nothing to clear either: an attachment that stops
-    // being eligible went through this effect's cleanup on the way here, which
-    // is where the revoke happens.
-    if (!eligible) {
-      return;
-    }
-    // `active` and the abort signal cover the two different races: the request
-    // still in flight is cancelled, and a response that arrives anyway — an
-    // abort the browser did not honour in time — is dropped before it can
-    // become the URL of an attachment nobody is looking at any more.
-    let active = true;
-    const controller = new AbortController();
-
-    fetchAttachmentPreview(id, controller.signal)
-      .then((blob) => {
-        if (!active) return;
-        replaceUrl(URL.createObjectURL(blob));
-      })
-      .catch(() => {
-        // Every failure means the same thing here: no preview, show the icon.
-        // Nothing is retried — a 409 or a 404 would answer the same way every
-        // time, and a rerender must not turn that into a request loop.
-        if (active) replaceUrl(null);
-      });
-
-    return () => {
-      active = false;
-      controller.abort();
-      replaceUrl(null);
-    };
-    // The dependencies are the attachment's identity and its eligibility, both
-    // stable across an ordinary rerender, so the list re-rendering does not
-    // refetch anything.
-  }, [id, eligible, replaceUrl]);
-
-  const onLoadError = useCallback(() => {
-    replaceUrl(null);
-  }, [replaceUrl]);
-
-  return { previewUrl, onLoadError };
+  const { url, onLoadError } = useAttachmentBlobUrl(
+    attachment.id,
+    canShowPreview(attachment),
+    fetchAttachmentPreview,
+  );
+  return { previewUrl: url, onLoadError };
 }

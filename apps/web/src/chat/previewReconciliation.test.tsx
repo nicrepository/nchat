@@ -46,6 +46,9 @@ vi.mock("./filesApi", () => ({
   ) => mockFetchConversationAttachments(target, limit, signal),
   fetchAttachmentPreview: (id: string, signal?: AbortSignal) =>
     mockFetchAttachmentPreview(id, signal),
+  // AttachmentVideo imports it. No fixture here is a video, so it is never
+  // called; the export simply has to exist.
+  fetchAttachmentContent: () => Promise.reject(new Error("not used")),
 }));
 
 const revokeObjectURL = vi.fn();

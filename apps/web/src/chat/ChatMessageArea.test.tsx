@@ -208,6 +208,11 @@ vi.mock("./filesApi", () => ({
     limit: number,
     signal?: AbortSignal,
   ) => mockFetchChannelAttachments(target, limit, signal),
+  // The panel's file rows render a thumbnail and a video player. Neither is
+  // exercised here — no fixture is previewable or a video — but both modules
+  // read the export at render time, so it has to exist.
+  fetchAttachmentPreview: () => Promise.reject(new Error("not used")),
+  fetchAttachmentContent: () => Promise.reject(new Error("not used")),
 }));
 
 // useChatWebSocket is a no-op in component tests — WS behaviour is tested in
