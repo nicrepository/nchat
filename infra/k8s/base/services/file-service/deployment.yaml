@@ -92,13 +92,35 @@ spec:
               port: http
             periodSeconds: 5
             failureThreshold: 12
+          # The request is what the service needs to serve traffic: uploads and
+          # downloads are streamed in 64 KiB chunks, so steady state is small.
+          #
+          # The limit has to cover something else — the RF-31 preview worker.
+          # Rendering a PDF's first page builds a WebAssembly sandbox around
+          # PDFium, which costs roughly 180 MiB while it runs and is released
+          # when the render finishes. That peak is transient and only occurs
+          # when a PDF is attached, but a limit it can cross is a limit that
+          # OOM-kills the pod mid-upload, so it is budgeted for rather than
+          # hoped against. Image previews cost a fraction of it.
+          #
+          # Only one preview is rendered at a time per replica, so the peak does
+          # not scale with the backlog.
+          #
+          # ephemeral-storage is bounded for the same reason the memory is: this
+          # service handles files it did not choose. Nothing it does writes to
+          # disk — uploads, downloads and preview rendering are all in memory or
+          # streamed — so the budget only has to cover container logs and the
+          # /tmp volume below, and a limit is what stops an unexpected writer
+          # from filling the node's disk instead of failing.
           resources:
             requests:
               cpu: 25m
               memory: 64Mi
+              ephemeral-storage: 64Mi
             limits:
               cpu: 250m
-              memory: 256Mi
+              memory: 512Mi
+              ephemeral-storage: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -109,5 +131,13 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
+        # The root filesystem is read-only, so /tmp is the one writable path in
+        # the container. Nothing in file-service writes there — attachments are
+        # streamed, and preview rendering happens in memory inside the
+        # WebAssembly sandbox, which is given no filesystem at all — but the Go
+        # runtime and any library that ever wants a scratch file need the path
+        # to exist. sizeLimit is what keeps "exists" from becoming "unbounded":
+        # the volume is capped, private to the pod, and gone when it restarts.
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 64Mi
