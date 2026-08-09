@@ -18,6 +18,7 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
+import type { UploadProgress } from "../lib/api";
 import { useAttachmentUpload, type AttachmentUploadTarget } from "./useAttachmentUpload";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
@@ -46,6 +47,15 @@ function IconSend() {
       <polygon points="22 2 15 22 11 13 2 9 22 2" />
     </svg>
   );
+}
+
+/**
+ * Whole percent sent, floored so the label never reads 100% before the last
+ * byte has left. `total` is always positive here: apiUpload drops any report
+ * without a computable length.
+ */
+function uploadPercent({ loaded, total }: UploadProgress): number {
+  return Math.min(100, Math.floor((loaded / total) * 100));
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -193,7 +203,16 @@ export default function ChatComposer({
     setDragActive(true);
   };
 
-  const handleDragLeave = () => setDragActive(false);
+  // A dragleave also fires every time the pointer crosses from the box into one
+  // of its children — the quote, the editor, the toolbar. Ending the drag state
+  // there would flicker the outline on each internal boundary, so only a leave
+  // that really exits the composer counts. A null relatedTarget (leaving the
+  // window, or a drop) is outside by definition.
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    const next = event.relatedTarget;
+    if (next instanceof Node && event.currentTarget.contains(next)) return;
+    setDragActive(false);
+  };
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     if (!attachEnabled || !dragHasFiles(event)) return;
@@ -277,7 +296,27 @@ export default function ChatComposer({
             role={upload.status === "failed" ? "alert" : "status"}
           >
             {dragActive && upload.status === "idle" && <span>Solte o arquivo para enviar.</span>}
-            {uploading && <span>Enviando arquivo…</span>}
+            {uploading && (
+              <>
+                <span>
+                  Enviando arquivo…
+                  {upload.progress && ` ${uploadPercent(upload.progress)}%`}
+                </span>
+                {/* Determinate only when the transport actually counted the
+                    bytes. With nothing measured the element is omitted rather
+                    than rendered value-less, so the text above stays the only
+                    claim being made. */}
+                {upload.progress && (
+                  <progress
+                    className="chat-msg-area__composer-progress"
+                    data-testid="chat-composer-upload-progress"
+                    aria-label="Progresso do envio"
+                    value={upload.progress.loaded}
+                    max={upload.progress.total}
+                  />
+                )}
+              </>
+            )}
             {upload.status === "success" && <span>Arquivo enviado: {upload.uploadedName}</span>}
             {upload.status === "failed" && <span>{upload.error}</span>}
             {(upload.status === "failed" || upload.status === "success") && (

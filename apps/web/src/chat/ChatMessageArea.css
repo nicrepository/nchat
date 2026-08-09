@@ -1180,6 +1180,12 @@
   color: var(--color-text-muted, #6b6580);
 }
 
+.chat-msg-area__composer-progress {
+  flex: 1 1 80px;
+  max-width: 160px;
+  height: 6px;
+}
+
 .chat-msg-area__composer-quote {
   display: flex;
   align-items: flex-start;

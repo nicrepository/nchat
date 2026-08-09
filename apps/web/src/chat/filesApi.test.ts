@@ -186,6 +186,41 @@ function createdAttachment() {
   };
 }
 
+/**
+ * Installs a minimal XMLHttpRequest and returns a handle to whichever one the
+ * transport opens next. Only the upload's progress channel is needed here.
+ */
+function startedUpload(): () => { reportProgress: (loaded: number, total: number) => void } {
+  let opened: EventTarget | null = null;
+  class StubXHR {
+    readonly upload: EventTarget;
+    constructor() {
+      const channel = new EventTarget();
+      this.upload = channel;
+      opened = channel;
+    }
+    open() {}
+    setRequestHeader() {}
+    addEventListener() {}
+    send() {}
+  }
+  vi.stubGlobal("XMLHttpRequest", StubXHR);
+  return () => {
+    const target = opened;
+    if (!target) throw new Error("no upload was opened");
+    return {
+      reportProgress: (loaded, total) =>
+        target.dispatchEvent(
+          new ProgressEvent("progress", { loaded, total, lengthComputable: true }),
+        ),
+    };
+  };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("uploadAttachment", () => {
   it("starts the upload for a file below the limit", async () => {
     mockAuthFetch.mockResolvedValueOnce(createdAttachment());
@@ -300,6 +335,38 @@ describe("uploadAttachment", () => {
       reason: "too_large",
       message: "O arquivo excede o limite permitido.",
     });
+  });
+
+  // The upload is the one route that does not ride the default transport: it
+  // needs XHR to be able to count the bytes leaving (RF-30). What must not
+  // change is where the authentication comes from, so the sender is handed to
+  // authenticatedFetch rather than called beside it.
+  it("sends through a transport that forwards the caller's progress callback", async () => {
+    mockAuthFetch.mockResolvedValueOnce(createdAttachment());
+    const onProgress = vi.fn();
+
+    await uploadAttachment(
+      { kind: "channel", id: "ch-1" },
+      fileOfSize(1024),
+      LIMIT,
+      undefined,
+      onProgress,
+    );
+
+    const send = mockAuthFetch.mock.calls[0][3] as (
+      url: string,
+      init: RequestInit,
+    ) => Promise<unknown>;
+    expect(typeof send).toBe("function");
+
+    // Driving the transport itself is api.test.ts's job. What is proved here is
+    // that the sender reaches XMLHttpRequest at all, and that the bytes it
+    // counts are reported to *this* call's callback.
+    const upload = startedUpload();
+    void send("/api/files/channels/ch-1/attachments", { method: "POST" });
+    upload().reportProgress(256, 1024);
+
+    expect(onProgress).toHaveBeenCalledWith({ loaded: 256, total: 1024 });
   });
 
   it("lets an abort through untouched so a cancel is not shown as a failure", async () => {

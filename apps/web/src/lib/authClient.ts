@@ -76,6 +76,21 @@ export function _resetState(): void {
 }
 
 /**
+ * How a request actually reaches the network.
+ *
+ * It exists so the upload transport (apiUpload, which reports progress) can be
+ * used *through* this module instead of beside it. Everything below — the
+ * bearer header, the single refresh-and-retry on 401, the late-arrival guard and
+ * the session-binding guard — is the same for both transports, and a second copy
+ * of that logic living in the file client is exactly what this avoids.
+ */
+export type RequestSender = <T>(
+  url: string,
+  init: RequestInit,
+  parse?: ResponseParser<T>,
+) => Promise<T>;
+
+/**
  * Authenticated wrapper around apiFetch.
  *
  * - Injects `Authorization: Bearer <access_token>` for every call.
@@ -97,11 +112,12 @@ export async function authenticatedFetch<T>(
   url: string,
   init: RequestInit,
   parse?: ResponseParser<T>,
+  send: RequestSender = apiFetch,
 ): Promise<T> {
   const originalAccessToken = getAccessToken();
 
   try {
-    return await apiFetch<T>(
+    return await send<T>(
       url,
       {
         ...init,
@@ -125,7 +141,7 @@ export async function authenticatedFetch<T>(
         rotation.fromAccessToken === originalAccessToken &&
         currentAccessToken === rotation.toAccessToken
       ) {
-        return apiFetch<T>(
+        return send<T>(
           url,
           {
             ...init,
@@ -185,10 +201,6 @@ export async function authenticatedFetch<T>(
 
     // Retry the original request once with the current access token.
     const newAccessToken = getAccessToken();
-    return apiFetch<T>(
-      url,
-      { ...init, headers: buildHeaders(init.headers, newAccessToken) },
-      parse,
-    );
+    return send<T>(url, { ...init, headers: buildHeaders(init.headers, newAccessToken) }, parse);
   }
 }

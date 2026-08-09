@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { UploadProgress } from "../lib/api";
 import { fetchWorkspaceUploadLimit } from "./chatApi";
 import { AttachmentUploadError, tooLargeMessage, uploadAttachment } from "./filesApi";
 import type { ChannelAttachment } from "./chatTypes";
@@ -36,6 +37,15 @@ export interface AttachmentUploadState {
   error: string | null;
   /** Name of the last successfully uploaded file, for the success notice. */
   uploadedName: string | null;
+  /**
+   * Bytes actually sent, as the transport reports them, or null when it has
+   * reported none yet — which is also what a body of unknown length looks like.
+   *
+   * Null is the instruction to show an indeterminate state. It is never
+   * substituted with a guess, a timer or a percentage derived from the file's
+   * own size: those would describe a transfer nothing observed.
+   */
+  progress: UploadProgress | null;
   selectFile: (file: File) => void;
   /** Clears a finished outcome so the composer returns to its resting state. */
   dismiss: () => void;
@@ -53,6 +63,7 @@ export function useAttachmentUpload(
   const [status, setStatus] = useState<AttachmentUploadStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [uploadedName, setUploadedName] = useState<string | null>(null);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
 
   // Guards every state write, so an upload that resolves after the composer
   // unmounted (target switch, navigation) dispatches nothing.
@@ -73,6 +84,7 @@ export function useAttachmentUpload(
     setStatus("idle");
     setError(null);
     setUploadedName(null);
+    setProgress(null);
   }, []);
 
   /**
@@ -113,6 +125,10 @@ export function useAttachmentUpload(
       // shown next to a running upload.
       setError(null);
       setUploadedName(null);
+      // A fresh attempt starts unmeasured: the previous attempt's byte counts
+      // describe a request that is over, and the limit lookup below runs before
+      // a single byte of this one is sent.
+      setProgress(null);
 
       void (async () => {
         try {
@@ -123,7 +139,17 @@ export function useAttachmentUpload(
             // Rejected locally: no request is made at all.
             throw new AttachmentUploadError("too_large", tooLargeMessage(limit));
           }
-          const attachment: ChannelAttachment = await uploadAttachment(target, file, limit);
+          const attachment: ChannelAttachment = await uploadAttachment(
+            target,
+            file,
+            limit,
+            undefined,
+            (sent) => {
+              // Guarded like every other write here: progress keeps arriving
+              // for a moment after the composer unmounts.
+              if (mountedRef.current) setProgress(sent);
+            },
+          );
           if (!mountedRef.current) return;
           setStatus("success");
           setUploadedName(attachment.filename || file.name);
@@ -140,11 +166,13 @@ export function useAttachmentUpload(
           // Released on every path, so a failure always leaves the composer
           // able to accept the same file again.
           busyRef.current = false;
+          // The bar belongs to a request in flight; neither outcome has one.
+          if (mountedRef.current) setProgress(null);
         }
       })();
     },
     [onUploaded, resolveLimit, target],
   );
 
-  return { status, error, uploadedName, selectFile, dismiss };
+  return { status, error, uploadedName, progress, selectFile, dismiss };
 }

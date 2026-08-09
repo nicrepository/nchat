@@ -12,7 +12,7 @@
  * built from a filename or an ID anywhere in this file.
  */
 
-import { ApiRequestError } from "../lib/api";
+import { ApiRequestError, apiUpload, type ResponseParser, type UploadProgress } from "../lib/api";
 import { authenticatedFetch } from "../lib/authClient";
 import { formatUploadLimit } from "../lib/uploadLimit";
 import type { AttachmentPreviewStatus, AttachmentStatus, ChannelAttachment } from "./chatTypes";
@@ -246,12 +246,20 @@ function mapUploadError(error: unknown, maxUploadBytes: number | null): Attachme
  *
  * Exactly one file per request, in the field named `file`: that is the contract
  * the service accepts, and a second part is rejected server-side.
+ *
+ * `onProgress` is called with the bytes actually handed to the network. It is
+ * the only source of a percentage anywhere in this feature — when the transport
+ * reports nothing, the caller shows an indeterminate state rather than a number
+ * it made up. The request travels over apiUpload for exactly this reason; the
+ * authentication and the 401 refresh-and-retry are still authenticatedFetch's,
+ * which is what keeps the upload from growing a second copy of them.
  */
 export async function uploadAttachment(
   target: { kind: "channel" | "dm"; id: string },
   file: File,
   maxUploadBytes: number | null,
   signal?: AbortSignal,
+  onProgress?: (progress: UploadProgress) => void,
 ): Promise<ChannelAttachment> {
   if (maxUploadBytes !== null && file.size > maxUploadBytes) {
     throw new AttachmentUploadError("too_large", tooLargeMessage(maxUploadBytes));
@@ -266,6 +274,9 @@ export async function uploadAttachment(
     body = await authenticatedFetch<{ data: unknown }>(
       `${FILES_BASE}/${collection}/${encodeURIComponent(target.id)}/attachments`,
       { method: "POST", body: form, signal },
+      undefined,
+      <R>(requestUrl: string, requestInit: RequestInit, parse?: ResponseParser<R>) =>
+        apiUpload<R>(requestUrl, requestInit, onProgress, parse),
     );
   } catch (error) {
     // An abort is the caller's own decision, not a failure to report.
