@@ -31,3 +31,12 @@ func NewFinishedLockConnForTest() LockConn {
 // GlobalSlotKeyForTest exposes the global slot key derivation so a test can
 // pre-fill the lock namespace without restating the hashing rule.
 func GlobalSlotKeyForTest(slot int) int64 { return globalSlotKey(slot) }
+
+// ClaimDueScansQueryForTest exposes the scan claim so a migration invariant can
+// be checked against the statement itself rather than against a copy of it.
+//
+// The index that serves this query lives in a .sql file the Go compiler never
+// looks at, so nothing but a test can hold the two together. Reading the real
+// query is what makes that test an invariant instead of two hardcoded strings
+// that agree until somebody edits one.
+func ClaimDueScansQueryForTest() string { return claimDueScansQuery }

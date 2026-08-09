@@ -3,8 +3,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -29,6 +31,24 @@ const (
 	defaultWriteTimeoutSeconds = 300
 
 	defaultSeaweedFSTimeoutSeconds = 120
+
+	// defaultMalwareScanTimeoutSeconds bounds one clamd exchange (RF-22). It has
+	// to cover streaming the largest attachment this deployment accepts, so it
+	// is generous for the same reason the upload body timeouts are: a budget
+	// tuned to a small file would make the largest ones permanently unscannable,
+	// and therefore permanently undownloadable.
+	defaultMalwareScanTimeoutSeconds = 300
+
+	// maxMalwareScanTimeoutSeconds is an operational ceiling, not a policy.
+	//
+	// It exists for two reasons and neither is "keep the old 300s behaviour":
+	// the value is multiplied by time.Second, so an absurd one overflows the
+	// int64 duration and produces a negative deadline that cancels instantly;
+	// and the claim lease is derived from it, so a budget measured in years
+	// would leave a crashed worker's row unclaimable for that long. An hour is
+	// twelve times the default and far beyond what streaming the 512 MiB
+	// ceiling to a local daemon can take.
+	maxMalwareScanTimeoutSeconds = 3600
 
 	// Upload admission defaults. Conservative on purpose: each global slot is a
 	// reserved database connection and, at the 512 MiB ceiling, up to that much
@@ -124,6 +144,34 @@ type Config struct {
 	// no scanner: uploads finalise as clean and are immediately downloadable.
 	MalwareScanRequired bool
 
+	// MalwareScannerAddress is the clamd endpoint, "host:port" (RF-22).
+	//
+	// It is optional and empty by default, and an empty value does NOT relax the
+	// gate: the scan worker simply does not start, so every upload stays in
+	// pending_scan and stays undownloadable. That is the fail-closed reading —
+	// "no scanner configured" means "nothing is approved", never "everything is".
+	// FILE_MALWARE_SCAN_REQUIRED is the only thing that changes what an upload
+	// finalises as, and validateScanPolicy governs it.
+	MalwareScannerAddress string
+	// MalwareScanTimeoutSeconds is the effective budget for scanning one
+	// attachment, and it is the *only* one.
+	//
+	// It bounds the exchange with the daemon (connect, stream, reply) and it is
+	// also what the worker's job deadline and its claim lease are derived from.
+	// Those used to be a fixed 300s inside the service, which made a longer
+	// configured value unreachable: the service cancelled first, the job was
+	// recorded as a retry, and no configuration could fix it.
+	MalwareScanTimeoutSeconds int
+
+	// ValkeyURL is the broadcast bus this service publishes attachment status
+	// changes onto, shared with chat-service. Optional: without it a verdict is
+	// still persisted and still authoritative, and clients see it on their next
+	// read instead of immediately.
+	ValkeyURL string
+	// WSInstanceID identifies this process on that bus, for the consumer's
+	// echo suppression. Defaults to a generated value.
+	WSInstanceID string
+
 	SeaweedFSFilerURL       string
 	SeaweedFSTimeoutSeconds int
 
@@ -164,6 +212,10 @@ func Load() Config {
 		EncryptionMasterKeyID:      platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY_ID", ""),
 		EncryptionPreviousKeys:     platformconfig.GetString("FILE_ENCRYPTION_PREVIOUS_KEYS", ""),
 		MalwareScanRequired:        scanRequired,
+		MalwareScannerAddress:      strings.TrimSpace(platformconfig.GetString("FILE_MALWARE_SCANNER_ADDRESS", "")),
+		MalwareScanTimeoutSeconds:  positiveInt("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", defaultMalwareScanTimeoutSeconds),
+		ValkeyURL:                  strings.TrimSpace(platformconfig.GetString("VALKEY_URL", "")),
+		WSInstanceID:               sanitizeInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
 		SeaweedFSFilerURL:          strings.TrimSpace(platformconfig.GetString("SEAWEEDFS_FILER_URL", "")),
 		SeaweedFSTimeoutSeconds:    positiveInt("SEAWEEDFS_TIMEOUT_SECONDS", defaultSeaweedFSTimeoutSeconds),
 		uploadsEnabledInvalid:      uploadsEnabledInvalid,
@@ -282,8 +334,58 @@ func (c Config) validateUploadDependencies() error {
 	if !validFilerURL(c.SeaweedFSFilerURL) {
 		return errors.New("SEAWEEDFS_FILER_URL must be a valid HTTP or HTTPS URL without credentials")
 	}
+	// The scanner endpoint is optional, but a configured one must be usable: a
+	// typo would otherwise start the worker against an address it can never
+	// reach, and every upload would sit in pending_scan while the logs filled
+	// with retries. Absent is a supported deployment (no worker, nothing
+	// approved); malformed is a mistake and is refused at start-up.
+	if c.MalwareScannerAddress != "" && !validScannerAddress(c.MalwareScannerAddress) {
+		return errors.New("FILE_MALWARE_SCANNER_ADDRESS must be host:port")
+	}
+	// The budget is the *effective* one: it bounds the scan job and derives the
+	// claim lease as well as the client's socket deadline. A non-positive value
+	// has already fallen back to the default by the time it gets here, exactly
+	// like every other timeout in this service, so the only thing left to refuse
+	// is a value large enough to overflow the duration it becomes.
+	if c.MalwareScanTimeoutSeconds > maxMalwareScanTimeoutSeconds {
+		return fmt.Errorf(
+			"FILE_MALWARE_SCAN_TIMEOUT_SECONDS must not exceed %d",
+			maxMalwareScanTimeoutSeconds,
+		)
+	}
 	return nil
 }
+
+// validScannerAddress accepts a plain "host:port" and nothing else.
+//
+// No scheme, no path, no credentials: the value is a dial target, so anything
+// that looks like a URL is a configuration mistake rather than something to
+// interpret. The port must be numeric and in range, which is also what stops a
+// value like "clamav:notaport" from failing later, per scan, instead of once.
+func validScannerAddress(address string) bool {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return false
+	}
+	number, err := strconv.Atoi(port)
+	return err == nil && number > 0 && number <= 65535
+}
+
+// sanitizeInstanceID mirrors chat-service's rule for WS_INSTANCE_ID: the value
+// ends up in a bus envelope the consumer validates, so a value it would reject
+// is dropped here and replaced by a generated one rather than silently causing
+// every event to be discarded.
+func sanitizeInstanceID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" || len(trimmed) > wsInstanceIDMaxLen || !wsInstanceIDRe.MatchString(trimmed) {
+		return ""
+	}
+	return trimmed
+}
+
+const wsInstanceIDMaxLen = 64
+
+var wsInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // validateScanPolicy refuses to disable the malware-scan gate unless the
 // deployment has explicitly declared itself a development environment.

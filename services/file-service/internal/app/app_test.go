@@ -52,6 +52,9 @@ func uploadsEnabledConfig(t *testing.T) config.Config {
 	cfg.SeaweedFSFilerURL = "http://seaweedfs-filer:8888"
 	cfg.SeaweedFSTimeoutSeconds = 30
 	cfg.MalwareScanRequired = true
+	// Load() always supplies a positive default; a zero here would make every
+	// scanner construction fail for a reason no deployment can have.
+	cfg.MalwareScanTimeoutSeconds = 30
 	cfg.DBMaxConnections = 10
 	cfg.UploadMaxConcurrent = 4
 	cfg.UploadMaxConcurrentPerUser = 2
@@ -412,5 +415,182 @@ func TestShutdownCancelsTheWorkerContext(t *testing.T) {
 	case <-cancelled:
 	default:
 		t.Fatal("shutdown must cancel the worker's context")
+	}
+}
+
+// --- antimalware scan worker (RF-22) -------------------------------------
+
+// No scanner configured is a supported deployment: the worker does not start,
+// and — the part that matters — that must not relax anything. Uploads still
+// finalise into pending_scan and stay undownloadable, because nothing is there
+// to approve them.
+func TestNoScannerConfiguredStartsNoWorkerAndApprovesNothing(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.MalwareScannerAddress = ""
+
+	application, err := newApp(cfg, appDependencies{
+		openDB: openStub(&stubPool{}), openAdmission: admissionStub(), openFence: fenceStub(),
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	if application.scanCancel != nil || application.scanDone != nil {
+		t.Fatal("a scan worker was started without a scanner")
+	}
+	// The gate itself is untouched: an absent scanner is not a policy change.
+	if !application.Config.MalwareScanRequired {
+		t.Fatal("an absent scanner address turned the scan gate off")
+	}
+}
+
+// A configured scanner starts the worker, and the worker is owned: Shutdown
+// stops it and waits for it before the pool closes, exactly like the other two.
+func TestAConfiguredScannerStartsAWorkerThatShutdownStops(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.MalwareScanTimeoutSeconds = 30
+
+	pool := &stubPool{}
+	application, err := newApp(cfg, appDependencies{
+		openDB: openStub(pool), openAdmission: admissionStub(), openFence: fenceStub(),
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if application.scanCancel == nil || application.scanDone == nil {
+		t.Fatal("no scan worker was started for a configured scanner")
+	}
+
+	// Observe the ordering rather than assume it: the worker holds the pool for
+	// the length of a claim, so a pool closed while it runs would fail the very
+	// statement that records a verdict.
+	stopped := make(chan struct{})
+	realDone := application.scanDone
+	application.scanDone = stopped
+	closedWhileRunning := false
+	go func() {
+		<-realDone
+		closedWhileRunning = pool.closed
+		close(stopped)
+	}()
+
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if closedWhileRunning {
+		t.Fatal("the pool was closed while the scan worker was still running")
+	}
+	if !pool.closed {
+		t.Fatal("the pool must be closed once every worker has stopped")
+	}
+}
+
+// The bus is optional and separate from the scanner. Without it verdicts are
+// still persisted and still authoritative; clients learn them on their next
+// read. A service that refused to scan without a broadcast bus would be making
+// realtime delivery a precondition for security.
+func TestTheScanWorkerRunsWithoutABroadcastBus(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.ValkeyURL = ""
+
+	application, err := newApp(cfg, appDependencies{
+		openDB: openStub(&stubPool{}), openAdmission: admissionStub(), openFence: fenceStub(),
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	if application.scanCancel == nil {
+		t.Fatal("the scan worker did not start without a bus")
+	}
+	if application.statusPublisher != nil {
+		t.Fatal("a publisher was built without a configured bus")
+	}
+}
+
+// Shutting a busless deployment down must be an ordinary shutdown, not a
+// special case.
+//
+// The publisher is the one dependency in Shutdown that is absent on a supported
+// configuration rather than only on a failed one, so it is the one whose
+// absence is worth asserting on: a shutdown that faulted here would take the
+// process down on the exit path, after the pool had already been closed, and
+// would do it on exactly the deployments that never configured a bus. The
+// assertions are what "no panic" means concretely — Shutdown returned, it
+// returned success, and the resources that do exist were still released.
+func TestShutdownWithoutABroadcastBusReleasesEverything(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.ValkeyURL = ""
+
+	pool := &stubPool{}
+	tracingStopped := false
+	application, err := newApp(cfg, appDependencies{
+		openDB: openStub(pool), openAdmission: admissionStub(), openFence: fenceStub(),
+		tracingShutdown: func(context.Context) error { tracingStopped = true; return nil },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if application.statusPublisher != nil {
+		t.Fatal("this test is meaningless with a publisher wired")
+	}
+
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown without a bus: %v", err)
+	}
+	if !pool.closed {
+		t.Fatal("the pool must still be closed when no bus is configured")
+	}
+	if !tracingStopped {
+		t.Fatal("tracing must still be shut down when no bus is configured")
+	}
+}
+
+// A bus URL the client cannot use must not stop the worker either: the verdict
+// is the requirement, the announcement is an optimisation.
+func TestAnUnusableBusDoesNotStopTheScanWorker(t *testing.T) {
+	cfg := uploadsEnabledConfig(t)
+	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+	cfg.ValkeyURL = "://not a url"
+
+	application, err := newApp(cfg, appDependencies{
+		openDB: openStub(&stubPool{}), openAdmission: admissionStub(), openFence: fenceStub(),
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	if application.scanCancel == nil {
+		t.Fatal("an unusable bus stopped the scan worker")
+	}
+	if application.statusPublisher != nil {
+		t.Fatal("an unusable bus produced a publisher")
+	}
+}
+
+// Uploads disabled means no attachment feature at all, so there is nothing for
+// a scan worker to do and no dependency for it to hold.
+func TestNoScanWorkerRunsWhileUploadsAreDisabled(t *testing.T) {
+	cfg := healthOnlyConfig()
+	cfg.MalwareScannerAddress = "127.0.0.1:3310"
+
+	application, err := newApp(cfg, appDependencies{tracingShutdown: noopShutdown})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	if application.scanCancel != nil {
+		t.Fatal("a scan worker was started with uploads disabled")
 	}
 }

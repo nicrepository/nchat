@@ -84,6 +84,16 @@ function fileIconFor(contentType: string): string {
   return "draft";
 }
 
+/**
+ * The one place the three scan states get their words (RF-22).
+ *
+ * All three are drawn, including `clean`. The badge used to be suppressed for
+ * an approved file on the theory that "no news is good news", which left the
+ * only visible states meaning "wait" and "blocked" — so a user reading the list
+ * could not tell an approved file from one whose badge they had simply missed,
+ * and the approval this whole feature exists to establish was the one outcome
+ * never shown.
+ */
 const attachmentStatusLabel: Record<ChannelAttachment["status"], string> = {
   pending_scan: "Em análise",
   clean: "Verificado",
@@ -859,13 +869,12 @@ function ConversationBody({
                       {file.createdAt &&
                         `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
                       {formatFileSize(file.size)}
-                      {file.status !== "clean" && (
-                        <span
-                          className={`chat-details__file-status chat-details__file-status--${file.status}`}
-                        >
-                          {attachmentStatusLabel[file.status]}
-                        </span>
-                      )}
+                      <span
+                        className={`chat-details__file-status chat-details__file-status--${file.status}`}
+                        data-testid={`chat-details-file-status-${file.id}`}
+                      >
+                        {attachmentStatusLabel[file.status]}
+                      </span>
                     </span>
                   </span>
                   {/* The player is a sibling of the row rather than part of it,

@@ -921,6 +921,12 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if evt.Type == EventTypeAttachmentStatus {
+		evt, ok = canonicalizeAttachmentEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 	if isCallEventType(evt.Type) {
 		evt, ok = canonicalizeCallEvent(evt)
 		if !ok {
@@ -951,7 +957,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	// Known event type required.
 	switch evt.Type {
 	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
-		EventTypeMembersAdded, EventTypeConversationAvailable,
+		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
@@ -1031,7 +1037,11 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 	// members.added is target-scoped like the message events, but it is about the
 	// target itself rather than about anything in it, so it has no message to
 	// name. A message_id on one is a shape this protocol does not produce.
-	if evt.Type == EventTypeMembersAdded {
+	//
+	// attachment.status is the same shape for the same reason: it is about a file
+	// in the target, not about a message, and an attachment can outlive the
+	// message that carried it.
+	if evt.Type == EventTypeMembersAdded || evt.Type == EventTypeAttachmentStatus {
 		if evt.MessageID != "" {
 			return Event{}, false
 		}
@@ -1126,6 +1136,80 @@ func canonicalizePinEvent(evt Event) (Event, bool) {
 		return Event{}, false
 	}
 	evt.Pin.ActorUserID = actorID.String()
+	return evt, true
+}
+
+// attachmentStatusValues is the closed set of states this hub will relay
+// (RF-22). It mirrors file-service's downloadable-status machine, and it is
+// restated here rather than trusted because the producer is another service:
+// the three values are the whole external contract, and a fourth arriving over
+// the bus is a shape neither this build nor its clients implement.
+//
+// pending_upload, failed and deleted are absent: they are internal upload
+// states with no meaning to a subscriber, and an attachment in one of them is
+// not something a client is showing.
+var attachmentStatusValues = map[string]struct{}{
+	"pending_scan": {},
+	"clean":        {},
+	"rejected":     {},
+}
+
+// attachmentUpdatedAtMaxLen bounds the timestamp string. It is a display and
+// ordering hint the client parses, so it is length-checked rather than parsed
+// here — a value this hub cannot interpret is still one the client can ignore,
+// but an unbounded one is memory a producer chose.
+const attachmentUpdatedAtMaxLen = 64
+
+// canonicalizeAttachmentEvent validates a remote attachment.status event
+// (RF-22).
+//
+// This is the only event whose producer is a different service, so the
+// validation is where the trust boundary actually is. Three things are asserted
+// and nothing is inferred:
+//
+//   - the target is a channel or a DM. TargetTypeUser is refused, because this
+//     event routes by subscription and a user target would put it on the
+//     recipient-addressed path it has no business reaching;
+//   - the attachment id is a UUID, canonicalized to lowercase, so the id a
+//     client reconciles against matches the one the API returns;
+//   - the status is one of the three the contract defines. An unknown value is
+//     dropped rather than forwarded, so a producer cannot invent a state the
+//     client would have to guess about.
+//
+// Every other payload is stripped. A producer that attached a pin, a reaction, a
+// members block or a message DTO gets none of them relayed: this event carries
+// an attachment state and nothing else, whatever was sent.
+func canonicalizeAttachmentEvent(evt Event) (Event, bool) {
+	if evt.Attachment == nil {
+		return Event{}, false
+	}
+	if evt.TargetType != TargetTypeChannel && evt.TargetType != TargetTypeDM {
+		return Event{}, false
+	}
+	attachmentID, err := uuid.Parse(evt.Attachment.AttachmentID)
+	if err != nil {
+		return Event{}, false
+	}
+	if _, known := attachmentStatusValues[evt.Attachment.Status]; !known {
+		return Event{}, false
+	}
+	if len(evt.Attachment.UpdatedAt) > attachmentUpdatedAtMaxLen {
+		return Event{}, false
+	}
+	evt.Attachment.AttachmentID = attachmentID.String()
+	// The message payloads are cleared here as well as by the caller, and the
+	// duplication is the point: this function is what the contract for
+	// attachment.status is read from, so "every other payload is stripped" has
+	// to be true of the function itself rather than of the order it happens to
+	// be called in. A message DTO riding on an attachment verdict is the one
+	// contaminated shape that would otherwise relay a body to every subscriber
+	// of the target.
+	evt.Payload = nil
+	evt.MessageUpdate = nil
+	evt.Pin = nil
+	evt.Reaction = nil
+	evt.Members = nil
+	evt.Call = nil
 	return evt, true
 }
 

@@ -3,9 +3,9 @@
 Upload, consulta e download autenticados de arquivos e imagens em canais e DMs.
 O conteudo e cifrado com envelope encryption antes de chegar ao SeaweedFS.
 
-Fora de escopo nesta fase: worker completo do ClamAV, politica de retencao
-(RF-34), URLs publicas, upload resumivel, deduplicacao e criptografia E2E MLS de
-anexos. O RF-31 implementado aqui cobre **thumbnail de imagem, primeira pagina
+Fora de escopo nesta fase: politica de retencao (RF-34), URLs publicas, upload
+resumivel, deduplicacao e criptografia E2E MLS de anexos. O worker assincrono de
+antimalware (RF-22) esta implementado -- ver "Scan assincrono de malware". O RF-31 implementado aqui cobre **thumbnail de imagem, primeira pagina
 de PDF e preview inline de video com HTTP Range**.
 
 ## Habilitacao
@@ -778,15 +778,13 @@ vindo do cliente que decida veredito de scan, nem para o dono do arquivo, nem
 para admin de workspace. Quem pudesse escolher `clean` poderia colocar um
 arquivo nao verificado na frente do parser de PDF.
 
-> **O produtor do veredito ainda nao existe.** Nao ha ClamAV neste repositorio:
-> nem cliente, nem container em `infra/compose`, nem manifest em `infra/k8s`,
-> nem configuracao. O ADR 0002 e `docs/architecture/provisional-stack.md`
-> registram o ClamAV como item **planejado e nao iniciado** (Sprint 3), e o
-> runbook do dev-env registra "sem ClamAV". As duas operacoes canonicas
-> (`MarkScanClean` e `MarkScanRejected`) existem, sao atomicas e estao cobertas
-> por teste de integracao contra PostgreSQL real -- o que falta e o worker que
-> as chama. Enquanto ele nao existir, **em ambiente com scan obrigatorio nenhum
-> preview e gerado**, por falha fechada. Ver "Estado do fluxo padrao" abaixo.
+> **O produtor do veredito e o worker do RF-22.** Ele e a unica coisa que chama
+> `MarkScanClean` e `MarkScanRejected`, roda dentro do proprio file-service e nao
+> tem superficie HTTP. Ver "Scan assincrono de malware" para a fila, o retry e o
+> comportamento quando o daemon esta indisponivel. Sem um scanner configurado
+> (`FILE_MALWARE_SCANNER_ADDRESS` vazio) o worker nao inicia e, com scan
+> obrigatorio, **nenhum anexo e aprovado e nenhum preview e gerado** -- falha
+> fechada, nao regressao.
 
 #### Como a remocao e gravada
 
@@ -970,29 +968,28 @@ real.
 
 #### Estado do fluxo padrao
 
-| Etapa                        | Existe? |
-| ---------------------------- | ------- |
-| upload -> `pending_scan`     | sim     |
-| operacao canonica `clean`    | sim     |
-| operacao canonica `rejected` | sim     |
-| operacao canonica de remocao | sim     |
-| **worker ClamAV que decide** | **nao** |
-| claim -> render -> `ready`   | sim     |
+| Etapa                            | Existe? |
+| -------------------------------- | ------- |
+| upload -> `pending_scan`         | sim     |
+| enfileiramento do scan           | sim     |
+| worker ClamAV que decide (RF-22) | sim     |
+| operacao canonica `clean`        | sim     |
+| operacao canonica `rejected`     | sim     |
+| operacao canonica de remocao     | sim     |
+| claim -> render -> `ready`       | sim     |
 
-Com `FILE_MALWARE_SCAN_REQUIRED=true` e sem o worker, a cadeia para na quarta
-linha: os anexos sao enviados, listados e ficam em `pending_scan`, e o preview
-permanece `pending`. Isso e falha fechada e nao regressao -- mas significa que o
-**RF-31 so entrega preview de ponta a ponta em producao depois da tarefa do
-ClamAV (RF-33)**. Em desenvolvimento declarado o fluxo e completo hoje, porque o
-upload ja finaliza em `clean`.
+A cadeia e completa quando ha um daemon configurado. **Sem
+`FILE_MALWARE_SCANNER_ADDRESS`** o worker nao inicia e a cadeia para na segunda
+linha: os anexos sao enviados, listados e ficam em `pending_scan`, o download
+responde `409 file_not_scanned` e o preview permanece `pending`.
 
 **Consequencia operacional, explicita:** com `FILE_MALWARE_SCAN_REQUIRED=true`
-(default) e sem o worker do ClamAV (RF-33, fora de escopo), todo upload termina
-em `pending_scan` e **nenhum preview e gerado**. Isso e falha fechada, nao
-regressao: a alternativa seria mandar conteudo nao verificado para um parser de
-PDF, que e exatamente o risco que este desenho existe para conter. Os anexos
-continuam sendo enviados, listados e -- quando o scan aprovar -- baixados
-normalmente.
+(default) e sem scanner configurado, todo upload termina em `pending_scan` e
+**nenhum preview e gerado**. Isso e falha fechada, nao regressao: a alternativa
+seria mandar conteudo nao verificado para um parser de PDF, que e exatamente o
+risco que este desenho existe para conter. Os anexos continuam sendo enviados,
+listados e -- quando o scan aprovar -- baixados normalmente. O mesmo vale para um
+daemon que esta configurado mas fora do ar: erro de scan nunca vira aprovacao.
 
 Em ambiente de desenvolvimento explicitamente declarado
 (`FILE_MALWARE_SCAN_REQUIRED=false` com `APP_ENV` na allowlist fechada), o
@@ -1274,6 +1271,190 @@ parar de exibir bytes que ele proprio ja recebeu enquanto o acesso era valido.
 aprovou naquele momento, e e exatamente por isso que um rescan posterior precisa
 chegar a tela.
 
+## Scan assincrono de malware (RF-22)
+
+O upload nao espera pelo scanner. Ele termina quando o objeto esta durAvel e a
+linha esta finalizada em `pending_scan`; o veredito chega depois, por um worker
+que roda dentro do proprio file-service.
+
+### Estados
+
+Sao tres, e sao os que a migration 000001 ja fechou em `attachments_status_check`
+-- este requisito nao introduziu nenhum estado novo:
+
+| Estado         | Significado para o usuario | Baixavel? |
+| -------------- | -------------------------- | --------- |
+| `pending_scan` | em analise                 | nao       |
+| `clean`        | aprovado                   | **sim**   |
+| `rejected`     | bloqueado                  | nao       |
+
+A maquina de estados tem exatamente duas transicoes de veredito:
+
+```
+pending_scan --(clean)----> clean
+pending_scan --(infected)-> rejected
+pending_scan --(erro)-----> pending_scan   (nada e gravado)
+```
+
+A terceira linha e o requisito central: **erro de infraestrutura nao e resultado
+de seguranca.** Daemon fora do ar, timeout, resposta que o cliente nao consegue
+interpretar, storage indisponivel, falha de decrypt -- todos deixam a linha
+exatamente onde estava. Nao existe caminho de `erro` para `clean`, e o cliente
+nunca decide veredito: nao ha rota, campo de request ou header que alcance
+`MarkScanClean`.
+
+### A fila
+
+A fila **e a coluna `status`**. Nao existe tabela de jobs: a migration 000005
+adiciona apenas `scan_attempts` e `scan_next_attempt_at` a `files.attachments`, e
+o agendamento e escrito pelo **mesmo `UPDATE`** que finaliza o upload
+(`MarkUploaded`). Nao ha dual write -- um anexo que existe em `pending_scan` esta,
+por essa mesma statement, enfileirado -- entao um crash entre duas gravacoes nao
+pode perder o job, porque nao ha duas gravacoes.
+
+O claim e o mesmo primitivo do preview e do outbox de e-mail:
+
+```sql
+SELECT ... WHERE status = 'pending_scan' AND deleted_at IS NULL ...
+FOR UPDATE SKIP LOCKED
+```
+
+seguido de um `UPDATE` que empurra `scan_next_attempt_at` para o futuro (o lease)
+e incrementa `scan_attempts`. Consequencias:
+
+- **varias replicas** rodam o mesmo loop e passam por cima das linhas umas das
+  outras em vez de bloquear; uma linha nunca e entregue duas vezes ao mesmo tempo;
+- **crash e recuperavel**: nao ha estado `processing` para vazar. O lease expira
+  e a linha volta a estar devida, sem janitor;
+- **restart nao perde nada**: o agendamento esta no banco, nao em memoria.
+
+Nenhuma transacao fica aberta enquanto o arquivo e transmitido. Sao tres passos
+separados: claim curto e atomico, operacao externa (streaming para o clamd), e
+gravacao curta e atomica do resultado.
+
+### Retry e backoff
+
+O lease **e** a agenda de retry -- um mecanismo, nao dois. A n-esima tentativa
+agenda a proxima para `lease * min(n, 8)` segundos adiante, deterministico e
+limitado. Um daemon fora do ar custa um `UPDATE` a cada poucos minutos por anexo,
+nunca uma tempestade de conexoes contra o clamd.
+
+Nao ha teto de tentativas e isso e deliberado: um estado que significasse
+"desisti" seria um quarto estado externo, indistinguivel de "ainda em analise"
+para o cliente, e exigiria uma varredura manual para sair dele. Uma linha que
+ninguem consegue escanear fica onde pertence -- nao aprovada -- e volta a ser
+tentada quando o daemon voltar.
+
+`scan_attempts` e saturado (`LEAST`) para nao estourar o `SMALLINT` e travar a
+statement de claim atras de uma linha em falha permanente.
+
+### Integracao com o ClamAV
+
+`services/file-service/internal/scanner` fala `INSTREAM` do clamd sobre TCP.
+
+- **nada de shell.** Nao ha `exec`, nao ha `clamscan`, nao ha linha de comando.
+  Filename, MIME e extensao nunca chegam ao daemon: o protocolo carrega bytes
+  com prefixo de tamanho e mais nada;
+- **streaming.** O objeto e aberto exatamente como um download o abre -- mesmo
+  key ring, mesmo binding, mesmo reader verificador -- e enviado em blocos de
+  64 KiB. Um anexo de 512 MiB custa 64 KiB de RAM. **Nenhum plaintext e
+  escrito em disco**, nem em `/tmp`, nem em lugar nenhum;
+- **timeouts** no connect, no socket e no job inteiro; cancelamento do contexto
+  fecha a conexao por baixo do I/O, entao um shutdown interrompe um scan em
+  andamento;
+- **resposta validada contra um conjunto fechado.** So o `OK` exato produz
+  `clean`. `FOUND` produz `rejected`. Qualquer outra coisa -- inclusive uma
+  resposta sem o terminador `NUL`, que seria indistinguivel de uma truncada -- e
+  falha de scan;
+- **todo arquivo e escaneado.** Nada consulta o tipo detectado para decidir que
+  algum conteudo dispensa analise: o tipo e um palpite sobre o conteudo que o
+  scanner existe para contradizer;
+- a assinatura casada **nao** e propagada: nao vai para o cliente, nem para o
+  evento, nem para o log.
+
+### Limites de tamanho
+
+`uploadpolicy.MaxMaxUploadBytes` e 512 MiB, entao o `StreamMaxLength` do clamd
+precisa ser **pelo menos** isso. Um daemon com limite menor recusaria
+sistematicamente os maiores anexos, o scan falharia, e o arquivo ficaria
+eternamente sem veredito -- que e exatamente a combinacao que nao pode existir.
+
+`infra/compose/clamav/clamd.conf` fixa `StreamMaxLength 512M` e `MaxFileSize
+512M` por esse motivo, e o comentario no arquivo aponta para a origem do numero.
+Quando o daemon recusa por tamanho, o worker classifica o resultado como
+`too_large` (metrica e log em nivel `error`), separado de um retry comum, porque
+e o unico caso que se corrige mexendo em configuracao.
+
+### Propagacao para os clientes
+
+Depois que o veredito **ja esta persistido**, o worker publica um evento
+`attachment.status` no mesmo barramento Valkey que o chat-service ja consome
+(`nchat:chat:ws:broadcast:{workspace_id}`). O hub canonicaliza o envelope, recusa
+tipo/identificador desconhecido, e entrega aos assinantes do canal ou da conversa
+-- **reavaliando a autorizacao de cada assinante no fan-out**, como faz com
+`pin.updated`.
+
+O payload e minimo:
+
+```json
+{ "attachment_id": "...", "status": "clean", "updated_at": "..." }
+```
+
+Sem filename, sem tamanho, sem tipo, sem uploader, sem assinatura de malware. O
+evento roteia por `(workspace, target)` e nunca por usuario, entao ele nao pode
+ser usado para descobrir anexos, canais privados, DMs ou membros: quem ja podia
+ler o destino recebe, e mais ninguem.
+
+**Persistencia e a fonte de verdade.** O evento e best-effort: um publish que
+falha nao desfaz nem repete o veredito, e um cliente que perdeu o evento obtem o
+estado correto no proximo `GET`. Nao ha dependencia de entrega exactly-once.
+
+### Configuracao
+
+| Variavel                            | Default | Efeito                                      |
+| ----------------------------------- | ------- | ------------------------------------------- |
+| `FILE_MALWARE_SCAN_REQUIRED`        | `true`  | upload finaliza em `pending_scan`           |
+| `FILE_MALWARE_SCANNER_ADDRESS`      | vazio   | `host:port` do clamd; vazio = sem worker    |
+| `FILE_MALWARE_SCAN_TIMEOUT_SECONDS` | `300`   | orcamento de uma troca com o daemon         |
+| `VALKEY_URL`                        | vazio   | barramento do evento; vazio = sem broadcast |
+| `WS_INSTANCE_ID`                    | gerado  | identidade deste processo no barramento     |
+
+Um endereco vazio **nao** afrouxa nada: sem scanner o worker nao inicia e todo
+upload fica em `pending_scan`, nao baixavel. Um endereco malformado (com esquema,
+com path, com porta nao numerica) e recusado na inicializacao, para nao virar um
+worker que tenta um alvo inalcancavel a cada poll.
+
+`FILE_MALWARE_SCAN_REQUIRED=false` continua sendo aceito **somente** com
+`APP_ENV` explicitamente em `development`, `dev`, `local`, `test` ou `nchat-dev`.
+Ausente, vazio, desconhecido ou com erro de digitacao e tratado como ambiente
+implantado e recusado.
+
+### Health e readiness
+
+O ClamAV **nao** entra em liveness nem em readiness. Indisponibilidade do daemon
+nao deve provocar restart loop nem tirar o servico do balanceador: uploads
+continuam sendo aceitos com seguranca, os jobs ficam duravelmente em
+`pending_scan`, e os downloads continuam falhando fechado. Tornar o servico
+inteiro indisponivel nao tornaria nenhum arquivo mais seguro.
+
+### Como rodar localmente
+
+```bash
+# clamd escuta em 127.0.0.1:3310; a primeira subida carrega a base de
+# assinaturas e leva alguns minutos ate ficar healthy.
+docker compose -f infra/compose/compose.dev.yml up -d clamav
+
+# no ambiente do file-service
+FILE_MALWARE_SCANNER_ADDRESS=localhost:3310
+```
+
+Para verificar a deteccao sem malware real, envie o arquivo de teste EICAR: o
+anexo deve ir para `rejected` dentro de um ciclo de poll (10 s) e o download
+passar a responder `409 file_not_scanned`. Parar o container e enviar outro
+arquivo demonstra o caminho de falha: o anexo fica em `pending_scan`, o log do
+worker registra `result=retry`, e subir o container de volta faz o proximo claim
+aprova-lo.
+
 ## Autorizacao
 
 A autorizacao acontece inteiramente no servidor, em uma unica consulta SQL que
@@ -1535,8 +1716,27 @@ remover no SeaweedFS. O log estruturado correspondente
 ## Observabilidade
 
 Metricas: `nchat_file_uploads_total{result}`,
-`nchat_file_downloads_total{result}`, `nchat_file_orphaned_objects_total`.
-Nenhum label carrega id, filename ou caminho.
+`nchat_file_downloads_total{result}`, `nchat_file_previews_total{result}`,
+`nchat_file_object_cleanups_total{result}`, `nchat_file_orphaned_objects_total`,
+`nchat_file_malware_scans_total{result}` e
+**`nchat_file_malware_scan_queue_depth`** (RF-22). Nenhum label carrega id,
+filename ou caminho.
+
+`nchat_file_malware_scan_queue_depth` e um gauge **sem labels**: quantos anexos
+aguardam veredito no cluster. Ele e reescrito a cada passada do worker, inclusive
+nas que nao encontram trabalho, porque um gauge escrito so quando ha backlog
+continuaria reportando o ultimo valor para sempre depois que a fila esvaziasse.
+Nao ha recorte por workspace, canal ou usuario: a cardinalidade cresceria com o
+produto e a pergunta que ele responde -- a fila esta drenando? -- nao precisa de
+um.
+
+`nchat_file_malware_scans_total{result}` usa o conjunto fechado `clean`,
+`infected`, `retry`, `too_large`, `superseded`. `retry` subindo e um daemon que
+nao responde; `too_large` subindo e configuracao (ver "Limites de tamanho").
+
+Os logs do worker carregam `attachment_id`, `result`, `attempt` e `duration_ms`.
+Nunca carregam filename, tipo de conteudo, chave de objeto, endereco do daemon,
+assinatura de malware, texto de erro do socket, DEK ou qualquer byte do arquivo.
 
 As metricas HTTP transversais (`nchat_http_requests_total`,
 `nchat_http_request_duration_seconds`) usam o label `route` com o template da

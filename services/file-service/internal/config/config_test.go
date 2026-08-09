@@ -430,3 +430,142 @@ func TestValidateAcceptsTheScanGateEverywhere(t *testing.T) {
 		}
 	}
 }
+
+// --- antimalware scanner (RF-22) ----------------------------------------
+
+// An absent scanner address is a supported deployment, and — this is the point
+// — it must not relax the gate. Without a daemon the worker does not run, so
+// uploads stay in pending_scan; what must never happen is an absent address
+// being read as "no scan needed".
+func TestAnAbsentScannerAddressDoesNotRelaxTheScanGate(t *testing.T) {
+	enableUploads(t)
+	unsetAppEnv(t)
+	t.Setenv("FILE_MALWARE_SCANNER_ADDRESS", "")
+
+	cfg := Load()
+	if cfg.MalwareScannerAddress != "" {
+		t.Fatalf("scanner address = %q, want empty", cfg.MalwareScannerAddress)
+	}
+	if !cfg.MalwareScanRequired {
+		t.Fatal("an absent scanner address turned the scan gate off")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestValidateRejectsAMalformedScannerAddress(t *testing.T) {
+	for name, address := range map[string]string{
+		"no port":        "clamav",
+		"a URL":          "tcp://clamav:3310",
+		"non-numeric":    "clamav:threeThreeOne",
+		"port too large": "clamav:70000",
+		"port zero":      "clamav:0",
+		"no host":        ":3310",
+	} {
+		t.Run(name, func(t *testing.T) {
+			enableUploads(t)
+			unsetAppEnv(t)
+			t.Setenv("FILE_MALWARE_SCANNER_ADDRESS", address)
+
+			if err := Load().Validate(); err == nil {
+				t.Fatalf("Validate accepted %q", address)
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsAHostPortScannerAddress(t *testing.T) {
+	for _, address := range []string{"clamav:3310", "127.0.0.1:3310", "[::1]:3310"} {
+		enableUploads(t)
+		unsetAppEnv(t)
+		t.Setenv("FILE_MALWARE_SCANNER_ADDRESS", address)
+
+		cfg := Load()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate(%q): %v", address, err)
+		}
+		if cfg.MalwareScannerAddress != address {
+			t.Fatalf("scanner address = %q, want %q", cfg.MalwareScannerAddress, address)
+		}
+	}
+}
+
+// The scan budget has to cover streaming the largest attachment the deployment
+// accepts, so it defaults high and a non-positive override falls back rather
+// than making every large file unscannable.
+func TestScanTimeoutDefaultsAndIgnoresNonPositiveOverrides(t *testing.T) {
+	t.Setenv("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", "")
+	if got := Load().MalwareScanTimeoutSeconds; got != defaultMalwareScanTimeoutSeconds {
+		t.Fatalf("timeout = %d, want %d", got, defaultMalwareScanTimeoutSeconds)
+	}
+	t.Setenv("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", "0")
+	if got := Load().MalwareScanTimeoutSeconds; got != defaultMalwareScanTimeoutSeconds {
+		t.Fatalf("timeout = %d for a zero override, want the default", got)
+	}
+	t.Setenv("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", "45")
+	if got := Load().MalwareScanTimeoutSeconds; got != 45 {
+		t.Fatalf("timeout = %d, want 45", got)
+	}
+}
+
+// The bus identifier ends up in an envelope the consumer validates, so a value
+// it would reject is dropped here rather than producing events nothing delivers.
+func TestWSInstanceIDIsSanitizedRatherThanTrusted(t *testing.T) {
+	for name, value := range map[string]string{
+		"a glob":     "file-*",
+		"a newline":  "file\nsvc",
+		"a space":    "file svc",
+		"too long":   strings.Repeat("a", 65),
+		"whitespace": "   ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("WS_INSTANCE_ID", value)
+			if got := Load().WSInstanceID; got != "" {
+				t.Fatalf("WSInstanceID = %q, want it rejected", got)
+			}
+		})
+	}
+	t.Setenv("WS_INSTANCE_ID", "file-service-0")
+	if got := Load().WSInstanceID; got != "file-service-0" {
+		t.Fatalf("WSInstanceID = %q, want it kept", got)
+	}
+}
+
+// The budget must actually apply. A value above the old hardcoded 300s is the
+// case that used to be silently unreachable, so it is the one that matters.
+func TestValidateAcceptsAScanTimeoutAboveTheOldFixedBudget(t *testing.T) {
+	enableUploads(t)
+	unsetAppEnv(t)
+	t.Setenv("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", "900")
+
+	cfg := Load()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.MalwareScanTimeoutSeconds != 900 {
+		t.Fatalf("timeout = %d, want 900 — the configuration must not be capped",
+			cfg.MalwareScanTimeoutSeconds)
+	}
+}
+
+// The ceiling exists to stop an overflow, not to restore the old cap: it has to
+// be well above the default, and a value past it is a start-up error rather
+// than a silently clamped one.
+func TestValidateRejectsAScanTimeoutThatWouldOverflow(t *testing.T) {
+	if maxMalwareScanTimeoutSeconds <= defaultMalwareScanTimeoutSeconds {
+		t.Fatal("the ceiling must leave room above the default, or it is the old cap by another name")
+	}
+	enableUploads(t)
+	unsetAppEnv(t)
+	t.Setenv("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", strconv.Itoa(maxMalwareScanTimeoutSeconds+1))
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("Validate accepted a timeout past the ceiling")
+	}
+
+	t.Setenv("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", strconv.Itoa(maxMalwareScanTimeoutSeconds))
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("Validate refused the ceiling itself: %v", err)
+	}
+}

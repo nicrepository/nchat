@@ -129,6 +129,15 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 		update.PreviewStatus != domain.PreviewStatusUnsupported {
 		return fmt.Errorf("%w: invalid initial preview status", domain.ErrInvalidInput)
 	}
+	// The scan job is scheduled by this same statement (RF-22), exactly as the
+	// preview job is and for the same reason: an attachment that finishes in
+	// pending_scan is, by that one UPDATE, already queued. There is no second
+	// write to lose in a crash and no queue row to disagree with the status.
+	//
+	// The schedule is derived from the status rather than passed in, so a caller
+	// cannot finalise an upload into pending_scan without queueing it — the two
+	// facts are one expression. A status that is not pending_scan (development's
+	// clean, per config.validateScanPolicy) clears the schedule instead.
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE files.attachments
 		   SET status = $2,
@@ -139,6 +148,7 @@ func (s *PGXAttachmentStore) MarkUploaded(ctx context.Context, update service.Up
 		       kek_key_id = $7,
 		       preview_status = $9,
 		       preview_next_attempt_at = CASE WHEN $9 = 'pending' THEN now() ELSE NULL END,
+		       scan_next_attempt_at = CASE WHEN $2 = 'pending_scan' THEN now() ELSE NULL END,
 		       uploaded_at = now(),
 		       updated_at = now()
 		 WHERE id = $1
@@ -211,6 +221,8 @@ func (s *PGXAttachmentStore) MarkFailed(ctx context.Context, attachmentID, failu
 //
 // preview_attempts is deliberately not reset: it is what an operator reads to
 // see how much work a row consumed, and a verdict does not undo that history.
+// scan_next_attempt_at *is* cleared, for the opposite reason: it is a schedule,
+// not a history, and the row has left the queue.
 //
 // # Which rows it accepts
 //
@@ -257,6 +269,7 @@ const markScanRejectedQuery = `
 		           WHEN preview_status = 'pending' THEN NULL
 		           ELSE preview_next_attempt_at
 		       END,
+		       scan_next_attempt_at = NULL,
 		       updated_at = now()
 		 WHERE id = $1
 		   AND workspace_id = $2
@@ -304,6 +317,14 @@ func (s *PGXAttachmentStore) MarkScanRejected(
 // download be served and what makes a preview claimable, so it is written as
 // narrowly as the rejection is written thoroughly.
 //
+// # The schedule
+//
+// scan_next_attempt_at is cleared, because the row has left the queue. It is
+// not load-bearing — the claim selects on status = 'pending_scan', so a decided
+// row is already invisible to it — but a timestamp saying "next attempt at
+// 14:03" on a file that was approved an hour ago is a lie an operator reading
+// the table has to work out for themselves.
+//
 // # What it does not touch
 //
 // Nothing about the preview. That is not an omission — it is the design. An
@@ -332,6 +353,7 @@ func (s *PGXAttachmentStore) MarkScanRejected(
 const markScanCleanQuery = `
 	UPDATE files.attachments
 	   SET status = 'clean',
+	       scan_next_attempt_at = NULL,
 	       updated_at = now()
 	 WHERE id = $1
 	   AND workspace_id = $2

@@ -188,6 +188,31 @@ export interface WSConversationAvailableEvent {
   target_id: string;
 }
 
+/**
+ * An attachment's antimalware verdict changed (RF-22).
+ *
+ * Produced by file-service and relayed over the same bus and the same
+ * subscription fan-out as pin.updated, so it arrives only for a target this
+ * client may already read. Like pin.updated it is an invalidation hint: the
+ * handler refetches the authoritative list rather than patching a status in
+ * place, which is what keeps a refetch and an event arriving together from
+ * disagreeing.
+ *
+ * The payload carries no filename, no size and no scanner detail — the server
+ * is deliberately not describing files over a broadcast.
+ */
+export interface WSAttachmentStatusEvent {
+  type: "attachment.status";
+  target_type: "channel" | "dm";
+  target_id: string;
+  attachment?: {
+    attachment_id: string;
+    /** One of the three states file-service persists. */
+    status: "pending_scan" | "clean" | "rejected";
+    updated_at: string;
+  };
+}
+
 export interface WSClientErrorEvent {
   type: "error";
   operation?: string;
@@ -216,6 +241,7 @@ interface UseChatWebSocketOptions {
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onConversationAvailable?: (event: WSConversationAvailableEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
   onSubscriptionError?: (event: WSClientErrorEvent) => void;
@@ -251,6 +277,7 @@ export function useChatWebSocket({
   onReactionUpdated,
   onPinUpdated,
   onMembersAdded,
+  onAttachmentStatus,
   onConversationAvailable,
   onReactionError,
   onSubscriptionError,
@@ -278,6 +305,7 @@ export function useChatWebSocket({
   const onReactionRef = useRef(onReactionUpdated);
   const onPinRef = useRef(onPinUpdated);
   const onMembersRef = useRef(onMembersAdded);
+  const onAttachmentStatusRef = useRef(onAttachmentStatus);
   const onConversationAvailableRef = useRef(onConversationAvailable);
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
@@ -292,6 +320,7 @@ export function useChatWebSocket({
     onReactionRef.current = onReactionUpdated;
     onPinRef.current = onPinUpdated;
     onMembersRef.current = onMembersAdded;
+    onAttachmentStatusRef.current = onAttachmentStatus;
     onConversationAvailableRef.current = onConversationAvailable;
     onReactionErrorRef.current = onReactionError;
     onSubscriptionErrorRef.current = onSubscriptionError;
@@ -454,6 +483,15 @@ export function useChatWebSocket({
         if (!control.expected.has(incomingTargetKey)) return;
         if (d["type"] === "message.created") {
           onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
+          return;
+        }
+        // Routed for any subscribed target rather than only the primary one
+        // (RF-22). A scan verdict is not a mutating action the user just took:
+        // it lands seconds or minutes after an upload, possibly while the user
+        // is looking at a different conversation, and the panel that has to
+        // reconcile is whichever one the attachment belongs to.
+        if (d["type"] === "attachment.status") {
+          onAttachmentStatusRef.current?.(normalizedData as unknown as WSAttachmentStatusEvent);
           return;
         }
         // Mutating actions remain scoped to the primary target.

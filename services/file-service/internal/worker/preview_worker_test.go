@@ -137,6 +137,88 @@ func TestStartReturnsImmediatelyWithoutAProcessor(t *testing.T) {
 	}
 }
 
+// attrCapturingHandler records the attributes of every record it is given, so a
+// test can assert on one field rather than on a formatted line.
+type attrCapturingHandler struct {
+	mu    sync.Mutex
+	attrs []slog.Attr
+}
+
+func (h *attrCapturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *attrCapturingHandler) Handle(_ context.Context, record slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	record.Attrs(func(attr slog.Attr) bool {
+		h.attrs = append(h.attrs, attr)
+		return true
+	})
+	return nil
+}
+
+func (h *attrCapturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *attrCapturingHandler) WithGroup(string) slog.Handler      { return h }
+
+// value returns the last value logged under key, or "" if the key never
+// appeared.
+func (h *attrCapturingHandler) value(key string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	found := ""
+	for _, attr := range h.attrs {
+		if attr.Key == key {
+			found = attr.Value.String()
+		}
+	}
+	return found
+}
+
+// Three jobs share this loop, so a failure has to say which one failed.
+//
+// The assertion is on the `worker` attribute alone and not on the message: the
+// wording is free to change, but an operator triaging a stuck scan queue must
+// never be reading a line that claims a preview failed.
+func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(worker.PreviewProcessor, *slog.Logger) *worker.Preview
+		want  string
+	}{
+		{"preview", worker.NewPreview, "preview"},
+		{"cleanup", worker.NewObjectCleanup, "object_cleanup"},
+		{"scan", worker.NewMalwareScan, "malware_scan"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &attrCapturingHandler{}
+			processor := newCountingProcessor()
+			processor.err = errors.New("connection refused")
+
+			job := tc.build(processor, slog.New(handler))
+			job.SetIntervalForTest(10 * time.Millisecond)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				job.Start(ctx)
+			}()
+			select {
+			case <-processor.signal:
+			case <-time.After(2 * time.Second):
+				cancel()
+				<-done
+				t.Fatal("the worker never ran a pass")
+			}
+			cancel()
+			<-done
+
+			if got := handler.value("worker"); got != tc.want {
+				t.Fatalf("worker attribute = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // The cleanup worker is the same loop on a slower cadence, so it has to stop
 // the same way: cancelled, and returned from.
 func TestObjectCleanupWorkerStopsWhenCancelled(t *testing.T) {
