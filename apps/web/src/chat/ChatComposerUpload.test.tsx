@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -198,6 +198,53 @@ describe("composer drag and drop", () => {
     expect(screen.queryByTestId("chat-composer-upload-status")).not.toBeInTheDocument();
   });
 
+  /**
+   * A dragleave naming where the pointer went.
+   *
+   * Built by hand because fireEvent.dragLeave cannot: jsdom has no DragEvent
+   * constructor, so testing-library falls back to a plain Event, which drops
+   * `relatedTarget` — the one field this behaviour is about.
+   */
+  function dragLeaveTo(box: HTMLElement, relatedTarget: EventTarget | null) {
+    fireEvent(box, new MouseEvent("dragleave", { bubbles: true, relatedTarget }));
+  }
+
+  // A dragleave fires on every internal boundary the pointer crosses. Ending
+  // the drag state there makes the outline blink its way across the composer.
+  it("keeps the drop hint while the pointer moves between the composer's own children", () => {
+    renderComposer();
+    const box = composerBox();
+
+    fireEvent.dragOver(box, { dataTransfer: dropData([fileOfSize(1024)]) });
+    expect(screen.getByText("Solte o arquivo para enviar.")).toBeInTheDocument();
+
+    dragLeaveTo(box, box.querySelector("button"));
+
+    expect(screen.getByText("Solte o arquivo para enviar.")).toBeInTheDocument();
+  });
+
+  it("drops the hint once the pointer really leaves the composer", () => {
+    renderComposer();
+    const box = composerBox();
+
+    fireEvent.dragOver(box, { dataTransfer: dropData([fileOfSize(1024)]) });
+    dragLeaveTo(box, document.body);
+
+    expect(screen.queryByText("Solte o arquivo para enviar.")).not.toBeInTheDocument();
+  });
+
+  // Leaving the window at all reports no destination, which is outside by
+  // definition — the hint must not stick to a drag that has gone.
+  it("drops the hint when the drag leaves the window entirely", () => {
+    renderComposer();
+    const box = composerBox();
+
+    fireEvent.dragOver(box, { dataTransfer: dropData([fileOfSize(1024)]) });
+    dragLeaveTo(box, null);
+
+    expect(screen.queryByText("Solte o arquivo para enviar.")).not.toBeInTheDocument();
+  });
+
   it("ignores a drop when the composer is disabled", () => {
     const onSend = vi.fn<(body: string) => Promise<SendResult>>();
     onSend.mockResolvedValue({ status: "sent" });
@@ -309,6 +356,105 @@ describe("composer upload state", () => {
 
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/Arquivo enviado/)).toBeInTheDocument();
+  });
+});
+
+// ── Progress (RF-30) ─────────────────────────────────────────────────────────
+//
+// The bar is drawn from what the transport counted, or not drawn at all. These
+// exercise the seam between the two: the composer never derives a percentage
+// from anything else, so an upload nobody measured stays indeterminate.
+
+describe("composer upload progress", () => {
+  /**
+   * Starts an upload that never settles and hands back the progress callback
+   * filesApi was given, so the test can report bytes the way apiUpload does.
+   */
+  function startMeasuredUpload() {
+    let report: ((progress: { loaded: number; total: number }) => void) | undefined;
+    let finish: (value: unknown) => void = () => {};
+    mockUploadAttachment.mockImplementation((...args: unknown[]) => {
+      report = args[4] as (progress: { loaded: number; total: number }) => void;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    return {
+      report: (loaded: number, total: number) => act(() => report?.({ loaded, total })),
+      finish: (value: unknown) => act(() => finish(value)),
+    };
+  }
+
+  it("shows a determinate bar for the bytes the transport reported", async () => {
+    const upload = startMeasuredUpload();
+    renderComposer();
+
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
+
+    upload.report(512, 2048);
+
+    const bar = screen.getByTestId("chat-composer-upload-progress") as HTMLProgressElement;
+    expect(bar).toHaveAttribute("aria-label", "Progresso do envio");
+    expect(bar.value).toBe(512);
+    expect(bar.max).toBe(2048);
+    expect(screen.getByText(/Enviando arquivo… 25%/)).toBeInTheDocument();
+  });
+
+  it("follows the transport rather than any local estimate", async () => {
+    const upload = startMeasuredUpload();
+    renderComposer();
+
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
+
+    upload.report(512, 2048);
+    upload.report(1536, 2048);
+
+    expect((screen.getByTestId("chat-composer-upload-progress") as HTMLProgressElement).value).toBe(
+      1536,
+    );
+    expect(screen.getByText(/Enviando arquivo… 75%/)).toBeInTheDocument();
+  });
+
+  // The honest case: nothing measured, so nothing is drawn. A bar with an
+  // invented denominator would be a claim this client cannot support.
+  it("stays indeterminate while the transport has reported nothing", async () => {
+    mockUploadAttachment.mockReturnValue(new Promise(() => {}));
+    renderComposer();
+
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+
+    expect(await screen.findByText("Enviando arquivo…")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-composer-upload-progress")).not.toBeInTheDocument();
+  });
+
+  it("removes the bar once the upload settles", async () => {
+    const upload = startMeasuredUpload();
+    renderComposer();
+
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
+    upload.report(2048, 2048);
+    expect(screen.getByTestId("chat-composer-upload-progress")).toBeInTheDocument();
+
+    upload.finish(uploadedAttachment());
+
+    expect(await screen.findByText(/Arquivo enviado/)).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-composer-upload-progress")).not.toBeInTheDocument();
+  });
+
+  // A report can land after the composer is gone: the request outlives the
+  // component when the user switches conversations mid-upload.
+  it("survives a report that arrives after the composer unmounted", async () => {
+    const upload = startMeasuredUpload();
+    const { unmount } = renderComposer();
+
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
+    unmount();
+
+    expect(() => upload.report(1024, 2048)).not.toThrow();
   });
 });
 

@@ -543,3 +543,47 @@ describe("authenticatedFetch", () => {
     });
   });
 });
+
+// ── Alternate transport (RF-30) ──────────────────────────────────────────────
+//
+// The upload transport is used *through* this module so it inherits the bearer
+// header and the refresh-and-retry instead of reimplementing them. These pin
+// that down: everything the default path guarantees has to hold for the
+// injected one, and the default must not silently take over.
+
+describe("authenticatedFetch with an injected sender", () => {
+  it("routes the request through the sender, with the authorization header", async () => {
+    setTokens("at_1");
+    const send = vi.fn().mockResolvedValue({ data: "ok" });
+
+    const result = await authenticatedFetch(
+      "/api/files/channels/ch-1/attachments",
+      { method: "POST" },
+      undefined,
+      send,
+    );
+
+    expect(result).toEqual({ data: "ok" });
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    const [url, init] = send.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/files/channels/ch-1/attachments");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer at_1");
+  });
+
+  it("refreshes once and retries on the same sender after a 401", async () => {
+    setTokens("expired_at");
+    const send = vi.fn().mockRejectedValueOnce(make401()).mockResolvedValueOnce({ data: "ok" });
+    mockRefresh.mockResolvedValue(makeTokenPair());
+
+    await expect(
+      authenticatedFetch("/api/files/dm/dm-1/attachments", { method: "POST" }, undefined, send),
+    ).resolves.toEqual({ data: "ok" });
+
+    expect(mockRefresh).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    // The retry carries the token the refresh produced, not the expired one.
+    const [, retryInit] = send.mock.calls[1] as [string, RequestInit];
+    expect(new Headers(retryInit.headers).get("authorization")).toBe("Bearer new_at");
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+});
