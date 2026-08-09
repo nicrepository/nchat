@@ -215,7 +215,9 @@ func enabledConfig() config.Config {
 	}
 }
 
-func newTestRouter(t *testing.T, useCases *fakeUseCases, cfg config.Config) http.Handler {
+// useCases is the interface rather than the fake, so the same harness can be
+// pointed at the real AttachmentService — see attachment_scan_gate_test.go.
+func newTestRouter(t *testing.T, useCases httpapi.AttachmentUseCases, cfg config.Config) http.Handler {
 	t.Helper()
 	limiter := httpapi.NewUserRateLimiter(1000, time.Minute)
 	t.Cleanup(limiter.Stop)
@@ -1029,8 +1031,8 @@ func TestRangeCannotBypassTheScanGateOrAuthorization(t *testing.T) {
 		err  error
 		want int
 	}{
-		{"scan pending", domain.ErrNotDownloadable, http.StatusConflict},
-		{"scan rejected", domain.ErrNotDownloadable, http.StatusConflict},
+		{"scan pending", domain.ErrNotDownloadable, http.StatusForbidden},
+		{"scan rejected", domain.ErrNotDownloadable, http.StatusForbidden},
 		{"not visible", domain.ErrNotFound, http.StatusNotFound},
 		{"session expired", domain.ErrUnauthorized, http.StatusUnauthorized},
 	}
@@ -1079,7 +1081,7 @@ func TestDownloadMapsServiceErrors(t *testing.T) {
 		want     int
 		wantCode string
 	}{
-		{name: "pending scan", err: domain.ErrNotDownloadable, want: http.StatusConflict, wantCode: "file_not_scanned"},
+		{name: "pending scan", err: domain.ErrNotDownloadable, want: http.StatusForbidden, wantCode: "file_not_scanned"},
 		{name: "not visible", err: domain.ErrNotFound, want: http.StatusNotFound, wantCode: httputil.ErrCodeNotFound},
 		{name: "session expired", err: domain.ErrUnauthorized, want: http.StatusUnauthorized, wantCode: httputil.ErrCodeUnauthorized},
 		{name: "storage down", err: domain.ErrUnavailable, want: http.StatusServiceUnavailable, wantCode: "service_unavailable"},

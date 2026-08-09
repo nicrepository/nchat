@@ -152,7 +152,7 @@ describe("AttachmentVideo", () => {
   });
 
   it("falls back to a message when the content cannot be fetched", async () => {
-    mockFetchAttachmentContent.mockRejectedValue(new Error("409"));
+    mockFetchAttachmentContent.mockRejectedValue(new Error("403"));
     render(<AttachmentVideo attachment={attachment()} />);
 
     expect(await screen.findByTestId("chat-details-video-error")).toBeInTheDocument();

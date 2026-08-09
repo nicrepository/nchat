@@ -736,7 +736,13 @@ func attachmentErrorStatus(err error) (int, string) {
 	case errors.Is(err, domain.ErrNotFound):
 		return http.StatusNotFound, httputil.ErrCodeNotFound
 	case errors.Is(err, domain.ErrNotDownloadable):
-		return http.StatusConflict, errCodeNotScanned
+		// 403, not 409: the malware scan is an authorization control of its own,
+		// independent of the caller's access to the channel or conversation. A
+		// caller who may see the attachment is still not permitted its bytes
+		// until a server-side verdict approves them, and no retry, no header and
+		// no request shape of theirs can change that — which is what 403 says and
+		// what 409 ("resolve the conflict and retry") does not.
+		return http.StatusForbidden, errCodeNotScanned
 	case errors.Is(err, domain.ErrPreviewUnavailable):
 		return http.StatusConflict, errCodePreviewUnavailable
 	case errors.Is(err, domain.ErrUnavailable):
@@ -754,9 +760,14 @@ func writeAttachmentError(w http.ResponseWriter, err error) {
 // attachmentErrorMessage keeps response text constant per outcome. The
 // underlying error never reaches the client.
 //
-// The code refines the status for the one status that carries two meanings:
-// 409 is both "not scanned yet" and "no preview", and a client that asked for a
-// preview must not be told the file is awaiting a scan when it is not.
+// The code is consulted before the status because the preview route has an
+// absence of its own — 409 preview_not_available — that must never be worded as
+// "awaiting a scan" for a file that has already been scanned.
+//
+// Nothing here names the scanner, the daemon's address, the storage host, the
+// row's actual status or whether a threat was found: an attachment that is
+// pending and one that was rejected are answered identically, so the route
+// cannot be used to learn a verdict the caller was not shown.
 func attachmentErrorMessage(status int, code string) string {
 	if code == errCodePreviewUnavailable {
 		return "attachment preview is not available"
@@ -768,10 +779,10 @@ func attachmentErrorMessage(status int, code string) string {
 		return "invalid upload request"
 	case http.StatusUnauthorized:
 		return "unauthorized"
+	case http.StatusForbidden:
+		return "attachment has not been approved by the malware scan"
 	case http.StatusNotFound:
 		return "attachment not found"
-	case http.StatusConflict:
-		return "attachment is awaiting malware scan"
 	case http.StatusServiceUnavailable:
 		return "attachment storage unavailable"
 	default:

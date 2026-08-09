@@ -407,7 +407,7 @@ describe("fetchAttachmentContent", () => {
   });
 
   it("propagates a refusal so the caller can draw its fallback", async () => {
-    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(409, "file_not_scanned", "nope"));
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "file_not_scanned", "nope"));
 
     await expect(fetchAttachmentContent("a-1")).rejects.toBeInstanceOf(ApiRequestError);
   });

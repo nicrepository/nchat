@@ -112,9 +112,10 @@ export async function fetchConversationAttachments(
  * attachment's visibility and its scan state on every call, so a preview is
  * never more durable, or more shareable, than the caller's own access.
  *
- * A preview that is not servable answers 409 and a caller that cannot see the
- * attachment answers 404 — both surface as ApiRequestError, and both mean the
- * same thing to the UI: draw the fallback.
+ * A preview that is not servable answers 409, an attachment the scan has not
+ * approved answers 403 and a caller that cannot see it answers 404 — all three
+ * surface as ApiRequestError, and all three mean the same thing to the UI: draw
+ * the fallback.
  */
 export async function fetchAttachmentPreview(
   attachmentId: string,
@@ -143,7 +144,7 @@ export async function fetchAttachmentPreview(
  * downloading everything — is not what is being used here. See
  * MAX_INLINE_VIDEO_BYTES in AttachmentVideo.
  *
- * A file the scan has not cleared answers 409 and one the caller cannot see
+ * A file the scan has not cleared answers 403 and one the caller cannot see
  * answers 404 — both surface as ApiRequestError, and both mean the same thing to
  * the UI: there is nothing to play.
  */

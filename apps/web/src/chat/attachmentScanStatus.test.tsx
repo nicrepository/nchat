@@ -184,7 +184,7 @@ describe("ações que dependem da aprovação", () => {
 
   // The preview route serves bytes derived from the same file, so requesting it
   // before the verdict would be the client acting as if the gate might not
-  // apply. The server answers 409 either way; not asking is the point.
+  // apply. The server answers 403 either way; not asking is the point.
   it("não busca preview enquanto o scan não aprovou", () => {
     renderPanel([attachment({ status: "pending_scan", previewStatus: "ready" })]);
     expect(mockFetchAttachmentPreview).not.toHaveBeenCalled();

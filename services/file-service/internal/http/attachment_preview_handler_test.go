@@ -113,7 +113,7 @@ func TestPreviewMapsRefusalsToStableCodes(t *testing.T) {
 			err: domain.ErrNotFound, wantStatus: http.StatusNotFound, wantCode: "not_found",
 		},
 		"not scanned": {
-			err: domain.ErrNotDownloadable, wantStatus: http.StatusConflict, wantCode: "file_not_scanned",
+			err: domain.ErrNotDownloadable, wantStatus: http.StatusForbidden, wantCode: "file_not_scanned",
 		},
 		"no preview": {
 			err: domain.ErrPreviewUnavailable, wantStatus: http.StatusConflict,
@@ -157,9 +157,12 @@ func TestPreviewMapsRefusalsToStableCodes(t *testing.T) {
 	}
 }
 
-// "Awaiting a scan" and "no preview" are both 409 and must not be confused:
-// a client asking for a preview would otherwise be told the file is unsafe.
-func TestPreviewMessageDistinguishesTheTwoConflicts(t *testing.T) {
+// "Not approved by the scan" and "no preview" are different refusals and must
+// not be confused: a client asking for a preview of a scanned file would
+// otherwise be told the file is unsafe. They now differ in status as well as in
+// wording, and both halves are asserted — a future refactor that collapsed them
+// back onto one status would still have to keep the messages apart.
+func TestPreviewMessageDistinguishesTheTwoRefusals(t *testing.T) {
 	messages := map[string]string{}
 	for _, tt := range []struct {
 		name string
@@ -277,7 +280,7 @@ func TestPreviewCountsEachRefusalUnderItsOwnCode(t *testing.T) {
 			wantResult: "preview_not_available",
 		},
 		"not scanned": {
-			err: domain.ErrNotDownloadable, wantStatus: http.StatusConflict,
+			err: domain.ErrNotDownloadable, wantStatus: http.StatusForbidden,
 			wantResult: "file_not_scanned",
 		},
 		"invisible attachment": {
