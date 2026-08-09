@@ -480,7 +480,7 @@ sao serializados.
 Aparecer na listagem **nao** concede permissao de download. O conteudo continua
 em `GET /api/files/attachments/{attachmentID}/content`, que reautoriza a cada
 chamada e so serve anexo com `status = clean`; `pending_scan` e `rejected`
-aparecem na lista com o seu estado e respondem `409 file_not_scanned` no
+aparecem na lista com o seu estado e respondem `403 file_not_scanned` no
 download.
 
 ### Download
@@ -509,8 +509,8 @@ nunca renderizados na origem da API.
 | 200    | -                     | anexo `clean` e visivel ao usuario             |
 | 206    | -                     | `Range` valido e satisfazivel                  |
 | 401    | `unauthorized`        | token invalido ou sessao inativa               |
+| 403    | `file_not_scanned`    | anexo existe e e visivel, mas nao esta `clean` |
 | 404    | `not_found`           | anexo inexistente, removido ou fora do alcance |
-| 409    | `file_not_scanned`    | anexo existe e e visivel, mas nao esta `clean` |
 | 416    | `range_not_supported` | mais de um intervalo por request               |
 | 416    | -                     | intervalo unico invalido ou fora do arquivo    |
 | 503    | `service_unavailable` | storage indisponivel ou objeto ausente         |
@@ -690,15 +690,17 @@ compartilhado nao sabe decidir isso.
 | ------ | ----------------------- | ------------------------------------------------- |
 | 200    | -                       | anexo `clean`, visivel, com preview `ready`       |
 | 401    | `unauthorized`          | token invalido ou sessao inativa                  |
+| 403    | `file_not_scanned`      | anexo existe e e visivel, mas nao esta `clean`    |
 | 404    | `not_found`             | anexo inexistente, removido ou fora do alcance    |
-| 409    | `file_not_scanned`      | anexo existe e e visivel, mas nao esta `clean`    |
 | 409    | `preview_not_available` | sem preview servivel (pending/unsupported/failed) |
 | 503    | `service_unavailable`   | storage indisponivel ou objeto ausente            |
 
-Os dois `409` tem mensagens diferentes de proposito: um cliente que pediu
-preview nao pode ser informado de que o arquivo esta aguardando scan quando nao
-esta. Qual das tres ausencias e a real vem do `previewStatus` do metadado, nao
-desta rota -- ela nunca descreve estado interno.
+As duas recusas tem status e mensagens diferentes de proposito: `403` diz que o
+anexo nao foi aprovado pelo antimalware e que nada que o cliente faca muda isso;
+`409` diz que nao ha preview servivel agora. Um cliente que pediu preview nao
+pode ser informado de que o arquivo esta aguardando scan quando nao esta. Qual
+das tres ausencias e a real vem do `previewStatus` do metadado, nao desta rota
+-- ela nunca descreve estado interno.
 
 ### Relacao com o scan de malware
 
@@ -981,7 +983,7 @@ real.
 A cadeia e completa quando ha um daemon configurado. **Sem
 `FILE_MALWARE_SCANNER_ADDRESS`** o worker nao inicia e a cadeia para na segunda
 linha: os anexos sao enviados, listados e ficam em `pending_scan`, o download
-responde `409 file_not_scanned` e o preview permanece `pending`.
+responde `403 file_not_scanned` e o preview permanece `pending`.
 
 **Consequencia operacional, explicita:** com `FILE_MALWARE_SCAN_REQUIRED=true`
 (default) e sem scanner configurado, todo upload termina em `pending_scan` e
@@ -1450,7 +1452,7 @@ FILE_MALWARE_SCANNER_ADDRESS=localhost:3310
 
 Para verificar a deteccao sem malware real, envie o arquivo de teste EICAR: o
 anexo deve ir para `rejected` dentro de um ciclo de poll (10 s) e o download
-passar a responder `409 file_not_scanned`. Parar o container e enviar outro
+passar a responder `403 file_not_scanned`. Parar o container e enviar outro
 arquivo demonstra o caminho de falha: o anexo fica em `pending_scan`, o log do
 worker registra `result=retry`, e subir o container de volta faz o proximo claim
 aprova-lo.
