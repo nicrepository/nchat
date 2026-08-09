@@ -1004,6 +1004,19 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     // Passed directly: useMessages holds this callback in a ref, so a new
     // identity each render does not restart the socket or its subscriptions.
     onMembersAdded: reloadOpenDetails,
+    // An attachment's malware verdict landed (RF-22). The same treatment as
+    // members.added and for the same reason: the event says which row changed,
+    // not what the list should now look like, so the panel refetches and the
+    // server stays the single authority on every attachment's status.
+    //
+    // Refetching rather than patching is also what makes the event and the
+    // panel's own reconciliation poll safe together. Both end in one
+    // `files_ready` carrying a whole list, so two of them arriving at once
+    // cannot duplicate a row, and neither can write a status the server did not
+    // just report. A missed event costs nothing: the poll, a reopen, or a
+    // reload all recover the current state, because the persisted status is the
+    // source of truth and this is only a hint that it moved.
+    onAttachmentStatus: reloadOpenDetails,
     onMessageRemoved: reloadPins,
   });
 

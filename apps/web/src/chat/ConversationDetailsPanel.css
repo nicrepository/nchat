@@ -540,6 +540,14 @@
   color: var(--color-warning-ink, #92400e);
 }
 
+/* The base badge is the amber "waiting" state, which pending_scan keeps. The
+   two decided states override it, so the three are distinguishable by colour as
+   well as by text. */
+.chat-details__file-status--clean {
+  background: var(--color-success-tint, #dcfce7);
+  color: var(--color-success-ink, #166534);
+}
+
 .chat-details__file-status--rejected {
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);

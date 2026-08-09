@@ -44,6 +44,7 @@ import {
   type WSMessageUpdatedEvent,
   type WSClientErrorEvent,
   type WSMembersAddedEvent,
+  type WSAttachmentStatusEvent,
   type WSPinUpdatedEvent,
   type WSReactionUpdatedEvent,
 } from "./useChatWebSocket";
@@ -563,6 +564,15 @@ interface UseMessagesOptions {
    * membership would double the WebSocket count per conversation.
    */
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  /**
+   * RF-22: called on an attachment.status event for the active target.
+   *
+   * Routed through this hook for the same reason members.added is — the
+   * connection and its subscriptions already live here — and filtered to the
+   * active target, so a verdict for another conversation cannot make this one
+   * refetch.
+   */
+  onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onMessageRemoved?: () => void;
 }
 
@@ -591,6 +601,7 @@ export function useMessages({
   onOwnReactionConfirmed,
   onPinUpdated,
   onMembersAdded,
+  onAttachmentStatus,
   onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -1205,6 +1216,19 @@ export function useMessages({
     [kind, targetId],
   );
 
+  // Same ref treatment again, same reason.
+  const onAttachmentStatusRef = useRef(onAttachmentStatus);
+  useLayoutEffect(() => {
+    onAttachmentStatusRef.current = onAttachmentStatus;
+  });
+  const handleAttachmentStatus = useCallback(
+    (event: WSAttachmentStatusEvent) => {
+      if (event.target_type !== kind || event.target_id !== targetId) return;
+      onAttachmentStatusRef.current?.(event);
+    },
+    [kind, targetId],
+  );
+
   const { toggleReaction: sendReactionToggle } = useChatWebSocket({
     kind,
     targetId,
@@ -1213,6 +1237,7 @@ export function useMessages({
     onReactionUpdated: handleReactionUpdated,
     onPinUpdated: handlePinUpdated,
     onMembersAdded: handleMembersAdded,
+    onAttachmentStatus: handleAttachmentStatus,
     onReactionError: handleReactionError,
     onSubscriptionError: handleSubscriptionError,
     onSubscribed: handleSubscribed,

@@ -213,6 +213,18 @@ recusado na inicializacao quando `APP_ENV` nao e um valor de desenvolvimento
 fechada: um `APP_ENV` desconhecido e tratado como ambiente implantado. Ver
 `docs/api/file-attachments.md`.
 
+O scan em si e assincrono (RF-22) e falha fechada em todas as direcoes:
+
+- indisponibilidade, timeout ou resposta invalida do daemon **nunca** produzem
+  aprovacao. Nada e gravado e o anexo continua em `pending_scan`, nao baixavel,
+  ate que um scan real conclua;
+- `FILE_MALWARE_SCANNER_ADDRESS` vazio nao afrouxa o gate: sem scanner o worker
+  nao inicia e nenhum anexo e aprovado;
+- o veredito e decidido exclusivamente server-side. Nao existe rota, campo de
+  request ou evento vindo do cliente que alcance a transicao para `clean`;
+- o gate vale para toda entrega de bytes derivados do arquivo -- download,
+  HTTP Range, preview e streaming inline -- e nao apenas para o download.
+
 ## Processo para vulnerabilidade Critical/High
 
 1. Criar issue restrita.

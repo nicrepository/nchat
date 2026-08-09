@@ -8,12 +8,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/file-service/internal/config"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
+	"github.com/nicrepository/nchat/services/file-service/internal/events"
 	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
 	"github.com/nicrepository/nchat/services/file-service/internal/preview"
+	"github.com/nicrepository/nchat/services/file-service/internal/scanner"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
 	"github.com/nicrepository/nchat/services/file-service/internal/storage"
 	"github.com/nicrepository/nchat/services/file-service/internal/worker"
@@ -40,8 +43,14 @@ type App struct {
 	previewDone   <-chan struct{}
 	cleanupCancel context.CancelFunc
 	cleanupDone   <-chan struct{}
-	shutdownOnce  sync.Once
-	shutdownErr   error
+	scanCancel    context.CancelFunc
+	scanDone      <-chan struct{}
+	// statusPublisher is the bus connection the scan worker announces verdicts
+	// on. Nil whenever no bus is configured, which is a supported deployment:
+	// verdicts are still persisted and clients still see them on their next read.
+	statusPublisher *events.Publisher
+	shutdownOnce    sync.Once
+	shutdownErr     error
 }
 
 type appDependencies struct {
@@ -176,7 +185,104 @@ func (a *App) wireAttachments(
 	a.startCleanupWorker(service.NewObjectCleanupService(
 		cleanupStore, objects, attachmentMetrics, logger,
 	), logger)
+	a.startMalwareScanWorker(cfg, pool, fence, objects, keys, attachmentMetrics, logger)
 	return nil
+}
+
+// startMalwareScanWorker drains the antimalware scan queue (RF-22).
+//
+// It starts only when a scanner is configured, and that asymmetry is the
+// fail-closed reading of an absent one: with no daemon there is nothing that
+// could produce a verdict, so a worker would only poll a queue it can never
+// drain. Every upload then stays in pending_scan and stays undownloadable,
+// which is the correct behaviour for a deployment with no scanner — the gate
+// itself is never what a missing address relaxes.
+//
+// A scanner that cannot be constructed from a validated address is the same
+// case: the worker does not start, and no attachment is approved. Nothing here
+// can fail the service's start-up, because uploads, listings and downloads of
+// already-approved files all keep working without a scan worker.
+//
+// The status publisher is separately optional. Without a bus the verdict is
+// still persisted and still authoritative; clients learn it from their next
+// read rather than immediately.
+func (a *App) startMalwareScanWorker(
+	cfg config.Config,
+	pool storage.Pool,
+	fence storage.AttachmentFencing,
+	objects service.ObjectStore,
+	keys *crypto.Keyring,
+	metrics *httpapi.AttachmentMetrics,
+	logger *slog.Logger,
+) {
+	if cfg.MalwareScannerAddress == "" {
+		logger.LogAttrs(context.Background(), slog.LevelWarn, "malware scan worker not started",
+			slog.String("reason", "scanner_not_configured"),
+			slog.Bool("uploads_downloadable_without_scan", !cfg.MalwareScanRequired),
+		)
+		return
+	}
+	malware, err := scanner.New(
+		cfg.MalwareScannerAddress, time.Duration(cfg.MalwareScanTimeoutSeconds)*time.Second,
+	)
+	if err != nil {
+		logger.LogAttrs(context.Background(), slog.LevelError, "malware scan worker not started",
+			slog.String("reason", "scanner_unavailable"),
+		)
+		return
+	}
+
+	// Nil when no bus is configured, and passed through as a typed nil would not
+	// be: the service checks the interface for nil, so an interface holding a
+	// nil *Publisher would pass that check and then fail on every verdict.
+	var publisher service.AttachmentStatusPublisher
+	if cfg.ValkeyURL != "" {
+		instanceID := cfg.WSInstanceID
+		if instanceID == "" {
+			// Only used for the consumer's echo suppression, so uniqueness is the
+			// whole requirement and a random value satisfies it.
+			instanceID = "file-" + uuid.New().String()
+		}
+		concrete, publisherErr := events.NewPublisher(cfg.ValkeyURL, instanceID)
+		if publisherErr != nil {
+			logger.LogAttrs(context.Background(), slog.LevelWarn, "attachment status bus unavailable",
+				slog.String("reason", "publisher_unavailable"),
+			)
+		} else {
+			a.statusPublisher = concrete
+			publisher = concrete
+		}
+	}
+
+	// The verdict store is the fenced one, the same the rest of the service
+	// uses. The *worker* holds no fence — it is the verdict's producer, and a
+	// session lock held for the length of a large scan would be a lock its own
+	// rejection then waits for — but the rejection statement itself must still
+	// run under it, so a condemned attachment cannot commit underneath a
+	// renderer already holding its plaintext.
+	scans := service.NewMalwareScanService(
+		storage.NewPGXScanStore(pool),
+		storage.NewFencedAttachmentStore(pool, fence),
+		objects,
+		keys,
+		malware,
+		publisher,
+		metrics,
+		// One source of truth for the budget: the same configured value the
+		// scanner client dials with also bounds the job and derives the lease.
+		// A service that cancelled at its own fixed deadline would make a
+		// longer configured timeout unreachable and every large scan a retry.
+		time.Duration(cfg.MalwareScanTimeoutSeconds)*time.Second,
+		logger,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		worker.NewMalwareScan(scans, logger).Start(ctx)
+	}()
+	a.scanCancel = cancel
+	a.scanDone = done
 }
 
 // startPreviewWorker runs preview generation for as long as the app lives.
@@ -230,9 +336,21 @@ func (a *App) Shutdown(ctx context.Context) error {
 		// Both workers hold the pool, so both must be stopped before it closes.
 		previewStopped := a.stopPreviewWorker(ctx)
 		cleanupStopped := a.stopWorker(ctx, a.cleanupCancel, a.cleanupDone)
-		if previewStopped && cleanupStopped {
+		scanStopped := a.stopWorker(ctx, a.scanCancel, a.scanDone)
+		if previewStopped && cleanupStopped && scanStopped {
 			if a.pool != nil {
 				a.pool.Close()
+			}
+			// After the workers, never before: the publish that follows a
+			// verdict runs on a context detached from the job's, so closing the
+			// bus first would drop the announcement of a verdict that was
+			// already written.
+			//
+			// Nil whenever no bus is configured, which is a supported
+			// deployment. Checked here rather than relied on inside Close, so
+			// this reads like every other optional resource above it.
+			if a.statusPublisher != nil {
+				a.statusPublisher.Close()
 			}
 		} else {
 			// The worker did not stop inside the grace period. Closing the pool

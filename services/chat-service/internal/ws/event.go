@@ -45,6 +45,26 @@ const (
 	// nothing.
 	EventTypeConversationAvailable EventType = "conversation.available"
 
+	// EventTypeAttachmentStatus is emitted after an attachment's antimalware
+	// verdict has been persisted (RF-22).
+	//
+	// It is the one event in this protocol chat-service never publishes. Its
+	// producer is file-service, which owns the scan and the row, and it reaches
+	// this hub the same way any other instance's event does: over the broadcast
+	// bus, as an untrusted payload that is canonicalised and then delivered to
+	// the target's subscribers, each re-authorised at fan-out.
+	//
+	// That routing is the whole authorization story. The event names a channel or
+	// a conversation, never a user, so it can only reach people who could already
+	// read that destination — it cannot be aimed, cannot widen a subscription and
+	// cannot reveal that a private target exists.
+	//
+	// Like pin.updated it is route-plus-flag: it carries the attachment's id, its
+	// new status and when it changed, and nothing about the file itself. The
+	// client reconciles by refetching the attachment list, which the file service
+	// re-authorises.
+	EventTypeAttachmentStatus EventType = "attachment.status"
+
 	// Call lifecycle (RF-23). User-scoped like conversation.available in that
 	// they name a peer, but with their own payload and their own validation.
 	EventTypeCallRinging   EventType = "call.ringing"
@@ -167,6 +187,31 @@ type MembersAddedPayload struct {
 	MemberCount int `json:"member_count"`
 }
 
+// AttachmentStatusPayload carries one attachment's new antimalware state
+// (RF-22).
+//
+// Three fields, and the omissions are the design. There is no filename, no
+// content type, no size, no uploader and no signature name: the recipient is
+// every subscriber of a channel, and a broadcast is the wrong place to describe
+// a file. What a client needs is which row changed and what it changed to, so
+// that is all it gets — everything else comes from an authorised read.
+//
+// Status is one of the three functional states the file service persists:
+// "pending_scan" (em analise), "clean" (aprovado), "rejected" (bloqueado). It is
+// echoed as the producer sent it, after canonicalisation against that closed
+// set, and grants nothing on its own: the download gate is server-side in
+// file-service and re-evaluated on every request, so a client that fabricated a
+// "clean" for itself would still be refused the bytes.
+type AttachmentStatusPayload struct {
+	AttachmentID string `json:"attachment_id"`
+	Status       string `json:"status"`
+	// UpdatedAt is when the verdict was persisted, as an RFC 3339 string. It is
+	// a string rather than a time.Time so a producer's formatting cannot make
+	// the whole envelope undecodable; the client uses it only to ignore an
+	// event older than what it already shows.
+	UpdatedAt string `json:"updated_at"`
+}
+
 type PinEventPayload struct {
 	MessageID string `json:"message_id"`
 	// ActorUserID is the user who pinned/unpinned, exposed like sender_id so
@@ -225,6 +270,9 @@ type Event struct {
 	Reaction      *ReactionEventPayload  `json:"reaction,omitempty"`
 	Pin           *PinEventPayload       `json:"pin,omitempty"`
 	Members       *MembersAddedPayload   `json:"members,omitempty"`
+	// Attachment carries an antimalware verdict (RF-22). Set only by
+	// file-service, over the bus; this hub never populates it.
+	Attachment *AttachmentStatusPayload `json:"attachment,omitempty"`
 	// RecipientUserID routes a user-scoped event to exactly one user.
 	//
 	// Set only for conversation.available, which is not delivered by

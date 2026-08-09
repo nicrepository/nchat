@@ -865,6 +865,86 @@ describe("useChatWebSocket", () => {
     expect(onMembersAdded).not.toHaveBeenCalled();
   });
 
+  // ── attachment.status (RF-22) ────────────────────────────────────────────
+
+  it("routes attachment.status for the active target", () => {
+    const onAttachmentStatus = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onAttachmentStatus,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "attachment.status",
+        target_type: "channel",
+        target_id: "ch-1",
+        attachment: {
+          attachment_id: "att-1",
+          status: "rejected",
+          updated_at: "2026-08-07T12:00:00Z",
+        },
+      }),
+    );
+    expect(onAttachmentStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "attachment.status",
+        attachment: expect.objectContaining({ attachment_id: "att-1", status: "rejected" }),
+      }),
+    );
+  });
+
+  it("ignores attachment.status for a target this hook is not subscribed to", () => {
+    const onAttachmentStatus = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onAttachmentStatus,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "attachment.status",
+        target_type: "channel",
+        target_id: "ch-other",
+        attachment: { attachment_id: "att-1", status: "clean", updated_at: "2026-08-07T12:00:00Z" },
+      }),
+    );
+    expect(onAttachmentStatus).not.toHaveBeenCalled();
+  });
+
+  // A verdict lands seconds or minutes after the upload, quite possibly while
+  // the user is looking elsewhere. Unlike the mutating actions, it is therefore
+  // routed for every subscribed target rather than only the primary one — the
+  // panel that has to reconcile is whichever the attachment belongs to.
+  it("routes attachment.status for an additional subscribed target", () => {
+    const onAttachmentStatus = vi.fn();
+    const additionalTargets: WSSubscriptionTarget[] = [{ kind: "dm", targetId: "dm-9" }];
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        additionalTargets,
+        onMessageCreated: vi.fn(),
+        onAttachmentStatus,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "attachment.status",
+        target_type: "dm",
+        target_id: "dm-9",
+        attachment: { attachment_id: "att-2", status: "clean", updated_at: "2026-08-07T12:00:00Z" },
+      }),
+    );
+    expect(onAttachmentStatus).toHaveBeenCalledOnce();
+  });
+
   it("routes every supported message.updated body format only for the active target", () => {
     const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
     renderHook(() =>

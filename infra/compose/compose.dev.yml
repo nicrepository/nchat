@@ -48,6 +48,54 @@ services:
     networks:
       - nchat-dev
 
+  clamav:
+    # Antimalware scanning for attachments (RF-22).
+    #
+    # file-service streams each finished upload here over clamd's INSTREAM and
+    # persists the verdict; a daemon that is down or unreachable never produces
+    # an approval, so stopping this container leaves uploads in "em analise"
+    # rather than making them downloadable.
+    # Defaulted, like SEAWEEDFS_VOLUME_2_HOST_PORT below: an operator whose
+    # .env.dev predates RF-22 must still be able to bring the project up. Without
+    # a default, an unset variable makes compose reject the *whole* file, not
+    # just this service.
+    image: ${CLAMAV_IMAGE:-clamav/clamav:1.4}
+    container_name: nchat-clamav
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      # The image's own entrypoint would otherwise start freshclam as well; the
+      # signature database that ships with the image is enough for local work and
+      # avoids a network fetch on every start. Set to false when testing against
+      # current signatures.
+      CLAMAV_NO_FRESHCLAMD: "${CLAMAV_NO_FRESHCLAMD:-true}"
+      CLAMAV_NO_MILTERD: "true"
+    ports:
+      # Bound to the loopback interface only. The services run on the host in
+      # local development (see the upload-guard note below), so the port has to
+      # be reachable from there — but a malware daemon must never be reachable
+      # from the network, and it has no authentication of its own to fall back on.
+      - "127.0.0.1:${CLAMAV_HOST_PORT:-3310}:3310"
+    volumes:
+      # The limits in this file are derived from uploadpolicy's 512 MiB ceiling.
+      # A StreamMaxLength below it would make the largest attachments permanently
+      # unscannable, and therefore permanently undownloadable.
+      - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      - nchat_clamav_data:/var/lib/clamav
+    healthcheck:
+      # PING/PONG on the same socket file-service uses, so the check proves the
+      # daemon is actually accepting commands rather than merely running.
+      test: ["CMD-SHELL", "clamdcheck.sh || exit 1"]
+      interval: 15s
+      timeout: 10s
+      # Generous: loading the signature database takes a while on first start,
+      # and a restart loop here would be worse than a slow first scan.
+      retries: 20
+      start_period: 120s
+    networks:
+      - nchat-dev
+
   seaweed-master:
     image: ${SEAWEEDFS_IMAGE}
     env_file:
@@ -307,6 +355,7 @@ networks:
 volumes:
   nchat_postgres_data:
   nchat_valkey_data:
+  nchat_clamav_data:
   nchat_seaweed_master_data:
   nchat_seaweed_volume_data:
   nchat_seaweed_filer_data:

@@ -10,6 +10,7 @@ import (
 
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+	"github.com/nicrepository/nchat/services/file-service/internal/storage"
 )
 
 // readFilesMigration loads a migration from the repository so the schema
@@ -652,6 +653,276 @@ func TestPreviewDownMigrationDropsOnlyDerivedState(t *testing.T) {
 	// Dropping columns the attachment itself depends on would take downloads
 	// with it, which is exactly what this rollback must not do.
 	for _, kept := range []string{"wrapped_dek", "kek_key_id", "storage_object_key"} {
+		if strings.Contains(statements, "DROP COLUMN IF EXISTS "+kept) {
+			t.Fatalf("the down migration must not drop %q", kept)
+		}
+	}
+	if !strings.Contains(down, "BEGIN;") || !strings.Contains(down, "COMMIT;") {
+		t.Fatal("the down migration must be transactional")
+	}
+}
+
+const scanUpMigration = "000005_attachment_malware_scan_jobs.up.sql"
+const scanDownMigration = "000005_attachment_malware_scan_jobs.down.sql"
+
+// The scan scheduler is purely additive, exactly like the preview one: every
+// column is nullable or has a DEFAULT, so an INSERT emitted by the previous
+// build stays valid and no writer has to be fenced out.
+func TestScanMigrationAddsOnlyOptionalColumns(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, scanUpMigration))
+
+	for _, column := range []string{"scan_attempts", "scan_next_attempt_at"} {
+		if !strings.Contains(up, column) {
+			t.Fatalf("expected column %q", column)
+		}
+	}
+	if !strings.Contains(up, "scan_attempts        SMALLINT    NOT NULL DEFAULT 0") {
+		t.Fatal("the only NOT NULL column must carry a DEFAULT")
+	}
+	if strings.Contains(up, "LOCK TABLE") || strings.Contains(up, "RAISE EXCEPTION") {
+		t.Fatal("a purely additive migration needs no lock and no emptiness guard")
+	}
+	if !strings.Contains(up, "BEGIN;") || !strings.Contains(up, "COMMIT;") {
+		t.Fatal("the migration must be transactional")
+	}
+	if !strings.Contains(up, "attachments_scan_attempts_check") {
+		t.Fatal("the attempt counter must be constrained non-negative")
+	}
+}
+
+// The migration must add no new status. RF-22's three functional states are the
+// ones migration 000001 already pinned, and a fourth would be a contract change
+// no client implements.
+func TestScanMigrationIntroducesNoNewStatus(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, scanUpMigration))
+
+	if strings.Contains(up, "attachments_status_check") {
+		t.Fatal("the status set must not be redefined by this migration")
+	}
+	for _, status := range []domain.Status{
+		domain.StatusPendingScan, domain.StatusClean, domain.StatusRejected,
+	} {
+		if !status.Valid() {
+			t.Fatalf("domain status %q is not in the closed set", status)
+		}
+	}
+	// The three external states exist already; nothing here needs to create one.
+	if !domain.StatusClean.Downloadable() {
+		t.Fatal("clean must be the downloadable state")
+	}
+	if domain.StatusPendingScan.Downloadable() || domain.StatusRejected.Downloadable() {
+		t.Fatal("only an approved attachment may be downloadable")
+	}
+}
+
+// The security property of the whole migration, and the reason it exists in
+// this shape: after it runs, no attachment is approved that a scan has not
+// approved.
+//
+// That is stronger than "grants nothing new". A 'clean' written before RF-22
+// has no provenance — the schema records no scanner, no verdict time, nothing —
+// and there was no producer of verdicts in any earlier build, so every one of
+// them is either a development bypass or an approval that never happened.
+// Leaving them alone would ship a download gate with a pre-approved set of files
+// behind it.
+func TestScanMigrationRevokesApprovalsWithNoScanBehindThem(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, scanUpMigration))
+
+	// The demotion itself: unscanned clean goes back to the state that honestly
+	// describes it, and is queued.
+	if !strings.Contains(up, "SET status = 'pending_scan'") {
+		t.Fatal("legacy approvals must be demoted to pending_scan")
+	}
+	if !strings.Contains(up, "WHERE status IN ('pending_scan', 'clean')") {
+		t.Fatal("the backfill must cover both the already-queued and the wrongly-approved")
+	}
+	if !strings.Contains(up, "scan_next_attempt_at = now()") {
+		t.Fatal("demoted rows must be due immediately, or they are demoted and stranded")
+	}
+	if !strings.Contains(up, "scan_attempts = 0") {
+		t.Fatal("a demoted row starts a fresh attempt budget")
+	}
+	if !strings.Contains(up, "deleted_at IS NULL") {
+		t.Fatal("the backfill must not queue removed attachments")
+	}
+}
+
+// Nothing in the migration may hand out the downloadable state. This is the
+// assertion that would fail if somebody ever "fixed" the availability cost of
+// the demotion by promoting rows instead.
+func TestScanMigrationGrantsCleanToNobody(t *testing.T) {
+	for _, name := range []string{scanUpMigration, scanDownMigration} {
+		sql := sqlOnly(readFilesMigration(t, name))
+		for _, forbidden := range []string{
+			"= 'clean'", "='clean'", "SET status = 'clean'",
+		} {
+			if strings.Contains(sql, forbidden) {
+				t.Fatalf("%s assigns clean (%q); only MarkScanClean may", name, forbidden)
+			}
+		}
+	}
+}
+
+// A verdict that already exists is not revisited, and an unfinished upload is
+// not promoted into one. Both are absent from the predicate rather than
+// filtered out later, which is what makes them unreachable rather than merely
+// unmatched.
+func TestScanMigrationLeavesEveryOtherStateAlone(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, scanUpMigration))
+	start := strings.Index(up, "UPDATE files.attachments")
+	if start < 0 {
+		t.Fatal("the migration has no backfill; legacy rows would never be queued")
+	}
+	backfill := up[start:]
+
+	for _, untouched := range []string{"'rejected'", "'pending_upload'", "'failed'", "'deleted'"} {
+		if strings.Contains(backfill, untouched) {
+			t.Fatalf("the backfill names %s; it must not reach that state at all", untouched)
+		}
+	}
+	// One statement, so there is exactly one description of an unscanned
+	// attachment once it has run.
+	if got := strings.Count(backfill, "UPDATE"); got != 1 {
+		t.Fatalf("the backfill is %d statements, want 1", got)
+	}
+}
+
+// The rollback must not restore what the demotion removed. Re-granting clean on
+// the way down would put back precisely the unverified approvals the way up
+// took away — and it could not even identify them, since nothing records which
+// rows were demoted.
+func TestScanDownMigrationDoesNotRestoreRevokedApprovals(t *testing.T) {
+	down := sqlOnly(readFilesMigration(t, scanDownMigration))
+
+	if strings.Contains(down, "UPDATE") || strings.Contains(down, "SET status") {
+		t.Fatalf("the down migration rewrites status:\n%s", down)
+	}
+}
+
+// The claim runs on every replica every few seconds against a table that grows
+// with every upload, and the queue-depth gauge reads the same predicate.
+func TestScanMigrationIndexesTheWorkerQueue(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, scanUpMigration))
+	if !strings.Contains(up, "idx_attachments_scan_pending") {
+		t.Fatal("expected an index for the scan queue")
+	}
+	if !strings.Contains(up, "WHERE status = 'pending_scan'") {
+		t.Fatal("the queue index must be partial, so it is empty when there is no backlog")
+	}
+}
+
+// The index has to cover the whole ordering, not just its first column.
+//
+// A claim that orders by (schedule, age) against an index on the schedule alone
+// makes PostgreSQL sort every matching row on every pass — and the backfill
+// stamps one identical now() across every legacy row, so the leading column is
+// constant on exactly the deployment with the largest backlog and the sort is
+// the whole backlog. The ordering is read out of the real statement rather than
+// restated here, so changing one without the other fails this test.
+func TestScanQueueIndexCoversTheClaimOrdering(t *testing.T) {
+	up := sqlOnly(readFilesMigration(t, scanUpMigration))
+
+	columns := orderByColumns(t, storage.ClaimDueScansQueryForTest())
+	if len(columns) < 2 {
+		t.Fatalf("the claim must break ties deterministically; ORDER BY = %v", columns)
+	}
+	// Fairness is the reason for the second column: without it two rows sharing a
+	// schedule are returned in whatever order the heap offers, and one upload can
+	// be overtaken indefinitely.
+	if columns[0] != "scan_next_attempt_at" || columns[1] != "created_at" {
+		t.Fatalf("ORDER BY = %v, want the schedule then the row's age", columns)
+	}
+
+	index := indexColumnList(t, up, "idx_attachments_scan_pending")
+	for _, column := range columns {
+		if !strings.Contains(index, column) {
+			t.Fatalf("the queue index (%s) does not cover ORDER BY column %q", index, column)
+		}
+	}
+	if strings.Index(index, columns[0]) > strings.Index(index, columns[1]) {
+		t.Fatalf("the queue index orders its columns %s, not as the claim does %v", index, columns)
+	}
+	// NULLS FIRST is not the default for an ascending column, and an index only
+	// serves an ORDER BY whose ordering it declares or exactly reverses. A plain
+	// ascending index would therefore be sorted anyway, and a backward scan of
+	// one would reverse created_at too — so the directions are asserted, not
+	// assumed.
+	if !strings.Contains(index, "scan_next_attempt_at ASC NULLS FIRST") {
+		t.Fatalf("the queue index must declare the claim's NULLS FIRST ordering: %s", index)
+	}
+	if !strings.Contains(index, "created_at ASC") {
+		t.Fatalf("the queue index must declare the tie-break ascending: %s", index)
+	}
+}
+
+// orderByColumns returns the bare column names of a statement's single ORDER BY
+// clause, stripped of table aliases and of the null/direction modifiers.
+func orderByColumns(t *testing.T, query string) []string {
+	t.Helper()
+	start := strings.Index(query, "ORDER BY")
+	if start < 0 {
+		t.Fatal("the claim has no ORDER BY; the queue would drain in heap order")
+	}
+	clause := query[start+len("ORDER BY"):]
+	if end := strings.Index(clause, "LIMIT"); end >= 0 {
+		clause = clause[:end]
+	}
+	var columns []string
+	for _, term := range strings.Split(clause, ",") {
+		fields := strings.Fields(term)
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if dot := strings.LastIndex(name, "."); dot >= 0 {
+			name = name[dot+1:]
+		}
+		columns = append(columns, name)
+	}
+	return columns
+}
+
+// indexColumnList returns the parenthesised column list of a named CREATE INDEX.
+func indexColumnList(t *testing.T, migration, name string) string {
+	t.Helper()
+	start := strings.Index(migration, "CREATE INDEX "+name)
+	if start < 0 {
+		t.Fatalf("migration does not create %s", name)
+	}
+	open := strings.Index(migration[start:], "(")
+	closing := strings.Index(migration[start:], ")")
+	if open < 0 || closing < 0 || closing < open {
+		t.Fatalf("could not read the column list of %s", name)
+	}
+	return migration[start+open+1 : start+closing]
+}
+
+// The rollback drops scheduling only. Verdicts and every column a download
+// depends on must survive it, and nothing may become downloadable because of it.
+func TestScanDownMigrationDropsOnlySchedulingState(t *testing.T) {
+	down := readFilesMigration(t, scanDownMigration)
+	statements := sqlOnly(down)
+
+	if !strings.Contains(statements, "DROP INDEX IF EXISTS files.idx_attachments_scan_pending") {
+		t.Fatal("the down migration must drop the queue index")
+	}
+	for _, column := range []string{
+		"DROP COLUMN IF EXISTS scan_next_attempt_at",
+		"DROP COLUMN IF EXISTS scan_attempts",
+	} {
+		if !strings.Contains(statements, column) {
+			t.Fatalf("the down migration must remove %q", column)
+		}
+	}
+	for _, forbidden := range []string{
+		"DROP SCHEMA", "DROP DATABASE", "TRUNCATE", "DROP EXTENSION",
+		"DROP TABLE", "DELETE FROM", "chat.", "auth.",
+	} {
+		if strings.Contains(statements, forbidden) {
+			t.Fatalf("the down migration must not contain %q", forbidden)
+		}
+	}
+	for _, kept := range []string{"status", "wrapped_dek", "kek_key_id", "storage_object_key"} {
 		if strings.Contains(statements, "DROP COLUMN IF EXISTS "+kept) {
 			t.Fatalf("the down migration must not drop %q", kept)
 		}

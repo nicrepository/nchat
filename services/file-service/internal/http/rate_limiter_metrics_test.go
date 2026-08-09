@@ -142,6 +142,10 @@ func TestAttachmentMetricsAreExportedWithBoundedLabels(t *testing.T) {
 	// The preview worker's outcome vocabulary is closed and decided in the
 	// service, so it can never become an unbounded label.
 	attachmentMetrics.ObservePreview("failed")
+	// Same for the scan worker's (RF-22): a closed result set and a label-free
+	// gauge, so neither can grow a series per attachment.
+	attachmentMetrics.ObserveScan("infected")
+	attachmentMetrics.SetScanQueueDepth(3)
 
 	useCases := readyUseCases()
 	limiter := httpapi.NewUserRateLimiter(100, time.Minute)
@@ -180,6 +184,9 @@ func TestAttachmentMetricsAreExportedWithBoundedLabels(t *testing.T) {
 		"nchat_file_downloads_total",
 		"nchat_file_orphaned_objects_total",
 		"nchat_file_previews_total",
+		"nchat_file_malware_scans_total",
+		// The metric RF-22 requires by name.
+		"nchat_file_malware_scan_queue_depth",
 	} {
 		if !strings.Contains(body, metric) {
 			t.Fatalf("expected %s to be exported:\n%s", metric, body)
@@ -200,6 +207,8 @@ func TestNilAttachmentMetricsAreSafe(t *testing.T) {
 	metrics.ObserveOrphanedObject()
 	metrics.ObservePreview("ready")
 	metrics.ObserveCleanup("removed")
+	metrics.ObserveScan("clean")
+	metrics.SetScanQueueDepth(0)
 }
 
 // The two workers export two series. They used to share one, which made a
