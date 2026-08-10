@@ -105,10 +105,10 @@ As imagens sao placeholders versionados. Dockerfiles reais, build e push de imag
 
 ### Workloads de apoio
 
-| Workload       | Imagem                     | Porta | Onde e renderizado          |
-| -------------- | -------------------------- | ----: | --------------------------- |
-| upload-guard   | `nginxinc/nginx-unprivileged` | 8080 | `base` (todos os overlays)  |
-| clamav         | `clamav/clamav` (fixada por digest) | 3310 | **apenas** `overlays/nchat-dev-server` |
+| Workload     | Imagem                              | Porta | Onde e renderizado                     |
+| ------------ | ----------------------------------- | ----: | -------------------------------------- |
+| upload-guard | `nginxinc/nginx-unprivileged`       |  8080 | `base` (todos os overlays)             |
+| clamav       | `clamav/clamav` (fixada por digest) |  3310 | **apenas** `overlays/nchat-dev-server` |
 
 `base/services/clamav/` fica sob `base/` para que um unico `clamd.conf` sirva ao
 Docker Compose e ao ConfigMap do Kubernetes — kustomize nao le arquivos fora da

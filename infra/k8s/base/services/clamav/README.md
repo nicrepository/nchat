@@ -48,11 +48,11 @@ unix socket that this configuration does not create, and was observed reporting
 3310 and completing real INSTREAM scans. Probes here speak the protocol
 file-service speaks, on the port file-service uses:
 
-| Probe     | Mechanism                   | Why                                                     |
-| --------- | --------------------------- | ------------------------------------------------------- |
-| startup   | `clamdscan --ping 1`        | semantic; ~10 min of headroom for the signature load     |
-| readiness | `clamdscan --ping 1`        | an open socket does not prove the engine finished loading |
-| liveness  | `tcpSocket: 3310`           | cheap and unhurried, so it never restarts a live scan     |
+| Probe     | Mechanism            | Why                                                       |
+| --------- | -------------------- | --------------------------------------------------------- |
+| startup   | `clamdscan --ping 1` | semantic; ~10 min of headroom for the signature load      |
+| readiness | `clamdscan --ping 1` | an open socket does not prove the engine finished loading |
+| liveness  | `tcpSocket: 3310`    | cheap and unhurried, so it never restarts a live scan     |
 
 ## Entrypoint
 
@@ -73,7 +73,7 @@ them are security properties rather than tuning:
   answer `OK`, which file-service records as a clean verdict over a partly
   examined file. With it, the same event answers
   `Heuristics.Limits.Exceeded FOUND` and the attachment is rejected.
-- **`MaxScanTime 420000`** — the engine's ceiling must sit *behind*
+- **`MaxScanTime 420000`** — the engine's ceiling must sit _behind_
   file-service's 300 s deadline (and behind the worker's 330 s claim lease), so
   the external timeout is what decides an unfinished scan. The order
   300 s < 330 s < 420 s is asserted by `scripts/ci/k8s-manifests-check.sh`.

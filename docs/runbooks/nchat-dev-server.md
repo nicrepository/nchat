@@ -1144,6 +1144,7 @@ nome**, deliberadamente, para ser adotada em vez de duplicada.
    `last-applied-configuration`; nesse caso o merge de três vias preserva campos
    que existam só no objeto vivo. Se sobrar campo residual, resolva com um
    `kubectl replace` nominal **desse único objeto** — nunca com `delete`.
+
 3. **Somente depois** de validar a convergência, remova nominalmente as duas
    policies cujos fluxos passaram a ser cobertos por
    `nchat-allow-traefik-http` (agora incluindo `upload-guard`),

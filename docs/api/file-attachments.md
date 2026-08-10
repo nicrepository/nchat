@@ -1457,11 +1457,11 @@ diretiva para `no`.
 de tempo do engine. Esse e resolvido garantindo que o file-service perca o
 controle da decisao para ninguem:
 
-| Ordem | Prazo | Valor | Papel |
-| ----- | ----- | ----- | ----- |
-| 1 | deadline de socket e de job do file-service | 300 s | **autoridade externa fail-closed** |
-| 2 | lease do claim do worker | 330 s | linha volta a ficar devida |
-| 3 | `MaxScanTime` do clamd | 420 s | backstop interno, nunca decide |
+| Ordem | Prazo                                       | Valor | Papel                              |
+| ----- | ------------------------------------------- | ----- | ---------------------------------- |
+| 1     | deadline de socket e de job do file-service | 300 s | **autoridade externa fail-closed** |
+| 2     | lease do claim do worker                    | 330 s | linha volta a ficar devida         |
+| 3     | `MaxScanTime` do clamd                      | 420 s | backstop interno, nunca decide     |
 
 Quando o deadline externo vence primeiro, a conexao e fechada, o cliente
 devolve erro, nada e gravado e o anexo continua em `pending_scan`. O default de

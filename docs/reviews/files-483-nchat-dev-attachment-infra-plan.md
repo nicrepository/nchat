@@ -10,37 +10,37 @@
 
 ## Histórico de revisões
 
-| Rev | Data | Estado | Mudança |
-|---|---|---|---|
-| 1 | 2026-08-09 | Design Review **REPROVADO**, risco Médio | versão inicial, baseada apenas em inspeção estática do repositório |
-| 2 | 2026-08-09 | Design Review **APROVADO**, risco geral **Médio** | incorpora verificações read-only no cluster, inspeção da imagem ClamAV e benchmark INSTREAM real; fecha R2, R3, R4, R5, R6, R13 e corrige A4, A8, A9, A10. **Ajuste final determinado pelo reviewer: `cpu.limit` do ClamAV de 1500m para 1250m**, preservando 500m de folga em `limits.cpu` do namespace sem alterar a ResourceQuota. |
-| 3 | 2026-08-09 | Threat Model **REPROVADO**, risco **Alto** → plano corrigido, pronto para revalidação | incorpora TM-01 (`clean` tem de significar scan completo), TM-06 (limites do ClamAV explícitos e verificáveis) e TM-10 (upload-guard é fronteira L7, não de rede). Nenhuma decisão do Design Review aprovado foi revertida; os recursos permanecem `500m/1536Mi` e `1250m/3Gi`. |
+| Rev | Data       | Estado                                                                                | Mudança                                                                                                                                                                                                                                                                                                                               |
+| --- | ---------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 2026-08-09 | Design Review **REPROVADO**, risco Médio                                              | versão inicial, baseada apenas em inspeção estática do repositório                                                                                                                                                                                                                                                                    |
+| 2   | 2026-08-09 | Design Review **APROVADO**, risco geral **Médio**                                     | incorpora verificações read-only no cluster, inspeção da imagem ClamAV e benchmark INSTREAM real; fecha R2, R3, R4, R5, R6, R13 e corrige A4, A8, A9, A10. **Ajuste final determinado pelo reviewer: `cpu.limit` do ClamAV de 1500m para 1250m**, preservando 500m de folga em `limits.cpu` do namespace sem alterar a ResourceQuota. |
+| 3   | 2026-08-09 | Threat Model **REPROVADO**, risco **Alto** → plano corrigido, pronto para revalidação | incorpora TM-01 (`clean` tem de significar scan completo), TM-06 (limites do ClamAV explícitos e verificáveis) e TM-10 (upload-guard é fronteira L7, não de rede). Nenhuma decisão do Design Review aprovado foi revertida; os recursos permanecem `500m/1536Mi` e `1250m/3Gi`.                                                       |
 
 ## Threat Model — findings e mitigações de desenho
 
-| # | Severidade | Finding | Mitigação de desenho | Onde |
-|---|---|---|---|---|
-| **TM-01** | **Alta** | `clean` não prova scan completo sob `MaxScanTime` / limites internos do engine | `AlertExceedsMax yes` promove limite de **conteúdo** a `FOUND`; `MaxScanTime 420000` coloca o limite **de tempo** do engine estritamente atrás do deadline externo de 300 s do file-service, que passa a ser a autoridade fail-closed declarada | §Configuração do clamd · §CI · §Testes |
-| **TM-06** | Média | Limites de parser e scratch do ClamAV dependiam de defaults ocultos | Todos os limites relevantes viram política versionada e verificada por CI; `/tmp` e `/var/lib/clamav` ganham `sizeLimit` finito e justificado; `ephemeral-storage` explícito | §Configuração do clamd · §Writable paths · §Recursos |
-| **TM-10** | Média | O plano tratava a passagem obrigatória pelo upload-guard como se fosse garantida pela rede | Declarado explicitamente que **NetworkPolicy não impede POST direto ao file-service**; a propriedade é de roteamento L7 do Traefik e passa a ter invariantes de CI sobre o manifest **renderizado** e testes E2E | §Fronteira de confiança L7 · §NetworkPolicies · §CI · §Testes |
+| #         | Severidade | Finding                                                                                    | Mitigação de desenho                                                                                                                                                                                                                            | Onde                                                          |
+| --------- | ---------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| **TM-01** | **Alta**   | `clean` não prova scan completo sob `MaxScanTime` / limites internos do engine             | `AlertExceedsMax yes` promove limite de **conteúdo** a `FOUND`; `MaxScanTime 420000` coloca o limite **de tempo** do engine estritamente atrás do deadline externo de 300 s do file-service, que passa a ser a autoridade fail-closed declarada | §Configuração do clamd · §CI · §Testes                        |
+| **TM-06** | Média      | Limites de parser e scratch do ClamAV dependiam de defaults ocultos                        | Todos os limites relevantes viram política versionada e verificada por CI; `/tmp` e `/var/lib/clamav` ganham `sizeLimit` finito e justificado; `ephemeral-storage` explícito                                                                    | §Configuração do clamd · §Writable paths · §Recursos          |
+| **TM-10** | Média      | O plano tratava a passagem obrigatória pelo upload-guard como se fosse garantida pela rede | Declarado explicitamente que **NetworkPolicy não impede POST direto ao file-service**; a propriedade é de roteamento L7 do Traefik e passa a ter invariantes de CI sobre o manifest **renderizado** e testes E2E                                | §Fronteira de confiança L7 · §NetworkPolicies · §CI · §Testes |
 
 ### O que a Rev 2 invalida da Rev 1
 
 Estas afirmações da Rev 1 estavam **erradas ou eram hipóteses** e foram
 removidas. Não devem ser reintroduzidas:
 
-| Afirmação da Rev 1 | Estado na Rev 2 |
-|---|---|
-| "UID/GID do ClamAV é 100/100" | **Errado.** Medido: `uid=100(clamav) gid=101(clamav)` |
-| "Filer do SeaweedFS *provavelmente* não está rodando" | **Confirmado parado.** `connection refused` em `127.0.0.1:8888` |
-| "Migration 000005 não aplicada" | **Errado.** Está aplicada, `dirty=false`, `in_progress=false` |
-| "Backfill vai revogar aprovações existentes no nchat-dev" | **Sem impacto operacional.** `files.attachments` tem 0 linhas |
-| "Resources do ClamAV a definir após medição" | **Medido.** Proposta numérica na §Recursos |
-| "ClamAV entra em `base/kustomization.yaml`" | **Rejeitado.** Só o overlay nchat-dev renderiza o workload |
-| "Aumentar a ResourceQuota" | **Desnecessário.** A proposta cabe na quota atual |
-| "Remover as 3 policies manuais após o deploy" | **Errado para uma delas.** `nchat-allow-upload-guard-file-ingress` é adotada por convergência de nome, não apagada |
-| "`clamdcheck.sh` serve como probe" | **Rejeitado.** O script reporta `unhealthy` com o daemon comprovadamente saudável |
-| "Benchmark: 120 s para 512 MiB" | **Não representativo.** Caminho errado (sem `--stream`). O caminho real levou **4.258 s** |
+| Afirmação da Rev 1                                        | Estado na Rev 2                                                                                                    |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| "UID/GID do ClamAV é 100/100"                             | **Errado.** Medido: `uid=100(clamav) gid=101(clamav)`                                                              |
+| "Filer do SeaweedFS _provavelmente_ não está rodando"     | **Confirmado parado.** `connection refused` em `127.0.0.1:8888`                                                    |
+| "Migration 000005 não aplicada"                           | **Errado.** Está aplicada, `dirty=false`, `in_progress=false`                                                      |
+| "Backfill vai revogar aprovações existentes no nchat-dev" | **Sem impacto operacional.** `files.attachments` tem 0 linhas                                                      |
+| "Resources do ClamAV a definir após medição"              | **Medido.** Proposta numérica na §Recursos                                                                         |
+| "ClamAV entra em `base/kustomization.yaml`"               | **Rejeitado.** Só o overlay nchat-dev renderiza o workload                                                         |
+| "Aumentar a ResourceQuota"                                | **Desnecessário.** A proposta cabe na quota atual                                                                  |
+| "Remover as 3 policies manuais após o deploy"             | **Errado para uma delas.** `nchat-allow-upload-guard-file-ingress` é adotada por convergência de nome, não apagada |
+| "`clamdcheck.sh` serve como probe"                        | **Rejeitado.** O script reporta `unhealthy` com o daemon comprovadamente saudável                                  |
+| "Benchmark: 120 s para 512 MiB"                           | **Não representativo.** Caminho errado (sem `--stream`). O caminho real levou **4.258 s**                          |
 
 ---
 
@@ -84,26 +84,26 @@ parado.
 
 ## Estado atual vs. estado necessário
 
-| Item | Estado atual (comprovado) | Estado necessário |
-|---|---|---|
-| `FILE_UPLOADS_ENABLED` | ausente → `false` | `"true"` no overlay nchat-dev |
-| `DATABASE_URL` no file-service | **ausente** — o patch do overlay substitui `envFrom` inteiro por só `nchat-config` | `secretKeyRef` → `nchat-postgres-runtime` |
-| `AUTH_JWT_HMAC_SECRET` no file-service | **ausente** — mesmo motivo | `secretKeyRef` → `nchat-secrets` |
-| `VALKEY_URL` no file-service | **ausente** — mesmo motivo | `secretKeyRef` → `nchat-secrets` |
-| `nchat-file-encryption` | template existe, SealedSecret **não existe** no repo nem no cluster; e o `secretRef` da base é descartado pelo patch | SealedSecret selado + `secretKeyRef` explícito |
-| `SEAWEEDFS_FILER_URL` | overlay define **`null`** (remove a chave); base aponta para `seaweedfs-filer`, que não existe em nchat-dev (Service chama-se `seaweedfs`) | `http://seaweedfs:8888` |
-| Filer do SeaweedFS | **parado** — `connection refused` em `:8888`; StatefulSet roda `weed server` sem `-filer` | `-filer=true` no StatefulSet **existente** |
-| ClamAV | inexistente em K8s | Deployment + Service ClusterIP :3310, **só no overlay nchat-dev** |
-| `FILE_MALWARE_SCANNER_ADDRESS` | ausente → worker não inicia, nada aprovado | `clamav:3310` |
-| Migration 000005 | **já aplicada**, `dirty=false`, `in_progress=false` | nenhuma ação |
-| `files.attachments` | **0 linhas** | nenhuma ação; backfill sem impacto |
-| NetworkPolicy Traefik→upload-guard | `nchat-allow-traefik-http` não lista o componente `upload-guard` | incluir |
-| NetworkPolicy DNS | `nchat-allow-dns-egress` não lista `file` nem `upload-guard` | incluir |
-| upload-guard→file-service | policy manual não versionada | versionar com o **mesmo nome** para adoção |
-| file-service→PG/Valkey/SeaweedFS/ClamAV | nenhuma policy em nenhuma direção | criar |
-| Policies criadas à mão no cluster | 3, não versionadas → **drift** | 1 adotada por nome, 2 removidas nominalmente |
-| ResourceQuota | folga suficiente para o ClamAV proposto | **não alterar** |
-| CI `k8s-manifests-check.sh` | contém invariantes que proíbem parte do que é necessário | substituir por invariantes positivos mais precisos |
+| Item                                    | Estado atual (comprovado)                                                                                                                  | Estado necessário                                                 |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `FILE_UPLOADS_ENABLED`                  | ausente → `false`                                                                                                                          | `"true"` no overlay nchat-dev                                     |
+| `DATABASE_URL` no file-service          | **ausente** — o patch do overlay substitui `envFrom` inteiro por só `nchat-config`                                                         | `secretKeyRef` → `nchat-postgres-runtime`                         |
+| `AUTH_JWT_HMAC_SECRET` no file-service  | **ausente** — mesmo motivo                                                                                                                 | `secretKeyRef` → `nchat-secrets`                                  |
+| `VALKEY_URL` no file-service            | **ausente** — mesmo motivo                                                                                                                 | `secretKeyRef` → `nchat-secrets`                                  |
+| `nchat-file-encryption`                 | template existe, SealedSecret **não existe** no repo nem no cluster; e o `secretRef` da base é descartado pelo patch                       | SealedSecret selado + `secretKeyRef` explícito                    |
+| `SEAWEEDFS_FILER_URL`                   | overlay define **`null`** (remove a chave); base aponta para `seaweedfs-filer`, que não existe em nchat-dev (Service chama-se `seaweedfs`) | `http://seaweedfs:8888`                                           |
+| Filer do SeaweedFS                      | **parado** — `connection refused` em `:8888`; StatefulSet roda `weed server` sem `-filer`                                                  | `-filer=true` no StatefulSet **existente**                        |
+| ClamAV                                  | inexistente em K8s                                                                                                                         | Deployment + Service ClusterIP :3310, **só no overlay nchat-dev** |
+| `FILE_MALWARE_SCANNER_ADDRESS`          | ausente → worker não inicia, nada aprovado                                                                                                 | `clamav:3310`                                                     |
+| Migration 000005                        | **já aplicada**, `dirty=false`, `in_progress=false`                                                                                        | nenhuma ação                                                      |
+| `files.attachments`                     | **0 linhas**                                                                                                                               | nenhuma ação; backfill sem impacto                                |
+| NetworkPolicy Traefik→upload-guard      | `nchat-allow-traefik-http` não lista o componente `upload-guard`                                                                           | incluir                                                           |
+| NetworkPolicy DNS                       | `nchat-allow-dns-egress` não lista `file` nem `upload-guard`                                                                               | incluir                                                           |
+| upload-guard→file-service               | policy manual não versionada                                                                                                               | versionar com o **mesmo nome** para adoção                        |
+| file-service→PG/Valkey/SeaweedFS/ClamAV | nenhuma policy em nenhuma direção                                                                                                          | criar                                                             |
+| Policies criadas à mão no cluster       | 3, não versionadas → **drift**                                                                                                             | 1 adotada por nome, 2 removidas nominalmente                      |
+| ResourceQuota                           | folga suficiente para o ClamAV proposto                                                                                                    | **não alterar**                                                   |
+| CI `k8s-manifests-check.sh`             | contém invariantes que proíbem parte do que é necessário                                                                                   | substituir por invariantes positivos mais precisos                |
 
 ---
 
@@ -118,7 +118,7 @@ parado.
 - **Impacto:** 503 determinístico em `POST /attachments`. É o sintoma reportado.
 - **Arquivos:** os dois acima.
 
-### A2 — O patch do overlay descarta *todos* os `secretRef` do file-service
+### A2 — O patch do overlay descarta _todos_ os `secretRef` do file-service
 
 - **Evidência:** `infra/k8s/base/services/file-service/deployment.yaml:50-64`
   declara `envFrom` com `nchat-config` + `secretRef: nchat-secrets` +
@@ -152,7 +152,7 @@ parado.
 - **Arquivos:** `configmap-patch.yaml`, `base/configmap.yaml`,
   `scripts/ci/k8s-manifests-check.sh`.
 
-### A4 — O Filer do SeaweedFS está CONFIRMADAMENTE parado *(atualizado na Rev 2)*
+### A4 — O Filer do SeaweedFS está CONFIRMADAMENTE parado _(atualizado na Rev 2)_
 
 - **Evidência estática:** `data/resources.yaml:250-254` →
   `args: [server, -dir=/data, -ip=seaweedfs, -ip.bind=0.0.0.0]`. Não há
@@ -169,7 +169,7 @@ parado.
   ```
 
 - **Impacto:** **bloqueante e confirmado.** `SeaweedFSStore.Ping` faz
-  `GET {filer}/` (`seaweedfs.go:211-224`) e é um check *crítico* de `/readyz`
+  `GET {filer}/` (`seaweedfs.go:211-224`) e é um check _crítico_ de `/readyz`
   quando uploads estão ligados (`handlers.go:58-63`). Sem Filer, o file-service
   nunca fica `ready`, `wait_for_rollouts` falha e o deploy inteiro aborta.
 - **Deixa de ser hipótese.** O Bloco 1 do plano é **obrigatório**, não
@@ -195,7 +195,7 @@ parado.
 - **Arquivos:** `network-policies.yaml`,
   `delete-permissive-network-policy.yaml`, `base/network-policy.yaml`.
 
-### A6 — O file-service não tem *nenhuma* policy de egress ou de acesso às suas dependências
+### A6 — O file-service não tem _nenhuma_ policy de egress ou de acesso às suas dependências
 
 - **Evidência:** em `network-policies.yaml`, `nchat-allow-postgres:86-96`
   autoriza ingress de
@@ -218,7 +218,7 @@ parado.
   uma policy versionada e será **adotada**; as outras duas precisam de remoção
   nominal. Ver §R13.
 
-### A8 — A imagem de migrations tem as migrations *embutidas* *(reclassificado na Rev 2)*
+### A8 — A imagem de migrations tem as migrations _embutidas_ _(reclassificado na Rev 2)_
 
 - **Evidência:** `Dockerfile.migrations:8` → `COPY migrations /app/migrations`.
   `scripts/db/migrate.sh:371-374` → `collect_up_files` faz
@@ -237,7 +237,7 @@ parado.
 - **Arquivos:** `Dockerfile.migrations`, `scripts/db/migrate.sh`,
   `scripts/deploy/nchat-dev/deploy.sh`.
 
-### A9 — A verificação operacional inicial da 000005 procurou o objeto errado *(resolvido na Rev 2)*
+### A9 — A verificação operacional inicial da 000005 procurou o objeto errado _(resolvido na Rev 2)_
 
 - **Evidência estática:** `migrations/files/000005_attachment_malware_scan_jobs.up.sql:48-53`
   **não cria tabela nenhuma**. Ela adiciona
@@ -245,7 +245,7 @@ parado.
   `scan_next_attempt_at TIMESTAMPTZ` em `files.attachments`, mais o CHECK
   `attachments_scan_attempts_check`, o backfill das linhas legadas (linhas
   127-132) e o índice parcial `idx_attachments_scan_pending` (linhas 163-165). O
-  nome do arquivo descreve o *conceito* de fila, não uma tabela. Procurar por
+  nome do arquivo descreve o _conceito_ de fila, não uma tabela. Procurar por
   `files.attachment_malware_scan_jobs` nunca poderia encontrar nada.
 - **Evidência operacional (Rev 2):** com as consultas corretas,
 
@@ -261,7 +261,7 @@ parado.
   migration pendente no nchat-dev. Não reaplicar manualmente. O pipeline mantém
   apenas seus invariantes normais.
 
-### A10 — Backfill da 000005 não tem impacto operacional no nchat-dev *(atualizado na Rev 2)*
+### A10 — Backfill da 000005 não tem impacto operacional no nchat-dev _(atualizado na Rev 2)_
 
 - **Evidência estática:** linhas 127-132 da 000005 —
   `UPDATE files.attachments SET status='pending_scan', scan_attempts=0, scan_next_attempt_at=now() WHERE status IN ('pending_scan','clean') AND deleted_at IS NULL`.
@@ -285,7 +285,7 @@ parado.
     todo Deployment/StatefulSet/Job renderizado — inclusive no ClamAV;
   - `external_image_refs` tem regex fechada
     (`postgres|valkey/valkey|chrislusf/seaweedfs|livekit/livekit-server|coturn/coturn`)
-    + contagem `-eq 6`, e exige digest `@sha256:` em todas;
+    - contagem `-eq 6`, e exige digest `@sha256:` em todas;
   - `grep -q 'secretRef:'` e `grep -Eq 'SEAWEEDFS_(FILER_URL|S3_ENDPOINT)'`
     proíbem construções necessárias.
 - **Impacto:** o CI precisa ser atualizado **no mesmo commit** que introduz as
@@ -327,7 +327,7 @@ parado.
   rollout. É a propriedade que torna seguro implantar o ClamAV sem acoplá-lo ao
   deploy — e a razão de o ClamAV não precisar entrar em `wait_for_rollouts`.
 
-### A15 — O healthcheck da imagem ClamAV reporta `unhealthy` com o daemon saudável *(novo na Rev 2)*
+### A15 — O healthcheck da imagem ClamAV reporta `unhealthy` com o daemon saudável _(novo na Rev 2)_
 
 - **Evidência (benchmark):** no mesmo instante em que o healthcheck do container
   reportava `Status: unhealthy` com `ERROR: Unable to contact server`:
@@ -342,7 +342,7 @@ parado.
   pod em `CrashLoopBackOff` ou permanentemente `NotReady` com o scanner
   funcionando perfeitamente. Ver §Probes.
 
-### A16 — O benchmark de 120 s não representa o caminho do NChat *(novo na Rev 2)*
+### A16 — O benchmark de 120 s não representa o caminho do NChat _(novo na Rev 2)_
 
 - **Evidência:** `clamdscan` **sem** `--stream` sobre o arquivo de 512 MiB levou
   `120.015 s` e retornou `OK`. O mesmo arquivo por `clamdscan --stream` — o
@@ -368,24 +368,24 @@ Todas as verificações abaixo são **read-only**. Nada foi alterado no cluster.
 
 ### Cluster nchat-dev
 
-| Verificação | Comando | Resultado |
-|---|---|---|
-| Filer do SeaweedFS | `kubectl -n nchat-dev exec sts/seaweedfs -- wget -qO- http://127.0.0.1:8888/` | **`connection refused`** |
-| Migration 000005 | `SELECT ... FROM public.schema_migrations WHERE domain='files' AND filename='000005_attachment_malware_scan_jobs'` | presente, `dirty=false`, `in_progress=false` |
-| Colunas da 000005 | `information_schema.columns` | `scan_attempts`, `scan_next_attempt_at` presentes |
-| Índice da 000005 | `pg_indexes` | `idx_attachments_scan_pending` presente |
-| Anexos existentes | `SELECT status, count(*) FROM files.attachments GROUP BY status` | **0 rows** |
+| Verificação        | Comando                                                                                                            | Resultado                                         |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
+| Filer do SeaweedFS | `kubectl -n nchat-dev exec sts/seaweedfs -- wget -qO- http://127.0.0.1:8888/`                                      | **`connection refused`**                          |
+| Migration 000005   | `SELECT ... FROM public.schema_migrations WHERE domain='files' AND filename='000005_attachment_malware_scan_jobs'` | presente, `dirty=false`, `in_progress=false`      |
+| Colunas da 000005  | `information_schema.columns`                                                                                       | `scan_attempts`, `scan_next_attempt_at` presentes |
+| Índice da 000005   | `pg_indexes`                                                                                                       | `idx_attachments_scan_pending` presente           |
+| Anexos existentes  | `SELECT status, count(*) FROM files.attachments GROUP BY status`                                                   | **0 rows**                                        |
 
 ### Capacidade e ResourceQuota
 
-| Recurso | Em uso | Cota | Folga |
-|---|---|---|---|
-| `requests.cpu` | 625m | 4 | 3375m |
-| `requests.memory` | 1536Mi | 6Gi | 4608Mi |
-| `limits.cpu` | 6250m | 8 | 1750m |
-| `limits.memory` | 6400Mi | 12Gi | 5888Mi |
-| `pods` | 14 | 30 | 16 |
-| `services` | 13 | 20 | 7 |
+| Recurso           | Em uso | Cota | Folga  |
+| ----------------- | ------ | ---- | ------ |
+| `requests.cpu`    | 625m   | 4    | 3375m  |
+| `requests.memory` | 1536Mi | 6Gi  | 4608Mi |
+| `limits.cpu`      | 6250m  | 8    | 1750m  |
+| `limits.memory`   | 6400Mi | 12Gi | 5888Mi |
+| `pods`            | 14     | 30   | 16     |
+| `services`        | 13     | 20   | 7      |
 
 Nó `srv-apps-01`: 8 CPUs e ~50 GiB RAM allocatable; uso observado ~747m (9%) de
 CPU e ~14844Mi (29%) de RAM.
@@ -396,15 +396,15 @@ cabe dentro dela — **nenhum aumento de quota é solicitado**.
 
 ### Imagem ClamAV (`clamav/clamav:1.4`)
 
-| Item | Valor medido |
-|---|---|
-| Usuário | `clamav:x:100:101::/var/lib/clamav:/bin/false` |
-| Grupo | `clamav:x:101:clamav` |
-| **UID / GID** | **100 / 101** — não 100/100 |
-| Entrypoints | `/init` e `/init-unprivileged` (existe e é executável) |
-| `clamd.conf` efetivo | `TCPSocket 3310`, `TCPAddr 0.0.0.0`, `StreamMaxLength 512M`, `MaxFileSize 512M`, `MaxScanSize 1024M`, `MaxThreads 4` |
-| Diretiva `User` | **ausente** na configuração consultada |
-| Healthcheck do container | `unhealthy` / `ERROR: Unable to contact server` — ver A15 |
+| Item                     | Valor medido                                                                                                         |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| Usuário                  | `clamav:x:100:101::/var/lib/clamav:/bin/false`                                                                       |
+| Grupo                    | `clamav:x:101:clamav`                                                                                                |
+| **UID / GID**            | **100 / 101** — não 100/100                                                                                          |
+| Entrypoints              | `/init` e `/init-unprivileged` (existe e é executável)                                                               |
+| `clamd.conf` efetivo     | `TCPSocket 3310`, `TCPAddr 0.0.0.0`, `StreamMaxLength 512M`, `MaxFileSize 512M`, `MaxScanSize 1024M`, `MaxThreads 4` |
+| Diretiva `User`          | **ausente** na configuração consultada                                                                               |
+| Healthcheck do container | `unhealthy` / `ERROR: Unable to contact server` — ver A15                                                            |
 
 A ausência de `User` no `clamd.conf` é uma propriedade a **preservar**: com
 `capabilities: drop: [ALL]` o clamd não teria como executar uma troca de usuário
@@ -416,14 +416,14 @@ pod, não pela configuração do daemon.
 Arquivo sintético seguro de 512 MiB (`536870912` bytes), via
 `clamdscan --stream`:
 
-| Métrica | Valor |
-|---|---|
-| Resultado | `OK`, `SCAN_RC=0` |
-| Tempo (clamdscan) | **4.258 s** |
-| Tempo (real) | 4.364 s |
-| RSS idle | ~945 MiB |
-| RSS durante INSTREAM | ~959 MiB, **pico ~1000 MiB** |
-| CPU | **176.92%** e 136.55% (usa mais de um core) |
+| Métrica              | Valor                                       |
+| -------------------- | ------------------------------------------- |
+| Resultado            | `OK`, `SCAN_RC=0`                           |
+| Tempo (clamdscan)    | **4.258 s**                                 |
+| Tempo (real)         | 4.364 s                                     |
+| RSS idle             | ~945 MiB                                    |
+| RSS durante INSTREAM | ~959 MiB, **pico ~1000 MiB**                |
+| CPU                  | **176.92%** e 136.55% (usa mais de um core) |
 
 **Leituras corretas deste benchmark:**
 
@@ -431,7 +431,7 @@ Arquivo sintético seguro de 512 MiB (`536870912` bytes), via
   consumo, não o arquivo;
 - a memória **não** cresce proporcionalmente ao tamanho do arquivo, porque
   INSTREAM é streaming;
-- **CPU é o recurso dominante** durante o scan, e o workload é *burst*;
+- **CPU é o recurso dominante** durante o scan, e o workload é _burst_;
 - o arquivo é de zeros e **não representa o pior caso** de parsing de archives
   ou documentos complexos — por isso a margem no `limit` de memória.
 
@@ -489,7 +489,7 @@ POST → 201 (status=pending_scan, scan_next_attempt_at=now())
 
 Ordem lógica. **Nada disso foi executado.**
 
-### Bloco 1 — SeaweedFS Filer *(obrigatório; o Filer está parado)*
+### Bloco 1 — SeaweedFS Filer _(obrigatório; o Filer está parado)_
 
 1. `infra/k8s/overlays/nchat-dev-server/data/resources.yaml`, StatefulSet
    `seaweedfs`:
@@ -506,7 +506,7 @@ Ordem lógica. **Nada disso foi executado.**
    - `livenessProbe`: manter `tcpSocket` na porta `master`.
    - O Service `seaweedfs` já expõe `filer: 8888` — nenhuma alteração.
 
-### Bloco 2 — Segredo de envelope encryption *(PR separado, ver §R12)*
+### Bloco 2 — Segredo de envelope encryption _(PR separado, ver §R12)_
 
 2. Gerar os valores fora do repositório seguindo
    `docs/runbooks/file-service-envelope-encryption.md` §Provisioning, a partir de
@@ -517,18 +517,18 @@ Ordem lógica. **Nada disso foi executado.**
 5. `infra/k8s/secrets/sealed/nchat-dev/kustomization.yaml` — adicionar o
    recurso.
 
-### Bloco 3 — ClamAV *(renderizado somente pelo overlay nchat-dev)*
+### Bloco 3 — ClamAV _(renderizado somente pelo overlay nchat-dev)_
 
 6. **Mover:** `infra/compose/clamav/clamd.conf` →
    `infra/k8s/base/services/clamav/clamd.conf`. Os limites existentes,
    derivados de `uploadpolicy.MaxMaxUploadBytes`, **não mudam**, e o arquivo
    continua **sem diretiva `User`** e **sem `ForceToDisk`**.
-6a. **Acrescentar ao mesmo `clamd.conf`** o bloco de política exigido pelo
-    Threat Model: `AlertExceedsMax yes`, `MaxScanTime 420000` e os limites de
-    parser explicitados (TM-01 e TM-06). Conteúdo exato em
-    §Configuração do clamd, item C. Este é o único ponto do plano em que o
-    conteúdo do arquivo muda em relação à Rev 2, e a mudança vale igualmente
-    para o Compose, que monta o mesmo arquivo.
+   6a. **Acrescentar ao mesmo `clamd.conf`** o bloco de política exigido pelo
+   Threat Model: `AlertExceedsMax yes`, `MaxScanTime 420000` e os limites de
+   parser explicitados (TM-01 e TM-06). Conteúdo exato em
+   §Configuração do clamd, item C. Este é o único ponto do plano em que o
+   conteúdo do arquivo muda em relação à Rev 2, e a mudança vale igualmente
+   para o Compose, que monta o mesmo arquivo.
 7. `infra/compose/compose.dev.yml` — ajustar o mount para
    `../k8s/base/services/clamav/clamd.conf:/etc/clamav/clamd.conf:ro`.
 8. **Novo:** `infra/k8s/base/services/clamav/{deployment.yaml, service.yaml, kustomization.yaml, README.md}`.
@@ -542,7 +542,7 @@ Ordem lógica. **Nada disso foi executado.**
 10. `infra/k8s/overlays/nchat-dev-server/kustomization.yaml` — adicionar
     `../../base/services/clamav` em `resources`. É o único lugar que o
     renderiza. (Alternativa equivalente, se o Design Review preferir a semântica
-    explícita: transformar o diretório em um Kustomize *Component* e referenciá-lo
+    explícita: transformar o diretório em um Kustomize _Component_ e referenciá-lo
     por `components:` — kustomize v5.7.1, já fixado em
     `scripts/deploy/nchat-dev/kustomize.env`, suporta ambos.)
 11. **Nenhuma alteração em `resource-quota.yaml` nem em `quota-patch.yaml`** —
@@ -565,13 +565,13 @@ Ordem lógica. **Nada disso foi executado.**
 14. `infra/k8s/overlays/nchat-dev-server/network-policies.yaml` — ver
     §NetworkPolicies.
 
-### Bloco 6 — Invariantes de CI *(mesmo commit que o Bloco 5)*
+### Bloco 6 — Invariantes de CI _(mesmo commit que o Bloco 5)_
 
 15. `scripts/ci/k8s-manifests-check.sh` — substituições, invariantes novos e
     invariantes derivados do Threat Model (TM-01 e TM-06). Ver §CI.
-15a. `scripts/ci/gateway-config-check.sh` — **estender ao manifest renderizado**
-     e acrescentar prioridade, `strip-files-prefix` e a asserção negativa de
-     backend (TM-10, §CI 20-24). Nenhuma asserção existente é removida.
+    15a. `scripts/ci/gateway-config-check.sh` — **estender ao manifest renderizado**
+    e acrescentar prioridade, `strip-files-prefix` e a asserção negativa de
+    backend (TM-10, §CI 20-24). Nenhuma asserção existente é removida.
 
 ### Bloco 7 — Testes derivados do Threat Model
 
@@ -647,7 +647,7 @@ engine venceria a corrida** — e um limite de tempo atingido pode produzir um
 resultado terminal ambíguo que o cliente leria como `OK`. É exatamente o TM-01.
 
 `AlertExceedsMax` **não resolve isto**: essa diretiva promove limites de
-*conteúdo* (tamanho, recursão, número de arquivos), não o limite de *tempo*. Os
+_conteúdo_ (tamanho, recursão, número de arquivos), não o limite de _tempo_. Os
 dois problemas precisam de mitigações diferentes.
 
 **Decisão: o deadline externo do file-service é a autoridade fail-closed, e o
@@ -655,11 +655,11 @@ limite interno do clamd é apenas um backstop que nunca deve ser alcançado.**
 
 Ordem obrigatória, do primeiro ao último a disparar:
 
-| # | Prazo | Valor | Origem | Papel |
-|---|---|---|---|---|
-| 1 | Deadline de socket e de job do file-service | **300 s** | `FILE_MALWARE_SCAN_TIMEOUT_SECONDS` (`config.go:216`); `conn.SetDeadline` em `clamd.go:139`; `ctx` fecha a conexão em `clamd.go:136` | **Autoridade externa fail-closed.** Ao expirar, a conexão é fechada, o scanner devolve erro, nada é gravado e o anexo continua em `pending_scan` |
-| 2 | Lease do claim | **330 s** | `newScanLease(jobTimeout) = jobTimeout + scanLeaseMargin(30 s)` (`malware_scan_service.go:35-67`) | A linha volta a ficar *due* e outro worker pode reivindicá-la |
-| 3 | `MaxScanTime` do clamd | **420 000 ms = 420 s** | `clamd.conf` (novo) | Backstop interno. Nunca decide o resultado no caminho normal |
+| #   | Prazo                                       | Valor                  | Origem                                                                                                                               | Papel                                                                                                                                            |
+| --- | ------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | Deadline de socket e de job do file-service | **300 s**              | `FILE_MALWARE_SCAN_TIMEOUT_SECONDS` (`config.go:216`); `conn.SetDeadline` em `clamd.go:139`; `ctx` fecha a conexão em `clamd.go:136` | **Autoridade externa fail-closed.** Ao expirar, a conexão é fechada, o scanner devolve erro, nada é gravado e o anexo continua em `pending_scan` |
+| 2   | Lease do claim                              | **330 s**              | `newScanLease(jobTimeout) = jobTimeout + scanLeaseMargin(30 s)` (`malware_scan_service.go:35-67`)                                    | A linha volta a ficar _due_ e outro worker pode reivindicá-la                                                                                    |
+| 3   | `MaxScanTime` do clamd                      | **420 000 ms = 420 s** | `clamd.conf` (novo)                                                                                                                  | Backstop interno. Nunca decide o resultado no caminho normal                                                                                     |
 
 `MaxScanTime 420000` — justificativa concreta, e por que **não** 301000 nem
 330000:
@@ -673,7 +673,7 @@ Ordem obrigatória, do primeiro ao último a disparar:
   — dois eventos independentes no mesmo milissegundo é a definição de corrida
   não determinística. 420 s mantém o backstop fora dessa janela;
 - **estruturalmente já favorecido:** o relógio do clamd começa quando ele começa
-  a *escanear*, ou seja, **depois** de receber o stream, enquanto os 300 s do
+  a _escanear_, ou seja, **depois** de receber o stream, enquanto os 300 s do
   cliente contam desde o dial. O engine tem, portanto, menos tempo de parede
   disponível do que o número sugere — a margem de 120 s é sobre uma corrida que
   já está inclinada a favor do cliente;
@@ -780,18 +780,18 @@ A inspeção de `services/file-service/internal/scanner/clamd.go` mostra que o
 comportamento atual **já satisfaz** o exigido pelo TM-01, e por construção, não
 por acaso:
 
-| Situação | Trecho | Resultado | Vira `clean`? |
-|---|---|---|---|
-| `... OK\0` | `clamd.go:321-322` | `VerdictClean` | **sim — único caso** |
-| `... FOUND\0` (inclui `Heuristics.Limits.Exceeded`) | `clamd.go:323-328` | `VerdictInfected`, sem erro → `rejected` | não |
-| `... ERROR` | `clamd.go:331-332` | `ErrProtocol` | não |
-| `size limit exceeded` | `clamd.go:329-330` | `ErrStreamTooLarge` | não |
-| resposta desconhecida / vazia | `clamd.go:333-337` (`default`) | `ErrProtocol` | não |
-| **NUL ausente** / resposta truncada | `readBounded`, `clamd.go:348-358` — o terminador é **obrigatório**; EOF vira `io.ErrUnexpectedEOF` | erro | não |
-| EOF, reset, falha de socket | `clamd.go:316`, `errRedacted` | erro | não |
-| timeout do deadline | `clamd.go:139`, `errRedacted` → `DeadlineExceeded` | erro | não |
-| cancelamento de contexto | `clamd.go:136` fecha o socket sob a I/O | erro | não |
-| falha da fonte de conteúdo (storage/decrypt) | `sourceError`, `clamd.go:200-203` | erro | não |
+| Situação                                            | Trecho                                                                                             | Resultado                                | Vira `clean`?        |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------- | -------------------- |
+| `... OK\0`                                          | `clamd.go:321-322`                                                                                 | `VerdictClean`                           | **sim — único caso** |
+| `... FOUND\0` (inclui `Heuristics.Limits.Exceeded`) | `clamd.go:323-328`                                                                                 | `VerdictInfected`, sem erro → `rejected` | não                  |
+| `... ERROR`                                         | `clamd.go:331-332`                                                                                 | `ErrProtocol`                            | não                  |
+| `size limit exceeded`                               | `clamd.go:329-330`                                                                                 | `ErrStreamTooLarge`                      | não                  |
+| resposta desconhecida / vazia                       | `clamd.go:333-337` (`default`)                                                                     | `ErrProtocol`                            | não                  |
+| **NUL ausente** / resposta truncada                 | `readBounded`, `clamd.go:348-358` — o terminador é **obrigatório**; EOF vira `io.ErrUnexpectedEOF` | erro                                     | não                  |
+| EOF, reset, falha de socket                         | `clamd.go:316`, `errRedacted`                                                                      | erro                                     | não                  |
+| timeout do deadline                                 | `clamd.go:139`, `errRedacted` → `DeadlineExceeded`                                                 | erro                                     | não                  |
+| cancelamento de contexto                            | `clamd.go:136` fecha o socket sob a I/O                                                            | erro                                     | não                  |
+| falha da fonte de conteúdo (storage/decrypt)        | `sourceError`, `clamd.go:200-203`                                                                  | erro                                     | não                  |
 
 Três propriedades sustentam isso e não podem ser perdidas numa refatoração
 futura: o zero value de `Verdict` é `VerdictClean`, e por isso **todo retorno
@@ -865,10 +865,10 @@ imagem fixada por digest.
 
 ### Writable paths e limites de scratch (TM-06)
 
-| Caminho | Volume | `sizeLimit` | Motivo |
-|---|---|---|---|
-| `/tmp` | `emptyDir` | **2Gi** | scratch de scan |
-| `/var/lib/clamav` | `emptyDir`, populado pelo initContainer | **1Gi** | base de assinaturas |
+| Caminho           | Volume                                  | `sizeLimit` | Motivo              |
+| ----------------- | --------------------------------------- | ----------- | ------------------- |
+| `/tmp`            | `emptyDir`                              | **2Gi**     | scratch de scan     |
+| `/var/lib/clamav` | `emptyDir`, populado pelo initContainer | **1Gi**     | base de assinaturas |
 
 **`/tmp` = 2Gi — justificativa.** O pior caso plausível de um único scan é a
 soma de duas coisas limitadas pela própria política do clamd:
@@ -964,23 +964,23 @@ resources:
     memory: 3Gi
 ```
 
-| Valor | Justificativa |
-|---|---|
-| `memory.request: 1536Mi` | idle medido ~945 MiB; pico INSTREAM ~1 GiB. 1536Mi dá margem relevante acima do steady-state. Request é garantia de scheduling, não teto de uso. |
-| `memory.limit: 3Gi` | ~3× o pico observado. O benchmark usou um arquivo de zeros e **não** cobre o pior caso de parser/archives; a margem é para isso. Com freshclam desligado não há recarga concorrente da base. |
-| `cpu.request: 500m` | idle é praticamente zero e os scans são *burst*. Reservar um core inteiro continuamente seria desperdício em dev; 500m garante scheduling sem sobre-reservar. |
-| `cpu.limit: 1250m` | **decisão do segundo Design Review.** O benchmark observou pico de ~177%, então 1250m pode alongar a fase CPU-bound do scan por throttling — mas o scan de 512 MiB levou 4.258 s contra um orçamento operacional de 300 s, folga larga o bastante para absorver isso com sobra. Em troca, a cota de `limits.cpu` do namespace fica em 7500m de 8000m, preservando **500m** de folga em vez dos 250m que 1500m deixaria. |
+| Valor                    | Justificativa                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memory.request: 1536Mi` | idle medido ~945 MiB; pico INSTREAM ~1 GiB. 1536Mi dá margem relevante acima do steady-state. Request é garantia de scheduling, não teto de uso.                                                                                                                                                                                                                                                                        |
+| `memory.limit: 3Gi`      | ~3× o pico observado. O benchmark usou um arquivo de zeros e **não** cobre o pior caso de parser/archives; a margem é para isso. Com freshclam desligado não há recarga concorrente da base.                                                                                                                                                                                                                            |
+| `cpu.request: 500m`      | idle é praticamente zero e os scans são _burst_. Reservar um core inteiro continuamente seria desperdício em dev; 500m garante scheduling sem sobre-reservar.                                                                                                                                                                                                                                                           |
+| `cpu.limit: 1250m`       | **decisão do segundo Design Review.** O benchmark observou pico de ~177%, então 1250m pode alongar a fase CPU-bound do scan por throttling — mas o scan de 512 MiB levou 4.258 s contra um orçamento operacional de 300 s, folga larga o bastante para absorver isso com sobra. Em troca, a cota de `limits.cpu` do namespace fica em 7500m de 8000m, preservando **500m** de folga em vez dos 250m que 1500m deixaria. |
 
 **Cabe na ResourceQuota atual, sem alteração:**
 
-| Recurso | Atual | + ClamAV | Cota | Folga final |
-|---|---|---|---|---|
-| `requests.cpu` | 625m | 1125m | 4000m | 2875m |
-| `requests.memory` | 1536Mi | 3072Mi | 6144Mi | 3072Mi |
-| `limits.cpu` | 6250m | **7500m** | 8000m | **500m** |
-| `limits.memory` | 6400Mi | 9472Mi | 12288Mi | 2816Mi |
-| `pods` | 14 | 15 | 30 | 15 |
-| `services` | 13 | 14 | 20 | 6 |
+| Recurso           | Atual  | + ClamAV  | Cota    | Folga final |
+| ----------------- | ------ | --------- | ------- | ----------- |
+| `requests.cpu`    | 625m   | 1125m     | 4000m   | 2875m       |
+| `requests.memory` | 1536Mi | 3072Mi    | 6144Mi  | 3072Mi      |
+| `limits.cpu`      | 6250m  | **7500m** | 8000m   | **500m**    |
+| `limits.memory`   | 6400Mi | 9472Mi    | 12288Mi | 2816Mi      |
+| `pods`            | 14     | 15        | 30      | 15          |
+| `services`        | 13     | 14        | 20      | 6           |
 
 `limits.cpu` fecha com 500m de folga. **A ResourceQuota não é alterada** — foi
 o `cpu.limit` do ClamAV que cedeu, e não a cota, exatamente como a alavanca
@@ -1015,14 +1015,14 @@ derivado do TM-06 e precisa de ratificação no Threat Model seguinte.
 **Nenhum evento de exaustão pode promover `clean`.** Registro explícito de cada
 caminho e do que ele produz:
 
-| Evento | Efeito imediato | Estado do anexo |
-|---|---|---|
-| Throttling de CPU no `cpu.limit` | scan mais lento, fila cresce | `pending_scan` até um veredito real |
-| Estouro do `memory.limit` → OOMKill | container reinicia; o scan em voo morre | `pending_scan`; lease expira em 330 s e a linha volta a ser *due* |
-| Estouro de `/tmp` ou de `ephemeral-storage` | pod despejado pelo kubelet | `pending_scan`; retomado quando o pod voltar |
-| `MaxScanTime` atingido (backstop) | resposta não-terminal ou erro | `pending_scan` — nunca `clean` (§A do clamd) |
-| Limite de conteúdo atingido | `Heuristics.Limits.Exceeded FOUND` | `rejected` (§B do clamd) |
-| ClamAV indisponível | worker registra `result=retry` | `pending_scan`, com backoff `lease × min(n, 8)` |
+| Evento                                      | Efeito imediato                         | Estado do anexo                                                   |
+| ------------------------------------------- | --------------------------------------- | ----------------------------------------------------------------- |
+| Throttling de CPU no `cpu.limit`            | scan mais lento, fila cresce            | `pending_scan` até um veredito real                               |
+| Estouro do `memory.limit` → OOMKill         | container reinicia; o scan em voo morre | `pending_scan`; lease expira em 330 s e a linha volta a ser _due_ |
+| Estouro de `/tmp` ou de `ephemeral-storage` | pod despejado pelo kubelet              | `pending_scan`; retomado quando o pod voltar                      |
+| `MaxScanTime` atingido (backstop)           | resposta não-terminal ou erro           | `pending_scan` — nunca `clean` (§A do clamd)                      |
+| Limite de conteúdo atingido                 | `Heuristics.Limits.Exceeded FOUND`      | `rejected` (§B do clamd)                                          |
+| ClamAV indisponível                         | worker registra `result=retry`          | `pending_scan`, com backoff `lease × min(n, 8)`                   |
 
 **Backlog é risco de disponibilidade, não justificativa para bypass.** Uma fila
 crescendo significa que anexos demoram a ficar baixáveis — nunca que o gate deva
@@ -1036,14 +1036,14 @@ O file-service já expõe as categorias de resultado e de erro como conjuntos
 fechados decididos no código (`malware_scan_service.go:69-137`). O desenho exige
 que estas fiquem observáveis no nchat-dev:
 
-| Sinal | Origem | Para quê |
-|---|---|---|
-| scans por resultado (`clean`, `infected`, `retry`, `too_large`, `superseded`) | rótulo de resultado do worker | distinguir veredito de falha operacional |
-| erros por categoria (`storage_read`, `decrypt`, `clamd_unavailable`, `clamd_protocol`, `clamd_stream_too_large`, `timeout`, `canceled`, `database`) | rótulo de erro do worker | separar "clamd caiu" de "chave não abre" |
-| duração do scan | worker | detectar aproximação dos 300 s |
-| profundidade da fila `pending_scan` | gauge sobre o índice parcial `idx_attachments_scan_pending` | backlog |
-| limite excedido | resultado `too_large` + veredito `Heuristics.Limits.Exceeded` | visibilidade do TM-01/TM-06 em produção |
-| scanner indisponível | erro `clamd_unavailable` | alarme operacional |
+| Sinal                                                                                                                                               | Origem                                                        | Para quê                                 |
+| --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | ---------------------------------------- |
+| scans por resultado (`clean`, `infected`, `retry`, `too_large`, `superseded`)                                                                       | rótulo de resultado do worker                                 | distinguir veredito de falha operacional |
+| erros por categoria (`storage_read`, `decrypt`, `clamd_unavailable`, `clamd_protocol`, `clamd_stream_too_large`, `timeout`, `canceled`, `database`) | rótulo de erro do worker                                      | separar "clamd caiu" de "chave não abre" |
+| duração do scan                                                                                                                                     | worker                                                        | detectar aproximação dos 300 s           |
+| profundidade da fila `pending_scan`                                                                                                                 | gauge sobre o índice parcial `idx_attachments_scan_pending`   | backlog                                  |
+| limite excedido                                                                                                                                     | resultado `too_large` + veredito `Heuristics.Limits.Exceeded` | visibilidade do TM-01/TM-06 em produção  |
+| scanner indisponível                                                                                                                                | erro `clamd_unavailable`                                      | alarme operacional                       |
 
 **Proibido como rótulo de métrica:** nome de arquivo, id de anexo, id de
 usuário, texto de erro do daemon, nome de assinatura — qualquer valor
@@ -1059,33 +1059,33 @@ Fluxos mínimos. Nenhum egress genérico, nenhum `0.0.0.0/0`, nenhum
 
 ### Alterações em policies existentes
 
-| Policy | Mudança | Fluxo liberado |
-|---|---|---|
-| `nchat-allow-traefik-http` | `+ upload-guard` | Traefik → upload-guard:8080 (porta nomeada `http`) |
-| `nchat-allow-dns-egress` | `+ file`, `+ upload-guard` | resolução DNS de `file-service`, `postgres`, `valkey`, `seaweedfs`, `clamav` |
-| `nchat-allow-postgres` | `+ file` na origem | file-service → PostgreSQL:5432 (ingress) |
-| `nchat-allow-valkey` | `+ file` na origem | file-service → Valkey:6379 (ingress) |
+| Policy                     | Mudança                    | Fluxo liberado                                                               |
+| -------------------------- | -------------------------- | ---------------------------------------------------------------------------- |
+| `nchat-allow-traefik-http` | `+ upload-guard`           | Traefik → upload-guard:8080 (porta nomeada `http`)                           |
+| `nchat-allow-dns-egress`   | `+ file`, `+ upload-guard` | resolução DNS de `file-service`, `postgres`, `valkey`, `seaweedfs`, `clamav` |
+| `nchat-allow-postgres`     | `+ file` na origem         | file-service → PostgreSQL:5432 (ingress)                                     |
+| `nchat-allow-valkey`       | `+ file` na origem         | file-service → Valkey:6379 (ingress)                                         |
 
 **O ClamAV não é adicionado à policy de DNS.** Com freshclam desligado ele não
-resolve nada; ele apenas *aceita* conexões. Adicionar só mediante evidência
+resolve nada; ele apenas _aceita_ conexões. Adicionar só mediante evidência
 concreta de necessidade.
 
 ### Policies novas
 
-| Nome | Tipo | Selector | Regra |
-|---|---|---|---|
-| `nchat-allow-upload-guard-file-egress` | Egress | `component: upload-guard` | → `component: file`, TCP/8083 |
-| `nchat-allow-upload-guard-file-ingress` | Ingress | `component: file` | ← `component: upload-guard`, TCP/8083 |
-| `nchat-allow-file-data-egress` | Egress | `component: file` | → `postgres` TCP/5432; → `valkey` TCP/6379; → `seaweedfs` TCP/8888 |
-| `nchat-allow-seaweedfs` | Ingress | `component: seaweedfs` | ← `component: file`, TCP/8888 apenas (**não** 9333, **não** 8333) |
-| `nchat-allow-file-clamav-egress` | Egress | `component: file` | → `component: clamav`, TCP/3310 |
-| `nchat-allow-clamav` | Ingress | `component: clamav` | ← `component: file`, TCP/3310 |
+| Nome                                    | Tipo    | Selector                  | Regra                                                              |
+| --------------------------------------- | ------- | ------------------------- | ------------------------------------------------------------------ |
+| `nchat-allow-upload-guard-file-egress`  | Egress  | `component: upload-guard` | → `component: file`, TCP/8083                                      |
+| `nchat-allow-upload-guard-file-ingress` | Ingress | `component: file`         | ← `component: upload-guard`, TCP/8083                              |
+| `nchat-allow-file-data-egress`          | Egress  | `component: file`         | → `postgres` TCP/5432; → `valkey` TCP/6379; → `seaweedfs` TCP/8888 |
+| `nchat-allow-seaweedfs`                 | Ingress | `component: seaweedfs`    | ← `component: file`, TCP/8888 apenas (**não** 9333, **não** 8333)  |
+| `nchat-allow-file-clamav-egress`        | Egress  | `component: file`         | → `component: clamav`, TCP/3310                                    |
+| `nchat-allow-clamav`                    | Ingress | `component: clamav`       | ← `component: file`, TCP/3310                                      |
 
 ### Notas de correção
 
 - **DNS do upload-guard é obrigatório:** `nginx.conf.template:59` usa
   `upstream file_service { server file-service:8083; }`, resolvido no
-  *carregamento da config*. Sem DNS o nginx não sobe — não é uma falha só na
+  _carregamento da config_. Sem DNS o nginx não sobe — não é uma falha só na
   primeira requisição.
 - **`nchat-allow-file-clamav-egress` é separada de `nchat-allow-file-data-egress`**
   para que remover o ClamAV seja apagar um arquivo lógico e não editar uma regra
@@ -1117,7 +1117,7 @@ mesmo nome da (3)**. Portanto:
   convergência tem de ser **verificada**, comparando o `spec` renderizado com o
   vivo. Se sobrar campo residual, a remediação é um `kubectl replace` nominal
   desse único objeto — **nunca** um delete.
-- **(1) e (2) são removidas nominalmente**, e só *após* a validação de que os
+- **(1) e (2) são removidas nominalmente**, e só _após_ a validação de que os
   fluxos equivalentes estão cobertos por `nchat-allow-traefik-http` (com
   `upload-guard`), `nchat-allow-dns-egress` (com `upload-guard`) e
   `nchat-allow-upload-guard-file-egress`:
@@ -1152,15 +1152,15 @@ uma propriedade de rede; não é. Correção registrada:
 
 O que cada camada realmente entrega:
 
-| Camada | Garante | Não garante |
-|---|---|---|
-| NetworkPolicy | quem pode falar com quem, em que porta | qual método/rota |
-| Roteamento Traefik | que `POST` nos dois caminhos de upload vá ao guard | nada sobre outros clientes já dentro do namespace |
-| upload-guard (nginx) | teto de corpo **enquanto transmite** (536879104 B) | autenticação, autorização, limite de política |
-| file-service | autenticação, autorização, **limite autoritativo por bytes lidos**, admission control, envelope encryption, gate de scan | — |
+| Camada               | Garante                                                                                                                  | Não garante                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
+| NetworkPolicy        | quem pode falar com quem, em que porta                                                                                   | qual método/rota                                  |
+| Roteamento Traefik   | que `POST` nos dois caminhos de upload vá ao guard                                                                       | nada sobre outros clientes já dentro do namespace |
+| upload-guard (nginx) | teto de corpo **enquanto transmite** (536879104 B)                                                                       | autenticação, autorização, limite de política     |
+| file-service         | autenticação, autorização, **limite autoritativo por bytes lidos**, admission control, envelope encryption, gate de scan | —                                                 |
 
 **Esta correção não enfraquece nada.** O upload-guard nunca foi o controle de
-segurança do *tamanho de política*: SECURITY.md §"Regras para uploads" já declara
+segurança do _tamanho de política_: SECURITY.md §"Regras para uploads" já declara
 que **"o file-service é a única fronteira de tamanho"** e que contornar gateway
 ou frontend não amplia o limite. O guard é defesa em profundidade contra
 exaustão de disco do gateway **antes** da autenticação. O que muda aqui é apenas
@@ -1180,7 +1180,7 @@ quanto nos três overlays (`assert_upload_route`, linhas 176-222):
 - ela carrega o middleware `upload-inflight`;
 - os routers `/api/files` **não**-upload continuam indo direto ao file-service.
 
-**Lacunas que o TM-10 obriga a fechar** — o que hoje *não* é verificado:
+**Lacunas que o TM-10 obriga a fechar** — o que hoje _não_ é verificado:
 
 1. as asserções rodam sobre os **arquivos-fonte**, não sobre o manifest
    **renderizado** pelo kustomize, que é o que efetivamente vai ao cluster;
@@ -1196,14 +1196,14 @@ quanto nos três overlays (`assert_upload_route`, linhas 176-222):
 Os quatro viram invariantes de CI (§CI, invariantes 16-20) e testes E2E
 (§Testes).
 
-| Origem | Chaves |
-|---|---|
-| ConfigMap `nchat-config` | `APP_ENV`, `FILE_UPLOADS_ENABLED`, `FILE_MALWARE_SCAN_REQUIRED`, `FILE_MALWARE_SCANNER_ADDRESS`, `FILE_MALWARE_SCAN_TIMEOUT_SECONDS`, `SEAWEEDFS_FILER_URL` |
-| `secretKeyRef` → `nchat-postgres-runtime` | `DATABASE_URL` |
-| `secretKeyRef` → `nchat-secrets` | `AUTH_JWT_HMAC_SECRET`, `VALKEY_URL` |
-| `secretKeyRef` → `nchat-file-encryption` | `FILE_ENCRYPTION_MASTER_KEY`, `FILE_ENCRYPTION_MASTER_KEY_ID`, `FILE_ENCRYPTION_PREVIOUS_KEYS` |
-| `env` do Deployment (base) | `PORT`, `SERVICE_NAME` |
-| **Ausente por decisão** | `SEAWEEDFS_S3_ENDPOINT` |
+| Origem                                    | Chaves                                                                                                                                                      |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ConfigMap `nchat-config`                  | `APP_ENV`, `FILE_UPLOADS_ENABLED`, `FILE_MALWARE_SCAN_REQUIRED`, `FILE_MALWARE_SCANNER_ADDRESS`, `FILE_MALWARE_SCAN_TIMEOUT_SECONDS`, `SEAWEEDFS_FILER_URL` |
+| `secretKeyRef` → `nchat-postgres-runtime` | `DATABASE_URL`                                                                                                                                              |
+| `secretKeyRef` → `nchat-secrets`          | `AUTH_JWT_HMAC_SECRET`, `VALKEY_URL`                                                                                                                        |
+| `secretKeyRef` → `nchat-file-encryption`  | `FILE_ENCRYPTION_MASTER_KEY`, `FILE_ENCRYPTION_MASTER_KEY_ID`, `FILE_ENCRYPTION_PREVIOUS_KEYS`                                                              |
+| `env` do Deployment (base)                | `PORT`, `SERVICE_NAME`                                                                                                                                      |
+| **Ausente por decisão**                   | `SEAWEEDFS_S3_ENDPOINT`                                                                                                                                     |
 
 ---
 
@@ -1215,11 +1215,11 @@ Os quatro viram invariantes de CI (§CI, invariantes 16-20) e testes E2E
 
 Fonte: `crypto.ValidateKeyring` via `config.go:326-333`, template e runbook.
 
-| Variável | Formato | Obrigatória |
-|---|---|---|
-| `FILE_ENCRYPTION_MASTER_KEY` | base64 **padrão** de exatamente **32 bytes** (`openssl rand -base64 32`). Sem default, sem fallback. | sim, com uploads ligados |
-| `FILE_ENCRYPTION_MASTER_KEY_ID` | rótulo **não secreto**, `[a-z0-9][a-z0-9._-]{0,63}`; convenção datada, ex.: `kek-2026-08` | sim |
-| `FILE_ENCRYPTION_PREVIOUS_KEYS` | pares `id:chave_base64` separados por vírgula; vazio fora de rotação | não |
+| Variável                        | Formato                                                                                              | Obrigatória              |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------ |
+| `FILE_ENCRYPTION_MASTER_KEY`    | base64 **padrão** de exatamente **32 bytes** (`openssl rand -base64 32`). Sem default, sem fallback. | sim, com uploads ligados |
+| `FILE_ENCRYPTION_MASTER_KEY_ID` | rótulo **não secreto**, `[a-z0-9][a-z0-9._-]{0,63}`; convenção datada, ex.: `kek-2026-08`            | sim                      |
+| `FILE_ENCRYPTION_PREVIOUS_KEYS` | pares `id:chave_base64` separados por vírgula; vazio fora de rotação                                 | não                      |
 
 Recusados no start-up: base64 inválido, comprimento ≠ 32 bytes, id malformado,
 id duplicado, entrada anterior que sombreie o id ativo. Nenhum valor aparece em
@@ -1253,7 +1253,7 @@ adicionar ao secret compartilhado.**
 
 `docs/runbooks/file-service-envelope-encryption.md` §Rotation: gerar novo par,
 mover o par atual para `FILE_ENCRYPTION_PREVIOUS_KEYS`, re-selar, aplicar,
-reiniciar; depois *rewrap* das linhas com o `kek_key_id` antigo; só remover a
+reiniciar; depois _rewrap_ das linhas com o `kek_key_id` antigo; só remover a
 chave anterior quando
 `SELECT count(*) ... WHERE kek_key_id='<antigo>' AND deleted_at IS NULL`
 retornar zero. **Limitação registrada pelo próprio runbook:** o job de rewrap
@@ -1384,7 +1384,7 @@ de decrypt é perdida (o Secret permanece), nenhum bypass é criado.
 ### Rollback de imagem
 
 `kubectl rollout undo deployment/file-service -n nchat-dev`. A 000005 é
-*forward-compatible* (colunas nullable/com DEFAULT — linhas 40-44 da migration),
+_forward-compatible_ (colunas nullable/com DEFAULT — linhas 40-44 da migration),
 então o binário anterior funciona com o schema novo: apenas nunca agenda scans.
 
 ### Proibições explícitas
@@ -1438,11 +1438,11 @@ Nenhum gate é relaxado genericamente. Cada proibição cega vira um invariante
 
 ### Substituições
 
-| Gate atual | Substituto |
-|---|---|
+| Gate atual                                              | Substituto                                                                                                                         |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `grep -Eq 'SEAWEEDFS_(FILER_URL\|S3_ENDPOINT)'` → falha | `SEAWEEDFS_FILER_URL` presente **exatamente uma vez** com valor exato `http://seaweedfs:8888`; `SEAWEEDFS_S3_ENDPOINT` **ausente** |
-| lista fechada de policies de Egress (8 nomes) | lista fechada estendida com as 3 novas policies de egress |
-| `external_image_refs` regex + `-eq 6` | regex e contagem estendidas para `clamav/clamav`, mantendo a exigência de digest `@sha256:` |
+| lista fechada de policies de Egress (8 nomes)           | lista fechada estendida com as 3 novas policies de egress                                                                          |
+| `external_image_refs` regex + `-eq 6`                   | regex e contagem estendidas para `clamav/clamav`, mantendo a exigência de digest `@sha256:`                                        |
 
 ### Invariantes novos
 
@@ -1538,34 +1538,34 @@ regressão**), `migrations-check.sh`, `sealed-secrets-policy-check.sh`,
 
 ## Testes de aceite em nchat-dev (pós-deploy)
 
-| # | Critério | Como verificar |
-|---|---|---|
-| 1 | Filer do SeaweedFS ativo | `kubectl -n nchat-dev exec sts/seaweedfs -- wget -qO- http://127.0.0.1:8888/` responde |
-| 2 | Migration 000005 íntegra | as 3 consultas da §Migrations; Job reporta `[SKIP]` |
-| 3 | file-service inicia | `kubectl rollout status`, sem CrashLoop |
-| 4 | `/healthz` 200 | probe interna via API proxy |
-| 5 | `/readyz` ready | checks `postgres` **e** `object-storage` passando |
-| 6 | ClamAV `Ready` | probe TCP/3310 com validação de `PONG` |
-| 7 | Upload válido | `201`, `status=pending_scan` |
-| 8 | Download antes do scan | `403 file_not_scanned` |
-| 9 | Preview antes do scan | `403` — mesmo gate |
-| 10 | HTTP Range antes do scan | `403` — o gate cobre toda entrega de bytes derivados |
-| 11 | Worker processando | log `worker=malware_scan`, `result=clean` |
-| 12 | Transição para `clean` | ~1 poll (10 s) + duração do scan |
-| 13 | Realtime | evento de status chega por WebSocket sem reload (via `VALKEY_URL`) |
-| 14 | Preview após `clean` | 200 |
-| 15 | EICAR → `rejected` | download `403`, permanente, sem reprocessamento |
-| 16 | Anexo grande | arquivo próximo de 512 MiB é aceito e escaneado; comparar o tempo real com os 4.258 s do benchmark |
-| 17 | ClamAV indisponível | `kubectl scale deploy/clamav --replicas=0`: upload novo fica em `pending_scan`, log `result=retry`, **nada** vira `clean`; file-service continua `ready` |
-| 18 | Restart do ClamAV | `--replicas=1`: o backlog drena no próximo claim |
-| 19 | Restart do file-service | linhas com lease expirado voltam a ficar due; nenhuma fica presa |
-| 20 | Porta 3310 não exposta | `kubectl get svc,ingress,ingressroute -n nchat-dev` sem referência a 3310; varredura externa não vê a porta |
-| 21 | Encryption at rest | ler o objeto direto no Filer e confirmar que não é o plaintext |
-| 22 | Sem regressão no upload-guard | upload > 536879104 B rejeitado pelo nginx enquanto transmite |
-| 23 | Sem regressão no limite | limite administrativo do workspace continua aplicado pelo file-service |
-| 24 | Sem regressão no default-deny | ambas as default-deny presentes; um pod arbitrário não alcança o ClamAV |
-| 25 | Drift convergido | `nchat-allow-upload-guard-file-ingress` existe e bate com o manifest; as outras duas policies manuais não existem mais |
-| 26 | Quota respeitada | `kubectl describe resourcequota -n nchat-dev` dentro dos limites, sem alteração de cota |
+| #   | Critério                      | Como verificar                                                                                                                                           |
+| --- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Filer do SeaweedFS ativo      | `kubectl -n nchat-dev exec sts/seaweedfs -- wget -qO- http://127.0.0.1:8888/` responde                                                                   |
+| 2   | Migration 000005 íntegra      | as 3 consultas da §Migrations; Job reporta `[SKIP]`                                                                                                      |
+| 3   | file-service inicia           | `kubectl rollout status`, sem CrashLoop                                                                                                                  |
+| 4   | `/healthz` 200                | probe interna via API proxy                                                                                                                              |
+| 5   | `/readyz` ready               | checks `postgres` **e** `object-storage` passando                                                                                                        |
+| 6   | ClamAV `Ready`                | probe TCP/3310 com validação de `PONG`                                                                                                                   |
+| 7   | Upload válido                 | `201`, `status=pending_scan`                                                                                                                             |
+| 8   | Download antes do scan        | `403 file_not_scanned`                                                                                                                                   |
+| 9   | Preview antes do scan         | `403` — mesmo gate                                                                                                                                       |
+| 10  | HTTP Range antes do scan      | `403` — o gate cobre toda entrega de bytes derivados                                                                                                     |
+| 11  | Worker processando            | log `worker=malware_scan`, `result=clean`                                                                                                                |
+| 12  | Transição para `clean`        | ~1 poll (10 s) + duração do scan                                                                                                                         |
+| 13  | Realtime                      | evento de status chega por WebSocket sem reload (via `VALKEY_URL`)                                                                                       |
+| 14  | Preview após `clean`          | 200                                                                                                                                                      |
+| 15  | EICAR → `rejected`            | download `403`, permanente, sem reprocessamento                                                                                                          |
+| 16  | Anexo grande                  | arquivo próximo de 512 MiB é aceito e escaneado; comparar o tempo real com os 4.258 s do benchmark                                                       |
+| 17  | ClamAV indisponível           | `kubectl scale deploy/clamav --replicas=0`: upload novo fica em `pending_scan`, log `result=retry`, **nada** vira `clean`; file-service continua `ready` |
+| 18  | Restart do ClamAV             | `--replicas=1`: o backlog drena no próximo claim                                                                                                         |
+| 19  | Restart do file-service       | linhas com lease expirado voltam a ficar due; nenhuma fica presa                                                                                         |
+| 20  | Porta 3310 não exposta        | `kubectl get svc,ingress,ingressroute -n nchat-dev` sem referência a 3310; varredura externa não vê a porta                                              |
+| 21  | Encryption at rest            | ler o objeto direto no Filer e confirmar que não é o plaintext                                                                                           |
+| 22  | Sem regressão no upload-guard | upload > 536879104 B rejeitado pelo nginx enquanto transmite                                                                                             |
+| 23  | Sem regressão no limite       | limite administrativo do workspace continua aplicado pelo file-service                                                                                   |
+| 24  | Sem regressão no default-deny | ambas as default-deny presentes; um pod arbitrário não alcança o ClamAV                                                                                  |
+| 25  | Drift convergido              | `nchat-allow-upload-guard-file-ingress` existe e bate com o manifest; as outras duas policies manuais não existem mais                                   |
+| 26  | Quota respeitada              | `kubectl describe resourcequota -n nchat-dev` dentro dos limites, sem alteração de cota                                                                  |
 
 ### Matriz de veredito do cliente clamd (TM-01) — teste obrigatório
 
@@ -1573,20 +1573,20 @@ Teste de unidade contra um daemon falso, travando a propriedade "só `OK\0`
 íntegro produz `clean`". A análise em §D mostra que o código atual satisfaz
 todos os casos; o teste existe para que uma refatoração futura não os perca.
 
-| Resposta / evento do daemon | Resultado exigido |
-|---|---|
-| `stream: OK\0` | `clean` |
-| `stream: Eicar-Signature FOUND\0` | `rejected` |
-| `stream: Heuristics.Limits.Exceeded FOUND\0` | `rejected` — **nunca** `clean` |
-| `... ERROR\0` | retry / `pending_scan` |
-| `INSTREAM size limit exceeded\0` | retry / `pending_scan` (`too_large`) |
-| EOF antes do terminador | retry / `pending_scan` |
-| resposta **sem NUL** final | retry / `pending_scan` |
-| connection reset | retry / `pending_scan` |
-| timeout do deadline | retry / `pending_scan` |
-| cancelamento de contexto | retry / `pending_scan` |
-| resposta vazia | retry / `pending_scan` |
-| resposta desconhecida | retry / `pending_scan` |
+| Resposta / evento do daemon                                    | Resultado exigido                           |
+| -------------------------------------------------------------- | ------------------------------------------- |
+| `stream: OK\0`                                                 | `clean`                                     |
+| `stream: Eicar-Signature FOUND\0`                              | `rejected`                                  |
+| `stream: Heuristics.Limits.Exceeded FOUND\0`                   | `rejected` — **nunca** `clean`              |
+| `... ERROR\0`                                                  | retry / `pending_scan`                      |
+| `INSTREAM size limit exceeded\0`                               | retry / `pending_scan` (`too_large`)        |
+| EOF antes do terminador                                        | retry / `pending_scan`                      |
+| resposta **sem NUL** final                                     | retry / `pending_scan`                      |
+| connection reset                                               | retry / `pending_scan`                      |
+| timeout do deadline                                            | retry / `pending_scan`                      |
+| cancelamento de contexto                                       | retry / `pending_scan`                      |
+| resposta vazia                                                 | retry / `pending_scan`                      |
+| resposta desconhecida                                          | retry / `pending_scan`                      |
 | resposta terminal recebida **após** falha da fonte de conteúdo | nunca `clean` a partir de stream incompleto |
 
 Se algum desses casos puder virar `clean` na implementação, **isso é uma
@@ -1619,14 +1619,14 @@ Todos executados contra o **host público**, porque a propriedade sob teste é d
 roteamento L7. Enviar requisição direta ao ClusterIP de dentro do cluster **não**
 prova nada sobre o roteamento público e não substitui nenhum destes.
 
-| # | Cenário | Resultado exigido |
-|---|---|---|
-| E1 | `POST` de anexo, multipart normal | passa pelo upload-guard (confirmável no log/contador do guard) |
-| E2 | `POST` de anexo com `Transfer-Encoding: chunked` | passa pelo upload-guard |
-| E3 | `POST` de anexo com `Content-Length` válido | passa pelo upload-guard |
-| E4 | payload acima de 536879104 bytes | recusado **pelo guard, durante o streaming** — não após bufferizar |
-| E5 | `GET` de download / preview / Range | alcança o file-service normalmente, sem o hop extra |
-| E6 | inventário de rotas públicas | **nenhuma** rota pública de `POST` de anexo aponta para `file-service` |
+| #   | Cenário                                          | Resultado exigido                                                      |
+| --- | ------------------------------------------------ | ---------------------------------------------------------------------- |
+| E1  | `POST` de anexo, multipart normal                | passa pelo upload-guard (confirmável no log/contador do guard)         |
+| E2  | `POST` de anexo com `Transfer-Encoding: chunked` | passa pelo upload-guard                                                |
+| E3  | `POST` de anexo com `Content-Length` válido      | passa pelo upload-guard                                                |
+| E4  | payload acima de 536879104 bytes                 | recusado **pelo guard, durante o streaming** — não após bufferizar     |
+| E5  | `GET` de download / preview / Range              | alcança o file-service normalmente, sem o hop extra                    |
+| E6  | inventário de rotas públicas                     | **nenhuma** rota pública de `POST` de anexo aponta para `file-service` |
 
 ---
 
@@ -1692,15 +1692,15 @@ reviewer. As verificações de implementação nomeadas nos itens 3 e 4 continua
 obrigatórias: elas confirmam premissas técnicas na hora de escrever os
 manifests, não reabrem decisão arquitetural.
 
-| # | Decisão | Contexto |
-|---|---|---|
-| **1** | **Recursos do ClamAV — AJUSTADO:** `requests 500m / 1536Mi`, `limits` **`1250m`** ` / 3Gi` (proposta original: 1500m) | Medido: idle ~945 MiB, pico INSTREAM ~1 GiB, CPU pico ~177%, 512 MiB em 4.258 s. O reviewer aplicou a alavanca prevista na própria Rev 2: reduzir o `cpu.limit` do ClamAV em vez de aumentar a cota. Com 1250m o throttling pode alongar a fase CPU-bound, mas 4.258 s contra 300 s de orçamento absorve isso com folga larga. `limits.cpu` do namespace passa de 6250m para **7500m de 8000m**, preservando **500m** de folga. **A ResourceQuota não é alterada.** |
-| **2** | **Forma de referência do ClamAV pelo overlay:** `resources: ../../base/services/clamav` (simples) *vs.* Kustomize *Component* (semântica explícita) | Ambos suportados pelo kustomize v5.7.1 já fixado. O resultado renderizado é o mesmo; a diferença é de expressividade. Em qualquer das duas, `base/kustomization.yaml` **não** referencia o diretório. |
-| **3** | **Probe do ClamAV:** `exec: ["clamdscan", "--ping", "1"]` como candidato primário | Precisa ser **verificado na implementação**: que a 1.4 use `TCPSocket` na ausência de `LocalSocket` e retorne código ≠ 0 com o daemon parado. Ratificar também o fallback (`tcpSocket` para liveness + exec comprovado para readiness). Ratificar ainda que `/init-unprivileged` funciona com a config customizada, os emptyDirs e UID/GID 100/101 — se não funcionar, o entrypoint precisa ser reavaliado no mesmo Design Review. |
-| **4** | **`/run/clamav` não é montado** | Baseado na ausência de `LocalSocket` e `PidFile` no `clamd.conf` do NChat. Se a verificação de implementação provar necessidade, adicionar **com evidência registrada**. |
-| **5** | **Reescrita dos gates de CI** | Nenhum gate é afrouxado: proibições cegas viram invariantes positivos mais estritos. Ratificar que a troca do `grep` de `SEAWEEDFS_*` por asserção de valor exato é aceitável. |
-| **6** | **Convergência de `nchat-allow-upload-guard-file-ingress`** | Adoção por igualdade de nome via `kubectl apply`, com verificação de spec e `kubectl replace` nominal como contingência. Ratificar que o time aceita adotar um objeto criado fora do versionamento em vez de recriá-lo. |
-| **7** | **Modelo de um único `kubectl apply`** | Mitigado por dois PRs + `maxUnavailable: 0` (o pod antigo sobrevive a um `/readyz` que falhe). Ratificar que isso substitui um deploy manual em etapas. |
+| #     | Decisão                                                                                                                                             | Contexto                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1** | **Recursos do ClamAV — AJUSTADO:** `requests 500m / 1536Mi`, `limits` **`1250m`** ` / 3Gi` (proposta original: 1500m)                               | Medido: idle ~945 MiB, pico INSTREAM ~1 GiB, CPU pico ~177%, 512 MiB em 4.258 s. O reviewer aplicou a alavanca prevista na própria Rev 2: reduzir o `cpu.limit` do ClamAV em vez de aumentar a cota. Com 1250m o throttling pode alongar a fase CPU-bound, mas 4.258 s contra 300 s de orçamento absorve isso com folga larga. `limits.cpu` do namespace passa de 6250m para **7500m de 8000m**, preservando **500m** de folga. **A ResourceQuota não é alterada.** |
+| **2** | **Forma de referência do ClamAV pelo overlay:** `resources: ../../base/services/clamav` (simples) _vs._ Kustomize _Component_ (semântica explícita) | Ambos suportados pelo kustomize v5.7.1 já fixado. O resultado renderizado é o mesmo; a diferença é de expressividade. Em qualquer das duas, `base/kustomization.yaml` **não** referencia o diretório.                                                                                                                                                                                                                                                               |
+| **3** | **Probe do ClamAV:** `exec: ["clamdscan", "--ping", "1"]` como candidato primário                                                                   | Precisa ser **verificado na implementação**: que a 1.4 use `TCPSocket` na ausência de `LocalSocket` e retorne código ≠ 0 com o daemon parado. Ratificar também o fallback (`tcpSocket` para liveness + exec comprovado para readiness). Ratificar ainda que `/init-unprivileged` funciona com a config customizada, os emptyDirs e UID/GID 100/101 — se não funcionar, o entrypoint precisa ser reavaliado no mesmo Design Review.                                  |
+| **4** | **`/run/clamav` não é montado**                                                                                                                     | Baseado na ausência de `LocalSocket` e `PidFile` no `clamd.conf` do NChat. Se a verificação de implementação provar necessidade, adicionar **com evidência registrada**.                                                                                                                                                                                                                                                                                            |
+| **5** | **Reescrita dos gates de CI**                                                                                                                       | Nenhum gate é afrouxado: proibições cegas viram invariantes positivos mais estritos. Ratificar que a troca do `grep` de `SEAWEEDFS_*` por asserção de valor exato é aceitável.                                                                                                                                                                                                                                                                                      |
+| **6** | **Convergência de `nchat-allow-upload-guard-file-ingress`**                                                                                         | Adoção por igualdade de nome via `kubectl apply`, com verificação de spec e `kubectl replace` nominal como contingência. Ratificar que o time aceita adotar um objeto criado fora do versionamento em vez de recriá-lo.                                                                                                                                                                                                                                             |
+| **7** | **Modelo de um único `kubectl apply`**                                                                                                              | Mitigado por dois PRs + `maxUnavailable: 0` (o pod antigo sobrevive a um `/readyz` que falhe). Ratificar que isso substitui um deploy manual em etapas.                                                                                                                                                                                                                                                                                                             |
 
 ### Estado dos itens que a Rev 2 levou ao Threat Model
 
@@ -1718,21 +1718,21 @@ manifests, não reabrem decisão arquitetural.
   zeros não exercita parsers de archive nem documentos complexos, então o pior
   caso real de CPU e memória permanece não medido. É a razão da margem no
   `limits.memory` (3Gi ≈ 3× o pico observado) e, agora, também do
-  dimensionamento de `/tmp` pelo pior caso *da política* (`StreamMaxLength` +
+  dimensionamento de `/tmp` pelo pior caso _da política_ (`StreamMaxLength` +
   `MaxScanSize`) em vez de pelo caso medido.
 
 ### Pontos que o novo Threat Model precisa ratificar
 
 Derivados exclusivamente dos três findings; nada de escopo novo.
 
-| # | Decisão a ratificar | Por quê |
-|---|---|---|
-| **T1** | `MaxScanTime 420000` (420 s) como backstop | 120 s de margem sobre os 300 s e estritamente acima do lease de 330 s. Ratificar o valor e a margem mínima que o CI vai exigir. |
-| **T2** | `AlertExceedsMax yes` e a aceitação de falsos positivos `Heuristics.Limits.Exceeded` | Trade-off explícito: recusar arquivo legítimo é preferível a aprovar arquivo não inspecionado. |
-| **T3** | `/tmp` `sizeLimit: 2Gi` e `/var/lib/clamav` `sizeLimit: 1Gi` | Dimensionados pelo pior caso da política, não pelo benchmark. Ratificar os tetos. |
-| **T4** | `ephemeral-storage` `requests 512Mi` / `limits 4Gi` | Acréscimo aos recursos já aprovados; sem impacto na ResourceQuota. |
-| **T5** | Versionar os limites de parser com os valores **efetivos observados** | Nenhum valor foi inventado; ratificar que congelar o efetivo é a política desejada. |
-| **T6** | Invariantes de roteamento sobre o manifest **renderizado**, incluindo prioridade | É a única camada que pode garantir a propriedade do TM-10. |
+| #      | Decisão a ratificar                                                                  | Por quê                                                                                                                         |
+| ------ | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| **T1** | `MaxScanTime 420000` (420 s) como backstop                                           | 120 s de margem sobre os 300 s e estritamente acima do lease de 330 s. Ratificar o valor e a margem mínima que o CI vai exigir. |
+| **T2** | `AlertExceedsMax yes` e a aceitação de falsos positivos `Heuristics.Limits.Exceeded` | Trade-off explícito: recusar arquivo legítimo é preferível a aprovar arquivo não inspecionado.                                  |
+| **T3** | `/tmp` `sizeLimit: 2Gi` e `/var/lib/clamav` `sizeLimit: 1Gi`                         | Dimensionados pelo pior caso da política, não pelo benchmark. Ratificar os tetos.                                               |
+| **T4** | `ephemeral-storage` `requests 512Mi` / `limits 4Gi`                                  | Acréscimo aos recursos já aprovados; sem impacto na ResourceQuota.                                                              |
+| **T5** | Versionar os limites de parser com os valores **efetivos observados**                | Nenhum valor foi inventado; ratificar que congelar o efetivo é a política desejada.                                             |
+| **T6** | Invariantes de roteamento sobre o manifest **renderizado**, incluindo prioridade     | É a única camada que pode garantir a propriedade do TM-10.                                                                      |
 
 ---
 
@@ -1743,10 +1743,10 @@ Derivados exclusivamente dos três findings; nada de escopo novo.
 O Design Review aprovou a Rev 2 com risco Médio; o Threat Model a reprovou com
 risco **Alto** por três findings. Esta Rev 3 corrige o **desenho** dos três:
 
-- **TM-01** — `clean` passa a significar scan completo. O limite de *tempo* do
+- **TM-01** — `clean` passa a significar scan completo. O limite de _tempo_ do
   engine fica atrás do deadline externo de 300 s, que é declarado a autoridade
   fail-closed (`MaxScanTime 420000` > lease 330 s > timeout 300 s); o limite de
-  *conteúdo* deixa de responder `OK` e passa a responder
+  _conteúdo_ deixa de responder `OK` e passa a responder
   `Heuristics.Limits.Exceeded FOUND` (`AlertExceedsMax yes`). A análise de
   `clamd.go` mostra que o cliente Go **já** satisfaz a semântica exigida em
   todos os casos enumerados — nenhuma correção em Go é necessária, apenas testes
