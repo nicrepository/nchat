@@ -13,9 +13,18 @@ metadata:
     #
     # RF-23 follow-up: media-service registers /media/*, not /api/media/*, so
     # the same class of bug applies to POST /api/media/media/livekit/token —
-    # see media-api-prefix below. Both regexes are mutually exclusive prefixes,
-    # so chaining them is order-independent.
-    traefik.ingress.kubernetes.io/router.middlewares: nchat-dev-auth-api-prefix@kubernetescrd,nchat-dev-media-api-prefix@kubernetescrd
+    # see media-api-prefix below.
+    #
+    # file-service is the third instance: it registers /attachments/*, not
+    # /api/files/attachments/*. Uploads worked only because the dedicated
+    # nchat-dev-uploads IngressRoute already applies strip-files-prefix, so
+    # every GET (content, preview, metadata, listing) answered 404. The same
+    # middleware is reused here rather than duplicated.
+    #
+    # All three act on mutually exclusive prefixes — /api/auth, /api/media,
+    # /api/files — so chaining them is order-independent and no request outside
+    # a middleware's own prefix is touched.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-dev-auth-api-prefix@kubernetescrd,nchat-dev-media-api-prefix@kubernetescrd,nchat-dev-strip-files-prefix@kubernetescrd
 spec:
   ingressClassName: traefik
   tls:
@@ -196,8 +205,10 @@ spec:
 #
 # Everything else under /api/files (health, download, listing, metadata) stays
 # on the shared Ingress and reaches file-service directly, so nothing else pays
-# the extra hop. This Ingress is matched by method and exact path shape, so
-# there is no upload path that reaches file-service around the cap.
+# the extra hop — the shared Ingress applies the same strip-files-prefix, so
+# those requests arrive with the public /api/files prefix removed, exactly as
+# they do through this route. This Ingress is matched by method and exact path
+# shape, so there is no upload path that reaches file-service around the cap.
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
@@ -249,8 +260,10 @@ spec:
   inFlightReq:
     amount: 16
 ---
-# Strips the public /api/files prefix before the request reaches the guard, so
-# the guard stays a dumb pipe and file-service receives the paths it registers.
+# Strips the public /api/files prefix so the guard stays a dumb pipe and
+# file-service receives the paths it registers. Shared by the upload route above
+# and the shared Ingress, which is what makes the upload and the download halves
+# of the contract the same rule instead of two that can drift apart.
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
