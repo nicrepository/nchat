@@ -46,6 +46,8 @@ make_topology_variant() {
   while IFS='=' read -r key value || [[ -n "$key$value" ]]; do
     if [[ "$key" == "$changed_key" ]]; then
       value="$changed_value"
+    elif [[ "$changed_key" == NCHAT_DEV_HOST && "$key" == NCHAT_DEV_PUBLIC_URL ]]; then
+      value="https://$changed_value"
     fi
     printf '%s=%s\n' "$key" "$value"
   done <"$TOPOLOGY_FIXTURE" >"$destination"
@@ -58,11 +60,19 @@ expect_invalid_topology() {
 }
 
 validate_topology_contract() {
-  local variant="$TEMP_DIR/topology-variant.env" materialized="$TEMP_DIR/materialized.env"
+  local variant="$TEMP_DIR/topology-variant.env" materialized="$TEMP_DIR/materialized.env" host248 host249
   load_nchat_dev_topology "$TOPOLOGY_FIXTURE" || fail "valid topology fixture rejected"
 
   make_topology_variant "$variant" NCHAT_DEV_NODE_IP 999.0.2.10
   expect_invalid_topology "$variant" "invalid IPv4 accepted"
+  make_topology_variant "$variant" NCHAT_DEV_TURN_EXTERNAL_IP 999.51.100.20
+  expect_invalid_topology "$variant" "invalid TURN external IPv4 accepted"
+  make_topology_variant "$variant" NCHAT_DEV_TURN_EXTERNAL_IP 198.051.100.20
+  expect_invalid_topology "$variant" "leading-zero TURN external IPv4 accepted"
+  make_topology_variant "$variant" NCHAT_DEV_TURN_EXTERNAL_IP '198.51.100.20 '
+  expect_invalid_topology "$variant" "whitespace in TURN external IPv4 accepted"
+  make_topology_variant "$variant" NCHAT_DEV_TURN_EXTERNAL_IP ''
+  expect_invalid_topology "$variant" "empty TURN external IPv4 accepted"
   make_topology_variant "$variant" NCHAT_DEV_NODE_CIDR 192.0.2.0/24
   expect_invalid_topology "$variant" "non-/32 node CIDR accepted"
   make_topology_variant "$variant" TURN_LISTEN_PORT 3478
@@ -89,19 +99,34 @@ validate_topology_contract() {
   expect_invalid_topology "$variant" "empty host label accepted"
   make_topology_variant "$variant" NCHAT_DEV_HOST REPLACE_ME_HOST
   expect_invalid_topology "$variant" "unresolved REPLACE_ME_HOST accepted as topology host"
+  host248="$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..56})"
+  host249="$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..57})"
+  [[ "${#host248}" -eq 248 && "${#host249}" -eq 249 ]] || fail "hostname boundary fixture lengths are incorrect"
+  make_topology_variant "$variant" NCHAT_DEV_HOST "$host248"
+  load_nchat_dev_topology "$variant" || fail "248-character topology host rejected"
+  make_topology_variant "$variant" NCHAT_DEV_HOST "$host249"
+  expect_invalid_topology "$variant" "249-character topology host accepted despite derived TURN hostname"
   cp "$TOPOLOGY_FIXTURE" "$variant"
   printf '%s\n' 'UNEXPECTED_KEY=value' >>"$variant"
   expect_invalid_topology "$variant" "unexpected topology key accepted"
+  grep -v '^NCHAT_DEV_TURN_EXTERNAL_IP=' "$TOPOLOGY_FIXTURE" >"$variant"
+  expect_invalid_topology "$variant" "missing TURN external IPv4 accepted"
+  cp "$TOPOLOGY_FIXTURE" "$variant"
+  printf '%s\n' 'NCHAT_DEV_TURN_EXTERNAL_IP=198.51.100.21' >>"$variant"
+  expect_invalid_topology "$variant" "duplicate TURN external IPv4 accepted"
 
   (
     unset NCHAT_DEV_TOPOLOGY_FILE
     export NCHAT_DEV_NODE_IP=192.0.2.20
     export NCHAT_DEV_NODE_CIDR=192.0.2.20/32
     export NCHAT_DEV_HOST=nchat-dev-ci.example.invalid
+    export NCHAT_DEV_TURN_EXTERNAL_IP=198.51.100.20
     materialize_nchat_dev_topology \
       "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/topology.env.example" "$materialized"
   ) || fail "environment topology materialization failed"
   [[ "$(stat -c '%a' "$materialized")" == 600 ]] || fail "materialized topology permissions are not 0600"
+  [[ "$(grep -Fxc 'NCHAT_DEV_TURN_EXTERNAL_IP=198.51.100.20' "$materialized")" -eq 1 ]] || \
+    fail "materialized topology does not contain exactly one TURN external IPv4"
   load_nchat_dev_topology "$materialized" || fail "materialized topology is invalid"
 
   local empty_host_dest="$TEMP_DIR/empty-host.env"
@@ -110,14 +135,29 @@ validate_topology_contract() {
     export NCHAT_DEV_NODE_IP=192.0.2.21
     export NCHAT_DEV_NODE_CIDR=192.0.2.21/32
     export NCHAT_DEV_HOST=
+    export NCHAT_DEV_TURN_EXTERNAL_IP=198.51.100.21
     materialize_nchat_dev_topology \
       "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/topology.env.example" "$empty_host_dest"
   ) >/dev/null 2>&1; then
     fail "empty NCHAT_DEV_HOST was accepted"
   fi
   [[ ! -e "$empty_host_dest" ]] || fail "empty NCHAT_DEV_HOST produced a rendered topology file"
+
+  local missing_turn_dest="$TEMP_DIR/missing-turn-external-ip.env"
   if (
-    unset NCHAT_DEV_TOPOLOGY_FILE NCHAT_DEV_NODE_IP NCHAT_DEV_NODE_CIDR NCHAT_DEV_HOST
+    unset NCHAT_DEV_TOPOLOGY_FILE NCHAT_DEV_TURN_EXTERNAL_IP
+    export NCHAT_DEV_NODE_IP=192.0.2.21
+    export NCHAT_DEV_NODE_CIDR=192.0.2.21/32
+    export NCHAT_DEV_HOST=nchat-dev-ci.example.invalid
+    materialize_nchat_dev_topology \
+      "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/topology.env.example" "$missing_turn_dest"
+  ) >/dev/null 2>&1; then
+    fail "missing NCHAT_DEV_TURN_EXTERNAL_IP was accepted"
+  fi
+  [[ ! -e "$missing_turn_dest" ]] || fail "missing NCHAT_DEV_TURN_EXTERNAL_IP produced a rendered topology file"
+
+  if (
+    unset NCHAT_DEV_TOPOLOGY_FILE NCHAT_DEV_NODE_IP NCHAT_DEV_NODE_CIDR NCHAT_DEV_HOST NCHAT_DEV_TURN_EXTERNAL_IP
     materialize_nchat_dev_topology \
       "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/topology.env.example" "$TEMP_DIR/missing.env"
   ) >/dev/null 2>&1; then
