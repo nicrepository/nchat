@@ -92,6 +92,43 @@ port_pairs() {
   ' <<<"$1"
 }
 
+# network_policy_flows prints one sorted "DIRECTION COMPONENT PROTOCOL/PORT"
+# line per (peer, port) pair of every ingress/egress rule in the NetworkPolicy
+# documents it is given. Unlike port_pairs it keeps the peer attached to the
+# port, which is the whole question for the SeaweedFS rules: 8888 and 8080 are
+# both reachable on the same pod, and only the peer distinguishes the flow that
+# is intended from the one that must never exist.
+#
+# A peer selected by matchExpressions rather than matchLabels prints as
+# "<none>". That is deliberate: the pairing is lost, but the port is not, so a
+# rule that granted 8080 through the other selector form still shows up and
+# still breaks an exact-set assertion instead of passing unseen.
+network_policy_flows() {
+  awk '
+    function emit_port() {
+      if (proto != "" || port != "") { pairs[++np] = proto "/" port; proto = ""; port = "" }
+    }
+    function flush(  i, j) {
+      if (np > 0) {
+        if (nc == 0) { comps[1] = "<none>"; nc = 1 }
+        for (i = 1; i <= nc; i++) for (j = 1; j <= np; j++) print direction, comps[i], pairs[j]
+      }
+      nc = 0; np = 0; proto = ""; port = ""
+    }
+    /^  (ingress|egress):[[:space:]]*$/ {
+      emit_port(); flush(); direction = $1; sub(/:$/, "", direction); active = 1; next
+    }
+    /^---$/ || /^[^[:space:]]/ || /^  [a-zA-Z]/ { emit_port(); flush(); active = 0; next }
+    active != 1 { next }
+    /^  - / { emit_port(); flush() }
+    /^[[:space:]]*- (port:|protocol:)/ { emit_port() }
+    /^[[:space:]]+app\.kubernetes\.io\/component: / { comps[++nc] = $NF }
+    /port:/ { port = $NF }
+    /protocol:/ { proto = $NF }
+    END { emit_port(); flush() }
+  ' <<<"$1" | LC_ALL=C sort
+}
+
 # yaml_documents_of_kind concatenates every document whose kind matches, unlike
 # yaml_document which stops at the first. Needed for negative assertions, where
 # "no routing object mentions the scanner" has to look at all of them.
@@ -535,7 +572,7 @@ validate_coturn_template() {
 }
 
 validate_nchat_dev() {
-  local application="$1" data="$2" migrations="$3" policy_block component image_ref
+  local application="$1" data="$2" migrations="$3" policy_block egress_block component image_ref
   local livekit_block coturn_block
   local -a external_image_refs=()
   validate_no_duplicate_resources "$application" "$data" "$migrations"
@@ -687,6 +724,7 @@ validate_nchat_dev() {
     nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
     nchat-allow-notification-postgres-egress \
+    nchat-allow-seaweedfs-volume-egress \
     nchat-allow-upload-guard-file-egress \
     nchat-default-deny-egress | LC_ALL=C sort)" ]]
   for policy_block in \
@@ -730,6 +768,57 @@ validate_nchat_dev() {
   fi
   if ! grep -A4 'readinessProbe:' <<<"$policy_block" | grep -Fq 'port: filer'; then
     echo "error: seaweedfs readiness must probe the filer port file-service consumes" >&2
+    return 1
+  fi
+
+  # In all-in-one mode `weed server` also runs the volume server, and -ip
+  # makes it announce itself to the master as seaweedfs:8080. The filer is
+  # handed that address and dials it to persist each chunk, so 8080 has to
+  # exist on the Service and be a named container port for targetPort to
+  # resolve. Neither did, and every upload ended failure_code=storage_write
+  # with `connection refused` (#483).
+  if [[ "$(awk '
+      function emit() { if (name != "") print name "/" port "/" target; name = port = target = "" }
+      /^  - name: / { emit(); name = $NF; next }
+      /^    port: / { port = $NF; next }
+      /^    targetPort: / { target = $NF; next }
+      END { emit() }
+    ' <<<"$(yaml_document "$data" Service seaweedfs)" | LC_ALL=C sort)" != "$(printf '%s\n' \
+    filer/8888/filer master/9333/master volume/8080/volume | LC_ALL=C sort)" ]]; then
+    echo "error: the seaweedfs Service must expose master/9333, volume/8080 and filer/8888" >&2
+    return 1
+  fi
+  if ! grep -A1 -Fx '        - containerPort: 8080' <<<"$policy_block" | grep -Fxq '          name: volume'; then
+    echo "error: the seaweedfs container must declare containerPort 8080 named volume" >&2
+    return 1
+  fi
+
+  # Who may reach which SeaweedFS port, stated as flows rather than as ports.
+  # file-service talks to the filer and nothing else; the filer->volume hop is
+  # the pod reaching itself through the Service, so it needs both halves —
+  # ingress, and egress because nchat-default-deny-egress covers every pod.
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-seaweedfs)"
+  if [[ "$(network_policy_flows "$policy_block")" != "$(printf '%s\n' \
+    'ingress file TCP/8888' 'ingress seaweedfs TCP/8080' | LC_ALL=C sort)" ]]; then
+    echo "error: nchat-allow-seaweedfs must admit exactly file->8888 and seaweedfs->8080" >&2
+    return 1
+  fi
+  egress_block="$(yaml_document "$application" NetworkPolicy nchat-allow-seaweedfs-volume-egress)"
+  if [[ "$(network_policy_flows "$egress_block")" != 'egress seaweedfs TCP/8080' ]]; then
+    echo "error: nchat-allow-seaweedfs-volume-egress must allow exactly seaweedfs->seaweedfs:8080/TCP" >&2
+    return 1
+  fi
+  # Pod-to-pod by label on both sides. A CIDR or a namespace would make the
+  # volume server reachable from outside the component it belongs to.
+  if grep -Eq 'ipBlock:|namespaceSelector:' <<<"$policy_block$egress_block"; then
+    echo "error: the SeaweedFS policies must select peers by podSelector only" >&2
+    return 1
+  fi
+  # And the negative that matters most: across every NetworkPolicy in the
+  # overlay, 8080 is reachable by SeaweedFS itself and by nobody else.
+  if [[ "$(network_policy_flows "$(yaml_documents_of_kind "$application" '|NetworkPolicy|')" | grep -F '/8080')" \
+    != "$(printf '%s\n' 'egress seaweedfs TCP/8080' 'ingress seaweedfs TCP/8080')" ]]; then
+    echo "error: only seaweedfs may reach the volume server on 8080" >&2
     return 1
   fi
 
