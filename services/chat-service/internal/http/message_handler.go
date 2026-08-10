@@ -142,6 +142,27 @@ type messageJSON struct {
 	IsForwarded       bool           `json:"is_forwarded"`
 	Quoted            *quoteJSON     `json:"quoted,omitempty"`
 	Reference         *referenceJSON `json:"reference,omitempty"`
+	// Attachments is omitted entirely for a message that carries none, so every
+	// existing text-only response is byte-for-byte what it was.
+	Attachments []messageAttachmentJSON `json:"attachments,omitempty"`
+}
+
+// messageAttachmentJSON is the only shape of an attachment a message viewer
+// ever sees (RF-32).
+//
+// It is metadata for drawing a row and nothing else. storage_object_key,
+// wrapped_dek, kek_key_id, envelope/wrap versions, scanner detail and every
+// internal path are absent by construction — they are not on domain.Message
+// either, so there is no field here to forget to strip. status and
+// preview_status are lifecycle values, not grants: file-service re-evaluates
+// both on every content and preview request.
+type messageAttachmentJSON struct {
+	ID            string `json:"id"`
+	Filename      string `json:"filename"`
+	ContentType   string `json:"content_type"`
+	Size          int64  `json:"size"`
+	Status        string `json:"status"`
+	PreviewStatus string `json:"preview_status"`
 }
 
 type quoteJSON struct {
@@ -205,13 +226,26 @@ type searchMentionsResponseData struct {
 // ── Request shapes ────────────────────────────────────────────────────────────
 
 // createMessageRequest is the inbound body for POST message endpoints.
-// Only body_text, body_format, parent_message_id, and referenced_message_id are
-// accepted. Any unrecognised field causes a 400.
+// Only body_text, body_format, parent_message_id, referenced_message_id, and
+// attachment_ids are accepted. Any unrecognised field causes a 400.
 type createMessageRequest struct {
 	BodyText            string `json:"body_text"`
 	BodyFormat          string `json:"body_format"`
 	ParentMessageID     string `json:"parent_message_id"`
 	ReferencedMessageID string `json:"referenced_message_id"`
+	// AttachmentIDs binds already-uploaded files to this message (RF-32).
+	//
+	// A list, even though the product rule is one attachment per message, so
+	// raising that rule is a constant and not a wire change. The list is a set of
+	// *candidate* references and nothing more: the ids are canonicalised and
+	// bounded by the service, then re-validated against the database in the same
+	// statement that inserts the message. Anything a client could claim about an
+	// attachment — its workspace, its destination, its status, its uploader — is
+	// re-read server-side and never taken from here.
+	//
+	// A non-array value fails to decode and answers 400, exactly like every other
+	// malformed field.
+	AttachmentIDs []string `json:"attachment_ids"`
 }
 
 type forwardMessageRequest struct {
@@ -375,8 +409,26 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		j.BodyText = m.BodyText
 		j.Quoted = mapQuoteJSON(m.Quoted)
 		j.Reference = mapReferenceJSON(m)
+		// Withheld for a removed message, like the body: the placeholder is the
+		// whole of what a deleted message says.
+		j.Attachments = mapAttachmentsJSON(m.Attachments)
 	}
 	return j
+}
+
+func mapAttachmentsJSON(attachments []domain.MessageAttachment) []messageAttachmentJSON {
+	if len(attachments) == 0 {
+		return nil
+	}
+	out := make([]messageAttachmentJSON, len(attachments))
+	for i, attachment := range attachments {
+		out[i] = messageAttachmentJSON{
+			ID: attachment.ID, Filename: attachment.Filename,
+			ContentType: attachment.ContentType, Size: attachment.SizeBytes,
+			Status: attachment.Status, PreviewStatus: attachment.PreviewStatus,
+		}
+	}
+	return out
 }
 
 func mapReferenceJSON(m domain.Message) *referenceJSON {
@@ -962,6 +1014,7 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
 		ParentMessageID:     req.ParentMessageID,
 		ReferencedMessageID: req.ReferencedMessageID,
+		AttachmentIDs:       req.AttachmentIDs,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -1106,6 +1159,7 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
 		ParentMessageID:     req.ParentMessageID,
 		ReferencedMessageID: req.ReferencedMessageID,
+		AttachmentIDs:       req.AttachmentIDs,
 	})
 	if err != nil {
 		mapServiceError(w, err)

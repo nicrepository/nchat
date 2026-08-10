@@ -70,7 +70,13 @@ export interface ChatComposerProps {
   referencePreview?: PendingReferencePreview;
   referenceTargetLabel?: string;
   onCancelReference?: () => void;
-  onSend: (body: string) => Promise<SendResult>;
+  /**
+   * Posts the composed message. `attachmentIds` (RF-32) references files that
+   * are already on the server: the bytes went up when the file was chosen, and
+   * pressing Enviar links them to the new message rather than sending them
+   * again.
+   */
+  onSend: (body: string, attachmentIds?: string[]) => Promise<SendResult>;
   /**
    * Destination for attachments (RF-32, issue #458). One prop serves channels
    * and DMs — the composer is already the single place both render — so the
@@ -164,19 +170,44 @@ export default function ChatComposer({
   uploadTarget = null,
   onAttachmentUploaded,
 }: ChatComposerProps) {
-  const { editor, canSend, sending, handleSend } = useChatEditor({
-    placeholder,
-    disabled,
-    channelId,
-    bodyFormat,
-    onSend,
-  });
   const hadContextRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
   const upload = useAttachmentUpload(uploadTarget, onAttachmentUploaded);
   const attachEnabled = uploadTarget !== null && !disabled;
   const uploading = upload.status === "uploading";
+  const pendingAttachment = upload.uploadedAttachment;
+
+  /**
+   * The one place a send is assembled (RF-32).
+   *
+   * Two things happen here that the editor cannot do itself:
+   *
+   *  - an upload in flight blocks the send. Returning "stale" rather than
+   *    throwing is deliberate: it is the result the editor already understands
+   *    as "nothing happened, keep the draft", so Enter during an upload costs
+   *    the user nothing;
+   *  - the pending attachment is cleared only on a confirmed "sent". A "stale"
+   *    result or a thrown error leaves it exactly where it was, so the same
+   *    already-uploaded file can be sent again without re-uploading it.
+   */
+  const handleComposerSend = async (body: string): Promise<SendResult> => {
+    if (uploading) return { status: "stale" };
+    const result = await onSend(body, pendingAttachment ? [pendingAttachment.id] : undefined);
+    if (result.status === "sent") upload.dismiss();
+    return result;
+  };
+
+  const { editor, canSend, sending, handleSend } = useChatEditor({
+    placeholder,
+    disabled,
+    channelId,
+    bodyFormat,
+    // An attachment is content, so a composer holding one may send an empty
+    // document — but not while its own upload is still running.
+    canSendEmpty: pendingAttachment !== null && !uploading,
+    onSend: handleComposerSend,
+  });
 
   // Both entry points funnel here, so there is exactly one place that decides
   // whether a file may be taken and exactly one validation path behind it.
@@ -317,13 +348,23 @@ export default function ChatComposer({
                 )}
               </>
             )}
-            {upload.status === "success" && <span>Arquivo enviado: {upload.uploadedName}</span>}
+            {/* The file is uploaded but not yet sent. Saying so is the whole
+                point: the previous copy read "Arquivo enviado", which described
+                a message that did not exist. */}
+            {upload.status === "success" && (
+              <span data-testid="chat-composer-pending-attachment">
+                Anexo pronto para envio: {upload.uploadedName}
+              </span>
+            )}
             {upload.status === "failed" && <span>{upload.error}</span>}
             {(upload.status === "failed" || upload.status === "success") && (
               <button
                 type="button"
                 className="chat-msg-area__composer-quote-close"
-                aria-label="Dispensar aviso de anexo"
+                aria-label={
+                  upload.status === "success" ? "Remover anexo" : "Dispensar aviso de anexo"
+                }
+                data-testid="chat-composer-remove-attachment"
                 onClick={upload.dismiss}
               >
                 <span className="material-symbols-outlined" aria-hidden="true">
@@ -367,7 +408,10 @@ export default function ChatComposer({
           <button
             type="button"
             className="chat-msg-area__send-btn"
-            disabled={!canSend}
+            // Unavailable while a file is going up, whatever else the composer
+            // holds: the attachment is part of the message being written, and
+            // sending now would post a message without it.
+            disabled={!canSend || uploading}
             aria-label="Enviar mensagem"
             onClick={() => void handleSend()}
             data-testid="chat-send-btn"

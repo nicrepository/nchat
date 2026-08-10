@@ -156,6 +156,40 @@ Exactly one of `channel_id` and `dm_conversation_id` must be non-null
 (`CONSTRAINT messages_exactly_one_target`). Composite FKs ensure the referenced
 channel or DM belongs to the same workspace as the message.
 
+### message_attachments (RF-32)
+
+| Column        | Type        | Notes                                             |
+| ------------- | ----------- | ------------------------------------------------- |
+| message_id    | uuid        | PK part, FK -> chat.messages (CASCADE)            |
+| attachment_id | uuid        | PK part, UNIQUE; files.attachments ref (no FK)    |
+| position      | smallint    | 0-9; orders several attachments under one message |
+| created_at    | timestamptz |                                                   |
+
+The edge lives in the `chat` schema because chat-service owns it and writes it in
+the same statement that inserts the message, which is what makes "message created
+but attachment not linked" unreachable. `attachment_id` has no foreign key for the
+same reason `files.attachments` references `chat.*` without one: cross-schema FKs
+are not used in this repository, so `migrations/chat` and `migrations/files` stay
+independent of each other's ordering. `UNIQUE (attachment_id)` makes an upload
+belong to at most one message, so an attachment id cannot be replayed into a
+second message or a second destination.
+
+Referential integrity is enforced at write time instead. The `invalid_attachments`
+CTE in `PGXMessageStore.CreateMessage` re-reads `files.attachments` and requires,
+for every candidate id: the row exists and is not soft-deleted, belongs to the
+message's workspace, belongs to exactly the message's destination (channel _or_ DM),
+was uploaded by the sender, is in `pending_scan` or `clean`, and is not already
+linked. Any failure produces zero rows and therefore the same non-enumerating
+`ErrNotFound` as every other invalid reference. `pending_scan` is deliberately
+linkable: the antimalware scan is asynchronous and a message must be sendable while
+it runs — content and preview delivery stay gated by file-service on every request.
+
+Reads load attachments for a whole page in one query keyed by the primary key
+(`loadAttachmentBatch`), alongside the existing reaction batch, so a page of
+messages never becomes a per-message lookup. The exposed metadata is `id`,
+`filename`, `content_type`, `size`, `status` and `preview_status`; storage keys,
+key material and scanner detail never leave file-service.
+
 ## Permission rules
 
 | Scenario                                              | Access |
@@ -494,6 +528,17 @@ target IDs all yield `ErrNotFound`.
 represent quote-reply (RF-07), forwarding (RF-08), and cross-target references
 (RF-09). Parent remains same-target. RF-09 requires a different channel or DM in
 the same workspace and stores no content snapshot.
+
+### Attachments on create (RF-32)
+
+`POST .../messages` additionally accepts `attachment_ids`, an array of at most
+`domain.MaxMessageAttachments` (1) canonical UUIDs. Unknown fields are still
+rejected. A message with no body is valid **only** when it carries a valid
+attachment; empty body with no attachment stays a `400`. The ids are candidate
+references: the service canonicalises them and rejects malformed, empty and
+duplicate values, and the storage layer re-validates each one against the database
+in the same statement that inserts the message. `PATCH` (edit) does not accept
+`attachment_ids` — editing text never changes a message's attachments.
 
 RF-08 uses `POST /api/chat/channels/{destinationChannelID}/messages/forward` with
 the strict body `{ "source_message_id": "<uuid>" }`. `Idempotency-Key` is optional

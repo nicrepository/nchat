@@ -324,7 +324,7 @@ describe("composer upload state", () => {
 
     resolveUpload(uploadedAttachment("relatorio.pdf"));
 
-    expect(await screen.findByText(/Arquivo enviado: relatorio\.pdf/)).toBeInTheDocument();
+    expect(await screen.findByText(/Anexo pronto para envio: relatorio\.pdf/)).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("chat-composer-attach-btn")).toBeEnabled());
   });
 
@@ -355,7 +355,7 @@ describe("composer upload state", () => {
     await userEvent.upload(fileInput(), fileOfSize(1024));
 
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText(/Arquivo enviado/)).toBeInTheDocument();
+    expect(await screen.findByText(/Anexo pronto para envio/)).toBeInTheDocument();
   });
 });
 
@@ -440,7 +440,7 @@ describe("composer upload progress", () => {
 
     upload.finish(uploadedAttachment());
 
-    expect(await screen.findByText(/Arquivo enviado/)).toBeInTheDocument();
+    expect(await screen.findByText(/Anexo pronto para envio/)).toBeInTheDocument();
     expect(screen.queryByTestId("chat-composer-upload-progress")).not.toBeInTheDocument();
   });
 

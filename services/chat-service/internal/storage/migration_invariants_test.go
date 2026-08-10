@@ -560,3 +560,53 @@ func TestChatMigration_BoundsWorkspaceMaxUploadBytesToWholeMiB(t *testing.T) {
 		t.Fatal("the default must sit inside the CHECK bounds")
 	}
 }
+
+// RF-32: the message <-> attachment edge.
+//
+// Three properties matter and all three are schema, not application code:
+// a link dies with its message, an attachment belongs to at most one message,
+// and no foreign key crosses into the files schema — which is what keeps
+// migrations/chat and migrations/files independent of each other's order, the
+// convention files/000001 states and chat/000001 already follows for auth.
+func TestChatMigration_BindsAttachmentsToExactlyOneMessage(t *testing.T) {
+	migration := readChatMigration(t, "000021_message_attachments.up.sql")
+
+	for _, fragment := range []string{
+		"CREATE TABLE chat.message_attachments",
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+		"PRIMARY KEY (message_id, attachment_id)",
+		"UNIQUE (attachment_id)",
+		"CHECK (position BETWEEN 0 AND 9)",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("message attachment migration missing %q", fragment)
+		}
+	}
+	if strings.Contains(migration, "REFERENCES files.") {
+		t.Fatal("no foreign key may cross into the files schema")
+	}
+	// The link table is new, so nothing may be rewritten to create it.
+	for _, forbidden := range []string{"UPDATE files.", "DELETE FROM files.", "ALTER TABLE files."} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("migration must not touch files.attachments: %q", forbidden)
+		}
+	}
+}
+
+// The rollback removes the edge and nothing else: no attachment, no message and
+// no column owned by another migration.
+func TestChatMigration_DownDropsOnlyTheMessageAttachmentEdge(t *testing.T) {
+	down := readChatMigration(t, "000021_message_attachments.down.sql")
+
+	if !strings.Contains(down, "DROP TABLE IF EXISTS chat.message_attachments") {
+		t.Fatal("rollback must drop chat.message_attachments")
+	}
+	if strings.Count(down, "DROP ") != 1 {
+		t.Fatalf("rollback must contain exactly one DROP: %s", down)
+	}
+	for _, forbidden := range []string{"DELETE FROM", "TRUNCATE", "ALTER TABLE", "UPDATE "} {
+		if strings.Contains(down, forbidden) {
+			t.Fatalf("rollback must not contain %q", forbidden)
+		}
+	}
+}

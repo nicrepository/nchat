@@ -192,6 +192,15 @@ export interface Message {
   quoted?: QuotedMessage;
   /** RF-09 cross-target reference, resolved for the current reader. */
   reference?: MessageReference;
+  /**
+   * RF-32 files bound to this message. Absent for every message that carries
+   * none, and withheld entirely for a removed one.
+   *
+   * The element type is ChannelAttachment, the same shape the details panel
+   * lists, so AttachmentThumbnail, AttachmentVideo and useAttachmentPreview
+   * work here unchanged and the scan gates are not written a second time.
+   */
+  attachments?: ChannelAttachment[];
 }
 
 export interface MessageEditHistoryEntry {
@@ -479,5 +488,84 @@ export interface ChannelAttachment {
   size: number;
   status: AttachmentStatus;
   previewStatus: AttachmentPreviewStatus;
-  createdAt: string; // ISO 8601
+  /**
+   * ISO 8601, or empty when the source does not publish one — a message's
+   * attachments are dated by the message itself, so chat-service does not
+   * repeat the timestamp. Every reader already treats "" as "no date to show".
+   */
+  createdAt: string;
+}
+
+/**
+ * Accepts only the statuses the contract defines. An unknown value degrades to
+ * "pending_scan" — the conservative reading, since the UI keys "not
+ * downloadable" off anything that is not "clean" and must never promote an
+ * unrecognised state to clean.
+ *
+ * Shared by both clients that parse attachments: file-service's listing
+ * (filesApi) and chat-service's message payloads (chatApi). One parser means
+ * the two can never disagree about what an unknown status means.
+ */
+export function parseAttachmentStatus(raw: unknown): AttachmentStatus {
+  return raw === "clean" || raw === "rejected" ? raw : "pending_scan";
+}
+
+/**
+ * Accepts only the four states the preview contract defines. Anything else — an
+ * older server that publishes no field at all, or a state this build does not
+ * know — degrades to "unsupported", which is the conservative reading: the UI
+ * shows the icon and the download action, and never promises a preview that may
+ * not exist.
+ */
+export function parseAttachmentPreviewStatus(raw: unknown): AttachmentPreviewStatus {
+  return raw === "pending" || raw === "ready" || raw === "failed" ? raw : "unsupported";
+}
+
+interface MessageAttachmentResponse {
+  id?: unknown;
+  filename?: unknown;
+  content_type?: unknown;
+  size?: unknown;
+  status?: unknown;
+  preview_status?: unknown;
+}
+
+/**
+ * Maps one attachment of a message (RF-32).
+ *
+ * The wire shape is chat-service's snake_case, and the result is the same
+ * ChannelAttachment the details panel renders — which is what lets the timeline
+ * reuse AttachmentThumbnail, AttachmentVideo and useAttachmentPreview instead of
+ * restating the scan rules. A row without a usable id is dropped rather than
+ * rendered as a file nothing can identify.
+ *
+ * createdAt is empty: a message's attachment is dated by the message.
+ */
+function parseMessageAttachment(raw: unknown): ChannelAttachment | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const item = raw as MessageAttachmentResponse;
+  if (typeof item.id !== "string" || item.id === "") return undefined;
+  return {
+    id: item.id,
+    filename: typeof item.filename === "string" ? item.filename : "",
+    contentType: typeof item.content_type === "string" ? item.content_type : "",
+    size: typeof item.size === "number" && Number.isFinite(item.size) ? item.size : 0,
+    status: parseAttachmentStatus(item.status),
+    previewStatus: parseAttachmentPreviewStatus(item.preview_status),
+    createdAt: "",
+  };
+}
+
+/**
+ * Parses the attachment list of a message payload, from HTTP or from a
+ * WebSocket event — one parser, so the two can never describe the same file
+ * differently. Anything that is not a usable array yields undefined, which is
+ * also what a text-only message and a pre-RF-32 server look like.
+ */
+export function parseMessageAttachments(raw: unknown): ChannelAttachment[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const attachments = raw
+    .map(parseMessageAttachment)
+    .filter((attachment): attachment is ChannelAttachment => attachment !== undefined);
+  return attachments.length > 0 ? attachments : undefined;
 }

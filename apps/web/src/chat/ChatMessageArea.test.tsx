@@ -1972,7 +1972,7 @@ describe("ChatMessageArea — send message", () => {
     await user.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
-    expect(mockPostChannelMessage.mock.calls[0]?.[2]).toBe("m1");
+    expect(mockPostChannelMessage.mock.calls[0]?.[2]).toMatchObject({ parentMessageId: "m1" });
     await waitFor(() =>
       expect(screen.queryByTestId("chat-composer-quote")).not.toBeInTheDocument(),
     );
@@ -2334,11 +2334,10 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     await userEvent.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
-    expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 4)).toEqual([
+    expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 3)).toEqual([
       "destination",
       "seguro",
-      undefined,
-      undefined,
+      { parentMessageId: undefined, referencedMessageId: undefined, attachmentIds: undefined },
     ]);
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
     expect(mockFetchDMMessage).not.toHaveBeenCalled();
@@ -2657,11 +2656,14 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     await userEvent.click(screen.getByTestId("chat-send-btn"));
 
     await waitFor(() => expect(mockPostChannelMessage).toHaveBeenCalledTimes(1));
-    expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 4)).toEqual([
+    expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 3)).toEqual([
       "destination",
       "veja",
-      undefined,
-      rf09SourceMessageID,
+      {
+        parentMessageId: undefined,
+        referencedMessageId: rf09SourceMessageID,
+        attachmentIds: undefined,
+      },
     ]);
     await waitFor(() =>
       expect(screen.queryByTestId("chat-composer-reference")).not.toBeInTheDocument(),

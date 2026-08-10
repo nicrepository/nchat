@@ -15,7 +15,11 @@
 import { ApiRequestError, apiUpload, type ResponseParser, type UploadProgress } from "../lib/api";
 import { authenticatedFetch } from "../lib/authClient";
 import { formatUploadLimit } from "../lib/uploadLimit";
-import type { AttachmentPreviewStatus, AttachmentStatus, ChannelAttachment } from "./chatTypes";
+import {
+  parseAttachmentPreviewStatus,
+  parseAttachmentStatus,
+  type ChannelAttachment,
+} from "./chatTypes";
 
 const FILES_BASE = import.meta.env.VITE_FILES_API_BASE_URL ?? "/api/files";
 
@@ -33,26 +37,8 @@ interface AttachmentsEnvelope {
   data: { attachments?: unknown };
 }
 
-/**
- * Accepts only the statuses the listing contract defines. An unknown value
- * degrades to "pending_scan" — the conservative reading, since the UI keys
- * "not downloadable" off anything that is not "clean" and must never promote an
- * unrecognised state to clean.
- */
-function attachmentStatus(raw: unknown): AttachmentStatus {
-  return raw === "clean" || raw === "rejected" ? raw : "pending_scan";
-}
-
-/**
- * Accepts only the four states the preview contract defines. Anything else —
- * an older server that publishes no field at all, or a state this build does
- * not know — degrades to "unsupported", which is the conservative reading: the
- * UI shows the icon and the download action, and never promises a preview that
- * may not exist.
- */
-function attachmentPreviewStatus(raw: unknown): AttachmentPreviewStatus {
-  return raw === "pending" || raw === "ready" || raw === "failed" ? raw : "unsupported";
-}
+// The two status parsers live in chatTypes so chatApi, which reads the same
+// two lifecycle values off a message payload, uses exactly these rules.
 
 function mapAttachment(raw: unknown): ChannelAttachment | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
@@ -63,8 +49,8 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
     filename: typeof item.filename === "string" ? item.filename : "",
     contentType: typeof item.contentType === "string" ? item.contentType : "",
     size: typeof item.size === "number" && Number.isFinite(item.size) ? item.size : 0,
-    status: attachmentStatus(item.status),
-    previewStatus: attachmentPreviewStatus(item.previewStatus),
+    status: parseAttachmentStatus(item.status),
+    previewStatus: parseAttachmentPreviewStatus(item.previewStatus),
     createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
   };
 }

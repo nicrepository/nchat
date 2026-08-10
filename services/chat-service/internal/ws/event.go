@@ -122,6 +122,13 @@ type MessagePayload struct {
 	DeletedAt         *time.Time    `json:"deleted_at,omitempty"`
 	Quoted            *QuotePayload `json:"quoted,omitempty"`
 	IsForwarded       bool          `json:"is_forwarded"`
+	// Attachments lets a subscriber render a message that carries a file without
+	// a follow-up GET, exactly like BodyText and Quoted (RF-32). It is the same
+	// metadata the list endpoints publish and grants nothing: content and preview
+	// delivery are re-authorised by file-service per request. Omitted when the
+	// message has none, and — like the rest of this payload — dropped from the
+	// event relayed over the bus, where a remote instance re-reads it instead.
+	Attachments []MessageAttachmentPayload `json:"attachments,omitempty"`
 	// HasReference forces route-only delivery so each subscriber resolves RF-09
 	// through an authenticated GET. It is process-local and never serialized.
 	HasReference bool `json:"-"`
@@ -141,6 +148,18 @@ type MessageUpdatedPayload struct {
 	IsRemoved  bool       `json:"is_removed"`
 	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
 	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// MessageAttachmentPayload mirrors the attachment metadata the HTTP message
+// representation carries. Nothing internal to file-service appears here: no
+// storage key, no key material, no scanner detail.
+type MessageAttachmentPayload struct {
+	ID            string `json:"id"`
+	Filename      string `json:"filename"`
+	ContentType   string `json:"content_type"`
+	Size          int64  `json:"size"`
+	Status        string `json:"status"`
+	PreviewStatus string `json:"preview_status"`
 }
 
 type QuotePayload struct {
