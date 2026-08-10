@@ -29,12 +29,14 @@ type fakeChannelCategoryProvider struct {
 	groups     []service.ChannelCategoryGroup
 	category   domain.ChannelCategory
 	categories []domain.ChannelCategory
+	canManage  bool
 
-	listErr    error
-	createErr  error
-	renameErr  error
-	reorderErr error
-	deleteErr  error
+	listErr      error
+	canManageErr error
+	createErr    error
+	renameErr    error
+	reorderErr   error
+	deleteErr    error
 
 	lastCreate  service.CreateChannelCategoryInput
 	lastRename  service.RenameChannelCategoryInput
@@ -46,6 +48,11 @@ type fakeChannelCategoryProvider struct {
 func (f *fakeChannelCategoryProvider) ListGroupedChannels(_ context.Context, _, _ string) ([]service.ChannelCategoryGroup, error) {
 	f.calls++
 	return f.groups, f.listErr
+}
+
+func (f *fakeChannelCategoryProvider) CanManageCategories(_ context.Context, _, _ string) (bool, error) {
+	f.calls++
+	return f.canManage, f.canManageErr
 }
 
 func (f *fakeChannelCategoryProvider) CreateChannelCategory(_ context.Context, input service.CreateChannelCategoryInput) (domain.ChannelCategory, error) {
@@ -245,6 +252,31 @@ func TestChannelCategoryHandler_List_EmptyChannelsAreArrays(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "null") {
 		t.Fatalf("response must not contain null: %s", recorder.Body.String())
+	}
+}
+
+func TestChannelCategoryHandler_List_ReflectsCanManage(t *testing.T) {
+	for _, canManage := range []bool{true, false} {
+		t.Run(fmt.Sprintf("canManage=%v", canManage), func(t *testing.T) {
+			provider := &fakeChannelCategoryProvider{groups: []service.ChannelCategoryGroup{{}}, canManage: canManage}
+			recorder := serveCategory(categoryHandler(provider).List, requestWithUser(http.MethodGet, httpapi.RouteChannelCategories, nil))
+			body := decodeBody(t, recorder)
+			data, ok := body["data"].(map[string]any)
+			if !ok {
+				t.Fatalf("missing data envelope: %v", body)
+			}
+			if data["can_manage"] != canManage {
+				t.Fatalf("can_manage = %v, want %v", data["can_manage"], canManage)
+			}
+		})
+	}
+}
+
+func TestChannelCategoryHandler_List_CanManageErrorMapsToStatus(t *testing.T) {
+	provider := &fakeChannelCategoryProvider{groups: []service.ChannelCategoryGroup{{}}, canManageErr: domain.ErrForbidden}
+	recorder := serveCategory(categoryHandler(provider).List, requestWithUser(http.MethodGet, httpapi.RouteChannelCategories, nil))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

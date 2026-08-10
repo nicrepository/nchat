@@ -65,13 +65,20 @@ func NewChannelService(workspaces storage.WorkspaceStore, channels storage.Chann
 // membership is read server-side from the caller bound by the auth middleware,
 // so a role or an actor claimed by the client changes nothing here.
 //
+// Placing the new channel into an existing category is the one exception: it
+// is refused for a caller who cannot manage channel categories
+// (domain.CanManageChannelCategories, RF-17), the same role gate the
+// category-management endpoints use. A plain member or guest still creates a
+// channel exactly as before — they just cannot land it anywhere but "Geral".
+//
 // The authoritative decision is CreateChannelForActiveMember's, which locks the
 // workspace and the membership and inserts from them in one statement. The check
 // below is the same predicate, not a second one: it exists so a caller with no
 // business in this workspace is refused before the input validation can tell
 // them whether a category ID exists in it.
 func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
-	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
+	member, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID)
+	if err != nil {
 		return domain.Channel{}, err
 	}
 
@@ -86,6 +93,9 @@ func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelI
 		return domain.Channel{}, err
 	}
 	categoryID := strings.TrimSpace(input.CategoryID)
+	if categoryID != "" && !domain.CanManageChannelCategories(&member) {
+		return domain.Channel{}, domain.ErrForbidden
+	}
 	if err := s.requireCategoryInWorkspace(ctx, input.WorkspaceID, categoryID); err != nil {
 		return domain.Channel{}, err
 	}

@@ -100,6 +100,26 @@ func TestChannelHandler_Create_DerivesCallerAndWorkspaceServerSide(t *testing.T)
 	}
 }
 
+// category_id is the one field of the create body that is optional and
+// forwarded as-is — authorization for a non-empty value lives in the service
+// (see channel_service_test.go), not here; the handler is only a pass-through.
+func TestChannelHandler_Create_ForwardsCategoryID(t *testing.T) {
+	provider := &fakeChannelProvider{channel: domain.Channel{
+		ID: createdChannelID, Slug: "infra", DisplayName: "Infraestrutura", Type: domain.ChannelTypePublic,
+	}}
+	body := `{"slug":"infra","display_name":"Infraestrutura","type":"public","category_id":"cat-1"}`
+
+	recorder := httptest.NewRecorder()
+	channelTestHandler(provider).Create(recorder, createChannelRequest(body))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", recorder.Code, recorder.Body.String())
+	}
+	if provider.lastInput.CategoryID != "cat-1" {
+		t.Fatalf("category_id = %q, want %q", provider.lastInput.CategoryID, "cat-1")
+	}
+}
+
 // A body that tries to elect its own workspace, creator or general flag is
 // rejected outright rather than silently ignored.
 func TestChannelHandler_Create_RejectsServerControlledFields(t *testing.T) {

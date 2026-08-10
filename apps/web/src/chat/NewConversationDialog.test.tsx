@@ -3,30 +3,36 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
+import type { ChannelCategoriesResult } from "./chatApi";
 import type { Channel, DMCandidate, DirectDMResult } from "./chatTypes";
 import { MAX_GROUP_MEMBERS } from "./dmGroupForm";
 import NewConversationDialog from "./NewConversationDialog";
 
-const { mockSearchDMCandidates, mockGetOrCreateDirectDM, mockCreateGroupDM, mockCreateChannel } =
-  vi.hoisted(() => ({
-    mockSearchDMCandidates:
-      vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
-    mockGetOrCreateDirectDM:
-      vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
-    mockCreateGroupDM:
-      vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
-    mockCreateChannel:
-      vi.fn<
-        (
-          input: { slug: string; displayName: string; type: "public" | "private" },
-          signal?: AbortSignal,
-        ) => Promise<Channel>
-      >(),
-  }));
+const {
+  mockSearchDMCandidates,
+  mockGetOrCreateDirectDM,
+  mockCreateGroupDM,
+  mockCreateChannel,
+  mockFetchChannelCategories,
+} = vi.hoisted(() => ({
+  mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
+  mockGetOrCreateDirectDM:
+    vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
+  mockCreateGroupDM:
+    vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
+  mockCreateChannel:
+    vi.fn<
+      (
+        input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
+        signal?: AbortSignal,
+      ) => Promise<Channel>
+    >(),
+  mockFetchChannelCategories: vi.fn<() => Promise<ChannelCategoriesResult>>(),
+}));
 
 vi.mock("./chatApi", () => ({
   createChannel: (
-    input: { slug: string; displayName: string; type: "public" | "private" },
+    input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
     signal?: AbortSignal,
   ) => mockCreateChannel(input, signal),
   searchDMCandidates: (query: string, signal?: AbortSignal) =>
@@ -35,6 +41,7 @@ vi.mock("./chatApi", () => ({
     mockGetOrCreateDirectDM(userId, signal),
   createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
     mockCreateGroupDM(userIds, title, signal),
+  fetchChannelCategories: () => mockFetchChannelCategories(),
 }));
 
 function deferred<T>() {
@@ -69,6 +76,10 @@ async function advanceSearch() {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  // Default: no manageable categories, so the RF-17 category picker stays
+  // hidden and every pre-existing "channel mode" test keeps exercising the
+  // form exactly as before that control existed.
+  mockFetchChannelCategories.mockResolvedValue({ groups: [], canManage: false });
 });
 
 afterEach(() => {
@@ -1022,5 +1033,95 @@ describe("NewConversationDialog — channel mode", () => {
 
     expect(screen.getByRole("button", { name: "Joana Silva" })).toBeInTheDocument();
     expect(screen.queryByLabelText(/nome do canal/i)).not.toBeInTheDocument();
+  });
+});
+
+// ── Channel mode — category picker (RF-17) ──────────────────────────────────
+// Only a caller the server confirms can manage categories (owner/admin) gets
+// this control; everyone else creates an uncategorized channel exactly as
+// channel mode always has. The client's own guess is never trusted for this —
+// `canManage` is read straight from the server response.
+
+describe("NewConversationDialog — channel mode category picker (RF-17)", () => {
+  it("stays hidden for a caller who cannot manage categories", async () => {
+    mockFetchChannelCategories.mockResolvedValue({ groups: [], canManage: false });
+    renderChannelMode();
+    await settle();
+
+    expect(screen.queryByLabelText(/categoria/i)).not.toBeInTheDocument();
+  });
+
+  it("stays hidden when the caller can manage categories but none exist yet", async () => {
+    mockFetchChannelCategories.mockResolvedValue({ groups: [], canManage: true });
+    renderChannelMode();
+    await settle();
+
+    expect(screen.queryByLabelText(/categoria/i)).not.toBeInTheDocument();
+  });
+
+  it("offers the existing categories, excluding the virtual Geral group, to a manager", async () => {
+    mockFetchChannelCategories.mockResolvedValue({
+      groups: [
+        { kind: "uncategorized", name: "Geral", channelIds: [] },
+        { kind: "category", id: "cat-times", name: "Times", channelIds: [] },
+        { kind: "category", id: "cat-projetos", name: "Projetos", channelIds: [] },
+      ],
+      canManage: true,
+    });
+    renderChannelMode();
+    await settle();
+
+    const select = screen.getByLabelText(/categoria/i) as HTMLSelectElement;
+    const optionLabels = Array.from(select.options).map((o) => o.textContent);
+    expect(optionLabels).toEqual(["Geral (sem categoria)", "Times", "Projetos"]);
+    // Only one "Geral" option — the default placeholder — never the virtual
+    // group duplicated as a selectable category.
+    expect(optionLabels.filter((label) => label === "Geral")).toHaveLength(0);
+  });
+
+  it("sends the chosen category_id on submit", async () => {
+    mockFetchChannelCategories.mockResolvedValue({
+      groups: [{ kind: "category", id: "cat-times", name: "Times", channelIds: [] }],
+      canManage: true,
+    });
+    mockCreateChannel.mockResolvedValue(createdChannel);
+    renderChannelMode();
+    await settle();
+    const select = screen.getByLabelText(/categoria/i);
+
+    fireEvent.change(nameField(), { target: { value: "Infraestrutura" } });
+    fireEvent.change(select, { target: { value: "cat-times" } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    expect(mockCreateChannel.mock.calls[0][0]).toEqual({
+      slug: "infraestrutura",
+      displayName: "Infraestrutura",
+      type: "public",
+      categoryId: "cat-times",
+    });
+  });
+
+  it("creates an uncategorized channel when the manager leaves the picker on its default", async () => {
+    mockFetchChannelCategories.mockResolvedValue({
+      groups: [{ kind: "category", id: "cat-times", name: "Times", channelIds: [] }],
+      canManage: true,
+    });
+    mockCreateChannel.mockResolvedValue(createdChannel);
+    renderChannelMode();
+    await settle();
+    screen.getByLabelText(/categoria/i);
+
+    fireEvent.change(nameField(), { target: { value: "Infraestrutura" } });
+    fireEvent.click(createChannelButton());
+    await settle();
+
+    // categoryId is undefined, not the string "" — toEqual treats an
+    // undefined property as absent, matching the pre-RF-17 contract shape.
+    expect(mockCreateChannel.mock.calls[0][0]).toEqual({
+      slug: "infraestrutura",
+      displayName: "Infraestrutura",
+      type: "public",
+    });
   });
 });

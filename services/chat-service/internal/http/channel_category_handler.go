@@ -15,6 +15,7 @@ import (
 // handler (RF-17).
 type channelCategoryProvider interface {
 	ListGroupedChannels(ctx context.Context, workspaceID, callerID string) ([]service.ChannelCategoryGroup, error)
+	CanManageCategories(ctx context.Context, workspaceID, callerID string) (bool, error)
 	CreateChannelCategory(ctx context.Context, input service.CreateChannelCategoryInput) (domain.ChannelCategory, error)
 	RenameChannelCategory(ctx context.Context, input service.RenameChannelCategoryInput) (domain.ChannelCategory, error)
 	ReorderChannelCategories(ctx context.Context, input service.ReorderChannelCategoriesInput) ([]domain.ChannelCategory, error)
@@ -67,6 +68,11 @@ type channelCategoryGroupJSON struct {
 
 type listChannelCategoriesResponse struct {
 	Groups []channelCategoryGroupJSON `json:"groups"`
+	// CanManage is a rendering hint only (RF-17 "criar canal" category picker
+	// and the category-management UI, both owner/admin-only): every write
+	// endpoint re-derives domain.CanManageChannelCategories from the session on
+	// its own, so this flag grants nothing by itself.
+	CanManage bool `json:"can_manage"`
 }
 
 // channelCategoryJSON is a persisted category on its own, returned by the write
@@ -115,7 +121,15 @@ func (h *ChannelCategoryHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeChannelCategoryError(w, err)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, listChannelCategoriesResponse{Groups: mapChannelCategoryGroups(groups)})
+	canManage, err := h.categories.CanManageCategories(r.Context(), workspaceID, callerID)
+	if err != nil {
+		writeChannelCategoryError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, listChannelCategoriesResponse{
+		Groups:    mapChannelCategoryGroups(groups),
+		CanManage: canManage,
+	})
 }
 
 // Create handles POST /api/chat/channel-categories.

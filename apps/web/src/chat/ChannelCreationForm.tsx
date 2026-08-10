@@ -9,6 +9,8 @@ import {
   validateChannelForm,
   type ChannelFormType,
 } from "./channelForm";
+import type { ChannelCategoryGroup } from "./channelGrouping";
+import { useChannelCategories } from "./useChannelCategories";
 
 interface ChannelCreationFormProps {
   /** Called with the new channel's ID once the server has created it. */
@@ -65,8 +67,20 @@ export default function ChannelCreationForm({
   // than asking the user to keep it in sync themselves.
   const [slugEdited, setSlugEdited] = useState(false);
   const [type, setType] = useState<ChannelFormType>("public");
+  // Empty means "Geral" (uncategorized) — the default, and the only option a
+  // caller who cannot manage categories ever gets (the selector below is
+  // hidden for them; the server would reject a non-empty value anyway).
+  const [categoryId, setCategoryId] = useState("");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const channelCategories = useChannelCategories();
+  const manageableCategories: Array<ChannelCategoryGroup & { id: string }> =
+    channelCategories.state.status === "ready" && channelCategories.state.canManage
+      ? channelCategories.state.groups.filter(
+          (group): group is ChannelCategoryGroup & { id: string } =>
+            group.kind === "category" && Boolean(group.id),
+        )
+      : [];
   const nameInputRef = useRef<HTMLInputElement>(null);
   // State updates are asynchronous, so `pending` cannot stop a second click
   // fired in the same tick; this ref is what actually makes submission single.
@@ -133,7 +147,7 @@ export default function ChannelCreationForm({
 
     try {
       const channel = await createChannel(
-        { slug: effectiveSlug, displayName, type },
+        { slug: effectiveSlug, displayName, type, categoryId: categoryId || undefined },
         controller.signal,
       );
       if (mountedRef.current) onCreated(channel.id);
@@ -231,6 +245,34 @@ export default function ChannelCreationForm({
         <p id="new-channel-slug-hint" className="new-dm-dialog__footer-hint">
           Letras minúsculas, números e hifens internos. Aparece como #{effectiveSlug || "canal"}.
         </p>
+
+        {/* RF-17: only owner/admin (server-confirmed via `canManage`, never
+            the client's own guess) get to place the new channel into an
+            existing category. Anyone else creates an uncategorized channel,
+            same as before this control existed — there is nothing to pick
+            from when there are no manageable categories either. */}
+        {manageableCategories.length > 0 && (
+          <>
+            <label className="new-dm-dialog__group-name" htmlFor="new-channel-category">
+              Categoria
+            </label>
+            <div className="new-dm-dialog__search-field">
+              <select
+                id="new-channel-category"
+                disabled={pending}
+                value={categoryId}
+                onChange={(event) => setCategoryId(event.target.value)}
+              >
+                <option value="">Geral (sem categoria)</option>
+                {manageableCategories.map((category) => (
+                  <option key={category.id} value={category.id}>
+                    {category.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </>
+        )}
 
         {error && (
           <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">

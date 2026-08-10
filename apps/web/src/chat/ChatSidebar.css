@@ -174,6 +174,59 @@
   margin-top: 18px;
 }
 
+/* ── Category headers (RF-17) ────────────────────────────────────────────────── */
+
+.chat-sidebar__category-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cs-sidebar-muted);
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 10px 6px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.12s;
+}
+
+.chat-sidebar__category-header:hover {
+  color: var(--cs-sidebar-text);
+}
+
+/* The default UA outline is barely visible on the dark sidebar, so the focus
+   ring is stated explicitly, same as the other interactive sidebar controls. */
+.chat-sidebar__category-header:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+.chat-sidebar__category-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The chevron rotates to show state, but `aria-expanded` on the button is the
+   real signal — rotation and color are decoration, not the only cue. */
+.chat-sidebar__category-chevron {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  transition: transform 0.12s;
+  transform: rotate(0deg);
+}
+
+.chat-sidebar__category-chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
 /* ── Nav items (channels) ────────────────────────────────────────────────────── */
 
 .chat-sidebar__nav-item {
@@ -810,7 +863,8 @@
   font-size: 20px;
 }
 
-.new-dm-dialog__search-field input {
+.new-dm-dialog__search-field input,
+.new-dm-dialog__search-field select {
   width: 100%;
   min-width: 0;
   height: 42px;

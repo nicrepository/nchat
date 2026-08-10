@@ -118,10 +118,16 @@ func (h *ChannelHandler) HasMembers() bool {
 // createChannelRequest is the whole accepted body. The workspace, the creator,
 // is_general, status and position are server-derived and deliberately absent —
 // the strict decoder answers 400 to a client that sends them.
+//
+// CategoryID is optional and, unlike the other three fields, is not open to
+// every caller: the service rejects a non-empty value from anyone who cannot
+// manage channel categories (RF-17), so sending it is only ever useful for an
+// owner or admin.
 type createChannelRequest struct {
 	Slug        string `json:"slug"`
 	DisplayName string `json:"display_name"`
 	Type        string `json:"type"`
+	CategoryID  string `json:"category_id"`
 }
 
 type createChannelResponse struct {
@@ -179,6 +185,7 @@ func (h *ChannelHandler) Create(w http.ResponseWriter, r *http.Request) {
 	channel, err := h.channels.CreateChannel(r.Context(), service.CreateChannelInput{
 		WorkspaceID: workspace.ID,
 		CallerID:    callerID,
+		CategoryID:  request.CategoryID,
 		Slug:        request.Slug,
 		DisplayName: request.DisplayName,
 		Type:        domain.ChannelType(request.Type),

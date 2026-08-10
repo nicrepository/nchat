@@ -231,6 +231,93 @@ func TestChannelService_CreateChannel_CrossWorkspaceCategoryRejected(t *testing.
 	}
 }
 
+// Placing a new channel into an existing category is the one part of channel
+// creation that is NOT open to every active role (unlike BUG #393's general
+// rule): it requires domain.CanManageChannelCategories, the same gate
+// category management uses. Member and guest are refused before the category
+// store is ever consulted — getCategoryErr is set to a value that would
+// produce a different error if reached, so ErrForbidden proves the order.
+func TestChannelService_CreateChannel_CategoryAssignmentRequiresManageRole(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "caller-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "caller-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			channels := &fakeChannelStore{getCategoryErr: domain.ErrNotFound}
+
+			_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+				WorkspaceID: "ws-1",
+				CallerID:    "caller-1",
+				CategoryID:  "cat-1",
+				Slug:        "team",
+				DisplayName: "Team",
+				Type:        domain.ChannelTypePublic,
+			})
+			if !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("expected ErrForbidden (not the category store's error), got %v", err)
+			}
+			if channels.lastCreateInput.Slug != "" {
+				t.Fatalf("denied caller must not reach storage, input=%+v", channels.lastCreateInput)
+			}
+		})
+	}
+}
+
+// The same roles create an uncategorized channel exactly as before — the new
+// gate only fires when CategoryID is non-empty.
+func TestChannelService_CreateChannel_UncategorizedStillOpenToAnyActiveRole(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "caller-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "caller-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			channels := &fakeChannelStore{createdChannel: domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Slug: "team", Type: domain.ChannelTypePublic}}
+
+			_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+				WorkspaceID: "ws-1",
+				CallerID:    "caller-1",
+				Slug:        "team",
+				DisplayName: "Team",
+				Type:        domain.ChannelTypePublic,
+			})
+			if err != nil {
+				t.Fatalf("CreateChannel: %v", err)
+			}
+		})
+	}
+}
+
+// Owner/admin may place the new channel straight into an existing category.
+func TestChannelService_CreateChannel_ManagerAssignsCategory(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "caller-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "caller-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			channels := &fakeChannelStore{createdChannel: domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Slug: "team", Type: domain.ChannelTypePublic}}
+			channels.category = domain.ChannelCategory{ID: "cat-1", WorkspaceID: "ws-1"}
+
+			_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+				WorkspaceID: "ws-1",
+				CallerID:    "caller-1",
+				CategoryID:  "cat-1",
+				Slug:        "team",
+				DisplayName: "Team",
+				Type:        domain.ChannelTypePublic,
+			})
+			if err != nil {
+				t.Fatalf("CreateChannel: %v", err)
+			}
+			if channels.lastCreateInput.CategoryID != "cat-1" {
+				t.Fatalf("category_id not propagated, input=%+v", channels.lastCreateInput)
+			}
+		})
+	}
+}
+
 func TestChannelService_CreateChannel_GeralSlugRejected(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "owner-1")] = domain.WorkspaceMember{

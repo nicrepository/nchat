@@ -267,6 +267,41 @@ func TestChannelCategoryService_ListIsOpenToEveryActiveMember(t *testing.T) {
 	}
 }
 
+// CanManageCategories is the same predicate the write endpoints enforce,
+// exposed as a read so a caller (e.g. the "criar canal" category picker) can
+// decide what to show without duplicating the role check.
+func TestChannelCategoryService_CanManageCategories(t *testing.T) {
+	for _, test := range []struct {
+		userID string
+		want   bool
+	}{
+		{userID: categoryOwnerID, want: true},
+		{userID: categoryAdminID, want: true},
+		{userID: categoryMemberID, want: false},
+		{userID: categoryGuestID, want: false},
+	} {
+		t.Run(test.userID, func(t *testing.T) {
+			got, err := newCategoryService(&fakeCategoryStore{}, &fakeVisibleChannelStore{}).
+				CanManageCategories(context.Background(), categoryWorkspaceID, test.userID)
+			if err != nil {
+				t.Fatalf("CanManageCategories: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("CanManageCategories(%s) = %v, want %v", test.userID, got, test.want)
+			}
+		})
+	}
+}
+
+func TestChannelCategoryService_CanManageCategoriesDeniesSuspendedAndNonMembers(t *testing.T) {
+	for _, userID := range []string{categorySuspendedID, "user-stranger", ""} {
+		if _, err := newCategoryService(&fakeCategoryStore{}, &fakeVisibleChannelStore{}).
+			CanManageCategories(context.Background(), categoryWorkspaceID, userID); !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("%q: error = %v, want ErrForbidden", userID, err)
+		}
+	}
+}
+
 func TestChannelCategoryService_ListDeniesSuspendedAndNonMembers(t *testing.T) {
 	for _, userID := range []string{categorySuspendedID, "user-stranger", ""} {
 		channels := &fakeVisibleChannelStore{}

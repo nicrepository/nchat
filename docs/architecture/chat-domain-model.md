@@ -317,6 +317,20 @@ statement re-derives it from `chat.workspace_members` in the same statement as t
 write, the way `UpdateEditWindow` does. Every mutation is scoped by
 `workspace_id` together with `category_id`; none ever runs on a bare category ID.
 
+`GET /api/chat/channel-categories` also returns `can_manage`, the same predicate
+(`ChannelCategoryService.CanManageCategories`) evaluated as a read — a rendering
+hint for the frontend (e.g. whether to offer a category picker on channel
+creation), never itself a grant: every write above re-derives the decision from
+the session regardless of what this field said.
+
+Placing a *new* channel into an existing category — `category_id` on
+`POST /api/chat/channels` — takes the same `owner`/`admin` gate, enforced in
+`ChannelService.CreateChannel` before the category-existence check. This is the
+one part of channel creation that is not "any active role" (BUG #393 above still
+governs everything else about creating a channel): a plain member or guest still
+creates a channel exactly as before, they simply cannot land it anywhere but the
+virtual "Geral" group in the same request.
+
 RF-17 was specified as "Admin and Moderator". There is no workspace-level
 moderator in this schema — `chat.workspace_members.role` is
 owner/admin/member/guest, and `moderator` exists only on `chat.channel_members` as
@@ -364,6 +378,12 @@ budget. No response carries SQL text, a constraint name or the rejected value.
 
 `GET /api/chat/sidebar` is unchanged. The grouped listing is additive, so the
 frontend task can adopt it without a migration of the existing contract.
+
+`POST /api/chat/channels` gained one optional field, `category_id`: empty or
+absent creates an uncategorized channel exactly as before; a non-empty value is
+validated against the same rules as this section's mutations (workspace-bound,
+`owner`/`admin` only) and otherwise answers 403, before the existence check that
+already returned 400 for a category from another workspace.
 
 `#geral` is immutable through CRUD. The service rejects attempts to create a
 regular channel with slug `geral`, rejects any update/archive of the general

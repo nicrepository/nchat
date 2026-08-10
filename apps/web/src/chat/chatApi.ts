@@ -13,6 +13,7 @@
 import { authenticatedFetch } from "../lib/authClient";
 import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
+import type { ChannelCategoryGroup } from "./channelGrouping";
 import {
   normalizeBodyFormat,
   parseDMConversationType,
@@ -285,6 +286,81 @@ export async function fetchSidebarData(): Promise<{
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
 }
 
+// ── Channel categories (RF-17) ───────────────────────────────────────────────
+
+interface ChannelCategoryGroupResponse {
+  kind?: unknown;
+  id?: unknown;
+  name?: unknown;
+  channels?: Array<{ id?: unknown }>;
+}
+
+interface ChannelCategoriesEnvelope {
+  data: { groups?: ChannelCategoryGroupResponse[]; can_manage?: unknown };
+}
+
+/** The grouping structure plus the RF-17 category-management capability hint. */
+export interface ChannelCategoriesResult {
+  groups: ChannelCategoryGroup[];
+  /**
+   * Whether the caller may manage categories (owner/admin) — a rendering hint
+   * only, exactly like `ChannelDetails.canManageMembers`. `POST
+   * /api/chat/channels` and the category-management endpoints re-derive the
+   * same decision from the session on every call; this flag grants nothing by
+   * itself. Normalized with a strict `=== true`, so an absent or malformed
+   * value hides management UI rather than showing it.
+   */
+  canManage: boolean;
+}
+
+/**
+ * Maps one grouped-listing row, or drops it.
+ *
+ * Only `kind: "category"` and `kind: "uncategorized"` are group kinds this
+ * build knows how to render — anything else (a future kind from a newer
+ * server) is dropped rather than guessed at, the same defensive rule
+ * `mapSidebarDM` applies to conversation type. `id` is required for a
+ * persisted category (it is how the write endpoints and the collapse state
+ * key the group) and dropped along with the row when missing, since a
+ * category without an id cannot be told apart from another one.
+ */
+function mapChannelCategoryGroup(raw: ChannelCategoryGroupResponse): ChannelCategoryGroup | undefined {
+  const name = typeof raw.name === "string" ? raw.name : "";
+  const channelIds = Array.isArray(raw.channels)
+    ? raw.channels.map((c) => c.id).filter((id): id is string => typeof id === "string" && id !== "")
+    : [];
+
+  if (raw.kind === "uncategorized") {
+    return { kind: "uncategorized", name, channelIds };
+  }
+  if (raw.kind === "category" && typeof raw.id === "string" && raw.id !== "") {
+    return { kind: "category", id: raw.id, name, channelIds };
+  }
+  return undefined;
+}
+
+/**
+ * Fetches the grouped-by-category listing (RF-17).
+ *
+ * Read-only: this build never calls the create/rename/reorder/delete
+ * category endpoints, all of which are owner/admin-only. The grouping this
+ * returns grants no channel access beyond `/api/chat/sidebar` — the server
+ * derives both from the same visibility policy — so combining the two is
+ * safe on the client (see `channelGrouping.ts`).
+ */
+export async function fetchChannelCategories(): Promise<ChannelCategoriesResult> {
+  const res = await authenticatedFetch<ChannelCategoriesEnvelope>(`${CHAT_BASE}/channel-categories`, {
+    method: "GET",
+  });
+  const groups = Array.isArray(res.data?.groups) ? res.data.groups : [];
+  return {
+    groups: groups
+      .map(mapChannelCategoryGroup)
+      .filter((group): group is ChannelCategoryGroup => group !== undefined),
+    canManage: res.data?.can_manage === true,
+  };
+}
+
 /**
  * The workspace's effective attachment size limit, in bytes, or null when the
  * server did not publish one (RF-32, issue #458).
@@ -437,7 +513,20 @@ export async function createGroupDM(
  * than as a generic failure.
  */
 export async function createChannel(
-  input: { slug: string; displayName: string; type: "public" | "private" },
+  input: {
+    slug: string;
+    displayName: string;
+    type: "public" | "private";
+    /**
+     * Places the new channel straight into an existing category (RF-17).
+     * Omitted or empty creates an uncategorized channel, same as before this
+     * field existed. A non-empty value is rejected by the server (403) for a
+     * caller who cannot manage channel categories — the frontend only offers
+     * this when `ChannelCategoriesResult.canManage` is true, but the server
+     * decision is the one that counts.
+     */
+    categoryId?: string;
+  },
   signal?: AbortSignal,
 ): Promise<Channel> {
   const response = await authenticatedFetch<CreateChannelEnvelope>(`${CHAT_BASE}/channels`, {
@@ -447,6 +536,7 @@ export async function createChannel(
       slug: input.slug.trim().toLowerCase(),
       display_name: input.displayName.trim(),
       type: input.type,
+      category_id: input.categoryId?.trim() ?? "",
     }),
     signal,
   });

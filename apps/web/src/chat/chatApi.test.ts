@@ -21,6 +21,7 @@ import {
   favoriteMessage,
   forwardChannelMessage,
   ERR_INVALID_RESPONSE,
+  fetchChannelCategories,
   fetchChannelDetails,
   fetchDirectProfile,
   fetchGroupDetails,
@@ -1970,7 +1971,12 @@ describe("createChannel", () => {
     expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slug: "infra", display_name: "Infraestrutura", type: "private" }),
+      body: JSON.stringify({
+        slug: "infra",
+        display_name: "Infraestrutura",
+        type: "private",
+        category_id: "",
+      }),
       signal: controller.signal,
     });
     const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
@@ -1984,6 +1990,76 @@ describe("createChannel", () => {
     await expect(
       createChannel({ slug: "infra", displayName: "Infra", type: "public" }),
     ).rejects.toMatchObject({ status: 403 });
+  });
+
+  // RF-17: category_id is trimmed like the other fields, and sent as "" —
+  // never omitted — when the caller did not choose one, so an uncategorized
+  // creation is always an explicit empty string rather than a missing field.
+  it("sends the trimmed category_id when the caller chose one", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "ch-1", slug: "infra", display_name: "Infra", type: "public" },
+    });
+
+    await createChannel({ slug: "infra", displayName: "Infra", type: "public", categoryId: "  cat-1  " });
+
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    expect(JSON.parse(init.body)).toMatchObject({ category_id: "cat-1" });
+  });
+});
+
+describe("fetchChannelCategories", () => {
+  it("maps groups and normalizes can_manage with a strict === true", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        groups: [
+          { kind: "uncategorized", name: "Geral", channels: [{ id: "c1" }] },
+          { kind: "category", id: "cat-1", name: "Times", channels: [{ id: "c2" }, { id: "c3" }] },
+        ],
+        can_manage: true,
+      },
+    });
+
+    await expect(fetchChannelCategories()).resolves.toEqual({
+      groups: [
+        { kind: "uncategorized", name: "Geral", channelIds: ["c1"] },
+        { kind: "category", id: "cat-1", name: "Times", channelIds: ["c2", "c3"] },
+      ],
+      canManage: true,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channel-categories", { method: "GET" });
+  });
+
+  it("treats anything other than the literal true as canManage: false", async () => {
+    for (const value of ["true", 1, {}, null, undefined]) {
+      mockAuthFetch.mockResolvedValue({ data: { groups: [], can_manage: value } });
+      await expect(fetchChannelCategories()).resolves.toEqual({ groups: [], canManage: false });
+    }
+  });
+
+  // A persisted category with no id cannot be told apart from another one, so
+  // the whole row is dropped rather than rendered with an unusable key — the
+  // same defensive rule the sidebar mapper applies elsewhere in this file.
+  it("drops a category row with no id, and a group of an unrecognized kind", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        groups: [
+          { kind: "category", name: "No id", channels: [] },
+          { kind: "future-kind", id: "x", name: "Unknown", channels: [] },
+          { kind: "category", id: "cat-1", name: "Times", channels: [] },
+        ],
+        can_manage: false,
+      },
+    });
+
+    await expect(fetchChannelCategories()).resolves.toEqual({
+      groups: [{ kind: "category", id: "cat-1", name: "Times", channelIds: [] }],
+      canManage: false,
+    });
+  });
+
+  it("tolerates a malformed or missing groups array", async () => {
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    await expect(fetchChannelCategories()).resolves.toEqual({ groups: [], canManage: false });
   });
 });
 

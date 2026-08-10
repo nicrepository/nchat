@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
+import { groupChannels, type GroupedChannels } from "./channelGrouping";
 import { partitionDMs, type Channel, type CurrentUser, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
 import { sortByActivity } from "./sidebarOrder";
+import { useChannelCategories } from "./useChannelCategories";
 
 /**
  * Placeholder user shown in the sidebar footer.
@@ -107,6 +109,25 @@ function IconStar() {
       aria-hidden="true"
     >
       <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+    </svg>
+  );
+}
+
+function IconChevron({ collapsed }: { collapsed: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`chat-sidebar__category-chevron${
+        collapsed ? " chat-sidebar__category-chevron--collapsed" : ""
+      }`}
+      aria-hidden="true"
+    >
+      <polyline points="6 9 12 15 18 9" />
     </svg>
   );
 }
@@ -315,6 +336,54 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelLi
   );
 }
 
+// ── Channel category section (RF-17) ────────────────────────────────────────
+
+interface CategorySectionProps {
+  group: GroupedChannels;
+  collapsed: boolean;
+  onToggle: (key: string) => void;
+  activeChannelId: string | undefined;
+  onSelect: (id: string) => void;
+}
+
+/**
+ * One collapsible category header plus its channel list.
+ *
+ * The list stays mounted with `hidden` rather than being unmounted while
+ * collapsed, so `aria-controls` always names a real element and the toggle
+ * never has to reconcile a list that was thrown away. Collapsing hides only
+ * the channel list — the header, and therefore the category name and its
+ * expanded/collapsed state, stays visible either way (RF-17 req. 5).
+ */
+function CategorySection({ group, collapsed, onToggle, activeChannelId, onSelect }: CategorySectionProps) {
+  const labelId = `chat-sidebar-category-${group.key}`;
+  const listId = `chat-sidebar-category-list-${group.key}`;
+
+  return (
+    <section className="chat-sidebar__section">
+      <button
+        type="button"
+        id={labelId}
+        className="chat-sidebar__category-header"
+        aria-expanded={!collapsed}
+        aria-controls={listId}
+        onClick={() => onToggle(group.key)}
+      >
+        <IconChevron collapsed={collapsed} />
+        <span className="chat-sidebar__category-name">{group.name}</span>
+      </button>
+      <div id={listId} hidden={collapsed}>
+        <ChannelList
+          channels={group.channels}
+          activeChannelId={activeChannelId}
+          onSelect={onSelect}
+          labelId={labelId}
+        />
+      </div>
+    </section>
+  );
+}
+
 // ── DM / group list ───────────────────────────────────────────────────────────
 
 interface DMListProps {
@@ -427,6 +496,25 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
 
+  // RF-17: fetched independently of the flat channel list (see
+  // useChannelCategories.ts for why). A failure here degrades to the flat
+  // "Canais" list below rather than becoming a sidebar-wide error.
+  const channelCategories = useChannelCategories();
+
+  // Which category groups are collapsed, keyed by `GroupedChannels.key`
+  // (a category id, or the uncategorized sentinel) — never by array index, so
+  // a reorder of the API response can never collapse the wrong group.
+  // Session-only: no requirement calls for persisting this across reloads.
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const toggleGroup = useCallback((key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
       newConversationButtonRef.current?.focus();
@@ -466,6 +554,16 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
     return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
   }, [dms]);
 
+  // RF-17: combines the canonical channel list above with the category
+  // structure into render-ready groups. `undefined` — categories still
+  // loading, or the fetch failed — means "render the flat list instead",
+  // never an empty grouped view.
+  const categoryGroupsRaw = channelCategories.state.status === "ready" ? channelCategories.state.groups : undefined;
+  const groupedChannels = useMemo(
+    () => (channels && categoryGroupsRaw ? groupChannels(channels, categoryGroupsRaw) : undefined),
+    [channels, categoryGroupsRaw],
+  );
+
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
   }
@@ -493,6 +591,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
     closeNewConversation();
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
     retry();
+    channelCategories.reload();
   }
 
   return (
@@ -545,14 +644,31 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
         {state.status === "ready" && (
           <>
-            <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              <ChannelList
-                channels={orderedChannels}
-                activeChannelId={activeChannelId}
-                onSelect={handleChannelSelect}
-                labelId={CHANNELS_LABEL_ID}
-              />
-            </Section>
+            {groupedChannels ? (
+              // RF-17: one collapsible header per category, in exactly the
+              // order the API returned — including the virtual "Geral" group
+              // for uncategorized channels, and empty categories, both kept
+              // rather than hidden.
+              groupedChannels.map((group) => (
+                <CategorySection
+                  key={group.key}
+                  group={group}
+                  collapsed={collapsedGroups.has(group.key)}
+                  onToggle={toggleGroup}
+                  activeChannelId={activeChannelId}
+                  onSelect={handleChannelSelect}
+                />
+              ))
+            ) : (
+              <Section labelId={CHANNELS_LABEL_ID} title="Canais">
+                <ChannelList
+                  channels={orderedChannels}
+                  activeChannelId={activeChannelId}
+                  onSelect={handleChannelSelect}
+                  labelId={CHANNELS_LABEL_ID}
+                />
+              </Section>
+            )}
 
             <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
               <DMList

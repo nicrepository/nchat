@@ -137,6 +137,24 @@ func (s *ChannelCategoryService) ListGroupedChannels(ctx context.Context, worksp
 	return groups, nil
 }
 
+// CanManageCategories reports whether callerID currently holds
+// domain.CanManageChannelCategories in workspaceID — the same predicate every
+// write in this service enforces via requireWorkspaceManager.
+//
+// It exists as its own read so a caller (the sidebar, the "criar canal" form)
+// can decide whether to offer category management or assignment *before*
+// attempting a write, without duplicating the role predicate. It is a UI hint
+// only, exactly like ChannelDetails.CanManageMembers: every write endpoint
+// re-derives the same decision from the session, so this answer grants
+// nothing by itself.
+func (s *ChannelCategoryService) CanManageCategories(ctx context.Context, workspaceID, callerID string) (bool, error) {
+	member, err := requireActiveWorkspaceMember(ctx, s.workspaces, s.members, workspaceID, callerID)
+	if err != nil {
+		return false, err
+	}
+	return domain.CanManageChannelCategories(&member), nil
+}
+
 // CreateChannelCategory appends a category to the workspace.
 //
 // The management role is checked here so a caller with no business in this

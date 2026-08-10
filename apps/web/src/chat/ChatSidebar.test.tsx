@@ -8,12 +8,15 @@ import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
 import ChatSidebar from "./ChatSidebar";
+import type { ChannelCategoriesResult } from "./chatApi";
+import type { ChannelCategoryGroup } from "./channelGrouping";
 import type { Channel, DMCandidate, DirectDMResult, DMConversation } from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
 const {
   mockFetchSidebarData,
+  mockFetchChannelCategories,
   mockSearchDMCandidates,
   mockGetOrCreateDirectDM,
   mockCreateGroupDM,
@@ -21,6 +24,7 @@ const {
 } = vi.hoisted(() => ({
   mockFetchSidebarData:
     vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
+  mockFetchChannelCategories: vi.fn<() => Promise<ChannelCategoriesResult>>(),
   mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
@@ -37,6 +41,7 @@ const {
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: () => mockFetchSidebarData(),
+  fetchChannelCategories: () => mockFetchChannelCategories(),
   // Keep individual exports so chatApi.test.ts can still import them.
   fetchChannels: vi.fn(),
   fetchDMs: vi.fn(),
@@ -136,6 +141,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockSearchDMCandidates.mockResolvedValue([]);
   mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
+  // Default: no RF-17 grouping available, so every pre-existing test keeps
+  // exercising the flat "Canais" fallback unless it opts into categories by
+  // overriding this mock. This also doubles as coverage for the fallback path
+  // itself (see "ChatSidebar — channel categories" below).
+  mockFetchChannelCategories.mockRejectedValue(new Error("not configured"));
 });
 
 afterEach(() => {
@@ -2065,5 +2075,155 @@ describe("ChatSidebar — single creation entry point", () => {
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+});
+
+// ── Channel categories (RF-17) ────────────────────────────────────────────────
+
+describe("ChatSidebar — channel categories", () => {
+  const categorizedSidebar = () => ({
+    currentUserId: "user-1",
+    channels: SAMPLE_CHANNELS,
+    dms: [],
+  });
+
+  const CATEGORY_GROUPS: ChannelCategoryGroup[] = [
+    { kind: "uncategorized", name: "Geral", channelIds: ["geral"] },
+    { kind: "category", id: "cat-times", name: "Times", channelIds: ["infraestrutura"] },
+    { kind: "category", id: "cat-projetos", name: "Projetos", channelIds: ["projetos"] },
+  ];
+
+  // canManage is irrelevant to how ChatSidebar renders groups (that flag only
+  // gates the "criar canal" category picker) — always false here so these
+  // tests do not accidentally depend on it.
+  const categoryResult = (groups: ChannelCategoryGroup[]) => ({ groups, canManage: false });
+
+  it("renders one collapsible header per category, in the order the API returned", async () => {
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(categoryResult(CATEGORY_GROUPS));
+    renderChat();
+
+    await screen.findByTestId("chat-sidebar");
+    const headers = await screen.findAllByRole("button", { name: /^(Geral|Times|Projetos)$/ });
+    expect(headers.map((h) => h.textContent)).toEqual(["Geral", "Times", "Projetos"]);
+    headers.forEach((h) => expect(h).toHaveAttribute("aria-expanded", "true"));
+  });
+
+  it("lists each channel under its own category, not under the others", async () => {
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(categoryResult(CATEGORY_GROUPS));
+    renderChat();
+
+    const timesHeader = await screen.findByRole("button", { name: "Times" });
+    const timesSection = timesHeader.closest("section")!;
+    expect(within(timesSection).getByRole("option", { name: "Canal infraestrutura" })).toBeInTheDocument();
+    expect(within(timesSection).queryByRole("option", { name: "Canal privado projetos" })).toBeNull();
+
+    const projetosHeader = await screen.findByRole("button", { name: "Projetos" });
+    const projetosSection = projetosHeader.closest("section")!;
+    expect(
+      within(projetosSection).getByRole("option", { name: "Canal privado projetos" }),
+    ).toBeInTheDocument();
+
+    const geralHeader = await screen.findByRole("button", { name: "Geral" });
+    const geralSection = geralHeader.closest("section")!;
+    expect(within(geralSection).getByRole("option", { name: "Canal geral" })).toBeInTheDocument();
+  });
+
+  it("collapses and expands a category on click, hiding only its channel list", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(categoryResult(CATEGORY_GROUPS));
+    renderChat();
+
+    const timesHeader = await screen.findByRole("button", { name: "Times" });
+    expect(timesHeader).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: "Canal infraestrutura" })).toBeVisible();
+
+    await user.click(timesHeader);
+
+    expect(timesHeader).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("option", { name: "Canal infraestrutura" })).not.toBeInTheDocument();
+    // The header itself — and the category name — stay visible while collapsed.
+    expect(timesHeader).toBeVisible();
+
+    await user.click(timesHeader);
+
+    expect(timesHeader).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: "Canal infraestrutura" })).toBeVisible();
+  });
+
+  it("collapses and expands a category from the keyboard", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(categoryResult(CATEGORY_GROUPS));
+    renderChat();
+
+    const timesHeader = await screen.findByRole("button", { name: "Times" });
+    timesHeader.focus();
+
+    await user.keyboard("{Enter}");
+    expect(timesHeader).toHaveAttribute("aria-expanded", "false");
+
+    await user.keyboard(" ");
+    expect(timesHeader).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("keeps two categories' collapsed state independent of each other", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(categoryResult(CATEGORY_GROUPS));
+    renderChat();
+
+    const timesHeader = await screen.findByRole("button", { name: "Times" });
+    const projetosHeader = await screen.findByRole("button", { name: "Projetos" });
+
+    await user.click(timesHeader);
+
+    expect(timesHeader).toHaveAttribute("aria-expanded", "false");
+    expect(projetosHeader).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: "Canal privado projetos" })).toBeVisible();
+  });
+
+  it("renders an empty category's header with its empty-state message, never dropping it", async () => {
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(
+      categoryResult([...CATEGORY_GROUPS, { kind: "category", id: "cat-vazia", name: "Vazia", channelIds: [] }]),
+    );
+    renderChat();
+
+    const emptyHeader = await screen.findByRole("button", { name: "Vazia" });
+    const emptySection = emptyHeader.closest("section")!;
+    expect(within(emptySection).getByText("Nenhum canal disponível.")).toBeInTheDocument();
+  });
+
+  it("preserves the active channel's selection across categories, and navigates on click", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockResolvedValue(categoryResult(CATEGORY_GROUPS));
+    renderChat("/chat/channel/infraestrutura");
+
+    const active = await screen.findByRole("option", { name: "Canal infraestrutura" });
+    expect(active).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: "Canal geral" })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+
+    await user.click(screen.getByRole("option", { name: "Canal geral" }));
+
+    expect(await screen.findByTestId("chat-channel")).toBeInTheDocument();
+  });
+
+  it("falls back to the flat 'Canais' list when the categories request fails", async () => {
+    mockFetchSidebarData.mockResolvedValue(categorizedSidebar());
+    mockFetchChannelCategories.mockRejectedValue(new Error("boom"));
+    renderChat();
+
+    expect(await screen.findByRole("heading", { name: "Canais" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Canal geral" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Canal infraestrutura" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Canal privado projetos" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Times" })).not.toBeInTheDocument();
   });
 });
