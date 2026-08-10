@@ -758,6 +758,11 @@ rm -f "$rendered_overlay_file"
 # Docker-dependent checks below, which exit early when Docker is absent.
 bash "$ROOT_DIR/scripts/ci/auth-route-contract-check.sh"
 
+# The same contract for /api/files: file-service registers /attachments/*, so
+# the shared Ingress must strip the public prefix the way the dedicated upload
+# route already did, or every GET under /api/files answers 404.
+bash "$ROOT_DIR/scripts/ci/files-route-contract-check.sh"
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker not found; skipping Docker-based gateway config validation."
   echo "Gateway config check passed."
