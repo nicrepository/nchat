@@ -1441,6 +1441,109 @@ describe("fetchDMMessage", () => {
 
 // ── postChannelMessage ────────────────────────────────────────────────────────
 
+// ── RF-32 attachments ─────────────────────────────────────────────────────────
+
+describe("message attachments", () => {
+  it("sends attachment_ids and omits the field when there is none", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "", { attachmentIds: ["att-1"] });
+    const [, withAttachment] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(withAttachment.body as string)).toEqual({
+      body_text: "",
+      body_format: "v3",
+      attachment_ids: ["att-1"],
+    });
+
+    mockAuthFetch.mockClear();
+    await postChannelMessage("geral", "texto", { attachmentIds: [] });
+    const [, withoutAttachment] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(withoutAttachment.body as string)).toEqual({
+      body_text: "texto",
+      body_format: "v3",
+    });
+  });
+
+  it("sends attachment_ids from a DM too", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-1", "", { attachmentIds: ["att-1"] });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "",
+      body_format: "v2",
+      attachment_ids: ["att-1"],
+    });
+  });
+
+  it("maps the attachment metadata a message carries", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          attachments: [
+            {
+              id: "att-1",
+              filename: "relatorio.pdf",
+              content_type: "application/pdf",
+              size: 2048,
+              status: "clean",
+              preview_status: "ready",
+            },
+          ],
+        }),
+      ),
+    );
+    const message = await postChannelMessage("geral", "veja");
+    expect(message.attachments).toEqual([
+      {
+        id: "att-1",
+        filename: "relatorio.pdf",
+        contentType: "application/pdf",
+        size: 2048,
+        status: "clean",
+        previewStatus: "ready",
+        createdAt: "",
+      },
+    ]);
+  });
+
+  it("degrades an unknown status to the non-downloadable one", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          attachments: [{ id: "att-1", status: "totally_fine", preview_status: "whatever" }],
+        }),
+      ),
+    );
+    const message = await postChannelMessage("geral", "veja");
+    expect(message.attachments?.[0]).toMatchObject({
+      status: "pending_scan",
+      previewStatus: "unsupported",
+    });
+  });
+
+  it("drops malformed entries and treats a non-array as absent", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(msgRaw({ attachments: [null, {}, { id: "" }, "att-1"] })),
+    );
+    expect((await postChannelMessage("geral", "veja")).attachments).toBeUndefined();
+
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ attachments: { id: "att-1" } })));
+    expect((await postChannelMessage("geral", "veja")).attachments).toBeUndefined();
+  });
+
+  it("withholds attachments from a removed message", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          is_removed: true,
+          status: "deleted",
+          attachments: [{ id: "att-1", filename: "secreto.pdf" }],
+        }),
+      ),
+    );
+    expect((await postChannelMessage("geral", "veja")).attachments).toBeUndefined();
+  });
+});
+
 describe("postChannelMessage", () => {
   it("calls the correct URL for a channel", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
@@ -1484,7 +1587,7 @@ describe("postChannelMessage", () => {
   it("passes abort signal to authenticatedFetch", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postChannelMessage("geral", "Hello", undefined, undefined, ctrl.signal);
+    await postChannelMessage("geral", "Hello", { signal: ctrl.signal });
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ signal: ctrl.signal }),
@@ -1493,7 +1596,7 @@ describe("postChannelMessage", () => {
 
   it("sends parent_message_id when replying in a channel", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
-    await postChannelMessage("geral", "Hello world", "parent-1");
+    await postChannelMessage("geral", "Hello world", { parentMessageId: "parent-1" });
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(options.body as string) as Record<string, unknown>;
     expect(body).toEqual({
@@ -1505,7 +1608,7 @@ describe("postChannelMessage", () => {
 
   it("sends referenced_message_id for RF-09", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
-    await postChannelMessage("geral", "Veja", undefined, "source-1");
+    await postChannelMessage("geral", "Veja", { referencedMessageId: "source-1" });
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(options.body as string)).toEqual({
       body_text: "Veja",
@@ -1517,7 +1620,11 @@ describe("postChannelMessage", () => {
   it("preserves reply and reference with an abort signal", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postChannelMessage("geral", "Veja", "parent-1", "source-1", ctrl.signal);
+    await postChannelMessage("geral", "Veja", {
+      parentMessageId: "parent-1",
+      referencedMessageId: "source-1",
+      signal: ctrl.signal,
+    });
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(options.body as string)).toEqual({
       body_text: "Veja",
@@ -1666,7 +1773,7 @@ describe("postDMMessage", () => {
   it("passes abort signal to authenticatedFetch", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postDMMessage("dm-juliane", "Hi", undefined, undefined, ctrl.signal);
+    await postDMMessage("dm-juliane", "Hi", { signal: ctrl.signal });
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ signal: ctrl.signal }),
@@ -1675,7 +1782,7 @@ describe("postDMMessage", () => {
 
   it("sends parent_message_id when replying in a DM", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
-    await postDMMessage("dm-juliane", "Mensagem direta", "parent-dm-1");
+    await postDMMessage("dm-juliane", "Mensagem direta", { parentMessageId: "parent-dm-1" });
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(options.body as string) as Record<string, unknown>;
     expect(body).toEqual({
@@ -1687,7 +1794,7 @@ describe("postDMMessage", () => {
 
   it("sends referenced_message_id when citing into a DM", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
-    await postDMMessage("dm-juliane", "Veja", undefined, "source-1");
+    await postDMMessage("dm-juliane", "Veja", { referencedMessageId: "source-1" });
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(options.body as string)).toEqual({
       body_text: "Veja",
@@ -1699,7 +1806,11 @@ describe("postDMMessage", () => {
   it("preserves reply and reference with an abort signal", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     const ctrl = new AbortController();
-    await postDMMessage("dm-juliane", "Veja", "parent-1", "source-1", ctrl.signal);
+    await postDMMessage("dm-juliane", "Veja", {
+      parentMessageId: "parent-1",
+      referencedMessageId: "source-1",
+      signal: ctrl.signal,
+    });
     const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(options.body as string)).toEqual({
       body_text: "Veja",

@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
@@ -81,6 +82,12 @@ type CreateMessageInput struct {
 	ReferencedMessageID    string
 	MentionedUserIDs       []string
 	MentionedChannelIDs    []string
+	// AttachmentIDs are candidate files.attachments ids, already parsed as
+	// canonical UUIDs, deduplicated and bounded by the service. They are
+	// candidates only: CreateMessage re-validates every one of them against the
+	// database in the same statement that inserts the message, and a message is
+	// not created at all when any of them fails.
+	AttachmentIDs []string
 }
 
 // ForwardChannelMessageInput contains only server-derived forwarding fields.
@@ -381,7 +388,53 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			SELECT DISTINCT id::uuid AS channel_id
 			FROM unnest($12::text[]) AS ids(id)
 		),
-		invalid_refs AS (
+			attachment_candidates AS (
+				SELECT id::uuid AS attachment_id, ord
+				FROM unnest($13::text[]) WITH ORDINALITY AS ids(id, ord)
+			),
+			-- RF-32 attachment authorization. A client sends only ids, so every
+			-- property that decides whether a link may exist is re-read here from
+			-- files.attachments — never taken from the request:
+			--   - the attachment exists and is not soft-deleted;
+			--   - it belongs to this message's workspace;
+			--   - it belongs to exactly this message's destination. The IS NOT
+			--     DISTINCT FROM pair is what makes that one test instead of four:
+			--     exactly one of $2/$3 is non-null, and files.attachments has its
+			--     own exclusivity CHECK, so a channel attachment cannot match a DM
+			--     message, a DM attachment cannot match a channel message, and
+			--     neither can match another channel or another conversation;
+			--   - it was uploaded by this sender. Being able to read a destination
+			--     is not permission to post somebody else's upload as one's own;
+			--   - its scan state is one a link may be made in. pending_scan is
+			--     deliberately allowed: the scan is asynchronous by design and a
+			--     message must be sendable while it runs. pending_upload (never
+			--     finished), rejected, failed and deleted are all refused;
+			--   - it is not already bound to a message, which is the same rule the
+			--     UNIQUE constraint enforces, checked here so a replay is a plain
+			--     zero-row refusal rather than a constraint error.
+			-- Any failure yields a row here, which stops the INSERT, which the
+			-- caller reports as the same non-enumerating not-found every other
+			-- invalid reference produces.
+			invalid_attachments AS (
+				SELECT 1
+				FROM attachment_candidates candidate
+				WHERE NOT EXISTS (
+					SELECT 1
+					FROM files.attachments a
+					WHERE a.id = candidate.attachment_id
+					  AND a.workspace_id = $1::uuid
+					  AND a.channel_id IS NOT DISTINCT FROM $2::uuid
+					  AND a.conversation_id IS NOT DISTINCT FROM $3::uuid
+					  AND a.uploader_id = $4::uuid
+					  AND a.status IN ('pending_scan', 'clean')
+					  AND a.deleted_at IS NULL
+					  AND NOT EXISTS (
+						SELECT 1 FROM chat.message_attachments existing
+						WHERE existing.attachment_id = a.id
+					  )
+				)
+			),
+			invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
 			WHERE
 				($8::uuid IS NOT NULL AND NOT EXISTS (
@@ -486,6 +539,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			) auth
 			WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 			  AND NOT EXISTS (SELECT 1 FROM invalid_mentions)
+			  AND NOT EXISTS (SELECT 1 FROM invalid_attachments)
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
@@ -499,6 +553,17 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			CROSS JOIN user_mentions
 			ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
 			RETURNING id
+		),
+		-- Same statement as the INSERT above, so the message and its links are one
+		-- atomic fact: there is no commit in which one exists without the other.
+		-- It reads the inserted CTE, so it writes nothing when authorization or
+		-- any reference check produced no message.
+		attachment_links AS (
+			INSERT INTO chat.message_attachments (message_id, attachment_id, position)
+			SELECT inserted.id, candidate.attachment_id, candidate.ord - 1
+			FROM inserted
+			CROSS JOIN attachment_candidates candidate
+			RETURNING attachment_id
 		)
 		SELECT `+listMessageWithQuoteColumns("m", "$4", "q")+`
 		FROM inserted m
@@ -515,16 +580,39 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		nullableUUID(input.ReferencedMessageID),
 		input.MentionedUserIDs,
 		input.MentionedChannelIDs,
+		input.AttachmentIDs,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Non-enumerating TOCTOU backstop: both auth failure and reference failure
-			// produce 0 rows. The service layer returns typed errors from pre-validation;
-			// this backstop returns ErrNotFound to avoid leaking target existence.
+			// Non-enumerating TOCTOU backstop: auth failure, reference failure and
+			// attachment failure all produce 0 rows. The service layer returns typed
+			// errors from pre-validation; this backstop returns ErrNotFound to avoid
+			// leaking target existence — or which attachment ids exist.
 			return domain.Message{}, domain.ErrNotFound
 		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23505", "23503": // unique_violation, foreign_key_violation
+				// The attachment may have been linked between invalid_attachments
+				// and attachment_links. Keep that race non-enumerating too.
+				return domain.Message{}, domain.ErrNotFound
+			case "23514", "23502": // check_violation, not_null_violation
+				return domain.Message{}, domain.ErrInvalidInput
+			}
+		}
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
+	}
+	// The links were written by a CTE of the statement above, which cannot see its
+	// own effects, so the metadata is read back here — one query, never one per
+	// attachment.
+	if len(input.AttachmentIDs) > 0 {
+		messages := []domain.Message{msg}
+		if err := s.loadAttachmentBatch(ctx, messages); err != nil {
+			return domain.Message{}, err
+		}
+		msg = messages[0]
 	}
 	return msg, nil
 }
@@ -998,6 +1086,9 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 	if err := s.loadReactionBatch(ctx, messages, userID); err != nil {
 		return domain.Message{}, err
 	}
+	if err := s.loadAttachmentBatch(ctx, messages); err != nil {
+		return domain.Message{}, err
+	}
 	return messages[0], nil
 }
 
@@ -1070,6 +1161,9 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 	if err := s.loadReactionBatch(ctx, result.Messages, input.UserID); err != nil {
 		return ListMessagesResult{}, err
 	}
+	if err := s.loadAttachmentBatch(ctx, result.Messages); err != nil {
+		return ListMessagesResult{}, err
+	}
 	return result, nil
 }
 
@@ -1138,6 +1232,9 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 	if err := s.loadReactionBatch(ctx, result.Messages, input.UserID); err != nil {
 		return ListMessagesResult{}, err
 	}
+	if err := s.loadAttachmentBatch(ctx, result.Messages); err != nil {
+		return ListMessagesResult{}, err
+	}
 	return result, nil
 }
 
@@ -1174,6 +1271,61 @@ func (s *PGXMessageStore) loadReactionBatch(ctx context.Context, messages []doma
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate message reactions: %w", err)
+	}
+	return nil
+}
+
+// loadAttachmentBatch fills Attachments for a whole page in one query (RF-32).
+//
+// It is deliberately shaped exactly like loadReactionBatch: one statement for
+// every message on the page, keyed by the chat.message_attachments primary key,
+// so a page of 50 messages costs one query and not 50. The join into
+// files.attachments is a read of another service's table — the same direction
+// file-service already reads chat.channels and chat.workspaces — and it selects
+// only the columns a viewer may see. Storage keys, key material and scanner
+// detail are not in the projection at all, so they cannot leak by being carried
+// into a struct and forgotten.
+//
+// Soft-deleted attachments are filtered out rather than rendered as a broken
+// row: a removed file stops being listed everywhere else too.
+func (s *PGXMessageStore) loadAttachmentBatch(ctx context.Context, messages []domain.Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	ids := make([]string, len(messages))
+	byID := make(map[string]int, len(messages))
+	for i := range messages {
+		ids[i] = messages[i].ID
+		byID[messages[i].ID] = i
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT ma.message_id::text, a.id::text, a.original_filename,
+		       COALESCE(NULLIF(a.detected_mime, ''), a.declared_mime),
+		       a.size_bytes, a.status, a.preview_status
+		FROM chat.message_attachments ma
+		JOIN files.attachments a ON a.id = ma.attachment_id
+		WHERE ma.message_id = ANY($1::uuid[])
+		  AND a.deleted_at IS NULL
+		ORDER BY ma.message_id, ma.position, a.id`, ids)
+	if err != nil {
+		return fmt.Errorf("load message attachments: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var messageID string
+		var attachment domain.MessageAttachment
+		if err := rows.Scan(
+			&messageID, &attachment.ID, &attachment.Filename, &attachment.ContentType,
+			&attachment.SizeBytes, &attachment.Status, &attachment.PreviewStatus,
+		); err != nil {
+			return fmt.Errorf("scan message attachment: %w", err)
+		}
+		if i, ok := byID[messageID]; ok {
+			messages[i].Attachments = append(messages[i].Attachments, attachment)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate message attachments: %w", err)
 	}
 	return nil
 }

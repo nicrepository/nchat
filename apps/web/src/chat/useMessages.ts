@@ -37,7 +37,13 @@ import {
   resolveDMMessageReferences,
   unfavoriteMessage,
 } from "./chatApi";
-import { normalizeBodyFormat, type Message, type MessagePage } from "./chatTypes";
+import {
+  normalizeBodyFormat,
+  parseMessageAttachments,
+  type ChannelAttachment,
+  type Message,
+  type MessagePage,
+} from "./chatTypes";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -141,6 +147,7 @@ type Action =
   | { type: "reaction_optimistic"; messageId: string; emoji: string }
   | { type: "reaction_revert"; messageId: string; error: string }
   | { type: "ws_fetch_error"; error: string }
+  | { type: "attachment_status"; attachmentId: string; status: ChannelAttachment["status"] }
   | { type: "ws_subscription_ready" };
 
 /** Applies a local toggle to a message's reaction list, mirroring server semantics for count/reactedByMe. */
@@ -438,6 +445,33 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       return { ...state, realtimeError: action.error, lastMutation: "none" };
     case "ws_subscription_ready":
       return { ...state, realtimeError: null };
+    case "attachment_status": {
+      // RF-22 verdict for an attachment shown inside a message (RF-32).
+      //
+      // Patched in place rather than refetched: the event already carries the
+      // authoritative new status, and the status is the only thing that changed
+      // — nothing here decides what may be downloaded. That gate is
+      // file-service's, applied to every content and preview request, so a
+      // client that got this wrong would still be refused the bytes.
+      //
+      // Messages that carry no matching attachment are returned unchanged by
+      // identity, so an event for another conversation's file — or one this
+      // timeline has never seen — allocates nothing and rerenders nothing.
+      let changed = false;
+      const messages = state.messages.map((message) => {
+        if (!message.attachments?.some((item) => item.id === action.attachmentId)) {
+          return message;
+        }
+        changed = true;
+        return {
+          ...message,
+          attachments: message.attachments.map((item) =>
+            item.id === action.attachmentId ? { ...item, status: action.status } : item,
+          ),
+        };
+      });
+      return changed ? { ...state, messages, lastMutation: "none" } : state;
+    }
     case "reaction_error": {
       // Server-level errors (rate limit, feature unavailable) aren't scoped to a
       // single message, so every optimistic toggle still in flight is reverted.
@@ -578,7 +612,16 @@ interface UseMessagesOptions {
 
 export interface UseMessagesResult {
   state: MessagesState;
-  sendMessage: (body: string, referencedMessageId?: string) => Promise<SendResult>;
+  /**
+   * Posts a message. `attachmentIds` (RF-32) are references to files already
+   * uploaded to this destination — nothing is re-uploaded here — and a message
+   * with one is valid even when the body is empty.
+   */
+  sendMessage: (
+    body: string,
+    referencedMessageId?: string,
+    attachmentIds?: string[],
+  ) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;
   selectReply: (message: Message) => void;
@@ -909,18 +952,25 @@ export function useMessages({
   }, [kind, targetId, isCurrentTarget, sanitizeTombstonedMessage]);
 
   const sendMessage = useCallback(
-    async (body: string, referencedMessageId?: string): Promise<SendResult> => {
-      if (!targetId || !body.trim()) return { status: "stale" };
+    async (
+      body: string,
+      referencedMessageId?: string,
+      attachmentIds?: string[],
+    ): Promise<SendResult> => {
+      // An attachment is content: a message carrying one is sendable with an
+      // empty body, and the server applies the same rule.
+      if (!targetId || (!body.trim() && !attachmentIds?.length)) return { status: "stale" };
 
       const sendKey = `${kind}:${targetId}`;
       const parentMessageId = stateRef.current.replyTo?.id;
       dispatch({ type: "sending" });
 
       try {
+        const options = { parentMessageId, referencedMessageId, attachmentIds };
         const sendFn =
           kind === "channel"
-            ? () => postChannelMessage(targetId, body, parentMessageId, referencedMessageId)
-            : () => postDMMessage(targetId, body, parentMessageId, referencedMessageId);
+            ? () => postChannelMessage(targetId, body, options)
+            : () => postDMMessage(targetId, body, options);
 
         const msg = await sendFn();
 
@@ -994,6 +1044,9 @@ export function useMessages({
                   createdAt: p.quoted.created_at ?? "",
                 }
               : undefined,
+          // Same parser as the HTTP path, so an event and a refetch describe the
+          // same attachment. Withheld for a removed message, like the body.
+          attachments: removed ? undefined : parseMessageAttachments(p.attachments),
         };
         if (!isCurrentTarget(loadKey)) return;
         dispatch({ type: "ws_received", message: sanitizeTombstonedMessage(msg) });
@@ -1224,6 +1277,16 @@ export function useMessages({
   const handleAttachmentStatus = useCallback(
     (event: WSAttachmentStatusEvent) => {
       if (event.target_type !== kind || event.target_id !== targetId) return;
+      // The timeline reconciles itself from the event (RF-32) while the caller
+      // still gets to refresh whatever else lists this destination's files. No
+      // polling is introduced: this is the mechanism that already existed.
+      if (event.attachment?.attachment_id) {
+        dispatch({
+          type: "attachment_status",
+          attachmentId: event.attachment.attachment_id,
+          status: event.attachment.status,
+        });
+      }
       onAttachmentStatusRef.current?.(event);
     },
     [kind, targetId],

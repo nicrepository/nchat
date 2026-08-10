@@ -11,6 +11,7 @@ import { createPortal } from "react-dom";
 
 import type { Message } from "./chatTypes";
 import InlineMessageEditor from "./InlineMessageEditor";
+import MessageAttachments from "./MessageAttachments";
 import MessageEditHistory from "./MessageEditHistory";
 import { formatTime, senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
@@ -591,6 +592,11 @@ export default function MessageBubble({
           ) : (
             <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} />
           )}
+          {/* RF-32. Below the body, so an attachment sent with text reads as
+              part of the same message, and hidden for a removed one along with
+              everything else the placeholder replaces. Editing does not touch
+              attachments, so they stay visible while the body is being edited. */}
+          {!message.isRemoved && <MessageAttachments attachments={message.attachments} />}
         </div>
         <MessageReactions
           message={message}

@@ -38,6 +38,18 @@ export interface AttachmentUploadState {
   /** Name of the last successfully uploaded file, for the success notice. */
   uploadedName: string | null;
   /**
+   * The persisted attachment the last successful upload produced (RF-32).
+   *
+   * It is kept, not discarded, because the upload and the message are two
+   * separate acts: the bytes are already on the server, and this is the
+   * reference the composer sends when the user finally presses Enviar. Nothing
+   * is re-uploaded at that point.
+   *
+   * Null in every other state, including after `dismiss`, so the composer's
+   * pending attachment and this value are the same fact.
+   */
+  uploadedAttachment: ChannelAttachment | null;
+  /**
    * Bytes actually sent, as the transport reports them, or null when it has
    * reported none yet — which is also what a body of unknown length looks like.
    *
@@ -63,6 +75,7 @@ export function useAttachmentUpload(
   const [status, setStatus] = useState<AttachmentUploadStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [uploadedName, setUploadedName] = useState<string | null>(null);
+  const [uploadedAttachment, setUploadedAttachment] = useState<ChannelAttachment | null>(null);
   const [progress, setProgress] = useState<UploadProgress | null>(null);
 
   // Guards every state write, so an upload that resolves after the composer
@@ -84,8 +97,37 @@ export function useAttachmentUpload(
     setStatus("idle");
     setError(null);
     setUploadedName(null);
+    setUploadedAttachment(null);
     setProgress(null);
   }, []);
+
+  /**
+   * A finished upload belongs to the destination it was uploaded to, and to no
+   * other. Switching channel, opening a DM, or navigating away therefore drops
+   * it: the server would refuse the link anyway — it re-reads the attachment's
+   * own destination — but a stale pending file must never even appear in the
+   * new conversation's composer, which would suggest it is about to be sent
+   * there.
+   *
+   * Keyed on kind *and* id, so the two ways a destination can change are one
+   * rule. An in-flight upload is not cancelled here; its own mountedRef and
+   * target guards already stop it from writing into the new destination's
+   * state.
+   *
+   * Adjusted during render rather than from an effect — React's documented
+   * pattern for state that must follow a prop — so no frame is ever painted in
+   * which the new destination's composer shows the previous one's file.
+   */
+  const targetKey = target ? `${target.kind}:${target.id}` : "";
+  const [stateOwner, setStateOwner] = useState(targetKey);
+  if (stateOwner !== targetKey) {
+    setStateOwner(targetKey);
+    setStatus("idle");
+    setError(null);
+    setUploadedName(null);
+    setUploadedAttachment(null);
+    setProgress(null);
+  }
 
   /**
    * Reads the workspace's current limit.
@@ -125,6 +167,10 @@ export function useAttachmentUpload(
       // shown next to a running upload.
       setError(null);
       setUploadedName(null);
+      // A new attempt also replaces the pending attachment: the composer holds
+      // one at a time, and the previous one stops being the file about to be
+      // sent the moment another is chosen.
+      setUploadedAttachment(null);
       // A fresh attempt starts unmeasured: the previous attempt's byte counts
       // describe a request that is over, and the limit lookup below runs before
       // a single byte of this one is sent.
@@ -153,6 +199,7 @@ export function useAttachmentUpload(
           if (!mountedRef.current) return;
           setStatus("success");
           setUploadedName(attachment.filename || file.name);
+          setUploadedAttachment(attachment);
           onUploaded?.();
         } catch (cause) {
           if (!mountedRef.current) return;
@@ -174,5 +221,5 @@ export function useAttachmentUpload(
     [onUploaded, resolveLimit, target],
   );
 
-  return { status, error, uploadedName, progress, selectFile, dismiss };
+  return { status, error, uploadedName, uploadedAttachment, progress, selectFile, dismiss };
 }

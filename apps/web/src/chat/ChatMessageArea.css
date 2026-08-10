@@ -1667,3 +1667,115 @@
     display: none;
   }
 }
+
+/* RF-32: attachments rendered inside a message.
+   The thumbnail and the video player are AttachmentThumbnail's and
+   AttachmentVideo's own elements, so they keep the chat-details__* classes the
+   details panel styles them with — one visual definition, reused rather than
+   restated. Everything below is only the frame around them. */
+.chat-msg-area__attachments {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-msg-area__attachment {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-msg-area__attachment-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chat-msg-area__attachment-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm, 6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__attachment-icon .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.chat-msg-area__attachment-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-msg-area__attachment-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-msg-area__attachment-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--color-text-muted, #6b6580);
+}
+
+/* A file still being scanned and a blocked one are visually distinct from an
+   approved one, because "wait" and "blocked" are not the same instruction. */
+.chat-msg-area__attachment-status--pending_scan {
+  color: var(--color-warning-strong, #92400e);
+}
+
+.chat-msg-area__attachment-status--clean {
+  color: var(--color-success-strong, #166534);
+}
+
+.chat-msg-area__attachment-status--rejected {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+.chat-msg-area__attachment-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-msg-area__attachment-action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.chat-msg-area__attachment-action .material-symbols-outlined {
+  font-size: 16px;
+}
+
+.chat-msg-area__attachment-note {
+  font-size: 11px;
+  color: var(--color-danger-strong, #b91c1c);
+}

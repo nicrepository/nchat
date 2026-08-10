@@ -1068,8 +1068,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   }, []);
 
   const handleSend = useCallback(
-    async (body: string): Promise<SendResult> => {
-      const result = await sendMessage(body, pendingReferenceId || undefined);
+    async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
+      const result = await sendMessage(body, pendingReferenceId || undefined, attachmentIds);
       if (result.status === "sent") {
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
@@ -1309,9 +1309,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           // the very pair the composer is keyed by — so an attachment can never
           // be posted to the destination the user just navigated away from.
           uploadTarget={targetId ? { kind, id: targetId } : null}
-          // An upload adds a file to the destination, it does not create a
-          // message: the files section of the details panel is what renders it,
-          // so reconciling that is the whole of the success path.
+          // An upload adds a file to the destination without creating a message
+          // — the message comes later, when the user presses Enviar (RF-32) —
+          // so the details panel's file list still has to reconcile here.
           onAttachmentUploaded={reloadOpenDetails}
         />
         {referenceSource && (
