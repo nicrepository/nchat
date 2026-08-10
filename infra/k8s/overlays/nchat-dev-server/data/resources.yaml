@@ -213,6 +213,13 @@ spec:
     - name: master
       port: 9333
       targetPort: master
+    # The filer does not keep chunks: it asks the master where to write and is
+    # handed back seaweedfs:8080, the address `-ip=seaweedfs` makes the volume
+    # server announce. Without this port the Service has no endpoint there and
+    # the write fails with `connection refused` (failure_code=storage_write).
+    - name: volume
+      port: 8080
+      targetPort: volume
     - name: filer
       port: 8888
       targetPort: filer
@@ -264,6 +271,8 @@ spec:
           ports:
             - name: master
               containerPort: 9333
+            - name: volume
+              containerPort: 8080
             - name: filer
               containerPort: 8888
           # The master has to be up before the filer can serve, so it is the

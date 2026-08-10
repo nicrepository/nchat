@@ -349,7 +349,9 @@ spec:
       ports:
         # The filer, and only the filer. The master (9333) is cluster
         # administration and the S3 gateway (8333) does not run here; neither
-        # belongs in an object read/write path.
+        # belongs in an object read/write path. The volume server (8080) is not
+        # an API file-service consumes either: it never addresses a volume
+        # directly, it hands the object to the filer and the filer relays it.
         - protocol: TCP
           port: 8888
 ---
@@ -371,6 +373,45 @@ spec:
       ports:
         - protocol: TCP
           port: 8888
+    # The second hop of the same write, internal to the all-in-one `weed
+    # server`: the master answers the filer with seaweedfs:8080, so the filer
+    # persists the chunk by dialling the Service back into this very pod. The
+    # source is restricted to the seaweedfs component itself — 8080 is not open
+    # to file-service or anything else.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: seaweedfs
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# The sending half of that second hop. It needs saying separately because the
+# dial leaves the pod: seaweedfs:8080 is a Service name, so the filer's
+# connection to its own volume server is egress, and nchat-default-deny-egress
+# selects every pod in the namespace. Ingress alone would leave the write
+# failing, only on a timeout instead of `connection refused`.
+#
+# Both halves stay pinned to the seaweedfs component, and DNS is not repeated
+# here — nchat-allow-dns-egress already covers it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-seaweedfs-volume-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: seaweedfs
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: seaweedfs
+      ports:
+        - protocol: TCP
+          port: 8080
 ---
 # Kept apart from nchat-allow-file-data-egress so that removing the scanner is
 # deleting one rule rather than editing a shared one.
