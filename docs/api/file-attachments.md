@@ -1431,6 +1431,86 @@ worker que tenta um alvo inalcancavel a cada poll.
 Ausente, vazio, desconhecido ou com erro de digitacao e tratado como ambiente
 implantado e recusado.
 
+### `clean` significa scan completo (issue #483)
+
+Um veredito `clean` so pode ser gravado quando o daemon terminou de olhar. Duas
+coisas garantem isso, e elas resolvem problemas diferentes.
+
+**Limites de conteudo — `AlertExceedsMax yes`.** Sem essa diretiva, atingir
+`MaxFileSize`, `MaxScanSize`, `MaxFiles` ou `MaxRecursion` faz o clamd parar de
+inspecionar e responder `OK`. Isso seria uma aprovacao sobre um arquivo
+examinado pela metade. Com ela, o mesmo evento responde
+`Heuristics.Limits.Exceeded FOUND` e o anexo vai para `rejected`. Medido na
+imagem fixada, com um arquivo de 2 MiB sob `MaxFileSize 1M`:
+
+```text
+AlertExceedsMax no   ->  arquivo: OK
+AlertExceedsMax yes  ->  arquivo: Heuristics.Limits.Exceeded.MaxFileSize FOUND
+```
+
+Falso positivo por esse heuristico e aceito de proposito: este gate prefere
+recusar arquivo legitimo a aprovar arquivo nao inspecionado. A correcao de um
+falso positivo e elevar o limite especifico, com justificativa — nunca voltar a
+diretiva para `no`.
+
+**Limite de tempo — ordem dos deadlines.** `AlertExceedsMax` nao cobre o limite
+de tempo do engine. Esse e resolvido garantindo que o file-service perca o
+controle da decisao para ninguem:
+
+| Ordem | Prazo                                       | Valor | Papel                              |
+| ----- | ------------------------------------------- | ----- | ---------------------------------- |
+| 1     | deadline de socket e de job do file-service | 300 s | **autoridade externa fail-closed** |
+| 2     | lease do claim do worker                    | 330 s | linha volta a ficar devida         |
+| 3     | `MaxScanTime` do clamd                      | 420 s | backstop interno, nunca decide     |
+
+Quando o deadline externo vence primeiro, a conexao e fechada, o cliente
+devolve erro, nada e gravado e o anexo continua em `pending_scan`. O default de
+`MaxScanTime` (120000 ms) invertia essa ordem e entregava o desfecho ao engine.
+`scripts/ci/k8s-manifests-check.sh` prova a desigualdade
+`MaxScanTime >= (FILE_MALWARE_SCAN_TIMEOUT_SECONDS + 60) * 1000` a cada build.
+
+Toda a politica vive em `infra/k8s/base/services/clamav/clamd.conf`, um unico
+arquivo versionado que o Compose e o ConfigMap do Kubernetes consomem.
+
+### Stack Kubernetes (nchat-dev)
+
+```text
+Traefik → upload-guard:8080 → file-service:8083 → PostgreSQL:5432
+                                                → SeaweedFS filer:8888
+                                                → Valkey:6379
+                                                → ClamAV:3310
+```
+
+- **SeaweedFS**: um unico processo `weed server -filer=true` serve master,
+  volume e filer. O filer em `:8888` e o endpoint que `SeaweedFSStore.Ping`
+  consulta, e por isso e ele — nao o master — que a readiness do StatefulSet
+  verifica.
+- **ClamAV**: `Deployment` + `Service` ClusterIP em 3310, renderizado **somente**
+  pelo overlay `nchat-dev-server`. Sem Ingress, NodePort, LoadBalancer ou
+  `hostPort`, e sem egress algum — inclusive sem DNS, porque freshclam esta
+  desligado. As assinaturas vem da imagem fixada por digest, copiadas por um
+  initContainer para um `emptyDir`.
+- **upload-guard**: fronteira **L7**. Ver abaixo.
+
+### O upload-guard e uma fronteira L7, nao de rede
+
+A propriedade "todo POST de anexo passa pelo upload-guard" **nao** e garantida
+por NetworkPolicy, e o desenho nao deve sugerir que seja. Uma NetworkPolicy
+casa pods e portas, nunca metodo HTTP nem caminho — e o Traefik precisa
+legitimamente alcancar o file-service no mesmo prefixo `/api/files` para
+download, Range, preview e listagem.
+
+A garantia vive na tabela de roteamento do Traefik: uma `IngressRoute` dedicada,
+restrita a `Method(POST)` e ao `PathRegexp` dos dois caminhos de anexo, com
+`priority` acima da regra generica de `/api/files`, os middlewares
+`strip-files-prefix` e `upload-inflight`, e `upload-guard:8080` como backend.
+`scripts/ci/gateway-config-check.sh` valida isso **no manifest renderizado**,
+incluindo a comparacao de prioridade contra a regra generica.
+
+Isso nao enfraquece nada: o file-service continua sendo a unica fronteira de
+tamanho por politica, e o guard e defesa em profundidade contra exaustao de
+disco do gateway antes da autenticacao.
+
 ### Health e readiness
 
 O ClamAV **nao** entra em liveness nem em readiness. Indisponibilidade do daemon

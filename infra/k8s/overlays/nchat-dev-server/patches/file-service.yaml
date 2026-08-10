@@ -8,6 +8,57 @@ spec:
     spec:
       containers:
         - name: file-service
+          # envFrom is a list without a merge key, so this replaces the base's
+          # entirely — including its two secretRef entries. That is the
+          # overlay's established pattern (see auth-service and chat-service):
+          # every secret is named key by key below, so no service receives a
+          # credential it does not use.
           envFrom:
             - configMapRef:
                 name: nchat-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+            - name: AUTH_JWT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_JWT_HMAC_SECRET
+            # Optional by design: without the bus a verdict is still persisted
+            # and still authoritative, clients just see it on their next read
+            # instead of immediately.
+            - name: VALKEY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: VALKEY_URL
+                  optional: true
+            # RF-33/RNF-17 envelope-encryption key ring, from a Secret only
+            # this Deployment references. It is deliberately not part of
+            # nchat-secrets, which every service mounts wholesale.
+            #
+            # The Secret itself is provisioned by a separate operational PR and
+            # must exist before FILE_UPLOADS_ENABLED=true reaches the cluster:
+            # with uploads on, Config.Validate refuses to start on a missing,
+            # mis-encoded or wrong-length key rather than defaulting anything.
+            - name: FILE_ENCRYPTION_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_MASTER_KEY
+            - name: FILE_ENCRYPTION_MASTER_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_MASTER_KEY_ID
+            # Empty except during a rotation, so a deployment that has never
+            # rotated must still start.
+            - name: FILE_ENCRYPTION_PREVIOUS_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-file-encryption
+                  key: FILE_ENCRYPTION_PREVIOUS_KEYS
+                  optional: true

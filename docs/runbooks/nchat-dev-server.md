@@ -1080,6 +1080,106 @@ de configuração. O critério de interrupção é: **criação, remoção, roll
 de spec** de recursos fora do namespace `nchat-dev`. Qualquer ocorrência dessas
 exige interrupção imediata e investigação.
 
+### 17.2 Stack de anexos (issue #483)
+
+**Pré-requisito bloqueante.** O Secret `nchat-file-encryption` é provisionado
+por um PR operacional separado (§9–§11) e precisa estar aplicado **antes** do
+deploy que liga `FILE_UPLOADS_ENABLED=true`. Com uploads habilitados e a chave
+ausente, `Config.Validate` recusa a inicialização — o pod novo nunca fica
+`ready`, o `maxUnavailable: 0` mantém o pod antigo servindo e o deploy aborta.
+Confirme apenas a existência, nunca o conteúdo:
+
+```bash
+# [srv-apps-01]
+kubectl get secret nchat-file-encryption -n nchat-dev
+```
+
+**SeaweedFS Filer.** O StatefulSet passou a rodar `weed server -filer=true`;
+antes disso a porta 8888 era declarada mas nada escutava nela, e o
+`SeaweedFSStore.Ping` do file-service consulta exatamente esse endpoint:
+
+```bash
+# [srv-apps-01]
+kubectl -n nchat-dev exec sts/seaweedfs -- wget -qO- http://127.0.0.1:8888/ >/dev/null && echo filer-ok
+kubectl -n nchat-dev get pod -l app.kubernetes.io/component=file \
+  -o jsonpath='{.items[*].status.containerStatuses[*].ready}'
+```
+
+**ClamAV.** Não expõe nada e não sai para lugar nenhum:
+
+```bash
+# [srv-apps-01]
+kubectl -n nchat-dev get deploy,svc -l app.kubernetes.io/component=clamav
+kubectl -n nchat-dev get svc clamav -o jsonpath='{.spec.type}{"\n"}'   # ClusterIP
+kubectl -n nchat-dev describe networkpolicy nchat-allow-clamav
+```
+
+A primeira subida carrega ~110 MiB de assinaturas e leva dezenas de segundos; o
+`startupProbe` tem folga para isso. O ClamAV **não** entra em
+`wait_for_rollouts` nem na readiness do file-service: enquanto ele não estiver
+pronto os anexos apenas se acumulam em `pending_scan`, não baixáveis.
+
+**Fluxo funcional**, nesta ordem: upload responde `201` com `pending_scan`;
+download, preview e Range respondem `403 file_not_scanned`; dentro de ~1 poll
+(10 s) mais a duração do scan o estado vira `clean` e a entrega é liberada. Com
+a fixture padrão EICAR o estado vira `rejected` e permanece bloqueado.
+
+### 17.3 Convergência das NetworkPolicies criadas à mão (issue #483)
+
+Três policies foram criadas manualmente no cluster durante o diagnóstico e não
+estavam versionadas. Uma delas passa a existir no repositório **com o mesmo
+nome**, deliberadamente, para ser adotada em vez de duplicada.
+
+1. `kubectl apply` do deploy versionado **adota**
+   `nchat-allow-upload-guard-file-ingress`. Ela **não deve ser removida**, nem
+   antes nem depois.
+2. Confirme que o objeto vivo convergiu para o manifest:
+
+   ```bash
+   # [srv-apps-01]
+   kubectl -n nchat-dev get networkpolicy nchat-allow-upload-guard-file-ingress -o yaml
+   ```
+
+   Como o objeto foi criado fora do `apply`, pode não ter a anotação
+   `last-applied-configuration`; nesse caso o merge de três vias preserva campos
+   que existam só no objeto vivo. Se sobrar campo residual, resolva com um
+   `kubectl replace` nominal **desse único objeto** — nunca com `delete`.
+
+3. **Somente depois** de validar a convergência, remova nominalmente as duas
+   policies cujos fluxos passaram a ser cobertos por
+   `nchat-allow-traefik-http` (agora incluindo `upload-guard`),
+   `nchat-allow-dns-egress` e `nchat-allow-upload-guard-file-egress`:
+
+   ```bash
+   # [srv-apps-01]
+   kubectl delete networkpolicy nchat-allow-traefik-upload-guard-ingress -n nchat-dev
+   kubectl delete networkpolicy nchat-allow-upload-guard-egress          -n nchat-dev
+   ```
+
+Proibido em qualquer etapa: `--prune`, curingas, `delete` genérico, ou remover
+qualquer policy antes da validação.
+
+### 17.4 Rollback do stack de anexos
+
+O rollback primário é de **configuração, não de schema**:
+`FILE_UPLOADS_ENABLED=false` no `configmap-patch.yaml` seguido de rollout. As
+rotas voltam a `503`, o worker não inicia e o serviço fica health-only. Nenhum
+anexo é perdido, nada em `pending_scan` ou `rejected` passa a ser servido, o
+Secret permanece e a capacidade de decriptar objetos existentes é preservada.
+
+Nunca, como forma de "destravar" uploads:
+
+- `FILE_MALWARE_SCAN_REQUIRED=false` — `APP_ENV=nchat-dev` está no allowlist que
+  faria o serviço aceitar, o que torna isto disciplina, não barreira técnica;
+- `AlertExceedsMax no` — restaura exatamente a condição em que um limite
+  atingido volta a responder `OK`;
+- `MaxScanTime` igual ou abaixo do timeout externo — inverte a ordem dos
+  deadlines e devolve o desfecho ao engine;
+- `UPDATE ... SET status='clean'`;
+- `migrate.sh down`;
+- remover `nchat-file-encryption`;
+- abrir NetworkPolicy ou remover as default-deny.
+
 ## 18. Rollback
 
 Rollback de aplicação não reverte schema. Confirme compatibilidade da migration;
