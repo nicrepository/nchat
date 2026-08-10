@@ -52,6 +52,21 @@ keys and a key **label**. Neither yields a KEK; both together still do not.
 4. Restart file-service. Only its Deployment references this Secret; it is
    deliberately not part of `nchat-secrets`, which every service mounts.
 
+### nchat-dev: order of operations (issue #483)
+
+In `nchat-dev` the key ring reaches the pod as three explicit `secretKeyRef`
+entries in `infra/k8s/overlays/nchat-dev-server/patches/file-service.yaml`, not
+through `envFrom` — that overlay replaces the base's `envFrom` list wholesale,
+which is why each secret is named key by key there.
+
+The sealed manifest is a **separate operational PR**
+(`infra/k8s/secrets/sealed/nchat-dev/`) and it must be merged and applied
+**before** the infrastructure change that sets `FILE_UPLOADS_ENABLED=true`.
+With uploads enabled and the Secret absent, `Config.Validate` refuses to start:
+the new pod never becomes ready, `maxUnavailable: 0` keeps the previous one
+serving, and the deploy aborts. That is the intended failure — it is not a
+reason to inline the key anywhere.
+
 ### Start-up behaviour
 
 With `FILE_UPLOADS_ENABLED=false` the service is health-only and needs no key at

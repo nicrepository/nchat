@@ -103,6 +103,27 @@ O script exige confirmacao digitando `DELETE` antes de remover os recursos do ov
 
 As imagens sao placeholders versionados. Dockerfiles reais, build e push de imagens entram em tarefas futuras.
 
+### Workloads de apoio
+
+| Workload       | Imagem                     | Porta | Onde e renderizado          |
+| -------------- | -------------------------- | ----: | --------------------------- |
+| upload-guard   | `nginxinc/nginx-unprivileged` | 8080 | `base` (todos os overlays)  |
+| clamav         | `clamav/clamav` (fixada por digest) | 3310 | **apenas** `overlays/nchat-dev-server` |
+
+`base/services/clamav/` fica sob `base/` para que um unico `clamd.conf` sirva ao
+Docker Compose e ao ConfigMap do Kubernetes — kustomize nao le arquivos fora da
+propria raiz, e o deploy copia somente `infra/k8s`. Mas o diretorio **nao** e
+recurso de `base/kustomization.yaml`: so o overlay `nchat-dev-server` o
+referencia, entao `base`, `k3s-dev` e `k3s-staging` nao renderizam ClamAV algum.
+Esses ambientes nao habilitam uploads, e um daemon de ~1 GiB que ninguem chama e
+custo sem proposito.
+
+O ClamAV **nao e exposto externamente**: `ClusterIP` em 3310, alcancavel apenas
+por `app.kubernetes.io/component: file` atraves da NetworkPolicy
+`nchat-allow-clamav`. Nao ha Ingress, IngressRoute, NodePort, LoadBalancer nem
+`hostPort` para ele, e nenhuma policy de egress — nem DNS —, porque freshclam
+esta desligado e as assinaturas vem da imagem fixada.
+
 ## Configuracao e secrets
 
 `base/configmap.yaml` contem apenas dados nao sensiveis. As referencias para PostgreSQL, Valkey e SeaweedFS apontam para nomes de servicos placeholder (`postgres`, `valkey`, `seaweedfs-filer`, `seaweedfs-s3`). Esses data services nao sao criados nesta tarefa; serao modelados em tarefa futura ou apontados para servicos externos.
