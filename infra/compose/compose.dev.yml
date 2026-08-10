@@ -62,6 +62,18 @@ services:
     image: ${CLAMAV_IMAGE:-clamav/clamav:1.4}
     container_name: nchat-clamav
     restart: unless-stopped
+    # Run the daemon directly instead of letting the image's entrypoint manage
+    # it. Left to itself, /init starts clamd and then blocks waiting for
+    # /tmp/clamd.sock to appear, giving up after CLAMD_STARTUP_TIMEOUT (30
+    # minutes) with "Failed to start clamd". This project's clamd.conf is
+    # TCP-only — no LocalSocket, so that socket never appears — and the
+    # container was observed exiting 1 that way while clamd itself answered
+    # PONG on 3310 the whole time. Passing a command takes the entrypoint's
+    # first branch, which execs it and skips both the socket wait and
+    # freshclam. The Kubernetes manifest does exactly the same.
+    command:
+      - clamd
+      - --foreground
     env_file:
       - .env.dev
     environment:
@@ -78,15 +90,25 @@ services:
       # from the network, and it has no authentication of its own to fall back on.
       - "127.0.0.1:${CLAMAV_HOST_PORT:-3310}:3310"
     volumes:
-      # The limits in this file are derived from uploadpolicy's 512 MiB ceiling.
-      # A StreamMaxLength below it would make the largest attachments permanently
-      # unscannable, and therefore permanently undownloadable.
-      - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      # The same file the Kubernetes ConfigMap is generated from, so local and
+      # cluster cannot drift — the arrangement upload-guard already uses below.
+      # The limits in it are derived from uploadpolicy's 512 MiB ceiling: a
+      # StreamMaxLength below that would make the largest attachments
+      # permanently unscannable, and therefore permanently undownloadable. It
+      # also carries the RF-22 verdict policy (AlertExceedsMax, MaxScanTime),
+      # which local development must exercise with the same semantics as the
+      # cluster.
+      - ../k8s/base/services/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
       - nchat_clamav_data:/var/lib/clamav
     healthcheck:
-      # PING/PONG on the same socket file-service uses, so the check proves the
-      # daemon is actually accepting commands rather than merely running.
-      test: ["CMD-SHELL", "clamdcheck.sh || exit 1"]
+      # PING/PONG over the same TCP endpoint file-service uses, so the check
+      # proves the daemon is accepting commands rather than merely running.
+      #
+      # Not clamdcheck.sh: that script expects the unix socket this config does
+      # not create, and reports "Unable to contact server" against a daemon
+      # answering PONG on 3310. clamdscan reads /etc/clamav/clamd.conf, finds
+      # TCPSocket and no LocalSocket, and connects over TCP.
+      test: ["CMD-SHELL", "clamdscan --ping 1 || exit 1"]
       interval: 15s
       timeout: 10s
       # Generous: loading the signature database takes a while on first start,

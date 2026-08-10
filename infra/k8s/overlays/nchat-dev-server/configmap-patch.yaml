@@ -14,5 +14,26 @@ data:
   # WS_INBOUND_MESSAGES_PER_MINUTE (sustained rate) stays at its code default.
   # See docs/ws-hub-foundation.md#inbound-rate-limiting.
   WS_INBOUND_BURST: "60"
-  SEAWEEDFS_FILER_URL: null
+  # The base value names seaweedfs-filer, a Service that does not exist here:
+  # this cluster runs one `weed server` process behind a Service called
+  # seaweedfs, whose filer port is 8888. file-service refuses to start with
+  # uploads enabled and an unusable endpoint, and /readyz probes this exact URL.
+  SEAWEEDFS_FILER_URL: http://seaweedfs:8888
+  # Still absent: nothing in this deployment speaks S3, and the SeaweedFS
+  # StatefulSet does not run the S3 gateway.
   SEAWEEDFS_S3_ENDPOINT: null
+  # RF-30/RF-22 attachment stack. Until this key existed the routes answered
+  # 503 "attachment uploads are disabled", which is the documented behaviour of
+  # the default, not a fault.
+  FILE_UPLOADS_ENABLED: "true"
+  # Never false. APP_ENV=nchat-dev is inside the allowlist that would let
+  # config.validateScanPolicy accept it, so the manifest — and a CI assertion —
+  # is what keeps the gate on. A fresh upload stays in pending_scan, and no
+  # byte derived from it is served, until a real scan approves it.
+  FILE_MALWARE_SCAN_REQUIRED: "true"
+  # Plain host:port dial target. No scheme, no path, no credentials.
+  FILE_MALWARE_SCANNER_ADDRESS: clamav:3310
+  # The external, fail-closed authority over one scan. It must stay below
+  # clamd's own MaxScanTime (420000 ms) and it derives the worker's 330 s claim
+  # lease; the ordering 300 < 330 < 420 is asserted in CI.
+  FILE_MALWARE_SCAN_TIMEOUT_SECONDS: "300"

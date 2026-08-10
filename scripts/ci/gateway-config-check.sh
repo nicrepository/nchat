@@ -251,6 +251,7 @@ done
 # every exit path — including the early returns below when Docker is absent.
 created_env=0
 created_topology_env=0
+rendered_overlay_file=""
 
 # One cleanup, one trap. Each branch removes only what this script created, so a
 # developer's own .env.dev or topology.env survives the run untouched.
@@ -264,6 +265,9 @@ cleanup() {
   if [ -n "$TEMP_CERT_DIR" ]; then
     rm -rf "$TEMP_CERT_DIR"
   fi
+  if [ -n "$rendered_overlay_file" ]; then
+    rm -f "$rendered_overlay_file"
+  fi
 }
 trap cleanup EXIT
 
@@ -271,6 +275,483 @@ if [ ! -f "$NCHAT_DEV_TOPOLOGY_FILE" ]; then
   cp "$NCHAT_DEV_TOPOLOGY_EXAMPLE" "$NCHAT_DEV_TOPOLOGY_FILE"
   created_topology_env=1
 fi
+
+# ---------------------------------------------------------------------------
+# The upload guard is an L7 boundary, and only L7 can enforce it (issue #483).
+#
+# A NetworkPolicy cannot express "this POST must go through the guard": it
+# matches pods and ports, never methods or paths, and Traefik legitimately needs
+# file-service on the same /api/files prefix for download, Range, preview and
+# listing. So the property "every attachment upload passes the guard" lives
+# entirely in the Traefik routing table, and it is asserted here — on the
+# manifest that is actually applied, not only on the source file that produces
+# it. The assertions above cover route shape in the sources; these cover what
+# survives kustomize.
+# ---------------------------------------------------------------------------
+NCHAT_DEV_OVERLAY="$ROOT_DIR/infra/k8s/overlays/nchat-dev-server"
+RENDERED_OVERLAY="$(mktemp "${TMPDIR:-/tmp}/nchat-gateway-render.XXXXXX")"
+rendered_overlay_file="$RENDERED_OVERLAY"
+
+if command -v kustomize >/dev/null 2>&1; then
+  kustomize build "$NCHAT_DEV_OVERLAY" >"$RENDERED_OVERLAY"
+elif command -v kubectl >/dev/null 2>&1; then
+  KUBECONFIG=/dev/null kubectl kustomize "$NCHAT_DEV_OVERLAY" >"$RENDERED_OVERLAY"
+else
+  echo "error: kustomize or kubectl is required to validate the rendered upload route." >&2
+  exit 1
+fi
+
+UPLOAD_PATH_REGEXP='PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)'
+
+# Exactly one route in the applied manifest may claim the upload paths. Two
+# would mean the winner is decided by priority arithmetic nobody reviewed.
+upload_route_count="$(grep -Fc "$UPLOAD_PATH_REGEXP" "$RENDERED_OVERLAY" || true)"
+if [ "$upload_route_count" -ne 1 ]; then
+  echo "Rendered nchat-dev must contain exactly one upload route, found $upload_route_count." >&2
+  exit 1
+fi
+
+# upload_route_block prints the IngressRoute document that owns the upload rule.
+upload_route_block="$(
+  awk -v needle="$UPLOAD_PATH_REGEXP" '
+    /^---$/ { if (found) exit; doc = ""; next }
+    { doc = doc $0 "\n"; if (index($0, needle)) found = 1 }
+    END { if (found) printf "%s", doc }
+  ' "$RENDERED_OVERLAY"
+)"
+
+if ! printf '%s' "$upload_route_block" | grep -Fq 'Method(`POST`)'; then
+  echo "Rendered upload route must be narrowed to POST." >&2
+  exit 1
+fi
+# The backend, matched as a real service reference: a component label reading
+# "upload-guard" must not be able to satisfy this.
+if ! printf '%s' "$upload_route_block" | grep -Eq '^ *- name: upload-guard$'; then
+  echo "Rendered upload route must send uploads to the guard, not to file-service." >&2
+  exit 1
+fi
+if ! printf '%s' "$upload_route_block" | grep -Eq '^ *port: 8080$'; then
+  echo "Rendered upload route must target the guard on port 8080." >&2
+  exit 1
+fi
+# file-service must not be reachable through this route by any spelling.
+if printf '%s' "$upload_route_block" | grep -Eq '^ *- name: file-service$'; then
+  echo "Rendered upload route must not name file-service as a backend." >&2
+  exit 1
+fi
+for middleware in strip-files-prefix upload-inflight; do
+  if ! printf '%s' "$upload_route_block" | grep -Eq "^ *- name: ${middleware}$"; then
+    echo "Rendered upload route must carry the ${middleware} middleware." >&2
+    exit 1
+  fi
+done
+
+nchat_dev_host="$(awk -F= '/^NCHAT_DEV_HOST=/ { print $2; exit }' "$NCHAT_DEV_TOPOLOGY_FILE")"
+
+# route_inventory turns a rendered manifest into one record per public route:
+#
+#   kind|namespace|name|explicit_priority|backend|rule
+#
+# Both kinds this repository actually uses are covered, and nothing else is
+# invented. For an Ingress the rule is reconstructed the way Traefik's
+# Kubernetes provider builds it, from the host, path and pathType that are in
+# the manifest — not from a string this script decides in advance.
+route_inventory() {
+  awk '
+    function emit_ingress_path() {
+      # Only a real path entry is a route. A rule that has been opened but has
+      # no path yet is not one, and emitting it would invent a match-everything
+      # route that does not exist.
+      if (kind != "Ingress" || path == "") return
+      rule = ""
+      if (host != "") rule = "Host(`" host "`)"
+      # Exact is the only pathType Traefik maps to Path(); Prefix,
+      # ImplementationSpecific and an absent value all become PathPrefix, which
+      # is the wider match and therefore the safe assumption.
+      matcher = (pathtype == "Exact") ? "Path(`" path "`)" : "PathPrefix(`" path "`)"
+      rule = (rule == "") ? matcher : rule " && " matcher
+      # A path whose backend could not be read must not look like a route to
+      # some other service: it is reported so the caller can refuse it.
+      printf "Ingress|%s|%s|%s|%s|%s\n", ns, name, annotation_priority,
+        (backend == "" ? "UNRESOLVED" : backend), rule
+    }
+    function emit_route() {
+      if (kind != "IngressRoute" || match_rule == "") return
+      printf "IngressRoute|%s|%s|%s|%s|%s\n", ns, name, route_priority, backend, match_rule
+    }
+    function reset_document() {
+      kind=""; ns=""; name=""; annotation_priority=""
+      host=""; path=""; pathtype=""; backend=""
+      match_rule=""; route_priority=""; section=""
+    }
+    function reset_path() { path=""; pathtype=""; backend="" }
+    function reset_route() { match_rule=""; route_priority=""; backend=""; section="" }
+    function value(line) { sub(/^[^:]*:[[:space:]]*/, "", line); gsub(/^"|"$/, "", line); return line }
+
+    BEGIN { reset_document() }
+    /^---$/ { emit_ingress_path(); emit_route(); reset_document(); next }
+    /^kind: (Ingress|IngressRoute)$/ { kind = $2; next }
+    kind == "" { next }
+
+    /^  name: / && name == "" { name = value($0); next }
+    /^  namespace: / && ns == "" { ns = value($0); next }
+    /^    traefik\.ingress\.kubernetes\.io\/router\.priority: / { annotation_priority = value($0); next }
+
+    # --- Ingress -----------------------------------------------------------
+    kind == "Ingress" && /^  - host: / { emit_ingress_path(); reset_path(); host = value($0); next }
+    kind == "Ingress" && /^  - http:/  { emit_ingress_path(); reset_path(); host = ""; next }
+    kind == "Ingress" && /^      - backend:/ { emit_ingress_path(); reset_path(); next }
+    kind == "Ingress" && /^            name: / && backend == "" { backend = value($0); next }
+    kind == "Ingress" && /^        path: / { path = value($0); next }
+    kind == "Ingress" && /^        pathType: / { pathtype = value($0); next }
+
+    # --- IngressRoute ------------------------------------------------------
+    kind == "IngressRoute" && /^  - (kind|match): / { emit_route(); reset_route() }
+    kind == "IngressRoute" && /^  - match: / { match_rule = value($0); next }
+    kind == "IngressRoute" && /^    match: / { match_rule = value($0); next }
+    kind == "IngressRoute" && /^    priority: / { route_priority = value($0); next }
+    kind == "IngressRoute" && /^    middlewares:/ { section = "middlewares"; next }
+    kind == "IngressRoute" && /^    services:/ { section = "services"; next }
+    kind == "IngressRoute" && /^    - name: / { if (section == "services" && backend == "") backend = value($0); next }
+
+    END { emit_ingress_path(); emit_route() }
+  ' "$1"
+}
+
+# rule_can_match answers whether an &&-composed Traefik rule can receive a POST
+# for one of the attachment paths. It returns:
+#
+#   0  the rule can match          2  the rule is provably disjoint
+#   1  the rule cannot be classified — treated as a failure by the caller
+#
+# It is deliberately not a general Traefik parser. It covers the matchers this
+# repository actually uses and refuses to guess about anything else, because a
+# wrong "disjoint" here is a silent bypass of the upload guard.
+rule_can_match() {
+  local rule="$1" sample_path="$2"
+  local host_matchers method_matchers path_matchers matcher literal
+
+  # Alternation would break the "every matcher must hold" reasoning below.
+  # Rather than model it, refuse to classify.
+  case "$rule" in
+    *'||'*) return 1 ;;
+  esac
+  # A regular expression on the path cannot be evaluated here at all.
+  case "$rule" in
+    *'PathRegexp('*) return 1 ;;
+  esac
+
+  host_matchers="$(printf '%s' "$rule" | grep -Eo 'Host\(`[^)]*`\)' || true)"
+  if [ -n "$host_matchers" ]; then
+    # Host() takes a comma-separated list; the route reaches us if any entry is
+    # the public host.
+    if ! printf '%s' "$host_matchers" | tr ',`' '\n\n' | grep -Fxq "$nchat_dev_host"; then
+      return 2
+    fi
+  fi
+
+  method_matchers="$(printf '%s' "$rule" | grep -Eo 'Method\(`[^)]*`\)' || true)"
+  if [ -n "$method_matchers" ]; then
+    if ! printf '%s' "$method_matchers" | tr ',`' '\n\n' | grep -Fxq POST; then
+      return 2
+    fi
+  fi
+
+  # Every path matcher has to admit the sample, because they are ANDed.
+  path_matchers="$(printf '%s' "$rule" | grep -Eo 'Path(Prefix)?\(`[^`]*`\)' || true)"
+  [ -n "$path_matchers" ] || return 0
+  while IFS= read -r matcher; do
+    [ -n "$matcher" ] || continue
+    literal="${matcher#*(\`}"
+    literal="${literal%\`)}"
+    case "$matcher" in
+      PathPrefix*)
+        case "$sample_path" in
+          "$literal"*) ;;
+          *) return 2 ;;
+        esac
+        ;;
+      Path*)
+        [ "$sample_path" = "$literal" ] || return 2
+        ;;
+    esac
+  done <<EOF
+$path_matchers
+EOF
+  return 0
+}
+
+# PRIORITY_MODEL_MARGIN pads a priority this script *derived* rather than read.
+#
+# Traefik's default router priority is the length of the rule, and for an
+# Ingress that rule is reconstructed above rather than taken from the manifest.
+# The reconstruction is faithful to the provider's shape, but a modelling error
+# of a few characters must not be what decides whether the guard is bypassable,
+# so a derived competitor is always treated as somewhat stronger than computed.
+# A priority read straight from the manifest needs no such padding.
+PRIORITY_MODEL_MARGIN=64
+
+UPLOAD_PATH_SAMPLES="/api/files/channels/00000000-0000-0000-0000-000000000000/attachments
+/api/files/dm/00000000-0000-0000-0000-000000000000/attachments"
+
+# Priority is what makes the guard win against the generic /api/files rule that
+# sends everything else straight to file-service. The competitors are taken from
+# the rendered manifest — every Ingress and IngressRoute that can carry an
+# attachment POST to file-service — so a route added later cannot escape the
+# comparison by being unknown to this script.
+assert_upload_route_wins() {
+  local rendered="$1"
+  local route_kind route_ns route_name route_priority route_backend route_rule
+  local upload_priority="" failures=0 matched unclassified sample rule_status
+  local effective_priority priority_source competitors
+
+  competitors="$(mktemp "${TMPDIR:-/tmp}/nchat-competing-routes.XXXXXX")"
+
+  while IFS='|' read -r route_kind route_ns route_name route_priority route_backend route_rule; do
+    [ -n "$route_kind" ] || continue
+
+    # The dedicated route identifies itself by the rule it carries, not by its
+    # name: renaming it must not make it invisible to this comparison.
+    case "$route_rule" in
+      *"$UPLOAD_PATH_REGEXP"*)
+        case "$route_priority" in
+          '' | *[!0-9]*)
+            echo "Rendered upload route must declare a numeric priority." >&2
+            rm -f "$competitors"
+            return 1
+            ;;
+        esac
+        upload_priority="$route_priority"
+        continue
+        ;;
+    esac
+
+    if [ "$route_backend" = UNRESOLVED ]; then
+      echo "ERROR: ${route_kind}/${route_ns}/${route_name} has a path whose backend could" >&2
+      echo "  not be read from the rendered manifest: ${route_rule}" >&2
+      echo "A route whose destination is unknown cannot be ruled out as a bypass." >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    [ "$route_backend" = file-service ] || continue
+
+    matched=0
+    unclassified=0
+    for sample in $UPLOAD_PATH_SAMPLES; do
+      rule_status=0
+      rule_can_match "$route_rule" "$sample" || rule_status=$?
+      case "$rule_status" in
+        0) matched=1; break ;;
+        1) unclassified=1 ;;
+      esac
+    done
+
+    if [ "$unclassified" -eq 1 ]; then
+      echo "ERROR: cannot prove ${route_kind}/${route_ns}/${route_name} is disjoint from" >&2
+      echo "  the attachment upload paths." >&2
+      echo "  rule:    ${route_rule}" >&2
+      echo "  backend: ${route_backend}" >&2
+      echo "A file-service route this gate cannot classify is treated as a bypass." >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    [ "$matched" -eq 1 ] || continue
+
+    if [ -n "$route_priority" ]; then
+      effective_priority="$route_priority"
+      priority_source=explicit
+    else
+      effective_priority=$((${#route_rule} + PRIORITY_MODEL_MARGIN))
+      priority_source="derived from rule length +${PRIORITY_MODEL_MARGIN} margin"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "${route_kind}/${route_ns}/${route_name}" "$route_rule" "$route_backend" \
+      "$effective_priority" "$priority_source" >>"$competitors"
+  done <<EOF
+$(route_inventory "$rendered")
+EOF
+
+  if [ -z "$upload_priority" ]; then
+    echo "Rendered upload route not found in the route inventory." >&2
+    rm -f "$competitors"
+    return 1
+  fi
+
+  local competitor rule backend
+  while IFS="$(printf '\t')" read -r competitor rule backend effective_priority priority_source; do
+    [ -n "$competitor" ] || continue
+    if [ "$effective_priority" -ge "$upload_priority" ]; then
+      echo "ERROR: competing route ${competitor} can match an attachment POST:" >&2
+      echo "  rule:               ${rule}" >&2
+      echo "  backend:            ${backend}" >&2
+      echo "  effective priority: ${effective_priority} (${priority_source})" >&2
+      echo "  upload route:       ${upload_priority}" >&2
+      echo "An attachment POST could reach file-service without the streaming cap." >&2
+      failures=$((failures + 1))
+    fi
+  done <"$competitors"
+
+  rm -f "$competitors"
+  [ "$failures" -eq 0 ]
+}
+
+assert_upload_route_wins "$RENDERED_OVERLAY" || exit 1
+
+# ---------------------------------------------------------------------------
+# Self-tests for the comparison above.
+#
+# The gate decides whether an attachment POST can reach file-service, so "it
+# passes today" is not evidence that it would notice tomorrow. Each case mutates
+# a *copy* of the rendered manifest — the working tree is never touched — and
+# asserts the expected verdict. They run in CI, so a future change that blinds
+# the gate fails here rather than in production.
+# ---------------------------------------------------------------------------
+selftest_failures=0
+
+expect_route_verdict() {
+  local label="$1" expected="$2" mutated="$3" observed=0
+  assert_upload_route_wins "$mutated" >/dev/null 2>&1 || observed=1
+  if [ "$observed" -ne "$expected" ]; then
+    echo "Route gate self-test '${label}' expected $([ "$expected" -eq 0 ] && echo PASS || echo FAIL)," >&2
+    echo "observed $([ "$observed" -eq 0 ] && echo PASS || echo FAIL)." >&2
+    selftest_failures=$((selftest_failures + 1))
+  fi
+  rm -f "$mutated"
+}
+
+mutated_render() {
+  local copy
+  copy="$(mktemp "${TMPDIR:-/tmp}/nchat-route-selftest.XXXXXX")"
+  cp "$RENDERED_OVERLAY" "$copy"
+  printf '%s' "$copy"
+}
+
+# A — the manifest as it stands.
+case_a="$(mutated_render)"
+expect_route_verdict 'valid manifest' 0 "$case_a"
+
+# B — the dedicated route loses its priority advantage.
+case_b="$(mutated_render)"
+sed -i 's/^    priority: 200$/    priority: 10/' "$case_b"
+expect_route_verdict 'upload route priority lowered' 1 "$case_b"
+
+# C — the generic /api/files Ingress claims an explicit priority. This is the
+# case the review flagged: nothing about the dedicated route changes, and the
+# old string-comparison gate saw nothing wrong.
+case_c="$(mutated_render)"
+sed -i 's|^    traefik.ingress.kubernetes.io/router.entrypoints: websecure$|&\n    traefik.ingress.kubernetes.io/router.priority: "500"|' "$case_c"
+expect_route_verdict 'competing Ingress annotates a higher priority' 1 "$case_c"
+
+# D — a brand-new Ingress for /api/files, with a priority that ties.
+case_d="$(mutated_render)"
+cat >>"$case_d" <<EOF
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    traefik.ingress.kubernetes.io/router.priority: "200"
+  name: nchat-dev-files-extra
+  namespace: nchat-dev
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: ${nchat_dev_host}
+    http:
+      paths:
+      - backend:
+          service:
+            name: file-service
+            port:
+              name: http
+        path: /api/files
+        pathType: Prefix
+EOF
+expect_route_verdict 'new competing Ingress ties on priority' 1 "$case_d"
+
+# E — a brand-new IngressRoute straight to file-service, outranking the guard.
+case_e="$(mutated_render)"
+cat >>"$case_e" <<EOF
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nchat-dev-files-direct
+  namespace: nchat-dev
+spec:
+  entryPoints:
+  - websecure
+  routes:
+  - kind: Rule
+    match: Host(\`${nchat_dev_host}\`) && PathPrefix(\`/api/files\`)
+    priority: 300
+    services:
+    - name: file-service
+      port: 8083
+EOF
+expect_route_verdict 'new competing IngressRoute outranks the guard' 1 "$case_e"
+
+# F — a file-service route that is provably disjoint from the upload paths must
+# not be flagged. A gate that fails on everything protects nothing, because it
+# gets switched off.
+case_f="$(mutated_render)"
+cat >>"$case_f" <<EOF
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nchat-dev-files-metrics
+  namespace: nchat-dev
+spec:
+  entryPoints:
+  - websecure
+  routes:
+  - kind: Rule
+    match: Host(\`${nchat_dev_host}\`) && PathPrefix(\`/api/files-metrics\`)
+    priority: 900
+    services:
+    - name: file-service
+      port: 8083
+EOF
+expect_route_verdict 'disjoint file-service route is accepted' 0 "$case_f"
+
+# G — a rule this gate cannot evaluate must fail closed rather than be assumed
+# harmless.
+case_g="$(mutated_render)"
+cat >>"$case_g" <<EOF
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nchat-dev-files-regexp
+  namespace: nchat-dev
+spec:
+  entryPoints:
+  - websecure
+  routes:
+  - kind: Rule
+    match: Host(\`${nchat_dev_host}\`) && PathRegexp(\`^/api/files/.*\$\`)
+    priority: 900
+    services:
+    - name: file-service
+      port: 8083
+EOF
+expect_route_verdict 'unclassifiable file-service route fails closed' 1 "$case_g"
+
+if [ "$selftest_failures" -ne 0 ]; then
+  echo "Route priority gate self-tests failed: $selftest_failures case(s)." >&2
+  exit 1
+fi
+
+# No other routing object may claim these POSTs. The priority comparison above
+# is the substantive guarantee; this stays as a second net, so a new IngressRoute
+# has to be looked at deliberately rather than merely out-prioritised.
+if [ "$(grep -c 'kind: IngressRoute' "$RENDERED_OVERLAY" || true)" -ne 1 ]; then
+  echo "Rendered nchat-dev must declare exactly one IngressRoute (the upload route)." >&2
+  exit 1
+fi
+
+rm -f "$rendered_overlay_file"
 
 # Issue #425: validates that the local gateway, every Kubernetes overlay, the
 # Go router and the frontend agree on the /api/auth contract. Runs before the

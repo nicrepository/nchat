@@ -92,6 +92,56 @@ port_pairs() {
   ' <<<"$1"
 }
 
+# yaml_documents_of_kind concatenates every document whose kind matches, unlike
+# yaml_document which stops at the first. Needed for negative assertions, where
+# "no routing object mentions the scanner" has to look at all of them.
+yaml_documents_of_kind() {
+  local file="$1" wanted_kinds="$2"
+  awk -v wanted="$wanted_kinds" '
+    function emit() { if (kind != "" && index(wanted, "|" kind "|")) printf "%s", document }
+    /^---$/ { emit(); document=""; kind=""; next }
+    { document=document $0 ORS }
+    /^kind:/ { kind=$2 }
+    END { emit() }
+  ' "$file"
+}
+
+# clamd_directive prints the value of a clamd.conf directive, ignoring the
+# comments that explain it. Empty output means the directive is not set, which
+# for this project is a failure rather than "use the default": an implicit
+# default is a security-relevant number nobody reviewed.
+clamd_directive() {
+  awk -v name="$2" '$1 == name { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' "$1"
+}
+
+# clamd_directive_count counts the ACTIVE occurrences of a directive, by name
+# and regardless of value.
+#
+# It exists because clamd applies the *last* setting it reads, so a duplicate
+# does not conflict — it silently wins. Checking that one line with the expected
+# value is present therefore proves nothing on its own: "AlertExceedsMax yes"
+# followed by "AlertExceedsMax no" satisfies that check and disables the
+# heuristic. Comments do not count: on "# MaxScanTime 500000" the first field is
+# "#", so only a real directive is ever matched.
+clamd_directive_count() {
+  awk -v name="$2" '$1 == name { total++ } END { print total + 0 }' "$1"
+}
+
+# require_single_clamd_directive fails unless the directive is set exactly once.
+require_single_clamd_directive() {
+  local conf="$1" name="$2" count
+  count="$(clamd_directive_count "$conf" "$name")"
+  if [[ "$count" -eq 0 ]]; then
+    echo "error: $name must be explicitly configured exactly once in clamd.conf" >&2
+    return 1
+  fi
+  if [[ "$count" -gt 1 ]]; then
+    echo "error: $name must be configured exactly once; found $count active directives." >&2
+    echo "clamd applies the last one, so a duplicate silently overrides the reviewed value." >&2
+    return 1
+  fi
+}
+
 network_policy_names_by_type() {
   local file="$1" wanted_type="$2"
   awk -v wanted_type="$wanted_type" '
@@ -145,6 +195,308 @@ validate_workload_hardening() {
     /limits:/ { limits=1 }
     END { check(); exit failed }
   ' "$1"
+}
+
+# validate_scan_time_ordering checks the one clamd setting that decides whether
+# an unfinished scan can look finished.
+#
+# The order that must hold is file-service's deadline < the worker's claim lease
+# < clamd's MaxScanTime. When file-service's deadline expires first it closes
+# the connection, the scan fails, nothing is written and the attachment stays in
+# pending_scan. If the engine's own limit fired first, the engine would decide,
+# which is exactly what the threat model refused.
+#
+# Uniqueness is checked before the value is read, because clamd keeps the last
+# occurrence: a duplicate silently overrides the reviewed number.
+validate_scan_time_ordering() {
+  local conf="$1" scan_timeout="$2" max_scan_time required_ms
+  require_single_clamd_directive "$conf" MaxScanTime || return 1
+  max_scan_time="$(clamd_directive "$conf" MaxScanTime)"
+  # Milliseconds, as a bare integer: clamd takes no unit suffix here, so "420s"
+  # is a misconfiguration and not a shorter way of saying the same thing.
+  if [[ ! "$max_scan_time" =~ ^[0-9]+$ ]]; then
+    echo "error: MaxScanTime must be a plain integer in milliseconds, got '$max_scan_time'." >&2
+    return 1
+  fi
+  # A margin, so the ordering does not hold by a millisecond of luck across
+  # scheduling, throttling and clock skew between two processes.
+  required_ms=$(((scan_timeout + 60) * 1000))
+  if ((max_scan_time < required_ms)); then
+    echo "error: MaxScanTime ($max_scan_time ms) must be at least" >&2
+    echo "(FILE_MALWARE_SCAN_TIMEOUT_SECONDS + 60) * 1000 = $required_ms ms, so the" >&2
+    echo "file-service deadline stays the fail-closed authority over a scan." >&2
+    return 1
+  fi
+}
+
+# selftest_scan_time_ordering proves the check above reacts to each way the
+# setting can go wrong.
+#
+# It runs against throwaway fixtures, never the versioned clamd.conf, and it
+# runs in CI: a future edit that makes the gate blind fails here instead of
+# shipping. The reference timeout is 300 s, so the contract floor is 360000 ms.
+selftest_scan_time_ordering() {
+  local fixture failures=0 label expected observed body
+  fixture="$(mktemp "${TMPDIR:-/tmp}/nchat-clamd-selftest.XXXXXX")"
+
+  run_case() {
+    label="$1"; expected="$2"; body="$3"
+    printf '%b' "$body" >"$fixture"
+    observed=0
+    validate_scan_time_ordering "$fixture" 300 >/dev/null 2>&1 || observed=1
+    if [[ "$observed" -ne "$expected" ]]; then
+      echo "error: MaxScanTime self-test '$label' expected $([[ "$expected" -eq 0 ]] && echo pass || echo fail)," >&2
+      echo "observed $([[ "$observed" -eq 0 ]] && echo pass || echo fail)." >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  run_case 'single valid directive'      0 'MaxScanTime 420000\n'
+  run_case 'directive absent'            1 'AlertExceedsMax yes\n'
+  run_case 'two active directives'       1 'MaxScanTime 420000\nMaxScanTime 500000\n'
+  run_case 'active plus commented'       0 'MaxScanTime 420000\n# MaxScanTime 500000\n'
+  run_case 'non-numeric value'           1 'MaxScanTime banana\n'
+  run_case 'unit suffix instead of ms'   1 'MaxScanTime 420s\n'
+  run_case 'below the required floor'    1 'MaxScanTime 120000\n'
+  run_case 'exactly at the floor'        0 'MaxScanTime 360000\n'
+  run_case 'one millisecond short'       1 'MaxScanTime 359999\n'
+
+  unset -f run_case
+  rm -f "$fixture"
+  [[ "$failures" -eq 0 ]]
+}
+
+# validate_clamav asserts the antimalware workload and, more importantly, the
+# two properties a verdict depends on (RF-22, issue #483).
+#
+# The threat model rejected an earlier design because "clean" did not prove a
+# finished scan: with AlertExceedsMax off, clamd answers OK after abandoning a
+# file at a limit, and with MaxScanTime below file-service's own deadline the
+# engine — not the service — decides what an unfinished scan looks like. Both
+# are asserted here rather than left to review.
+validate_clamav() {
+  local application="$1" conf="$ROOT_DIR/infra/k8s/base/services/clamav/clamd.conf"
+  local block routing scan_timeout directive value expected
+  local -a images=()
+
+  [[ -f "$conf" ]] || { echo "error: missing $conf" >&2; return 1; }
+
+  selftest_scan_time_ordering || return 1
+
+  # One clamd.conf, shared by Compose and Kubernetes. A second copy is how the
+  # two quietly stop agreeing about what the scanner enforces.
+  if [[ "$(find "$ROOT_DIR/infra" -name clamd.conf -type f | wc -l)" -ne 1 ]]; then
+    echo "error: there must be exactly one versioned clamd.conf under infra/" >&2
+    return 1
+  fi
+  if ! grep -Fq '../k8s/base/services/clamav/clamd.conf:/etc/clamav/clamd.conf:ro' \
+    "$ROOT_DIR/infra/compose/compose.dev.yml"; then
+    echo "error: Compose must mount the same clamd.conf the ConfigMap is generated from" >&2
+    return 1
+  fi
+
+  # The scanner is rendered by the nchat-dev overlay alone; base must not carry
+  # it, or k3s-dev and k3s-staging would inherit a 1 GiB daemon they never call.
+  if grep -Eq '^[[:space:]]*-[[:space:]]*services/clamav[[:space:]]*$' \
+    "$ROOT_DIR/infra/k8s/base/kustomization.yaml"; then
+    echo "error: base/kustomization.yaml must not reference services/clamav" >&2
+    return 1
+  fi
+
+  # --- verdict semantics -----------------------------------------------------
+  #
+  # Uniqueness comes first, for every directive whose value decides a verdict.
+  # Asserting that the wanted line is present is not enough on its own: clamd
+  # keeps the last setting it reads, so an appended duplicate overrides the
+  # reviewed one while the "is it there?" check still passes.
+  require_single_clamd_directive "$conf" AlertExceedsMax || return 1
+  if [[ "$(grep -Exc 'AlertExceedsMax yes' "$conf")" -ne 1 ]]; then
+    echo "error: clamd.conf must set AlertExceedsMax yes exactly once: without it a" >&2
+    echo "file abandoned at a limit is answered as OK and recorded as clean." >&2
+    return 1
+  fi
+
+  scan_timeout="$(awk -F': ' '/^  FILE_MALWARE_SCAN_TIMEOUT_SECONDS:/ {gsub(/"/, "", $2); print $2; exit}' \
+    "$application")"
+  if [[ ! "$scan_timeout" =~ ^[0-9]+$ ]]; then
+    echo "error: FILE_MALWARE_SCAN_TIMEOUT_SECONDS must be set in nchat-config." >&2
+    return 1
+  fi
+  validate_scan_time_ordering "$conf" "$scan_timeout" || return 1
+
+  # --- limits, stated rather than inherited ----------------------------------
+  for directive in \
+    'StreamMaxLength 512M' 'MaxFileSize 512M' 'MaxScanSize 1024M' \
+    'MaxRecursion 12' 'MaxFiles 10000' 'MaxThreads 4' \
+    'MaxEmbeddedPE 40M' 'MaxHTMLNormalize 40M' 'MaxHTMLNoTags 8M' \
+    'MaxScriptNormalize 20M' 'MaxZipTypeRcg 1M' 'MaxPartitions 50' \
+    'MaxIconsPE 100' 'MaxRecHWP3 16' 'PCREMatchLimit 100000' \
+    'PCRERecMatchLimit 2000' 'PCREMaxFileSize 100M'; do
+    if [[ "$(grep -Exc -- "$directive" "$conf")" -ne 1 ]]; then
+      echo "error: clamd.conf must declare exactly one: $directive" >&2
+      return 1
+    fi
+    # And no second setting of the same limit under a different value, which the
+    # exact-line count above cannot see.
+    require_single_clamd_directive "$conf" "${directive%% *}" || return 1
+  done
+  # Absent on purpose, each for a reason recorded in the file itself. Matched at
+  # the start of a line so the comments explaining the absence do not trip it.
+  for directive in User LocalSocket PidFile ForceToDisk; do
+    if grep -Eq "^${directive}[[:space:]]" "$conf"; then
+      echo "error: clamd.conf must not set $directive" >&2
+      return 1
+    fi
+  done
+  # The generator wired this exact file, not some other one.
+  grep -Fq 'AlertExceedsMax yes' "$application" || {
+    echo "error: the rendered clamav-config ConfigMap does not carry clamd.conf" >&2
+    return 1
+  }
+
+  # --- workload --------------------------------------------------------------
+  block="$(yaml_document "$application" Deployment clamav)"
+  [[ -n "$block" ]] || { echo "error: nchat-dev must render Deployment/clamav" >&2; return 1; }
+
+  for value in 'runAsUser: 100' 'runAsGroup: 101' 'fsGroup: 101' 'runAsNonRoot: true' \
+    'automountServiceAccountToken: false' 'enableServiceLinks: false' 'type: Recreate'; do
+    grep -Fq "$value" <<<"$block" || {
+      echo "error: Deployment/clamav must declare: $value" >&2
+      return 1
+    }
+  done
+  # Container and init container both hardened: two occurrences of each.
+  for value in 'allowPrivilegeEscalation: false' 'readOnlyRootFilesystem: true'; do
+    if [[ "$(grep -Fc "$value" <<<"$block")" -ne 2 ]]; then
+      echo "error: clamav container and init container must both declare: $value" >&2
+      return 1
+    fi
+  done
+
+  # The database that gets copied must come from the build that scans with it.
+  mapfile -t images < <(grep -Eo 'image: clamav/clamav:[^[:space:]]+' <<<"$block" | sort -u)
+  if [[ "${#images[@]}" -ne 1 ]]; then
+    echo "error: clamav init container and container must use one identical image" >&2
+    printf '%s\n' "${images[@]}" >&2
+    return 1
+  fi
+  [[ "${images[0]}" =~ @sha256:[a-f0-9]{64}$ ]] || {
+    echo "error: the clamav image must be pinned by digest: ${images[0]}" >&2
+    return 1
+  }
+
+  # Probes have to speak the protocol file-service speaks, on its port. The
+  # image's own clamdcheck.sh expects a unix socket this config does not create
+  # and reports failure against a daemon that is answering PONG on 3310.
+  # Two semantic probes — startup and readiness. Liveness stays a plain TCP
+  # check so it cannot restart the pod in the middle of a long scan.
+  if [[ "$(grep -Fc -- '- clamdscan' <<<"$block")" -ne 2 ]] ||
+    [[ "$(grep -Fc -- '- --ping' <<<"$block")" -ne 2 ]]; then
+    echo "error: clamav startup and readiness must validate PING/PONG with clamdscan --ping" >&2
+    return 1
+  fi
+  grep -Fq 'tcpSocket:' <<<"$block" || {
+    echo "error: clamav liveness must be a plain tcpSocket check on the clamd port" >&2
+    return 1
+  }
+  if grep -Eq 'clamdcheck\.sh|LocalSocket' <<<"$block"; then
+    echo "error: clamav probes must not depend on clamdcheck.sh or a LocalSocket" >&2
+    return 1
+  fi
+
+  # Every emptyDir bounded, and the container's ephemeral-storage ceiling at
+  # least as large as the volumes it has to hold.
+  if [[ "$(grep -Fc 'emptyDir:' <<<"$block")" -ne "$(grep -Fc 'sizeLimit:' <<<"$block")" ]]; then
+    echo "error: every emptyDir in Deployment/clamav needs a sizeLimit" >&2
+    return 1
+  fi
+  for value in 'sizeLimit: 2Gi' 'sizeLimit: 1Gi'; do
+    grep -Fq "$value" <<<"$block" || {
+      echo "error: Deployment/clamav must declare: $value" >&2
+      return 1
+    }
+  done
+  grep -Fq 'ephemeral-storage: 512Mi' <<<"$block" || {
+    echo "error: Deployment/clamav must request ephemeral-storage" >&2
+    return 1
+  }
+  # 4Gi >= 2Gi + 1Gi, so a full /tmp plus a full signature volume cannot exceed
+  # what the container is allowed to consume before the kubelet evicts it.
+  grep -Fq 'ephemeral-storage: 4Gi' <<<"$block" || {
+    echo "error: limits.ephemeral-storage must cover the sum of the emptyDir sizeLimits" >&2
+    return 1
+  }
+  for value in 'cpu: 500m' 'memory: 1536Mi' 'cpu: 1250m' 'memory: 3Gi'; do
+    grep -Fq "$value" <<<"$block" || {
+      echo "error: Deployment/clamav must declare the ratified resource: $value" >&2
+      return 1
+    }
+  done
+
+  # --- exposure --------------------------------------------------------------
+  block="$(yaml_document "$application" Service clamav)"
+  grep -Fq 'type: ClusterIP' <<<"$block" || {
+    echo "error: Service/clamav must be ClusterIP" >&2
+    return 1
+  }
+  if [[ "$(port_pairs "$block")" != "TCP/3310" ]]; then
+    echo "error: Service/clamav must expose exactly TCP/3310" >&2
+    return 1
+  fi
+  if grep -Eq 'NodePort|LoadBalancer|hostPort' "$application"; then
+    echo "error: no workload in nchat-dev may use NodePort, LoadBalancer or hostPort" >&2
+    return 1
+  fi
+  routing="$(yaml_documents_of_kind "$application" '|Ingress|IngressRoute|')"
+  if grep -Eq 'clamav|3310' <<<"$routing"; then
+    echo "error: no Ingress or IngressRoute may reference the scanner" >&2
+    return 1
+  fi
+
+  block="$(yaml_document "$application" NetworkPolicy nchat-allow-clamav)"
+  grep -Fq 'app.kubernetes.io/component: clamav' <<<"$block"
+  grep -Fq 'app.kubernetes.io/component: file' <<<"$block"
+  if [[ "$(grep -Fxc '    - podSelector:' <<<"$block")" -ne 1 ]]; then
+    echo "error: nchat-allow-clamav must authorize exactly one origin pod selector" >&2
+    return 1
+  fi
+  if [[ "$(port_pairs "$block")" != "TCP/3310" ]]; then
+    echo "error: nchat-allow-clamav must allow only TCP/3310" >&2
+    return 1
+  fi
+  # No egress policy for the scanner at all: freshclam is off, so it never
+  # opens a connection, not even to DNS.
+  if grep -Fq 'nchat-allow-clamav-egress' "$application"; then
+    echo "error: clamav must have no egress policy while freshclam is disabled" >&2
+    return 1
+  fi
+  # file resolves postgres, valkey, seaweedfs and clamav; upload-guard resolves
+  # its upstream when nginx loads its config, so without DNS it never starts.
+  block="$(yaml_document "$application" NetworkPolicy nchat-allow-dns-egress)"
+  for expected in file upload-guard; do
+    grep -Exq "[[:space:]]*- $expected" <<<"$block" || {
+      echo "error: $expected must be granted DNS egress" >&2
+      return 1
+    }
+  done
+  # The scanner is not on that list, and that is the point.
+  if grep -Exq '[[:space:]]*- clamav' <<<"$block"; then
+    echo "error: clamav must not be granted DNS egress while freshclam is disabled" >&2
+    return 1
+  fi
+}
+
+# validate_clamav_absent proves the scanner reaches only the environment that
+# asked for it.
+validate_clamav_absent() {
+  local overlay rendered
+  for overlay in "$@"; do
+    rendered="${overlay#*=}"
+    if grep -Eq 'component: clamav|clamav/clamav' "$rendered"; then
+      echo "error: ${overlay%%=*} must not render the ClamAV workload" >&2
+      return 1
+    fi
+  done
 }
 
 validate_coturn_template() {
@@ -329,10 +681,13 @@ validate_nchat_dev() {
     nchat-allow-auth-postgres-egress \
     nchat-allow-chat-data-egress \
     nchat-allow-dns-egress \
+    nchat-allow-file-clamav-egress \
+    nchat-allow-file-data-egress \
     nchat-allow-livekit-api-egress \
     nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
     nchat-allow-notification-postgres-egress \
+    nchat-allow-upload-guard-file-egress \
     nchat-default-deny-egress | LC_ALL=C sort)" ]]
   for policy_block in \
     nchat-allow-dns-egress nchat-allow-traefik-http nchat-allow-postgres \
@@ -351,7 +706,49 @@ validate_nchat_dev() {
   if grep -q 'namespaceSelector: {}' "$application"; then return 1; fi
   if grep -Eq 'port: (8333|9333)' "$application"; then return 1; fi
   if grep -Eq 'name: s3|port: 8333|containerPort: 8333|[[:space:]]- -s3$' "$data"; then return 1; fi
-  if grep -Eq 'SEAWEEDFS_(FILER_URL|S3_ENDPOINT)' "$application"; then return 1; fi
+
+  # The storage endpoint used to be banned outright, back when nothing here
+  # spoke to the filer. Attachments do, so a blanket ban would only be evaded;
+  # the replacement is stricter, not looser — one exact value, and the S3
+  # gateway still absent because this deployment does not run it.
+  if [[ "$(grep -Fxc '  SEAWEEDFS_FILER_URL: http://seaweedfs:8888' "$application")" -ne 1 ]]; then
+    echo "error: nchat-config must set SEAWEEDFS_FILER_URL to http://seaweedfs:8888 exactly once" >&2
+    return 1
+  fi
+  if grep -q 'SEAWEEDFS_S3_ENDPOINT' "$application"; then
+    echo "error: nchat-dev must not configure an S3 endpoint" >&2
+    return 1
+  fi
+  # `weed server` leaves the filer off unless told otherwise, which is how port
+  # 8888 came to be declared by the Service while nothing listened on it. The
+  # readiness probe has to be the filer as well: probing only the master is what
+  # kept the gap invisible.
+  policy_block="$(yaml_document "$data" StatefulSet seaweedfs)"
+  if [[ "$(grep -Fc -- '- -filer=true' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: the seaweedfs StatefulSet must start the filer (-filer=true)" >&2
+    return 1
+  fi
+  if ! grep -A4 'readinessProbe:' <<<"$policy_block" | grep -Fq 'port: filer'; then
+    echo "error: seaweedfs readiness must probe the filer port file-service consumes" >&2
+    return 1
+  fi
+
+  # The attachment stack's own configuration. FILE_MALWARE_SCAN_REQUIRED is the
+  # one that must never drift: APP_ENV=nchat-dev sits inside the allowlist that
+  # would let the service accept false, so the manifest is what keeps the gate
+  # on.
+  if [[ "$(grep -Fxc '  FILE_MALWARE_SCAN_REQUIRED: "true"' "$application")" -ne 1 ]]; then
+    echo "error: FILE_MALWARE_SCAN_REQUIRED must be exactly \"true\" in nchat-config" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '  FILE_UPLOADS_ENABLED: "true"' "$application")" -ne 1 ]]; then
+    echo "error: FILE_UPLOADS_ENABLED must be stated explicitly in nchat-config" >&2
+    return 1
+  fi
+  if [[ "$(grep -Fxc '  FILE_MALWARE_SCANNER_ADDRESS: clamav:3310' "$application")" -ne 1 ]]; then
+    echo "error: FILE_MALWARE_SCANNER_ADDRESS must be the host:port dial target clamav:3310" >&2
+    return 1
+  fi
 
   # WS_INBOUND_BURST=60 must be declared exactly once in nchat-config so the
   # web client's bootstrap burst (1 call.sync + 12 subscribe messages) is not
@@ -372,19 +769,23 @@ validate_nchat_dev() {
     return 1
   fi
 
+  # Two references for clamav — the daemon and the init container that seeds its
+  # signatures — so the expected count is 6 + 2.
   mapfile -t external_image_refs < <(
-    grep -hE '^        image: (postgres|valkey/valkey|chrislusf/seaweedfs|livekit/livekit-server|coturn/coturn):' \
+    grep -hE '^ +image: (postgres|valkey/valkey|chrislusf/seaweedfs|livekit/livekit-server|coturn/coturn|clamav/clamav):' \
       "$application" "$data"
   )
   for image_ref in "${external_image_refs[@]}"; do
     image_ref="${image_ref#*image: }"
     [[ "$image_ref" =~ @sha256:[a-f0-9]{64}$ ]]
   done
-  [[ "${#external_image_refs[@]}" -eq 6 ]]
+  [[ "${#external_image_refs[@]}" -eq 8 ]]
 
-  for component in auth chat file notification admin search media web; do
+  for component in auth chat file notification admin search media web clamav upload-guard; do
     grep -q "app.kubernetes.io/component: $component" "$application"
   done
+
+  validate_clamav "$application"
 }
 
 load_nchat_dev_topology "$NCHAT_DEV_TOPOLOGY_FILE"
@@ -405,6 +806,10 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server]}" \
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server/data]}" \
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server/migrations]}"
+  validate_clamav_absent \
+    "infra/k8s/base=${rendered_by_overlay[infra/k8s/base]}" \
+    "infra/k8s/overlays/k3s-dev=${rendered_by_overlay[infra/k8s/overlays/k3s-dev]}" \
+    "infra/k8s/overlays/k3s-staging=${rendered_by_overlay[infra/k8s/overlays/k3s-staging]}"
 fi
 
 echo "K8s manifests CI check passed."

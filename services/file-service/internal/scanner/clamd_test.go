@@ -38,6 +38,12 @@ type fakeDaemon struct {
 	// *local* source failure is exercised: the daemon has nothing to say,
 	// because the terminator it is waiting for will never be sent.
 	silent bool
+	// resetAfterCommand aborts the connection the moment the command arrives,
+	// with SO_LINGER 0 so the peer sees a reset rather than an orderly close.
+	// A reset is the one transport failure an EOF cannot stand in for: it
+	// discards whatever was queued, so a client that read its reply optimistically
+	// would be left holding nothing at all.
+	resetAfterCommand bool
 
 	mu       sync.Mutex
 	received []byte
@@ -72,6 +78,14 @@ func (d *fakeDaemon) serve(conn net.Conn) {
 	d.mu.Lock()
 	d.command = string(command)
 	d.mu.Unlock()
+
+	if d.resetAfterCommand {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetLinger(0)
+		}
+		_ = conn.Close()
+		return
+	}
 
 	if d.silent {
 		// Read whatever arrives and answer nothing, until the client hangs up.
@@ -602,5 +616,91 @@ func TestAnEarlyDaemonVerdictSurvivesAnInterruptedSend(t *testing.T) {
 	}
 	if verdict != scanner.VerdictInfected {
 		t.Fatalf("verdict = %v, want the daemon's early verdict to survive", verdict)
+	}
+}
+
+// TestScanRejectsALimitTheEngineReportsAsAHeuristic is the client half of the
+// threat model's headline finding (TM-01, issue #483): a verdict of clean has
+// to mean the daemon finished looking.
+//
+// clamd stops inspecting when it reaches MaxFileSize, MaxScanSize, MaxFiles or
+// MaxRecursion. What it says about that depends on one setting, and the
+// difference was measured against the pinned clamav/clamav:1.4 image with a
+// 2 MiB file of zeros under MaxFileSize 1M:
+//
+//	AlertExceedsMax no   ->  "/tmp/big.bin: OK"
+//	AlertExceedsMax yes  ->  "/tmp/big.bin: Heuristics.Limits.Exceeded.MaxFileSize FOUND"
+//
+// The deployment now sets it to yes (infra/k8s/base/services/clamav/clamd.conf),
+// which turns an abandoned scan into a rejection. This test pins the client
+// side of that contract: the heuristic name is not special-cased anywhere, so
+// what makes it a rejection is the FOUND suffix — and it must come back as a
+// *verdict*, not an error, or the worker would retry forever instead of
+// recording the outcome.
+func TestScanRejectsALimitTheEngineReportsAsAHeuristic(t *testing.T) {
+	for name, reply := range map[string]string{
+		"file size":  "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND\x00",
+		"scan size":  "stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND\x00",
+		"file count": "stream: Heuristics.Limits.Exceeded.MaxFiles FOUND\x00",
+		"recursion":  "stream: Heuristics.Limits.Exceeded.MaxRecursion FOUND\x00",
+	} {
+		t.Run(name, func(t *testing.T) {
+			daemon := startFakeDaemon(t, &fakeDaemon{reply: reply})
+			client := newClient(t, daemon.address(), 5*time.Second)
+
+			verdict, err := client.Scan(context.Background(), strings.NewReader("a composite file"))
+			if err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+			if verdict != scanner.VerdictInfected {
+				t.Fatalf("verdict = %v, want infected: a limit the engine hit must not be an approval",
+					verdict)
+			}
+		})
+	}
+}
+
+// TestScanNeverApprovesWhatTheDaemonDidNotFinishSaying covers the failures that
+// end a scan without a terminal reply.
+//
+// Every one of them must produce an error rather than a verdict, so the
+// attachment stays in pending_scan and is retried. The security property is the
+// asymmetry: an unfinished exchange may cost a retry, it may never cost an
+// approval. Together with the OK/FOUND cases above and
+// TestScanNeverReportsCleanForAnythingButOK, this completes the verdict matrix
+// the threat model asked to be locked down.
+func TestScanNeverApprovesWhatTheDaemonDidNotFinishSaying(t *testing.T) {
+	cases := map[string]*fakeDaemon{
+		// clamd read the command and the machine went away.
+		"connection reset": {resetAfterCommand: true},
+		// An orderly close with nothing said. Distinct from a reset: the client
+		// sees EOF, not an error from the transport.
+		"hangs up without replying": {reply: ""},
+		// A reply that never reaches its NUL. Indistinguishable from a
+		// truncated one, which is exactly the shape that could smuggle an "OK"
+		// prefix past a client that accepted short reads.
+		"verdict cut short": {reply: "stream: Heuristics.Limits.Exceeded.MaxFileSize FOU"},
+		// clamd's answer when a stream passes StreamMaxLength: it stops reading
+		// mid-body. The file was never inspected, so this is a failure and not
+		// a verdict — and it is the one an operator fixes with configuration.
+		"stream over the daemon's limit": {
+			closeEarly: true,
+			reply:      "INSTREAM size limit exceeded. ERROR\x00",
+		},
+	}
+
+	for name, daemon := range cases {
+		t.Run(name, func(t *testing.T) {
+			started := startFakeDaemon(t, daemon)
+			client := newClient(t, started.address(), 5*time.Second)
+
+			verdict, err := client.Scan(context.Background(), strings.NewReader("payload"))
+			if err == nil {
+				t.Fatalf("Scan succeeded with verdict %v, want an error", verdict)
+			}
+			if verdict == scanner.VerdictClean {
+				t.Fatal("an unfinished exchange produced a clean verdict")
+			}
+		})
 	}
 }

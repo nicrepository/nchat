@@ -3,6 +3,11 @@ kind: Kustomization
 namespace: nchat-dev
 resources:
   - ../../base
+  # ClamAV is referenced here and only here. It lives under base/services/ so
+  # that one clamd.conf serves both Compose and Kubernetes, but it is not a
+  # resource of base/kustomization.yaml: k3s-dev and k3s-staging do not enable
+  # uploads and must not render a 1 GiB scanner they never call.
+  - ../../base/services/clamav
   - ../../secrets/sealed/nchat-dev
   - certificate.yaml
   - ingress.yaml

@@ -252,16 +252,37 @@ spec:
             - -dir=/data
             - -ip=seaweedfs
             - -ip.bind=0.0.0.0
+            # `weed server` starts the master and the volume server; the filer
+            # is opt-in and defaults to off. Without this flag port 8888 is
+            # declared below and by the Service but nothing listens on it, which
+            # is exactly what was found in nchat-dev: `connection refused`.
+            # file-service cannot work without it — SeaweedFSStore.Ping does
+            # GET {filer}/ and that check is critical to /readyz once uploads
+            # are enabled. No second StatefulSet, Deployment or Service is
+            # created: one `weed server` process serves master, volume and filer.
+            - -filer=true
           ports:
             - name: master
               containerPort: 9333
             - name: filer
               containerPort: 8888
-          readinessProbe:
+          # The master has to be up before the filer can serve, so it is the
+          # startup gate; readiness is then the filer, because that is the only
+          # endpoint file-service actually consumes. Probing the master for
+          # readiness is what let a missing filer stay invisible.
+          startupProbe:
             httpGet:
               path: /cluster/status
               port: master
             periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /
+              port: filer
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
             tcpSocket:
               port: master
