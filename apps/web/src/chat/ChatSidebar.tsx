@@ -111,6 +111,23 @@ function IconStar() {
   );
 }
 
+function IconChevronDown() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__chevron-icon"
+      aria-hidden="true"
+    >
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  );
+}
+
 // ── Avatar helpers ────────────────────────────────────────────────────────────
 
 interface AvatarProps {
@@ -424,6 +441,15 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   // One dialog, one trigger, one piece of open state: two of them could be open
   // at once, and there is nothing left for a second one to do (BUG #393).
   const [newConversationOpen, setNewConversationOpen] = useState(false);
+  const [collapsedCategories, setCollapsedCategories] = useState<Record<string, boolean>>({});
+
+  const toggleCategory = (key: string) => {
+    setCollapsedCategories((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
 
@@ -460,7 +486,35 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   // the element that had it, and the scroll position survives a reorder.
   const channels = state.status === "ready" ? state.channels : undefined;
   const dms = state.status === "ready" ? state.dms : undefined;
-  const orderedChannels = useMemo(() => sortByActivity(channels ?? []), [channels]);
+  const categories = state.status === "ready" ? state.categories : undefined;
+
+  const effectiveCategories = (categories && categories.length > 0) ? categories : [{ id: 'uncategorized', name: 'Geral', kind: 'uncategorized' }];
+
+  const groupedChannelsByCategory = useMemo(() => {
+    if (!channels) return [];
+    // If there are no categories (undefined or empty), render a flat list without grouping.
+    if (!effectiveCategories || effectiveCategories.length === 0) {
+      return [{ category: null, channels: sortByActivity(channels) }];
+    }
+
+    const channelsByCat = new Map<string | undefined, Channel[]>();
+    for (const ch of channels) {
+      const key = ch.categoryId || undefined;
+      const list = channelsByCat.get(key) ?? [];
+      list.push(ch);
+      channelsByCat.set(key, list);
+    }
+    return effectiveCategories.map((cat) => {
+      const key = cat.id || undefined;
+      const catChannels = channelsByCat.get(key) ?? [];
+      const ordered = sortByActivity(catChannels);
+      return {
+        category: cat,
+        channels: ordered,
+      };
+    });
+  }, [channels, categories]);
+
   const { orderedDirects, orderedGroups } = useMemo(() => {
     const { directs, groups } = partitionDMs(dms ?? []);
     return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
@@ -546,12 +600,40 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         {state.status === "ready" && (
           <>
             <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              <ChannelList
-                channels={orderedChannels}
-                activeChannelId={activeChannelId}
-                onSelect={handleChannelSelect}
-                labelId={CHANNELS_LABEL_ID}
-              />
+              <div className="chat-sidebar__categories-list">
+                {groupedChannelsByCategory.map(({ category, channels: catChannels }) => {
+                  const categoryKey = category.id || "uncategorized";
+                  const isCollapsed = collapsedCategories[categoryKey] === true;
+
+                  return (
+                    <div key={categoryKey} className="chat-sidebar__category-group">
+                      <button
+                        type="button"
+                        className="chat-sidebar__category-header"
+                        onClick={() => toggleCategory(categoryKey)}
+                        aria-expanded={!isCollapsed}
+                        tabIndex={-1}
+                      >
+                        <span className={`chat-sidebar__category-chevron ${isCollapsed ? "chat-sidebar__category-chevron--collapsed" : ""}`}>
+                          <IconChevronDown />
+                        </span>
+                        <span className="chat-sidebar__category-title">{category.name}</span>
+                      </button>
+
+                      {!isCollapsed && (
+                        <div className="chat-sidebar__category-channels">
+                          <ChannelList
+                            channels={catChannels}
+                            activeChannelId={activeChannelId}
+                            onSelect={handleChannelSelect}
+                            labelId={CHANNELS_LABEL_ID}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </Section>
 
             <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
@@ -607,6 +689,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
       {newConversationOpen && state.status === "ready" && (
         <NewConversationDialog
           currentUserId={state.currentUserId}
+          categories={categories || []}
           onClose={closeNewConversation}
           onOpened={handleDMOpened}
           onChannelCreated={handleChannelCreated}
