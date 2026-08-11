@@ -463,7 +463,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 						m.channel_id IS NOT DISTINCT FROM $2::uuid
 						AND m.dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 					  )
-					  AND `+messageAccessPredicate+`
+					  AND `+messageAccessPredicate("$4")+`
 				))
 		),
 		invalid_mentions AS (
@@ -519,11 +519,9 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				  ON wm.workspace_id = w.id AND wm.user_id = $4::uuid AND wm.status = 'active'
 				JOIN chat.channels c
 				  ON c.id = $2::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'
-				LEFT JOIN chat.channel_members cm
-				  ON cm.channel_id = c.id AND cm.user_id = $4::uuid
 				WHERE $2::uuid IS NOT NULL
 				  AND w.id = $1::uuid AND w.status = 'active'
-				  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+				  AND chat.channel_visible_to_user(c.id, $4::uuid)
 				UNION ALL
 				-- DM message authorization branch.
 				SELECT 1
@@ -632,7 +630,7 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			  AND m.kind = 'user'
 			  AND m.status = 'active'
 			  AND m.deleted_at IS NULL
-			  AND `+messageAccessPredicate+`
+			  AND `+messageAccessPredicate("$3")+`
 			FOR SHARE OF m
 		),
 		inserted AS (
@@ -652,11 +650,7 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			  ON destination_channel.id = $2::uuid
 			 AND destination_channel.workspace_id = destination_workspace.id
 			 AND destination_channel.status = 'active'
-			LEFT JOIN chat.channel_members destination_channel_member
-			  ON destination_channel_member.channel_id = destination_channel.id
-			 AND destination_channel_member.user_id = $3::uuid
-			WHERE destination_channel.type = 'public'
-			   OR destination_channel_member.user_id IS NOT NULL
+			WHERE chat.channel_visible_to_user(destination_channel.id, $3::uuid)
 			ON CONFLICT (workspace_id, sender_id, channel_id, forward_idempotency_key)
 				WHERE forward_idempotency_key IS NOT NULL
 			DO UPDATE SET forward_idempotency_key = EXCLUDED.forward_idempotency_key
@@ -704,7 +698,7 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 		       w.edit_window_seconds, clock_timestamp()
 		FROM chat.messages m`+messageAccessJoins("$3")+`
 		WHERE m.workspace_id = $1 AND m.id = $2
-		  AND `+messageAccessPredicate+`
+		  AND `+messageAccessPredicate("$3")+`
 		FOR UPDATE OF m`,
 		input.WorkspaceID, input.MessageID, input.EditorID,
 	).Scan(&current.SenderID, (*string)(&current.Status), &deletedAt, &current.CreatedAt, &editWindowSeconds, &databaseNow)
@@ -772,7 +766,7 @@ func (s *PGXMessageStore) DeleteMessage(ctx context.Context, input DeleteMessage
 		SELECT m.sender_id::text, m.kind, m.status, m.deleted_at, clock_timestamp()
 		FROM chat.messages m`+messageAccessJoins("$3")+`
 		WHERE m.workspace_id = $1 AND m.id = $2
-		  AND `+messageAccessPredicate+`
+		  AND `+messageAccessPredicate("$3")+`
 		FOR UPDATE OF m`,
 		input.WorkspaceID, input.MessageID, input.RequesterID,
 	).Scan(&current.SenderID, (*string)(&current.Kind), (*string)(&current.Status), &deletedAt, &databaseNow)
@@ -831,7 +825,7 @@ func (s *PGXMessageStore) ListMessageEditHistory(ctx context.Context, input List
 			FROM chat.messages m`+messageAccessJoins("$3")+`
 			WHERE m.workspace_id = $1 AND m.id = $2
 			  AND m.status = 'active' AND m.deleted_at IS NULL
-			  AND `+messageAccessPredicate+`
+			  AND `+messageAccessPredicate("$3")+`
 		)
 		SELECT COALESCE(h.id::text, ''), COALESCE(h.message_id::text, ''),
 		       COALESCE(h.body, ''), COALESCE(h.body_format, ''),
@@ -971,7 +965,7 @@ func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, worksp
 		  AND m.status = 'active'
 		  AND m.channel_id IS NOT DISTINCT FROM $3
 		  AND m.dm_conversation_id IS NOT DISTINCT FROM $4
-		  AND `+messageAccessPredicate,
+		  AND `+messageAccessPredicate("$5"),
 		messageID, workspaceID, nullableUUID(channelID), nullableUUID(dmConversationID), userID,
 	).Scan(&exists)
 	if err != nil {
@@ -1002,7 +996,7 @@ func (s *PGXMessageStore) ResolveMessageReferences(ctx context.Context, workspac
 		WHERE m.workspace_id = $1::uuid
 		  AND m.status = 'active'
 		  AND m.deleted_at IS NULL
-		  AND `+messageAccessPredicate,
+		  AND `+messageAccessPredicate("$2"),
 		workspaceID, userID, messageIDs,
 	)
 	if err != nil {
@@ -1043,7 +1037,7 @@ func (s *PGXMessageStore) ListReferencedMessageIDs(ctx context.Context, workspac
 		  AND m.status = 'active'
 		  AND m.deleted_at IS NULL
 		  AND m.referenced_message_id IS NOT NULL
-		  AND `+messageAccessPredicate,
+		  AND `+messageAccessPredicate("$2"),
 		workspaceID, userID, nullableUUID(channelID), nullableUUID(dmConversationID), messageIDs,
 	)
 	if err != nil {
@@ -1072,7 +1066,7 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 		FROM chat.messages m`+messageAccessJoins("$3")+`
 		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 		WHERE m.id = $1 AND m.workspace_id = $2
-		  AND `+messageAccessPredicate,
+		  AND `+messageAccessPredicate("$3"),
 		messageID, workspaceID, userID,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
@@ -1110,14 +1104,12 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  ON w.id = m.workspace_id AND w.status = 'active'
 			JOIN chat.workspace_members wm
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
-			LEFT JOIN chat.channel_members cm
-			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
 			LEFT JOIN auth.users u
 			  ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 			WHERE m.workspace_id = $1
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
-			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+			  AND chat.channel_visible_to_user(c.id, $3::uuid)
 			  AND (m.created_at, m.id) < ($4, $5::uuid)
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $6`,
@@ -1135,14 +1127,12 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  ON w.id = m.workspace_id AND w.status = 'active'
 			JOIN chat.workspace_members wm
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
-			LEFT JOIN chat.channel_members cm
-			  ON cm.channel_id = m.channel_id AND cm.user_id = $3
 			LEFT JOIN auth.users u
 			  ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 			WHERE m.workspace_id = $1
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
-			  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+			  AND chat.channel_visible_to_user(c.id, $3::uuid)
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $4`,
 			input.WorkspaceID, input.ChannelID, input.UserID,

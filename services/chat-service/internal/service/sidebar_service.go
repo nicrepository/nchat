@@ -121,8 +121,10 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 		Workspace: workspace,
 		Channels:  sidebarChannels,
 		DMs:       dms,
-		// Constant by construction, not a role lookup: every path that reaches
-		// here has already proved the membership channel creation requires.
-		CanCreateChannel: true,
+		// The same predicate CreateChannel enforces, not a constant: active
+		// membership stopped being sufficient when RF-74 excluded the guest.
+		// This flag is an affordance, never the control — ChannelService still
+		// decides — but it must not offer a guest a button that returns 403.
+		CanCreateChannel: domain.CanCreateChannel(&member),
 	}, nil
 }

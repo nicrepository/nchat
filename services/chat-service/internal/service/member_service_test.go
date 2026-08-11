@@ -128,8 +128,8 @@ func TestMemberService_SyncGeneralMemberships_ActiveMembersOnly(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.generalChannels["ws-1"] = "ch-geral"
 	ms.workspaceMembers[wmKey("ws-1", "active")] = activeMembership("ws-1", "active")
-	ms.workspaceMembers[wmKey("ws-1", "suspended")] = domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: "suspended", Status: domain.MemberStatusSuspended}
-	ms.workspaceMembers[wmKey("ws-1", "left")] = domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: "left", Status: domain.MemberStatusLeft}
+	ms.workspaceMembers[wmKey("ws-1", "suspended")] = domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: "suspended", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended}
+	ms.workspaceMembers[wmKey("ws-1", "left")] = domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: "left", Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusLeft}
 	general := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", IsGeneral: true, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
 	workspace := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
 
@@ -198,7 +198,7 @@ func TestMemberService_EnsureGeneralMembership_SuspendedAndLeftMembersAreSkipped
 		t.Run(string(status), func(t *testing.T) {
 			ms := newFakeMemberStore()
 			ms.generalChannels["ws-1"] = "ch-geral"
-			ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: "user-1", Status: status}
+			ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: status}
 			general := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", IsGeneral: true, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
 			workspace := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
 
@@ -231,6 +231,42 @@ func TestMemberService_SelfJoinChannel_PublicChannel_Success(t *testing.T) {
 	}
 	if m.ChannelID != "ch-1" || m.UserID != "user-1" || m.Role != domain.ChannelRoleMember {
 		t.Fatalf("unexpected member: %+v", m)
+	}
+}
+
+// RF-74: self-join is the shortest path around guest isolation there is —
+// scoping a guest to the channels it was added to means nothing if it can add
+// itself to any public channel. Owner, admin, moderator and member still join
+// freely; a guest and an unrecognised role are refused and write nothing.
+func TestMemberService_SelfJoinChannel_FollowsCanReachPublicChannels(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
+		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard"),
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+			ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+			ms.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "user-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+
+			_, err := svc.SelfJoinChannel(context.Background(), "ws-1", "ch-1", "user-1")
+			allowed := domain.CanReachPublicChannels(&domain.WorkspaceMember{Role: role, Status: domain.MemberStatusActive})
+
+			if allowed && err != nil {
+				t.Fatalf("predicate allows %s but the service refused: %v", role, err)
+			}
+			if !allowed {
+				if !errors.Is(err, domain.ErrForbidden) {
+					t.Fatalf("predicate denies %s but the service returned %v", role, err)
+				}
+				if _, ok := ms.channelMembers[cmKey("ch-1", "user-1")]; ok {
+					t.Fatal("a refused caller joined the channel anyway")
+				}
+			}
+		})
 	}
 }
 
@@ -525,6 +561,43 @@ func TestMemberService_RemoveMemberFromChannel_GuestRoleDenied(t *testing.T) {
 	}
 }
 
+// Adding and removing the same channel_members row are the same authority, so
+// the moderator RF-74 created reaches both. The assertion is against
+// domain.CanManageChannelMembers itself, not a second role list: the route must
+// consult the named predicate and nothing stricter above it.
+func TestMemberService_RemoveMemberFromChannel_FollowsCanManageChannelMembers(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
+		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard"),
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ch := domain.Channel{ID: "ch-1", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+			ws := domain.Workspace{ID: "ws-1", Status: domain.WorkspaceStatusActive}
+			ms.workspaceMembers[wmKey("ws-1", "caller-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "caller-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			ms.channelMembers[cmKey("ch-1", "user-1")] = domain.ChannelMember{ChannelID: "ch-1", UserID: "user-1", Role: domain.ChannelRoleMember}
+			svc := service.NewMemberService(ms, &fakeChannelStore{channel: ch}, &fakeWorkspaceStore{workspace: ws})
+
+			err := svc.RemoveMemberFromChannel(context.Background(), "ws-1", "ch-1", "caller-1", "user-1")
+			allowed := domain.CanManageChannelMembers(&domain.WorkspaceMember{Role: role, Status: domain.MemberStatusActive})
+
+			if allowed && err != nil {
+				t.Fatalf("predicate allows %s but the service refused: %v", role, err)
+			}
+			if !allowed {
+				if !errors.Is(err, domain.ErrForbidden) {
+					t.Fatalf("predicate denies %s but the service returned %v", role, err)
+				}
+				if _, ok := ms.channelMembers[cmKey("ch-1", "user-1")]; !ok {
+					t.Fatal("a refused caller removed a membership")
+				}
+			}
+		})
+	}
+}
+
 func TestMemberService_RemoveMemberFromChannel_GeneralChannel_Denied(t *testing.T) {
 	ms := newFakeMemberStore()
 	ch := domain.Channel{ID: "ch-geral", WorkspaceID: "ws-1", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true}
@@ -647,4 +720,108 @@ func TestMemberService_SelfJoinChannel_NotFound_ExactErrorShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Regression for the test double itself: the fake member store used to join
+// every active member to #geral, guests included, while PGXMemberStore stopped
+// doing that for guests in RF-74. A fake that is more permissive than the store
+// makes the service suite agree with a state production cannot produce, so a
+// regression in the guest boundary would have gone unnoticed here.
+//
+// Both sides now gate on domain.CanReachPublicChannels.
+func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T) {
+	general := func(ms *fakeMemberStore) (string, bool) {
+		_, ok := ms.channelMembers[cmKey("ch-geral", "u")]
+		return "ch-geral", ok
+	}
+
+	t.Run("AddWorkspaceMember", func(t *testing.T) {
+		for _, tt := range []struct {
+			role domain.WorkspaceRole
+			want bool
+		}{
+			{role: domain.WorkspaceRoleGuest, want: false},
+			{role: domain.WorkspaceRoleMember, want: true},
+			{role: domain.WorkspaceRoleModerator, want: true},
+			{role: domain.WorkspaceRoleAdmin, want: true},
+			{role: domain.WorkspaceRoleOwner, want: true},
+		} {
+			t.Run(string(tt.role), func(t *testing.T) {
+				ms := newFakeMemberStore()
+				ms.generalChannels["ws-1"] = "ch-geral"
+				if _, err := ms.AddWorkspaceMember(context.Background(), "ws-1", "u", tt.role); err != nil {
+					t.Fatalf("AddWorkspaceMember: %v", err)
+				}
+				if _, got := general(ms); got != tt.want {
+					t.Fatalf("%s in #geral = %v, want %v", tt.role, got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("ActivateWorkspaceMember", func(t *testing.T) {
+		for _, tt := range []struct {
+			role domain.WorkspaceRole
+			want bool
+		}{
+			{role: domain.WorkspaceRoleGuest, want: false},
+			{role: domain.WorkspaceRoleMember, want: true},
+		} {
+			t.Run(string(tt.role), func(t *testing.T) {
+				ms := newFakeMemberStore()
+				ms.generalChannels["ws-1"] = "ch-geral"
+				ms.workspaceMembers[wmKey("ws-1", "u")] = domain.WorkspaceMember{
+					WorkspaceID: "ws-1", UserID: "u", Role: tt.role, Status: domain.MemberStatusLeft,
+				}
+				if _, err := ms.ActivateWorkspaceMember(context.Background(), "ws-1", "u"); err != nil {
+					t.Fatalf("ActivateWorkspaceMember: %v", err)
+				}
+				if _, got := general(ms); got != tt.want {
+					t.Fatalf("reactivated %s in #geral = %v, want %v", tt.role, got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("SyncGeneralMemberships skips guests", func(t *testing.T) {
+		ms := newFakeMemberStore()
+		ms.generalChannels["ws-1"] = "ch-geral"
+		ms.workspaceMembers[wmKey("ws-1", "u")] = domain.WorkspaceMember{
+			WorkspaceID: "ws-1", UserID: "u", Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive,
+		}
+		ms.workspaceMembers[wmKey("ws-1", "m")] = activeMembership("ws-1", "m")
+
+		inserted, err := ms.SyncGeneralMemberships(context.Background(), "ws-1")
+		if err != nil {
+			t.Fatalf("SyncGeneralMemberships: %v", err)
+		}
+		if inserted != 1 {
+			t.Fatalf("inserted = %d, want 1 (the member only)", inserted)
+		}
+		if _, ok := general(ms); ok {
+			t.Fatal("sync joined a guest to #geral")
+		}
+	})
+
+	// "A guest is not joined automatically" is not "a guest may never belong".
+	// RF-74 says a guest reaches the channels it was explicitly added to, and
+	// #geral is not special: an explicit membership must survive a sync, which
+	// only ever inserts.
+	t.Run("explicit guest membership survives sync", func(t *testing.T) {
+		ms := newFakeMemberStore()
+		ms.generalChannels["ws-1"] = "ch-geral"
+		ms.workspaceMembers[wmKey("ws-1", "u")] = domain.WorkspaceMember{
+			WorkspaceID: "ws-1", UserID: "u", Role: domain.WorkspaceRoleGuest, Status: domain.MemberStatusActive,
+		}
+		if _, err := ms.AddChannelMember(context.Background(), "ch-geral", "u", domain.ChannelRoleMember); err != nil {
+			t.Fatalf("explicitly add guest to #geral: %v", err)
+		}
+
+		if _, err := ms.SyncGeneralMemberships(context.Background(), "ws-1"); err != nil {
+			t.Fatalf("SyncGeneralMemberships: %v", err)
+		}
+		if _, ok := general(ms); !ok {
+			t.Fatal("sync removed a guest's explicit #geral membership")
+		}
+	})
 }

@@ -70,6 +70,13 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 			SELECT b.channel_id::text AS channel_id, ''::text AS dm_id
 			FROM base b
 			JOIN chat.channels c ON c.id = b.channel_id AND c.status = 'active' AND c.type = 'public'
+			-- A public channel is reachable by workspace membership alone for
+			-- every role except guest (RF-74), whose reach is only the channels
+			-- it belongs to. A guest that does belong is admitted here, by the
+			-- chat.channel_members half of the shared function -- not by the
+			-- private_channel branch below, which only ever matches c.type =
+			-- 'private'. This branch is the only one that admits a guest.
+			WHERE chat.channel_visible_to_user(c.id, $2)
 			FOR SHARE OF c
 		),
 		private_channel AS MATERIALIZED (

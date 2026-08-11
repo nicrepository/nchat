@@ -137,13 +137,40 @@ func (s *ChannelCategoryService) ListGroupedChannels(ctx context.Context, worksp
 	return groups, nil
 }
 
+// requireChannelCategoryManager is the single authorization gate for every
+// category mutation.
+//
+// It consults domain.CanManageChannelCategories and nothing stricter above it.
+// The distinction matters: this used to call requireWorkspaceManager, which
+// applies domain.CanManageWorkspace, leaving CanManageChannelCategories as
+// decoration — RF-74 widening that predicate to the workspace moderator would
+// have had no effect on these four routes. The predicate a route names must be
+// the predicate the route actually runs. Same reasoning, and same shape, as
+// MemberService.AddChannelMembers.
+//
+// Every denial is domain.ErrForbidden, from requireActiveWorkspaceMember or
+// from here, so a caller cannot tell "workspace does not exist" from "you are
+// not a member" from "your role is not enough".
+func requireChannelCategoryManager(
+	ctx context.Context, workspaces storage.WorkspaceStore, members storage.MemberStore, workspaceID, callerID string,
+) error {
+	member, err := requireActiveWorkspaceMember(ctx, workspaces, members, workspaceID, callerID)
+	if err != nil {
+		return err
+	}
+	if !domain.CanManageChannelCategories(&member) {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
 // CreateChannelCategory appends a category to the workspace.
 //
 // The management role is checked here so a caller with no business in this
 // workspace is refused before the name validation can tell them anything about
 // it, and again inside the INSERT, which is the decision that counts.
 func (s *ChannelCategoryService) CreateChannelCategory(ctx context.Context, input CreateChannelCategoryInput) (domain.ChannelCategory, error) {
-	if _, err := requireWorkspaceManager(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID); err != nil {
+	if err := requireChannelCategoryManager(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID); err != nil {
 		return domain.ChannelCategory{}, err
 	}
 	name, err := domain.NormalizeChannelCategoryName(input.Name)
@@ -178,7 +205,7 @@ func (s *ChannelCategoryService) CreateChannelCategory(ctx context.Context, inpu
 // RenameChannelCategory renames one category of the workspace. The name is the
 // only field a caller may change; position moves only through reordering.
 func (s *ChannelCategoryService) RenameChannelCategory(ctx context.Context, input RenameChannelCategoryInput) (domain.ChannelCategory, error) {
-	if _, err := requireWorkspaceManager(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID); err != nil {
+	if err := requireChannelCategoryManager(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID); err != nil {
 		return domain.ChannelCategory{}, err
 	}
 	name, err := domain.NormalizeChannelCategoryName(input.Name)
@@ -206,7 +233,7 @@ func (s *ChannelCategoryService) RenameChannelCategory(ctx context.Context, inpu
 // exceed MaxCategoriesPerWorkspace. The set itself is verified against the rows
 // the store locks, not against a count read beforehand.
 func (s *ChannelCategoryService) ReorderChannelCategories(ctx context.Context, input ReorderChannelCategoriesInput) ([]domain.ChannelCategory, error) {
-	if _, err := requireWorkspaceManager(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID); err != nil {
+	if err := requireChannelCategoryManager(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID); err != nil {
 		return nil, err
 	}
 	if len(input.OrderedIDs) == 0 || len(input.OrderedIDs) > domain.MaxCategoriesPerWorkspace {
@@ -236,7 +263,7 @@ func (s *ChannelCategoryService) ReorderChannelCategories(ctx context.Context, i
 // service has no idempotent deletes, and reporting "deleted" for something that
 // was never there would hide a client bug.
 func (s *ChannelCategoryService) DeleteChannelCategory(ctx context.Context, workspaceID, categoryID, callerID string) error {
-	if _, err := requireWorkspaceManager(ctx, s.workspaces, s.members, workspaceID, callerID); err != nil {
+	if err := requireChannelCategoryManager(ctx, s.workspaces, s.members, workspaceID, callerID); err != nil {
 		return err
 	}
 	return s.categories.DeleteChannelCategoryForManager(ctx, workspaceID, categoryID, callerID)

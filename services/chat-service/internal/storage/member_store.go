@@ -235,7 +235,12 @@ func (s *PGXMemberStore) EnsureGeneralMembership(ctx context.Context, workspaceI
 }
 
 // SyncGeneralMemberships backfills missing #geral memberships for active
-// workspace members only. It returns the number of inserted channel_members rows.
+// workspace members only, excluding guests (RF-74). It returns the number of
+// inserted channel_members rows.
+//
+// It never removes a row. A guest that already holds a #geral membership — one
+// written before RF-74, or one a manager added deliberately — keeps it; the
+// backfill only stops creating new ones.
 func (s *PGXMemberStore) SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -261,6 +266,7 @@ func (s *PGXMemberStore) SyncGeneralMemberships(ctx context.Context, workspaceID
 		FROM chat.workspace_members wm
 		WHERE wm.workspace_id = $2
 		  AND wm.status = 'active'
+		  AND wm.role IN `+generalMembershipRoles+`
 		ON CONFLICT (channel_id, user_id) DO NOTHING`,
 		generalChannelID, workspaceID, string(domain.ChannelRoleMember),
 	)
@@ -295,12 +301,26 @@ func ensureWorkspaceActive(ctx context.Context, q memberQuerier, workspaceID str
 	return nil
 }
 
+// ensureGeneralMembership adds userID to the workspace's #geral channel, unless
+// userID is a guest.
+//
+// The exclusion is the RF-74 guest boundary applied to the one channel every
+// member is joined to automatically. #geral is where a workspace's traffic
+// lives; auto-joining a guest to it would mean "restricted to the channels it
+// was explicitly added to" started with the busiest channel in the workspace
+// already granted. A guest reaches #geral the same way it reaches any other
+// channel: somebody with domain.CanManageChannelMembers adds it.
+//
+// The role is not passed in and not read separately: the insert selects it from
+// the membership row inside the caller's transaction, so the decision cannot be
+// taken against a role that has since changed, and a membership row that is not
+// there writes nothing.
 func ensureGeneralMembership(ctx context.Context, q memberQuerier, workspaceID, userID string) error {
 	generalChannelID, err := getGeneralChannelID(ctx, q, workspaceID)
 	if err != nil {
 		return err
 	}
-	if err := addGeneralChannelMember(ctx, q, generalChannelID, userID); err != nil {
+	if err := addGeneralChannelMember(ctx, q, generalChannelID, workspaceID, userID); err != nil {
 		return err
 	}
 	return nil
@@ -327,12 +347,22 @@ func getGeneralChannelID(ctx context.Context, q memberQuerier, workspaceID strin
 	return channelID, nil
 }
 
-func addGeneralChannelMember(ctx context.Context, q memberQuerier, channelID, userID string) error {
+// generalMembershipRoles is the role list that receives #geral automatically,
+// and the SQL statement of domain.CanReachPublicChannels: a guest is excluded,
+// and so is any role this list does not recognise. Shared by the single-user
+// path and the backfill so the two cannot disagree about who #geral belongs to.
+const generalMembershipRoles = `('owner', 'admin', 'moderator', 'member')`
+
+func addGeneralChannelMember(ctx context.Context, q memberQuerier, channelID, workspaceID, userID string) error {
 	_, err := q.Exec(ctx, `
 		INSERT INTO chat.channel_members (channel_id, user_id, role)
-		VALUES ($1, $2, $3)
+		SELECT $1, wm.user_id, $4
+		FROM chat.workspace_members wm
+		WHERE wm.workspace_id = $2
+		  AND wm.user_id = $3
+		  AND wm.role IN `+generalMembershipRoles+`
 		ON CONFLICT (channel_id, user_id) DO NOTHING`,
-		channelID, userID, string(domain.ChannelRoleMember),
+		channelID, workspaceID, userID, string(domain.ChannelRoleMember),
 	)
 	if err != nil {
 		return fmt.Errorf("add general channel member: %w", err)
@@ -440,9 +470,10 @@ func (s *PGXMemberStore) AddChannelMembers(
 	// memberships. Locking the row also serialises this against a concurrent
 	// role change rather than merely observing it.
 	//
-	// The role list is the SQL statement of domain.CanManageChannelMembers. The
-	// two must agree; the service's decision is deliberately not passed down as
-	// a boolean, because a boolean computed a moment ago is exactly the thing
+	// The role list is the SQL statement of domain.CanManageChannelMembers,
+	// which RF-74 widened from owner/admin to include the workspace moderator.
+	// The two must agree; the service's decision is deliberately not passed down
+	// as a boolean, because a boolean computed a moment ago is exactly the thing
 	// this query exists to distrust.
 	//
 	// FOR SHARE rather than FOR UPDATE, matching managerAuthorizedWorkspace in
@@ -466,7 +497,7 @@ func (s *PGXMemberStore) AddChannelMembers(
 		WHERE wm.workspace_id = $1::uuid
 		  AND wm.user_id = $3::uuid
 		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin')
+		  AND wm.role IN ('owner', 'admin', 'moderator')
 		FOR SHARE OF wm`,
 		workspaceID, channelID, callerID,
 	).Scan(&actorAuthorized)

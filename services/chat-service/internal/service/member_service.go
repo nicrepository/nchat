@@ -64,6 +64,13 @@ func (s *MemberService) SyncGeneralMemberships(ctx context.Context, workspaceID 
 // #geral explicit join is idempotent (returns existing membership).
 // The caller must be an active workspace member; the workspace must be active.
 // The channel role is always ChannelRoleMember; the caller cannot set it.
+//
+// A guest is refused (RF-74). This route is the shortest path around guest
+// isolation there is: the whole point of scoping a guest to the channels it was
+// added to is lost if it can add itself to any public channel. The predicate is
+// domain.CanReachPublicChannels — the same one that decides whether the guest
+// could have read the channel in the first place — so a role that may not read
+// a public channel may not join one either.
 func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channelID, userID string) (domain.ChannelMember, error) {
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
 	if errors.Is(err, domain.ErrNotFound) {
@@ -97,6 +104,9 @@ func (s *MemberService) SelfJoinChannel(ctx context.Context, workspaceID, channe
 		return domain.ChannelMember{}, fmt.Errorf("get workspace member: %w", err)
 	}
 	if wm.Status != domain.MemberStatusActive {
+		return domain.ChannelMember{}, domain.ErrForbidden
+	}
+	if !domain.CanReachPublicChannels(&wm) {
 		return domain.ChannelMember{}, domain.ErrForbidden
 	}
 
@@ -320,8 +330,12 @@ func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID
 }
 
 // RemoveMemberFromChannel removes targetUserID from channelID in workspaceID.
-// callerID must be an active owner or admin in the workspace.
-// Returns ErrForbidden when removing from #geral or when caller lacks manager permission.
+//
+// Authorization is domain.CanManageChannelMembers — the same predicate the add
+// path uses, rather than a second inline role list that could drift from it.
+// Adding and removing the same row are the same authority, so RF-74 widening
+// the add to the workspace moderator widens the removal with it.
+// Returns ErrForbidden when removing from #geral or when caller lacks permission.
 func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) error {
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
 	if err != nil {
@@ -349,10 +363,7 @@ func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID
 	if err != nil {
 		return fmt.Errorf("get caller workspace member: %w", err)
 	}
-	if caller.Status != domain.MemberStatusActive {
-		return domain.ErrForbidden
-	}
-	if caller.Role != domain.WorkspaceRoleOwner && caller.Role != domain.WorkspaceRoleAdmin {
+	if !domain.CanManageChannelMembers(&caller) {
 		return domain.ErrForbidden
 	}
 

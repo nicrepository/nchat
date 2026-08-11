@@ -272,7 +272,7 @@ func TestPGXChannelStore_ListVisibleChannelsByUser_ReturnsChannels(t *testing.T)
 	defer mock.Close()
 
 	now := time.Now()
-	mock.ExpectQuery(`(?s)FROM chat\.channels c.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.workspace_id = c\.workspace_id.*wm\.user_id = \$2.*wm\.status = 'active'.*LEFT JOIN chat\.channel_members cm.*cm\.channel_id = c\.id.*cm\.user_id = \$2.*WHERE c\.workspace_id = \$1.*c\.status = 'active'.*c\.is_general = true OR c\.type = 'public' OR cm\.channel_id IS NOT NULL`).
+	mock.ExpectQuery(`(?s)FROM chat\.channels c.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.workspace_id = c\.workspace_id.*wm\.user_id = \$2.*wm\.status = 'active'.*LEFT JOIN chat\.channel_members cm.*cm\.channel_id = c\.id.*cm\.user_id = \$2.*WHERE c\.workspace_id = \$1.*c\.status = 'active'.*chat\.channel_visible_to_user\(c\.id, \$2::uuid\)`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(visibleChannelAccessCols()).
 			AddRow("ch-geral", "ws-1", "", "geral", "Geral", "public", "active", true, 0, "", now, now, "", "", "", nil).
@@ -561,7 +561,7 @@ func TestPGXChannelStore_GetVisibleChannelByID_SQLVisibility(t *testing.T) {
 	defer mock.Close()
 
 	now := time.Now()
-	mock.ExpectQuery(`(?s)FROM chat\.channels c.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.workspace_id = c\.workspace_id.*wm\.user_id = \$3.*wm\.status = 'active'.*LEFT JOIN chat\.channel_members cm.*cm\.channel_id = c\.id.*cm\.user_id = \$3.*WHERE c\.workspace_id = \$1.*c\.id = \$2.*c\.status = 'active'.*c\.is_general = true OR c\.type = 'public' OR cm\.channel_id IS NOT NULL`).
+	mock.ExpectQuery(`(?s)FROM chat\.channels c.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.workspace_id = c\.workspace_id.*wm\.user_id = \$3.*wm\.status = 'active'.*WHERE c\.workspace_id = \$1.*c\.id = \$2.*c\.status = 'active'.*chat\.channel_visible_to_user\(c\.id, \$3::uuid\)`).
 		WithArgs("ws-1", "ch-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "private", "Private", "private", "active", false, 0, "", now, now))
@@ -604,7 +604,7 @@ func TestPGXChannelStore_GetVisibleChannelBySlug_NotFoundForHiddenChannel(t *tes
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`(?s)FROM chat\.channels c.*c\.slug = \$2.*cm\.channel_id IS NOT NULL`).
+	mock.ExpectQuery(`(?s)FROM chat\.channels c.*c\.slug = \$2.*chat\.channel_visible_to_user\(c\.id, \$3::uuid\)`).
 		WithArgs("ws-1", "private", "user-1").
 		WillReturnRows(pgxmock.NewRows(channelCols()))
 

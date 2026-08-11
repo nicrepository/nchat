@@ -28,14 +28,17 @@ const createMsgSQL = `(?s)invalid_refs AS.*m\.status = 'active'.*m\.deleted_at I
 	`INSERT INTO chat\.messages.*` +
 	`chat\.workspace_members.*wm\.status.*active.*` +
 	`chat\.channels.*c\.status.*active.*` +
-	`chat\.channel_members.*` +
+	// Channel read access is chat.channel_visible_to_user's answer and nothing
+	// else, so the guest scope RF-74 defines applies to posting too.
+	`chat\.channel_visible_to_user\(c\.id, \$4::uuid\).*` +
 	`chat\.dm_conversations.*dc\.status.*active.*` +
 	`chat\.dm_members.*dm\.status.*active`
 
 const forwardMsgSQL = `(?s)WITH source AS.*` +
 	`m\.channel_id <>.*m\.kind = 'user'.*m\.status = 'active'.*FOR SHARE OF m.*` +
 	`INSERT INTO chat\.messages.*source\.body_text.*source\.body_format.*source\.id.*` +
-	`destination_workspace.*destination_member.*destination_channel.*destination_channel_member.*` +
+	`destination_workspace.*destination_member.*destination_channel.*` +
+	`chat\.channel_visible_to_user\(destination_channel\.id, \$3::uuid\).*` +
 	`ON CONFLICT.*forward_idempotency_key`
 
 // messageCols returns the column names matching messageColumns("") scan order.
@@ -727,7 +730,7 @@ func TestPGXMessageStore_ValidateRefMessageInTarget_DeletedReturnsErrInvalidRef(
 func TestPGXMessageStore_ResolveMessageReferences_FiltersWithCanonicalReadAccess(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now().UTC()
-	mock.ExpectQuery(`(?s)FROM unnest\(\$3::text\[\]\).*JOIN chat\.messages m.*JOIN chat\.workspace_members wm.*LEFT JOIN chat\.channel_members cm.*LEFT JOIN chat\.dm_members dm.*m\.status = 'active'.*m\.deleted_at IS NULL`).
+	mock.ExpectQuery(`(?s)FROM unnest\(\$3::text\[\]\).*JOIN chat\.messages m.*JOIN chat\.workspace_members wm.*LEFT JOIN chat\.dm_members dm.*m\.status = 'active'.*m\.deleted_at IS NULL.*chat\.channel_visible_to_user\(c\.id, \$2::uuid\)`).
 		WithArgs("ws-1", "user-1", []string{"msg-visible", "msg-hidden"}).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"message_id", "target_type", "target_id", "target_label", "author", "body", "body_format", "created_at",
