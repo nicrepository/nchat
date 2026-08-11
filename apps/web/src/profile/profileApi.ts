@@ -33,11 +33,16 @@ interface AvatarResponse {
 }
 
 interface SelfProfileResponse {
-  data: { id: string; display_name: string; avatar_url?: unknown };
+  data: { id: string; display_name?: unknown; avatar_url?: unknown };
 }
 
 export interface SelfProfile {
   id: string;
+  /**
+   * Trimmed display name, and "" when the server has no usable one. Callers get
+   * a single rule for "is there a name to show?" instead of each re-deciding
+   * whether whitespace counts.
+   */
   displayName: string;
   /** Present only when set and same-origin; a cross-origin value is dropped. */
   avatarUrl?: string;
@@ -55,9 +60,18 @@ export async function fetchMyProfile(signal?: AbortSignal): Promise<SelfProfile>
   });
   return {
     id: res.data.id,
-    displayName: res.data.display_name,
+    displayName: normalizeDisplayName(res.data.display_name),
     avatarUrl: sameOriginAvatarUrl(res.data.avatar_url),
   };
+}
+
+/**
+ * "" for anything that is not a name: absent, null, empty, whitespace-only.
+ * Trimming here rather than at render time means the same value decides both
+ * what is shown and what the initials are derived from.
+ */
+function normalizeDisplayName(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim() : "";
 }
 
 /**

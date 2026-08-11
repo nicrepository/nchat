@@ -137,15 +137,6 @@ export interface DirectDMResult {
   created: boolean;
 }
 
-// ── Current user (sidebar footer) ───────────────────────────────────────────
-
-export interface CurrentUser {
-  displayName: string;
-  initials: string;
-  color: AvatarColor;
-  role: string;
-}
-
 // ── Sidebar active selection ─────────────────────────────────────────────────
 
 export type ActiveItem = { kind: "channel"; id: string } | { kind: "dm"; id: string } | null;
