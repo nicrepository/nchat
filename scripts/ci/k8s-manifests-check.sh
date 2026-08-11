@@ -556,19 +556,25 @@ validate_coturn_template() {
     "listening-port=$TURN_LISTEN_PORT" \
     "min-port=$TURN_RELAY_MIN_PORT" \
     "max-port=$TURN_RELAY_MAX_PORT" \
-    'use-auth-secret' 'no-multicast-peers' 'no-cli' 'fingerprint'; do
+    "external-ip=$NCHAT_DEV_TURN_EXTERNAL_IP/$NCHAT_DEV_NODE_IP" \
+    "realm=$NCHAT_DEV_HOST" \
+    'use-auth-secret' 'no-multicast-peers' 'no-cli' 'no-tls' 'no-dtls' 'fingerprint'; do
     [[ "$(grep -Fxc -- "$directive" "$rendered" || true)" -eq 1 ]] || {
       echo "error: expected exactly one coturn directive: $directive" >&2
       return 1
     }
   done
   [[ "$(grep -c '^allowed-peer-ip=' "$rendered" || true)" -eq 1 ]]
+  [[ "$(grep -c '^external-ip=' "$rendered" || true)" -eq 1 ]]
   if grep -Eq '^[[:space:]]*allow-loopback-peers([[:space:]]|$)' "$rendered"; then return 1; fi
   if grep -Eq '^allowed-peer-ip=.*-' "$rendered"; then return 1; fi
   if grep -Eq 'REPLACE_ME_(NODE_IP|HOST|LIVEKIT_|TURN_)' "$rendered" "$livekit"; then return 1; fi
   grep -Fxq "port: $LIVEKIT_API_PORT" "$livekit"
   grep -Fxq "  tcp_port: $LIVEKIT_RTC_TCP_PORT" "$livekit"
   grep -Fxq "  udp_port: $LIVEKIT_RTC_UDP_PORT" "$livekit"
+  grep -Fxq "    - host: turn.$NCHAT_DEV_HOST" "$livekit"
+  grep -Fxq "      port: $TURN_LISTEN_PORT" "$livekit"
+  grep -Fxq '      protocol: udp' "$livekit"
 }
 
 validate_nchat_dev() {

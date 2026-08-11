@@ -136,7 +136,8 @@ umask 077
 cp infra/k8s/overlays/nchat-dev-server/topology.env.example \
   infra/k8s/overlays/nchat-dev-server/topology.env
 chmod 0600 infra/k8s/overlays/nchat-dev-server/topology.env
-# Edite NCHAT_DEV_NODE_IP, NCHAT_DEV_NODE_CIDR e NCHAT_DEV_HOST.
+# Edite NCHAT_DEV_NODE_IP, NCHAT_DEV_NODE_CIDR, NCHAT_DEV_HOST e
+# NCHAT_DEV_TURN_EXTERNAL_IP.
 # Confirme que nenhum REPLACE_ME permanece.
 ! grep -q REPLACE_ME infra/k8s/overlays/nchat-dev-server/topology.env
 
@@ -209,6 +210,10 @@ sudo install -d -m 0750 -o 65532 -g 65532 /mnt/hdd-geral/k3s/nchat-dev/seaweedfs
 ```
 
 As portas do contrato vêm do example versionado; não as duplique em templates.
+O hostname público do TURN é derivado como `turn.${NCHAT_DEV_HOST}` e deve ter
+registro A direto para `NCHAT_DEV_TURN_EXTERNAL_IP`. Esse nome atende TURN UDP,
+não HTTP: mantenha-o fora de proxy HTTP/CDN comum, inclusive o proxy orange-cloud
+da Cloudflare.
 
 ## 4. Configuração do GitHub Environment
 
@@ -219,9 +224,12 @@ valores em issues ou logs, estas variables não secretas:
 - `NCHAT_DEV_NODE_CIDR`, exatamente o mesmo IP com `/32`;
 - `NCHAT_DEV_HOST`, que deve ser um hostname RFC 1123 completo: rótulos de 1 a
   63 caracteres alfanuméricos com hífen apenas internamente (nunca inicial ou
-  final), sem rótulo vazio, sem ponto inicial/final e com no máximo 253
-  caracteres no total. Maiúsculas, `_`, espaços e quebras de linha são
-  rejeitados.
+  final), sem rótulo vazio, sem ponto inicial/final e com no máximo 248
+  caracteres no total. Esse limite reserva os cinco caracteres de `turn.` para
+  que o hostname TURN derivado também permaneça dentro do máximo RFC 1123 de
+  253 caracteres. Maiúsculas, `_`, espaços e quebras de linha são rejeitados;
+- `NCHAT_DEV_TURN_EXTERNAL_IP`, o IPv4 público que o coturn anuncia para
+  alocações de relay quando está atrás de NAT.
 
 O workflow falha antes da renderização se alguma estiver ausente ou inválida. As
 variables não substituem Secrets; credenciais continuam em SealedSecrets.
@@ -584,7 +592,9 @@ senha, o Docker config do GHCR, o token do runner, o token do GHCR e chaves priv
 No coturn, `allowed-peer-ip` prevalece sobre o range `denied-peer-ip` que o contém.
 O renderizador produz exatamente uma exceção para `NCHAT_DEV_NODE_IP`. Como coturn e
 LiveKit compartilham `hostNetwork`, o risco residual abrange outros processos no
-mesmo host. Não adicione peers permitidos.
+mesmo host. Não adicione peers permitidos. O mesmo renderizador produz
+`external-ip=${NCHAT_DEV_TURN_EXTERNAL_IP}/${NCHAT_DEV_NODE_IP}`; confirme esse par sem
+exibir a linha de `static-auth-secret`.
 
 Crie o pull secret do GHCR sem passar a credencial a subprocessos por argumento:
 
@@ -745,12 +755,26 @@ pnpm k8s:ci
 Não copie digest de comentário, issue ou resultado de busca. O digest deve ter
 `sha256:` mais 64 caracteres hexadecimais e pertencer exatamente à tag revisada.
 
-## 13. Firewall restrito à LAN
+## 13. Firewall e NAT do TURN público
 
-Comandos genéricos como `sudo ufw allow "${TURN_LISTEN_PORT}/tcp"` liberam a porta em
-**todas** as interfaces, incluindo qualquer uplink WAN presente no host. Isso é
-proibido. As regras deste runbook devem ficar restritas à interface e ao CIDR da LAN
-interna.
+O signaling continua no caminho HTTPS/WSS existente por Cloudflare e Traefik. Para
+clientes sem rota até a LAN, somente o fallback coturn é publicado. O DNS
+`turn.${NCHAT_DEV_HOST}` deve resolver diretamente para
+`NCHAT_DEV_TURN_EXTERNAL_IP`, sem proxy HTTP/CDN comum; o TURN deste ambiente usa
+UDP e mantém TLS/DTLS desabilitados.
+
+O caminho de NAT/firewall aprovado deve encaminhar somente:
+
+- `TURN_LISTEN_PORT`/UDP para a mesma porta UDP em `NCHAT_DEV_NODE_IP`;
+- cada porta UDP de `TURN_RELAY_MIN_PORT` até `TURN_RELAY_MAX_PORT` para a mesma
+  porta UDP em `NCHAT_DEV_NODE_IP`.
+
+Os relay ports exigem mapeamento externo/interno 1:1 porque o coturn anuncia o
+endereço e a porta alocados ao cliente. Não traduza o range para uma porta única,
+não reduza o range e não publique TCP ou TLS/DTLS como parte deste contrato.
+`LIVEKIT_RTC_TCP_PORT` (7881/TCP) e `LIVEKIT_RTC_UDP_PORT` (7882/UDP) permanecem
+privados e nunca devem receber regra WAN/NAT/port-forward. Não crie Service
+`NodePort`/`LoadBalancer` nem Ingress para expor essas portas do LiveKit.
 
 Primeiro, identifique a topologia de rede real do host e o estado atual do firewall:
 
@@ -775,47 +799,13 @@ sudo ufw status numbered | tee "/root/ufw-before-nchat-dev-$(date +%Y%m%d-%H%M%S
 sudo nft list ruleset > "/root/nft-before-nchat-dev-$(date +%Y%m%d-%H%M%S).txt"
 ```
 
-Defina manualmente, após revisão humana da saída acima, a interface e o CIDR da LAN
-interna — nunca copie estes valores de outro ambiente:
-
-```bash
-# [srv-apps-01]
-LAN_IFACE='<INTERFACE_LAN>'
-LAN_CIDR='<CIDR_DA_REDE_INTERNA>'
-test "$LAN_IFACE" != '<INTERFACE_LAN>'
-test "$LAN_CIDR" != '<CIDR_DA_REDE_INTERNA>'
-ip link show "$LAN_IFACE"
-```
-
-Somente então, aplique regras restritas à interface e ao CIDR da LAN:
-
-```bash
-# [srv-apps-01]
-sudo ufw allow in on "$LAN_IFACE" \
-  from "$LAN_CIDR" \
-  to any port "$TURN_LISTEN_PORT" proto tcp \
-  comment 'nchat-dev coturn LAN TCP'
-
-sudo ufw allow in on "$LAN_IFACE" \
-  from "$LAN_CIDR" \
-  to any port "$TURN_LISTEN_PORT" proto udp \
-  comment 'nchat-dev coturn LAN UDP'
-
-sudo ufw allow in on "$LAN_IFACE" \
-  from "$LAN_CIDR" \
-  to any port "$LIVEKIT_RTC_TCP_PORT" proto tcp \
-  comment 'nchat-dev livekit RTC LAN TCP'
-
-sudo ufw allow in on "$LAN_IFACE" \
-  from "$LAN_CIDR" \
-  to any port "$LIVEKIT_RTC_UDP_PORT" proto udp \
-  comment 'nchat-dev livekit RTC LAN UDP'
-
-sudo ufw allow in on "$LAN_IFACE" \
-  from "$LAN_CIDR" \
-  to any port "${TURN_RELAY_MIN_PORT}:${TURN_RELAY_MAX_PORT}" proto udp \
-  comment 'nchat-dev coturn relay LAN'
-```
+Qualquer regra concreta depende das interfaces e dos saltos de NAT reais. Revise-a
+humanamente em OPNsense/MikroTik/firewall do host e restrinja protocolo, destino e
+portas ao contrato acima. Não copie regras de outro ambiente, não use um comando
+genérico que abra portas adicionais e não desabilite proteções para fazer o teste
+passar. A exposição dos relay ports é intencional, mas continua protegida por
+`use-auth-secret`, `fingerprint`, denied-peer ranges e a única exceção canônica para
+o nó LiveKit.
 
 Depois das mudanças, capture o novo estado e faça revisão humana do diff lógico —
 **não** restaure nem sobrescreva o firewall automaticamente:
@@ -833,14 +823,17 @@ Proibições explícitas nesta seção:
 - Não apagar regras existentes.
 - Não alterar a policy default.
 - Não executar `nft flush ruleset`.
-- Não publicar estas portas em WAN, NAT, OPNsense ou port-forward.
+- Não publicar 7881/TCP nem 7882/UDP em WAN, NAT, OPNsense ou port-forward.
+- Não publicar portas além de `TURN_LISTEN_PORT`/UDP e do relay range UDP.
+- Não remover autenticação ou proteções de peer do coturn.
 - Preservar 80/443 do Traefik.
 - Preservar 3478 do UniFi.
 - Não alterar regras de outras aplicações.
 
-Se o host usa nftables/firewalld em vez de ufw, traduza somente estas regras
-restritas à LAN — não altere a configuração global do Traefik. O hardening futuro é
-separar coturn e LiveKit em IP/nó dedicado antes de qualquer mudança de exposição.
+Se o host usa nftables/firewalld em vez de UFW, mantenha o mesmo contrato mínimo e
+não altere a configuração global do Traefik. Não reinicie k3s, Traefik, Docker ou o
+servidor para aplicar ou validar este desenho. O hardening futuro é separar coturn e
+LiveKit em IP/nó dedicado sem ampliar a exposição do LiveKit.
 
 ## 14. Validações pré-deploy
 
