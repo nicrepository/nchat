@@ -38,7 +38,7 @@ func TestPGXMemberStore_AddChannelMembers_RevalidatesActorBeforeWriting(t *testi
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin'\).*FOR SHARE OF wm`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator'\).*FOR SHARE OF wm`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
 	mock.ExpectQuery(`(?s)WITH eligible AS.*INSERT INTO chat\.channel_members.*ON CONFLICT \(channel_id, user_id\) DO NOTHING`).

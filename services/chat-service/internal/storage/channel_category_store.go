@@ -97,11 +97,29 @@ const channelCategoryColumns = `id, workspace_id, name, position, created_at, up
 // stable order for every reader.
 const channelCategoryOrder = `ORDER BY position, lower(name), id`
 
-// managerAuthorizedWorkspace is the shared authorization fragment for category
-// mutations: the workspace must be active and the caller must hold an active
-// management role in it. It mirrors PGXWorkspaceStore.UpdateEditWindow — the
-// service checks the same predicate first for a legible error, and this is the
-// backstop that decides, serialized with the write.
+// channelCategoryManagerRoles is the SQL statement of
+// domain.CanManageChannelCategories, which RF-74 widened from owner/admin to
+// include the workspace moderator.
+//
+// It is a constant because all four category mutations must apply the same set
+// and two of them cannot share managerAuthorizedWorkspace below: create and
+// reorder are SELECT-shaped and use it directly, while rename is an UPDATE ...
+// FROM and delete is a DELETE ... USING, which restate the join. Restating the
+// join is survivable; restating the role list is what let rename and delete
+// drift back to owner/admin and refuse a moderator the service had already
+// admitted. The list now has one definition, so the next role change cannot
+// reach three of the four operations and miss the others.
+//
+// This is chat.workspace_members.role. The per-channel moderator on
+// chat.channel_members is a different scope and is never consulted here.
+const channelCategoryManagerRoles = `('owner', 'admin', 'moderator')`
+
+// managerAuthorizedWorkspace is the shared authorization fragment for the two
+// category mutations shaped as a SELECT: the workspace must be active and the
+// caller must hold an active management role in it. It mirrors
+// PGXWorkspaceStore.UpdateEditWindow — the service checks the same predicate
+// first for a legible error, and this is the backstop that decides, serialized
+// with the write.
 //
 // FOR SHARE rather than FOR UPDATE: revoking a membership or disabling a
 // workspace is an UPDATE of a non-key column, which takes FOR NO KEY UPDATE and
@@ -118,7 +136,10 @@ const managerAuthorizedWorkspace = `
 	  AND w.status = 'active'
 	  AND wm.user_id = $2
 	  AND wm.status = 'active'
-	  AND wm.role IN ('owner', 'admin')
+	  -- The service checks the same predicate first for a legible error; the
+	  -- decision is deliberately not passed down as a boolean, because a boolean
+	  -- computed a moment ago is exactly the thing this query exists to distrust.
+	  AND wm.role IN ` + channelCategoryManagerRoles + `
 	FOR SHARE OF w, wm`
 
 func (s *PGXChannelStore) ListChannelCategories(ctx context.Context, workspaceID string) ([]domain.ChannelCategory, error) {
@@ -208,7 +229,7 @@ func (s *PGXChannelStore) RenameChannelCategoryForManager(ctx context.Context, i
 		  AND wm.workspace_id = c.workspace_id
 		  AND wm.user_id = $2
 		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin')
+		  AND wm.role IN `+channelCategoryManagerRoles+`
 		RETURNING c.id, c.workspace_id, c.name, c.position, c.created_at, c.updated_at`,
 		input.WorkspaceID, input.CallerID, input.CategoryID, input.Name,
 	).Scan(&c.ID, &c.WorkspaceID, &c.Name, &c.Position, &c.CreatedAt, &c.UpdatedAt)
@@ -336,7 +357,7 @@ func (s *PGXChannelStore) DeleteChannelCategoryForManager(ctx context.Context, w
 		  AND wm.workspace_id = c.workspace_id
 		  AND wm.user_id = $2
 		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin')`,
+		  AND wm.role IN `+channelCategoryManagerRoles,
 		workspaceID, callerID, categoryID,
 	)
 	if err != nil {

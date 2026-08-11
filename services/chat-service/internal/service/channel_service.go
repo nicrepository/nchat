@@ -59,20 +59,26 @@ func NewChannelService(workspaces storage.WorkspaceStore, channels storage.Chann
 // CreateChannel creates a public or private channel in an active workspace.
 // Private channels add the creator as a channel member in the storage transaction.
 //
-// Creating a channel takes active workspace membership and nothing more (BUG
-// #393): the role is deliberately not consulted, so a plain member and an owner
-// take the same path. Update and archive remain management operations. The
-// membership is read server-side from the caller bound by the auth middleware,
-// so a role or an actor claimed by the client changes nothing here.
+// Creating a channel takes no management role (BUG #393): a plain member and an
+// owner take the same path. The one role it excludes is guest, via
+// domain.CanCreateChannel — a guest reaches only the channels it was added to,
+// and creating channels would hand back the workspace-wide scope RF-74 removes.
+// Update and archive remain management operations. The membership is read
+// server-side from the caller bound by the auth middleware, so a role or an
+// actor claimed by the client changes nothing here.
 //
 // The authoritative decision is CreateChannelForActiveMember's, which locks the
-// workspace and the membership and inserts from them in one statement. The check
-// below is the same predicate, not a second one: it exists so a caller with no
-// business in this workspace is refused before the input validation can tell
-// them whether a category ID exists in it.
+// workspace and the membership and inserts from them in one statement — role
+// list included. The check below is the same predicate, not a second one: it
+// exists so a caller with no business in this workspace is refused before the
+// input validation can tell them whether a category ID exists in it.
 func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
-	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
+	member, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID)
+	if err != nil {
 		return domain.Channel{}, err
+	}
+	if !domain.CanCreateChannel(&member) {
+		return domain.Channel{}, domain.ErrForbidden
 	}
 
 	slug, displayName, err := normalizeChannelFields(input.Slug, input.DisplayName)

@@ -20,7 +20,7 @@ const (
 func TestPGXResourceAuthorizerAllowsVisibleChannel(t *testing.T) {
 	mock := newStorageMock(t)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
-	mock.ExpectQuery(`(?s)WITH active_session AS.*auth\.user_sessions.*authorized_resource AS.*chat\.channels.*chat\.workspaces.*w\.status = 'active'.*chat\.workspace_members.*wm\.status = 'active'.*LEFT JOIN chat\.channel_members.*c\.status = 'active'.*c\.type = 'public'.*SELECT.*session_expires_at.*resource_id`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*auth\.user_sessions.*authorized_resource AS.*chat\.channels.*chat\.workspaces.*w\.status = 'active'.*chat\.workspace_members.*wm\.status = 'active'.*c\.status = 'active'.*chat\.channel_visible_to_user\(c\.id, active\.user_id\).*SELECT.*session_expires_at.*resource_id`).
 		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
 			AddRow(expiresAt, storageTestResource))

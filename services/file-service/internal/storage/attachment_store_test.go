@@ -361,7 +361,7 @@ func TestGetAuthorizedReEvaluatesMembershipInTheSameQuery(t *testing.T) {
 	for _, fragment := range []string{
 		"active_session",
 		"chat.workspace_members",
-		"chat.channel_members",
+		"chat.channel_visible_to_user(c.id, active.user_id)",
 		"chat.dm_members",
 		"a.deleted_at IS NULL",
 		"a.workspace_id",
