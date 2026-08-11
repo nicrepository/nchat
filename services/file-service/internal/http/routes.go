@@ -29,4 +29,12 @@ const (
 	// the file. A query parameter on /content would have made both of those
 	// invisible to a router, a cache and a log.
 	RouteAttachmentPreview = "/attachments/{attachmentID}/preview"
+
+	// RF-10 Open Graph preview of an external link. It is not an attachment
+	// resource and shares nothing with the routes above: no attachment exists,
+	// nothing is stored, and the subject is a URL the caller supplies rather
+	// than an object this service owns. It is a POST because it causes an
+	// outbound request and because the URL belongs in a body, not in a query
+	// string that access logs and intermediary caches would keep.
+	RouteLinkPreview = "/link-preview"
 )

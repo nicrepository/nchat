@@ -12,13 +12,14 @@ import (
 // never labels: they are unbounded, and two of them are the identifiers this
 // service exists to keep private.
 type AttachmentMetrics struct {
-	uploads   *prometheus.CounterVec
-	downloads *prometheus.CounterVec
-	previews  *prometheus.CounterVec
-	cleanups  *prometheus.CounterVec
-	scans     *prometheus.CounterVec
-	scanQueue prometheus.Gauge
-	orphans   prometheus.Counter
+	uploads      *prometheus.CounterVec
+	downloads    *prometheus.CounterVec
+	previews     *prometheus.CounterVec
+	linkPreviews *prometheus.CounterVec
+	cleanups     *prometheus.CounterVec
+	scans        *prometheus.CounterVec
+	scanQueue    prometheus.Gauge
+	orphans      prometheus.Counter
 }
 
 // NewAttachmentMetrics registers the attachment counters on the shared
@@ -48,6 +49,24 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 		previews: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nchat_file_previews_total",
 			Help: "Attachment preview generation and delivery by outcome.",
+		}, []string{"result"}),
+		// Open Graph link preview outcomes (RF-10): hit, success, invalid_url,
+		// blocked, unsupported_content_type, timeout, upstream_error,
+		// no_metadata.
+		//
+		// Its own series rather than a label on the attachment preview counter,
+		// because the two answer different questions: that one is about
+		// rendering files this service stores, this one is about reaching sites
+		// it does not control. A rising "blocked" here is worth an alert — it
+		// means callers are pointing the fetcher at destinations the SSRF
+		// policy refuses — and it would be invisible mixed into the other.
+		//
+		// The URL is never a label. It is caller-supplied and unbounded, so one
+		// hostile client could otherwise create a series per request and take
+		// the metrics endpoint down with it.
+		linkPreviews: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nchat_file_link_previews_total",
+			Help: "Open Graph link preview requests by outcome.",
 		}, []string{"result"}),
 		// Object cleanup outcomes (SR-002). A separate series from previews on
 		// purpose: this counts storage being reclaimed, not previews being
@@ -84,9 +103,17 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	}
 	// Register reports false when metrics are disabled; the counters still work
 	// as no-op accumulators, so callers never need a nil check.
-	metrics.Register(m.uploads, m.downloads, m.previews, m.cleanups,
+	metrics.Register(m.uploads, m.downloads, m.previews, m.linkPreviews, m.cleanups,
 		m.scans, m.scanQueue, m.orphans)
 	return m
+}
+
+// ObserveLinkPreview satisfies linkpreview.Observer.
+func (m *AttachmentMetrics) ObserveLinkPreview(result string) {
+	if m == nil {
+		return
+	}
+	m.linkPreviews.WithLabelValues(result).Inc()
 }
 
 func (m *AttachmentMetrics) observeUpload(result string) {

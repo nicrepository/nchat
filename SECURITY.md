@@ -225,6 +225,40 @@ O scan em si e assincrono (RF-22) e falha fechada em todas as direcoes:
 - o gate vale para toda entrega de bytes derivados do arquivo -- download,
   HTTP Range, preview e streaming inline -- e nao apenas para o download.
 
+## Regras para fetch de conteudo externo
+
+Vale para toda requisicao de saida cujo destino e escolhido, direta ou
+indiretamente, por um usuario. Hoje o unico caso e o preview de links por Open
+Graph (RF-10) no file-service; a regra e permanente e vale para qualquer feature
+futura com a mesma forma.
+
+- O destino e julgado pelo **endereco IP que a conexao vai usar**, nunca pelo
+  hostname. Resolver, verificar **todas** as respostas e conectar ao endereco ja
+  aceito: nao pode existir janela entre a checagem e o uso (DNS rebinding). Um
+  nome com varios enderecos e recusado se qualquer um deles nao for publico.
+- Destinos nao publicos sao recusados em IPv4 e IPv6, incluindo as formas em que
+  um endereco IPv4 viaja dentro de um IPv6. Metadata services de nuvem sao
+  cobertos por essa regra, e com eles qualquer alias que resolva para eles.
+  Bloquear por hostname literal nao e controle.
+- Somente `http` e `https`, somente a porta default do esquema, nunca
+  credenciais na URL.
+- Cada redirect passa por toda a validacao de novo, e o numero de saltos e
+  limitado.
+- Proxies do ambiente sao ignorados: um proxy resolveria e conectaria no lugar
+  do servico.
+- TLS e verificado contra o hostname original. `InsecureSkipVerify` e proibido.
+- Allowlist explicita de Content-Type, decidida antes de ler o corpo; corpo lido
+  atraves de limite aplicado sobre bytes descomprimidos; timeouts curtos e
+  finitos por fase.
+- A rota e autenticada e tem rate limit por usuario. Um endpoint anonimo seria um
+  fetcher aberto usando o endereco e a banda do deployment.
+- Nenhum conteudo remoto e devolvido ao cliente: apenas metadados normalizados,
+  como dados e nunca como markup.
+- A recusa nunca revela o destino, o endereco ou a mensagem do servidor remoto,
+  em resposta, log ou label de metrica.
+
+Ver `docs/api/link-preview.md`.
+
 ## Processo para vulnerabilidade Critical/High
 
 1. Criar issue restrita.
