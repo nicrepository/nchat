@@ -72,6 +72,27 @@ describe("fetchMyProfile", () => {
     expect(init.method).toBe("GET");
   });
 
+  it("normalises the display name and reports '' when there is none usable", async () => {
+    for (const [raw, expected] of [
+      ["  Ana Souza  ", "Ana Souza"],
+      ["   ", ""],
+      ["", ""],
+      [null, ""],
+      [undefined, ""],
+      [42, ""],
+    ] as const) {
+      mockAuthFetch.mockResolvedValue({ data: { id: "u1", display_name: raw } });
+      expect((await fetchMyProfile()).displayName).toBe(expected);
+    }
+  });
+
+  it("forwards an abort signal to the transport", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { id: "u1", display_name: "Ana" } });
+    const controller = new AbortController();
+    await fetchMyProfile(controller.signal);
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
   it("drops a cross-origin avatar from the profile", async () => {
     mockAuthFetch.mockResolvedValue({
       data: { id: "u1", display_name: "Ana", avatar_url: "https://evil.example.test/a.png" },

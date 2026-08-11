@@ -1095,6 +1095,19 @@ async function installWebSocketMock(
 }
 
 async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
+  // The sidebar footer identifies the signed-in user from the session, via
+  // GET /api/auth/me. A spec that needs a different self profile (an avatar, no
+  // name) registers its own route after this one, which then takes precedence.
+  await page.route("**/api/auth/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: { id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME },
+      }),
+    }),
+  );
+
   await page.route("**/api/chat/sidebar", (route) =>
     route.fulfill({
       status: 200,

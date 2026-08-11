@@ -434,13 +434,28 @@
   color: #fff;
 }
 
+/* Profile and Settings sit on one line: the profile link takes the space that
+   is left and the icon keeps its own, so a long name is clipped by the name
+   itself and never pushes the settings control out of the sidebar. */
+.chat-sidebar__user-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 6px 2px;
+}
+
 .chat-sidebar__user {
+  flex: 1;
+  /* Without this a flex item refuses to shrink below its content, which is what
+     turns a long name into an overflow instead of an ellipsis. */
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
   border-radius: 10px;
-  margin: 0 6px 2px;
+  color: var(--cs-sidebar-text);
+  text-decoration: none;
   transition: background 0.12s;
 }
 
@@ -448,11 +463,8 @@
   background: var(--cs-sidebar-hover);
 }
 
-.chat-sidebar__user-info {
-  min-width: 0;
-}
-
 .chat-sidebar__user-name {
+  min-width: 0;
   font-size: 12.5px;
   font-weight: 600;
   color: #fff;
@@ -461,12 +473,58 @@
   white-space: nowrap;
 }
 
-.chat-sidebar__user-role {
-  font-size: 10.5px;
-  color: var(--cs-sidebar-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.chat-sidebar__user-settings {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  color: var(--cs-sidebar-text);
+  text-decoration: none;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.chat-sidebar__user-settings:hover {
+  background: var(--cs-sidebar-hover);
+  color: #fff;
+}
+
+.chat-sidebar__user:focus-visible,
+.chat-sidebar__user-settings:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+/* Identity-neutral stand-in while the profile is unknown. Same box as the real
+   row, so the footer does not jump when the answer arrives. */
+.chat-sidebar__user-placeholder {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.chat-sidebar__user-avatar-skeleton {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.chat-sidebar__user-name-skeleton {
+  height: 10px;
+  width: 96px;
+  max-width: 100%;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Only loading pulses: a failed load is not in progress. */
+.chat-sidebar__user-placeholder[data-state="loading"] .chat-sidebar__user-avatar-skeleton,
+.chat-sidebar__user-placeholder[data-state="loading"] .chat-sidebar__user-name-skeleton {
+  animation: cs-pulse 1.4s ease-in-out infinite;
 }
 
 /* ── Loading skeleton ────────────────────────────────────────────────────────── */

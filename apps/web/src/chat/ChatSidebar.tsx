@@ -2,21 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
-import { partitionDMs, type Channel, type CurrentUser, type DMConversation } from "./chatTypes";
+import { useSelfProfile } from "../profile/selfProfile";
+import { partitionDMs, type Channel, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
 import { sortByActivity } from "./sidebarOrder";
-
-/**
- * Placeholder user shown in the sidebar footer.
- * Replace with a real profile API call once GET /api/auth/me is available.
- */
-const PLACEHOLDER_USER: CurrentUser = {
-  displayName: "Usuário",
-  initials: "?",
-  color: "purple",
-  role: "",
-};
 
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
 
@@ -395,6 +385,70 @@ function safeDecodeURIComponent(segment: string): string {
   }
 }
 
+// ── Footer user block ─────────────────────────────────────────────────────────
+
+/**
+ * The authenticated user's own row: picture, name, and Settings beside it.
+ *
+ * Identity comes from GET /api/auth/me through the shared self-profile cache —
+ * never from a client-chosen id, never from a fixture. Until that answer exists
+ * the row is identity-neutral: a placeholder of the same size, so nothing shifts
+ * and no invented name ("Usuário") or invented initial ("?") is ever on screen,
+ * not even for a frame. A load failure is its own state for the same reason: it
+ * is not a user without an avatar.
+ *
+ * Profile and Settings are siblings, not nested links: one interactive element
+ * may not contain another.
+ */
+function SidebarUser() {
+  const self = useSelfProfile();
+  // "" covers absent / null / whitespace-only — normalised once, in profileApi.
+  const displayName = self.status === "ready" ? self.profile.displayName : "";
+
+  return (
+    <div className="chat-sidebar__user-row">
+      <Link
+        to="/profile"
+        className="chat-sidebar__user"
+        aria-label={displayName ? `Meu perfil de ${displayName}` : "Meu perfil"}
+      >
+        {self.status === "ready" ? (
+          <>
+            <Avatar
+              // No usable name means no initials to derive: an empty swatch,
+              // never "?". Its colour is still the user's own, so the row does
+              // not change identity when a name arrives.
+              initials={displayName ? initialsFrom(displayName) : ""}
+              src={self.profile.avatarUrl}
+              color={avatarColorFor(self.profile.id)}
+              size="md"
+            />
+            <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>
+          </>
+        ) : (
+          <span
+            className="chat-sidebar__user-placeholder"
+            data-state={self.status}
+            data-testid="chat-sidebar-user-placeholder"
+            aria-hidden="true"
+          >
+            <span className="chat-sidebar__avatar chat-sidebar__avatar--md chat-sidebar__user-avatar-skeleton" />
+            <span className="chat-sidebar__user-name-skeleton" />
+          </span>
+        )}
+      </Link>
+      <Link
+        to="/admin/users"
+        className="chat-sidebar__user-settings"
+        aria-label="Configurações"
+        title="Configurações"
+      >
+        <IconSettings />
+      </Link>
+    </div>
+  );
+}
+
 // ── Main sidebar ──────────────────────────────────────────────────────────────
 
 type SidebarState =
@@ -587,22 +641,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
           <IconStar />
           <span>Favoritos</span>
         </Link>
-        <Link to="/admin/users" className="chat-sidebar__footer-item" aria-label="Configurações">
-          <IconSettings />
-          <span>Configurações</span>
-        </Link>
-        <Link to="/profile" className="chat-sidebar__user" aria-label="Meu perfil">
-          <Avatar
-            initials={PLACEHOLDER_USER.initials}
-            color={PLACEHOLDER_USER.color}
-            status="online"
-            size="md"
-          />
-          <div className="chat-sidebar__user-info" aria-hidden="true">
-            <div className="chat-sidebar__user-name">{PLACEHOLDER_USER.displayName}</div>
-            <div className="chat-sidebar__user-role">{PLACEHOLDER_USER.role}</div>
-          </div>
-        </Link>
+        <SidebarUser />
       </div>
       {newConversationOpen && state.status === "ready" && (
         <NewConversationDialog

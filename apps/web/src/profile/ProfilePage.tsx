@@ -10,6 +10,7 @@ import {
   removeAvatar,
   uploadAvatar,
 } from "./profileApi";
+import { refreshSelfProfile } from "./selfProfile";
 
 /**
  * ProfilePage — lets the signed-in user set, replace or remove their avatar.
@@ -142,6 +143,10 @@ export default function ProfilePage() {
     try {
       const url = await uploadAvatar(selectedFile);
       setPersistedAvatarUrl(url); // server-decided, same-origin URL — not the local blob.
+      // Only now, with the change persisted, does every other screen showing the
+      // profile (the sidebar) get told to re-read it. On failure nothing below
+      // runs, so nothing the server did not confirm is ever published.
+      refreshSelfProfile();
       discardSelection();
       setNotice("saved");
     } catch (error) {
@@ -160,6 +165,7 @@ export default function ProfilePage() {
     try {
       await removeAvatar();
       setPersistedAvatarUrl(""); // only clear the visible avatar AFTER the server confirms.
+      refreshSelfProfile();
       discardSelection();
       setNotice("removed");
     } catch (error) {
