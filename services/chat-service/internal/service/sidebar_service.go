@@ -15,6 +15,7 @@ type SidebarData struct {
 	Workspace domain.Workspace
 	Channels  []SidebarChannel
 	DMs       []domain.DMConversationWithParticipantIDs
+	Pins      map[string]*time.Time
 	// CanCreateChannel is a deprecated compatibility field, retained only to
 	// keep feeding the sidebar's can_create_channel JSON key for clients that
 	// predate BUG #393. It is always true when this struct is returned: active
@@ -40,6 +41,7 @@ type SidebarChannel struct {
 	Channel       domain.Channel
 	CanWrite      bool
 	LastMessageAt *time.Time
+	PinnedAt      *time.Time
 }
 
 type sidebarChannelStore interface {
@@ -53,6 +55,7 @@ type SidebarService struct {
 	channels   sidebarChannelStore
 	members    storage.MemberStore
 	dms        storage.DMStore
+	pins       storage.SidebarPinStore
 }
 
 func NewSidebarService(
@@ -60,13 +63,18 @@ func NewSidebarService(
 	channels sidebarChannelStore,
 	members storage.MemberStore,
 	dms storage.DMStore,
+	pins ...storage.SidebarPinStore,
 ) *SidebarService {
-	return &SidebarService{
+	svc := &SidebarService{
 		workspaces: workspaces,
 		channels:   channels,
 		members:    members,
 		dms:        dms,
 	}
+	if len(pins) > 0 {
+		svc.pins = pins[0]
+	}
+	return svc
 }
 
 // GetSidebar returns the channels and DM conversations visible to userID in
@@ -117,10 +125,25 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 		return SidebarData{}, fmt.Errorf("list dms: %w", err)
 	}
 
+	pinned := make(map[string]*time.Time)
+	if s.pins != nil {
+		pins, err := s.pins.List(ctx, workspace.ID, userID)
+		if err != nil {
+			return SidebarData{}, fmt.Errorf("list sidebar pins: %w", err)
+		}
+		for i := range pins {
+			at := pins[i].PinnedAt
+			pinned[pins[i].ConversationType+":"+pins[i].ConversationID] = &at
+		}
+	}
+	for i := range sidebarChannels {
+		sidebarChannels[i].PinnedAt = pinned["channel:"+sidebarChannels[i].Channel.ID]
+	}
 	return SidebarData{
 		Workspace: workspace,
 		Channels:  sidebarChannels,
 		DMs:       dms,
+		Pins:      pinned,
 		// Constant by construction, not a role lookup: every path that reaches
 		// here has already proved the membership channel creation requires.
 		CanCreateChannel: true,

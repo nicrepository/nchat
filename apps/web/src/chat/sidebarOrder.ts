@@ -154,6 +154,25 @@ export function sortByActivity<T extends ActivityOrdered>(items: readonly T[]): 
   return [...items].sort(compareByActivity);
 }
 
+export interface PinnedOrdered extends ActivityOrdered {
+  pinnedAt?: string | null;
+}
+
+/** Pinned rows are stable by oldest pin; unpinned rows retain activity order. */
+export function sortPinnedFirst<T extends PinnedOrdered>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) => {
+    const aPinned = parseInstant(a.pinnedAt);
+    const bPinned = parseInstant(b.pinnedAt);
+    if (aPinned && !bPinned) return -1;
+    if (!aPinned && bPinned) return 1;
+    if (!aPinned || !bPinned) return compareByActivity(a, b);
+
+    const instantOrder = compareInstants(aPinned, bPinned);
+    if (instantOrder !== 0) return instantOrder;
+    return a.id.localeCompare(b.id);
+  });
+}
+
 /**
  * The later of two activity instants, as a monotonic merge.
  *

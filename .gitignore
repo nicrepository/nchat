@@ -6,6 +6,9 @@
 infra/compose/.env.dev
 *.local
 *.local.*
+*.bat
+*.ps1
+
 
 # Rendered LiveKit/coturn dev config (contains real secrets, see *.template sources)
 infra/compose/livekit/livekit.runtime.yaml

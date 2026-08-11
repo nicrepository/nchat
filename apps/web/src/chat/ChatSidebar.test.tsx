@@ -21,6 +21,7 @@ const {
   mockGetOrCreateDirectDM,
   mockCreateGroupDM,
   mockCreateChannel,
+  mockSetSidebarPin,
 } = vi.hoisted(() => ({
   mockFetchSidebarData:
     vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
@@ -37,6 +38,7 @@ const {
         signal?: AbortSignal,
       ) => Promise<Channel>
     >(),
+  mockSetSidebarPin: vi.fn<(kind: "channel" | "dm", id: string, pinned: boolean) => Promise<void>>(),
 }));
 
 vi.mock("./chatApi", () => ({
@@ -55,6 +57,7 @@ vi.mock("./chatApi", () => ({
     input: { slug: string; displayName: string; type: "public" | "private" },
     signal?: AbortSignal,
   ) => mockCreateChannel(input, signal),
+  setSidebarPin: (kind: "channel" | "dm", id: string, pinned: boolean) => mockSetSidebarPin(kind, id, pinned),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -141,6 +144,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockSearchDMCandidates.mockResolvedValue([]);
   mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
+  mockSetSidebarPin.mockResolvedValue();
   // Default: no RF-17 grouping available, so every pre-existing test keeps
   // exercising the flat "Canais" fallback unless it opts into categories by
   // overriding this mock. This also doubles as coverage for the fallback path
@@ -1266,6 +1270,8 @@ describe("ChatSidebar — section classification", () => {
     for (const label of expected) {
       await user.tab();
       expect(screen.getByRole("option", { name: label })).toHaveFocus();
+      await user.tab();
+      expect(document.activeElement).toHaveAccessibleName(/Fixar .* no topo/i);
     }
 
     // Tab order continues past the last section into the footer.
@@ -1570,6 +1576,7 @@ describe("ChatSidebar — activity ordering", () => {
     for (const label of ["Canal canal-novo", "Canal canal-antigo", "Mensagem direta com Juliane"]) {
       await user.tab();
       expect(screen.getByRole("option", { name: label })).toHaveFocus();
+      await user.tab();
     }
   });
 });

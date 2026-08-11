@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { compareByActivity, laterActivity, parseInstant, sortByActivity } from "./sidebarOrder";
+import { compareByActivity, laterActivity, parseInstant, sortByActivity, sortPinnedFirst } from "./sidebarOrder";
 import type { ActivityOrdered } from "./sidebarOrder";
 
 /**
@@ -243,6 +243,29 @@ describe("laterActivity", () => {
     ]) {
       expect(laterActivity("2026-08-04T12:00:00.1Z", equivalent)).toBe("2026-08-04T12:00:00.1Z");
     }
+  });
+});
+
+describe("sortPinnedFirst", () => {
+  it("keeps pinned conversations first from the oldest pin and preserves activity order for the rest", () => {
+    const items = [
+      { ...item({ id: "recent", lastMessageAt: "2026-08-10T12:00:00Z" }), pinnedAt: null },
+      { ...item({ id: "pin-new", lastMessageAt: "2026-08-11T12:00:00Z" }), pinnedAt: "2026-08-02T00:00:00Z" },
+      { ...item({ id: "old", lastMessageAt: "2026-08-01T12:00:00Z" }), pinnedAt: null },
+      { ...item({ id: "pin-old", lastMessageAt: "2026-07-01T12:00:00Z" }), pinnedAt: "2026-08-01T00:00:00Z" },
+    ];
+
+    expect(ids(sortPinnedFirst(items))).toEqual(["pin-old", "pin-new", "recent", "old"]);
+  });
+
+  it("uses the id as a deterministic tie-breaker and never mutates the input", () => {
+    const items = [
+      { ...item({ id: "b" }), pinnedAt: "2026-08-01T00:00:00Z" },
+      { ...item({ id: "a" }), pinnedAt: "2026-08-01T00:00:00Z" },
+    ];
+
+    expect(ids(sortPinnedFirst(items))).toEqual(["a", "b"]);
+    expect(ids(items)).toEqual(["b", "a"]);
   });
 });
 

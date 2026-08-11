@@ -1000,3 +1000,36 @@
     padding-right: 18px;
   }
 }
+.chat-sidebar__item-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 2rem;
+  align-items: center;
+}
+
+.chat-sidebar__item-row > .chat-sidebar__nav-item,
+.chat-sidebar__item-row > .chat-sidebar__dm-item {
+  min-width: 0;
+  width: 100%;
+}
+
+.chat-sidebar__pin {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  min-width: 2rem;
+  min-height: 2rem;
+  opacity: 0;
+}
+
+.chat-sidebar__item-row:hover .chat-sidebar__pin,
+.chat-sidebar__pin:focus-visible,
+.chat-sidebar__pin--active {
+  opacity: 1;
+}
+
+.chat-sidebar__pin:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}

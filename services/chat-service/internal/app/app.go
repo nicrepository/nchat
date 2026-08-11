@@ -123,6 +123,7 @@ func New(cfg config.Config) (*App, error) {
 	var reactionSvc *service.ReactionService
 	var favoriteSvc *service.FavoriteService
 	var pinSvc *service.PinService
+	var sidebarPinSvc *service.SidebarPinService
 	var permissionSvc *service.PermissionService
 	var channelSvc *service.ChannelService
 	var channelCategorySvc *service.ChannelCategoryService
@@ -157,13 +158,15 @@ func New(cfg config.Config) (*App, error) {
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
+			sidebarPinStore := storage.NewPGXSidebarPinStore(pool)
+			sidebarPinSvc = service.NewSidebarPinService(sidebarPinStore)
 			callSvc = service.NewCallService(storage.NewPGXCallStore(pool), time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
 			permissionSvc = service.NewPermissionService(memberStore, channelStore)
 			channelSvc = service.NewChannelService(workspaceStore, channelStore, memberStore)
 			// channelStore is both the category store and the visible-channel read
 			// side, so RF-17 groups channels through the same query the sidebar uses.
 			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
-			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
+			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore, sidebarPinStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
 			// One MemberService instance for both consumers: mention autocomplete
@@ -175,6 +178,9 @@ func New(cfg config.Config) (*App, error) {
 	}
 
 	sidebar := httpapi.NewSidebarHandler(sidebarSvc)
+	if sidebarPinSvc != nil {
+		sidebar = sidebar.WithPins(sidebarPinSvc, workspaceStore)
+	}
 	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc, nil)
 	if mentionSvc != nil {
 		messageHandler = httpapi.NewMessageHandler(workspaceStore, messageSvc, mentionSvc)
@@ -287,6 +293,9 @@ func New(cfg config.Config) (*App, error) {
 	// Pins broadcast over the same hub; wired after the hub exists (RF-05).
 	if pinSvc != nil {
 		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
+	}
+	if sidebarPinSvc != nil {
+		sidebarPinSvc.SetPublisher(&hubBroadcaster{hub: hub})
 	}
 
 	// The channel-details panel (issue #435) reports member presence from the
@@ -478,6 +487,10 @@ func (b *hubBroadcaster) PublishMembersAdded(ctx context.Context, workspaceID, t
 // PublishConversationAvailable adapts the hub's user-scoped signal (issue #398).
 func (b *hubBroadcaster) PublishConversationAvailable(ctx context.Context, workspaceID, targetType, targetID string, userIDs []string) {
 	b.hub.PublishConversationAvailable(ctx, workspaceID, ws.TargetType(targetType), targetID, userIDs)
+}
+
+func (b *hubBroadcaster) PublishSidebarPinUpdated(ctx context.Context, workspaceID, targetType, targetID, userID string) {
+	b.hub.PublishSidebarPinUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, userID)
 }
 
 func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {

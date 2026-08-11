@@ -599,6 +599,22 @@ func (h *Hub) PublishConversationAvailable(
 	}
 }
 
+func (h *Hub) PublishSidebarPinUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID, userID string) {
+	if userID == "" {
+		return
+	}
+	evt := Event{SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeSidebarPinUpdated, WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID, RecipientUserID: userID, EventID: uuid.New().String(), SourceInstanceID: h.instanceID, CreatedAt: time.Now().UTC()}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal sidebar pin event", "error", err)
+		return
+	}
+	h.deliverToLocalUserSessions(evt, data)
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: sidebar pin bus publish failed", "target_type", string(targetType), "error", err)
+	}
+}
+
 // deliverToLocalUserSessions enqueues data to every live session of
 // evt.RecipientUserID in evt.WorkspaceID on this instance.
 //
@@ -818,7 +834,7 @@ func (h *Hub) handleRemoteBusEvent(evt Event) {
 	// Delivering here also closes the republication loop: this returns without
 	// ever calling bus.Publish, so an event received from the bus is never sent
 	// back to it.
-	if canonical.Type == EventTypeConversationAvailable {
+	if canonical.Type == EventTypeConversationAvailable || canonical.Type == EventTypeSidebarPinUpdated {
 		if !h.remoteRecipientMayAccess(canonical) {
 			return
 		}
@@ -957,7 +973,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	// Known event type required.
 	switch evt.Type {
 	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
-		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
+		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeSidebarPinUpdated, EventTypeAttachmentStatus,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
@@ -1012,7 +1028,7 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 	// conversation.available is the one event that names a user rather than a
 	// message: it is routed to a recipient, not to a message's subscribers.
 	// Its recipient is required and must be a UUID; a message ID is not.
-	if evt.Type == EventTypeConversationAvailable {
+	if evt.Type == EventTypeConversationAvailable || evt.Type == EventTypeSidebarPinUpdated {
 		rid, err := uuid.Parse(evt.RecipientUserID)
 		if err != nil {
 			return Event{}, false

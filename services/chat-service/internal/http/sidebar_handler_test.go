@@ -700,15 +700,15 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 	for _, dm := range raw.Data.DMs {
 		// created_at and last_message_at (issue #414) are the two ordering keys;
 		// they say when, never what, who or which message.
-		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at"} {
+		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at", "pinned_at"} {
 			if _, ok := dm[key]; !ok {
 				t.Fatalf("missing expected DM field %q in %v", key, dm)
 			}
 		}
 		counterpart, hasCounterpart := dm["counterpart"]
-		wantFields := 5
+		wantFields := 6
 		if hasCounterpart {
-			wantFields = 6
+			wantFields = 7
 		}
 		if len(dm) != wantFields {
 			t.Fatalf("expected exactly %d DM fields, got %d: %v", wantFields, len(dm), dm)

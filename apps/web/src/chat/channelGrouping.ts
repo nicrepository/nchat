@@ -1,5 +1,5 @@
 import type { Channel } from "./chatTypes";
-import { sortByActivity } from "./sidebarOrder";
+import { sortPinnedFirst } from "./sidebarOrder";
 
 // ── Channel categories (RF-17) ──────────────────────────────────────────────
 
@@ -71,7 +71,7 @@ export function groupChannels(
       kind: group.kind,
       id: group.id,
       name: group.name,
-      channels: sortByActivity(resolved),
+      channels: sortPinnedFirst(resolved),
     };
   });
 
@@ -79,13 +79,13 @@ export function groupChannels(
   if (orphans.length > 0) {
     const uncategorized = result.find((group) => group.kind === "uncategorized");
     if (uncategorized) {
-      uncategorized.channels = sortByActivity([...uncategorized.channels, ...orphans]);
+      uncategorized.channels = sortPinnedFirst([...uncategorized.channels, ...orphans]);
     } else {
       result.unshift({
         key: UNCATEGORIZED_GROUP_KEY,
         kind: "uncategorized",
         name: "Geral",
-        channels: sortByActivity(orphans),
+        channels: sortPinnedFirst(orphans),
       });
     }
   }

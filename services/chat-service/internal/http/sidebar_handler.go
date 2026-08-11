@@ -10,6 +10,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 // sidebarProvider is satisfied by *service.SidebarService; extracted for testing.
@@ -59,6 +60,7 @@ type sidebarChannelJSON struct {
 	// for why these two keep a precision the detail endpoints do not need.
 	CreatedAt     string  `json:"created_at"`
 	LastMessageAt *string `json:"last_message_at"`
+	PinnedAt      *string `json:"pinned_at"`
 }
 
 // sidebarDMCounterpartJSON is the identity of the other participant of a 1:1
@@ -89,6 +91,7 @@ type sidebarDMJSON struct {
 	Counterpart   *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
 	CreatedAt     string                    `json:"created_at"`
 	LastMessageAt *string                   `json:"last_message_at"`
+	PinnedAt      *string                   `json:"pinned_at"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -107,13 +110,68 @@ type sidebarResponseBody struct {
 
 // SidebarHandler handles GET /api/chat/sidebar.
 type SidebarHandler struct {
-	svc sidebarProvider
+	svc        sidebarProvider
+	pins       *service.SidebarPinService
+	workspaces storage.WorkspaceStore
 }
 
 // NewSidebarHandler returns a SidebarHandler backed by svc. When svc is nil,
 // all requests return 503 (service not yet wired).
 func NewSidebarHandler(svc sidebarProvider) *SidebarHandler {
 	return &SidebarHandler{svc: svc}
+}
+
+func (h *SidebarHandler) WithPins(pins *service.SidebarPinService, workspaces storage.WorkspaceStore) *SidebarHandler {
+	h.pins, h.workspaces = pins, workspaces
+	return h
+}
+
+func (h *SidebarHandler) pinContext(w http.ResponseWriter, r *http.Request) (service.SidebarPinInput, bool) {
+	if h.pins == nil || h.workspaces == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "sidebar pins not available")
+		return service.SidebarPinInput{}, false
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return service.SidebarPinInput{}, false
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return service.SidebarPinInput{}, false
+	}
+	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
+	if err != nil {
+		mapServiceError(w, err)
+		return service.SidebarPinInput{}, false
+	}
+	in := service.SidebarPinInput{WorkspaceID: workspace.ID, UserID: userID, ConversationType: r.PathValue("conversationType"), ConversationID: conversationID}
+	return in, true
+}
+
+func (h *SidebarHandler) Pin(w http.ResponseWriter, r *http.Request) {
+	in, ok := h.pinContext(w, r)
+	if !ok {
+		return
+	}
+	pin, err := h.pins.Pin(r.Context(), in)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, map[string]any{"conversation_type": pin.ConversationType, "conversation_id": pin.ConversationID, "pinned_at": pin.PinnedAt.UTC().Format(time.RFC3339Nano)})
+}
+
+func (h *SidebarHandler) Unpin(w http.ResponseWriter, r *http.Request) {
+	in, ok := h.pinContext(w, r)
+	if !ok {
+		return
+	}
+	if err := h.pins.Unpin(r.Context(), in); err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Ready reports whether the handler is wired to a real sidebar service.
@@ -156,7 +214,7 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			MaxUploadBytes: domain.EffectiveMaxUploadBytes(data.Workspace.MaxUploadBytes),
 		},
 		Channels:         mapChannels(data.Channels),
-		DMConvs:          mapDMs(data.DMs),
+		DMConvs:          mapDMs(data.DMs, data.Pins),
 		CanCreateChannel: data.CanCreateChannel,
 	}
 	// Ensure arrays are never null in JSON output.
@@ -183,14 +241,19 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 			CanWrite:      sidebarChannel.CanWrite,
 			CreatedAt:     formatSidebarTime(ch.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
+			PinnedAt:      formatSidebarTimePtr(sidebarChannel.PinnedAt),
 		})
 	}
 	return out
 }
 
 // mapDMs converts domain DMs to JSON, computing a display name for each.
-func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
+func mapDMs(dms []domain.DMConversationWithParticipantIDs, pinMaps ...map[string]*time.Time) []sidebarDMJSON {
 	out := make([]sidebarDMJSON, 0, len(dms))
+	var pins map[string]*time.Time
+	if len(pinMaps) > 0 {
+		pins = pinMaps[0]
+	}
 	for _, dm := range dms {
 		name := computeDMName(dm.Type, dm.Title, dm.CounterpartDisplayName)
 		out = append(out, sidebarDMJSON{
@@ -200,6 +263,7 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 			Counterpart:   mapDMCounterpart(dm, name),
 			CreatedAt:     formatSidebarTime(dm.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(dm.LastMessageAt),
+			PinnedAt:      formatSidebarTimePtr(pins["dm:"+dm.ID]),
 		})
 	}
 	return out

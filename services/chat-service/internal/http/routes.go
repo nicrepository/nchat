@@ -5,6 +5,7 @@ const (
 	RouteReadyz               = "/readyz"
 	RouteVersion              = "/version"
 	RouteSidebar              = "/api/chat/sidebar"
+	RouteSidebarPin           = "/api/chat/sidebar/pins/{conversationType}/{conversationID}"
 	RouteDMCandidates         = "/api/chat/dm-candidates"
 	RouteDMConversations      = "/api/chat/dms"
 	RouteDMGroupConversations = "/api/chat/dms/group"

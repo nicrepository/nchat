@@ -44,6 +44,7 @@ const (
 	// a client that receives this for a conversation it cannot read still sees
 	// nothing.
 	EventTypeConversationAvailable EventType = "conversation.available"
+	EventTypeSidebarPinUpdated     EventType = "sidebar.pin_updated"
 
 	// EventTypeAttachmentStatus is emitted after an attachment's antimalware
 	// verdict has been persisted (RF-22).

@@ -18,7 +18,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import AttachmentVideo from "./AttachmentVideo";
-import { MAX_INLINE_VIDEO_BYTES, canPlayInline } from "./attachmentVideo";
+import { MAX_INLINE_VIDEO_BYTES, canPlayInline } from "./videoAttachment";
 import type { ChannelAttachment } from "./chatTypes";
 
 const mockFetchAttachmentContent = vi.hoisted(() => vi.fn());

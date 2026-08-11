@@ -6,7 +6,7 @@ import { groupChannels, type GroupedChannels } from "./channelGrouping";
 import { partitionDMs, type Channel, type CurrentUser, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
-import { sortByActivity } from "./sidebarOrder";
+import { sortPinnedFirst } from "./sidebarOrder";
 import { useChannelCategories } from "./useChannelCategories";
 
 /**
@@ -289,9 +289,17 @@ interface ChannelListProps {
   activeChannelId: string | undefined;
   onSelect: (id: string) => void;
   labelId: string;
+  onTogglePin: (kind: "channel" | "dm", id: string, pinnedAt?: string | null) => Promise<void>;
 }
 
-function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelListProps) {
+function PinButton({ name, pinnedAt, onToggle }: { name: string; pinnedAt?: string | null; onToggle: () => Promise<void> }) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState(false);
+  const pinned = Boolean(pinnedAt);
+  return <button type="button" className={`chat-sidebar__pin${pinned ? " chat-sidebar__pin--active" : ""}`} aria-label={pinned ? `Desafixar ${name}` : `Fixar ${name} no topo`} aria-pressed={pinned} disabled={pending} onClick={(event) => { event.stopPropagation(); setPending(true); setError(false); void onToggle().catch(() => setError(true)).finally(() => setPending(false)); }}><span aria-hidden="true">📌</span>{error && <span className="sr-only" role="alert">Não foi possível atualizar a fixação.</span>}</button>;
+}
+
+function ChannelList({ channels, activeChannelId, onSelect, labelId, onTogglePin }: ChannelListProps) {
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -305,8 +313,8 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelLi
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
         return (
+          <div className="chat-sidebar__item-row" key={ch.id}>
           <button
-            key={ch.id}
             type="button"
             role="option"
             aria-selected={isActive}
@@ -330,6 +338,8 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelLi
               </span>
             )}
           </button>
+          <PinButton name={ch.name} pinnedAt={ch.pinnedAt} onToggle={() => onTogglePin("channel", ch.id, ch.pinnedAt)} />
+          </div>
         );
       })}
     </div>
@@ -344,6 +354,7 @@ interface CategorySectionProps {
   onToggle: (key: string) => void;
   activeChannelId: string | undefined;
   onSelect: (id: string) => void;
+  onTogglePin: ChannelListProps["onTogglePin"];
 }
 
 /**
@@ -355,7 +366,7 @@ interface CategorySectionProps {
  * the channel list — the header, and therefore the category name and its
  * expanded/collapsed state, stays visible either way (RF-17 req. 5).
  */
-function CategorySection({ group, collapsed, onToggle, activeChannelId, onSelect }: CategorySectionProps) {
+function CategorySection({ group, collapsed, onToggle, activeChannelId, onSelect, onTogglePin }: CategorySectionProps) {
   const labelId = `chat-sidebar-category-${group.key}`;
   const listId = `chat-sidebar-category-list-${group.key}`;
 
@@ -378,6 +389,7 @@ function CategorySection({ group, collapsed, onToggle, activeChannelId, onSelect
           activeChannelId={activeChannelId}
           onSelect={onSelect}
           labelId={labelId}
+          onTogglePin={onTogglePin}
         />
       </div>
     </section>
@@ -393,9 +405,10 @@ interface DMListProps {
   onSelect: (id: string) => void;
   labelId: string;
   emptyMessage: string;
+  onTogglePin: ChannelListProps["onTogglePin"];
 }
 
-function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProps) {
+function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, onTogglePin }: DMListProps) {
   if (dms.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -412,8 +425,8 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProp
         const counterpart = dm.counterpart;
 
         return (
+          <div className="chat-sidebar__item-row" key={dm.id}>
           <button
-            key={dm.id}
             type="button"
             role="option"
             aria-selected={isActive}
@@ -447,6 +460,8 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProp
               </span>
             )}
           </button>
+          <PinButton name={dm.name} pinnedAt={dm.pinnedAt} onToggle={() => onTogglePin("dm", dm.id, dm.pinnedAt)} />
+          </div>
         );
       })}
     </div>
@@ -479,6 +494,7 @@ type SidebarState =
 interface ChatSidebarProps {
   state: SidebarState;
   retry: () => void;
+  onTogglePin?: ChannelListProps["onTogglePin"];
 }
 
 // Static because the sidebar is mounted once per app; each heading owns the id
@@ -487,7 +503,7 @@ const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
 const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
 const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
 
-export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
+export default function ChatSidebar({ state, retry, onTogglePin = async () => {} }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
   // One dialog, one trigger, one piece of open state: two of them could be open
@@ -548,10 +564,10 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   // the element that had it, and the scroll position survives a reorder.
   const channels = state.status === "ready" ? state.channels : undefined;
   const dms = state.status === "ready" ? state.dms : undefined;
-  const orderedChannels = useMemo(() => sortByActivity(channels ?? []), [channels]);
+  const orderedChannels = useMemo(() => sortPinnedFirst(channels ?? []), [channels]);
   const { orderedDirects, orderedGroups } = useMemo(() => {
     const { directs, groups } = partitionDMs(dms ?? []);
-    return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
+    return { orderedDirects: sortPinnedFirst(directs), orderedGroups: sortPinnedFirst(groups) };
   }, [dms]);
 
   // RF-17: combines the canonical channel list above with the category
@@ -657,6 +673,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                   onToggle={toggleGroup}
                   activeChannelId={activeChannelId}
                   onSelect={handleChannelSelect}
+                  onTogglePin={onTogglePin}
                 />
               ))
             ) : (
@@ -666,6 +683,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                   activeChannelId={activeChannelId}
                   onSelect={handleChannelSelect}
                   labelId={CHANNELS_LABEL_ID}
+                  onTogglePin={onTogglePin}
                 />
               </Section>
             )}
@@ -677,6 +695,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                 onSelect={handleDMSelect}
                 labelId={DIRECTS_LABEL_ID}
                 emptyMessage="Nenhuma mensagem direta."
+                onTogglePin={onTogglePin}
               />
             </Section>
 
@@ -687,6 +706,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                 onSelect={handleDMSelect}
                 labelId={GROUPS_LABEL_ID}
                 emptyMessage="Nenhum grupo."
+                onTogglePin={onTogglePin}
               />
             </Section>
           </>

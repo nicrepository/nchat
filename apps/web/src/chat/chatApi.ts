@@ -52,6 +52,7 @@ interface SidebarChannelResponse {
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
+  pinned_at?: unknown;
 }
 
 interface SidebarDMCounterpartResponse {
@@ -70,6 +71,7 @@ interface SidebarDMResponse {
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
+  pinned_at?: unknown;
 }
 
 interface SidebarResponse {
@@ -145,6 +147,7 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     canWrite: ch.can_write === true,
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
+    ...(Object.hasOwn(ch, "pinned_at") ? { pinnedAt: sidebarTimestamp(ch.pinned_at) } : {}),
   };
 }
 
@@ -248,9 +251,10 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     type,
     name: dm.name,
     participants: [],
-    counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
+    ...(dm.counterpart === undefined ? {} : { counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart) }),
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
+    ...(Object.hasOwn(dm, "pinned_at") ? { pinnedAt: sidebarTimestamp(dm.pinned_at) } : {}),
   };
 }
 
@@ -284,6 +288,14 @@ export async function fetchSidebarData(): Promise<{
   const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
   const dms = mapSidebarDMs(sidebar.dm_conversations);
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
+}
+
+export type SidebarConversationKind = "channel" | "dm";
+
+export async function setSidebarPin(kind: SidebarConversationKind, conversationId: string, pinned: boolean): Promise<void> {
+  await authenticatedFetch(`${CHAT_BASE}/sidebar/pins/${kind}/${encodeURIComponent(conversationId)}`, {
+    method: pinned ? "PUT" : "DELETE",
+  });
 }
 
 // ── Channel categories (RF-17) ───────────────────────────────────────────────

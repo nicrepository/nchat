@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useLocation } from "react-router";
 
-import { fetchSidebarData } from "./chatApi";
+import { fetchSidebarData, setSidebarPin, type SidebarConversationKind } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ConversationActivity, DMConversation } from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
@@ -40,7 +40,8 @@ type Action =
       messageCreatedAt: string;
       activeTarget?: WSSubscriptionTarget;
     }
-  | { type: "target_opened"; target: WSSubscriptionTarget };
+  | { type: "target_opened"; target: WSSubscriptionTarget }
+  | { type: "pin_changed"; kind: SidebarConversationKind; targetId: string; pinnedAt: string | null };
 
 /**
  * Replaces the list with the server's, keeping each surviving item's activity
@@ -166,6 +167,12 @@ function reducer(state: SidebarState, action: Action): SidebarState {
         ),
       };
     }
+    case "pin_changed": {
+      if (state.status !== "ready") return state;
+      const update = <T extends { id: string; pinnedAt?: string | null }>(items: T[]) =>
+        items.map((item) => item.id === action.targetId ? { ...item, pinnedAt: action.pinnedAt } : item);
+      return action.kind === "channel" ? { ...state, channels: update(state.channels) } : { ...state, dms: update(state.dms) };
+    }
   }
 }
 
@@ -270,6 +277,24 @@ export function useChatSidebar() {
     run();
   }, []);
 
+  const pinGeneration = useRef(new Map<string, number>());
+  const togglePin = useCallback(async (kind: SidebarConversationKind, targetId: string, wasPinnedAt: string | null | undefined) => {
+    const key = `${kind}:${targetId}`;
+    const generation = (pinGeneration.current.get(key) ?? 0) + 1;
+    pinGeneration.current.set(key, generation);
+    const pinned = !wasPinnedAt;
+    dispatch({ type: "pin_changed", kind, targetId, pinnedAt: pinned ? new Date().toISOString() : null });
+    try {
+      await setSidebarPin(kind, targetId, pinned);
+      if (pinGeneration.current.get(key) === generation) refreshSidebar();
+    } catch (error) {
+      if (pinGeneration.current.get(key) === generation) {
+        dispatch({ type: "pin_changed", kind, targetId, pinnedAt: wasPinnedAt ?? null });
+      }
+      throw error;
+    }
+  }, [refreshSidebar]);
+
   const realtimeTargets: WSSubscriptionTarget[] =
     state.status === "ready"
       ? [
@@ -320,5 +345,5 @@ export function useChatSidebar() {
     }
   }, [openedTargetKind, openedTargetId, state.status]);
 
-  return { state, retry: load };
+  return { state, retry: load, togglePin };
 }

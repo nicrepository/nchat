@@ -474,7 +474,7 @@ export function useChatWebSocket({
         // precisely for a target the client is not subscribed to yet, so
         // requiring a subscription would drop the one message that tells a
         // newly-added user their sidebar is stale.
-        if (d["type"] === "conversation.available" && incomingTargetId && incomingTargetType) {
+        if ((d["type"] === "conversation.available" || d["type"] === "sidebar.pin_updated") && incomingTargetId && incomingTargetType) {
           onConversationAvailableRef.current?.(
             normalizedData as unknown as WSConversationAvailableEvent,
           );

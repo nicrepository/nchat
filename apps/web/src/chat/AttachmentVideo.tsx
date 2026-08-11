@@ -8,10 +8,10 @@
  * keeps showing the icon, the size and the status it always did.
  *
  * Which attachments qualify, and why playback is bounded by size at all, is
- * attachmentVideo.ts. The object URL's lifetime is useAttachmentBlobUrl's.
+ * videoAttachment.ts. The object URL's lifetime is useAttachmentBlobUrl's.
  */
 
-import { canPlayInline, isVideoAttachment } from "./attachmentVideo";
+import { canPlayInline, isVideoAttachment } from "./videoAttachment";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchAttachmentContent } from "./filesApi";
 import type { ChannelAttachment } from "./chatTypes";

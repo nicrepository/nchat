@@ -74,7 +74,6 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle(RouteSidebar, httputil.MethodNotAllowed(http.MethodGet,
 		BearerAuth(validator)(RequireActiveSession(sessionValidator)(sidebar)),
 	))
-
 	authMiddleware := func(h http.Handler) http.Handler {
 		return BearerAuth(validator)(RequireActiveSession(sessionValidator)(h))
 	}
@@ -92,6 +91,8 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	messageForwardLimiter := NewUserRateLimiter(messageForwardRateLimit, time.Minute)
 	pinActionLimiter := NewUserRateLimiter(pinActionRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
+	mux.Handle("PUT "+RouteSidebarPin, authMiddleware(pinActionLimiter.Middleware(http.HandlerFunc(sidebar.Pin))))
+	mux.Handle("DELETE "+RouteSidebarPin, authMiddleware(pinActionLimiter.Middleware(http.HandlerFunc(sidebar.Unpin))))
 
 	// RF-19 (issue #419): every route that creates a message goes through
 	// sendLimit, so there is exactly one place a send can be admitted from and
