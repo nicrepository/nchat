@@ -1,6 +1,6 @@
 # Security Policy
 
-## Politica de release
+## Política de release
 
 Nenhum release pode sair com vulnerabilidade Critical ou High conhecida sem mitigacao documentada.
 
