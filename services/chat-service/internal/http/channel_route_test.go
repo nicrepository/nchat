@@ -321,11 +321,16 @@ func TestChannelRoute_Create_MembershipAndWorkspaceState(t *testing.T) {
 		hasMember  bool
 		wantStatus int
 	}{
-		// Every active role creates: the rule is membership, not rank (BUG #393).
+		// Creation still takes membership and not rank (BUG #393): owner, admin,
+		// moderator and member take the same path. The one exception is the guest,
+		// whose reach is the channels it was added to (RF-74) — creating channels
+		// would give it back the workspace-wide scope that role does not have.
 		{name: "active owner", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleOwner, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusCreated},
 		{name: "active admin", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleAdmin, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusCreated},
+		{name: "active moderator", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleModerator, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusCreated},
 		{name: "active member", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleMember, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusCreated},
-		{name: "active guest", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleGuest, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusCreated},
+		{name: "active guest", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleGuest, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusForbidden},
+		{name: "unknown role", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRole("wizard"), domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusForbidden},
 		{name: "suspended membership", workspace: routeActiveWorkspace(), member: routeMember(domain.WorkspaceRoleOwner, domain.MemberStatusSuspended), hasMember: true, wantStatus: http.StatusForbidden},
 		{name: "no membership", workspace: routeActiveWorkspace(), wantStatus: http.StatusForbidden},
 		{name: "disabled workspace", workspace: disabled, member: routeMember(domain.WorkspaceRoleOwner, domain.MemberStatusActive), hasMember: true, wantStatus: http.StatusForbidden},

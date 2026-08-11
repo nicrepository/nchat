@@ -203,6 +203,7 @@ type fakeMemberStore struct {
 	removeCMErr       error
 	getWMErr          error
 	getCMErr          error
+	getCMCalls        int
 	mentionCandidates []domain.MentionCandidate
 	mentionErr        error
 	dmCandidates      []domain.DMCandidate
@@ -355,18 +356,20 @@ func (f *fakeMemberStore) AddWorkspaceMember(_ context.Context, workspaceID, use
 	key := wmKey(workspaceID, userID)
 	if existing, ok := f.workspaceMembers[key]; ok {
 		if existing.Status == domain.MemberStatusActive {
-			if err := f.addGeneralMembership(workspaceID, userID); err != nil {
+			if err := f.addGeneralMembership(existing); err != nil {
 				return domain.WorkspaceMember{}, err
 			}
 		}
 		return domain.WorkspaceMember{}, domain.ErrAlreadyMember
 	}
-	if err := f.addGeneralMembership(workspaceID, userID); err != nil {
-		return domain.WorkspaceMember{}, err
-	}
+	// The member is built before the #geral join because the real statement
+	// reads the role off the row it just inserted, and the role decides.
 	m := domain.WorkspaceMember{
 		WorkspaceID: workspaceID, UserID: userID,
 		Role: role, Status: domain.MemberStatusActive, JoinedAt: time.Now(),
+	}
+	if err := f.addGeneralMembership(m); err != nil {
+		return domain.WorkspaceMember{}, err
 	}
 	f.workspaceMembers[key] = m
 	return m, nil
@@ -394,7 +397,7 @@ func (f *fakeMemberStore) ActivateWorkspaceMember(_ context.Context, workspaceID
 	}
 	previous := m
 	m.Status = domain.MemberStatusActive
-	if err := f.addGeneralMembership(workspaceID, userID); err != nil {
+	if err := f.addGeneralMembership(m); err != nil {
 		f.workspaceMembers[key] = previous
 		return domain.WorkspaceMember{}, err
 	}
@@ -434,11 +437,12 @@ func (f *fakeMemberStore) AddChannelMembers(
 		return storage.AddMembersResult{}, f.addCMsErr
 	}
 	// Models the transactional re-check the real store performs: the actor must
-	// still be an active owner/admin at write time, so a test that revokes the
-	// role between the service check and here sees the write refused.
+	// still hold the capability at write time, so a test that revokes the role
+	// between the service check and here sees the write refused. It asks the
+	// same domain predicate the store's SQL role list restates, so the two
+	// cannot drift as RF-74 widened that list.
 	actor, ok := f.workspaceMembers[wmKey(workspaceID, callerID)]
-	if !ok || actor.Status != domain.MemberStatusActive ||
-		(actor.Role != domain.WorkspaceRoleOwner && actor.Role != domain.WorkspaceRoleAdmin) {
+	if !ok || !domain.CanManageChannelMembers(&actor) {
 		return storage.AddMembersResult{}, domain.ErrForbidden
 	}
 	for _, userID := range userIDs {
@@ -503,6 +507,7 @@ func (f *fakeMemberStore) SearchChannelMemberCandidates(
 }
 
 func (f *fakeMemberStore) GetChannelMember(_ context.Context, channelID, userID string) (domain.ChannelMember, error) {
+	f.getCMCalls++
 	if f.getCMErr != nil {
 		return domain.ChannelMember{}, f.getCMErr
 	}
@@ -532,7 +537,7 @@ func (f *fakeMemberStore) EnsureGeneralMembership(_ context.Context, workspaceID
 	if m.Status != domain.MemberStatusActive {
 		return domain.ErrMemberInactive
 	}
-	return f.addGeneralMembership(workspaceID, userID)
+	return f.addGeneralMembership(m)
 }
 
 func (f *fakeMemberStore) SyncGeneralMemberships(_ context.Context, workspaceID string) (int64, error) {
@@ -548,7 +553,15 @@ func (f *fakeMemberStore) SyncGeneralMemberships(_ context.Context, workspaceID 
 	}
 	var inserted int64
 	for _, m := range f.workspaceMembers {
-		if m.WorkspaceID != workspaceID || m.Status != domain.MemberStatusActive {
+		if m.WorkspaceID != workspaceID {
+			continue
+		}
+		// Same gate as the real backfill's `status = 'active' AND role IN (...)`:
+		// CanReachPublicChannels covers both, so a guest is skipped here exactly
+		// as it is skipped there. Note this only declines to *insert* — the loop
+		// never deletes, so a guest that was explicitly added to #geral keeps
+		// that membership across a sync.
+		if !domain.CanReachPublicChannels(&m) {
 			continue
 		}
 		key := cmKey(channelID, m.UserID)
@@ -570,20 +583,40 @@ func (f *fakeMemberStore) requireActiveWorkspace(workspaceID string) error {
 	return nil
 }
 
-func (f *fakeMemberStore) addGeneralMembership(workspaceID, userID string) error {
-	channelID, ok := f.generalChannels[workspaceID]
+// addGeneralMembership models PGXMemberStore's automatic #geral join.
+//
+// It takes the whole membership rather than a user ID because the real
+// statement selects the role from the membership row and inserts only for the
+// roles in generalMembershipRoles. A guest is excluded there (RF-74), so it is
+// excluded here: a fake that joined a guest to #geral would let a regression in
+// the guest boundary pass every service test.
+//
+// The exclusion is domain.CanReachPublicChannels, not a `role != guest`
+// comparison, so the fake and the store stay tied to the same rule and an
+// unrecognised role is denied by both.
+//
+// Silently doing nothing, rather than erroring, is what the real INSERT ...
+// SELECT does when the role does not match: zero rows, no error. Only the
+// *automatic* join is gated — an explicit AddChannelMember into #geral is a
+// different path and stays available to a guest, which is how RF-74 says a
+// guest reaches any channel.
+func (f *fakeMemberStore) addGeneralMembership(m domain.WorkspaceMember) error {
+	channelID, ok := f.generalChannels[m.WorkspaceID]
 	if !ok {
 		return domain.ErrGeneralChannelMissing
 	}
 	if f.addCMErr != nil {
 		return f.addCMErr
 	}
-	key := cmKey(channelID, userID)
+	if !domain.CanReachPublicChannels(&m) {
+		return nil
+	}
+	key := cmKey(channelID, m.UserID)
 	if _, ok := f.channelMembers[key]; ok {
 		return nil
 	}
 	f.channelMembers[key] = domain.ChannelMember{
-		ChannelID: channelID, UserID: userID, Role: domain.ChannelRoleMember, JoinedAt: time.Now(),
+		ChannelID: channelID, UserID: m.UserID, Role: domain.ChannelRoleMember, JoinedAt: time.Now(),
 	}
 	return nil
 }

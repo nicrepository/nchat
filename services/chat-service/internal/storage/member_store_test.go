@@ -173,8 +173,8 @@ func TestPGXMemberStore_AddWorkspaceMember_Success(t *testing.T) {
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
@@ -214,8 +214,8 @@ func TestPGXMemberStore_AddWorkspaceMember_AlreadyMember(t *testing.T) {
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	mock.ExpectCommit()
 
@@ -435,8 +435,8 @@ func TestPGXMemberStore_AddWorkspaceMember_AddsGeneralInTransaction(t *testing.T
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
@@ -527,8 +527,8 @@ func TestPGXMemberStore_AddWorkspaceMember_GeneralInsertErrorRollsBack(t *testin
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnError(want)
 	mock.ExpectRollback()
 
@@ -592,8 +592,8 @@ func TestPGXMemberStore_ActivateWorkspaceMember_AddsGeneralInTransaction(t *test
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
@@ -762,8 +762,8 @@ func TestPGXMemberStore_EnsureGeneralMembership_AddsActiveMember(t *testing.T) {
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
@@ -881,8 +881,8 @@ func TestPGXMemberStore_EnsureGeneralMembership_CommitErrorPropagates(t *testing
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
-		WithArgs("ch-geral", "user-1", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit().WillReturnError(want)
 

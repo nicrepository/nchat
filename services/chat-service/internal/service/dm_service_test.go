@@ -170,8 +170,8 @@ func TestDMService_GetOrCreateDirectConversation_RejectsIneligibleCallerBeforeCr
 		name   string
 		member *domain.WorkspaceMember
 	}{
-		{name: "suspended", member: &domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: user1, Status: domain.MemberStatusSuspended}},
-		{name: "removed", member: &domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: user1, Status: domain.MemberStatusLeft}},
+		{name: "suspended", member: &domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: user1, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended}},
+		{name: "removed", member: &domain.WorkspaceMember{WorkspaceID: "ws-1", UserID: user1, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusLeft}},
 		{name: "without membership"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -743,7 +743,7 @@ func TestDMService_SearchDMCandidates_RejectsInvalidSearch(t *testing.T) {
 func TestDMService_SearchDMCandidates_RequiresActiveCallerAndPropagatesStoreError(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", user1)] = domain.WorkspaceMember{
-		WorkspaceID: "ws-1", UserID: user1, Status: domain.MemberStatusSuspended,
+		WorkspaceID: "ws-1", UserID: user1, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended,
 	}
 	svc := service.NewDMService(&fakeDMStore{}, ms)
 	if _, err := svc.SearchDMCandidates(context.Background(), service.SearchDMCandidatesInput{

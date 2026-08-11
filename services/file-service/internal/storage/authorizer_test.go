@@ -111,7 +111,10 @@ func TestChannelAuthorizationMatchesTheChatWritePolicy(t *testing.T) {
 		"chat.workspace_members",
 		"wm.status = 'active'",
 		"c.status = 'active'",
-		"c.type = 'public' OR cm.user_id IS NOT NULL",
+		// The channel policy is not restated here: it is chat.channel_visible_to_user,
+		// the one definition chat-service, file-service and media-service share, so
+		// the RF-74 guest scope applies to uploads without a second copy of the rule.
+		"chat.channel_visible_to_user(c.id, active.user_id)",
 		"c.workspace_id",
 	} {
 		if !strings.Contains(pool.lastSQL, fragment) {

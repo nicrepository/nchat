@@ -62,7 +62,11 @@ func addInput(userIDs ...string) service.AddChannelMembersInput {
 }
 
 func TestAddChannelMembersAllowsWorkspaceManagers(t *testing.T) {
-	for _, role := range []domain.WorkspaceRole{domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin} {
+	// RF-74 added the moderator: domain.CanManageChannelMembers is the workspace
+	// moderation gate now, not the administration gate.
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
+	} {
 		t.Run(string(role), func(t *testing.T) {
 			svc, members, _ := addMembersFixture(t, role)
 
@@ -127,8 +131,8 @@ func TestAddChannelMembersRejectsNonManagers(t *testing.T) {
 // must be rejected, with no third opinion in between.
 func TestAddChannelMembersDefersEntirelyToTheNamedPredicate(t *testing.T) {
 	for _, role := range []domain.WorkspaceRole{
-		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin,
-		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest,
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
+		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest, domain.WorkspaceRole("wizard"),
 	} {
 		t.Run(string(role), func(t *testing.T) {
 			svc, _, _ := addMembersFixture(t, role)

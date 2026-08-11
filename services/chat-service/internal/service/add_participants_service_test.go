@@ -89,6 +89,65 @@ func TestAddGroupParticipantsRejectsInvisibleConversation(t *testing.T) {
 	}
 }
 
+// RF-74 regression: workspace RBAC is not a key to private conversations.
+//
+// A group is participant-only, and participation is the *only* question asked —
+// chat.dm_members, never chat.workspace_members.role. Introducing the workspace
+// moderator, and any future role, must not change that. Applying
+// domain.CanManageWorkspace here would be strictly *more* permissive, not less:
+// an admin is not a participant, cannot see the conversation through the DM
+// visibility policy, and giving them authority over a private conversation they
+// cannot read is the escalation SECURITY.md rules out.
+//
+// The same holds for reading: GetGroupDetails and the candidate search run
+// through the identical gate, so no workspace role reaches a conversation it
+// does not participate in.
+func TestAddGroupParticipantsIgnoresEveryWorkspaceRole(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,
+		domain.WorkspaceRoleMember, domain.WorkspaceRoleGuest,
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			dms := &fakeDMStore{
+				visibleConversation: domain.DMConversation{
+					ID: apConversationID, WorkspaceID: amWorkspaceID,
+					Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
+				},
+				addParticipantsResult: storage.AddMembersResult{Added: 1, TotalCount: 4},
+				// Not a participant: the DM visibility policy yields nothing, which
+				// is the whole authorization.
+				getVisibleErr: domain.ErrNotFound,
+			}
+			// The caller does hold the role under test at workspace scope, so a
+			// route that consulted the workspace role would let the top three
+			// through here.
+			members := &fakeMemberStore{
+				workspaceMembers: map[string]domain.WorkspaceMember{
+					wmKey(amWorkspaceID, amManagerID): {
+						WorkspaceID: amWorkspaceID, UserID: amManagerID,
+						Role: role, Status: domain.MemberStatusActive,
+					},
+				},
+				channelMembers:     map[string]domain.ChannelMember{},
+				ineligibleAccounts: map[string]struct{}{},
+			}
+			svc := service.NewDMService(dms, members)
+
+			if _, err := svc.AddGroupParticipants(context.Background(), participantsInput(amTargetA)); !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("%s: err = %v, want ErrNotFound", role, err)
+			}
+			if _, err := svc.GetGroupDetails(context.Background(), service.GroupDetailsInput{
+				WorkspaceID: amWorkspaceID, CallerID: amManagerID, ConversationID: apConversationID,
+			}); !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("%s: GetGroupDetails = %v, want ErrNotFound", role, err)
+			}
+			if dms.addParticipantsCalls != 0 {
+				t.Fatalf("%s reached the store without participating", role)
+			}
+		})
+	}
+}
+
 // Access is settled before the payload is validated, so an unauthorized caller
 // cannot learn from a 400-vs-404 whether the conversation exists.
 func TestAddGroupParticipantsChecksAccessBeforeValidatingThePayload(t *testing.T) {

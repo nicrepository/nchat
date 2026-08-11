@@ -862,12 +862,10 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		          ON wm.workspace_id = c.workspace_id
 		         AND wm.user_id = active.user_id
 		         AND wm.status = 'active'
-		        LEFT JOIN chat.channel_members AS cm
-		          ON cm.channel_id = c.id AND cm.user_id = active.user_id
 		        WHERE c.id = a.channel_id
 		          AND c.workspace_id = a.workspace_id
 		          AND c.status = 'active'
-		          AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+		          AND chat.channel_visible_to_user(c.id, active.user_id)
 		    ))
 		    OR
 		    (a.destination_kind = 'dm' AND EXISTS (

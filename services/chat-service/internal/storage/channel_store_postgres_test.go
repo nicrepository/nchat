@@ -27,6 +27,7 @@ const (
 	chanAdmin          = "c1000000-0000-4000-8000-00000000000b"
 	chanMember         = "c1000000-0000-4000-8000-00000000000c"
 	chanGuest          = "c1000000-0000-4000-8000-00000000000d"
+	chanModerator      = "c1000000-0000-4000-8000-000000000012"
 	chanSuspended      = "c1000000-0000-4000-8000-00000000000e"
 	chanStranger       = "c1000000-0000-4000-8000-00000000000f"
 	chanForeignOwner   = "c1000000-0000-4000-8000-000000000010"
@@ -99,20 +100,23 @@ func newChannelAuthzPool(t *testing.T) *pgxpool.Pool {
 			($2, $5, 'geral', 'geral', 'public', true, 'active'),
 			($3, $6, 'geral', 'geral', 'public', true, 'active')`,
 			args: []any{chanGeneral, chanOtherGeneral, chanDisabledGenrl, chanWorkspace, chanOtherWorkspace, chanDisabledWS}},
-		// Every role in the workspace is active. Only status and workspace vary,
-		// which is the point: the role must not change the outcome.
+		// Every role in the workspace is active, so status and workspace are the
+		// only things that vary among the roles that may create a channel. The
+		// guest is the one role RF-74 excludes, and it is seeded active
+		// precisely so the denial cannot be blamed on membership status.
 		{sql: `INSERT INTO chat.workspace_members (workspace_id, user_id, role, status) VALUES
-			($1, $4, 'owner',  'active'),
-			($1, $5, 'admin',  'active'),
-			($1, $6, 'member', 'active'),
-			($1, $7, 'guest',  'active'),
-			($1, $8, 'member', 'suspended'),
-			($2, $9, 'owner',  'active'),
-			($3, $10,'owner',  'active')`,
+			($1, $4,  'owner',     'active'),
+			($1, $5,  'admin',     'active'),
+			($1, $6,  'member',    'active'),
+			($1, $7,  'guest',     'active'),
+			($1, $8,  'member',    'suspended'),
+			($1, $11, 'moderator', 'active'),
+			($2, $9,  'owner',     'active'),
+			($3, $10, 'owner',     'active')`,
 			args: []any{
 				chanWorkspace, chanOtherWorkspace, chanDisabledWS,
 				chanOwner, chanAdmin, chanMember, chanGuest, chanSuspended,
-				chanForeignOwner, chanDisabledOwner,
+				chanForeignOwner, chanDisabledOwner, chanModerator,
 			}},
 	} {
 		if _, err := tx.Exec(ctx, seed.sql, seed.args...); err != nil {
@@ -154,7 +158,12 @@ func TestPGXChannelStoreCreateForActiveMemberPostgreSQL(t *testing.T) {
 		{name: "active owner", workspaceID: chanWorkspace, actor: chanOwner, slug: "by-owner"},
 		{name: "active admin", workspaceID: chanWorkspace, actor: chanAdmin, slug: "by-admin"},
 		{name: "active member", workspaceID: chanWorkspace, actor: chanMember, slug: "by-member"},
-		{name: "active guest", workspaceID: chanWorkspace, actor: chanGuest, slug: "by-guest"},
+		{name: "active moderator", workspaceID: chanWorkspace, actor: chanModerator, slug: "by-moderator"},
+		// RF-74: the guest is active and in the right workspace, and is refused
+		// on role alone. This is the database half of domain.CanCreateChannel —
+		// the INSERT re-derives the role list, so the service check is not the
+		// only thing standing between a guest and a channel.
+		{name: "active guest", workspaceID: chanWorkspace, actor: chanGuest, slug: "by-guest", wantErr: domain.ErrForbidden},
 		{name: "suspended member", workspaceID: chanWorkspace, actor: chanSuspended, slug: "by-suspended", wantErr: domain.ErrForbidden},
 		{name: "no membership", workspaceID: chanWorkspace, actor: chanStranger, slug: "by-stranger", wantErr: domain.ErrForbidden},
 		{name: "membership in another workspace", workspaceID: chanWorkspace, actor: chanForeignOwner, slug: "by-foreign", wantErr: domain.ErrForbidden},
@@ -202,7 +211,7 @@ func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t 
 		Slug:                    "private-room",
 		DisplayName:             "Private Room",
 		Type:                    domain.ChannelTypePrivate,
-		CreatedBy:               chanGuest,
+		CreatedBy:               chanMember,
 		EnsureCreatorMemberRole: domain.ChannelRoleMember,
 	})
 	if err != nil {
@@ -210,7 +219,7 @@ func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t 
 	}
 	if n := countChannelRows(t, pool,
 		`SELECT count(*) FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`,
-		private.ID, chanGuest); n != 1 {
+		private.ID, chanMember); n != 1 {
 		t.Fatalf("private creator memberships = %d, want 1", n)
 	}
 
@@ -219,7 +228,7 @@ func TestPGXChannelStoreCreateForActiveMemberSeedsPrivateMembershipPostgreSQL(t 
 		Slug:        "public-room",
 		DisplayName: "Public Room",
 		Type:        domain.ChannelTypePublic,
-		CreatedBy:   chanGuest,
+		CreatedBy:   chanMember,
 	})
 	if err != nil {
 		t.Fatalf("create public channel: %v", err)

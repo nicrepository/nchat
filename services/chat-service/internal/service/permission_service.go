@@ -50,18 +50,31 @@ func (s *PermissionService) CanRead(ctx context.Context, workspaceID, channelID,
 		return false, fmt.Errorf("get channel: %w", err)
 	}
 
-	var cm *domain.ChannelMember
-	if ch.Type == domain.ChannelTypePrivate {
-		got, err := s.members.GetChannelMember(ctx, channelID, userID)
-		if errors.Is(err, domain.ErrNotFound) {
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("get channel member: %w", err)
-		}
-		cm = &got
+	// Ask the domain with the workspace membership alone first. For a role that
+	// reaches public channels that is already the whole answer, so the common
+	// path keeps its single round trip.
+	//
+	// When it is not — a guest, whose reach is only the channels it was added
+	// to (RF-74), or anybody at all facing a private channel — an explicit
+	// channel membership is the one thing that can still change the answer, so
+	// load it and ask again. Deliberately not "if the channel is private":
+	// that condition was the bug, because it left a guest that *is* a member of
+	// a public channel being judged as if it were not one.
+	//
+	// The decision stays in domain.CanReadChannel either way. Nothing here
+	// tests a role or a channel type; this only supplies the input the domain
+	// needs to answer correctly.
+	if domain.CanReadChannel(&wm, nil, ch) {
+		return true, nil
 	}
-	return domain.CanReadChannel(&wm, cm, ch), nil
+	cm, err := s.members.GetChannelMember(ctx, channelID, userID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get channel member: %w", err)
+	}
+	return domain.CanReadChannel(&wm, &cm, ch), nil
 }
 
 // CanWrite reports whether userID may post to channelID in workspaceID.

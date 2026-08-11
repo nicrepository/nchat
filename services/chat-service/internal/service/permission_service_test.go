@@ -10,7 +10,7 @@ import (
 )
 
 func activeMembership(workspaceID, userID string) domain.WorkspaceMember {
-	return domain.WorkspaceMember{WorkspaceID: workspaceID, UserID: userID, Status: domain.MemberStatusActive}
+	return domain.WorkspaceMember{WorkspaceID: workspaceID, UserID: userID, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive}
 }
 
 func TestPermissionService_ListVisibleChannels_NonMember_Empty(t *testing.T) {
@@ -245,7 +245,7 @@ func TestPermissionService_CanRead_StalePrivateMembershipCannotCrossWorkspace(t 
 		t.Run(string(status), func(t *testing.T) {
 			ms := newFakeMemberStore()
 			ms.workspaceMembers[wmKey("ws-a", "user-1")] = activeMembership("ws-a", "user-1")
-			ms.workspaceMembers[wmKey("ws-b", "user-1")] = domain.WorkspaceMember{WorkspaceID: "ws-b", UserID: "user-1", Status: status}
+			ms.workspaceMembers[wmKey("ws-b", "user-1")] = domain.WorkspaceMember{WorkspaceID: "ws-b", UserID: "user-1", Role: domain.WorkspaceRoleMember, Status: status}
 			ms.channelMembers[cmKey("private-b", "user-1")] = domain.ChannelMember{ChannelID: "private-b", UserID: "user-1"}
 			channel := domain.Channel{ID: "private-b", WorkspaceID: "ws-b", Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
 
@@ -269,6 +269,110 @@ func TestPermissionService_CanRead_ChannelMembershipDBError_Propagates(t *testin
 	_, err := service.NewPermissionService(ms, &fakeChannelStore{channel: channel}).CanRead(context.Background(), "ws-1", "private", "user-1")
 	if err == nil {
 		t.Fatal("expected channel membership database error")
+	}
+}
+
+// Regression: PermissionService used to load the channel membership only for
+// private channels, so a guest explicitly added to a *public* channel was judged
+// as if it had no membership at all and was refused — while the SQL policy that
+// backs the listing admitted it. The service and chat.channel_visible_to_user
+// disagreed about the same user and the same channel.
+//
+// The matrix is unchanged by this fix; only the input handed to the domain is.
+// Every non-guest row below states the behaviour that already existed.
+func TestPermissionService_CanRead_GuestReachesOnlyChannelsItBelongsTo(t *testing.T) {
+	const workspace, user = "ws-1", "user-1"
+	public := domain.Channel{ID: "ch-pub", WorkspaceID: workspace, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+	general := domain.Channel{ID: "ch-geral", WorkspaceID: workspace, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive, IsGeneral: true}
+	private := domain.Channel{ID: "ch-priv", WorkspaceID: workspace, Type: domain.ChannelTypePrivate, Status: domain.ChannelStatusActive}
+
+	for _, tt := range []struct {
+		name       string
+		role       domain.WorkspaceRole
+		channel    domain.Channel
+		channelMem bool
+		want       bool
+	}{
+		// The finding: an included guest must read the public channel it is in.
+		{name: "guest in public channel reads it", role: domain.WorkspaceRoleGuest, channel: public, channelMem: true, want: true},
+		{name: "guest outside public channel is denied", role: domain.WorkspaceRoleGuest, channel: public, want: false},
+		{name: "guest in general reads it", role: domain.WorkspaceRoleGuest, channel: general, channelMem: true, want: true},
+		{name: "guest outside general is denied", role: domain.WorkspaceRoleGuest, channel: general, want: false},
+		{name: "guest in private channel reads it", role: domain.WorkspaceRoleGuest, channel: private, channelMem: true, want: true},
+		{name: "guest outside private channel is denied", role: domain.WorkspaceRoleGuest, channel: private, want: false},
+
+		// Unchanged for every role that reaches public channels on its own.
+		{name: "member reads public without channel membership", role: domain.WorkspaceRoleMember, channel: public, want: true},
+		{name: "moderator reads public without channel membership", role: domain.WorkspaceRoleModerator, channel: public, want: true},
+		{name: "admin reads public without channel membership", role: domain.WorkspaceRoleAdmin, channel: public, want: true},
+		{name: "owner reads general without channel membership", role: domain.WorkspaceRoleOwner, channel: general, want: true},
+		{name: "member in public channel still reads it", role: domain.WorkspaceRoleMember, channel: public, channelMem: true, want: true},
+
+		// Private still takes channel membership from everybody.
+		{name: "owner outside private channel is denied", role: domain.WorkspaceRoleOwner, channel: private, want: false},
+		{name: "admin outside private channel is denied", role: domain.WorkspaceRoleAdmin, channel: private, want: false},
+		{name: "member in private channel reads it", role: domain.WorkspaceRoleMember, channel: private, channelMem: true, want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey(workspace, user)] = domain.WorkspaceMember{
+				WorkspaceID: workspace, UserID: user, Role: tt.role, Status: domain.MemberStatusActive,
+			}
+			if tt.channelMem {
+				ms.channelMembers[cmKey(tt.channel.ID, user)] = domain.ChannelMember{ChannelID: tt.channel.ID, UserID: user}
+			}
+			svc := service.NewPermissionService(ms, &fakeChannelStore{channel: tt.channel})
+
+			got, err := svc.CanRead(context.Background(), workspace, tt.channel.ID, user)
+			if err != nil {
+				t.Fatalf("CanRead: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("CanRead = %v, want %v", got, tt.want)
+			}
+			// Write follows read (CanWriteChannel == CanReadChannel), so the fix
+			// must reach it too — this is the half MentionService and the message
+			// routes consume.
+			gotWrite, err := svc.CanWrite(context.Background(), workspace, tt.channel.ID, user)
+			if err != nil {
+				t.Fatalf("CanWrite: %v", err)
+			}
+			if gotWrite != tt.want {
+				t.Fatalf("CanWrite = %v, want %v", gotWrite, tt.want)
+			}
+		})
+	}
+}
+
+// The membership is loaded only when it could still change the answer, so the
+// hot path — a full member reading a public channel — keeps its single query.
+// Fetching unconditionally would have fixed the bug too, at the cost of a second
+// round trip on the most frequent authorization check in the service.
+func TestPermissionService_CanRead_LoadsChannelMembershipOnlyWhenItCanMatter(t *testing.T) {
+	const workspace, user = "ws-1", "user-1"
+	public := domain.Channel{ID: "ch-pub", WorkspaceID: workspace, Type: domain.ChannelTypePublic, Status: domain.ChannelStatusActive}
+
+	for _, tt := range []struct {
+		name     string
+		role     domain.WorkspaceRole
+		wantCall int
+	}{
+		{name: "member decided by role alone", role: domain.WorkspaceRoleMember, wantCall: 0},
+		{name: "guest needs the membership", role: domain.WorkspaceRoleGuest, wantCall: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey(workspace, user)] = domain.WorkspaceMember{
+				WorkspaceID: workspace, UserID: user, Role: tt.role, Status: domain.MemberStatusActive,
+			}
+			if _, err := service.NewPermissionService(ms, &fakeChannelStore{channel: public}).
+				CanRead(context.Background(), workspace, public.ID, user); err != nil {
+				t.Fatalf("CanRead: %v", err)
+			}
+			if ms.getCMCalls != tt.wantCall {
+				t.Fatalf("GetChannelMember calls = %d, want %d", ms.getCMCalls, tt.wantCall)
+			}
+		})
 	}
 }
 

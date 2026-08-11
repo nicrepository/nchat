@@ -76,14 +76,16 @@ func TestChannelService_CreatePrivateChannel_ManagerAddsCreatorMembership(t *tes
 }
 
 // Creating a channel takes active membership, not a management role (BUG #393):
-// every active role reaches storage, and the creator recorded is the caller the
-// service was given — never anything the role could have influenced.
+// every active role that reaches the workspace's public channels gets to
+// storage, and the creator recorded is the caller the service was given — never
+// anything the role could have influenced. The guest is covered separately
+// below, because RF-74 makes it the one active role that may not create.
 func TestChannelService_CreateChannel_AnyActiveRoleSucceeds(t *testing.T) {
 	for _, role := range []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner,
 		domain.WorkspaceRoleAdmin,
+		domain.WorkspaceRoleModerator,
 		domain.WorkspaceRoleMember,
-		domain.WorkspaceRoleGuest,
 	} {
 		t.Run(string(role), func(t *testing.T) {
 			ms := newFakeMemberStore()
@@ -109,6 +111,41 @@ func TestChannelService_CreateChannel_AnyActiveRoleSucceeds(t *testing.T) {
 			}
 			if channels.lastCreateInput.CreatedBy != "caller-1" || channels.lastCreateInput.IsGeneral {
 				t.Fatalf("service must own created_by/is_general, input=%+v", channels.lastCreateInput)
+			}
+		})
+	}
+}
+
+// RF-74: a guest reaches only the channels it was added to, so it may not mint
+// channels of its own — a guest-created public channel would also be visible to
+// every real member. An unrecognised role is denied for the same reason a
+// guest is: the predicate is an allowlist, so a role the code does not know is
+// never treated as a full member. Neither ever reaches storage.
+func TestChannelService_CreateChannel_GuestAndUnknownRoleDenied(t *testing.T) {
+	for _, role := range []domain.WorkspaceRole{
+		domain.WorkspaceRoleGuest,
+		domain.WorkspaceRole("wizard"),
+		domain.WorkspaceRole(""),
+	} {
+		t.Run(string(role), func(t *testing.T) {
+			ms := newFakeMemberStore()
+			ms.workspaceMembers[wmKey("ws-1", "caller-1")] = domain.WorkspaceMember{
+				WorkspaceID: "ws-1", UserID: "caller-1", Role: role, Status: domain.MemberStatusActive,
+			}
+			channels := &fakeChannelStore{createdChannel: domain.Channel{ID: "ch-1", WorkspaceID: "ws-1"}}
+
+			_, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).CreateChannel(context.Background(), service.CreateChannelInput{
+				WorkspaceID: "ws-1",
+				CallerID:    "caller-1",
+				Slug:        "team",
+				DisplayName: "Team",
+				Type:        domain.ChannelTypePublic,
+			})
+			if !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("CreateChannel = %v, want ErrForbidden", err)
+			}
+			if channels.lastCreateInput.Slug != "" {
+				t.Fatalf("a denied creation reached storage: %+v", channels.lastCreateInput)
 			}
 		})
 	}

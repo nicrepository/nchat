@@ -10,11 +10,18 @@ import (
 
 // messageAccessJoins and messageAccessPredicate express "the user can read
 // this message right now": active workspace + active workspace membership, and
-// either an active public channel, an active private channel the user belongs
-// to, or an active DM conversation the user is an active member of. They mirror
-// the visibility rules used by the message list queries and the reaction store.
+// either a channel chat.channel_visible_to_user admits for this user or an
+// active DM conversation the user is an active member of. They mirror the
+// visibility rules used by the message list queries and the reaction store.
 // Both AddFavorite and ListFavorites re-evaluate access server-side on every
 // request — favorites made before an access revocation are filtered out.
+//
+// The channel half delegates to chat.channel_visible_to_user rather than
+// restating it, which is what makes the RF-74 guest scope reach favorites and
+// pins (PGXPinStore.AddPin and RemovePin build on these two): a guest may
+// favorite and pin in a channel it belongs to, and neither in one it does not.
+// Pin and unpin therefore stay exactly as strong as read access and no
+// stronger, which is the RF-05 decision recorded in SECURITY.md.
 func messageAccessJoins(userArg string) string {
 	return `
 	JOIN chat.workspaces w
@@ -23,18 +30,18 @@ func messageAccessJoins(userArg string) string {
 	  ON wm.workspace_id = m.workspace_id AND wm.user_id = ` + userArg + ` AND wm.status = 'active'
 	LEFT JOIN chat.channels c
 	  ON c.id = m.channel_id AND c.status = 'active'
-	LEFT JOIN chat.channel_members cm
-	  ON cm.channel_id = m.channel_id AND cm.user_id = ` + userArg + `
 	LEFT JOIN chat.dm_conversations dc
 	  ON dc.id = m.dm_conversation_id AND dc.status = 'active'
 	LEFT JOIN chat.dm_members dm
 	  ON dm.conversation_id = m.dm_conversation_id AND dm.user_id = ` + userArg + ` AND dm.status = 'active'`
 }
 
-const messageAccessPredicate = `(
-		(m.channel_id IS NOT NULL AND c.id IS NOT NULL AND (c.type = 'public' OR cm.user_id IS NOT NULL))
+func messageAccessPredicate(userArg string) string {
+	return `(
+		(m.channel_id IS NOT NULL AND c.id IS NOT NULL AND chat.channel_visible_to_user(c.id, ` + userArg + `::uuid))
 		OR (m.dm_conversation_id IS NOT NULL AND dc.id IS NOT NULL AND dm.user_id IS NOT NULL)
 	)`
+}
 
 // AddFavoriteInput identifies the message the authenticated user wants to favorite.
 // UserID always comes from the authenticated context, never from the payload.
@@ -98,7 +105,7 @@ func (s *PGXFavoriteStore) AddFavorite(ctx context.Context, input AddFavoriteInp
 			SELECT m.id
 			FROM chat.messages m`+messageAccessJoins("$2")+`
 			WHERE m.workspace_id = $1 AND m.id = $3 AND m.status = 'active'
-			  AND `+messageAccessPredicate+`
+			  AND `+messageAccessPredicate("$2")+`
 		),
 		ins AS (
 			INSERT INTO chat.message_favorites (user_id, message_id)
@@ -144,7 +151,7 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 		LEFT JOIN auth.users u
 		  ON u.id = m.sender_id
 		WHERE f.user_id = $2
-		  AND ` + messageAccessPredicate
+		  AND ` + messageAccessPredicate("$2")
 
 	args := []any{input.WorkspaceID, input.UserID}
 	if input.BeforeCursor != nil {
