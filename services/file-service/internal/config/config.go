@@ -70,6 +70,23 @@ const (
 	dbConnectionHeadroom = 4
 
 	defaultDBMaxConnections = defaultUploadMaxConcurrent + dbConnectionHeadroom + 2
+
+	// RF-10 Open Graph link previews.
+	//
+	// The timeout is short and it is meant to be: it is the budget for reaching
+	// a third-party site nobody here controls, and a request the user is
+	// waiting on. A site that cannot answer a document request in five seconds
+	// does not get a preview. The per-phase budgets inside the fetcher (dial,
+	// TLS, response headers) are smaller still and are not configurable —
+	// they are properties of the sandbox, not of a deployment.
+	defaultLinkPreviewTimeoutSeconds = 5
+	maxLinkPreviewTimeoutSeconds     = 30
+
+	// The cache TTL is long enough that a link pasted into a busy channel is
+	// fetched once rather than once per reader, and short enough that an edited
+	// page is picked up the same day.
+	defaultLinkPreviewCacheTTLSeconds = 900
+	maxLinkPreviewCacheTTLSeconds     = 86400
 )
 
 type Config struct {
@@ -175,15 +192,31 @@ type Config struct {
 	SeaweedFSFilerURL       string
 	SeaweedFSTimeoutSeconds int
 
+	// LinkPreviewEnabled gates the RF-10 route. It defaults to false for the
+	// same reason FILE_UPLOADS_ENABLED does: the feature makes this service
+	// open outbound connections to hosts a user names, so a deployment gets it
+	// by asking for it, never by forgetting to say otherwise. While false the
+	// route answers 503 and no fetcher is built.
+	LinkPreviewEnabled bool
+	// LinkPreviewTimeoutSeconds bounds one whole remote exchange, and
+	// LinkPreviewCacheTTLSeconds how long a successful preview is reused.
+	// Everything else about the fetch — body ceiling, redirect limit, cache
+	// size, allowed content types — is a constant, because a deployment that
+	// could widen them could weaken the sandbox.
+	LinkPreviewTimeoutSeconds  int
+	LinkPreviewCacheTTLSeconds int
+
 	uploadsEnabledInvalid      bool
 	malwareScanRequiredInvalid bool
 	maxUploadBytesInvalid      bool
+	linkPreviewEnabledInvalid  bool
 }
 
 func Load() Config {
 	uploadsEnabled, uploadsEnabledInvalid := configuredBool("FILE_UPLOADS_ENABLED", false)
 	scanRequired, scanRequiredInvalid := configuredBool("FILE_MALWARE_SCAN_REQUIRED", true)
 	maxUploadBytes, maxUploadBytesInvalid := configuredInt64("FILE_MAX_UPLOAD_BYTES", domain.MaxMaxUploadBytes)
+	linkPreviewEnabled, linkPreviewEnabledInvalid := configuredBool("FILE_LINK_PREVIEW_ENABLED", false)
 
 	return Config{
 		ServiceName: serviceName,
@@ -218,9 +251,17 @@ func Load() Config {
 		WSInstanceID:               sanitizeInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
 		SeaweedFSFilerURL:          strings.TrimSpace(platformconfig.GetString("SEAWEEDFS_FILER_URL", "")),
 		SeaweedFSTimeoutSeconds:    positiveInt("SEAWEEDFS_TIMEOUT_SECONDS", defaultSeaweedFSTimeoutSeconds),
+		LinkPreviewEnabled:         linkPreviewEnabled,
+		LinkPreviewTimeoutSeconds: positiveInt(
+			"FILE_LINK_PREVIEW_TIMEOUT_SECONDS", defaultLinkPreviewTimeoutSeconds,
+		),
+		LinkPreviewCacheTTLSeconds: positiveInt(
+			"FILE_LINK_PREVIEW_CACHE_TTL_SECONDS", defaultLinkPreviewCacheTTLSeconds,
+		),
 		uploadsEnabledInvalid:      uploadsEnabledInvalid,
 		malwareScanRequiredInvalid: scanRequiredInvalid,
 		maxUploadBytesInvalid:      maxUploadBytesInvalid,
+		linkPreviewEnabledInvalid:  linkPreviewEnabledInvalid,
 	}
 }
 
@@ -234,6 +275,11 @@ func (c Config) Validate() error {
 	}
 	if c.malwareScanRequiredInvalid {
 		return errors.New("FILE_MALWARE_SCAN_REQUIRED must be a valid boolean")
+	}
+	// Link previews are validated before the early return below, because they
+	// are independent of uploads: a deployment may run either, both or neither.
+	if err := c.validateLinkPreview(); err != nil {
+		return err
 	}
 	if !c.UploadsEnabled {
 		return nil
@@ -310,14 +356,8 @@ func (c Config) validateUploadDependencies() error {
 	if c.DatabaseURL == "" {
 		return errors.New("database URL is required when uploads are enabled")
 	}
-	if len([]byte(c.AuthJWTHMACSecret)) < 32 {
-		return errors.New("JWT HMAC secret must be at least 32 bytes")
-	}
-	if c.AuthJWTIssuer == "" {
-		return errors.New("JWT issuer is required")
-	}
-	if c.AuthJWTAudience == "" {
-		return errors.New("JWT audience is required")
+	if err := c.validateAuthDependencies(); err != nil {
+		return err
 	}
 	// One check for the whole key ring: the active key, its id and any previous
 	// key kept for reading. It builds the ring the service will use, so a
@@ -354,6 +394,53 @@ func (c Config) validateUploadDependencies() error {
 		)
 	}
 	return nil
+}
+
+// validateAuthDependencies checks the access-token settings every
+// authenticated route needs. It is shared rather than restated because uploads
+// and link previews are enabled independently and both are authenticated: a
+// deployment running only one of them must still be refused if it cannot
+// validate a token.
+func (c Config) validateAuthDependencies() error {
+	if len([]byte(c.AuthJWTHMACSecret)) < 32 {
+		return errors.New("JWT HMAC secret must be at least 32 bytes")
+	}
+	if c.AuthJWTIssuer == "" {
+		return errors.New("JWT issuer is required")
+	}
+	if c.AuthJWTAudience == "" {
+		return errors.New("JWT audience is required")
+	}
+	return nil
+}
+
+// validateLinkPreview checks the RF-10 settings.
+//
+// The ceilings are operational, not policy. A timeout is multiplied by
+// time.Second, so an absurd value overflows the duration it becomes and yields
+// a deadline that has already passed; and a budget measured in minutes would
+// hold a request — and a socket — open for a third-party site that has already
+// failed. The TTL ceiling exists so a typo cannot make a cached preview
+// effectively permanent. A non-positive value has already fallen back to the
+// default in Load, exactly like every other timeout in this service.
+func (c Config) validateLinkPreview() error {
+	if c.linkPreviewEnabledInvalid {
+		return errors.New("FILE_LINK_PREVIEW_ENABLED must be a valid boolean")
+	}
+	if !c.LinkPreviewEnabled {
+		return nil
+	}
+	if c.LinkPreviewTimeoutSeconds > maxLinkPreviewTimeoutSeconds {
+		return fmt.Errorf(
+			"FILE_LINK_PREVIEW_TIMEOUT_SECONDS must not exceed %d", maxLinkPreviewTimeoutSeconds,
+		)
+	}
+	if c.LinkPreviewCacheTTLSeconds > maxLinkPreviewCacheTTLSeconds {
+		return fmt.Errorf(
+			"FILE_LINK_PREVIEW_CACHE_TTL_SECONDS must not exceed %d", maxLinkPreviewCacheTTLSeconds,
+		)
+	}
+	return c.validateAuthDependencies()
 }
 
 // validScannerAddress accepts a plain "host:port" and nothing else.

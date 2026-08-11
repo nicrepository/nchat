@@ -24,6 +24,12 @@ type RouterDependencies struct {
 	RateLimiter     *UserRateLimiter
 	ReadinessPinger Pinger
 	StoragePinger   Pinger
+	// LinkPreviews serves RF-10. It has its own limiter rather than sharing the
+	// upload budget: a client previewing the links in a busy channel would
+	// otherwise spend the allowance that exists to protect uploads, and one
+	// feature would silently deny the other.
+	LinkPreviews           LinkPreviewUseCase
+	LinkPreviewRateLimiter *UserRateLimiter
 	// Observability is the registry the app already built so the attachment
 	// counters and the HTTP counters end up on the same /metrics endpoint.
 	Observability *observability.Metrics
@@ -55,6 +61,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, dependencies ...RouterDep
 	mux.Handle(RouteMetrics, metrics.Handler())
 
 	registerAttachmentRoutes(mux, cfg, logger, deps)
+	registerLinkPreviewRoute(mux, cfg, deps)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
@@ -108,4 +115,33 @@ func registerAttachmentRoutes(
 	// and is not rate limited for the same reason the listing is not: it is a
 	// read, and the upload budget exists to protect writes.
 	mux.Handle("GET "+RouteAttachmentPreview, authenticated(http.HandlerFunc(handler.GetPreview)))
+}
+
+// registerLinkPreviewRoute wires RF-10.
+//
+// The route is registered in every configuration, exactly like the attachment
+// routes: disabled or half-wired it answers 503, so a missing configuration is
+// never mistaken for a route that does not exist.
+//
+// It is authenticated for a reason worth stating: an anonymous version of this
+// endpoint would be an open fetcher anyone on the internet could point at
+// arbitrary hosts, using this deployment's address and this deployment's
+// budget. The rate limit is the second half of that — the route is the only one
+// in the service where a caller decides how much outbound work happens.
+func registerLinkPreviewRoute(mux *http.ServeMux, cfg config.Config, deps RouterDependencies) {
+	guarded := func(next http.Handler) http.Handler {
+		switch {
+		case !cfg.LinkPreviewEnabled:
+			return Unavailable("link previews are disabled")
+		case deps.TokenValidator == nil || deps.LinkPreviews == nil:
+			return Unavailable("link preview dependencies unavailable")
+		default:
+			return BearerAuth(deps.TokenValidator)(next)
+		}
+	}
+	var handler http.Handler = http.HandlerFunc(NewLinkPreviewHandler(deps.LinkPreviews).Create)
+	if deps.LinkPreviewRateLimiter != nil {
+		handler = deps.LinkPreviewRateLimiter.Middleware(handler)
+	}
+	mux.Handle("POST "+RouteLinkPreview, guarded(handler))
 }
