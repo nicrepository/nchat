@@ -8,7 +8,13 @@ import { clearTokens, setTokens } from "../lib/authSession";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
 import ChatSidebar from "./ChatSidebar";
-import type { Channel, DMCandidate, DirectDMResult, DMConversation, ChannelCategory } from "./chatTypes";
+import type {
+  Channel,
+  DMCandidate,
+  DirectDMResult,
+  DMConversation,
+  ChannelCategory,
+} from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
@@ -19,27 +25,30 @@ const {
   mockCreateGroupDM,
   mockCreateChannel,
 } = vi.hoisted(() => ({
-  mockFetchSidebarData:
-    vi.fn<
-      () => Promise<{
-        currentUserId: string;
-        channels: Channel[];
-        dms: DMConversation[];
-        categories?: ChannelCategory[];
-      }>
-    >(),
+  mockFetchSidebarData: vi.fn<
+    () => Promise<{
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+      categories?: ChannelCategory[];
+    }>
+  >(),
   mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
   mockCreateGroupDM:
     vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
-  mockCreateChannel:
-    vi.fn<
-      (
-        input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
-        signal?: AbortSignal,
-      ) => Promise<Channel>
-    >(),
+  mockCreateChannel: vi.fn<
+    (
+      input: {
+        slug: string;
+        displayName: string;
+        type: "public" | "private";
+        categoryId?: string;
+      },
+      signal?: AbortSignal,
+    ) => Promise<Channel>
+  >(),
 }));
 
 vi.mock("./chatApi", () => ({
@@ -2094,8 +2103,22 @@ describe("ChatSidebar — collapsible categories", () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "user-1",
       channels: [
-        { id: "ch-1", name: "canal-1", type: "public", canWrite: true, categoryId: "cat-proj", categoryName: "Projetos" },
-        { id: "ch-2", name: "canal-2", type: "public", canWrite: true, categoryId: "cat-infra", categoryName: "Infra" },
+        {
+          id: "ch-1",
+          name: "canal-1",
+          type: "public",
+          canWrite: true,
+          categoryId: "cat-proj",
+          categoryName: "Projetos",
+        },
+        {
+          id: "ch-2",
+          name: "canal-2",
+          type: "public",
+          canWrite: true,
+          categoryId: "cat-infra",
+          categoryName: "Infra",
+        },
       ],
       dms: [],
       categories: [
@@ -2119,12 +2142,17 @@ describe("ChatSidebar — collapsible categories", () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId: "user-1",
       channels: [
-        { id: "ch-1", name: "canal-1", type: "public", canWrite: true, categoryId: "cat-proj", categoryName: "Projetos" },
+        {
+          id: "ch-1",
+          name: "canal-1",
+          type: "public",
+          canWrite: true,
+          categoryId: "cat-proj",
+          categoryName: "Projetos",
+        },
       ],
       dms: [],
-      categories: [
-        { id: "cat-proj", name: "Projetos", kind: "category" },
-      ],
+      categories: [{ id: "cat-proj", name: "Projetos", kind: "category" }],
     });
     renderChat();
 
@@ -2144,4 +2172,3 @@ describe("ChatSidebar — collapsible categories", () => {
     expect(screen.getByRole("option", { name: /canal-1/i })).toBeInTheDocument();
   });
 });
-

@@ -201,7 +201,8 @@ export function useChatSidebar() {
 
     const loading = fetchSidebarData()
       .then(({ currentUserId, channels, dms, categories }) => {
-        if (mountedRef.current) dispatch({ type: "loaded", currentUserId, channels, dms, categories });
+        if (mountedRef.current)
+          dispatch({ type: "loaded", currentUserId, channels, dms, categories });
       })
       .catch((err: unknown) => {
         if (mountedRef.current) {
@@ -254,7 +255,8 @@ export function useChatSidebar() {
     const run = () => {
       fetchSidebarData()
         .then(({ currentUserId, channels, dms, categories }) => {
-          if (mountedRef.current) dispatch({ type: "loaded", currentUserId, channels, dms, categories });
+          if (mountedRef.current)
+            dispatch({ type: "loaded", currentUserId, channels, dms, categories });
         })
         .catch(() => {
           // The sidebar on screen stays valid; the next event or navigation

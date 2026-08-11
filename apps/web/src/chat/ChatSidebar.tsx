@@ -488,7 +488,10 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const dms = state.status === "ready" ? state.dms : undefined;
   const categories = state.status === "ready" ? state.categories : undefined;
 
-  const effectiveCategories = (categories && categories.length > 0) ? categories : [{ id: 'uncategorized', name: 'Geral', kind: 'uncategorized' }];
+  const effectiveCategories =
+    categories && categories.length > 0
+      ? categories
+      : [{ id: "uncategorized", name: "Geral", kind: "uncategorized" }];
 
   const groupedChannelsByCategory = useMemo(() => {
     if (!channels) return [];
@@ -614,7 +617,9 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                         aria-expanded={!isCollapsed}
                         tabIndex={-1}
                       >
-                        <span className={`chat-sidebar__category-chevron ${isCollapsed ? "chat-sidebar__category-chevron--collapsed" : ""}`}>
+                        <span
+                          className={`chat-sidebar__category-chevron ${isCollapsed ? "chat-sidebar__category-chevron--collapsed" : ""}`}
+                        >
                           <IconChevronDown />
                         </span>
                         <span className="chat-sidebar__category-title">{category.name}</span>

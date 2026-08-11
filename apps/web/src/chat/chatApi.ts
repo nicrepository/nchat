@@ -110,7 +110,13 @@ interface GroupDMEnvelope {
 }
 
 interface CreateChannelEnvelope {
-  data: { id: string; slug: string; display_name: string; type: "public" | "private"; category_id?: string };
+  data: {
+    id: string;
+    slug: string;
+    display_name: string;
+    type: "public" | "private";
+    category_id?: string;
+  };
 }
 
 interface AllowedReactionEmojisEnvelope {
@@ -139,7 +145,7 @@ async function fetchSidebar(): Promise<SidebarResponse> {
 async function fetchChannelCategories(): Promise<{ groups: ChannelCategoryGroupResponse[] }> {
   const res = await authenticatedFetch<ChannelCategoriesEnvelope>(
     `${CHAT_BASE}/channel-categories`,
-    { method: "GET" }
+    { method: "GET" },
   );
   return res.data;
 }
@@ -283,14 +289,11 @@ function mapSidebarDMs(raw: SidebarDMResponse[] | undefined): DMConversation[] {
 // ── Exported API ──────────────────────────────────────────────────────────────
 
 export async function fetchChannels(): Promise<Channel[]> {
-  const [sidebar, categoriesRes] = await Promise.all([
-    fetchSidebar(),
-    fetchChannelCategories(),
-  ]);
+  const [sidebar, categoriesRes] = await Promise.all([fetchSidebar(), fetchChannelCategories()]);
 
   const channels: Channel[] = [];
   for (const group of categoriesRes.groups ?? []) {
-    const groupChannels = (group.channels ?? []).map(ch => ({
+    const groupChannels = (group.channels ?? []).map((ch) => ({
       ...mapSidebarChannel(ch),
       categoryId: group.id,
       categoryName: group.name,
@@ -298,7 +301,7 @@ export async function fetchChannels(): Promise<Channel[]> {
     channels.push(...groupChannels);
   }
 
-  const groupedChannelIds = new Set(channels.map(ch => ch.id));
+  const groupedChannelIds = new Set(channels.map((ch) => ch.id));
   const flatChannels = (sidebar.channels ?? []).map(mapSidebarChannel);
   for (const ch of flatChannels) {
     if (!groupedChannelIds.has(ch.id)) {
@@ -327,12 +330,9 @@ export async function fetchSidebarData(): Promise<{
   dms: DMConversation[];
   categories: ChannelCategory[];
 }> {
-  const [sidebar, categoriesRes] = await Promise.all([
-    fetchSidebar(),
-    fetchChannelCategories(),
-  ]);
+  const [sidebar, categoriesRes] = await Promise.all([fetchSidebar(), fetchChannelCategories()]);
 
-  const categories: ChannelCategory[] = (categoriesRes.groups ?? []).map(group => ({
+  const categories: ChannelCategory[] = (categoriesRes.groups ?? []).map((group) => ({
     id: group.id,
     name: group.name,
     kind: group.kind,
@@ -340,7 +340,7 @@ export async function fetchSidebarData(): Promise<{
 
   const channels: Channel[] = [];
   for (const group of categoriesRes.groups ?? []) {
-    const groupChannels = (group.channels ?? []).map(ch => ({
+    const groupChannels = (group.channels ?? []).map((ch) => ({
       ...mapSidebarChannel(ch),
       categoryId: group.id,
       categoryName: group.name,
@@ -348,7 +348,7 @@ export async function fetchSidebarData(): Promise<{
     channels.push(...groupChannels);
   }
 
-  const groupedChannelIds = new Set(channels.map(ch => ch.id));
+  const groupedChannelIds = new Set(channels.map((ch) => ch.id));
   const flatChannels = (sidebar.channels ?? []).map(mapSidebarChannel);
   for (const ch of flatChannels) {
     if (!groupedChannelIds.has(ch.id)) {
@@ -553,7 +553,7 @@ export async function createChannelCategory(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim() }),
       signal,
-    }
+    },
   );
   return {
     id: response.data.id,
