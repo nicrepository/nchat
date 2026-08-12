@@ -6,6 +6,7 @@ import { partitionDMs, type Channel, type CurrentUser, type DMConversation } fro
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
 import { sortByActivity } from "./sidebarOrder";
+import type { SidebarState } from "./useChatSidebar";
 
 /**
  * Placeholder user shown in the sidebar footer.
@@ -414,16 +415,6 @@ function safeDecodeURIComponent(segment: string): string {
 
 // ── Main sidebar ──────────────────────────────────────────────────────────────
 
-type SidebarState =
-  | { status: "loading" }
-  | { status: "error"; error: string }
-  | {
-      status: "ready";
-      currentUserId: string;
-      channels: Channel[];
-      dms: DMConversation[];
-    };
-
 interface ChatSidebarProps {
   state: SidebarState;
   retry: () => void;
@@ -491,14 +482,10 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const effectiveCategories =
     categories && categories.length > 0
       ? categories
-      : [{ id: "uncategorized", name: "Geral", kind: "uncategorized" }];
+      : [{ id: undefined, name: "Geral", kind: "uncategorized" as const }];
 
   const groupedChannelsByCategory = useMemo(() => {
     if (!channels) return [];
-    // If there are no categories (undefined or empty), render a flat list without grouping.
-    if (!effectiveCategories || effectiveCategories.length === 0) {
-      return [{ category: null, channels: sortByActivity(channels) }];
-    }
 
     const channelsByCat = new Map<string | undefined, Channel[]>();
     for (const ch of channels) {

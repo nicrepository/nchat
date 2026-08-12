@@ -13,7 +13,7 @@ import {
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-type SidebarState =
+export type SidebarState =
   | { status: "loading" }
   | { status: "error"; error: string }
   | {

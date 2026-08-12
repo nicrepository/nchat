@@ -680,6 +680,7 @@ describe("ChatSidebar — DMs", () => {
           counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl },
         },
       ] as DMConversation[],
+      categories: [] as ChannelCategory[],
     });
 
     const tree = (avatarUrl: string) => (
@@ -1300,6 +1301,7 @@ describe("ChatSidebar — section classification", () => {
       currentUserId: "user-a",
       channels: [{ ...PUBLIC_CHANNEL }],
       dms,
+      categories: [] as ChannelCategory[],
     });
     const tree = (dms: DMConversation[]) => (
       <MemoryRouter initialEntries={["/chat/dm/dm-grp"]}>
@@ -1374,6 +1376,7 @@ describe("ChatSidebar — activity ordering", () => {
     currentUserId: "user-a",
     channels,
     dms,
+    categories: [] as ChannelCategory[],
   });
 
   const renderState = (channels: Channel[], dms: DMConversation[], path = "/chat") =>
