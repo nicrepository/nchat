@@ -15,6 +15,7 @@ import (
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/events"
 	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
+	"github.com/nicrepository/nchat/services/file-service/internal/linkpreview"
 	"github.com/nicrepository/nchat/services/file-service/internal/preview"
 	"github.com/nicrepository/nchat/services/file-service/internal/scanner"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
@@ -25,6 +26,18 @@ import (
 const (
 	uploadRateLimitPerMinute = 20
 	uploadRateLimitWindow    = time.Minute
+
+	// linkPreviewRateLimitPerMinute bounds how much outbound fetching one user
+	// can cause (RF-10). It is its own budget rather than a share of the upload
+	// one because the two protect different things and would otherwise starve
+	// each other: this is the control that stops the endpoint being used to
+	// sweep the internet, or this deployment's own bandwidth, on request.
+	//
+	// It is per-process, the same known ceiling the upload limiter carries: N
+	// replicas grant N budgets. The cache is what keeps the common case — the
+	// same link previewed by everyone in a channel — from reaching the network
+	// at all.
+	linkPreviewRateLimitPerMinute = 30
 )
 
 type App struct {
@@ -41,10 +54,13 @@ type App struct {
 	// releases what it was using.
 	previewCancel context.CancelFunc
 	previewDone   <-chan struct{}
-	cleanupCancel context.CancelFunc
-	cleanupDone   <-chan struct{}
-	scanCancel    context.CancelFunc
-	scanDone      <-chan struct{}
+	// linkPreviewLimiter is stopped by Shutdown like the upload one: it owns a
+	// goroutine that sweeps expired windows.
+	linkPreviewLimiter *httpapi.UserRateLimiter
+	cleanupCancel      context.CancelFunc
+	cleanupDone        <-chan struct{}
+	scanCancel         context.CancelFunc
+	scanDone           <-chan struct{}
 	// statusPublisher is the bus connection the scan worker announces verdicts
 	// on. Nil whenever no bus is configured, which is a supported deployment:
 	// verdicts are still persisted and clients still see them on their next read.
@@ -92,8 +108,47 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 			return nil, err
 		}
 	}
+	// Independent of uploads: link previews touch no database, no storage and
+	// no key material, so a deployment may run them with uploads switched off.
+	if cfg.LinkPreviewEnabled {
+		if err := application.wireLinkPreviews(cfg, metrics, &routerDeps); err != nil {
+			_ = shutdownTracing(shutdown)
+			return nil, err
+		}
+	}
 	application.Handler = httpapi.NewRouter(cfg, logger, routerDeps)
 	return application, nil
+}
+
+// wireLinkPreviews builds the RF-10 route's dependencies.
+//
+// The token validator is shared with the attachment routes when those are also
+// enabled: it is derived entirely from configuration, so building a second one
+// would only mean two objects answering identically.
+func (a *App) wireLinkPreviews(
+	cfg config.Config, metrics *observability.Metrics, routerDeps *httpapi.RouterDependencies,
+) error {
+	if routerDeps.TokenValidator == nil {
+		validator, err := httpapi.NewTokenValidator(
+			cfg.AuthJWTHMACSecret, cfg.AuthJWTIssuer, cfg.AuthJWTAudience,
+		)
+		if err != nil {
+			return err
+		}
+		routerDeps.TokenValidator = validator
+	}
+	if routerDeps.Metrics == nil {
+		routerDeps.Metrics = httpapi.NewAttachmentMetrics(metrics)
+	}
+	limiter := httpapi.NewUserRateLimiter(linkPreviewRateLimitPerMinute, uploadRateLimitWindow)
+	a.linkPreviewLimiter = limiter
+	routerDeps.LinkPreviewRateLimiter = limiter
+	routerDeps.LinkPreviews = linkpreview.NewService(
+		time.Duration(cfg.LinkPreviewTimeoutSeconds)*time.Second,
+		time.Duration(cfg.LinkPreviewCacheTTLSeconds)*time.Second,
+		routerDeps.Metrics,
+	)
+	return nil
 }
 
 func (a *App) wireAttachments(
@@ -327,6 +382,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 		var failures []error
 		if a.rateLimiter != nil {
 			a.rateLimiter.Stop()
+		}
+		if a.linkPreviewLimiter != nil {
+			a.linkPreviewLimiter.Stop()
 		}
 		// The order is a correctness requirement, not tidiness. The preview
 		// worker holds the pool for the length of a job — a claim, a decrypted

@@ -75,6 +75,40 @@ type Message struct {
 	// reference but the caller cannot currently read its origin, Available is false
 	// and every other field is empty.
 	Reference *MessageReference
+
+	// Attachments are the files bound to this message (RF-32), read through
+	// chat.message_attachments. Empty for every message that carries none.
+	Attachments []MessageAttachment
+}
+
+// MaxMessageAttachments bounds how many attachments one message may be created
+// with.
+//
+// It is one because the composer uploads one file at a time and keeps a single
+// pending attachment; the API is nonetheless a list so raising this is a
+// constant and a UI change rather than a new field. It is enforced server-side
+// and is not a UI convenience: an unbounded list is an unbounded amount of
+// validation work per request.
+const MaxMessageAttachments = 1
+
+// MessageAttachment is the metadata a message viewer may see about a file bound
+// to a message.
+//
+// The omissions are the contract. There is no storage object key, no wrapped
+// DEK, no KEK identifier, no envelope version and no scanner detail: those are
+// file-service's internals and never leave it. Status and PreviewStatus are the
+// two lifecycle values the UI needs to decide what to draw, and neither grants
+// anything — content and preview delivery are gated by file-service on every
+// request, against the row rather than against anything said here.
+type MessageAttachment struct {
+	ID       string
+	Filename string
+	// ContentType is the detected type when the server has one, and the declared
+	// one otherwise. It is a rendering hint, never an authorization input.
+	ContentType   string
+	SizeBytes     int64
+	Status        string
+	PreviewStatus string
 }
 
 // MessageEditHistory is a previous persisted version of a message body.

@@ -69,20 +69,23 @@ func NormalizeChannelCategoryName(value string) (string, error) {
 // CanManageChannelCategories reports whether a user may create, rename, reorder
 // or delete channel categories.
 //
-// It is the workspace management gate — active owner or admin — reusing
-// CanManageWorkspace rather than restating it, exactly as channel update and
-// archive do. Reading categories is deliberately not covered: any active member
-// may read, and the channels inside each group are filtered by the existing
-// channel read policy, so listing categories never widens channel access.
+// It is the workspace moderation gate — active owner, admin or moderator —
+// reusing CanModerateWorkspace rather than restating it. Reading categories is
+// deliberately not covered: any active member may read, and the channels inside
+// each group are filtered by the existing channel read policy, so listing
+// categories never widens channel access. A guest reads the same listing and
+// sees only the channels it belongs to, because that policy is what fills the
+// groups.
 //
-// RF-17 was specified as "Admin and Moderator". There is no workspace-level
-// moderator in this schema: chat.workspace_members.role is
-// owner/admin/member/guest, and 'moderator' exists only on chat.channel_members
-// as a per-channel role. Treating "moderates some channel" as "may restructure
-// the whole workspace sidebar" would be an escalation, and inventing a workspace
-// role nothing can assign would be dead code widening a security constraint.
-// This predicate is the named seam to widen when RF-74 introduces a real
-// workspace moderation role; the divergence is recorded in SECURITY.md.
+// RF-17 was specified as "Admin and Moderator" and had to settle for owner and
+// admin: chat.workspace_members.role accepted only owner/admin/member/guest at
+// the time, and 'moderator' existed solely on chat.channel_members as a
+// per-channel role. Treating "moderates some channel" as "may restructure the
+// whole workspace sidebar" would have been an escalation, and inventing a
+// workspace role nothing could assign would have been dead code widening a
+// security constraint. RF-74 created the workspace role for real (migration
+// 000022), so this predicate now says what RF-17 asked for. The per-channel
+// role is still never consulted.
 func CanManageChannelCategories(wm *WorkspaceMember) bool {
-	return CanManageWorkspace(wm)
+	return CanModerateWorkspace(wm)
 }

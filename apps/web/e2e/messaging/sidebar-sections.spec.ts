@@ -272,3 +272,72 @@ test.describe("sidebar — ordenação por atividade", () => {
     }
   });
 });
+
+/**
+ * ISSUE #437 — the footer identifies the *authenticated* user. These cover the
+ * two shapes the contract allows (with and without a picture) plus the settings
+ * control's reachability, by role and by keyboard — never by pixel.
+ */
+test.describe("sidebar — rodapé do usuário autenticado", () => {
+  const userLink = (page: Page) => page.getByRole("link", { name: /meu perfil/i });
+
+  test("mostra o nome real e as iniciais quando não há foto", async ({ page }, testInfo) => {
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    await expect(userLink(page)).toContainText(CURRENT_USER_NAME);
+    await expect(userLink(page).locator("img")).toHaveCount(0);
+    // Never the placeholder identity this issue removed.
+    await expect(page.getByTestId("chat-sidebar")).not.toContainText("Usuário");
+  });
+
+  test("mostra a foto configurada quando existe", async ({ page }, testInfo) => {
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    // Registered after the helper's default, so it takes precedence; the reload
+    // is what makes the sidebar ask again.
+    await page.route("**/api/auth/me", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            id: CURRENT_USER_ID,
+            display_name: CURRENT_USER_NAME,
+            avatar_url: "/assets/nic-labs-icon.png",
+          },
+        }),
+      }),
+    );
+    await page.reload();
+
+    await expect(userLink(page).locator("img")).toHaveAttribute("src", "/assets/nic-labs-icon.png");
+  });
+
+  test("mantém Configurações acionável por mouse e por teclado", async ({ page }, testInfo) => {
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    const settings = page.getByRole("link", { name: "Configurações" });
+    await expect(settings).toHaveAttribute("href", "/admin/users");
+
+    await userLink(page).focus();
+    await page.keyboard.press("Tab");
+    await expect(settings).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/admin\/users/);
+  });
+
+  test("mantém o rodapé utilizável em largura reduzida", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 360, height: 720 });
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    const settings = page.getByRole("link", { name: "Configurações" });
+    await expect(settings).toBeVisible();
+
+    // The settings control stays inside the sidebar instead of being pushed out.
+    const sidebar = await page.getByTestId("chat-sidebar").boundingBox();
+    const box = await settings.boundingBox();
+    expect(sidebar).not.toBeNull();
+    expect(box).not.toBeNull();
+    expect(box!.x + box!.width).toBeLessThanOrEqual(sidebar!.x + sidebar!.width + 1);
+  });
+});

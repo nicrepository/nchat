@@ -594,3 +594,89 @@ func TestNoScanWorkerRunsWhileUploadsAreDisabled(t *testing.T) {
 		t.Fatal("a scan worker was started with uploads disabled")
 	}
 }
+
+// --- RF-10 link previews -------------------------------------------------
+
+func linkPreviewsEnabledConfig() config.Config {
+	cfg := healthOnlyConfig()
+	cfg.LinkPreviewEnabled = true
+	cfg.LinkPreviewTimeoutSeconds = 5
+	cfg.LinkPreviewCacheTTLSeconds = 900
+	cfg.AuthJWTHMACSecret = strings.Repeat("s", 32)
+	cfg.AuthJWTIssuer = "nchat-auth"
+	cfg.AuthJWTAudience = "nchat-api"
+	return cfg
+}
+
+// TestNewWiresLinkPreviewsWithoutUploads: the feature needs no database, no
+// storage and no key material, so it must not drag the attachment wiring in.
+func TestNewWiresLinkPreviewsWithoutUploads(t *testing.T) {
+	application, err := newApp(linkPreviewsEnabledConfig(), appDependencies{
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	request := httptest.NewRequest(http.MethodPost, "/link-preview",
+		strings.NewReader(`{"url":"https://example.com/"}`))
+	response := httptest.NewRecorder()
+	application.Handler.ServeHTTP(response, request)
+
+	// Wired and reachable: unauthenticated, so 401 rather than the 503 a
+	// disabled or half-wired feature answers with.
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 from a wired route, got %d (%s)", response.Code, response.Body)
+	}
+	if application.pool != nil {
+		t.Fatal("link previews must not open a database pool")
+	}
+}
+
+func TestNewRefusesLinkPreviewsWithAWeakJWTSecret(t *testing.T) {
+	cfg := linkPreviewsEnabledConfig()
+	cfg.AuthJWTHMACSecret = "short"
+
+	if _, err := newApp(cfg, appDependencies{tracingShutdown: noopShutdown}); err == nil {
+		t.Fatal("link previews must not start without a usable JWT secret")
+	}
+}
+
+func TestLinkPreviewRouteIsUnavailableWhileDisabled(t *testing.T) {
+	application, err := newApp(healthOnlyConfig(), appDependencies{tracingShutdown: noopShutdown})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Cleanup(func() { _ = application.Shutdown(context.Background()) })
+
+	request := httptest.NewRequest(http.MethodPost, "/link-preview",
+		strings.NewReader(`{"url":"https://example.com/"}`))
+	response := httptest.NewRecorder()
+	application.Handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 from a disabled feature, got %d", response.Code)
+	}
+}
+
+// TestShutdownStopsTheLinkPreviewLimiter: the limiter owns a goroutine, so a
+// service that starts one must stop it.
+func TestShutdownStopsTheLinkPreviewLimiter(t *testing.T) {
+	application, err := newApp(linkPreviewsEnabledConfig(), appDependencies{
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if application.linkPreviewLimiter == nil {
+		t.Fatal("expected a link preview limiter to be wired")
+	}
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	// Stop is idempotent; a second shutdown must not panic on a closed channel.
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+}

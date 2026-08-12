@@ -105,6 +105,7 @@ const (
 	categoryOwnerID     = "user-owner"
 	categoryMemberID    = "user-member"
 	categoryGuestID     = "user-guest"
+	categoryModeratorID = "user-moderator"
 	categorySuspendedID = "user-suspended"
 	otherWorkspaceID    = "ws-cat-2"
 )
@@ -128,6 +129,7 @@ func categoryMemberStore() *fakeMemberStore {
 			wmKey(categoryWorkspaceID, categoryAdminID):     member(categoryAdminID, domain.WorkspaceRoleAdmin, domain.MemberStatusActive),
 			wmKey(categoryWorkspaceID, categoryMemberID):    member(categoryMemberID, domain.WorkspaceRoleMember, domain.MemberStatusActive),
 			wmKey(categoryWorkspaceID, categoryGuestID):     member(categoryGuestID, domain.WorkspaceRoleGuest, domain.MemberStatusActive),
+			wmKey(categoryWorkspaceID, categoryModeratorID): member(categoryModeratorID, domain.WorkspaceRoleModerator, domain.MemberStatusActive),
 			wmKey(categoryWorkspaceID, categorySuspendedID): member(categorySuspendedID, domain.WorkspaceRoleAdmin, domain.MemberStatusSuspended),
 		},
 	}
@@ -205,7 +207,9 @@ func TestChannelCategoryService_MutationsRequireWorkspaceManagement(t *testing.T
 }
 
 func TestChannelCategoryService_ManagementRolesMayMutate(t *testing.T) {
-	for _, userID := range []string{categoryOwnerID, categoryAdminID} {
+	// RF-17 asked for "Admin and Moderator" and had to settle for owner/admin
+	// until RF-74 created the workspace moderator. It is here now.
+	for _, userID := range []string{categoryOwnerID, categoryAdminID, categoryModeratorID} {
 		t.Run(userID, func(t *testing.T) {
 			categories := &fakeCategoryStore{
 				categories: []domain.ChannelCategory{{ID: "cat-1", WorkspaceID: categoryWorkspaceID, Name: "Alfa"}},
@@ -257,7 +261,7 @@ func TestChannelCategoryService_OtherWorkspaceIsForbidden(t *testing.T) {
 // Reading is open to any active member, including a guest: the categories carry
 // no channel the caller could not already list.
 func TestChannelCategoryService_ListIsOpenToEveryActiveMember(t *testing.T) {
-	for _, userID := range []string{categoryOwnerID, categoryAdminID, categoryMemberID, categoryGuestID} {
+	for _, userID := range []string{categoryOwnerID, categoryAdminID, categoryModeratorID, categoryMemberID, categoryGuestID} {
 		t.Run(userID, func(t *testing.T) {
 			if _, err := newCategoryService(&fakeCategoryStore{}, &fakeVisibleChannelStore{}).
 				ListGroupedChannels(context.Background(), categoryWorkspaceID, userID); err != nil {

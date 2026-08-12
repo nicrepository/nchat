@@ -96,10 +96,8 @@ const channelDestinationQuery = authsession.ActiveSessionCTE + `,
 		  ON wm.workspace_id = c.workspace_id
 		 AND wm.user_id = active.user_id
 		 AND wm.status = 'active'
-		LEFT JOIN chat.channel_members AS cm
-		  ON cm.channel_id = c.id AND cm.user_id = active.user_id
 		WHERE c.status = 'active'
-		  AND (c.type = 'public' OR cm.user_id IS NOT NULL)
+		  AND chat.channel_visible_to_user(c.id, active.user_id)
 	)
 	SELECT
 		(SELECT session_expires_at FROM active_session) AS session_expires_at,

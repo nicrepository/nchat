@@ -1,10 +1,12 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
 import { clearTokens, setTokens } from "../lib/authSession";
+import { _resetSelfProfile, refreshSelfProfile } from "../profile/selfProfile";
+import type { SelfProfile } from "../profile/profileApi";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
 import ChatSidebar from "./ChatSidebar";
@@ -81,6 +83,17 @@ vi.mock("./chatApi", () => ({
     signal?: AbortSignal,
   ) => mockCreateChannel(input, signal),
 }));
+
+// ── Mock profileApi (the footer's identity source) ────────────────────────────
+
+const { mockFetchMyProfile } = vi.hoisted(() => ({
+  mockFetchMyProfile: vi.fn<(signal?: AbortSignal) => Promise<SelfProfile>>(),
+}));
+
+vi.mock("../profile/profileApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../profile/profileApi")>();
+  return { ...actual, fetchMyProfile: (signal?: AbortSignal) => mockFetchMyProfile(signal) };
+});
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -164,12 +177,15 @@ function renderChat(initialPath = "/chat", authenticated = true) {
 beforeEach(() => {
   clearTokens();
   vi.clearAllMocks();
+  _resetSelfProfile();
   mockSearchDMCandidates.mockResolvedValue([]);
   mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-new", created: true });
+  mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
 });
 
 afterEach(() => {
   clearTokens();
+  _resetSelfProfile();
 });
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -1889,13 +1905,227 @@ describe("ChatSidebar — storage safety", () => {
 // ── Footer ────────────────────────────────────────────────────────────────────
 
 describe("ChatSidebar — footer", () => {
-  it("renders placeholder user name in footer", async () => {
-    mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: [], dms: [] });
-    renderChat();
+  // The footer's identity is the session's, so it does not depend on the
+  // conversation lists: rendering the sidebar directly keeps each assertion
+  // about the footer alone.
+  function renderFooter() {
+    return render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={{ status: "ready", currentUserId: "user-a", channels: [], dms: [] }}
+          retry={() => {}}
+        />
+      </MemoryRouter>,
+    );
+  }
 
-    await screen.findByTestId("chat-sidebar");
-    // Footer renders the placeholder user; real profile comes from a future /api/auth/me endpoint.
-    expect(screen.getByTestId("chat-sidebar")).toHaveTextContent("Usuário");
+  const userLink = () => screen.getByRole("link", { name: /meu perfil/i });
+  const avatarText = () => userLink().querySelector(".chat-sidebar__avatar")?.textContent;
+
+  it("shows no invented identity while the profile is loading", async () => {
+    // A request that never settles: the loading state stays observable.
+    mockFetchMyProfile.mockReturnValue(new Promise<SelfProfile>(() => {}));
+    renderFooter();
+
+    const placeholder = await screen.findByTestId("chat-sidebar-user-placeholder");
+    expect(placeholder).toHaveAttribute("data-state", "loading");
+    const sidebar = screen.getByTestId("chat-sidebar");
+    expect(sidebar).not.toHaveTextContent("Usuário");
+    expect(sidebar).not.toHaveTextContent("?");
+  });
+
+  it("shows the authenticated user's real display name once loaded", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
+    renderFooter();
+
+    expect(await screen.findByText("Ana Souza")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-sidebar-user-placeholder")).not.toBeInTheDocument();
+  });
+
+  it("renders the avatar image when the profile carries one", async () => {
+    mockFetchMyProfile.mockResolvedValue({
+      id: "user-a",
+      displayName: "Ana Souza",
+      avatarUrl: "/api/auth/avatars/a.png",
+    });
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    const img = userLink().querySelector("img");
+    expect(img).toHaveAttribute("src", "/api/auth/avatars/a.png");
+    expect(img).toHaveAttribute("referrerpolicy", "no-referrer");
+  });
+
+  it("falls back to initials when the profile has no avatar", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    expect(userLink().querySelector("img")).toBeNull();
+    expect(avatarText()).toBe("AS");
+  });
+
+  it("falls back to initials when the avatar image fails to load", async () => {
+    mockFetchMyProfile.mockResolvedValue({
+      id: "user-a",
+      displayName: "Ana Souza",
+      avatarUrl: "/api/auth/avatars/broken.png",
+    });
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    const img = userLink().querySelector("img") as HTMLImageElement;
+    fireEvent.error(img);
+
+    expect(userLink().querySelector("img")).toBeNull();
+    expect(avatarText()).toBe("AS");
+  });
+
+  it("tries a new avatar URL after a previous one failed", async () => {
+    mockFetchMyProfile.mockResolvedValue({
+      id: "user-a",
+      displayName: "Ana Souza",
+      avatarUrl: "/api/auth/avatars/broken.png",
+    });
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    fireEvent.error(userLink().querySelector("img") as HTMLImageElement);
+    expect(userLink().querySelector("img")).toBeNull();
+
+    // A confirmed profile change publishes the new URL; the earlier failure is
+    // scoped to the URL it happened on and must not suppress this one.
+    mockFetchMyProfile.mockResolvedValue({
+      id: "user-a",
+      displayName: "Ana Souza",
+      avatarUrl: "/api/auth/avatars/new.png",
+    });
+    act(() => refreshSelfProfile());
+
+    await waitFor(() =>
+      expect(userLink().querySelector("img")).toHaveAttribute("src", "/api/auth/avatars/new.png"),
+    );
+  });
+
+  it("drops to initials when a confirmed removal leaves no avatar", async () => {
+    mockFetchMyProfile.mockResolvedValue({
+      id: "user-a",
+      displayName: "Ana Souza",
+      avatarUrl: "/api/auth/avatars/a.png",
+    });
+    renderFooter();
+
+    await waitFor(() => expect(userLink().querySelector("img")).toBeInTheDocument());
+
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
+    act(() => refreshSelfProfile());
+
+    await waitFor(() => expect(userLink().querySelector("img")).toBeNull());
+    expect(avatarText()).toBe("AS");
+  });
+
+  it.each([
+    ["Ana", "A"],
+    ["Ana Souza", "AS"],
+    ["Ana   Maria   Souza", "AM"],
+    ["Édson Ávila", "ÉÁ"],
+    ["ana souza", "AS"],
+  ])("derives at most two initials from %s", async (displayName, expected) => {
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName });
+    renderFooter();
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-sidebar-user-placeholder")).not.toBeInTheDocument(),
+    );
+    expect(avatarText()).toBe(expected);
+  });
+
+  it("keeps the footer structure with a very long name", async () => {
+    const longName = "Maria Aparecida de Souza Fernandes do Nascimento Albuquerque Filha";
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: longName });
+    renderFooter();
+
+    // The name is one clipped element (CSS ellipsis), and the settings control
+    // remains a sibling of the profile link rather than being pushed out of it.
+    const name = await screen.findByText(longName);
+    expect(name).toHaveClass("chat-sidebar__user-name");
+    expect(avatarText()).toBe("MA");
+    expect(screen.getByRole("link", { name: "Configurações" })).toBeInTheDocument();
+  });
+
+  it("keeps the settings action, its target and its accessible name", async () => {
+    renderFooter();
+
+    const settings = await screen.findByRole("link", { name: "Configurações" });
+    expect(settings).toHaveAttribute("href", "/admin/users");
+    expect(settings).toHaveAttribute("title", "Configurações");
+    // Interactive elements must not nest: settings is a sibling of the profile
+    // link, never inside it.
+    expect(userLink().contains(settings)).toBe(false);
+  });
+
+  it("keeps the profile link reachable", async () => {
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    expect(userLink()).toHaveAttribute("href", "/profile");
+  });
+
+  it("reaches the profile and settings links by keyboard", async () => {
+    const user = userEvent.setup();
+    renderFooter();
+
+    await screen.findByText("Ana Souza");
+    const settings = screen.getByRole("link", { name: "Configurações" });
+    userLink().focus();
+    expect(userLink()).toHaveFocus();
+    await user.tab();
+    expect(settings).toHaveFocus();
+  });
+
+  it("does not invent an identity when the profile fails to load", async () => {
+    mockFetchMyProfile.mockRejectedValue(new ApiRequestError(500, "internal_error", "boom"));
+    renderFooter();
+
+    const placeholder = await screen.findByTestId("chat-sidebar-user-placeholder");
+    // An error is its own state — not "Usuário", not "?", not "no avatar".
+    await waitFor(() => expect(placeholder).toHaveAttribute("data-state", "error"));
+    const sidebar = screen.getByTestId("chat-sidebar");
+    expect(sidebar).not.toHaveTextContent("Usuário");
+    expect(sidebar).not.toHaveTextContent("?");
+  });
+
+  it("never renders the previous session's profile after a session switch", async () => {
+    setTokens("token-a");
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "Ana Souza" });
+    renderFooter();
+    await screen.findByText("Ana Souza");
+
+    // Session B: A's name must be gone in the same commit as the switch, before
+    // B's profile has even been requested.
+    mockFetchMyProfile.mockReturnValue(new Promise<SelfProfile>(() => {}));
+    act(() => setTokens("token-b"));
+    expect(screen.queryByText("Ana Souza")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-sidebar-user-placeholder")).toHaveAttribute(
+      "data-state",
+      "loading",
+    );
+
+    mockFetchMyProfile.mockResolvedValue({ id: "user-b", displayName: "Bruno Lima" });
+    act(() => refreshSelfProfile());
+    expect(await screen.findByText("Bruno Lima")).toBeInTheDocument();
+    expect(screen.queryByText("Ana Souza")).not.toBeInTheDocument();
+  });
+
+  it("shows a neutral label instead of '?' when the server has no usable name", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: "" });
+    renderFooter();
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-sidebar-user-placeholder")).not.toBeInTheDocument(),
+    );
+    expect(avatarText()).toBe("");
+    expect(screen.getByTestId("chat-sidebar")).not.toHaveTextContent("Usuário");
   });
 
   it("footer does not render fixture user identity", async () => {
@@ -1905,6 +2135,15 @@ describe("ChatSidebar — footer", () => {
     await screen.findByTestId("chat-sidebar");
     // The sidebar must never show hardcoded personal data.
     expect(screen.getByTestId("chat-sidebar")).not.toHaveTextContent("Álvaro Neto");
+  });
+
+  it("leaves the new-conversation trigger untouched", async () => {
+    mockFetchSidebarData.mockResolvedValue({ currentUserId: "user-a", channels: [], dms: [] });
+    renderChat();
+
+    const trigger = await screen.findByRole("button", { name: "Nova conversa" });
+    await waitFor(() => expect(trigger).toBeEnabled());
+    expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
   });
 });
 

@@ -67,6 +67,16 @@ export interface UseChatEditorOptions {
   initialContent?: TTNode;
   clearOnSend?: boolean;
   testId?: string;
+  /**
+   * Whether the message has content this editor cannot see — today, a pending
+   * attachment (RF-32).
+   *
+   * The editor owns the text and nothing else, so "is there anything to send"
+   * is not a question it can answer alone. When true, an empty document is a
+   * valid send; when false (the default) the long-standing rule is unchanged
+   * and an empty composer sends nothing.
+   */
+  canSendEmpty?: boolean;
   onSend: (body: string) => Promise<SendResult>;
 }
 
@@ -108,6 +118,7 @@ export function useChatEditor({
   initialContent,
   clearOnSend = true,
   testId = "chat-composer-input",
+  canSendEmpty = false,
   onSend,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
@@ -180,12 +191,12 @@ export function useChatEditor({
     dom.setAttribute("aria-label", placeholder);
   }, [editor, disabled, sending, placeholder]);
 
-  const canSend = hasContent && !sending && !disabled;
+  const canSend = (hasContent || canSendEmpty) && !sending && !disabled;
 
   async function handleSend() {
     if (!canSend || !editor) return;
     const body = tiptapDocToMarkdown(editor.getJSON(), bodyFormat).trim();
-    if (!body) return;
+    if (!body && !canSendEmpty) return;
     setSending(true);
     try {
       const result = await onSend(body);

@@ -801,3 +801,35 @@ func TestReactionHandlerAdapterPropagatesServiceError(t *testing.T) {
 		t.Fatalf("expected %v, got %v", want, err)
 	}
 }
+
+// RF-32: a subscriber must be able to render a message that carries a file
+// without a follow-up GET, and a removed one must describe nothing.
+func TestDomainMessageToWSPayloadCarriesAttachmentMetadata(t *testing.T) {
+	attachment := domain.MessageAttachment{
+		ID: "attachment-1", Filename: "relatorio.pdf", ContentType: "application/pdf",
+		SizeBytes: 2048, Status: "pending_scan", PreviewStatus: "pending",
+	}
+	payload := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		SenderID: "user-1", Attachments: []domain.MessageAttachment{attachment},
+	})
+	if len(payload.Attachments) != 1 {
+		t.Fatalf("attachment payload not mapped: %+v", payload.Attachments)
+	}
+	got := payload.Attachments[0]
+	if got.ID != attachment.ID || got.Filename != attachment.Filename ||
+		got.ContentType != attachment.ContentType || got.Size != attachment.SizeBytes ||
+		got.Status != attachment.Status || got.PreviewStatus != attachment.PreviewStatus {
+		t.Fatalf("attachment payload mismatch: %+v", got)
+	}
+}
+
+func TestDomainMessageToWSPayloadWithholdsAttachmentsOnRemovedMessage(t *testing.T) {
+	payload := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", Status: domain.MessageStatusDeleted, DeletedAt: time.Now().UTC(),
+		Attachments: []domain.MessageAttachment{{ID: "attachment-1", Filename: "secret.pdf"}},
+	})
+	if payload.Attachments != nil {
+		t.Fatalf("removed message must not describe its attachments: %+v", payload.Attachments)
+	}
+}

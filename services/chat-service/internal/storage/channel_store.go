@@ -177,6 +177,13 @@ func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, inpu
 			  AND w.status = 'active'
 			  AND wm.user_id = $8
 			  AND wm.status = 'active'
+			  -- The SQL statement of domain.CanCreateChannel: every role that
+			  -- reaches the workspace's public channels may create one, and a
+			  -- guest — whose reach is only the channels it was added to — may
+			  -- not. Re-derived here rather than trusted from the service, so a
+			  -- demotion to guest that commits mid-flight is serialised against
+			  -- the insert by the FOR SHARE below instead of racing it.
+			  AND wm.role IN ('owner', 'admin', 'moderator', 'member')
 			FOR SHARE OF w, wm
 		)
 		INSERT INTO chat.channels
@@ -345,12 +352,10 @@ func (s *PGXChannelStore) GetVisibleChannelByID(ctx context.Context, workspaceID
 		  ON c.workspace_id = w.id AND w.status = 'active'
 		JOIN chat.workspace_members wm
 		  ON wm.workspace_id = c.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
-		LEFT JOIN chat.channel_members cm
-		  ON cm.channel_id = c.id AND cm.user_id = $3
 		WHERE c.workspace_id = $1
 		  AND c.id = $2
 		  AND c.status = 'active'
-		  AND (c.is_general = true OR c.type = 'public' OR cm.channel_id IS NOT NULL)`,
+		  AND chat.channel_visible_to_user(c.id, $3::uuid)`,
 		workspaceID, channelID, userID,
 	)
 }
@@ -365,12 +370,10 @@ func (s *PGXChannelStore) GetVisibleChannelBySlug(ctx context.Context, workspace
 		  ON c.workspace_id = w.id AND w.status = 'active'
 		JOIN chat.workspace_members wm
 		  ON wm.workspace_id = c.workspace_id AND wm.user_id = $3 AND wm.status = 'active'
-		LEFT JOIN chat.channel_members cm
-		  ON cm.channel_id = c.id AND cm.user_id = $3
 		WHERE c.workspace_id = $1
 		  AND c.slug = $2
 		  AND c.status = 'active'
-		  AND (c.is_general = true OR c.type = 'public' OR cm.channel_id IS NOT NULL)`,
+		  AND chat.channel_visible_to_user(c.id, $3::uuid)`,
 		workspaceID, slug, userID,
 	)
 }
@@ -469,7 +472,7 @@ func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, wo
 		) lm ON true
 		WHERE c.workspace_id = $1
 		  AND c.status = 'active'
-		  AND (c.is_general = true OR c.type = 'public' OR cm.channel_id IS NOT NULL)
+		  AND chat.channel_visible_to_user(c.id, $2::uuid)
 		ORDER BY c.position, c.display_name`,
 		workspaceID, userID,
 	)

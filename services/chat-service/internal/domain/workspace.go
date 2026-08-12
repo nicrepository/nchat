@@ -45,11 +45,22 @@ const (
 
 type WorkspaceRole string
 
+// The RF-74 workspace roles, in descending authority.
+//
+// WorkspaceRoleModerator is a workspace-scoped role and has nothing to do with
+// ChannelRoleModerator below, which is per-channel. Neither is ever read as the
+// other: moderating one channel does not moderate the workspace, and moderating
+// the workspace does not by itself grant access to a private channel.
+//
+// WorkspaceRoleGuest is a membership that grants no channel access on its own.
+// Every other role reaches the workspace's public channels; a guest reaches
+// exactly the channels it holds a chat.channel_members row for.
 const (
-	WorkspaceRoleOwner  WorkspaceRole = "owner"
-	WorkspaceRoleAdmin  WorkspaceRole = "admin"
-	WorkspaceRoleMember WorkspaceRole = "member"
-	WorkspaceRoleGuest  WorkspaceRole = "guest"
+	WorkspaceRoleOwner     WorkspaceRole = "owner"
+	WorkspaceRoleAdmin     WorkspaceRole = "admin"
+	WorkspaceRoleModerator WorkspaceRole = "moderator"
+	WorkspaceRoleMember    WorkspaceRole = "member"
+	WorkspaceRoleGuest     WorkspaceRole = "guest"
 )
 
 type MemberStatus string
@@ -373,11 +384,44 @@ type DMCandidate struct {
 	DisplayName string
 }
 
+// CanReachPublicChannels reports whether wm's role reaches the workspace's
+// public channels without an explicit channel membership (RF-74).
+//
+// This is the guest boundary, stated once. Owner, admin, moderator and member
+// are workspace-wide roles: belonging to the workspace is what gives them
+// #geral and every public channel. A guest is not — its membership grants no
+// channel on its own, so it reaches exactly the channels it was added to.
+//
+// The role test is an allowlist rather than "not a guest" so that an
+// unrecognised role — a row written before the CHECK constraint was widened, a
+// value from a future migration, a zero-valued struct in a test — is denied
+// instead of being treated as a full member. chat.channel_visible_to_user
+// applies the same allowlist in SQL and the two must stay identical.
+func CanReachPublicChannels(wm *WorkspaceMember) bool {
+	if wm == nil || wm.Status != MemberStatusActive {
+		return false
+	}
+	switch wm.Role {
+	case WorkspaceRoleOwner, WorkspaceRoleAdmin, WorkspaceRoleModerator, WorkspaceRoleMember:
+		return true
+	default:
+		return false
+	}
+}
+
 // CanReadChannel reports whether a user may read ch.
 // wm is the workspace membership (nil = non-member).
 // cm is the channel membership (nil = not a channel member).
-// Public channels and #geral require active workspace membership only.
-// Private channels additionally require channel membership.
+//
+// An explicit channel membership is sufficient for any role, and for a guest it
+// is the only thing that is: public channels and #geral are reachable by
+// workspace membership alone only for the roles CanReachPublicChannels admits.
+// Private channels always require channel membership, for every role — a
+// workspace admin does not read a private channel it does not belong to.
+//
+// This is the Go statement of chat.channel_visible_to_user. The SQL is the
+// authority (it is what the listing, the message reads and the WebSocket
+// authorizer actually run); this predicate must agree with it exactly.
 func CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
 	if wm == nil || wm.Status != MemberStatusActive || wm.WorkspaceID != ch.WorkspaceID {
 		return false
@@ -385,13 +429,13 @@ func CanReadChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
 	if ch.Status != ChannelStatusActive {
 		return false
 	}
-	if ch.IsGeneral {
-		return ch.Type == ChannelTypePublic
-	}
-	if ch.Type == ChannelTypePublic {
+	if cm != nil && cm.ChannelID == ch.ID && cm.UserID == wm.UserID {
 		return true
 	}
-	return ch.Type == ChannelTypePrivate && cm != nil && cm.ChannelID == ch.ID && cm.UserID == wm.UserID
+	if !CanReachPublicChannels(wm) {
+		return false
+	}
+	return ch.Type == ChannelTypePublic
 }
 
 // CanWriteChannel reports whether a user may post to ch.
@@ -403,13 +447,51 @@ func CanWriteChannel(wm *WorkspaceMember, cm *ChannelMember, ch Channel) bool {
 // CanManageWorkspace reports whether a user holds workspace management rights —
 // the single predicate behind channel update and archival, and behind workspace
 // settings. Channel *creation* is deliberately not one of them: it takes active
-// membership only (BUG #393). A nil or inactive membership is never sufficient.
+// membership that reaches public channels (BUG #393, narrowed for guests by
+// CanCreateChannel below). A nil or inactive membership is never sufficient.
+//
+// RF-74 deliberately does not add the moderator here. A moderator moderates
+// channel structure and channel membership; changing what a channel *is*,
+// archiving it, or changing the workspace's anti-spam and upload policies is
+// administration. Widening this predicate would also widen
+// auth-service's admin API, whose workspace is resolved by the same
+// owner/admin test in PGXUserStore.GetAdminWorkspaceID.
 func CanManageWorkspace(wm *WorkspaceMember) bool {
 	if wm == nil || wm.Status != MemberStatusActive {
 		return false
 	}
 	return wm.Role == WorkspaceRoleOwner || wm.Role == WorkspaceRoleAdmin
 }
+
+// CanModerateWorkspace reports whether a user holds workspace moderation rights
+// (RF-74): every administrator, plus the workspace moderator role.
+//
+// This is the seam SECURITY.md reserved. RF-17 specified "Admin and Moderator"
+// for channel categories and issue #398 inherited the same shape for channel
+// membership; both had to settle for owner/admin because no workspace moderator
+// existed to name. It exists now, and the two capabilities below delegate here
+// instead of to CanManageWorkspace.
+//
+// It is emphatically not chat.channel_members.role — moderating one channel
+// still confers nothing at workspace scope, and no code path reads that column
+// for an authorization decision.
+func CanModerateWorkspace(wm *WorkspaceMember) bool {
+	if CanManageWorkspace(wm) {
+		return true
+	}
+	return wm != nil && wm.Status == MemberStatusActive && wm.Role == WorkspaceRoleModerator
+}
+
+// CanCreateChannel reports whether a user may create a channel in the workspace.
+//
+// Creating a channel still takes no management role (BUG #393): a plain member
+// and an owner take the same path, and the role is not otherwise consulted. The
+// one role this excludes is guest, and for the same reason it excludes a guest
+// from reading a public channel — a guest's reach is the channels it was added
+// to, and letting it mint channels of its own would hand it back the
+// workspace-wide scope RF-74 removes. It would also let a guest create a public
+// channel that every real member sees.
+func CanCreateChannel(wm *WorkspaceMember) bool { return CanReachPublicChannels(wm) }
 
 // MaxAddMembersPerRequest bounds one add-members call (issue #398).
 //
@@ -424,26 +506,28 @@ const MaxAddMembersPerRequest = 25
 // CanManageChannelMembers reports whether a user may add participants to a
 // channel (issue #398).
 //
-// It is the workspace management gate — active owner or admin — reusing
-// CanManageWorkspace rather than restating it, exactly as channel update,
-// channel archival and channel categories do. The choice is not a new policy:
-// removing a member from a channel already takes owner or admin
-// (MemberService.RemoveMemberFromChannel), and docs/runbooks/
-// task-chat-channel-join-leave.md names the addition its "manager-add flow".
-// Adding and removing the same row are the same authority.
+// It is the workspace moderation gate — active owner, admin or moderator —
+// reusing CanModerateWorkspace rather than restating it, exactly as channel
+// categories do. The choice is not a new policy: removing a member from a
+// channel is the same authority (MemberService.RemoveMemberFromChannel), and
+// docs/runbooks/task-chat-channel-join-leave.md names the addition its
+// "manager-add flow". Adding and removing the same row are the same authority.
+//
+// RF-74 is what widened this from owner/admin to include the moderator: this
+// predicate was written as the named seam for exactly that, and the seam is now
+// spent. The widening reaches the store as well — PGXMemberStore.AddChannelMembers
+// re-derives the same role list inside its transaction.
 //
 // Deliberately *not* "any member of the channel": that would let anyone with
 // read access to a private channel widen its audience, which is precisely the
 // property a private channel has. Deliberately not the per-channel 'moderator'
-// role either — nothing in this codebase ever assigns it, so gating on it would
-// be dead code standing in for a real check. This predicate is the named seam
-// to widen when RF-74 introduces a real moderation role; the divergence is
-// recorded in SECURITY.md.
+// role either — that role is per channel and is never read as workspace
+// authority.
 //
 // Group DM participation is a different question with a different answer and is
 // deliberately not routed through here: chat.dm_members.role is closed by CHECK
 // to the single value 'member', so a group has no manager to be, and a
 // workspace admin is not even a participant. See DMService.AddGroupParticipants.
 func CanManageChannelMembers(wm *WorkspaceMember) bool {
-	return CanManageWorkspace(wm)
+	return CanModerateWorkspace(wm)
 }

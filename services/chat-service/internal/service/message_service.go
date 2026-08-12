@@ -65,6 +65,10 @@ type CreateChannelMessageInput struct {
 	// ForwardedFromMessageID remains reserved for RF-08 and is not exposed via HTTP.
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
+	// AttachmentIDs are candidate files.attachments ids supplied by the client
+	// (RF-32). Everything about them is re-derived server-side; see
+	// normalizeAttachmentIDs and the storage layer's invalid_attachments CTE.
+	AttachmentIDs []string
 }
 
 // CreateDMMessageInput is the caller-provided input for posting to a DM conversation.
@@ -79,6 +83,9 @@ type CreateDMMessageInput struct {
 	// ForwardedFromMessageID remains reserved for RF-08 and is not exposed via HTTP.
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
+	// AttachmentIDs are candidate files.attachments ids supplied by the client
+	// (RF-32), validated exactly as the channel path validates them.
+	AttachmentIDs []string
 }
 
 type ForwardChannelMessageInput struct {
@@ -255,7 +262,11 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	if workspaceID == "" || channelID == "" || senderID == "" {
 		return domain.Message{}, fmt.Errorf("%w: workspace_id, channel_id, and sender_id are required", domain.ErrInvalidInput)
 	}
-	if err := validateMessageBody(body); err != nil {
+	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := validateMessageContent(body, len(attachmentIDs)); err != nil {
 		return domain.Message{}, err
 	}
 	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
@@ -315,6 +326,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		ReferencedMessageID:    referencedID,
 		MentionedUserIDs:       mentionedUserIDs,
 		MentionedChannelIDs:    mentionedChannelIDs,
+		AttachmentIDs:          attachmentIDs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create channel message: %w", err)
@@ -374,7 +386,11 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	if workspaceID == "" || conversationID == "" || senderID == "" {
 		return domain.Message{}, fmt.Errorf("%w: workspace_id, conversation_id, and sender_id are required", domain.ErrInvalidInput)
 	}
-	if err := validateMessageBody(body); err != nil {
+	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := validateMessageContent(body, len(attachmentIDs)); err != nil {
 		return domain.Message{}, err
 	}
 	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
@@ -415,6 +431,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		ParentMessageID:        parentID,
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
+		AttachmentIDs:          attachmentIDs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create dm message: %w", err)
@@ -796,14 +813,61 @@ func (s *MessageService) ResolveMessageReferenceBatch(ctx context.Context, input
 	return result, nil
 }
 
+// validateMessageBody is the rule for every path where a body is the whole
+// message: editing, in particular, which may not empty a message out.
 func validateMessageBody(body string) error {
-	if body == "" {
-		return fmt.Errorf("%w: body_text is required", domain.ErrInvalidInput)
+	return validateMessageContent(body, 0)
+}
+
+// validateMessageContent is the creation rule: a message needs something in it,
+// and an attachment is something (RF-32).
+//
+// Empty body plus no attachment stays invalid, which is what keeps the empty
+// send that has always been refused refused. Body plus attachment, and
+// attachment alone, are both valid. The length ceiling is unchanged and applies
+// regardless of attachments.
+func validateMessageContent(body string, attachmentCount int) error {
+	if body == "" && attachmentCount == 0 {
+		return fmt.Errorf("%w: body_text or attachment_ids is required", domain.ErrInvalidInput)
 	}
 	if len([]rune(body)) > maxMessageBodyRunes {
 		return fmt.Errorf("%w: body_text exceeds maximum length of %d characters", domain.ErrInvalidInput, maxMessageBodyRunes)
 	}
 	return nil
+}
+
+// normalizeAttachmentIDs turns the client's list into the canonical, bounded,
+// duplicate-free one the storage layer may re-validate (RF-32).
+//
+// Nothing here decides whether an attachment may be linked — that is a database
+// question and is answered atomically with the INSERT. This only refuses input
+// that could never name a valid attachment, and does it before any query runs:
+// too many ids, an empty or malformed one, or the same id twice. A duplicate is
+// an error rather than something to silently collapse, because a client sending
+// one is not describing the message it thinks it is.
+func normalizeAttachmentIDs(rawIDs []string) ([]string, error) {
+	if len(rawIDs) == 0 {
+		return nil, nil
+	}
+	if len(rawIDs) > domain.MaxMessageAttachments {
+		return nil, fmt.Errorf("%w: at most %d attachment_ids are allowed",
+			domain.ErrInvalidInput, domain.MaxMessageAttachments)
+	}
+	ids := make([]string, 0, len(rawIDs))
+	seen := make(map[string]struct{}, len(rawIDs))
+	for _, rawID := range rawIDs {
+		parsed, err := uuid.Parse(strings.TrimSpace(rawID))
+		if err != nil || parsed == uuid.Nil {
+			return nil, fmt.Errorf("%w: invalid attachment id", domain.ErrInvalidInput)
+		}
+		id := parsed.String()
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("%w: duplicate attachment id", domain.ErrInvalidInput)
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func validateMentionRefs(userIDs, channelIDs []string, labels map[string]string) error {

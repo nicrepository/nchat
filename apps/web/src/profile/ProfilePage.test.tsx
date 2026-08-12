@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ProfilePage from "./ProfilePage";
 import { AvatarUploadError } from "./profileApi";
+import { _resetSelfProfile, useSelfProfile } from "./selfProfile";
 
 const { mockUpload, mockRemove, mockFetchProfile } = vi.hoisted(() => ({
   mockUpload: vi.fn(),
@@ -36,8 +37,12 @@ beforeEach(() => {
   });
   // Default: a user with no persisted avatar.
   mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana", avatarUrl: undefined });
+  _resetSelfProfile();
 });
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  _resetSelfProfile();
+});
 
 function renderPage() {
   return render(
@@ -385,5 +390,87 @@ describe("ProfilePage — removal", () => {
       "src",
       "/api/auth/avatars/saved.png",
     );
+  });
+});
+
+// ── Shared self-profile ───────────────────────────────────────────────────────
+
+/** Stands in for any other screen showing the profile (the sidebar footer). */
+function SelfProbe() {
+  const state = useSelfProfile();
+  return (
+    <span data-testid="self">
+      {state.status === "ready" ? (state.profile.avatarUrl ?? "none") : state.status}
+    </span>
+  );
+}
+
+function renderPageWithProbe() {
+  return render(
+    <MemoryRouter>
+      <ProfilePage />
+      <SelfProbe />
+    </MemoryRouter>,
+  );
+}
+
+const self = () => screen.getByTestId("self").textContent;
+
+describe("ProfilePage — shared self-profile", () => {
+  it("publishes a confirmed upload so other screens follow without a reload", async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue("/api/auth/avatars/new.png");
+    renderPageWithProbe();
+    await settled();
+    await waitFor(() => expect(self()).toBe("none"));
+
+    // What the sidebar will read next is the server's answer, not the upload's.
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      avatarUrl: "/api/auth/avatars/new.png",
+    });
+    await user.upload(fileInput(), pngFile());
+    await user.click(uploadBtn());
+
+    await waitFor(() => expect(self()).toBe("/api/auth/avatars/new.png"));
+  });
+
+  it("publishes a confirmed removal", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      avatarUrl: "/api/auth/avatars/saved.png",
+    });
+    mockRemove.mockResolvedValue(undefined);
+    renderPageWithProbe();
+    await settled();
+    await waitFor(() => expect(self()).toBe("/api/auth/avatars/saved.png"));
+
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana", avatarUrl: undefined });
+    await user.click(removeBtn());
+
+    await waitFor(() => expect(self()).toBe("none"));
+  });
+
+  it("publishes nothing the server did not confirm", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      avatarUrl: "/api/auth/avatars/old.png",
+    });
+    mockUpload.mockRejectedValue(new AvatarUploadError("unknown", "Falhou."));
+    renderPageWithProbe();
+    await settled();
+    await waitFor(() => expect(self()).toBe("/api/auth/avatars/old.png"));
+
+    await user.upload(fileInput(), pngFile());
+    await user.click(uploadBtn());
+    expect(await screen.findByText(/falhou/i)).toBeInTheDocument();
+
+    // One load (the mount), never a second: a failure publishes nothing.
+    expect(self()).toBe("/api/auth/avatars/old.png");
   });
 });

@@ -569,3 +569,119 @@ func TestValidateRejectsAScanTimeoutThatWouldOverflow(t *testing.T) {
 		t.Fatalf("Validate refused the ceiling itself: %v", err)
 	}
 }
+
+// --- RF-10 link previews -------------------------------------------------
+
+// enableLinkPreviews sets the minimum a link-preview deployment needs. It does
+// not enable uploads: the two features are independent and the tests below say
+// so.
+func enableLinkPreviews(t *testing.T) {
+	t.Helper()
+	t.Setenv("FILE_LINK_PREVIEW_ENABLED", "true")
+	t.Setenv("AUTH_JWT_HMAC_SECRET", testJWTSecret(t))
+}
+
+func TestLoadDefaultsLinkPreviewsToDisabled(t *testing.T) {
+	cfg := Load()
+
+	if cfg.LinkPreviewEnabled {
+		t.Fatal("link previews must be off unless a deployment asks for them")
+	}
+	if cfg.LinkPreviewTimeoutSeconds != defaultLinkPreviewTimeoutSeconds {
+		t.Fatalf("timeout: %d", cfg.LinkPreviewTimeoutSeconds)
+	}
+	if cfg.LinkPreviewCacheTTLSeconds != defaultLinkPreviewCacheTTLSeconds {
+		t.Fatalf("cache TTL: %d", cfg.LinkPreviewCacheTTLSeconds)
+	}
+}
+
+func TestLoadReadsLinkPreviewOverrides(t *testing.T) {
+	t.Setenv("FILE_LINK_PREVIEW_ENABLED", "true")
+	t.Setenv("FILE_LINK_PREVIEW_TIMEOUT_SECONDS", "8")
+	t.Setenv("FILE_LINK_PREVIEW_CACHE_TTL_SECONDS", "60")
+
+	cfg := Load()
+
+	if !cfg.LinkPreviewEnabled || cfg.LinkPreviewTimeoutSeconds != 8 ||
+		cfg.LinkPreviewCacheTTLSeconds != 60 {
+		t.Fatalf("unexpected config %+v", cfg)
+	}
+}
+
+func TestLoadFallsBackOnNonPositiveLinkPreviewValues(t *testing.T) {
+	t.Setenv("FILE_LINK_PREVIEW_TIMEOUT_SECONDS", "0")
+	t.Setenv("FILE_LINK_PREVIEW_CACHE_TTL_SECONDS", "-30")
+
+	cfg := Load()
+
+	if cfg.LinkPreviewTimeoutSeconds != defaultLinkPreviewTimeoutSeconds ||
+		cfg.LinkPreviewCacheTTLSeconds != defaultLinkPreviewCacheTTLSeconds {
+		t.Fatalf("unexpected config %+v", cfg)
+	}
+}
+
+func TestValidateAcceptsLinkPreviewsWithoutUploads(t *testing.T) {
+	enableLinkPreviews(t)
+
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("link previews must run with uploads disabled: %v", err)
+	}
+}
+
+func TestValidateRejectsAnInvalidLinkPreviewBoolean(t *testing.T) {
+	t.Setenv("FILE_LINK_PREVIEW_ENABLED", "perhaps")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("an unparseable FILE_LINK_PREVIEW_ENABLED must stop start-up")
+	}
+}
+
+// TestValidateRequiresTokenValidationForLinkPreviews: the route is
+// authenticated, so a deployment that cannot validate a token must not start
+// with it enabled — an unauthenticated version would be an open fetcher.
+func TestValidateRequiresTokenValidationForLinkPreviews(t *testing.T) {
+	t.Setenv("FILE_LINK_PREVIEW_ENABLED", "true")
+	t.Setenv("AUTH_JWT_HMAC_SECRET", "too-short")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("link previews must not start without a usable JWT secret")
+	}
+}
+
+func TestValidateRejectsUnusableLinkPreviewBudgets(t *testing.T) {
+	for name, env := range map[string][2]string{
+		"timeout too large": {"FILE_LINK_PREVIEW_TIMEOUT_SECONDS",
+			strconv.Itoa(maxLinkPreviewTimeoutSeconds + 1)},
+		"ttl too large": {"FILE_LINK_PREVIEW_CACHE_TTL_SECONDS",
+			strconv.Itoa(maxLinkPreviewCacheTTLSeconds + 1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			enableLinkPreviews(t)
+			t.Setenv(env[0], env[1])
+
+			if err := Load().Validate(); err == nil {
+				t.Fatalf("%s must be refused", env[0])
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsTheLinkPreviewCeilingsThemselves(t *testing.T) {
+	enableLinkPreviews(t)
+	t.Setenv("FILE_LINK_PREVIEW_TIMEOUT_SECONDS", strconv.Itoa(maxLinkPreviewTimeoutSeconds))
+	t.Setenv("FILE_LINK_PREVIEW_CACHE_TTL_SECONDS", strconv.Itoa(maxLinkPreviewCacheTTLSeconds))
+
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("the ceilings themselves must be acceptable: %v", err)
+	}
+}
+
+// TestValidateIgnoresLinkPreviewBudgetsWhileDisabled: an out-of-range value in
+// a deployment that does not run the feature is not a reason to refuse to boot.
+func TestValidateIgnoresLinkPreviewBudgetsWhileDisabled(t *testing.T) {
+	t.Setenv("FILE_LINK_PREVIEW_TIMEOUT_SECONDS", strconv.Itoa(maxLinkPreviewTimeoutSeconds+1))
+
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("a disabled feature must not block start-up: %v", err)
+	}
+}

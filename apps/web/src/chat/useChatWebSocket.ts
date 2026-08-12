@@ -51,6 +51,12 @@ export interface WSMessagePayload {
   quoted?: WSQuotePayload;
   /** Missing means a pre-RF-08 server during rolling deploys. */
   is_forwarded?: unknown;
+  /**
+   * RF-32 attachment metadata, so a subscriber renders a message carrying a
+   * file without a follow-up GET. Absent on a text-only message and on any
+   * pre-RF-32 server; the shape is validated by the client that reads it.
+   */
+  attachments?: unknown;
 }
 
 export interface WSQuotePayload {

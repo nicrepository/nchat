@@ -493,8 +493,9 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 	removed := msg.Status == domain.MessageStatusDeleted || deletedAt != nil
 	body := msg.BodyText
 	quoted := domainQuoteToWSPayload(msg.Quoted)
+	attachments := domainAttachmentsToWSPayload(msg.Attachments)
 	if removed {
-		body, quoted = "", nil
+		body, quoted, attachments = "", nil, nil
 	}
 	return ws.MessagePayload{
 		ID:                msg.ID,
@@ -513,9 +514,25 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		EditedAt:          editedAt,
 		DeletedAt:         deletedAt,
 		Quoted:            quoted,
+		Attachments:       attachments,
 		IsForwarded:       msg.ForwardedFromMessageID != "",
 		HasReference:      msg.ReferencedMessageID != "",
 	}
+}
+
+func domainAttachmentsToWSPayload(attachments []domain.MessageAttachment) []ws.MessageAttachmentPayload {
+	if len(attachments) == 0 {
+		return nil
+	}
+	payload := make([]ws.MessageAttachmentPayload, len(attachments))
+	for i, attachment := range attachments {
+		payload[i] = ws.MessageAttachmentPayload{
+			ID: attachment.ID, Filename: attachment.Filename,
+			ContentType: attachment.ContentType, Size: attachment.SizeBytes,
+			Status: attachment.Status, PreviewStatus: attachment.PreviewStatus,
+		}
+	}
+	return payload
 }
 
 func domainQuoteToWSPayload(q *domain.QuotedMessage) *ws.QuotePayload {

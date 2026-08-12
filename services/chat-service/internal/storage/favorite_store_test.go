@@ -17,7 +17,7 @@ import (
 // addFavoriteSQL asserts the single-statement shape: access CTE (workspace
 // membership + public/private channel or DM membership), active-message
 // filter, insert guarded by the CTE, and idempotent conflict handling.
-const addFavoriteSQL = `(?s)WITH authorized AS.*chat\.workspace_members wm.*chat\.dm_members dm.*m\.status = 'active'.*c\.type = 'public' OR cm\.user_id IS NOT NULL.*dm\.user_id IS NOT NULL.*INSERT INTO chat\.message_favorites.*ON CONFLICT \(user_id, message_id\) DO NOTHING.*SELECT EXISTS`
+const addFavoriteSQL = `(?s)WITH authorized AS.*chat\.workspace_members wm.*chat\.dm_members dm.*m\.status = 'active'.*chat\.channel_visible_to_user\(c\.id, \$2::uuid\).*dm\.user_id IS NOT NULL.*INSERT INTO chat\.message_favorites.*ON CONFLICT \(user_id, message_id\) DO NOTHING.*SELECT EXISTS`
 
 func favoriteInput() storage.AddFavoriteInput {
 	return storage.AddFavoriteInput{WorkspaceID: "ws-1", UserID: "user-1", MessageID: "msg-1"}
@@ -90,7 +90,7 @@ func favoriteRow(id, channelID, dmID string, now, favoritedAt time.Time) []any {
 
 // listFavoritesSQL asserts current-access filtering at list time and that no
 // m.status filter drops deleted messages (RF-14: they stay, with placeholder).
-const listFavoritesSQL = `(?s)FROM chat\.message_favorites f.*JOIN chat\.messages m.*chat\.workspace_members wm.*WHERE f\.user_id = \$2.*c\.type = 'public' OR cm\.user_id IS NOT NULL.*dm\.user_id IS NOT NULL.*ORDER BY f\.created_at DESC, f\.message_id DESC`
+const listFavoritesSQL = `(?s)FROM chat\.message_favorites f.*JOIN chat\.messages m.*chat\.workspace_members wm.*WHERE f\.user_id = \$2.*chat\.channel_visible_to_user\(c\.id, \$2::uuid\).*dm\.user_id IS NOT NULL.*ORDER BY f\.created_at DESC, f\.message_id DESC`
 
 func TestPGXFavoriteStore_ListFavorites_ReturnsNewestFirstWithDeletedRetained(t *testing.T) {
 	mock := newMock(t)

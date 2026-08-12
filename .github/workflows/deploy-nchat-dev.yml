@@ -42,6 +42,7 @@ jobs:
           NCHAT_DEV_NODE_IP: ${{ vars.NCHAT_DEV_NODE_IP }}
           NCHAT_DEV_NODE_CIDR: ${{ vars.NCHAT_DEV_NODE_CIDR }}
           NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
+          NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
         run: scripts/ci/nchat-dev-deployment-check.sh
       - name: Deploy data, migrations and application
         env:
@@ -50,4 +51,5 @@ jobs:
           NCHAT_DEV_NODE_IP: ${{ vars.NCHAT_DEV_NODE_IP }}
           NCHAT_DEV_NODE_CIDR: ${{ vars.NCHAT_DEV_NODE_CIDR }}
           NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
+          NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
         run: scripts/deploy/nchat-dev/deploy.sh

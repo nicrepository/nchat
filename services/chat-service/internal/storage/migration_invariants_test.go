@@ -560,3 +560,168 @@ func TestChatMigration_BoundsWorkspaceMaxUploadBytesToWholeMiB(t *testing.T) {
 		t.Fatal("the default must sit inside the CHECK bounds")
 	}
 }
+
+// RF-32: the message <-> attachment edge.
+//
+// Three properties matter and all three are schema, not application code:
+// a link dies with its message, an attachment belongs to at most one message,
+// and no foreign key crosses into the files schema — which is what keeps
+// migrations/chat and migrations/files independent of each other's order, the
+// convention files/000001 states and chat/000001 already follows for auth.
+func TestChatMigration_BindsAttachmentsToExactlyOneMessage(t *testing.T) {
+	migration := readChatMigration(t, "000021_message_attachments.up.sql")
+
+	for _, fragment := range []string{
+		"CREATE TABLE chat.message_attachments",
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+		"PRIMARY KEY (message_id, attachment_id)",
+		"UNIQUE (attachment_id)",
+		"CHECK (position BETWEEN 0 AND 9)",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("message attachment migration missing %q", fragment)
+		}
+	}
+	if strings.Contains(migration, "REFERENCES files.") {
+		t.Fatal("no foreign key may cross into the files schema")
+	}
+	// The link table is new, so nothing may be rewritten to create it.
+	for _, forbidden := range []string{"UPDATE files.", "DELETE FROM files.", "ALTER TABLE files."} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("migration must not touch files.attachments: %q", forbidden)
+		}
+	}
+}
+
+// The rollback removes the edge and nothing else: no attachment, no message and
+// no column owned by another migration.
+func TestChatMigration_DownDropsOnlyTheMessageAttachmentEdge(t *testing.T) {
+	down := readChatMigration(t, "000021_message_attachments.down.sql")
+
+	if !strings.Contains(down, "DROP TABLE IF EXISTS chat.message_attachments") {
+		t.Fatal("rollback must drop chat.message_attachments")
+	}
+	if strings.Count(down, "DROP ") != 1 {
+		t.Fatalf("rollback must contain exactly one DROP: %s", down)
+	}
+	for _, forbidden := range []string{"DELETE FROM", "TRUNCATE", "ALTER TABLE", "UPDATE "} {
+		if strings.Contains(down, forbidden) {
+			t.Fatalf("rollback must not contain %q", forbidden)
+		}
+	}
+}
+
+// ── RF-74: workspace moderator and guest channel scope (000022) ──────────────
+
+// The role CHECK admits exactly the five RF-74 roles and nothing else. A widened
+// constraint is the one part of this feature that cannot be un-widened by a code
+// change, so the accepted set is asserted literally.
+func TestChatMigration_AcceptsExactlyTheFiveRF74WorkspaceRoles(t *testing.T) {
+	migration := readChatMigration(t, "000022_workspace_moderator_and_guest_channel_scope.up.sql")
+
+	if !strings.Contains(migration, "CHECK (role IN ('owner', 'admin', 'moderator', 'member', 'guest'))") {
+		t.Fatal("the workspace role CHECK must accept exactly owner/admin/moderator/member/guest")
+	}
+	// The per-channel role is a different scope and must not be redefined here.
+	// The function below reads chat.channel_members; nothing may alter it.
+	if strings.Contains(migration, "ALTER TABLE chat.channel_members") {
+		t.Fatal("the workspace role migration must not alter chat.channel_members")
+	}
+	// Widening the accepted set must not reclassify anybody into it.
+	for _, forbidden := range []string{"UPDATE chat.workspace_members", "DELETE FROM", "TRUNCATE"} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("the up migration must not rewrite membership rows: %q", forbidden)
+		}
+	}
+}
+
+// chat.channel_visible_to_user is the single definition of channel read access
+// shared by chat-service, file-service and media-service. The RF-74 guest rule
+// lives inside it: an explicit chat.channel_members row admits any role, and a
+// public channel admits only the roles on the allowlist — which is an allowlist
+// precisely so an unrecognised role is denied rather than treated as a member.
+func TestChatMigration_ChannelVisibilityFunctionScopesGuestsToTheirChannels(t *testing.T) {
+	migration := readChatMigration(t, "000022_workspace_moderator_and_guest_channel_scope.up.sql")
+
+	for _, fragment := range []string{
+		"CREATE OR REPLACE FUNCTION chat.channel_visible_to_user(p_channel_id UUID, p_user_id UUID)",
+		"JOIN chat.workspace_members wm",
+		"wm.status = 'active'",
+		"LEFT JOIN chat.channel_members cm",
+		"cm.user_id IS NOT NULL",
+		"wm.role IN ('owner', 'admin', 'moderator', 'member')",
+		"c.type = 'public'",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("channel visibility function missing %q", fragment)
+		}
+	}
+	// "not a guest" would admit any unknown role; the allowlist is the point.
+	if strings.Contains(migration, "<> 'guest'") || strings.Contains(migration, "!= 'guest'") {
+		t.Fatal("the role test must be an allowlist, not a guest denylist")
+	}
+}
+
+// The rollback restores the previous policy without destroying data. It has to
+// move workspace moderators to a role the old CHECK accepts, and 'member' — the
+// nearest role with no management authority — is the only direction a rollback
+// may take.
+func TestChatMigration_DownDemotesModeratorsAndRestoresThePreviousPolicy(t *testing.T) {
+	down := readChatMigration(t, "000022_workspace_moderator_and_guest_channel_scope.down.sql")
+
+	for _, fragment := range []string{
+		"UPDATE chat.workspace_members",
+		"SET role = 'member'",
+		"WHERE role = 'moderator'",
+		"CHECK (role IN ('owner', 'admin', 'member', 'guest'))",
+		"CREATE OR REPLACE FUNCTION chat.channel_visible_to_user",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Fatalf("rollback missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"DELETE FROM", "TRUNCATE", "DROP TABLE", "DROP FUNCTION"} {
+		if strings.Contains(down, forbidden) {
+			t.Fatalf("rollback must not destroy data or the shared function: %q", forbidden)
+		}
+	}
+	// A rollback that widened access silently would be worse than one that
+	// failed: the restored body must admit public channels for everyone again,
+	// which is only correct because it is the pre-RF-74 policy.
+	if !strings.Contains(down, "c.is_general = true OR c.type = 'public' OR cm.user_id IS NOT NULL") {
+		t.Fatal("rollback must restore the exact pre-RF-74 visibility body")
+	}
+}
+
+// Every query in this package that decides channel read access must ask the
+// shared function rather than restating the predicate. A reintroduced inline
+// copy is how the guest scope would come apart one store at a time — silently,
+// and only for the paths that copy went into.
+func TestChatStores_ChannelReadAccessIsOnlyTheSharedFunction(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve storage package path")
+	}
+	sources, err := filepath.Glob(filepath.Join(filepath.Dir(currentFile), "*.go"))
+	if err != nil {
+		t.Fatalf("list storage sources: %v", err)
+	}
+	for _, path := range sources {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		contents, err := os.ReadFile(path) //nolint:gosec // Glob is restricted to this package.
+		if err != nil {
+			t.Fatalf("read %s: %v", filepath.Base(path), err)
+		}
+		for _, inlined := range []string{
+			"c.type = 'public' OR cm.user_id IS NOT NULL",
+			"c.is_general = true OR c.type = 'public'",
+		} {
+			if strings.Contains(string(contents), inlined) {
+				t.Fatalf("%s restates the channel read policy (%q); call chat.channel_visible_to_user instead",
+					filepath.Base(path), inlined)
+			}
+		}
+	}
+}

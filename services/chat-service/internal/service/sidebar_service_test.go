@@ -170,7 +170,7 @@ func activeWorkspace() domain.Workspace {
 }
 
 func activeMember() domain.WorkspaceMember {
-	return domain.WorkspaceMember{WorkspaceID: sidebarWsID, UserID: sidebarUserID, Status: domain.MemberStatusActive}
+	return domain.WorkspaceMember{WorkspaceID: sidebarWsID, UserID: sidebarUserID, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusActive}
 }
 
 func newSidebarService(
@@ -227,7 +227,7 @@ func TestSidebarService_UserNotMember_ReturnsForbidden(t *testing.T) {
 }
 
 func TestSidebarService_SuspendedMember_ReturnsForbidden(t *testing.T) {
-	suspended := domain.WorkspaceMember{WorkspaceID: sidebarWsID, UserID: sidebarUserID, Status: domain.MemberStatusSuspended}
+	suspended := domain.WorkspaceMember{WorkspaceID: sidebarWsID, UserID: sidebarUserID, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusSuspended}
 	svc := newSidebarService(
 		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
 		&sidebarFakeMemberStore{member: suspended},
@@ -241,7 +241,7 @@ func TestSidebarService_SuspendedMember_ReturnsForbidden(t *testing.T) {
 }
 
 func TestSidebarService_LeftMember_ReturnsForbidden(t *testing.T) {
-	left := domain.WorkspaceMember{WorkspaceID: sidebarWsID, UserID: sidebarUserID, Status: domain.MemberStatusLeft}
+	left := domain.WorkspaceMember{WorkspaceID: sidebarWsID, UserID: sidebarUserID, Role: domain.WorkspaceRoleMember, Status: domain.MemberStatusLeft}
 	svc := newSidebarService(
 		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
 		&sidebarFakeMemberStore{member: left},
@@ -550,19 +550,26 @@ func (c *capturingChannelStore) ArchiveChannel(_ context.Context, _, _ string) (
 	return domain.Channel{}, nil
 }
 
-// CanCreateChannel is a compatibility field, not a role lookup: every active
-// role sees true, because a returned sidebar already proves the only condition
-// channel creation has (BUG #393).
-func TestSidebarService_CanCreateChannelIsTrueForEveryActiveRole(t *testing.T) {
-	for _, role := range []domain.WorkspaceRole{
-		domain.WorkspaceRoleOwner,
-		domain.WorkspaceRoleAdmin,
-		domain.WorkspaceRoleMember,
-		domain.WorkspaceRoleGuest,
+// CanCreateChannel reports what ChannelService.CreateChannel will actually do.
+// Creation still takes no management role (BUG #393), so every active role sees
+// true — except the guest, which RF-74 excludes. A returned sidebar stopped
+// being proof of the condition when that exclusion landed, so the flag must
+// track domain.CanCreateChannel rather than being constant: a guest offered the
+// affordance would get a 403 from the route behind it.
+func TestSidebarService_CanCreateChannelMatchesTheCreatePredicate(t *testing.T) {
+	for _, tc := range []struct {
+		role domain.WorkspaceRole
+		want bool
+	}{
+		{domain.WorkspaceRoleOwner, true},
+		{domain.WorkspaceRoleAdmin, true},
+		{domain.WorkspaceRoleModerator, true},
+		{domain.WorkspaceRoleMember, true},
+		{domain.WorkspaceRoleGuest, false},
 	} {
-		t.Run(string(role), func(t *testing.T) {
+		t.Run(string(tc.role), func(t *testing.T) {
 			member := activeMember()
-			member.Role = role
+			member.Role = tc.role
 			svc := newSidebarService(
 				&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
 				&sidebarFakeMemberStore{member: member},
@@ -573,8 +580,8 @@ func TestSidebarService_CanCreateChannelIsTrueForEveryActiveRole(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !data.CanCreateChannel {
-				t.Fatalf("CanCreateChannel = false for active %s, want true", role)
+			if data.CanCreateChannel != tc.want {
+				t.Fatalf("CanCreateChannel = %v for active %s, want %v", data.CanCreateChannel, tc.role, tc.want)
 			}
 		})
 	}

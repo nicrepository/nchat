@@ -63,7 +63,7 @@ func (s *PGXPinStore) AddPin(ctx context.Context, workspaceID, targetType, targe
 			FROM chat.messages m`+messageAccessJoins("$4")+`
 			WHERE m.workspace_id = $3 AND m.id = $5 AND m.status = 'active'
 			  AND `+pinMessageTargetPredicate+`
-			  AND `+messageAccessPredicate+`
+			  AND `+messageAccessPredicate("$4")+`
 		),
 		existing AS (
 			SELECT 1 FROM chat.message_pins WHERE target_type = $1 AND target_id = $2 AND message_id = $5
@@ -107,7 +107,7 @@ func (s *PGXPinStore) RemovePin(ctx context.Context, workspaceID, targetType, ta
 			FROM chat.messages m`+messageAccessJoins("$4")+`
 			WHERE m.workspace_id = $3 AND m.id = $5
 			  AND `+pinMessageTargetPredicate+`
-			  AND `+messageAccessPredicate+`
+			  AND `+messageAccessPredicate("$4")+`
 		),
 		deleted AS (
 			DELETE FROM chat.message_pins p
@@ -140,15 +140,13 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 				  ON wm.workspace_id = w.id AND wm.user_id = $4 AND wm.status = 'active'
 				LEFT JOIN chat.channels c
 				  ON $1 = 'channel' AND c.id = $2 AND c.workspace_id = w.id AND c.status = 'active'
-				LEFT JOIN chat.channel_members cm
-				  ON cm.channel_id = c.id AND cm.user_id = $4
 				LEFT JOIN chat.dm_conversations dc
 				  ON $1 = 'dm' AND dc.id = $2 AND dc.workspace_id = w.id AND dc.status = 'active'
 				LEFT JOIN chat.dm_members dm
 				  ON dm.conversation_id = dc.id AND dm.user_id = $4 AND dm.status = 'active'
 				WHERE w.id = $3 AND w.status = 'active'
 				  AND (
-					($1 = 'channel' AND c.id IS NOT NULL AND (c.type = 'public' OR cm.user_id IS NOT NULL))
+					($1 = 'channel' AND c.id IS NOT NULL AND chat.channel_visible_to_user(c.id, $4::uuid))
 					OR ($1 = 'dm' AND dc.id IS NOT NULL AND dm.user_id IS NOT NULL)
 				  )
 			) AS allowed
@@ -166,7 +164,7 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 			  AND m.workspace_id = $3
 			  AND p.target_type = $1 AND p.target_id = $2
 			  AND `+pinMessageTargetPredicate+`
-			  AND `+messageAccessPredicate+`
+			  AND `+messageAccessPredicate("$4")+`
 		),
 		pin_rows AS (
 			SELECT *, count(*) OVER() AS total_count

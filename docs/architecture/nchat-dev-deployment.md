@@ -13,14 +13,18 @@ segredos permanecem fora do deploy automático.
   bootstrap de papéis; `migrations/`, somente o Job; e o overlay raiz, somente a
   aplicação. O workflow aplica todas com `kubectl apply -k`.
 - A topologia operacional não fica no Git. O arquivo ignorado `topology.env`, ou as
-  variables do GitHub Environment `NCHAT_DEV_NODE_IP`, `NCHAT_DEV_NODE_CIDR` e
-  `NCHAT_DEV_HOST`, alimenta uma cópia temporária do overlay. O arquivo
-  `topology.env.example` mantém os placeholders e é a fonte canônica das portas.
+  variables do GitHub Environment `NCHAT_DEV_NODE_IP`, `NCHAT_DEV_NODE_CIDR`,
+  `NCHAT_DEV_HOST` e `NCHAT_DEV_TURN_EXTERNAL_IP`, alimenta uma cópia temporária do
+  overlay. Como o hostname TURN é derivado com o prefixo `turn.`, o contrato limita
+  `NCHAT_DEV_HOST` a 248 caracteres para manter ambos os nomes dentro do máximo RFC
+  1123 de 253 caracteres. O arquivo `topology.env.example` mantém os placeholders e
+  é a fonte canônica das portas.
 - PostgreSQL, Valkey e SeaweedFS usam StatefulSets e PVs estáticos. As tags humanas
   e os digests de manifest list das três imagens são centralizados no Kustomization
   de dados; LiveKit e coturn também usam tag mais digest verificado.
 - LiveKit e coturn usam `hostNetwork` somente para WebRTC. A API LiveKit permanece
-  em TCP 7880; RTC usa 7881/TCP e 7882/UDP; coturn usa 3480/TCP+UDP e
+  em TCP 7880; RTC direto usa 7881/TCP e 7882/UDP apenas na rede privada; coturn
+  fornece o fallback público em `TURN_LISTEN_PORT`/UDP e aloca relays em
   49300-49340/UDP. A porta 3478 continua reservada ao UniFi.
 - Build e deploy são workflows separados. O inventário canônico
   `scripts/deploy/nchat-dev/images.txt` gera a matriz de build, valida o
@@ -37,17 +41,17 @@ segredos permanecem fora do deploy automático.
 
 ## Matriz real de comunicação
 
-| Origem                          | Destino                | Porta/protocolo           | Evidência/estado                               |
-| ------------------------------- | ---------------------- | ------------------------- | ---------------------------------------------- |
-| Traefik                         | web e sete serviços Go | porta nomeada `http`/TCP  | rotas públicas do Ingress                      |
-| Traefik                         | LiveKit                | TCP 7880                  | signaling em `/livekit`                        |
-| auth-service                    | PostgreSQL             | TCP 5432                  | `DATABASE_URL`/pgx                             |
-| chat-service                    | PostgreSQL             | TCP 5432                  | `DATABASE_URL`/pgx                             |
-| chat-service                    | Valkey                 | TCP 6379                  | cache, rate limit e broadcast por `VALKEY_URL` |
-| notification-service            | PostgreSQL             | TCP 5432                  | outbox por `DATABASE_URL`                      |
-| media-service                   | IP canônico do LiveKit | TCP 7880                  | `LIVEKIT_API_URL` e readiness TCP da API       |
-| migrations e postgres-bootstrap | PostgreSQL             | TCP 5432                  | schema, grants e papéis                        |
-| browser                         | LiveKit/coturn         | WSS/HTTPS e portas WebRTC | cliente fora do PodNetwork                     |
+| Origem                          | Destino                | Porta/protocolo                    | Evidência/estado                               |
+| ------------------------------- | ---------------------- | ---------------------------------- | ---------------------------------------------- |
+| Traefik                         | web e sete serviços Go | porta nomeada `http`/TCP           | rotas públicas do Ingress                      |
+| Traefik                         | LiveKit                | TCP 7880                           | signaling em `/livekit`                        |
+| auth-service                    | PostgreSQL             | TCP 5432                           | `DATABASE_URL`/pgx                             |
+| chat-service                    | PostgreSQL             | TCP 5432                           | `DATABASE_URL`/pgx                             |
+| chat-service                    | Valkey                 | TCP 6379                           | cache, rate limit e broadcast por `VALKEY_URL` |
+| notification-service            | PostgreSQL             | TCP 5432                           | outbox por `DATABASE_URL`                      |
+| media-service                   | IP canônico do LiveKit | TCP 7880                           | `LIVEKIT_API_URL` e readiness TCP da API       |
+| migrations e postgres-bootstrap | PostgreSQL             | TCP 5432                           | schema, grants e papéis                        |
+| browser                         | LiveKit/coturn         | WSS/HTTPS; RTC privado ou TURN UDP | cliente fora do PodNetwork                     |
 
 Não há chamada HTTP/gRPC entre microsserviços no código atual. `file-service`,
 `admin-service` e `search-service` são executáveis, mas hoje expõem apenas contratos
@@ -57,6 +61,24 @@ filer nem S3. Por isso o gateway S3 e a porta 8333 ficam desabilitados, e nenhum
 aplicação acessa filer, S3 ou master 9333. OIDC/HTTPS externo e SMTP permanecem
 desabilitados em `nchat-dev`; ativá-los exige políticas específicas para destinos
 aprovados. DNS é permitido somente a workloads que resolvem Services/hosts atuais.
+
+## Topologia WebRTC e TURN
+
+O signaling do LiveKit continua no caminho público normal de HTTPS/WSS por
+Cloudflare e Traefik. A mídia direta do LiveKit permanece nos endereços privados
+7881/TCP e 7882/UDP; essas portas não recebem exposição WAN, Ingress,
+`NodePort` nem `LoadBalancer`.
+
+Quando o navegador não alcança esses candidatos privados, o LiveKit anuncia um
+servidor TURN UDP em `turn.${NCHAT_DEV_HOST}:TURN_LISTEN_PORT`. Esse hostname DNS
+resolve diretamente para `NCHAT_DEV_TURN_EXTERNAL_IP` e não passa por proxy
+HTTP/CDN comum. O coturn recebe o tráfego no `TURN_LISTEN_PORT` configurado e usa
+49300-49340/UDP para relay allocations. Atrás de NAT, a configuração renderizada
+declara `external-ip=${NCHAT_DEV_TURN_EXTERNAL_IP}/${NCHAT_DEV_NODE_IP}`; cada porta do
+range de relay preserva mapeamento externo/interno 1:1.
+
+Somente o listener TURN UDP e o range UDP de relay compõem a superfície pública de
+mídia. TURN/TLS e TURN/DTLS permanecem desabilitados (`no-tls` e `no-dtls`).
 
 ## Políticas por serviço
 
@@ -77,26 +99,28 @@ aprovados. DNS é permitido somente a workloads que resolvem Services/hosts atua
 
 ## Threat model
 
-| Ameaça                          | Controle                                                                |
-| ------------------------------- | ----------------------------------------------------------------------- |
-| secret ou credencial no Git/log | Sealed Secrets strict-scope, templates e diagnóstico sem Secret/env     |
-| imagem trocada após aprovação   | tag de build por commit e deploy por digest validado byte a byte        |
-| deploy concorrente/parcial      | concurrency sem cancelamento, migrations bloqueantes e rollout status   |
-| runner comprometido             | runner dedicado, sem Docker socket e RBAC limitado ao `nchat-dev`       |
-| movimento lateral               | default-deny e políticas específicas por origem, destino e porta        |
-| privilégio excessivo no banco   | admin isolado; migrator owner; runtime CONNECT/USAGE/CRUD/sequences     |
-| perda de dados                  | PV local, node affinity e reclaim policy `Retain`                       |
-| relay aberto/SSRF no coturn     | autenticação, ranges privados/reservados negados e uma exceção canônica |
-| supply chain CI                 | Actions por SHA; Kustomize/controller com versão e checksum fixos       |
-| XSS/clickjacking no web         | CSP sem `unsafe-eval`, frame denial e headers defensivos do nginx       |
-| CSP duplicada/contraditória     | CSP única no nginx, validada por `web:security-headers-check`           |
+| Ameaça                          | Controle                                                                                                             |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| secret ou credencial no Git/log | Sealed Secrets strict-scope, templates e diagnóstico sem Secret/env                                                  |
+| imagem trocada após aprovação   | tag de build por commit e deploy por digest validado byte a byte                                                     |
+| deploy concorrente/parcial      | concurrency sem cancelamento, migrations bloqueantes e rollout status                                                |
+| runner comprometido             | runner dedicado, sem Docker socket e RBAC limitado ao `nchat-dev`                                                    |
+| movimento lateral               | default-deny e políticas específicas por origem, destino e porta                                                     |
+| privilégio excessivo no banco   | admin isolado; migrator owner; runtime CONNECT/USAGE/CRUD/sequences                                                  |
+| perda de dados                  | PV local, node affinity e reclaim policy `Retain`                                                                    |
+| relay aberto/SSRF no coturn     | listener/relays públicos exigem autenticação, fingerprint, ranges privados/reservados negados e uma exceção canônica |
+| supply chain CI                 | Actions por SHA; Kustomize/controller com versão e checksum fixos                                                    |
+| XSS/clickjacking no web         | CSP sem `unsafe-eval`, frame denial e headers defensivos do nginx                                                    |
+| CSP duplicada/contraditória     | CSP única no nginx, validada por `web:security-headers-check`                                                        |
 
 No coturn, `allowed-peer-ip` prevalece sobre um `denied-peer-ip` sobreposto. A única
 exceção renderizada é `NCHAT_DEV_NODE_IP`, usado pelo LiveKit. Como coturn e LiveKit
 compartilham `hostNetwork`, essa permissão identifica o host inteiro, não o processo
 LiveKit; esse é um risco residual conhecido. As portas de mídia não podem ser
-expostas à WAN. O hardening futuro é separar LiveKit e coturn em IPs ou nós dedicados
-e então remover a exceção do host compartilhado.
+expostas à WAN, com exceção do listener TURN UDP e do range de relay UDP
+explicitamente autenticados. As portas diretas 7881/TCP e 7882/UDP permanecem
+privadas. O hardening futuro é separar LiveKit e coturn em IPs ou nós dedicados e
+então remover a exceção do host compartilhado.
 
 A CSP tem uma única fonte versionada: `infra/docker/web/nginx.conf`. Nem o Traefik,
 nem o Ingress, nem os serviços Go emitem `Content-Security-Policy`, e o repositório

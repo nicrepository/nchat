@@ -298,10 +298,17 @@ func (s *PGXUserStore) swapAvatarURL(ctx context.Context, userID string, newValu
 //
 // This is the workspace-scoping decision for the whole admin API, taken from
 // the caller's own membership row and nothing else. The three conditions are
-// each load-bearing: the role check is the authorization (a member or guest
-// matches no row and gets ErrForbidden), the membership status check keeps a
-// suspended or departed admin out, and the workspace status check keeps an
-// archived workspace from being administered.
+// each load-bearing: the role check is the authorization (a member, a moderator
+// or a guest matches no row and gets ErrForbidden), the membership status check
+// keeps a suspended or departed admin out, and the workspace status check keeps
+// an archived workspace from being administered.
+//
+// RF-74 deliberately did not widen this to the workspace moderator. A moderator
+// moderates channel structure and channel membership inside chat-service; this
+// query gates user administration — listing the workspace's users, inviting
+// them, suspending and reactivating them — which is the Admin de Workspace
+// capability and nothing less. It mirrors domain.CanManageWorkspace in
+// chat-service, not domain.CanModerateWorkspace.
 //
 // A caller who administers several workspaces resolves to the oldest
 // membership, which is stable across calls, so the list and any follow-up

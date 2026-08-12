@@ -16,6 +16,7 @@ import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
   parseDMConversationType,
+  parseMessageAttachments,
   type AddMembersResult,
   type Channel,
   type ChannelCategory,
@@ -605,6 +606,8 @@ interface MessageResponse {
   is_forwarded?: unknown;
   quoted?: QuoteResponse;
   reference?: ReferenceResponse;
+  /** RF-32. Absent on a text-only message and on any pre-RF-32 server. */
+  attachments?: unknown;
 }
 
 interface QuoteResponse {
@@ -760,6 +763,8 @@ function mapMessage(r: MessageResponse): Message {
     isForwarded: r.is_forwarded === true,
     quoted: !isRemoved && r.quoted ? mapQuote(r.quoted) : undefined,
     reference: !isRemoved && r.reference ? mapReference(r.reference) : undefined,
+    // A removed message describes nothing, exactly as its body and quote do not.
+    attachments: isRemoved ? undefined : parseMessageAttachments(r.attachments),
   };
 }
 
@@ -843,23 +848,49 @@ export async function fetchChannelMessages(
   };
 }
 
+/**
+ * Everything optional about posting a message, in one object.
+ *
+ * An object rather than four more positional parameters: the list was already
+ * at "two ids and a signal", and a fifth positional would make a misordered
+ * call — an AbortSignal where the attachment list goes — a silent bug the type
+ * checker could not always see. Every field is optional, so a caller that
+ * passes nothing posts exactly the body, as before.
+ */
+export interface PostMessageOptions {
+  parentMessageId?: string;
+  referencedMessageId?: string;
+  /**
+   * Ids of attachments already uploaded to this destination (RF-32). They are
+   * references, not content: nothing is re-uploaded here, and the server
+   * re-validates each id against the destination before it links anything.
+   */
+  attachmentIds?: string[];
+  signal?: AbortSignal;
+}
+
+function postMessageBody(bodyText: string, bodyFormat: string, options: PostMessageOptions) {
+  return JSON.stringify({
+    body_text: bodyText,
+    body_format: bodyFormat,
+    ...(options.parentMessageId ? { parent_message_id: options.parentMessageId } : {}),
+    ...(options.referencedMessageId ? { referenced_message_id: options.referencedMessageId } : {}),
+    // Omitted entirely when there is none, so a text-only request is the exact
+    // payload it has always been.
+    ...(options.attachmentIds?.length ? { attachment_ids: options.attachmentIds } : {}),
+  });
+}
+
 export async function postChannelMessage(
   channelId: string,
   bodyText: string,
-  parentMessageId?: string,
-  referencedMessageId?: string,
-  signal?: AbortSignal,
+  options: PostMessageOptions = {},
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      body_text: bodyText,
-      body_format: "v3",
-      ...(parentMessageId ? { parent_message_id: parentMessageId } : {}),
-      ...(referencedMessageId ? { referenced_message_id: referencedMessageId } : {}),
-    }),
-    signal,
+    body: postMessageBody(bodyText, "v3", options),
+    signal: options.signal,
   });
   return mapMessage(res.data);
 }
@@ -953,20 +984,13 @@ export async function fetchMentionCandidates(
 export async function postDMMessage(
   conversationId: string,
   bodyText: string,
-  parentMessageId?: string,
-  referencedMessageId?: string,
-  signal?: AbortSignal,
+  options: PostMessageOptions = {},
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      body_text: bodyText,
-      body_format: "v2",
-      ...(parentMessageId ? { parent_message_id: parentMessageId } : {}),
-      ...(referencedMessageId ? { referenced_message_id: referencedMessageId } : {}),
-    }),
-    signal,
+    body: postMessageBody(bodyText, "v2", options),
+    signal: options.signal,
   });
   return mapMessage(res.data);
 }

@@ -97,6 +97,72 @@ Sealed Secrets e obrigatorio para versionar secrets do MVP:
 - Definir tamanho maximo de mensagem.
 - Aplicar timeout de inatividade.
 
+## RBAC (RF-74)
+
+A matriz canonica de permissoes por papel, escopo e acao esta em
+`docs/security/rbac-matrix.md`. As secoes abaixo registram as decisoes
+concretas; a matriz e a referencia completa.
+
+Os cinco papeis do RF-74 e onde cada um vive:
+
+- **Admin Master** — escopo de plataforma. Nao existe papel global no banco: o
+  unico mecanismo e a identidade de bootstrap `X-NChat-Admin-Token`, restrita as
+  tres rotas `/admin/*` do auth-service. Nao le canal nem DM.
+- **Admin de Workspace** — `chat.workspace_members.role IN ('owner','admin')`,
+  exposto como `domain.CanManageWorkspace`. `owner` **nao** e Admin Master: e a
+  autoridade maxima dentro de um workspace e nada fora dele.
+- **Moderador** — `chat.workspace_members.role = 'moderator'`, criado pela
+  migration 000022 e exposto como `domain.CanModerateWorkspace`. Nao administra
+  o workspace, nao altera settings e recebe `403` na API administrativa de
+  usuarios.
+- **Usuario** — `member`.
+- **Guest** — `guest`. Membership de workspace **nao concede canal algum**.
+
+O `moderator` de `chat.channel_members` continua sendo um papel **por canal** e
+nunca e lido como autoridade de workspace. Nenhuma decisao de autorizacao
+consulta essa coluna.
+
+Nenhuma claim de papel existe no JWT: o papel e lido de
+`chat.workspace_members` a cada request. Nao existe rota que escreva
+`chat.workspace_members.role` — a atribuicao de papel e feita no banco, como
+ja era para `owner` e `admin`.
+
+## Escopo de canais do Guest (RF-74)
+
+Um Guest acessa **somente os canais em que foi explicitamente incluido**
+(`chat.channel_members`). Integrar o workspace nao lhe da nenhum canal publico,
+nem o `#geral`.
+
+A regra tem uma unica definicao: a funcao SQL
+`chat.channel_visible_to_user(channel_id, user_id)` (migration 000022),
+compartilhada por chat-service, file-service e media-service. Ela e a autoridade
+— o backend decide, o frontend nao e controle de seguranca — e cobre pelo mesmo
+predicado a listagem/sidebar, o acesso direto por ID e por slug, a leitura e a
+publicacao de mensagens, o encaminhamento, reacoes, favoritos, pins, download de
+anexos, o token de midia e o autorizador de subscricao do WebSocket. Um Guest
+nao recebe eventos de canal ao qual nao pertence porque a subscricao passa pela
+mesma consulta.
+
+A verificacao de papel e uma **allowlist** (`owner/admin/moderator/member`), nao
+uma negacao de `guest`: um papel nao reconhecido e recusado em vez de ser
+tratado como membro comum, entao alargar o CHECK de papeis nunca alarga acesso
+como efeito colateral. `domain.CanReadChannel` e a mesma regra em Go e deve
+concordar com a funcao SQL exatamente.
+
+Consequencias deliberadas para o Guest:
+
+- **nao** entra sozinho em canal publico (`SelfJoinChannel` recusa) — sem isso,
+  o isolamento seria contornavel em uma requisicao;
+- **nao** cria canal (`domain.CanCreateChannel`), re-verificado no proprio
+  `INSERT`;
+- **nao** e adicionado automaticamente a `#geral`; chega la sendo adicionado,
+  como a qualquer outro canal. O backfill `SyncGeneralMemberships` deixou de
+  criar essas linhas e nunca remove as existentes.
+
+Canal privado continua exigindo membership de canal para **todos** os papeis:
+nem owner, nem admin, nem moderador leem um canal privado do qual nao
+participam.
+
 ## Autorizacao para pin/unpin de mensagens
 
 Fixar e desafixar mensagem (RF-05) nao exige papel de Moderador ou
@@ -106,47 +172,68 @@ acesso usada para leitura de mensagens (RF-04), sem RBAC adicional.
 Decisao de produto registrada em 2026-07-08 (issue #105), substituindo
 a suposicao original de acesso restrito a Moderador/Admin.
 
+O RF-74 nao alterou essa regra e a reforcou: pin e unpin reutilizam a
+autorizacao de leitura do dominio em vez de terem uma excecao propria para
+Guest. `PGXPinStore.AddPin` e `RemovePin` chamam
+`chat.channel_visible_to_user` pelo mesmo fragmento que os favoritos usam,
+entao um Guest incluido no canal fixa e desafixa, e um Guest fora dele recebe o
+mesmo `404` nao-enumerante que recebe ao tentar ler.
+
 ## Autorizacao para categorias de canais
 
 Criar, renomear, reordenar e excluir categoria de canal (RF-17) exige
-papel ativo de `owner` ou `admin` no workspace -- o mesmo gate ja usado
-para update/archive de canal e para workspace settings, exposto como
-`domain.CanManageChannelCategories`. Usuario comum e Guest recebem 403.
+papel ativo de `owner`, `admin` ou `moderator` no workspace, exposto como
+`domain.CanManageChannelCategories`, que delega a
+`domain.CanModerateWorkspace`. Usuario comum e Guest recebem 403.
 Ler a listagem agrupada e aberto a qualquer membro ativo e nao amplia
 acesso a canal: os canais de cada grupo vem da mesma politica SQL de
-leitura usada pelo sidebar.
+leitura usada pelo sidebar, entao um Guest ve os grupos com apenas os
+canais que integra.
 
-O RF-17 foi especificado como "Admin e Moderador". Nao existe papel de
-moderador em nivel de workspace neste schema:
-`chat.workspace_members.role` aceita apenas
-`owner/admin/member/guest`, e `moderator` existe somente em
-`chat.channel_members`, como papel por canal. Tratar "modera algum
-canal" como "pode reestruturar a sidebar do workspace" seria escalacao
-de privilegio, e criar um papel de workspace que nenhum endpoint
-atribui seria codigo morto alargando uma constraint de seguranca fora
-do escopo da tarefa. `CanManageChannelCategories` e a costura nomeada
-para incluir um papel real de moderacao de workspace quando o RF-74
-criar um. Mesma forma de divergencia registrada acima para RF-05.
+O RF-17 foi especificado como "Admin e Moderador" e teve de se contentar com
+owner/admin: `chat.workspace_members.role` aceitava apenas
+`owner/admin/member/guest`, e `moderator` existia somente em
+`chat.channel_members`, como papel por canal. Tratar "modera algum canal" como
+"pode reestruturar a sidebar do workspace" seria escalacao de privilegio, e
+criar um papel de workspace que nenhum endpoint atribui seria codigo morto
+alargando uma constraint de seguranca. O RF-74 criou o papel de verdade
+(migration 000022), entao `CanManageChannelCategories` passa a dizer o que o
+RF-17 pediu. O papel por canal continua sem ser consultado.
+
+Junto com isso, as quatro mutacoes de categoria passaram a consultar
+`CanManageChannelCategories` diretamente. Antes chamavam
+`requireWorkspaceManager`, que aplica `CanManageWorkspace` -- o predicado
+nomeado era decoracao, e alarga-lo para o RF-74 nao teria tido efeito nenhum
+nessas rotas. Uma rota deve executar o predicado que ela nomeia.
+
+Update e archive de canal **nao** acompanharam: continuam exigindo
+`CanManageWorkspace`. Moderar a estrutura e a composicao de canais e diferente
+de mudar o que um canal e ou de arquiva-lo.
 
 ## Autorizacao para adicionar membros
 
-Adicionar participantes a um **canal** (issue #398) exige papel ativo de `owner`
-ou `admin` no workspace, exposto como `domain.CanManageChannelMembers`, que
-delega a `CanManageWorkspace`. E o mesmo gate ja usado para update/archive de
-canal, para categorias e para a operacao inversa -- remover membro de canal, que
-`MemberService.RemoveMemberFromChannel` ja restringia a owner/admin. Adicionar e
-remover a mesma linha sao a mesma autoridade;
+Adicionar participantes a um **canal** (issue #398) exige papel ativo de
+`owner`, `admin` ou `moderator` no workspace, exposto como
+`domain.CanManageChannelMembers`, que delega a `CanModerateWorkspace`. E o mesmo
+gate usado para categorias e para a operacao inversa -- remover membro de canal.
+Adicionar e remover a mesma linha sao a mesma autoridade;
 `docs/runbooks/task-chat-channel-join-leave.md` ja chamava a adicao de
-"manager-add flow".
+"manager-add flow". `MemberService.RemoveMemberFromChannel` deixou de repetir
+uma lista de papeis propria e passou a consultar o mesmo predicado, para que as
+duas nao possam divergir.
+
+O RF-74 e o que alargou esse predicado de owner/admin para incluir o moderador:
+ele foi escrito como costura nomeada exatamente para isso, e a costura foi
+gasta. O alargamento chega ao store tambem --
+`PGXMemberStore.AddChannelMembers` re-deriva a mesma lista de papeis dentro da
+sua transacao, sob `FOR SHARE`, entao uma revogacao de papel em voo e
+serializada contra a escrita em vez de correr com ela.
 
 Deliberadamente **nao** e "qualquer membro do canal": isso permitiria a quem
 apenas le um canal privado ampliar a audiencia dele, que e precisamente a
 propriedade que um canal privado tem. O papel `moderator` de
-`chat.channel_members` tambem nao e consultado -- nenhum caminho de codigo o
-atribui, entao decidir por ele seria codigo morto ocupando o lugar de uma
-verificacao real. Mesma forma de divergencia registrada para RF-05 e RF-17.
-`CanManageChannelMembers` e a costura nomeada para alargar quando o RF-74 criar
-um papel real de moderacao.
+`chat.channel_members` tambem nao e consultado -- ele e por canal, e moderar um
+canal nao confere autoridade de workspace.
 
 Adicionar participantes a um **grupo** (`chat.dm_conversations` com
 `type = 'group'`) exige apenas participacao ativa na conversa. Nao ha gestor a
@@ -166,6 +253,31 @@ Em ambas as rotas, um chamador sem permissao e um usuario inelegivel respondem o
 mesmo `403`, sem dizer qual usuario nem se ele esta suspenso, deletado, em outro
 workspace ou inexistente -- distinguir isso transformaria a rota em um oraculo de
 contas.
+
+O RF-74 nao ampliou o acesso a DMs. Participacao (`chat.dm_members`) continua a
+unica pergunta feita em qualquer caminho de DM; `chat.workspace_members.role`
+nao e consultada em nenhum deles, entao nem o Moderador criado pelo RF-74 nem o
+Admin Master ganham leitura, detalhes ou administracao de conversa privada.
+
+## Autorizacao administrativa de usuarios
+
+`/auth/admin/users` e `/auth/admin/invites` sao browser-side e exigem
+`BearerAuth` + `RequireActiveSession` + `RequireWorkspaceAdmin`. O workspace vem
+de `PGXUserStore.GetAdminWorkspaceID`, que exige `role IN ('owner','admin')`
+ativo em workspace ativo e nao le nenhum valor enviado pelo cliente. O RF-74
+deliberadamente **nao** incluiu o `moderator` ai: moderar canais e categorias e
+diferente de listar, convidar e suspender pessoas.
+
+As rotas `/admin/users`, `/admin/invites` e `/admin/users/{id}/status`
+permanecem atras de `AdminBootstrapGuard` (`X-NChat-Admin-Token`), CLI-only.
+Esse bypass e o unico escopo de plataforma que existe hoje e e o que o RF-74
+documenta como **Admin Master**: nao ha tabela, coluna nem papel global de
+administrador de plataforma, e o RF-74 nao criou um -- um papel que nenhum
+endpoint sabe atribuir seria o mesmo codigo morto ja recusado acima para o
+moderador. O token continua porque e o unico caminho que funciona antes de
+existir um primeiro administrador; substitui-lo exige decidir como esse primeiro
+administrador nasce, o que esta fora do RF-74. A limitacao esta registrada em
+`docs/security/rbac-matrix.md`.
 
 ## Regras para uploads
 
@@ -224,6 +336,40 @@ O scan em si e assincrono (RF-22) e falha fechada em todas as direcoes:
   request ou evento vindo do cliente que alcance a transicao para `clean`;
 - o gate vale para toda entrega de bytes derivados do arquivo -- download,
   HTTP Range, preview e streaming inline -- e nao apenas para o download.
+
+## Regras para fetch de conteudo externo
+
+Vale para toda requisicao de saida cujo destino e escolhido, direta ou
+indiretamente, por um usuario. Hoje o unico caso e o preview de links por Open
+Graph (RF-10) no file-service; a regra e permanente e vale para qualquer feature
+futura com a mesma forma.
+
+- O destino e julgado pelo **endereco IP que a conexao vai usar**, nunca pelo
+  hostname. Resolver, verificar **todas** as respostas e conectar ao endereco ja
+  aceito: nao pode existir janela entre a checagem e o uso (DNS rebinding). Um
+  nome com varios enderecos e recusado se qualquer um deles nao for publico.
+- Destinos nao publicos sao recusados em IPv4 e IPv6, incluindo as formas em que
+  um endereco IPv4 viaja dentro de um IPv6. Metadata services de nuvem sao
+  cobertos por essa regra, e com eles qualquer alias que resolva para eles.
+  Bloquear por hostname literal nao e controle.
+- Somente `http` e `https`, somente a porta default do esquema, nunca
+  credenciais na URL.
+- Cada redirect passa por toda a validacao de novo, e o numero de saltos e
+  limitado.
+- Proxies do ambiente sao ignorados: um proxy resolveria e conectaria no lugar
+  do servico.
+- TLS e verificado contra o hostname original. `InsecureSkipVerify` e proibido.
+- Allowlist explicita de Content-Type, decidida antes de ler o corpo; corpo lido
+  atraves de limite aplicado sobre bytes descomprimidos; timeouts curtos e
+  finitos por fase.
+- A rota e autenticada e tem rate limit por usuario. Um endpoint anonimo seria um
+  fetcher aberto usando o endereco e a banda do deployment.
+- Nenhum conteudo remoto e devolvido ao cliente: apenas metadados normalizados,
+  como dados e nunca como markup.
+- A recusa nunca revela o destino, o endereco ou a mensagem do servidor remoto,
+  em resposta, log ou label de metrica.
+
+Ver `docs/api/link-preview.md`.
 
 ## Processo para vulnerabilidade Critical/High
 
