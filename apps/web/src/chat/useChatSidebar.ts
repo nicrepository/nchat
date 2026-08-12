@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useLocation } from "react-router";
 
-import { fetchSidebarData } from "./chatApi";
+import { fetchSidebarData, setSidebarConversationPinned } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ConversationActivity, DMConversation } from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
@@ -40,7 +40,8 @@ type Action =
       messageCreatedAt: string;
       activeTarget?: WSSubscriptionTarget;
     }
-  | { type: "target_opened"; target: WSSubscriptionTarget };
+  | { type: "target_opened"; target: WSSubscriptionTarget }
+  | { type: "pin_changed"; target: WSSubscriptionTarget; pinnedAt: string | null };
 
 /**
  * Replaces the list with the server's, keeping each surviving item's activity
@@ -164,6 +165,18 @@ function reducer(state: SidebarState, action: Action): SidebarState {
         dms: state.dms.map((dm) =>
           dm.id === action.target.targetId && dm.unreadCount ? { ...dm, unreadCount: 0 } : dm,
         ),
+      };
+    }
+    case "pin_changed": {
+      if (state.status !== "ready") return state;
+      const update = <T extends { id: string; pinnedAt?: string | null }>(items: T[]): T[] =>
+        items.map((item) =>
+          item.id === action.target.targetId ? { ...item, pinnedAt: action.pinnedAt } : item,
+        );
+      return {
+        ...state,
+        channels: action.target.kind === "channel" ? update(state.channels) : state.channels,
+        dms: action.target.kind === "dm" ? update(state.dms) : state.dms,
       };
     }
   }
@@ -320,5 +333,23 @@ export function useChatSidebar() {
     }
   }, [openedTargetKind, openedTargetId, state.status]);
 
-  return { state, retry: load };
+  const setPinned = useCallback(
+    async (target: WSSubscriptionTarget, pinned: boolean) => {
+      if (state.status !== "ready") return;
+      const items = target.kind === "channel" ? state.channels : state.dms;
+      const previous = items.find((item) => item.id === target.targetId)?.pinnedAt ?? null;
+      const optimistic = pinned ? "0001-01-01T00:00:00Z" : null;
+      dispatch({ type: "pin_changed", target, pinnedAt: optimistic });
+      try {
+        await setSidebarConversationPinned(target.kind, target.targetId, pinned);
+        refreshSidebar();
+      } catch (error) {
+        dispatch({ type: "pin_changed", target, pinnedAt: previous });
+        throw error;
+      }
+    },
+    [refreshSidebar, state],
+  );
+
+  return { state, retry: load, setPinned };
 }

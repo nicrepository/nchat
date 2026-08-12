@@ -273,6 +273,46 @@ test.describe("sidebar — ordenação por atividade", () => {
   });
 });
 
+test.describe("sidebar — conversas fixadas", () => {
+  test("fixa e desafixa em sua própria categoria, preservando a seleção", async ({
+    page,
+  }, testInfo) => {
+    const { scenario, targetId } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+    scenario.sidebarChannels.push({
+      id: "e2e-channel-pinned",
+      slug: "fixado",
+      display_name: "Canal Fixável",
+      type: "public",
+      can_write: true,
+      unread_count: 2,
+      last_message_at: "2026-08-13T10:00:00Z",
+    });
+
+    await page.reload();
+    const channels = optionsIn(page, "Canais");
+    await expect(channels).toHaveText([/Canal Fixável/, new RegExp(channel.display_name)]);
+    await page.getByLabel(`Fixar ${channel.display_name} no topo`).click();
+    await expect
+      .poll(() => scenario.requests.sidebarPins)
+      .toEqual([{ targetId: channel.id, action: "add" }]);
+    await expect(optionsIn(page, "Canais")).toHaveText([
+      new RegExp(channel.display_name),
+      /Canal Fixável/,
+    ]);
+    await expect(section(page, "Mensagens diretas").getByRole("option")).toHaveCount(1);
+    await expect(section(page, "Grupos").getByRole("option")).toHaveCount(1);
+    await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+
+    await page.getByLabel(`Desafixar ${channel.display_name}`).click();
+    await expect.poll(() => scenario.requests.sidebarPins).toHaveLength(2);
+    await expect(optionsIn(page, "Canais")).toHaveText([
+      /Canal Fixável/,
+      new RegExp(channel.display_name),
+    ]);
+  });
+});
+
 /**
  * ISSUE #437 — the footer identifies the *authenticated* user. These cover the
  * two shapes the contract allows (with and without a picture) plus the settings

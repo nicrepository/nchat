@@ -193,6 +193,30 @@ describe("compareByActivity", () => {
     expect(ids(items)).toEqual(["b", "a"]);
     expect(sorted).not.toBe(items);
   });
+
+  it("keeps the oldest pinned conversations ahead of unpinned activity", () => {
+    type PinOrdered = ActivityOrdered & { pinnedAt?: string | null };
+    const recentUnpinned = item({
+      id: "recent-unpinned",
+      lastMessageAt: "2026-08-12T12:00:00Z",
+    }) as PinOrdered;
+    const newerPin = item({
+      id: "newer-pin",
+      pinnedAt: "2026-08-12T10:00:00Z",
+      lastMessageAt: "2026-08-12T11:00:00Z",
+    }) as PinOrdered;
+    const olderPin = item({
+      id: "older-pin",
+      pinnedAt: "2026-08-12T09:00:00Z",
+      lastMessageAt: "2026-08-12T08:00:00Z",
+    }) as PinOrdered;
+
+    expect(ids(sortByActivity([recentUnpinned, newerPin, olderPin]))).toEqual([
+      "older-pin",
+      "newer-pin",
+      "recent-unpinned",
+    ]);
+  });
 });
 
 describe("laterActivity", () => {

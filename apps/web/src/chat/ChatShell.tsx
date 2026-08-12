@@ -18,7 +18,7 @@ export interface ChatOutletContext {
 }
 
 export default function ChatShell() {
-  const { state, retry } = useChatSidebar();
+  const { state, retry, setPinned } = useChatSidebar();
   const media = useCallMedia();
   const prepareMedia = media.prepare;
   const identityReady = state.status === "ready";
@@ -53,7 +53,7 @@ export default function ChatShell() {
 
   return (
     <div className="chat-app" data-testid="chat-shell">
-      <ChatSidebar state={state} retry={retry} />
+      <ChatSidebar state={state} retry={retry} setPinned={setPinned} />
       <main className="chat-app__main" aria-label="Área de mensagens">
         <Outlet context={outletContext} />
       </main>

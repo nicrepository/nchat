@@ -26,6 +26,7 @@ type ConversationAccessGuard = (targetId: string) => boolean;
 interface SidebarActivityFixture {
   created_at?: string;
   last_message_at?: string | null;
+  pinned_at?: string | null;
 }
 
 interface SidebarChannelFixture extends SidebarActivityFixture {
@@ -146,6 +147,7 @@ export interface MessagingScenario {
     deletes: string[];
     favorites: Array<{ messageId: string; action: "add" | "remove" }>;
     pins: Array<{ messageId: string; targetId: string; action: "add" | "remove" }>;
+    sidebarPins: Array<{ targetId: string; action: "add" | "remove" }>;
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
@@ -1121,6 +1123,27 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
       }),
     }),
   );
+
+  const mutateSidebarPin = async (route: Route) => {
+    const request = route.request();
+    const parts = new URL(request.url()).pathname.split("/");
+    const marker = parts.indexOf("channels") >= 0 ? "channels" : "dm";
+    const id = parts[parts.indexOf(marker) + 1];
+    const item =
+      marker === "channels"
+        ? scenario.sidebarChannels.find((channel) => channel.id === id)
+        : scenario.sidebarDMs.find((dm) => dm.id === id);
+    if (!item) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const action = request.method() === "POST" ? "add" : "remove";
+    scenario.requests.sidebarPins.push({ targetId: id, action });
+    item.pinned_at = action === "add" ? "2026-08-12T10:00:00Z" : null;
+    await route.fulfill({ status: 204 });
+  };
+  await page.route("**/api/chat/channels/*/sidebar-pin", mutateSidebarPin);
+  await page.route("**/api/chat/dm/*/sidebar-pin", mutateSidebarPin);
 }
 
 async function installInteractionMocks(

@@ -49,6 +49,7 @@ import {
   searchChannelMemberCandidates,
   searchDMCandidates,
   searchGroupParticipantCandidates,
+  setSidebarConversationPinned,
   unfavoriteMessage,
   unpinMessage,
 } from "./chatApi";
@@ -636,6 +637,41 @@ describe("fetchSidebarData", () => {
     );
     const { dms } = await fetchSidebarData();
     expect(dms[0].type).toBe("group");
+  });
+
+  it("maps server-side pin timestamps without inventing a client preference", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            can_write: true,
+            pinned_at: "2026-08-12T10:00:00Z",
+          },
+        ],
+        dms: [{ id: "group-1", type: "group", name: "Equipe", pinned_at: "2026-08-12T11:00:00Z" }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0]).toMatchObject({ id: "ch-1", pinnedAt: "2026-08-12T10:00:00Z" });
+    expect(dms[0]).toMatchObject({ id: "group-1", pinnedAt: "2026-08-12T11:00:00Z" });
+  });
+
+  it("uses target-specific idempotent pin endpoints without user or workspace payload", async () => {
+    mockAuthFetch.mockResolvedValue({});
+    await setSidebarConversationPinned("channel", "ch 1", true);
+    await setSidebarConversationPinned("dm", "dm 1", false);
+
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(1, "/api/chat/channels/ch%201/sidebar-pin", {
+      method: "POST",
+    });
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/sidebar-pin", {
+      method: "DELETE",
+    });
   });
 
   // ISSUE #414 — the two ordering keys travel on the items the sidebar already

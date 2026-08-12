@@ -1264,14 +1264,18 @@ describe("ChatSidebar — section classification", () => {
     trigger.focus();
 
     const expected = [
-      "Canal geral",
-      "Canal privado projetos",
-      "Mensagem direta com Juliane Lino",
-      "Grupo Equipe Infra",
-    ];
-    for (const label of expected) {
+      ["option", "Canal geral"],
+      ["button", "Fixar geral no topo"],
+      ["option", "Canal privado projetos"],
+      ["button", "Fixar projetos no topo"],
+      ["option", "Mensagem direta com Juliane Lino"],
+      ["button", "Fixar Juliane Lino no topo"],
+      ["option", "Grupo Equipe Infra"],
+      ["button", "Fixar Equipe Infra no topo"],
+    ] as const;
+    for (const [role, label] of expected) {
       await user.tab();
-      expect(screen.getByRole("option", { name: label })).toHaveFocus();
+      expect(screen.getByRole(role, { name: label })).toHaveFocus();
     }
 
     // Tab order continues past the last section into the footer.
@@ -1362,10 +1366,18 @@ describe("ChatSidebar — activity ordering", () => {
     dms,
   });
 
-  const renderState = (channels: Channel[], dms: DMConversation[], path = "/chat") =>
+  const renderState = (
+    channels: Channel[],
+    dms: DMConversation[],
+    path = "/chat",
+    setPinned?: (
+      target: { kind: "channel" | "dm"; targetId: string },
+      pinned: boolean,
+    ) => Promise<void>,
+  ) =>
     render(
       <MemoryRouter initialEntries={[path]}>
-        <ChatSidebar state={readyState(channels, dms)} retry={() => {}} />
+        <ChatSidebar state={readyState(channels, dms)} retry={() => {}} setPinned={setPinned} />
       </MemoryRouter>,
     );
 
@@ -1380,6 +1392,28 @@ describe("ChatSidebar — activity ordering", () => {
     );
 
     expect(optionNamesIn("Canais")).toEqual(["Canal agitado", "Canal medio", "Canal quieto"]);
+  });
+
+  it("exposes a named pin action and preserves the item's original category", async () => {
+    const user = userEvent.setup();
+    const setPinned = vi.fn().mockResolvedValue(undefined);
+    renderState(
+      [channel("geral", { pinnedAt: "2026-08-12T10:00:00Z", unreadCount: 3 })],
+      [dm("projeto", "group")],
+      "/chat/channel/geral",
+      setPinned,
+    );
+
+    expect(within(section("Canais")).getByLabelText("Desafixar geral")).toBeInTheDocument();
+    expect(within(section("Canais")).getByLabelText("Desafixar geral")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(
+      within(section("Grupos")).getByRole("option", { name: "Grupo projeto" }),
+    ).toBeInTheDocument();
+    await user.click(within(section("Canais")).getByLabelText("Desafixar geral"));
+    expect(setPinned).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" }, false);
   });
 
   it("orders direct messages independently of every other section", () => {
@@ -1573,9 +1607,15 @@ describe("ChatSidebar — activity ordering", () => {
     const trigger = screen.getByRole("button", { name: "Nova conversa" });
     trigger.focus();
 
-    for (const label of ["Canal canal-novo", "Canal canal-antigo", "Mensagem direta com Juliane"]) {
+    for (const [role, label] of [
+      ["option", "Canal canal-novo"],
+      ["button", "Fixar canal-novo no topo"],
+      ["option", "Canal canal-antigo"],
+      ["button", "Fixar canal-antigo no topo"],
+      ["option", "Mensagem direta com Juliane"],
+    ] as const) {
       await user.tab();
-      expect(screen.getByRole("option", { name: label })).toHaveFocus();
+      expect(screen.getByRole(role, { name: label })).toHaveFocus();
     }
   });
 });

@@ -153,6 +153,40 @@
   gap: 1px;
 }
 
+.chat-sidebar__item-row {
+  display: flex;
+  align-items: center;
+}
+.chat-sidebar__item-row > .chat-sidebar__nav-item,
+.chat-sidebar__item-row > .chat-sidebar__dm-item {
+  flex: 1;
+  min-width: 0;
+}
+.chat-sidebar__pin-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  min-height: 2rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 0.25rem;
+}
+.chat-sidebar__pin-action:hover,
+.chat-sidebar__pin-action:focus-visible {
+  background: var(--color-surface-hover, rgba(255, 255, 255, 0.12));
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+.chat-sidebar__pin-action[aria-pressed="true"] {
+  background: var(--color-surface-hover, rgba(255, 255, 255, 0.12));
+}
+.chat-sidebar__pin-error {
+  margin: 0.5rem;
+  font-size: 0.75rem;
+}
+
 /* ── Section labels ──────────────────────────────────────────────────────────── */
 
 .chat-sidebar__section-label {
