@@ -229,6 +229,8 @@ describe("fetchChannels", () => {
       canWrite: true,
       createdAt: null,
       lastMessageAt: null,
+      categoryId: undefined,
+      categoryName: "Geral",
     });
     expect(channels[1]).toEqual({
       id: "ch-2",
@@ -237,6 +239,8 @@ describe("fetchChannels", () => {
       canWrite: false,
       createdAt: null,
       lastMessageAt: null,
+      categoryId: undefined,
+      categoryName: "Geral",
     });
   });
 
@@ -297,6 +301,9 @@ describe("fetchChannels", () => {
   });
 
   it("makes an independent request per call (no cross-call caching)", async () => {
+    // Each fetchChannels() call fires two requests (sidebar + channel
+    // categories, via Promise.all), so two invocations need four queued
+    // responses in call order: sidebar, categories, sidebar, categories.
     mockAuthFetch
       .mockResolvedValueOnce(
         sidebarResponse({
@@ -305,20 +312,22 @@ describe("fetchChannels", () => {
           ],
         }),
       )
+      .mockResolvedValueOnce(sidebarResponse())
       .mockResolvedValueOnce(
         sidebarResponse({
           channels: [
             { id: "ch-b", slug: "b", display_name: "b", type: "public", is_general: false },
           ],
         }),
-      );
+      )
+      .mockResolvedValueOnce(sidebarResponse());
 
     const first = await fetchChannels();
     const second = await fetchChannels();
 
     expect(first[0].id).toBe("ch-a");
     expect(second[0].id).toBe("ch-b");
-    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -591,7 +600,7 @@ describe("fetchDMs", () => {
 // ── fetchSidebarData ──────────────────────────────────────────────────────────
 
 describe("fetchSidebarData", () => {
-  it("returns both channels and DMs in one request", async () => {
+  it("returns channels, DMs and categories together", async () => {
     mockAuthFetch.mockResolvedValue(
       sidebarResponse({
         channels: [
@@ -617,6 +626,8 @@ describe("fetchSidebarData", () => {
       canWrite: true,
       createdAt: null,
       lastMessageAt: null,
+      categoryId: undefined,
+      categoryName: "Geral",
     });
     expect(dms).toHaveLength(1);
     expect(dms[0]).toEqual({
@@ -627,7 +638,8 @@ describe("fetchSidebarData", () => {
       createdAt: null,
       lastMessageAt: null,
     });
-    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+    // Sidebar and channel categories, via Promise.all — not one request.
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
   });
 
   it("maps group DM type correctly", async () => {
@@ -803,6 +815,7 @@ describe("partial sidebar compatibility", () => {
       currentUserId: "user-1",
       channels: [],
       dms: [],
+      categories: [],
     });
   });
 });
@@ -2117,7 +2130,7 @@ describe("fetchSidebarData", () => {
     for (const value of [true, false, "true", 1, {}, null]) {
       mockAuthFetch.mockResolvedValue(sidebarPayload({ can_create_channel: value }));
       const data = await fetchSidebarData();
-      expect(data).toEqual({ currentUserId: "user-1", channels: [], dms: [] });
+      expect(data).toEqual({ currentUserId: "user-1", channels: [], dms: [], categories: [] });
     }
   });
 
@@ -2127,6 +2140,7 @@ describe("fetchSidebarData", () => {
       currentUserId: "user-1",
       channels: [],
       dms: [],
+      categories: [],
     });
   });
 });

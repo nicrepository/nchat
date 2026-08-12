@@ -1912,7 +1912,13 @@ describe("ChatSidebar — footer", () => {
     return render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatSidebar
-          state={{ status: "ready", currentUserId: "user-a", channels: [], dms: [] }}
+          state={{
+            status: "ready",
+            currentUserId: "user-a",
+            channels: [],
+            dms: [],
+            categories: [],
+          }}
           retry={() => {}}
         />
       </MemoryRouter>,
