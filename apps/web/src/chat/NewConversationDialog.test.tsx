@@ -50,6 +50,7 @@ function deferred<T>() {
 function renderDialog(overrides: Partial<ComponentProps<typeof NewConversationDialog>> = {}) {
   const props = {
     currentUserId: "current-user",
+    categories: [],
     onClose: vi.fn(),
     onOpened: vi.fn(),
     onChannelCreated: vi.fn(),
@@ -274,6 +275,7 @@ describe("NewConversationDialog", () => {
     const view = render(
       <NewConversationDialog
         currentUserId="current-user"
+        categories={[]}
         onClose={vi.fn()}
         onOpened={onOpened}
         onChannelCreated={vi.fn()}
@@ -372,6 +374,7 @@ it("ignores a failure that lands after the dialog was unmounted", async () => {
   const view = render(
     <NewConversationDialog
       currentUserId="current-user"
+      categories={[]}
       onClose={vi.fn()}
       onOpened={vi.fn()}
       onChannelCreated={vi.fn()}
