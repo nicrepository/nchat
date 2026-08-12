@@ -127,6 +127,29 @@ type sidebarFakeDMStore struct {
 	err error
 }
 
+type sidebarFakePinStore struct {
+	pins      []storage.SidebarPin
+	pinArgs   []string
+	unpinArgs []string
+	pinErr    error
+	unpinErr  error
+	listErr   error
+}
+
+func (f *sidebarFakePinStore) Pin(_ context.Context, workspaceID, userID, targetType, targetID string) error {
+	f.pinArgs = []string{workspaceID, userID, targetType, targetID}
+	return f.pinErr
+}
+
+func (f *sidebarFakePinStore) Unpin(_ context.Context, userID, targetType, targetID string) error {
+	f.unpinArgs = []string{userID, targetType, targetID}
+	return f.unpinErr
+}
+
+func (f *sidebarFakePinStore) ListVisible(_ context.Context, _, _ string) ([]storage.SidebarPin, error) {
+	return f.pins, f.listErr
+}
+
 func (f *sidebarFakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
 	return storage.CreateDirectConversationResult{}, nil
 }
@@ -182,6 +205,17 @@ func newSidebarService(
 	ds storage.DMStore,
 ) *service.SidebarService {
 	return service.NewSidebarService(ws, cs, ms, ds) // real API: workspaces, channels, members, dms
+}
+
+func newPinnedSidebarService(pins storage.SidebarPinStore) (*service.SidebarService, *sidebarFakeChannelStore, *sidebarFakeDMStore) {
+	channels := &sidebarFakeChannelStore{accesses: []storage.VisibleChannelAccess{{Channel: domain.Channel{ID: "channel-1", Status: domain.ChannelStatusActive}}}}
+	dms := &sidebarFakeDMStore{dms: []domain.DMConversationWithParticipantIDs{{DMConversation: domain.DMConversation{ID: "dm-1", Status: domain.DMConversationStatusActive}}}}
+	return newSidebarService(
+		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+		&sidebarFakeMemberStore{member: activeMember()},
+		channels,
+		dms,
+	).WithPins(pins), channels, dms
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -584,5 +618,69 @@ func TestSidebarService_CanCreateChannelMatchesTheCreatePredicate(t *testing.T) 
 				t.Fatalf("CanCreateChannel = %v for active %s, want %v", data.CanCreateChannel, tc.role, tc.want)
 			}
 		})
+	}
+}
+
+func TestSidebarService_GetSidebarAppliesOnlyVisiblePins(t *testing.T) {
+	pinnedAt := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	pins := &sidebarFakePinStore{pins: []storage.SidebarPin{
+		{TargetType: storage.SidebarPinTargetChannel, TargetID: "channel-1", PinnedAt: pinnedAt},
+		{TargetType: storage.SidebarPinTargetDM, TargetID: "dm-1", PinnedAt: pinnedAt.Add(time.Minute)},
+		// The store is the visibility boundary. A stale preference outside its
+		// result must not be able to add a ghost conversation to the sidebar.
+		{TargetType: storage.SidebarPinTargetChannel, TargetID: "removed-channel", PinnedAt: pinnedAt},
+	}}
+	svc, _, _ := newPinnedSidebarService(pins)
+
+	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+	if err != nil {
+		t.Fatalf("GetSidebar: %v", err)
+	}
+	if data.Channels[0].PinnedAt == nil || !data.Channels[0].PinnedAt.Equal(pinnedAt) {
+		t.Fatalf("channel pin not applied: %+v", data.Channels[0])
+	}
+	if data.DMs[0].PinnedAt == nil || !data.DMs[0].PinnedAt.Equal(pinnedAt.Add(time.Minute)) {
+		t.Fatalf("DM pin not applied: %+v", data.DMs[0])
+	}
+	if len(data.Channels) != 1 || len(data.DMs) != 1 {
+		t.Fatalf("pins must not create sidebar items: %+v", data)
+	}
+}
+
+func TestSidebarService_PinConversationDerivesWorkspaceAndUserFromContext(t *testing.T) {
+	pins := &sidebarFakePinStore{}
+	svc, _, _ := newPinnedSidebarService(pins)
+
+	if err := svc.PinConversation(context.Background(), sidebarUserID, service.PinTargetChannel, "channel-1"); err != nil {
+		t.Fatalf("PinConversation: %v", err)
+	}
+	want := []string{sidebarWsID, sidebarUserID, service.PinTargetChannel, "channel-1"}
+	if len(pins.pinArgs) != len(want) {
+		t.Fatalf("Pin arguments = %#v, want %#v", pins.pinArgs, want)
+	}
+	for i := range want {
+		if pins.pinArgs[i] != want[i] {
+			t.Fatalf("Pin argument %d = %q, want %q", i, pins.pinArgs[i], want[i])
+		}
+	}
+}
+
+func TestSidebarService_PinConversationRejectsInactiveMembership(t *testing.T) {
+	pins := &sidebarFakePinStore{}
+	member := activeMember()
+	member.Status = domain.MemberStatusSuspended
+	svc := newSidebarService(
+		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+		&sidebarFakeMemberStore{member: member},
+		&sidebarFakeChannelStore{},
+		&sidebarFakeDMStore{},
+	).WithPins(pins)
+
+	err := svc.PinConversation(context.Background(), sidebarUserID, service.PinTargetChannel, "private-channel")
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if pins.pinArgs != nil {
+		t.Fatalf("store must not receive unauthorized pin: %#v", pins.pinArgs)
 	}
 }
