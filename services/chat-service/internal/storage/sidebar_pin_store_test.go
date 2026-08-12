@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,23 @@ func TestPGXSidebarPinStore_PinInaccessibleConversationDoesNotDiscloseIt(t *test
 	checkExpectations(t, mock)
 }
 
+func TestPGXSidebarPinStore_PinRejectsInvalidTargetAndWrapsDatabaseFailure(t *testing.T) {
+	store := storage.NewPGXSidebarPinStore(newMock(t))
+	if err := store.Pin(context.Background(), "ws-1", "user-1", "group", "group-1"); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+
+	mock := newMock(t)
+	mock.ExpectQuery(`(?s)WITH authorized AS.*channel_visible_to_user.*SELECT EXISTS`).
+		WithArgs("ws-1", "user-1", "channel-1").
+		WillReturnError(errors.New("database unavailable"))
+	err := storage.NewPGXSidebarPinStore(mock).Pin(context.Background(), "ws-1", "user-1", storage.SidebarPinTargetChannel, "channel-1")
+	if err == nil || !strings.Contains(err.Error(), "pin sidebar conversation") {
+		t.Fatalf("expected wrapped database error, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXSidebarPinStore_UnpinIsScopedToCurrentUserAndIdempotent(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectExec(`DELETE FROM chat\.sidebar_conversation_pins WHERE user_id = \$1 AND dm_conversation_id = \$2`).
@@ -62,6 +80,23 @@ func TestPGXSidebarPinStore_UnpinIsScopedToCurrentUserAndIdempotent(t *testing.T
 
 	if err := storage.NewPGXSidebarPinStore(mock).Unpin(context.Background(), "user-1", storage.SidebarPinTargetDM, "dm-1"); err != nil {
 		t.Fatalf("Unpin: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXSidebarPinStore_UnpinRejectsInvalidTargetAndWrapsDatabaseFailure(t *testing.T) {
+	store := storage.NewPGXSidebarPinStore(newMock(t))
+	if err := store.Unpin(context.Background(), "user-1", "group", "group-1"); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+
+	mock := newMock(t)
+	mock.ExpectExec(`DELETE FROM chat\.sidebar_conversation_pins WHERE user_id = \$1 AND channel_id = \$2`).
+		WithArgs("user-1", "channel-1").
+		WillReturnError(errors.New("database unavailable"))
+	err := storage.NewPGXSidebarPinStore(mock).Unpin(context.Background(), "user-1", storage.SidebarPinTargetChannel, "channel-1")
+	if err == nil || !strings.Contains(err.Error(), "unpin sidebar conversation") {
+		t.Fatalf("expected wrapped database error, got %v", err)
 	}
 	checkExpectations(t, mock)
 }
@@ -81,6 +116,30 @@ func TestPGXSidebarPinStore_ListVisibleFiltersByWorkspaceAndAccess(t *testing.T)
 	}
 	if len(pins) != 2 || pins[0].TargetID != "channel-1" || pins[1].TargetType != storage.SidebarPinTargetDM {
 		t.Fatalf("unexpected pins: %+v", pins)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXSidebarPinStore_ListVisibleWrapsQueryAndIterationFailures(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(`(?s)FROM chat\.sidebar_conversation_pins p.*ORDER BY 3 ASC`).
+		WithArgs("ws-1", "user-1").
+		WillReturnError(errors.New("database unavailable"))
+	_, err := storage.NewPGXSidebarPinStore(mock).ListVisible(context.Background(), "ws-1", "user-1")
+	if err == nil || !strings.Contains(err.Error(), "list visible sidebar pins") {
+		t.Fatalf("expected wrapped query error, got %v", err)
+	}
+	checkExpectations(t, mock)
+
+	mock = newMock(t)
+	mock.ExpectQuery(`(?s)FROM chat\.sidebar_conversation_pins p.*ORDER BY 3 ASC`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"target_type", "target_id", "pinned_at"}).
+			AddRow("channel", "channel-1", time.Now()).
+			RowError(0, errors.New("row unavailable")))
+	_, err = storage.NewPGXSidebarPinStore(mock).ListVisible(context.Background(), "ws-1", "user-1")
+	if err == nil || !strings.Contains(err.Error(), "scan visible sidebar pin") {
+		t.Fatalf("expected wrapped scan error, got %v", err)
 	}
 	checkExpectations(t, mock)
 }

@@ -269,6 +269,8 @@ test.describe("sidebar — ordenação por atividade", () => {
     for (const expected of [OTHER_CHANNEL_NAME, "Canal Recente"]) {
       await page.keyboard.press("Tab");
       await expect(names(page, "Canais").filter({ hasText: expected })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(page.getByLabel(`Fixar ${expected} no topo`)).toBeFocused();
     }
   });
 });

@@ -412,6 +412,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       deletes: [],
       favorites: [],
       pins: [],
+      sidebarPins: [],
       reactions: [],
       dmCreates: [],
       groupCreates: [],

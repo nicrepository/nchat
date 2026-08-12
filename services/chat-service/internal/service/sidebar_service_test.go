@@ -684,3 +684,30 @@ func TestSidebarService_PinConversationRejectsInactiveMembership(t *testing.T) {
 		t.Fatalf("store must not receive unauthorized pin: %#v", pins.pinArgs)
 	}
 }
+
+func TestSidebarService_PinAndUnpinRequireConfiguredStore(t *testing.T) {
+	svc, _, _ := newPinnedSidebarService(nil)
+	if err := svc.PinConversation(context.Background(), sidebarUserID, service.PinTargetChannel, "channel-1"); err == nil {
+		t.Fatal("expected unavailable pin store error")
+	}
+	if err := svc.UnpinConversation(context.Background(), sidebarUserID, service.PinTargetDM, "dm-1"); err == nil {
+		t.Fatal("expected unavailable pin store error")
+	}
+}
+
+func TestSidebarService_UnpinConversationUsesAuthenticatedUser(t *testing.T) {
+	pins := &sidebarFakePinStore{}
+	svc, _, _ := newPinnedSidebarService(pins)
+	if err := svc.UnpinConversation(context.Background(), sidebarUserID, service.PinTargetDM, "dm-1"); err != nil {
+		t.Fatalf("UnpinConversation: %v", err)
+	}
+	want := []string{sidebarUserID, service.PinTargetDM, "dm-1"}
+	if len(pins.unpinArgs) != len(want) {
+		t.Fatalf("Unpin arguments = %#v, want %#v", pins.unpinArgs, want)
+	}
+	for i := range want {
+		if pins.unpinArgs[i] != want[i] {
+			t.Fatalf("Unpin argument %d = %q, want %q", i, pins.unpinArgs[i], want[i])
+		}
+	}
+}
