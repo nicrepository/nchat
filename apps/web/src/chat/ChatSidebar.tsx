@@ -369,6 +369,89 @@ interface DMListProps {
   onPin: (id: string, pinned: boolean) => void;
 }
 
+/**
+ * One conversation row.
+ *
+ * Its own component because presence is a subscription, and a subscription
+ * needs a hook: keeping it here means the row of the person who just went away
+ * re-renders and the other forty do not. The group branch calls the same hook
+ * with no id — a group has no single presence — so the rule of hooks holds
+ * without a second component.
+ */
+function DMRow({
+  dm,
+  isActive,
+  onSelect,
+  onPin,
+}: {
+  dm: DMConversation;
+  isActive: boolean;
+  onSelect: (id: string) => void;
+  onPin: (id: string, pinned: boolean) => void;
+}) {
+  const isGroup = dm.type === "group";
+  const counterpart = dm.counterpart;
+  // Scoped to this conversation: the counterpart is one of its two participants,
+  // so the server's roster for it is exactly the list that would have named them.
+  const presence = usePresence(
+    isGroup ? undefined : counterpart?.userId,
+    presenceTargetKey("dm", dm.id),
+  );
+  const baseLabel = isGroup ? `Grupo ${dm.name}` : `Mensagem direta com ${dm.name}`;
+  // Presence in words, in the row's accessible name. The dot is what a sighted
+  // user sees and this is what a screen reader hears, from the same value —
+  // and it is why the avatar does not need to become a focusable control to
+  // make the state reachable by keyboard.
+  const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`;
+
+  return (
+    <div className="chat-sidebar__item-row">
+      <button
+        type="button"
+        role="option"
+        aria-selected={isActive}
+        aria-label={label}
+        className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
+        onClick={() => onSelect(dm.id)}
+      >
+        {/* The 1:1 avatar always renders — with a picture when there is
+          one, with initials otherwise — so the row height never shifts
+          depending on whether a counterpart has an avatar. */}
+        {isGroup ? (
+          <GroupAvatars dm={dm} />
+        ) : (
+          <Avatar
+            initials={initialsFrom(counterpart?.displayName ?? dm.name)}
+            src={counterpart?.avatarUrl}
+            color={avatarColorFor(counterpart?.userId ?? dm.id)}
+            status={presence}
+            size="sm"
+          />
+        )}
+        <span className="chat-sidebar__dm-name">{dm.name}</span>
+        {isGroup && (
+          <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
+        )}
+        {dm.unreadCount != null && dm.unreadCount > 0 && (
+          <span className="chat-sidebar__unread-badge" aria-label={`${dm.unreadCount} não lidas`}>
+            {dm.unreadCount}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
+        className="chat-sidebar__pin-action"
+        aria-pressed={Boolean(dm.pinnedAt)}
+        aria-label={dm.pinnedAt ? `Desafixar ${dm.name}` : `Fixar ${dm.name} no topo`}
+        title={dm.pinnedAt ? "Desafixar" : "Fixar no topo"}
+        onClick={() => onPin(dm.id, Boolean(dm.pinnedAt))}
+      >
+        <IconPin />
+      </button>
+    </div>
+  );
+}
+
 function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, onPin }: DMListProps) {
   if (dms.length === 0) {
     return (
@@ -380,62 +463,15 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, onPin }: DML
 
   return (
     <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
-      {dms.map((dm) => {
-        const isActive = dm.id === activeDMId;
-        const isGroup = dm.type === "group";
-        const counterpart = dm.counterpart;
-
-        return (
-          <div key={dm.id} className="chat-sidebar__item-row">
-            <button
-              type="button"
-              role="option"
-              aria-selected={isActive}
-              aria-label={isGroup ? `Grupo ${dm.name}` : `Mensagem direta com ${dm.name}`}
-              className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
-              onClick={() => onSelect(dm.id)}
-            >
-              {/* The 1:1 avatar always renders — with a picture when there is
-                one, with initials otherwise — so the row height never shifts
-                depending on whether a counterpart has an avatar. */}
-              {isGroup ? (
-                <GroupAvatars dm={dm} />
-              ) : (
-                <Avatar
-                  initials={initialsFrom(counterpart?.displayName ?? dm.name)}
-                  src={counterpart?.avatarUrl}
-                  color={avatarColorFor(counterpart?.userId ?? dm.id)}
-                  size="sm"
-                />
-              )}
-              <span className="chat-sidebar__dm-name">{dm.name}</span>
-              {isGroup && (
-                <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">
-                  grupo
-                </span>
-              )}
-              {dm.unreadCount != null && dm.unreadCount > 0 && (
-                <span
-                  className="chat-sidebar__unread-badge"
-                  aria-label={`${dm.unreadCount} não lidas`}
-                >
-                  {dm.unreadCount}
-                </span>
-              )}
-            </button>
-            <button
-              type="button"
-              className="chat-sidebar__pin-action"
-              aria-pressed={Boolean(dm.pinnedAt)}
-              aria-label={dm.pinnedAt ? `Desafixar ${dm.name}` : `Fixar ${dm.name} no topo`}
-              title={dm.pinnedAt ? "Desafixar" : "Fixar no topo"}
-              onClick={() => onPin(dm.id, Boolean(dm.pinnedAt))}
-            >
-              <IconPin />
-            </button>
-          </div>
-        );
-      })}
+      {dms.map((dm) => (
+        <DMRow
+          key={dm.id}
+          dm={dm}
+          isActive={dm.id === activeDMId}
+          onSelect={onSelect}
+          onPin={onPin}
+        />
+      ))}
     </div>
   );
 }
@@ -598,10 +634,13 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
   const dms = state.status === "ready" ? state.dms : undefined;
   const categories = state.status === "ready" ? state.categories : undefined;
 
-  const effectiveCategories =
-    categories && categories.length > 0
-      ? categories
-      : [{ id: undefined, name: "Geral", kind: "uncategorized" as const }];
+  const effectiveCategories = useMemo(
+    () =>
+      categories && categories.length > 0
+        ? categories
+        : [{ id: undefined, name: "Geral", kind: "uncategorized" as const }],
+    [categories],
+  );
 
   const groupedChannelsByCategory = useMemo(() => {
     if (!channels) return [];
@@ -622,7 +661,7 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
         channels: ordered,
       };
     });
-  }, [channels, categories]);
+  }, [channels, effectiveCategories]);
 
   const { orderedDirects, orderedGroups } = useMemo(() => {
     const { directs, groups } = partitionDMs(dms ?? []);
@@ -717,13 +756,53 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
         {state.status === "ready" && (
           <>
             <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              <ChannelList
-                channels={orderedChannels}
-                activeChannelId={activeChannelId}
-                onSelect={handleChannelSelect}
-                labelId={CHANNELS_LABEL_ID}
-                onPin={(id, pinned) => handlePin("channel", id, pinned)}
-              />
+              {groupedChannelsByCategory.length <= 1 &&
+              groupedChannelsByCategory[0]?.category.kind === "uncategorized" ? (
+                <ChannelList
+                  channels={groupedChannelsByCategory[0]?.channels ?? []}
+                  activeChannelId={activeChannelId}
+                  onSelect={handleChannelSelect}
+                  labelId={CHANNELS_LABEL_ID}
+                  onPin={(id, pinned) => handlePin("channel", id, pinned)}
+                />
+              ) : (
+                <div className="chat-sidebar__categories-list">
+                  {groupedChannelsByCategory.map(({ category, channels: categoryChannels }) => {
+                    const categoryKey = category.id ?? "uncategorized";
+                    const headerId = `chat-sidebar-category-${categoryKey}`;
+                    const collapsed = Boolean(collapsedCategories[categoryKey]);
+                    return (
+                      <div key={categoryKey} className="chat-sidebar__category-group">
+                        <button
+                          type="button"
+                          id={headerId}
+                          className="chat-sidebar__category-header"
+                          aria-expanded={!collapsed}
+                          onClick={() => toggleCategory(categoryKey)}
+                        >
+                          <span
+                            className={`chat-sidebar__category-chevron${collapsed ? " chat-sidebar__category-chevron--collapsed" : ""}`}
+                          >
+                            <IconChevronDown />
+                          </span>
+                          <span className="chat-sidebar__category-title">{category.name}</span>
+                        </button>
+                        {!collapsed && (
+                          <div className="chat-sidebar__category-channels">
+                            <ChannelList
+                              channels={categoryChannels}
+                              activeChannelId={activeChannelId}
+                              onSelect={handleChannelSelect}
+                              labelId={headerId}
+                              onPin={(id, pinned) => handlePin("channel", id, pinned)}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </Section>
 
             <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>

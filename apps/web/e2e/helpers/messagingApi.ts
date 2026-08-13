@@ -1320,6 +1320,22 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     }),
   );
 
+  // fetchSidebarData()/fetchChannels() also fetch channel categories via
+  // Promise.all — an unmocked route here rejects that whole call, so a
+  // neutral empty-groups response keeps the sidebar's own data flow from
+  // failing in specs that don't care about categories.
+  await page.route("**/api/chat/channel-categories", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: {
+          groups: [],
+        },
+      }),
+    }),
+  );
+
   const mutateSidebarPin = async (route: Route) => {
     const request = route.request();
     const parts = new URL(request.url()).pathname.split("/");
