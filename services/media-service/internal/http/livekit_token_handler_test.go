@@ -22,6 +22,7 @@ const (
 	handlerTestUserID    = "11111111-1111-4111-8111-111111111111"
 	handlerTestSessionID = "22222222-2222-4222-8222-222222222222"
 	handlerTestResource  = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	handlerTestServerURL = "wss://livekit-dev.nic-labs.com"
 )
 
 type fakeTokenIssuer struct {
@@ -46,7 +47,7 @@ func TestLiveKitTokenHandlerIssuesCallTokenFromPrincipal(t *testing.T) {
 		Token: "signed-livekit-token", ExpiresAt: expiresAt,
 	}}
 	response := serveLiveKitHandler(
-		LiveKitToken(issuer, slog.Default()),
+		LiveKitToken(issuer, handlerTestServerURL, slog.Default()),
 		`{"call_id":"`+handlerTestResource+`"}`,
 		authenticatedRequestContext(),
 	)
@@ -58,12 +59,14 @@ func TestLiveKitTokenHandlerIssuesCallTokenFromPrincipal(t *testing.T) {
 		Data struct {
 			Token     string `json:"token"`
 			ExpiresAt string `json:"expiresAt"`
+			ServerURL string `json:"serverUrl"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.Data.Token != issuer.result.Token || body.Data.ExpiresAt != expiresAt.Format(time.RFC3339) {
+	if body.Data.Token != issuer.result.Token || body.Data.ExpiresAt != expiresAt.Format(time.RFC3339) ||
+		body.Data.ServerURL != handlerTestServerURL {
 		t.Fatalf("unexpected response: %+v", body.Data)
 	}
 	if issuer.calls != 1 {
@@ -98,7 +101,7 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			issuer := &fakeTokenIssuer{}
-			response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()), tt.body, authenticatedRequestContext())
+			response := serveLiveKitHandler(LiveKitToken(issuer, handlerTestServerURL, slog.Default()), tt.body, authenticatedRequestContext())
 			if response.Code != tt.want {
 				t.Fatalf("expected %d, got %d: %s", tt.want, response.Code, response.Body.String())
 			}
@@ -111,7 +114,7 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 
 func TestLiveKitTokenHandlerRequiresPrincipalAndJSON(t *testing.T) {
 	issuer := &fakeTokenIssuer{}
-	response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()),
+	response := serveLiveKitHandler(LiveKitToken(issuer, handlerTestServerURL, slog.Default()),
 		`{"call_id":"`+handlerTestResource+`"}`, context.Background())
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", response.Code)
@@ -121,7 +124,7 @@ func TestLiveKitTokenHandlerRequiresPrincipalAndJSON(t *testing.T) {
 		strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`))
 	request = request.WithContext(authenticatedRequestContext())
 	response = httptest.NewRecorder()
-	LiveKitToken(issuer, slog.Default()).ServeHTTP(response, request)
+	LiveKitToken(issuer, handlerTestServerURL, slog.Default()).ServeHTTP(response, request)
 	if response.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("expected 415, got %d", response.Code)
 	}
@@ -146,7 +149,7 @@ func TestLiveKitTokenHandlerMapsServiceErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			issuer := &fakeTokenIssuer{err: tt.err}
-			response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()),
+			response := serveLiveKitHandler(LiveKitToken(issuer, handlerTestServerURL, slog.Default()),
 				`{"call_id":"`+handlerTestResource+`"}`, authenticatedRequestContext())
 			if response.Code != tt.want {
 				t.Fatalf("expected %d, got %d: %s", tt.want, response.Code, response.Body.String())
@@ -172,7 +175,7 @@ func TestLiveKitTokenHandlerDoesNotLogTokensSecretsOrIdentifiers(t *testing.T) {
 		Token:     "sensitive-livekit-token",
 		ExpiresAt: time.Now().UTC().Add(time.Minute),
 	}}
-	handler := httputil.RequestID(LiveKitToken(issuer, logger))
+	handler := httputil.RequestID(LiveKitToken(issuer, handlerTestServerURL, logger))
 	request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken,
 		strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -226,7 +229,7 @@ func TestLiveKitTokenHandlerClassifiesLogsAndCorrelatesInternalFailures(t *testi
 		t.Run(tt.name, func(t *testing.T) {
 			var logs bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			handler := httputil.RequestID(LiveKitToken(&fakeTokenIssuer{err: tt.issuerErr}, logger))
+			handler := httputil.RequestID(LiveKitToken(&fakeTokenIssuer{err: tt.issuerErr}, handlerTestServerURL, logger))
 			request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken,
 				strings.NewReader(`{"call_id":"`+handlerTestResource+`"}`))
 			request.Header.Set("Content-Type", "application/json")
@@ -311,7 +314,7 @@ func TestLiveKitUnavailableLogsBoundedCauseWithCorrelation(t *testing.T) {
 func TestLiveKitTokenHandlerLogsUnavailableDependencyCause(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	handler := httputil.RequestID(LiveKitToken(nil, logger))
+	handler := httputil.RequestID(LiveKitToken(nil, handlerTestServerURL, logger))
 	request := httptest.NewRequest(http.MethodPost, RouteLiveKitToken, nil)
 	request.Header.Set("X-Request-ID", "req-dependency")
 	request = request.WithContext(authenticatedRequestContext())
@@ -342,7 +345,7 @@ func TestLiveKitTokenHandlerPropagatesCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(authenticatedRequestContext())
 	cancel()
 	issuer := &fakeTokenIssuer{}
-	response := serveLiveKitHandler(LiveKitToken(issuer, slog.Default()),
+	response := serveLiveKitHandler(LiveKitToken(issuer, handlerTestServerURL, slog.Default()),
 		`{"call_id":"`+handlerTestResource+`"}`, ctx)
 	if issuer.calls != 1 {
 		t.Fatalf("expected canceled context to reach issuer, got %d calls", issuer.calls)

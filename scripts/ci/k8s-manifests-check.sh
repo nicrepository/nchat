@@ -588,7 +588,7 @@ validate_nchat_dev() {
   if grep -q '^kind: Secret$' "$application" "$data" "$migrations"; then return 1; fi
   if grep -q 'secretRef:' "$application" "$data" "$migrations"; then return 1; fi
   if grep -q 'REPLACE_ME_' "$application" "$data" "$migrations"; then return 1; fi
-  if grep -Eq '0\.0\.0\.0/0|port: 3478|containerPort: 3478' "$application" "$data" "$migrations"; then return 1; fi
+  if grep -Eq 'port: 3478|containerPort: 3478' "$application" "$data" "$migrations"; then return 1; fi
   if grep -R -Eq '/containers/0|/env/-' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server"; then return 1; fi
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-livekit-api-egress)"
@@ -609,9 +609,10 @@ validate_nchat_dev() {
     echo "error: nchat-allow-livekit-api-egress must not target a namespace" >&2
     return 1
   fi
-  grep -Fq "cidr: $NCHAT_DEV_NODE_CIDR" <<<"$policy_block"
-  if [[ "$(port_pairs "$policy_block")" != "TCP/$LIVEKIT_API_PORT" ]]; then
-    echo "error: nchat-allow-livekit-api-egress must have exactly one port TCP/$LIVEKIT_API_PORT" >&2
+  grep -Fq 'cidr: 0.0.0.0/0' <<<"$policy_block"
+  [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' "$application")" -eq 1 ]]
+  if [[ "$(port_pairs "$policy_block")" != "TCP/443" ]]; then
+    echo "error: nchat-allow-livekit-api-egress must have exactly one port TCP/443" >&2
     return 1
   fi
   if grep -Fq 'port: 5432' <<<"$policy_block"; then
@@ -699,7 +700,8 @@ validate_nchat_dev() {
     return 1
   fi
   [[ "$(grep -R -l 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches" | wc -l)" -eq 1 ]]
-  grep -q 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml"
+  grep -A1 -F 'name: LIVEKIT_API_URL' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/patches/media-service.yaml" |
+    grep -Fxq '              value: wss://livekit-dev.nic-labs.com'
 
   livekit_block="$(yaml_document "$application" Deployment livekit)"
   coturn_block="$(yaml_document "$application" Deployment coturn)"

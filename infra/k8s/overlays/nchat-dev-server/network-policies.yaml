@@ -260,11 +260,13 @@ spec:
     - Egress
   egress:
     - to:
+        # Kubernetes NetworkPolicy has no FQDN selector. Keep this exception
+        # scoped to media-service and the TLS port used by the fixed WSS URL.
         - ipBlock:
-            cidr: REPLACE_ME_NODE_CIDR
+            cidr: 0.0.0.0/0
       ports:
         - protocol: TCP
-          port: 0
+          port: 443
 ---
 # The upload guard's only upstream. It proxies the two attachment upload routes
 # and talks to nothing else.
