@@ -23,8 +23,18 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import { acquireChatSocket, type ChatSocketHandle, type ChatSocketStatus } from "./chatSocket";
+import {
+  acquireChatSocket,
+  releaseConsumerSubscriptions,
+  resendConsumerSubscriptions,
+  setConsumerSubscriptions,
+  type ChatSocketHandle,
+  type ChatSocketStatus,
+} from "./chatSocket";
 import { normalizeChatTargetId } from "./chatTargetId";
+
+/** Distinguishes one mounted hook from another for subscription ownership. */
+let nextConsumerId = 0;
 
 const SUBSCRIPTION_RETRY_BASE_DELAY_MS = 250;
 const SUBSCRIPTION_RETRY_MAX_DELAY_MS = 2_000;
@@ -317,6 +327,12 @@ export function useChatWebSocket({
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
   const socketRef = useRef<ChatSocketHandle | null>(null);
+  // Stable for the life of this hook instance, across effect re-runs and the
+  // double mount StrictMode performs. It is what the shared connection records
+  // interest under, so two hooks watching one channel are two owners of it
+  // rather than two subscribe/unsubscribe pairs racing each other.
+  const consumerIdRef = useRef<string | null>(null);
+  consumerIdRef.current ??= `chat-ws-${++nextConsumerId}`;
   const [connectionStatus, setConnectionStatus] = useState<ChatSocketStatus>("connecting");
   const desiredTargetsRef = useRef(subscriptionTargets);
   const subscriptionControlRef = useRef<SubscriptionControl | null>(null);
@@ -346,6 +362,7 @@ export function useChatWebSocket({
     const primaryTarget = JSON.parse(primaryTargetSignature) as WSSubscriptionTarget | null;
     if (!primaryTarget) return;
     const primaryTargetKey = subscriptionTargetKey(primaryTarget);
+    const consumerId = consumerIdRef.current!;
     let closed = false;
     let handle: ChatSocketHandle | null = null;
 
@@ -370,19 +387,36 @@ export function useChatWebSocket({
       return true;
     };
 
-    const sendSubscribe = (generation: number, targetKeys?: Iterable<string>) => {
-      const control = currentSubscriptionControl(generation);
-      if (!control || !handle?.isOpen()) return;
-      const keys = targetKeys ?? control.expected.keys();
+    /**
+     * Adopts targets the connection reports are already live because another
+     * consumer holds them.
+     *
+     * No frame was sent for those, so no `subscribed` acknowledgement is coming
+     * — waiting for one would leave the caller permanently un-resynchronised the
+     * moment two views share a conversation. The acknowledgement is synthesised
+     * from what the connection already knows to be true.
+     */
+    const adoptSharedSubscriptions = (control: SubscriptionControl, keys: readonly string[]) => {
       for (const key of keys) {
+        if (!control.pending.delete(key)) continue;
+        control.confirmed.add(key);
         const target = control.expected.get(key);
-        if (!target) continue;
-        handle.send({
-          type: "subscribe",
+        if (!target || key !== primaryTargetKey) continue;
+        control.primaryAcknowledgement = {
+          type: "subscribed",
+          operation: "subscribe",
           target_type: target.kind,
           target_id: target.targetId,
-        });
+        };
       }
+    };
+
+    /** Declares this consumer's targets to the connection, which owns the frames. */
+    const declareTargets = (control: SubscriptionControl) => {
+      adoptSharedSubscriptions(
+        control,
+        setConsumerSubscriptions(consumerId, [...control.expected.values()]),
+      );
     };
 
     const scheduleSubscriptionRecovery = (generation: number) => {
@@ -409,7 +443,7 @@ export function useChatWebSocket({
         const activeControl = currentSubscriptionControl(generation);
         if (!activeControl || activeControl.generation !== control.generation) return;
         activeControl.timer = null;
-        sendSubscribe(generation, activeControl.pending);
+        resendConsumerSubscriptions(consumerId, activeControl.pending);
       }, delay);
     };
 
@@ -434,9 +468,14 @@ export function useChatWebSocket({
         };
         clearSubscriptionRecoveryTimer(subscriptionControlRef.current);
         subscriptionControlRef.current = control;
-        // One resubscribe per generation: this is also the resynchronisation
-        // point, since the acknowledgement is what the caller waits on.
-        sendSubscribe(generation);
+        // The connection has already re-established what it owns; this only
+        // declares what *this* consumer wants of it, which is also the
+        // resynchronisation point since the acknowledgement is what the caller
+        // waits on.
+        declareTargets(control);
+        if (control.pending.size === 0 && control.primaryAcknowledgement) {
+          onSubscribedRef.current?.(control.primaryAcknowledgement);
+        }
       },
 
       onMessage: (d, generation) => {
@@ -546,17 +585,11 @@ export function useChatWebSocket({
       const releasing = handle;
       handle = null;
       socketRef.current = null;
-      if (releasing?.isOpen()) {
-        // The connection outlives this hook, so its targets must be dropped
-        // explicitly — releasing alone would leave the server subscribed.
-        for (const target of control?.expected.values() ?? desiredTargetsRef.current) {
-          releasing.send({
-            type: "unsubscribe",
-            target_type: target.kind,
-            target_id: target.targetId,
-          });
-        }
-      }
+      // Interest is dropped, not the subscription: the connection unsubscribes
+      // only if nobody else declared this target. Sending the frame from here is
+      // what used to cut the sidebar off from a channel the message list happened
+      // to close.
+      releaseConsumerSubscriptions(consumerId);
       releasing?.release();
     };
   }, [primaryTargetSignature]);
@@ -566,39 +599,51 @@ export function useChatWebSocket({
     const handle = socketRef.current;
     if (!control || !handle?.isOpen()) return;
 
+    const consumerId = consumerIdRef.current!;
+    const primaryTarget = JSON.parse(primaryTargetSignature) as WSSubscriptionTarget | null;
+    const primaryTargetKey = primaryTarget ? subscriptionTargetKey(primaryTarget) : "";
     const targets = JSON.parse(subscriptionSignature) as WSSubscriptionTarget[];
     const nextTargets = new Map(targets.map((target) => [subscriptionTargetKey(target), target]));
-    const hadPendingTargets = control.pending.size > 0;
-    for (const [key, target] of control.expected) {
+    let awaited = control.pending.size > 0;
+    const adopted: string[] = [];
+    for (const [key] of control.expected) {
       if (nextTargets.has(key)) continue;
       control.expected.delete(key);
       control.pending.delete(key);
       control.confirmed.delete(key);
-      handle.send({
-        type: "unsubscribe",
-        target_type: target.kind,
-        target_id: target.targetId,
-      });
     }
     for (const [key, target] of nextTargets) {
       if (control.expected.has(key)) continue;
       control.expected.set(key, target);
       control.pending.add(key);
-      handle.send({
-        type: "subscribe",
-        target_type: target.kind,
-        target_id: target.targetId,
-      });
+      awaited = true;
+    }
+    // One declaration for the whole new set. The connection works out which
+    // targets genuinely arrived and which genuinely left; a target this consumer
+    // dropped but another still wants produces no unsubscribe at all.
+    adopted.push(...setConsumerSubscriptions(consumerId, targets));
+    for (const key of adopted) {
+      if (!control.pending.delete(key)) continue;
+      control.confirmed.add(key);
+      const target = control.expected.get(key);
+      if (target && key === primaryTargetKey) {
+        control.primaryAcknowledgement = {
+          type: "subscribed",
+          operation: "subscribe",
+          target_type: target.kind,
+          target_id: target.targetId,
+        };
+      }
     }
     if (control.pending.size === 0) {
       if (control.timer !== null) window.clearTimeout(control.timer);
       control.timer = null;
       control.attempts = 0;
-      if (hadPendingTargets && control.primaryAcknowledgement) {
+      if (awaited && control.primaryAcknowledgement) {
         onSubscribedRef.current?.(control.primaryAcknowledgement);
       }
     }
-  }, [subscriptionSignature]);
+  }, [subscriptionSignature, primaryTargetSignature]);
 
   return { toggleReaction, connectionStatus };
 }

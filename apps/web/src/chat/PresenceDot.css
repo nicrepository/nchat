@@ -1,0 +1,52 @@
+/* PresenceDot (RF-58).
+
+   Positioned against the nearest positioned ancestor — the avatar — at its
+   bottom-right corner, outside the normal flow. Nothing here participates in
+   layout, so an avatar's size and a row's height are the same whether the
+   person is online, offline or not yet known.
+
+   The ring is what keeps the dot legible on top of a photo: without it a green
+   dot on a green shirt is invisible. Its colour is the surface behind the
+   avatar, which callers override where that is not the panel background. */
+
+.presence-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  border-radius: 50%;
+  border: 2px solid var(--color-surface, #fff);
+  /* The dot never shrinks inside a flex avatar. */
+  flex: none;
+  /* The avatar may clip its image; the dot must not be clipped with it. */
+  pointer-events: auto;
+}
+
+.presence-dot--sm {
+  width: 9px;
+  height: 9px;
+}
+
+.presence-dot--md {
+  width: 11px;
+  height: 11px;
+}
+
+.presence-dot--lg {
+  width: 16px;
+  height: 16px;
+  border-width: 3px;
+  right: 4px;
+  bottom: 4px;
+}
+
+.presence-dot--online {
+  background: var(--presence-online);
+}
+
+.presence-dot--away {
+  background: var(--presence-away);
+}
+
+.presence-dot--offline {
+  background: var(--presence-offline);
+}

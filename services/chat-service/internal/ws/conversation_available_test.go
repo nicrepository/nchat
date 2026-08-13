@@ -769,7 +769,7 @@ func TestRemoteConversationAvailableSelfEchoIsDroppedBeforeAuthorizing(t *testin
 	client := registerForTest(hubB, "c-remote", caRecipient, caWorkspace)
 
 	evt := remoteAvailable()
-	evt.SourceInstanceID = hubB.instanceID
+	evt.SourceInstanceID = hubB.presenceInstanceID
 	hubB.handleRemoteBusEvent(evt)
 
 	if got := len(auth.recorded()); got != 0 {

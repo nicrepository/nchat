@@ -6,7 +6,10 @@ import { useSelfProfile } from "../profile/selfProfile";
 import { partitionDMs, type Channel, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
+import PresenceDot from "./PresenceDot";
+import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
 import { sortByActivity } from "./sidebarOrder";
+import type { SidebarState } from "./useChatSidebar";
 
 function IconPin() {
   return (
@@ -116,6 +119,23 @@ function IconStar() {
   );
 }
 
+function IconChevronDown() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__chevron-icon"
+      aria-hidden="true"
+    >
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  );
+}
+
 // ── Avatar helpers ────────────────────────────────────────────────────────────
 
 interface AvatarProps {
@@ -123,7 +143,14 @@ interface AvatarProps {
   /** Optional picture. Initials are shown when absent or when loading fails. */
   src?: string;
   color?: string;
-  status?: "online" | "away" | "offline";
+  /**
+   * Live presence (RF-58). Absent for an avatar that stands for a conversation
+   * rather than a person — a group has no single state to report.
+   *
+   * The dot is decoration: the row that owns this avatar names the state in its
+   * accessible label, so nothing here has to be reachable on its own.
+   */
+  status?: PresenceState;
   size?: "sm" | "md";
 }
 
@@ -158,9 +185,7 @@ function Avatar({ initials, src, color = "purple", status, size = "sm" }: Avatar
       ) : (
         initials
       )}
-      {status && (
-        <span className={`chat-sidebar__avatar-status chat-sidebar__avatar-status--${status}`} />
-      )}
+      {status && <PresenceDot state={status} size={size} ringColor="var(--cs-sidebar-bg)" />}
     </span>
   );
 }
@@ -445,13 +470,24 @@ function SidebarUser() {
   const self = useSelfProfile();
   // "" covers absent / null / whitespace-only — normalised once, in profileApi.
   const displayName = self.status === "ready" ? self.profile.displayName : "";
+  // The viewer's own presence comes back from the server like everyone else's:
+  // their session announces itself into the conversations it subscribes to, and
+  // the echo is what this reads. Nothing here decides locally that "I" am
+  // online, so the footer shows what the server would tell anybody else.
+  //
+  // No conversation is passed, and none would be right: the footer is not
+  // rendering this person *inside* a conversation. It therefore never shows
+  // "offline" — which is correct, because a viewer looking at their own row is
+  // by definition connected.
+  const presence = usePresence(self.status === "ready" ? self.profile.id : undefined);
+  const baseLabel = displayName ? `Meu perfil de ${displayName}` : "Meu perfil";
 
   return (
     <div className="chat-sidebar__user-row">
       <Link
         to="/profile"
         className="chat-sidebar__user"
-        aria-label={displayName ? `Meu perfil de ${displayName}` : "Meu perfil"}
+        aria-label={presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`}
       >
         {self.status === "ready" ? (
           <>
@@ -462,6 +498,7 @@ function SidebarUser() {
               initials={displayName ? initialsFrom(displayName) : ""}
               src={self.profile.avatarUrl}
               color={avatarColorFor(self.profile.id)}
+              status={presence}
               size="md"
             />
             <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>
@@ -492,16 +529,6 @@ function SidebarUser() {
 
 // ── Main sidebar ──────────────────────────────────────────────────────────────
 
-type SidebarState =
-  | { status: "loading" }
-  | { status: "error"; error: string }
-  | {
-      status: "ready";
-      currentUserId: string;
-      channels: Channel[];
-      dms: DMConversation[];
-    };
-
 interface ChatSidebarProps {
   state: SidebarState;
   retry: () => void;
@@ -523,6 +550,15 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
   // One dialog, one trigger, one piece of open state: two of them could be open
   // at once, and there is nothing left for a second one to do (BUG #393).
   const [newConversationOpen, setNewConversationOpen] = useState(false);
+  const [collapsedCategories, setCollapsedCategories] = useState<Record<string, boolean>>({});
+
+  const toggleCategory = (key: string) => {
+    setCollapsedCategories((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
   const [pinError, setPinError] = useState("");
@@ -560,7 +596,34 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
   // the element that had it, and the scroll position survives a reorder.
   const channels = state.status === "ready" ? state.channels : undefined;
   const dms = state.status === "ready" ? state.dms : undefined;
-  const orderedChannels = useMemo(() => sortByActivity(channels ?? []), [channels]);
+  const categories = state.status === "ready" ? state.categories : undefined;
+
+  const effectiveCategories =
+    categories && categories.length > 0
+      ? categories
+      : [{ id: undefined, name: "Geral", kind: "uncategorized" as const }];
+
+  const groupedChannelsByCategory = useMemo(() => {
+    if (!channels) return [];
+
+    const channelsByCat = new Map<string | undefined, Channel[]>();
+    for (const ch of channels) {
+      const key = ch.categoryId || undefined;
+      const list = channelsByCat.get(key) ?? [];
+      list.push(ch);
+      channelsByCat.set(key, list);
+    }
+    return effectiveCategories.map((cat) => {
+      const key = cat.id || undefined;
+      const catChannels = channelsByCat.get(key) ?? [];
+      const ordered = sortByActivity(catChannels);
+      return {
+        category: cat,
+        channels: ordered,
+      };
+    });
+  }, [channels, categories]);
+
   const { orderedDirects, orderedGroups } = useMemo(() => {
     const { directs, groups } = partitionDMs(dms ?? []);
     return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
@@ -708,6 +771,7 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
       {newConversationOpen && state.status === "ready" && (
         <NewConversationDialog
           currentUserId={state.currentUserId}
+          categories={categories || []}
           onClose={closeNewConversation}
           onOpened={handleDMOpened}
           onChannelCreated={handleChannelCreated}

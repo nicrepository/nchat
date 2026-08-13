@@ -9,6 +9,9 @@
 //   - Per-user connection limits are enforced before upgrade (429 on excess).
 //   - writePump, startHeartbeat, and startConnectionPumps are wired to ServeWS.
 //   - PresenceTracker is attached via WithPresence; presence updates on connect/disconnect.
+//   - Presence is broadcast as presence.updated, once per target the user subscribes
+//     to, and answered per subscribe with a presence.snapshot (RF-58). See
+//     docs/api/presence-websocket.md.
 //   - In-process hub only; no distributed fan-out (Valkey/pub-sub is future scope).
 //   - Subscription authorization for channels and DM conversations.
 //   - Authorization is re-checked before every broadcast delivery.
@@ -20,7 +23,8 @@
 //
 //   - Browser reconnect / exponential backoff.
 //   - Scroll-infinite pagination and cursor-based history.
-//   - Presence broadcast to other clients.
+//   - Presence consolidated across chat-service replicas: the tracker and the
+//     snapshot it feeds are per-instance (RF-58).
 //   - End-to-end encryption / MLS key service.
 //   - Valkey or any distributed pub-sub.
 //   - Sending chat messages over WebSocket (prefer HTTP REST for writes).

@@ -3,7 +3,7 @@ import { useLocation } from "react-router";
 
 import { fetchSidebarData, setSidebarConversationPinned } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
-import type { Channel, ConversationActivity, DMConversation } from "./chatTypes";
+import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
 import {
   useChatWebSocket,
@@ -13,7 +13,7 @@ import {
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-type SidebarState =
+export type SidebarState =
   | { status: "loading" }
   | { status: "error"; error: string }
   | {
@@ -21,6 +21,7 @@ type SidebarState =
       currentUserId: string;
       channels: Channel[];
       dms: DMConversation[];
+      categories: ChannelCategory[];
     };
 
 type Action =
@@ -29,6 +30,7 @@ type Action =
       currentUserId: string;
       channels: Channel[];
       dms: DMConversation[];
+      categories: ChannelCategory[];
     }
   | { type: "error"; error: string }
   | { type: "reload" }
@@ -105,6 +107,7 @@ function reducer(state: SidebarState, action: Action): SidebarState {
         currentUserId: action.currentUserId,
         channels: mergeActivity(action.channels, previous?.channels),
         dms: mergeActivity(action.dms, previous?.dms),
+        categories: action.categories || [],
       };
     }
     case "error":
@@ -210,8 +213,9 @@ export function useChatSidebar() {
     dispatch({ type: "reload" });
 
     const loading = fetchSidebarData()
-      .then(({ currentUserId, channels, dms }) => {
-        if (mountedRef.current) dispatch({ type: "loaded", currentUserId, channels, dms });
+      .then(({ currentUserId, channels, dms, categories }) => {
+        if (mountedRef.current)
+          dispatch({ type: "loaded", currentUserId, channels, dms, categories });
       })
       .catch((err: unknown) => {
         if (mountedRef.current) {
@@ -263,8 +267,9 @@ export function useChatSidebar() {
     refreshInFlight.current = true;
     const run = () => {
       fetchSidebarData()
-        .then(({ currentUserId, channels, dms }) => {
-          if (mountedRef.current) dispatch({ type: "loaded", currentUserId, channels, dms });
+        .then(({ currentUserId, channels, dms, categories }) => {
+          if (mountedRef.current)
+            dispatch({ type: "loaded", currentUserId, channels, dms, categories });
         })
         .catch(() => {
           // The sidebar on screen stays valid; the next event or navigation

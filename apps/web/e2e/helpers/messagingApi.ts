@@ -583,6 +583,150 @@ export async function emitMessageCreated(
   }, event);
 }
 
+/** One presence entry as the server states it (RF-58). */
+export interface PresenceFixture {
+  user_id: string;
+  state: "online" | "away" | "offline";
+  updated_at: string;
+}
+
+/**
+ * The instant every seeded presence entry carries.
+ *
+ * Deliberately far in the past, so any transition a spec emits afterwards is
+ * unambiguously newer and the client's stale-update rule cannot discard it.
+ */
+const SEEDED_PRESENCE_AT = "2026-01-01T00:00:00.000Z";
+
+/**
+ * The presence the mocked server would report, **per target**, derived from the
+ * same fixtures its REST responses are built from.
+ *
+ * Per target and not one global list, because a roster is the answer to "who is
+ * present in this conversation" and answering it with everybody in the fixture
+ * is exactly the isolation bug these specs exist to catch: a mock that reports a
+ * user in a channel they are not in cannot fail when the client leaks them.
+ *
+ * One server, one answer: the details endpoints already state who is online in
+ * each conversation, so the WebSocket snapshot is built from the same
+ * memberships. Anyone absent from a conversation's fixture is absent from its
+ * roster, which the client reads as offline once a complete snapshot arrives —
+ * the server's real answer for someone it holds no connection for there.
+ */
+function seedPresenceRosters(scenario: MessagingScenario): Record<string, PresenceFixture[]> {
+  const rosters: Record<string, PresenceFixture[]> = {};
+  const add = (targetKey: string, userId: string, state?: "online" | "away" | "offline") => {
+    if (!userId || !state || state === "offline") return;
+    const roster = (rosters[targetKey] ??= []);
+    if (roster.some((entry) => entry.user_id === userId)) return;
+    roster.push({ user_id: userId, state, updated_at: SEEDED_PRESENCE_AT });
+  };
+
+  for (const [channelId, details] of scenario.channelDetails) {
+    for (const member of details.online_members) {
+      add(`channel:${channelId}`, member.user_id, member.presence);
+    }
+  }
+  for (const [conversationId, details] of scenario.groupDetails) {
+    for (const participant of details.participants) {
+      add(`dm:${conversationId}`, participant.user_id, participant.presence);
+    }
+  }
+  for (const [conversationId, profile] of scenario.directProfiles) {
+    add(`dm:${conversationId}`, profile.profile.user_id, profile.profile.presence);
+  }
+  return rosters;
+}
+
+/**
+ * Sets what a subscribe to one conversation will be answered with, without
+ * touching any tab that is already connected. It is the server's roster for that
+ * conversation, not the client's view.
+ */
+export async function setPresenceRoster(
+  page: Page,
+  target: { kind: TargetKind; targetId: string },
+  users: PresenceFixture[],
+) {
+  await page.waitForFunction(
+    () =>
+      typeof (window as unknown as { __e2eSetPresenceRoster?: unknown }).__e2eSetPresenceRoster ===
+      "function",
+  );
+  await page.evaluate(
+    ({ targetKey, roster }) => {
+      (
+        window as unknown as {
+          __e2eSetPresenceRoster: (key: string, value: typeof roster) => void;
+        }
+      ).__e2eSetPresenceRoster(targetKey, roster);
+    },
+    {
+      targetKey: `${target.kind}:${target.targetId}`,
+      roster: users as unknown as Array<Record<string, unknown>>,
+    },
+  );
+}
+
+/**
+ * Publishes one presence transition, as the server does when a user connects,
+ * goes idle or loses their last session.
+ *
+ * It also updates the roster, so a later subscribe reports the same thing the
+ * event just announced — a server that contradicted itself between the two
+ * would make any reconnect assertion meaningless.
+ */
+export async function emitPresence(
+  page: Page,
+  options: { kind: TargetKind; targetId: string; user: PresenceFixture },
+) {
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate(
+    ({ kind, targetId, user }) => {
+      const scope = window as unknown as {
+        __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        __e2eSetPresenceRoster: (key: string, users: Array<Record<string, unknown>>) => void;
+      };
+      // The same conversation the event is published into, so a later subscribe
+      // is answered with what was just announced.
+      scope.__e2eSetPresenceRoster(
+        `${kind}:${targetId}`,
+        user.state === "offline" ? [] : [user as unknown as Record<string, unknown>],
+      );
+      scope.__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "presence.updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        presence: user,
+        event_id: `${user.user_id}-${user.state}-${user.updated_at}`,
+      });
+    },
+    { kind: options.kind, targetId: options.targetId, user: options.user },
+  );
+}
+
+/** Kills the tab's connection so the client takes its own reconnect path. */
+export async function dropWebSocket(page: Page) {
+  await page.waitForFunction(
+    () =>
+      typeof (window as unknown as { __e2eDropWebSockets?: unknown }).__e2eDropWebSockets ===
+      "function",
+  );
+  await page.evaluate(() => {
+    (window as unknown as { __e2eDropWebSockets: () => void }).__e2eDropWebSockets();
+  });
+}
+
 export async function installMessagingMocks(
   page: Page,
   scenario: MessagingScenario,
@@ -917,11 +1061,19 @@ async function installWebSocketMock(
 
   await page.addInitScript(
     (args) => {
-      const { accessToken, targetKind, targetId, currentUserId, allowedTargets } = args;
+      const { accessToken, targetKind, targetId, currentUserId, allowedTargets, presence } = args;
       sessionStorage.setItem("nchat_at", accessToken);
       const allowed = new Set(allowedTargets);
       const sockets = new Set<StableWebSocket>();
       const sentMessages: Array<Record<string, unknown>> = [];
+      // Who the server would report as present, per conversation. Seeded from
+      // the same fixtures the REST responses use, and mutable so a spec can
+      // change the world while the tab is disconnected and assert that
+      // reconnecting adopts the new truth instead of replaying the old one.
+      const presenceRosters: Record<string, Array<Record<string, unknown>>> = presence;
+      // Every roster this mock answered with, so a spec can assert what each
+      // conversation was actually told rather than waiting a fixed time.
+      const deliveredSnapshots: Array<Record<string, unknown>> = [];
 
       class StableWebSocket {
         static readonly CONNECTING = 0;
@@ -988,7 +1140,21 @@ async function installWebSocketMock(
               return;
             }
             this.subscriptions.add(key);
-            queueMicrotask(() =>
+            const snapshot = {
+              type: "presence.snapshot",
+              target_type: kind,
+              target_id: id,
+              // This conversation's roster, never the whole fixture: a user in
+              // another channel has no business appearing here.
+              users: presenceRosters[key] ?? [],
+              // Complete: the fixture roster is the whole of what this mocked
+              // server knows about this conversation. Only a complete snapshot
+              // lets the client read absence as offline.
+              complete: true,
+              taken_at: new Date().toISOString(),
+            };
+            deliveredSnapshots.push(snapshot);
+            queueMicrotask(() => {
               this.onmessage?.(
                 new MessageEvent("message", {
                   data: JSON.stringify({
@@ -998,8 +1164,14 @@ async function installWebSocketMock(
                     target_id: id,
                   }),
                 }),
-              ),
-            );
+              );
+              // The server answers a subscribe with who is already present in
+              // that target (RF-58). Emitting it here, after the ack and from
+              // the current roster, is what lets a spec exercise the real
+              // reconnect sequence: a new socket resubscribes and rebuilds its
+              // presence from the snapshot rather than from stale memory.
+              this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(snapshot) }));
+            });
             return;
           }
           if (parsed["type"] !== "reaction.toggle") return;
@@ -1077,6 +1249,25 @@ async function installWebSocketMock(
           __e2eWebSocketMessages: () => Array<Record<string, unknown>>;
         }
       ).__e2eWebSocketMessages = () => [...sentMessages];
+      (
+        window as unknown as { __e2eReceivedSnapshots: () => Array<Record<string, unknown>> }
+      ).__e2eReceivedSnapshots = () => [...deliveredSnapshots];
+      (
+        window as unknown as {
+          __e2eSetPresenceRoster: (
+            targetKey: string,
+            users: Array<Record<string, unknown>>,
+          ) => void;
+        }
+      ).__e2eSetPresenceRoster = (targetKey, users) => {
+        presenceRosters[targetKey] = users;
+      };
+      // Drops every live socket the way a network failure would: no close
+      // frame the client can distinguish, so it takes its normal reconnect
+      // path rather than a test-only shortcut.
+      (window as unknown as { __e2eDropWebSockets: () => void }).__e2eDropWebSockets = () => {
+        for (const socket of [...sockets]) socket.close();
+      };
 
       window.WebSocket = StableWebSocket as unknown as typeof WebSocket;
     },
@@ -1093,6 +1284,10 @@ async function installWebSocketMock(
           .filter((dm) => assertConversationAccess(dm.id))
           .map((dm) => `dm:${dm.id}`),
       ],
+      presence: seedPresenceRosters(scenario) as unknown as Record<
+        string,
+        Array<Record<string, unknown>>
+      >,
     },
   );
 }

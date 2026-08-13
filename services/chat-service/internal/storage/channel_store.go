@@ -360,6 +360,58 @@ func (s *PGXChannelStore) GetVisibleChannelByID(ctx context.Context, workspaceID
 	)
 }
 
+// FilterUsersVisibleToChannel returns, of the given users, those who may read
+// channelID in workspaceID — in one query.
+//
+// It is the same predicate GetVisibleChannelByID applies, asked about a list
+// instead of one person: the identical workspace and channel conditions plus
+// chat.channel_visible_to_user, which is the canonical definition of channel
+// read access. Nothing here reimplements that rule; it calls it.
+//
+// The list is server-supplied (presence assertions this service wrote), never a
+// client's, and the answer is a subset of it — so the query can only ever narrow
+// what the caller already had.
+func (s *PGXChannelStore) FilterUsersVisibleToChannel(
+	ctx context.Context, workspaceID, channelID string, userIDs []string,
+) ([]string, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT candidate.user_id::text
+		FROM unnest($3::uuid[]) AS candidate(user_id)
+		JOIN chat.channels c
+		  ON c.workspace_id = $1
+		 AND c.id = $2
+		 AND c.status = 'active'
+		JOIN chat.workspaces w
+		  ON c.workspace_id = w.id AND w.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = c.workspace_id
+		 AND wm.user_id = candidate.user_id
+		 AND wm.status = 'active'
+		WHERE chat.channel_visible_to_user(c.id, candidate.user_id)`,
+		workspaceID, channelID, userIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("filter users visible to channel: %w", err)
+	}
+	defer rows.Close()
+
+	allowed := make([]string, 0, len(userIDs))
+	for rows.Next() {
+		var userID string
+		if scanErr := rows.Scan(&userID); scanErr != nil {
+			return nil, fmt.Errorf("filter users visible to channel: %w", scanErr)
+		}
+		allowed = append(allowed, userID)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("filter users visible to channel: %w", rows.Err())
+	}
+	return allowed, nil
+}
+
 func (s *PGXChannelStore) GetVisibleChannelBySlug(ctx context.Context, workspaceID, slug, userID string) (domain.Channel, error) {
 	return s.getVisibleChannel(ctx, `
 		SELECT c.id, c.workspace_id, COALESCE(c.category_id::text, ''), c.slug, c.display_name,

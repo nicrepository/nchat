@@ -142,6 +142,19 @@ func TestStartReturnsImmediatelyWithoutAProcessor(t *testing.T) {
 type attrCapturingHandler struct {
 	mu    sync.Mutex
 	attrs []slog.Attr
+	// named is closed once a record carrying the `worker` attribute has been
+	// handled. It exists because the line under test is the one thing a
+	// cancellation suppresses: a failed pass whose context is already done is
+	// shutdown rather than a failure, and poll deliberately logs nothing for it.
+	// Waiting for the pass to *start* and cancelling therefore raced the log,
+	// and losing that race read the attribute as "" — the CI failure this
+	// replaces. Waiting for the record itself cannot race it.
+	named chan struct{}
+	once  sync.Once
+}
+
+func newAttrCapturingHandler() *attrCapturingHandler {
+	return &attrCapturingHandler{named: make(chan struct{})}
 }
 
 func (h *attrCapturingHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -149,10 +162,17 @@ func (h *attrCapturingHandler) Enabled(context.Context, slog.Level) bool { retur
 func (h *attrCapturingHandler) Handle(_ context.Context, record slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	named := false
 	record.Attrs(func(attr slog.Attr) bool {
 		h.attrs = append(h.attrs, attr)
+		if attr.Key == "worker" {
+			named = true
+		}
 		return true
 	})
+	if named {
+		h.once.Do(func() { close(h.named) })
+	}
 	return nil
 }
 
@@ -189,7 +209,7 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 		{"scan", worker.NewMalwareScan, "malware_scan"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := &attrCapturingHandler{}
+			handler := newAttrCapturingHandler()
 			processor := newCountingProcessor()
 			processor.err = errors.New("connection refused")
 
@@ -202,12 +222,15 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 				defer close(done)
 				job.Start(ctx)
 			}()
+			// The failed pass has been logged — not merely started. Cancelling on
+			// the start of the pass instead would suppress the very line this
+			// asserts on whenever it arrived first.
 			select {
-			case <-processor.signal:
+			case <-handler.named:
 			case <-time.After(2 * time.Second):
 				cancel()
 				<-done
-				t.Fatal("the worker never ran a pass")
+				t.Fatal("the worker never logged a failed pass")
 			}
 			cancel()
 			<-done

@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import ChannelCreationForm from "./ChannelCreationForm";
 import { ApiRequestError } from "../lib/api";
 import { createGroupDM, getOrCreateDirectDM, searchDMCandidates } from "./chatApi";
-import type { DMCandidate } from "./chatTypes";
+import type { DMCandidate, ChannelCategory } from "./chatTypes";
 import {
   limitGroupTitleInput,
   MAX_GROUP_MEMBERS,
@@ -31,6 +31,7 @@ type Submission = { kind: "idle" } | { kind: "direct"; userId: string } | { kind
 
 interface NewConversationDialogProps {
   currentUserId: string;
+  categories: ChannelCategory[];
   onClose: () => void;
   onOpened: (conversationId: string) => void;
   onChannelCreated: (channelId: string) => void;
@@ -188,6 +189,7 @@ function GroupSubmitFooter({ selectedCount, pending, disabled, onSubmit }: Group
 
 export default function NewConversationDialog({
   currentUserId,
+  categories = [],
   onClose,
   onOpened,
   onChannelCreated,
@@ -395,7 +397,11 @@ export default function NewConversationDialog({
         <ConversationModeChoice mode={mode} disabled={busy} onChange={changeMode} />
 
         {isChannel && (
-          <ChannelCreationForm onCreated={onChannelCreated} onPendingChange={setChannelPending} />
+          <ChannelCreationForm
+            categories={categories}
+            onCreated={onChannelCreated}
+            onPendingChange={setChannelPending}
+          />
         )}
 
         {!isChannel && (

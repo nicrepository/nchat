@@ -23,6 +23,7 @@
  */
 
 import { getAccessToken, getSessionGeneration, onAuthChange } from "../lib/authSession";
+import { normalizeChatTargetId } from "./chatTargetId";
 
 const CHAT_WS_URL =
   (import.meta.env.VITE_CHAT_WS_URL as string | undefined) ??
@@ -84,6 +85,36 @@ export interface ChatSocketHandle {
   release: () => void;
 }
 
+/** A conversation a consumer wants events for. */
+export interface ChatSubscriptionTarget {
+  kind: "channel" | "dm";
+  targetId: string;
+}
+
+/** The key a target is owned by. Normalised, so two spellings are one target. */
+export function chatSubscriptionKey({ kind, targetId }: ChatSubscriptionTarget): string {
+  return `${kind}:${normalizeChatTargetId(targetId)}`;
+}
+
+/**
+ * At most one activity frame per this window, however much the user types.
+ *
+ * The server's away timeout is minutes; anything well inside it keeps a working
+ * user online, and there is no benefit to being more precise about a person who
+ * is demonstrably at the keyboard.
+ */
+export const PRESENCE_ACTIVITY_THROTTLE_MS = 25_000;
+
+/**
+ * The DOM events that count as a person being there.
+ *
+ * Deliberately not `mousemove`: a cursor resting on a trackpad, a page that
+ * scrolls under an animation, a pointer nudged by a passing hand — none of those
+ * are somebody using the application, and treating them as such is how an
+ * abandoned tab stays online forever.
+ */
+const ACTIVITY_EVENTS = ["keydown", "pointerdown", "touchstart", "wheel"] as const;
+
 /**
  * Equal-jitter exponential backoff. Pure, so the schedule is asserted directly
  * instead of through a stubbed global, and `random` is injectable so tests do
@@ -111,6 +142,40 @@ let sessionGeneration = getSessionGeneration();
 let unsubscribeAuth: (() => void) | null = null;
 let onlineListener: (() => void) | null = null;
 let randomSource: () => number = Math.random;
+let lastActivitySentAt = 0;
+let activityListenersAttached = false;
+
+/**
+ * Who wants each target, and what to send for it.
+ *
+ * The connection owns the remote subscription; hooks only declare interest. That
+ * is the difference this map exists for: the sidebar and the open conversation
+ * both watch the same channel over the same socket, and when the conversation
+ * unmounts it used to send `unsubscribe` for a target the sidebar was still
+ * reading — so the sidebar silently stopped receiving events for it.
+ *
+ * A set of consumer ids rather than a count, because the failure modes are
+ * repeats and not arithmetic: React StrictMode mounts an effect twice, a cleanup
+ * can run after its replacement, and a consumer can re-declare what it already
+ * has. Adding a name that is already present is a no-op; decrementing a counter
+ * twice for one consumer is a subscription lost for everyone.
+ */
+const subscriptionOwners = new Map<
+  string,
+  { target: ChatSubscriptionTarget; consumers: Set<string> }
+>();
+/** What each consumer currently declares, so its next declaration is a diff. */
+const consumerTargets = new Map<string, Map<string, ChatSubscriptionTarget>>();
+/**
+ * Targets the server has acknowledged on the *current* generation.
+ *
+ * A consumer that joins a target somebody else already holds sends no frame, so
+ * no acknowledgement is coming for it — this is what lets it be told the
+ * subscription is already live instead of waiting forever for a reply to a
+ * question nobody asked. Cleared whenever the connection is replaced, because an
+ * acknowledgement belongs to the socket that gave it.
+ */
+const confirmedTargets = new Set<string>();
 
 function devLog(message: string, detail?: Record<string, unknown>): void {
   // Development only, and never carries a token, a URL or a message payload —
@@ -156,6 +221,185 @@ function discardSocket(): void {
   } catch {
     // A socket already closing throws in some browsers; nothing to recover.
   }
+}
+
+/**
+ * Reports that a person just did something, and tells the server if it is worth
+ * saying (issue #444).
+ *
+ * Presence is *human* activity, and the server can only see what the client
+ * sends. Messages are posted over HTTP, so a user could type all afternoon and
+ * still be marked away five minutes after their last WebSocket frame — which is
+ * precisely what happened.
+ *
+ * What this is not is a heartbeat. Nothing here runs on a timer: no activity
+ * means no frame, which is what lets the server's away detection still work on
+ * an abandoned tab. The throttle bounds the other direction — a hundred
+ * keystrokes are one frame, not a hundred.
+ *
+ * A closed socket consumes nothing: the throttle window is only spent on a frame
+ * that was actually sent, so the first real activity after a reconnect is
+ * reported immediately rather than waiting out a window nobody heard.
+ */
+export function markPresenceActivity(): void {
+  const live = socketReady() ? socket : null;
+  if (!live) return;
+  const now = Date.now();
+  if (lastActivitySentAt !== 0 && now - lastActivitySentAt < PRESENCE_ACTIVITY_THROTTLE_MS) return;
+  lastActivitySentAt = now;
+  live.send(JSON.stringify({ type: "ping" }));
+}
+
+function handleActivityEvent(): void {
+  markPresenceActivity();
+}
+
+function handleVisibilityChange(): void {
+  // Coming back to the tab is a person returning to it. Leaving is not activity
+  // and deliberately reports nothing.
+  if (document.visibilityState === "visible") markPresenceActivity();
+}
+
+/**
+ * Installs the activity listeners once for the whole tab.
+ *
+ * Once, and here, because there is one connection: a listener per component
+ * would multiply with the message list, and each would have to know about
+ * throttling and about the socket. The connection already knows both.
+ */
+function ensureActivityListeners(): void {
+  if (activityListenersAttached) return;
+  activityListenersAttached = true;
+  for (const name of ACTIVITY_EVENTS) {
+    window.addEventListener(name, handleActivityEvent, { passive: true });
+  }
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+}
+
+function removeActivityListeners(): void {
+  if (!activityListenersAttached) return;
+  activityListenersAttached = false;
+  for (const name of ACTIVITY_EVENTS) {
+    window.removeEventListener(name, handleActivityEvent);
+  }
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+}
+
+/**
+ * Whether a frame sent right now would reach the server on a connection whose
+ * consumers have been told about it.
+ *
+ * `reachedOpen` and not merely `readyState`: between creating a socket and its
+ * open callback there is a window where writing would emit a frame the
+ * reconnect path is about to emit again, since re-establishing what the
+ * connection owns is exactly what opening does.
+ */
+function socketReady(): boolean {
+  return socket !== null && reachedOpen && socket.readyState === WebSocket.OPEN;
+}
+
+function sendSubscriptionFrame(type: "subscribe" | "unsubscribe", target: ChatSubscriptionTarget) {
+  const live = socketReady() ? socket : null;
+  if (!live) return;
+  live.send(JSON.stringify({ type, target_type: target.kind, target_id: target.targetId }));
+}
+
+/**
+ * Declares everything one consumer wants, and emits only the frames that change
+ * what the *connection* wants.
+ *
+ * `subscribe` is sent on the 0 → 1 transition of a target's owner set and
+ * `unsubscribe` on the 1 → 0 transition; everything in between is bookkeeping.
+ *
+ * Returns the targets that are already live on this connection because somebody
+ * else holds them — no frame was sent for those, so no acknowledgement is coming
+ * and the caller must treat them as confirmed rather than waiting.
+ */
+export function setConsumerSubscriptions(
+  consumerId: string,
+  targets: readonly ChatSubscriptionTarget[],
+): string[] {
+  const next = new Map(targets.map((target) => [chatSubscriptionKey(target), target]));
+  const previous = consumerTargets.get(consumerId);
+  consumerTargets.set(consumerId, next);
+
+  for (const [key, target] of previous ?? []) {
+    if (next.has(key)) continue;
+    const entry = subscriptionOwners.get(key);
+    if (!entry) continue;
+    entry.consumers.delete(consumerId);
+    if (entry.consumers.size > 0) continue;
+    subscriptionOwners.delete(key);
+    confirmedTargets.delete(key);
+    sendSubscriptionFrame("unsubscribe", target);
+  }
+
+  const alreadyLive: string[] = [];
+  for (const [key, target] of next) {
+    let entry = subscriptionOwners.get(key);
+    if (!entry) {
+      entry = { target, consumers: new Set() };
+      subscriptionOwners.set(key, entry);
+    }
+    const wasUnowned = entry.consumers.size === 0;
+    entry.consumers.add(consumerId);
+    if (wasUnowned) {
+      sendSubscriptionFrame("subscribe", target);
+    } else if (confirmedTargets.has(key)) {
+      alreadyLive.push(key);
+    }
+  }
+  return alreadyLive;
+}
+
+/** Drops every interest one consumer declared. */
+export function releaseConsumerSubscriptions(consumerId: string): void {
+  setConsumerSubscriptions(consumerId, []);
+  consumerTargets.delete(consumerId);
+}
+
+/**
+ * Re-sends `subscribe` for targets this consumer holds, after the server told it
+ * the room was temporarily unavailable. Subscribing to a target one already has
+ * is idempotent server-side, so a retry cannot disturb the other owners.
+ */
+export function resendConsumerSubscriptions(consumerId: string, keys: Iterable<string>): void {
+  const owned = consumerTargets.get(consumerId);
+  if (!owned) return;
+  for (const key of keys) {
+    const target = owned.get(key);
+    if (target) sendSubscriptionFrame("subscribe", target);
+  }
+}
+
+/**
+ * Re-establishes every owned target on a connection that has just opened.
+ *
+ * One frame per target, not one per consumer: the ownership map is what the
+ * connection wants, and a reconnect is the connection saying it again.
+ */
+function resubscribeOwnedTargets(): void {
+  confirmedTargets.clear();
+  for (const entry of subscriptionOwners.values()) {
+    if (entry.consumers.size === 0) continue;
+    sendSubscriptionFrame("subscribe", entry.target);
+  }
+}
+
+/** Forgets every declared interest. Used when the identity behind them changes. */
+function clearSubscriptionOwnership(): void {
+  subscriptionOwners.clear();
+  consumerTargets.clear();
+  confirmedTargets.clear();
+}
+
+/** Records an acknowledgement so a later joiner can be told the target is live. */
+function noteSubscriptionAcknowledgement(data: Record<string, unknown>): void {
+  if (data["type"] !== "subscribed" || data["operation"] !== "subscribe") return;
+  const kind = data["target_type"];
+  const targetId = data["target_id"];
+  if ((kind !== "channel" && kind !== "dm") || typeof targetId !== "string") return;
+  confirmedTargets.add(chatSubscriptionKey({ kind, targetId }));
 }
 
 function ensureOnlineListener(): void {
@@ -237,6 +481,14 @@ function connect(): void {
     if (socket !== created || reachedOpen) return;
     reachedOpen = true;
     setStatus("connected");
+    // A fresh connection is itself evidence the user is here — the server marks
+    // them online on register — so the throttle starts spent, and the next real
+    // activity is reported without waiting out a window.
+    lastActivitySentAt = 0;
+    // The connection re-establishes what it owns before any consumer is told it
+    // opened, so a consumer re-declaring what it already had produces no second
+    // frame for the same target.
+    resubscribeOwnedTargets();
     // The attempt counter is deliberately not reset here: a socket that opens
     // and drops immediately must keep backing off, not restart at the floor.
     clearStabilityTimer();
@@ -259,6 +511,7 @@ function connect(): void {
       return;
     }
     if (!data || typeof data !== "object") return;
+    noteSubscriptionAcknowledgement(data as Record<string, unknown>);
     for (const listener of [...listeners]) {
       listener.onMessage?.(data as Record<string, unknown>, currentGeneration);
     }
@@ -273,6 +526,9 @@ function connect(): void {
     if (socket !== created) return;
     socket = null;
     clearStabilityTimer();
+    // The acknowledgements belonged to this socket. Ownership does not: the
+    // consumers still want those targets, and the next open re-asserts them.
+    confirmedTargets.clear();
     for (const listener of [...listeners]) listener.onClose?.(currentGeneration);
     if (event.code === WS_CLOSE_POLICY_VIOLATION) {
       // Permanent rejection: reconnecting would resend the same bootstrap
@@ -299,6 +555,11 @@ function handleAuthChange(): void {
   discardSocket();
   attempt = 0;
   consecutiveFailures = 0;
+  // Subscriptions are authorized against an identity, so none of them survive it
+  // changing. Consumers that are still mounted declare their targets again on
+  // the next open, which is what re-derives them under the new session.
+  clearSubscriptionOwnership();
+  lastActivitySentAt = 0;
 
   if (refCount === 0) {
     setStatus("disconnected");
@@ -325,6 +586,7 @@ export function acquireChatSocket(listener: ChatSocketListener): ChatSocketHandl
     sessionGeneration = getSessionGeneration();
     unsubscribeAuth = onAuthChange(handleAuthChange);
     ensureOnlineListener();
+    ensureActivityListeners();
   }
 
   let released = false;
@@ -367,8 +629,11 @@ export function acquireChatSocket(listener: ChatSocketListener): ChatSocketHandl
       unsubscribeAuth?.();
       unsubscribeAuth = null;
       removeOnlineListener();
+      removeActivityListeners();
+      clearSubscriptionOwnership();
       attempt = 0;
       consecutiveFailures = 0;
+      lastActivitySentAt = 0;
       setStatus("disconnected");
     },
   };
@@ -380,10 +645,13 @@ export function _resetChatSocket(randomForTests: () => number = Math.random): vo
   clearStabilityTimer();
   discardSocket();
   removeOnlineListener();
+  removeActivityListeners();
+  clearSubscriptionOwnership();
   unsubscribeAuth?.();
   unsubscribeAuth = null;
   listeners.clear();
   refCount = 0;
+  lastActivitySentAt = 0;
   attempt = 0;
   consecutiveFailures = 0;
   reachedOpen = false;

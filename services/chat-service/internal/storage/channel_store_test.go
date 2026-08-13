@@ -1130,3 +1130,50 @@ func TestPGXChannelStore_CreateChannelForActiveMember_UnknownErrorIsNotForbidden
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
+
+// FilterUsersVisibleToChannel is the batch form of GetVisibleChannelByID's
+// predicate, and it must delegate to the same canonical SQL function rather than
+// restate the rule.
+func TestPGXChannelStore_FilterUsersVisibleToChannel_SQLVisibility(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`(?s)FROM unnest\(\$3::uuid\[\]\) AS candidate\(user_id\).*JOIN chat\.channels c.*c\.workspace_id = \$1.*c\.id = \$2.*c\.status = 'active'.*JOIN chat\.workspaces w.*w\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.user_id = candidate\.user_id.*wm\.status = 'active'.*WHERE chat\.channel_visible_to_user\(c\.id, candidate\.user_id\)`).
+		WithArgs("ws-1", "ch-1", []string{"user-1", "user-2"}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id"}).AddRow("user-1"))
+
+	store := storage.NewPGXChannelStore(mock)
+	allowed, err := store.FilterUsersVisibleToChannel(
+		context.Background(), "ws-1", "ch-1", []string{"user-1", "user-2"},
+	)
+	if err != nil {
+		t.Fatalf("FilterUsersVisibleToChannel: %v", err)
+	}
+	if len(allowed) != 1 || allowed[0] != "user-1" {
+		t.Fatalf("expected only the visible user, got %v", allowed)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// An empty list asks nothing at all.
+func TestPGXChannelStore_FilterUsersVisibleToChannel_EmptyInput(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	store := storage.NewPGXChannelStore(mock)
+	allowed, err := store.FilterUsersVisibleToChannel(context.Background(), "ws-1", "ch-1", nil)
+	if err != nil || len(allowed) != 0 {
+		t.Fatalf("expected no query and no results, got %v / %v", allowed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}

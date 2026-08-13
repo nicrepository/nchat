@@ -818,6 +818,60 @@ func (s *PGXDMStore) GetVisibleConversationByID(ctx context.Context, workspaceID
 	return conversation, nil
 }
 
+// FilterUsersInConversation returns, of the given users, those who may read
+// conversationID in workspaceID — in one query.
+//
+// It is the same predicate GetVisibleConversationByID applies, asked about a
+// list instead of one person: active workspace membership plus an active
+// chat.dm_members row. Workspace membership alone is deliberately not enough for
+// a conversation, exactly as in the single-row form.
+//
+// The list is server-supplied (presence assertions this service wrote), never a
+// client's, and the answer is a subset of it.
+func (s *PGXDMStore) FilterUsersInConversation(
+	ctx context.Context, workspaceID, conversationID string, userIDs []string,
+) ([]string, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT candidate.user_id::text
+		FROM unnest($3::uuid[]) AS candidate(user_id)
+		JOIN chat.dm_conversations dc
+		  ON dc.workspace_id = $1
+		 AND dc.id = $2
+		 AND dc.status = 'active'
+		JOIN chat.workspaces w
+		  ON w.id = dc.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = dc.workspace_id
+		 AND wm.user_id = candidate.user_id
+		 AND wm.status = 'active'
+		JOIN chat.dm_members dm
+		  ON dm.conversation_id = dc.id
+		 AND dm.user_id = candidate.user_id
+		 AND dm.status = 'active'`,
+		workspaceID, conversationID, userIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("filter users in conversation: %w", err)
+	}
+	defer rows.Close()
+
+	allowed := make([]string, 0, len(userIDs))
+	for rows.Next() {
+		var userID string
+		if scanErr := rows.Scan(&userID); scanErr != nil {
+			return nil, fmt.Errorf("filter users in conversation: %w", scanErr)
+		}
+		allowed = append(allowed, userID)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("filter users in conversation: %w", rows.Err())
+	}
+	return allowed, nil
+}
+
 // GetDirectCounterpartProfile authorises the caller and resolves who the other
 // side of a 1:1 conversation is, in one query (issue #443).
 //

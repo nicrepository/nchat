@@ -243,23 +243,9 @@
   background: linear-gradient(135deg, #0d9488, #2dd4bf);
 }
 
-.chat-details__presence {
-  position: absolute;
-  right: -1px;
-  bottom: -1px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  border: 2px solid var(--color-surface, #fff);
-  background: var(--color-muted-2, #a39cb3);
-}
-
-.chat-details__presence--online {
-  background: #16a34a;
-}
-.chat-details__presence--away {
-  background: #d97706;
-}
+/* The member and profile presence dots are PresenceDot (RF-58); their geometry
+   and colours live in PresenceDot.css. Both avatars below are positioned, which
+   is what the dot anchors to. */
 
 .chat-details__member-text {
   flex: 1;
@@ -327,17 +313,6 @@
   background: linear-gradient(135deg, #7b43e8, #b485f4);
 }
 
-.chat-details__profile-presence {
-  position: absolute;
-  right: 4px;
-  bottom: 4px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  border: 3px solid var(--color-surface, #fff);
-  background: var(--color-muted-2, #a39cb3);
-}
-
 .chat-details__profile-name {
   margin: 0;
   font-size: 20px;
@@ -372,11 +347,28 @@
   color: var(--color-success-ink, #166534);
 }
 
+.chat-details__profile-status--away {
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+}
+
+/* The badge's own dot. Inline in a pill rather than pinned to an avatar, so it
+   is not PresenceDot — but it reads the same tokens, so the two can only ever
+   agree on what each state looks like. */
 .chat-details__status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--color-muted-2, #a39cb3);
+  flex: none;
+  background: var(--presence-offline);
+}
+
+.chat-details__status-dot--online {
+  background: var(--presence-online);
+}
+
+.chat-details__status-dot--away {
+  background: var(--presence-away);
 }
 
 .chat-details__profile-meta {

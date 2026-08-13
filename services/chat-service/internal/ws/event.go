@@ -65,6 +65,28 @@ const (
 	// re-authorises.
 	EventTypeAttachmentStatus EventType = "attachment.status"
 
+	// EventTypePresenceUpdated carries one user's online/away/offline state
+	// (RF-58).
+	//
+	// It routes by (workspace, target) like message.created, and that is the
+	// whole authorization story: a presence event is published once per target
+	// the user is subscribed to, so it can only reach people who share a channel
+	// or a conversation with them and who pass the same fan-out re-check every
+	// other event passes. There is deliberately no workspace-wide presence
+	// broadcast — that would let any member, Guest included, enumerate everyone
+	// connected to the workspace, which no existing read grants.
+	//
+	// The payload is a user id, a state and when the server decided it. No last
+	// seen instant, no device, no session, no address: presence answers "can I
+	// reach this person now", and everything else would be a second, unrequested
+	// disclosure riding on it.
+	//
+	// The state is always the server's. A client cannot set its own presence and
+	// cannot name anyone else's: the only inbound signal that touches presence is
+	// activity on an authenticated connection, credited to that connection's
+	// server-asserted identity (see Hub.handleClientMessage).
+	EventTypePresenceUpdated EventType = "presence.updated"
+
 	// Call lifecycle (RF-23). User-scoped like conversation.available in that
 	// they name a peer, but with their own payload and their own validation.
 	EventTypeCallRinging   EventType = "call.ringing"
@@ -231,6 +253,65 @@ type AttachmentStatusPayload struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+// PresencePayload is one user's presence, as this server currently holds it
+// (RF-58).
+//
+// State is one of the three PresenceStatus values. UpdatedAt is when the server
+// decided that state, as an RFC 3339 string — a string rather than a time.Time
+// for the same reason AttachmentStatusPayload's is: a producer's formatting must
+// not be able to make the whole envelope undecodable. It is the ordering key,
+// and it is server time on every path, so a client that reconciles two events
+// never has to trust a browser clock, its own or anyone else's.
+type PresencePayload struct {
+	UserID    string `json:"user_id"`
+	State     string `json:"state"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// PresenceSnapshotResponse answers a subscribe with the presence of the users
+// already in that target (RF-58).
+//
+// It is addressed to one client rather than broadcast, exactly like the
+// "subscribed" acknowledgement it follows, so it needs no recipient field and
+// never reaches the bus. The client has just been authorized for this target, so
+// nothing here is disclosed that the subsequent presence.updated stream would
+// not disclose anyway.
+//
+// Users lists only people this instance currently holds a connection for, so
+// every entry is online or away. Someone offline is simply absent.
+//
+// Complete is what makes that absence readable. When true, the list is every
+// present subscriber of this target that this instance knows of, so a client may
+// conclude that anyone it expected here and did not find is offline. When false
+// the list was cut short (see presenceSnapshotMaxUsers) and says nothing about
+// who is missing — the entries it does carry remain valid, because each is a
+// positive statement about one person.
+//
+// The scope is always one target. A snapshot for a channel says nothing about
+// anybody in a conversation, and a client that treated it as a global answer
+// would report strangers as offline on the strength of a list they were never
+// eligible to appear in.
+type PresenceSnapshotResponse struct {
+	Type       string            `json:"type"`
+	TargetType TargetType        `json:"target_type"`
+	TargetID   string            `json:"target_id"`
+	Users      []PresencePayload `json:"users"`
+	Complete   bool              `json:"complete"`
+	// TakenAt is when the server read this roster, from the same clock every
+	// updated_at comes from.
+	//
+	// A complete snapshot replaces a client's view of one conversation, and
+	// replacing means removing people it does not name. Without an instant of its
+	// own it could only do that blindly, and a snapshot that was read *before* a
+	// transition would undo it — someone would come online and then be erased by
+	// an answer computed a moment earlier. With it, the client keeps anything it
+	// knows to be newer and drops the rest.
+	TakenAt string `json:"taken_at"`
+}
+
+// PresenceSnapshotType is the wire value of PresenceSnapshotResponse.Type.
+const PresenceSnapshotType = "presence.snapshot"
+
 type PinEventPayload struct {
 	MessageID string `json:"message_id"`
 	// ActorUserID is the user who pinned/unpinned, exposed like sender_id so
@@ -292,6 +373,8 @@ type Event struct {
 	// Attachment carries an antimalware verdict (RF-22). Set only by
 	// file-service, over the bus; this hub never populates it.
 	Attachment *AttachmentStatusPayload `json:"attachment,omitempty"`
+	// Presence carries one user's online/away/offline state (RF-58).
+	Presence *PresencePayload `json:"presence,omitempty"`
 	// RecipientUserID routes a user-scoped event to exactly one user.
 	//
 	// Set only for conversation.available, which is not delivered by

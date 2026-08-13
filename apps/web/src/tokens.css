@@ -82,6 +82,17 @@
   --color-success-tint: #dcfce7;
   --color-success-ink: #166534;
 
+  /* Presence (RF-58).
+     One definition for every surface that draws a presence dot, so the sidebar,
+     the details panel, the conversation header and the message list cannot
+     drift apart. The away colour is red by product decision, not by the usual
+     market convention of amber — do not "fix" it to amber.
+     Colour is never the only carrier: every indicator is accompanied by the
+     word Online / Ausente / Offline. */
+  --presence-online: var(--color-success);
+  --presence-away: var(--color-danger);
+  --presence-offline: var(--color-muted-2);
+
   /* Radii */
   --radius-sm: 4px;
   --radius-md: 6px;

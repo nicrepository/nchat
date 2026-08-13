@@ -34,6 +34,14 @@ export interface Channel extends ConversationActivity {
   /** Server-derived permission. The forwarding endpoint remains authoritative. */
   canWrite: boolean;
   unreadCount?: number;
+  categoryId?: string;
+  categoryName?: string;
+}
+
+export interface ChannelCategory {
+  id?: string;
+  name: string;
+  kind: "category" | "uncategorized";
 }
 
 export type DMType = "1:1" | "group";
