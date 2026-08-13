@@ -1,7 +1,8 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { ApiRequestError } from "../lib/api";
-import { createChannel } from "./chatApi";
+import { createChannel, createChannelCategory } from "./chatApi";
+import type { ChannelCategory } from "./chatTypes";
 import {
   MAX_CHANNEL_SLUG_LENGTH,
   slugifyChannelName,
@@ -11,6 +12,7 @@ import {
 } from "./channelForm";
 
 interface ChannelCreationFormProps {
+  categories: ChannelCategory[];
   /** Called with the new channel's ID once the server has created it. */
   onCreated: (channelId: string) => void;
   /**
@@ -55,10 +57,13 @@ function createErrorMessage(error: unknown): string {
  * call, and a denial arrives as a status this form translates.
  */
 export default function ChannelCreationForm({
+  categories = [],
   onCreated,
   onPendingChange,
 }: ChannelCreationFormProps) {
   const [displayName, setDisplayName] = useState("");
+  const [selectedCategoryId, setSelectedCategoryId] = useState("");
+  const [newCategoryName, setNewCategoryName] = useState("");
   const [slug, setSlug] = useState("");
   // Once the slug is edited by hand it stops following the name: silently
   // overwriting a deliberate identifier on the next keystroke would be worse
@@ -125,6 +130,10 @@ export default function ChannelCreationForm({
       setError(message);
       return;
     }
+    if (selectedCategoryId === "__new__" && !newCategoryName.trim()) {
+      setError("Digite o nome da nova categoria.");
+      return;
+    }
     submittingRef.current = true;
     markPending(true);
     setError("");
@@ -132,8 +141,19 @@ export default function ChannelCreationForm({
     abortRef.current = controller;
 
     try {
+      let finalCategoryId = selectedCategoryId;
+      if (selectedCategoryId === "__new__") {
+        const newCat = await createChannelCategory(newCategoryName, controller.signal);
+        finalCategoryId = newCat.id || "";
+      }
+
       const channel = await createChannel(
-        { slug: effectiveSlug, displayName, type },
+        {
+          slug: effectiveSlug,
+          displayName,
+          type,
+          categoryId: finalCategoryId || undefined,
+        },
         controller.signal,
       );
       if (mountedRef.current) onCreated(channel.id);
@@ -231,6 +251,64 @@ export default function ChannelCreationForm({
         <p id="new-channel-slug-hint" className="new-dm-dialog__footer-hint">
           Letras minúsculas, números e hifens internos. Aparece como #{effectiveSlug || "canal"}.
         </p>
+
+        <label className="new-dm-dialog__group-name" htmlFor="new-channel-category-select">
+          Categoria
+        </label>
+        <div className="new-dm-dialog__search-field">
+          <select
+            id="new-channel-category-select"
+            value={selectedCategoryId}
+            disabled={pending}
+            onChange={(event) => {
+              setSelectedCategoryId(event.target.value);
+              setError("");
+            }}
+            style={{
+              width: "100%",
+              background: "transparent",
+              border: "none",
+              outline: "none",
+              color: "inherit",
+              font: "inherit",
+              fontSize: "14px",
+              height: "42px",
+              cursor: "pointer",
+            }}
+          >
+            <option value="">Nenhuma (Geral)</option>
+            {categories
+              .filter((cat) => cat.kind === "category" && cat.id)
+              .map((cat) => (
+                <option key={cat.id} value={cat.id}>
+                  {cat.name}
+                </option>
+              ))}
+            <option value="__new__">+ Criar nova categoria...</option>
+          </select>
+        </div>
+
+        {selectedCategoryId === "__new__" && (
+          <>
+            <label className="new-dm-dialog__group-name" htmlFor="new-channel-new-category">
+              Nome da nova categoria
+            </label>
+            <div className="new-dm-dialog__search-field">
+              <input
+                id="new-channel-new-category"
+                type="text"
+                autoComplete="off"
+                placeholder="Ex.: Projetos Especiais"
+                value={newCategoryName}
+                disabled={pending}
+                onChange={(event) => {
+                  setNewCategoryName(event.target.value);
+                  setError("");
+                }}
+              />
+            </div>
+          </>
+        )}
 
         {error && (
           <p className="new-dm-dialog__error new-dm-dialog__error--open" role="alert">

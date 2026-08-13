@@ -10,7 +10,13 @@ import type { SelfProfile } from "../profile/profileApi";
 import RequireAuth from "../auth/RequireAuth";
 import ChatShell from "./ChatShell";
 import ChatSidebar from "./ChatSidebar";
-import type { Channel, DMCandidate, DirectDMResult, DMConversation } from "./chatTypes";
+import type {
+  Channel,
+  DMCandidate,
+  DirectDMResult,
+  DMConversation,
+  ChannelCategory,
+} from "./chatTypes";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
@@ -21,24 +27,48 @@ const {
   mockCreateGroupDM,
   mockCreateChannel,
 } = vi.hoisted(() => ({
-  mockFetchSidebarData:
-    vi.fn<() => Promise<{ currentUserId: string; channels: Channel[]; dms: DMConversation[] }>>(),
+  mockFetchSidebarData: vi.fn<
+    () => Promise<{
+      currentUserId: string;
+      channels: Channel[];
+      dms: DMConversation[];
+      categories?: ChannelCategory[];
+    }>
+  >(),
   mockSearchDMCandidates: vi.fn<(query: string, signal?: AbortSignal) => Promise<DMCandidate[]>>(),
   mockGetOrCreateDirectDM:
     vi.fn<(userId: string, signal?: AbortSignal) => Promise<DirectDMResult>>(),
   mockCreateGroupDM:
     vi.fn<(userIds: string[], title: string, signal?: AbortSignal) => Promise<string>>(),
-  mockCreateChannel:
-    vi.fn<
-      (
-        input: { slug: string; displayName: string; type: "public" | "private" },
-        signal?: AbortSignal,
-      ) => Promise<Channel>
-    >(),
+  mockCreateChannel: vi.fn<
+    (
+      input: {
+        slug: string;
+        displayName: string;
+        type: "public" | "private";
+        categoryId?: string;
+      },
+      signal?: AbortSignal,
+    ) => Promise<Channel>
+  >(),
 }));
 
 vi.mock("./chatApi", () => ({
-  fetchSidebarData: () => mockFetchSidebarData(),
+  fetchSidebarData: () => {
+    const res = mockFetchSidebarData();
+    if (res && typeof res.then === "function") {
+      return res.then((data) => ({
+        categories: [{ name: "Geral", kind: "uncategorized" }],
+        ...data,
+      }));
+    }
+    return Promise.resolve({
+      categories: [{ name: "Geral", kind: "uncategorized" }],
+      currentUserId: "",
+      channels: [],
+      dms: [],
+    });
+  },
   // Keep individual exports so chatApi.test.ts can still import them.
   fetchChannels: vi.fn(),
   fetchDMs: vi.fn(),
@@ -49,7 +79,7 @@ vi.mock("./chatApi", () => ({
   createGroupDM: (userIds: string[], title: string, signal?: AbortSignal) =>
     mockCreateGroupDM(userIds, title, signal),
   createChannel: (
-    input: { slug: string; displayName: string; type: "public" | "private" },
+    input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
     signal?: AbortSignal,
   ) => mockCreateChannel(input, signal),
 }));
@@ -666,6 +696,7 @@ describe("ChatSidebar — DMs", () => {
           counterpart: { userId: "user-2", displayName: "Juliane Lino", avatarUrl },
         },
       ] as DMConversation[],
+      categories: [] as ChannelCategory[],
     });
 
     const tree = (avatarUrl: string) => (
@@ -1286,6 +1317,7 @@ describe("ChatSidebar — section classification", () => {
       currentUserId: "user-a",
       channels: [{ ...PUBLIC_CHANNEL }],
       dms,
+      categories: [] as ChannelCategory[],
     });
     const tree = (dms: DMConversation[]) => (
       <MemoryRouter initialEntries={["/chat/dm/dm-grp"]}>
@@ -1360,6 +1392,7 @@ describe("ChatSidebar — activity ordering", () => {
     currentUserId: "user-a",
     channels,
     dms,
+    categories: [] as ChannelCategory[],
   });
 
   const renderState = (channels: Channel[], dms: DMConversation[], path = "/chat") =>
@@ -1879,7 +1912,13 @@ describe("ChatSidebar — footer", () => {
     return render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatSidebar
-          state={{ status: "ready", currentUserId: "user-a", channels: [], dms: [] }}
+          state={{
+            status: "ready",
+            currentUserId: "user-a",
+            channels: [],
+            dms: [],
+            categories: [],
+          }}
           retry={() => {}}
         />
       </MemoryRouter>,
@@ -2304,5 +2343,80 @@ describe("ChatSidebar — single creation entry point", () => {
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+});
+
+describe("ChatSidebar — collapsible categories", () => {
+  it("renders grouped channels under their category headers", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-1",
+      channels: [
+        {
+          id: "ch-1",
+          name: "canal-1",
+          type: "public",
+          canWrite: true,
+          categoryId: "cat-proj",
+          categoryName: "Projetos",
+        },
+        {
+          id: "ch-2",
+          name: "canal-2",
+          type: "public",
+          canWrite: true,
+          categoryId: "cat-infra",
+          categoryName: "Infra",
+        },
+      ],
+      dms: [],
+      categories: [
+        { id: "cat-proj", name: "Projetos", kind: "category" },
+        { id: "cat-infra", name: "Infra", kind: "category" },
+      ],
+    });
+    renderChat();
+
+    // Verify category headers are rendered
+    expect(await screen.findByRole("button", { name: /Projetos/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Infra/i })).toBeInTheDocument();
+
+    // Verify channels are rendered under their headers
+    expect(screen.getByRole("option", { name: /canal-1/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /canal-2/i })).toBeInTheDocument();
+  });
+
+  it("collapses and expands categories when clicked", async () => {
+    const user = userEvent.setup();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-1",
+      channels: [
+        {
+          id: "ch-1",
+          name: "canal-1",
+          type: "public",
+          canWrite: true,
+          categoryId: "cat-proj",
+          categoryName: "Projetos",
+        },
+      ],
+      dms: [],
+      categories: [{ id: "cat-proj", name: "Projetos", kind: "category" }],
+    });
+    renderChat();
+
+    // Category button should be expanded by default
+    const headerBtn = await screen.findByRole("button", { name: /Projetos/i });
+    expect(headerBtn).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: /canal-1/i })).toBeInTheDocument();
+
+    // Click to collapse
+    await user.click(headerBtn);
+    expect(headerBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("option", { name: /canal-1/i })).not.toBeInTheDocument();
+
+    // Click to expand again
+    await user.click(headerBtn);
+    expect(headerBtn).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: /canal-1/i })).toBeInTheDocument();
   });
 });

@@ -171,6 +171,7 @@ describe("ChatShell call identity bootstrap", () => {
             counterpart: { userId: callerId, displayName: "Ana Lima" },
           },
         ],
+        categories: [],
       }),
     );
 
@@ -243,6 +244,7 @@ describe("ChatShell call identity bootstrap", () => {
             counterpart: { userId: callerId, displayName: "Ana Lima" },
           },
         ],
+        categories: [],
       }),
     );
 
@@ -316,6 +318,7 @@ describe("ChatShell call identity bootstrap", () => {
             counterpart: { userId: callerId, displayName: "Ana Lima" },
           },
         ],
+        categories: [],
       }),
     );
 

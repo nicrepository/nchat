@@ -19,6 +19,7 @@ import {
   parseMessageAttachments,
   type AddMembersResult,
   type Channel,
+  type ChannelCategory,
   type ChannelDetails,
   type ChannelMemberProfile,
   type GroupDetails,
@@ -83,6 +84,20 @@ interface SidebarEnvelope {
   data: SidebarResponse;
 }
 
+interface ChannelCategoryGroupResponse {
+  kind: "category" | "uncategorized";
+  id?: string;
+  name: string;
+  position?: number;
+  channels: SidebarChannelResponse[];
+}
+
+interface ChannelCategoriesEnvelope {
+  data: {
+    groups: ChannelCategoryGroupResponse[];
+  };
+}
+
 interface DMCandidateEnvelope {
   data: { candidates: Array<{ user_id: string; display_name: string }> };
 }
@@ -96,7 +111,13 @@ interface GroupDMEnvelope {
 }
 
 interface CreateChannelEnvelope {
-  data: { id: string; slug: string; display_name: string; type: "public" | "private" };
+  data: {
+    id: string;
+    slug: string;
+    display_name: string;
+    type: "public" | "private";
+    category_id?: string;
+  };
 }
 
 interface AllowedReactionEmojisEnvelope {
@@ -119,6 +140,14 @@ async function fetchSidebar(): Promise<SidebarResponse> {
   const res = await authenticatedFetch<SidebarEnvelope>(`${CHAT_BASE}/sidebar`, {
     method: "GET",
   });
+  return res.data;
+}
+
+async function fetchChannelCategories(): Promise<{ groups: ChannelCategoryGroupResponse[] }> {
+  const res = await authenticatedFetch<ChannelCategoriesEnvelope>(
+    `${CHAT_BASE}/channel-categories`,
+    { method: "GET" },
+  );
   return res.data;
 }
 
@@ -261,8 +290,31 @@ function mapSidebarDMs(raw: SidebarDMResponse[] | undefined): DMConversation[] {
 // ── Exported API ──────────────────────────────────────────────────────────────
 
 export async function fetchChannels(): Promise<Channel[]> {
-  const sidebar = await fetchSidebar();
-  return (sidebar.channels ?? []).map(mapSidebarChannel);
+  const [sidebar, categoriesRes] = await Promise.all([fetchSidebar(), fetchChannelCategories()]);
+
+  const channels: Channel[] = [];
+  for (const group of categoriesRes.groups ?? []) {
+    const groupChannels = (group.channels ?? []).map((ch) => ({
+      ...mapSidebarChannel(ch),
+      categoryId: group.id,
+      categoryName: group.name,
+    }));
+    channels.push(...groupChannels);
+  }
+
+  const groupedChannelIds = new Set(channels.map((ch) => ch.id));
+  const flatChannels = (sidebar.channels ?? []).map(mapSidebarChannel);
+  for (const ch of flatChannels) {
+    if (!groupedChannelIds.has(ch.id)) {
+      channels.push({
+        ...ch,
+        categoryId: undefined,
+        categoryName: "Geral",
+      });
+    }
+  }
+
+  return channels;
 }
 
 export async function fetchDMs(): Promise<DMConversation[]> {
@@ -271,19 +323,46 @@ export async function fetchDMs(): Promise<DMConversation[]> {
 }
 
 /**
- * Fetches the full sidebar in a single request and returns both channels and DMs.
- * Prefer this over calling fetchChannels() + fetchDMs() separately to avoid
- * making two HTTP requests per load.
+ * Fetches the full sidebar in a single request and returns channels (with category context), DMs, and categories list.
  */
 export async function fetchSidebarData(): Promise<{
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
+  categories: ChannelCategory[];
 }> {
-  const sidebar = await fetchSidebar();
-  const channels = (sidebar.channels ?? []).map(mapSidebarChannel);
+  const [sidebar, categoriesRes] = await Promise.all([fetchSidebar(), fetchChannelCategories()]);
+
+  const categories: ChannelCategory[] = (categoriesRes.groups ?? []).map((group) => ({
+    id: group.id,
+    name: group.name,
+    kind: group.kind,
+  }));
+
+  const channels: Channel[] = [];
+  for (const group of categoriesRes.groups ?? []) {
+    const groupChannels = (group.channels ?? []).map((ch) => ({
+      ...mapSidebarChannel(ch),
+      categoryId: group.id,
+      categoryName: group.name,
+    }));
+    channels.push(...groupChannels);
+  }
+
+  const groupedChannelIds = new Set(channels.map((ch) => ch.id));
+  const flatChannels = (sidebar.channels ?? []).map(mapSidebarChannel);
+  for (const ch of flatChannels) {
+    if (!groupedChannelIds.has(ch.id)) {
+      channels.push({
+        ...ch,
+        categoryId: undefined,
+        categoryName: "Geral",
+      });
+    }
+  }
+
   const dms = mapSidebarDMs(sidebar.dm_conversations);
-  return { currentUserId: sidebar.current_user_id ?? "", channels, dms };
+  return { currentUserId: sidebar.current_user_id ?? "", channels, dms, categories };
 }
 
 /**
@@ -438,7 +517,7 @@ export async function createGroupDM(
  * than as a generic failure.
  */
 export async function createChannel(
-  input: { slug: string; displayName: string; type: "public" | "private" },
+  input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
   signal?: AbortSignal,
 ): Promise<Channel> {
   const response = await authenticatedFetch<CreateChannelEnvelope>(`${CHAT_BASE}/channels`, {
@@ -448,6 +527,7 @@ export async function createChannel(
       slug: input.slug.trim().toLowerCase(),
       display_name: input.displayName.trim(),
       type: input.type,
+      category_id: input.categoryId || undefined,
     }),
     signal,
   });
@@ -459,6 +539,27 @@ export async function createChannel(
     // The creator of a channel can write to it, but the sidebar refetch is what
     // makes this authoritative; nothing here is trusted for a write decision.
     canWrite: true,
+    categoryId: created.category_id,
+  };
+}
+
+export async function createChannelCategory(
+  name: string,
+  signal?: AbortSignal,
+): Promise<ChannelCategory> {
+  const response = await authenticatedFetch<{ data: { id: string; name: string } }>(
+    `${CHAT_BASE}/channel-categories`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim() }),
+      signal,
+    },
+  );
+  return {
+    id: response.data.id,
+    name: response.data.name,
+    kind: "category",
   };
 }
 

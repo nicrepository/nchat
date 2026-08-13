@@ -122,6 +122,7 @@ type createChannelRequest struct {
 	Slug        string `json:"slug"`
 	DisplayName string `json:"display_name"`
 	Type        string `json:"type"`
+	CategoryID  string `json:"category_id,omitempty"`
 }
 
 type createChannelResponse struct {
@@ -179,6 +180,7 @@ func (h *ChannelHandler) Create(w http.ResponseWriter, r *http.Request) {
 	channel, err := h.channels.CreateChannel(r.Context(), service.CreateChannelInput{
 		WorkspaceID: workspace.ID,
 		CallerID:    callerID,
+		CategoryID:  request.CategoryID,
 		Slug:        request.Slug,
 		DisplayName: request.DisplayName,
 		Type:        domain.ChannelType(request.Type),

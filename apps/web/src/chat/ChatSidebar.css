@@ -174,6 +174,70 @@
   margin-top: 18px;
 }
 
+/* ── Collapsible Categories (RF-17) ─────────────────────────────────────────── */
+
+.chat-sidebar__categories-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-sidebar__category-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-sidebar__category-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  color: var(--cs-sidebar-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  transition: color 0.12s;
+}
+
+.chat-sidebar__category-header:hover {
+  color: var(--cs-sidebar-text);
+}
+
+.chat-sidebar__category-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease;
+}
+
+.chat-sidebar__category-chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+.chat-sidebar__chevron-icon {
+  width: 12px;
+  height: 12px;
+  opacity: 0.8;
+}
+
+.chat-sidebar__category-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__category-channels {
+  padding-left: 8px;
+  margin-top: 2px;
+}
+
 /* ── Nav items (channels) ────────────────────────────────────────────────────── */
 
 .chat-sidebar__nav-item {
