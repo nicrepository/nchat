@@ -131,6 +131,7 @@ func New(cfg config.Config) (*App, error) {
 	var reactionSvc *service.ReactionService
 	var favoriteSvc *service.FavoriteService
 	var pinSvc *service.PinService
+	var sidebarPinStore *storage.PGXSidebarPinStore
 	var permissionSvc *service.PermissionService
 	var channelSvc *service.ChannelService
 	var channelCategorySvc *service.ChannelCategoryService
@@ -165,13 +166,14 @@ func New(cfg config.Config) (*App, error) {
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
+			sidebarPinStore = storage.NewPGXSidebarPinStore(pool)
 			callSvc = service.NewCallService(storage.NewPGXCallStore(pool), time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
 			permissionSvc = service.NewPermissionService(memberStore, channelStore)
 			channelSvc = service.NewChannelService(workspaceStore, channelStore, memberStore)
 			// channelStore is both the category store and the visible-channel read
 			// side, so RF-17 groups channels through the same query the sidebar uses.
 			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
-			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore)
+			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore).WithPins(sidebarPinStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
 			// One MemberService instance for both consumers: mention autocomplete

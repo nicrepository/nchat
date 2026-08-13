@@ -78,7 +78,6 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	authMiddleware := func(h http.Handler) http.Handler {
 		return BearerAuth(validator)(RequireActiveSession(sessionValidator)(h))
 	}
-
 	// Shared rate limiters.
 	// msgListLimiter: guards paginated GET list endpoints.
 	// msgGetSingleLimiter: guards GET single-message fallback used by realtime WS.
@@ -92,6 +91,20 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	messageForwardLimiter := NewUserRateLimiter(messageForwardRateLimit, time.Minute)
 	pinActionLimiter := NewUserRateLimiter(pinActionRateLimit, time.Minute)
 	mentionSearchLimiter := NewUserRateLimiter(mentionSearchRateLimit, time.Minute)
+	// Sidebar pin mutations are private preferences, but still writes. Reuse the
+	// established pin-action budget so they cannot become an unbounded write API.
+	mux.Handle("POST "+RouteChannelSidebarPin, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.PinChannel)),
+	))
+	mux.Handle("DELETE "+RouteChannelSidebarPin, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnpinChannel)),
+	))
+	mux.Handle("POST "+RouteDMSidebarPin, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.PinDM)),
+	))
+	mux.Handle("DELETE "+RouteDMSidebarPin, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnpinDM)),
+	))
 
 	// RF-19 (issue #419): every route that creates a message goes through
 	// sendLimit, so there is exactly one place a send can be admitted from and
