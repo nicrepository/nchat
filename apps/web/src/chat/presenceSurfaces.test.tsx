@@ -142,7 +142,15 @@ function renderSidebar() {
   return render(
     <MemoryRouter initialEntries={["/chat"]}>
       <ChatSidebar
-        state={{ status: "ready", currentUserId: "user-self", channels: CHANNELS, dms: DMS }}
+        state={{
+          status: "ready",
+          currentUserId: "user-self",
+          channels: CHANNELS,
+          dms: DMS,
+          // These tests are about presence, not grouping: no category means the
+          // sidebar renders its channels ungrouped, which is what they assert on.
+          categories: [],
+        }}
         retry={() => {}}
       />
     </MemoryRouter>,
@@ -332,7 +340,15 @@ describe("one presence for one person", () => {
     return render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatSidebar
-          state={{ status: "ready", currentUserId: "user-self", channels: CHANNELS, dms: DMS }}
+          state={{
+            status: "ready",
+            currentUserId: "user-self",
+            channels: CHANNELS,
+            dms: DMS,
+            // These tests are about presence, not grouping: no category means the
+            // sidebar renders its channels ungrouped, which is what they assert on.
+            categories: [],
+          }}
           retry={() => {}}
         />
         <ConversationDetailsPanel
