@@ -6,12 +6,13 @@ interface CallTokenEnvelope {
   data: {
     token: string;
     expiresAt: string;
+    serverUrl: string;
   };
 }
 
 export async function issueCallToken(
   callId: string,
-): Promise<{ token: string; expiresAt: string }> {
+): Promise<{ token: string; expiresAt: string; serverUrl: string }> {
   const response = await authenticatedFetch<CallTokenEnvelope>(
     `${MEDIA_BASE}/media/livekit/token`,
     {

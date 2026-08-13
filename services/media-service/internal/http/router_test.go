@@ -363,6 +363,30 @@ func TestLiveKitAPICheckerRejectsInvalidURL(t *testing.T) {
 	}
 }
 
+func TestReadinessConvertsSecureWebSocketLiveKitURLToHTTPS(t *testing.T) {
+	liveKit := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer liveKit.Close()
+
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = liveKit.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+
+	cfg := testConfig()
+	cfg.LiveKitEnabled = true
+	cfg.LiveKitAPIURL = strings.Replace(liveKit.URL, "https://", "wss://", 1)
+	router := NewRouter(cfg, slog.Default(), RouterDependencies{ReadinessPinger: &readinessPinger{}})
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, RouteReadyz, nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected readiness success for WSS LiveKit URL, got %d: %s", response.Code, response.Body.String())
+	}
+	assertReadinessCheck(t, decodeHealthEnvelope(t, response).Data.Checks, "livekit-api")
+}
+
 func TestNewRouterLiveKitDisabledLogsIntegrationDisabled(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))

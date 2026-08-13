@@ -95,6 +95,7 @@ const baseCall = {
   occurred_at: "2026-07-30T12:00:00Z",
   expires_at: "2026-07-30T12:00:30Z",
 };
+const liveKitServerUrl = "wss://livekit-dev.nic-labs.com";
 
 function ringingEvent(version: number) {
   return {
@@ -184,6 +185,7 @@ beforeEach(() => {
   vi.mocked(issueCallToken).mockResolvedValue({
     token: "media-token",
     expiresAt: "2026-07-30T12:05:00Z",
+    serverUrl: liveKitServerUrl,
   });
   vi.mocked(requestMediaPermission).mockReset();
   vi.mocked(requestMediaPermission).mockResolvedValue({ ok: true });
@@ -266,6 +268,11 @@ describe("useCallSignaling", () => {
     act(() => socket.simulateOpen());
     await authorizeActiveCall(result, socket, 2);
     await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    expect(media.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ call_id: baseCall.call_id }),
+      "media-token",
+      liveKitServerUrl,
+    );
 
     act(() =>
       socket.simulateMessage({
@@ -1208,6 +1215,7 @@ describe("useCallSignaling", () => {
       expect(media.connect).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ ...baseCall, status: "active" }),
         "media-token",
+        liveKitServerUrl,
       ),
     );
     await waitFor(() => expect(result.current.mediaReady).toBe(true));
@@ -1285,7 +1293,7 @@ describe("useCallSignaling", () => {
 
   it("does not connect a late token after a locally accepted end", async () => {
     const media = mediaBridge();
-    const token = deferredValue<{ token: string; expiresAt: string }>();
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
     vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
     const { result } = renderHook(() => useCallSignaling(media));
     const socket = FakeWebSocket.instances[0];
@@ -1299,7 +1307,11 @@ describe("useCallSignaling", () => {
     expect(media.stop).toHaveBeenCalledOnce();
 
     await act(async () => {
-      token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+      token.resolve({
+        token: "late-media-token",
+        expiresAt: "2026-07-30T12:06:00Z",
+        serverUrl: "wss://livekit-dev.nic-labs.com",
+      });
       await token.promise;
     });
 
@@ -1331,6 +1343,7 @@ describe("useCallSignaling", () => {
     expect(media.connect).toHaveBeenLastCalledWith(
       expect.objectContaining({ call_id: nextCallId }),
       "media-token",
+      liveKitServerUrl,
     );
   });
 
@@ -1338,7 +1351,7 @@ describe("useCallSignaling", () => {
     "does not connect a late token after a locally accepted %s",
     async (action) => {
       const media = mediaBridge();
-      const token = deferredValue<{ token: string; expiresAt: string }>();
+      const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
       vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
       const { result } = renderHook(() => useCallSignaling(media));
       const socket = FakeWebSocket.instances[0];
@@ -1352,7 +1365,11 @@ describe("useCallSignaling", () => {
       expect(media.stop).toHaveBeenCalledOnce();
 
       await act(async () => {
-        token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+        token.resolve({
+          token: "late-media-token",
+          expiresAt: "2026-07-30T12:06:00Z",
+          serverUrl: "wss://livekit-dev.nic-labs.com",
+        });
         await token.promise;
       });
 
@@ -1363,7 +1380,7 @@ describe("useCallSignaling", () => {
 
   it("allows a fresh media retry after the server rejects a terminal command", async () => {
     const media = mediaBridge();
-    const token = deferredValue<{ token: string; expiresAt: string }>();
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
     vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
     const { result } = renderHook(() => useCallSignaling(media));
     const socket = FakeWebSocket.instances[0];
@@ -1375,7 +1392,11 @@ describe("useCallSignaling", () => {
     });
 
     await act(async () => {
-      token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+      token.resolve({
+        token: "late-media-token",
+        expiresAt: "2026-07-30T12:06:00Z",
+        serverUrl: "wss://livekit-dev.nic-labs.com",
+      });
       await token.promise;
     });
     act(() =>
@@ -1397,13 +1418,14 @@ describe("useCallSignaling", () => {
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ call_id: baseCall.call_id }),
       "media-token",
+      liveKitServerUrl,
     );
     expect(result.current.error).toBeNull();
   });
 
   it("does not connect a late token after unmount", async () => {
     const media = mediaBridge();
-    const token = deferredValue<{ token: string; expiresAt: string }>();
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
     vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
     const { result, unmount } = renderHook(() => useCallSignaling(media));
     const socket = FakeWebSocket.instances[0];
@@ -1413,7 +1435,11 @@ describe("useCallSignaling", () => {
 
     unmount();
     await act(async () => {
-      token.resolve({ token: "late-media-token", expiresAt: "2026-07-30T12:06:00Z" });
+      token.resolve({
+        token: "late-media-token",
+        expiresAt: "2026-07-30T12:06:00Z",
+        serverUrl: "wss://livekit-dev.nic-labs.com",
+      });
       await token.promise;
     });
 
@@ -1490,6 +1516,7 @@ describe("useCallSignaling", () => {
     vi.mocked(issueCallToken).mockResolvedValueOnce({
       token: "fresh-media-token",
       expiresAt: "2026-07-30T12:06:00Z",
+      serverUrl: liveKitServerUrl,
     });
     await act(async () => result.current.retryMedia());
 
@@ -1497,6 +1524,7 @@ describe("useCallSignaling", () => {
     expect(media.connect).toHaveBeenLastCalledWith(
       expect.objectContaining({ call_id: baseCall.call_id }),
       "fresh-media-token",
+      liveKitServerUrl,
     );
     expect(result.current.error).toBeNull();
     expect(result.current.mediaReady).toBe(true);
@@ -1511,7 +1539,7 @@ describe("useCallSignaling", () => {
     await authorizeActiveCall(result, socket, 2);
     await waitFor(() => expect(result.current.error).not.toBeNull());
 
-    const token = deferredValue<{ token: string; expiresAt: string }>();
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
     vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
     const firstRetry = result.current.retryMedia();
     const duplicateRetry = result.current.retryMedia();
@@ -1524,6 +1552,7 @@ describe("useCallSignaling", () => {
     token.resolve({
       token: "fresh-media-token",
       expiresAt: "2026-07-30T12:06:00Z",
+      serverUrl: liveKitServerUrl,
     });
     await act(async () => firstRetry);
     expect(media.connect).toHaveBeenCalledTimes(2);
@@ -1561,7 +1590,7 @@ describe("useCallSignaling", () => {
     await authorizeActiveCall(result, socket, 2);
     await waitFor(() => expect(result.current.error).not.toBeNull());
 
-    const token = deferredValue<{ token: string; expiresAt: string }>();
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
     vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
     const retry = result.current.retryMedia();
     await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));
@@ -1584,7 +1613,7 @@ describe("useCallSignaling", () => {
     await authorizeActiveCall(result, socket, 2);
     await waitFor(() => expect(result.current.error).not.toBeNull());
 
-    const token = deferredValue<{ token: string; expiresAt: string }>();
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
     vi.mocked(issueCallToken).mockImplementationOnce(() => token.promise);
     const retry = result.current.retryMedia();
     await waitFor(() => expect(issueCallToken).toHaveBeenCalledTimes(2));

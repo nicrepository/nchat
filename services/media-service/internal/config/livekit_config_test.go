@@ -31,6 +31,14 @@ func TestLiveKitConfigurationValidWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestLiveKitConfigurationAcceptsSecureWebSocketURL(t *testing.T) {
+	cfg := validLiveKitConfig()
+	cfg.LiveKitAPIURL = "wss://livekit-dev.nic-labs.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected secure WebSocket URL to be valid: %v", err)
+	}
+}
+
 func TestLiveKitConfigurationRejectsMissingRequiredValues(t *testing.T) {
 	tests := []struct {
 		name   string

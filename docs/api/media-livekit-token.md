@@ -23,14 +23,15 @@ Resposta:
 {
   "data": {
     "token": "<livekit-token>",
-    "expiresAt": "2026-07-21T15:04:05Z"
+    "expiresAt": "2026-07-21T15:04:05Z",
+    "serverUrl": "wss://livekit-dev.nic-labs.com"
   }
 }
 ```
 
-`identity`, `room`, `grants` e TTL nunca sao aceitos do cliente. A identidade e o
-UUID `sub` do access token. A sala é derivada exclusivamente do UUID persistido:
-`call:<uuid>`.
+`identity`, `room`, `grants`, TTL e `serverUrl` nunca sao aceitos do cliente. A
+identidade e o UUID `sub` do access token. A sala é derivada exclusivamente do
+UUID persistido: `call:<uuid>`. O `serverUrl` vem de `LIVEKIT_API_URL`.
 
 ## Autenticacao e autorizacao
 
@@ -85,7 +86,7 @@ sao obrigatorios:
 | `AUTH_JWT_HMAC_SECRET`       | validacao do access token, sem default |
 | `AUTH_JWT_ISSUER`            | default `nchat-auth`                   |
 | `AUTH_JWT_AUDIENCE`          | default `nchat-api`                    |
-| `LIVEKIT_API_URL`            | readiness da API LiveKit               |
+| `LIVEKIT_API_URL`            | URL do SDK web e readiness do LiveKit  |
 | `LIVEKIT_API_KEY`            | assinatura server-side, sem default    |
 | `LIVEKIT_API_SECRET`         | assinatura server-side, sem default    |
 | `LIVEKIT_TOKEN_TTL_SECONDS`  | default 300, faixa 60-600              |
@@ -93,6 +94,10 @@ sao obrigatorios:
 Chaves e secrets devem ser fornecidos por Secret/SealedSecret. Eles nao aparecem
 em health, readiness, version, logs, traces ou metricas. O token emitido tambem nao
 e registrado.
+
+`LIVEKIT_API_URL` aceita HTTP/HTTPS para desenvolvimento local e WSS para a
+conexao segura do SDK web. No caso WSS, o readiness consulta a origem HTTPS
+equivalente; a resposta do token preserva e entrega a URL WSS sem alteracao.
 
 Com `LIVEKIT_ENABLED=false`, `/readyz` nao abre nem verifica PostgreSQL ou LiveKit.
 Com `LIVEKIT_ENABLED=true`, os checks criticos `postgres` e `livekit-api` devem
