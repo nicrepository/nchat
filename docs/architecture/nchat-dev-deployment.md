@@ -19,6 +19,11 @@ segredos permanecem fora do deploy automático.
   `NCHAT_DEV_HOST` a 248 caracteres para manter ambos os nomes dentro do máximo RFC
   1123 de 253 caracteres. O arquivo `topology.env.example` mantém os placeholders e
   é a fonte canônica das portas.
+- No ambiente `nchat-dev-server`, o `media-service` recebe
+  `LIVEKIT_API_URL=wss://livekit-dev.nic-labs.com` diretamente do patch do
+  Deployment. Esse endpoint é externo ao `srv-apps-01`, exclusivo de dev/teste e
+  não possui fallback para o LiveKit antigo. `LIVEKIT_API_KEY` e
+  `LIVEKIT_API_SECRET` continuam vindo do Secret gerado pelo SealedSecret.
 - PostgreSQL, Valkey e SeaweedFS usam StatefulSets e PVs estáticos. As tags humanas
   e os digests de manifest list das três imagens são centralizados no Kustomization
   de dados; LiveKit e coturn também usam tag mais digest verificado.
@@ -49,9 +54,9 @@ segredos permanecem fora do deploy automático.
 | chat-service                    | PostgreSQL             | TCP 5432                           | `DATABASE_URL`/pgx                             |
 | chat-service                    | Valkey                 | TCP 6379                           | cache, rate limit e broadcast por `VALKEY_URL` |
 | notification-service            | PostgreSQL             | TCP 5432                           | outbox por `DATABASE_URL`                      |
-| media-service                   | IP canônico do LiveKit | TCP 7880                           | `LIVEKIT_API_URL` e readiness TCP da API       |
+| media-service                   | LiveKit AWS dev/teste  | HTTPS TCP 443                      | `LIVEKIT_API_URL` do Deployment e readiness    |
 | migrations e postgres-bootstrap | PostgreSQL             | TCP 5432                           | schema, grants e papéis                        |
-| browser                         | LiveKit/coturn         | WSS/HTTPS; RTC privado ou TURN UDP | cliente fora do PodNetwork                     |
+| browser                         | LiveKit AWS dev/teste  | WSS/HTTPS                          | `serverUrl` retornado pelo media-service       |
 
 Não há chamada HTTP/gRPC entre microsserviços no código atual. `file-service`,
 `admin-service` e `search-service` são executáveis, mas hoje expõem apenas contratos
@@ -62,23 +67,17 @@ aplicação acessa filer, S3 ou master 9333. OIDC/HTTPS externo e SMTP permanece
 desabilitados em `nchat-dev`; ativá-los exige políticas específicas para destinos
 aprovados. DNS é permitido somente a workloads que resolvem Services/hosts atuais.
 
-## Topologia WebRTC e TURN
+## LiveKit do media-service
 
-O signaling do LiveKit continua no caminho público normal de HTTPS/WSS por
-Cloudflare e Traefik. A mídia direta do LiveKit permanece nos endereços privados
-7881/TCP e 7882/UDP; essas portas não recebem exposição WAN, Ingress,
-`NodePort` nem `LoadBalancer`.
+No ambiente de dev/teste, o `media-service` emite o JWT pelo contrato atual e
+retorna `wss://livekit-dev.nic-labs.com` como `serverUrl`. O readiness converte
+essa URL WSS para HTTPS ao verificar a API equivalente. O endpoint AWS é externo
+ao `srv-apps-01`, não utiliza fallback para o LiveKit antigo e não representa a
+arquitetura de produção.
 
-Quando o navegador não alcança esses candidatos privados, o LiveKit anuncia um
-servidor TURN UDP em `turn.${NCHAT_DEV_HOST}:TURN_LISTEN_PORT`. Esse hostname DNS
-resolve diretamente para `NCHAT_DEV_TURN_EXTERNAL_IP` e não passa por proxy
-HTTP/CDN comum. O coturn recebe o tráfego no `TURN_LISTEN_PORT` configurado e usa
-49300-49340/UDP para relay allocations. Atrás de NAT, a configuração renderizada
-declara `external-ip=${NCHAT_DEV_TURN_EXTERNAL_IP}/${NCHAT_DEV_NODE_IP}`; cada porta do
-range de relay preserva mapeamento externo/interno 1:1.
-
-Somente o listener TURN UDP e o range UDP de relay compõem a superfície pública de
-mídia. TURN/TLS e TURN/DTLS permanecem desabilitados (`no-tls` e `no-dtls`).
+As credenciais não fazem parte da topologia nem do ConfigMap:
+`LIVEKIT_API_KEY` e `LIVEKIT_API_SECRET` permanecem referenciadas pelo
+Deployment a partir do Secret gerado pelo SealedSecret.
 
 ## Políticas por serviço
 
@@ -91,7 +90,7 @@ mídia. TURN/TLS e TURN/DTLS permanecem desabilitados (`no-tls` e `no-dtls`).
 | notification-service | Traefik → `http`                            | DNS; PostgreSQL TCP 5432            |
 | admin-service        | Traefik → `http`                            | nenhum                              |
 | search-service       | Traefik → `http`                            | nenhum                              |
-| media-service        | Traefik → `http`                            | nó LiveKit `/32`, somente TCP 7880  |
+| media-service        | Traefik → `http`                            | DNS; HTTPS TCP 443 para LiveKit AWS |
 | PostgreSQL           | auth, chat, notification, jobs → TCP 5432   | nenhum                              |
 | Valkey               | chat-service → TCP 6379                     | nenhum acesso externo               |
 | SeaweedFS            | nenhum cliente de aplicação                 | DNS interno; sem gateway S3         |
