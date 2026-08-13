@@ -40,11 +40,17 @@ type Client struct {
 	id          string
 	userID      string
 	workspaceID string
-	outbox      chan []byte
-	snd         sender
-	ctx         context.Context
-	cancel      context.CancelFunc
-	closeOnce   sync.Once
+	// session is the server-side identity this connection was opened with, plus
+	// the authority that can say whether it is still valid. Internal metadata:
+	// it is never part of the WebSocket protocol in either direction, and the
+	// client cannot name, change or observe it. Zero when no session authority
+	// is wired, which leaves the connection with upgrade-time validation only.
+	session   sessionGuard
+	outbox    chan []byte
+	snd       sender
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 }
 
 // newClient creates a Client with a bounded outbox.

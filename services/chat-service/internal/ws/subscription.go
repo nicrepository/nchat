@@ -34,6 +34,73 @@ type channelVisibilityChecker interface {
 	GetVisibleChannelByID(ctx context.Context, workspaceID, channelID, userID string) (domain.Channel, error)
 }
 
+// SubjectAuthorizer answers the same question as CanAccess for a whole list of
+// people at once.
+//
+// It exists because presence produces exactly that question: a target's roster
+// is a set of users the server itself asserted, and every one of them has to be
+// re-checked before anybody sees it. Asking one at a time turns one snapshot
+// into as many queries as there are people in the conversation.
+//
+// It is an optional capability, not a replacement: a caller that does not have
+// one falls back to CanAccess per subject, which is why the interface is
+// discovered rather than required. Implementations must return a subset of the
+// users they were given and must not widen the rule CanAccess applies.
+type SubjectAuthorizer interface {
+	AuthorizeSubjects(
+		ctx context.Context, workspaceID string, targetType TargetType, targetID string, userIDs []string,
+	) ([]string, error)
+}
+
+// channelSubjectFilter and dmSubjectFilter are the batch reads serviceAuthorizer
+// uses when its stores provide them. Declared here rather than added to the
+// store interfaces so nothing that already satisfies those interfaces has to
+// change.
+type channelSubjectFilter interface {
+	FilterUsersVisibleToChannel(ctx context.Context, workspaceID, channelID string, userIDs []string) ([]string, error)
+}
+
+type dmSubjectFilter interface {
+	FilterUsersInConversation(ctx context.Context, workspaceID, conversationID string, userIDs []string) ([]string, error)
+}
+
+// ErrSubjectBatchUnsupported reports that this authorizer cannot answer for a
+// list, so the caller should ask one at a time.
+var ErrSubjectBatchUnsupported = errors.New("ws: batch subject authorization unavailable")
+
+// AuthorizeSubjects implements SubjectAuthorizer against the same authority
+// CanAccess uses: the canonical channel visibility function for a channel, and
+// active conversation membership for a DM.
+//
+// Unknown target types are refused rather than passed through, exactly as in
+// CanAccess — an unrecognised kind is not a reason to authorise anybody.
+func (a *serviceAuthorizer) AuthorizeSubjects(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID string, userIDs []string,
+) ([]string, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	switch targetType {
+	case TargetTypeChannel:
+		channels, ok := a.channels.(channelSubjectFilter)
+		if !ok {
+			return nil, ErrSubjectBatchUnsupported
+		}
+		return channels.FilterUsersVisibleToChannel(ctx, workspaceID, targetID, userIDs)
+
+	case TargetTypeDM:
+		dms, ok := any(a.dms).(dmSubjectFilter)
+		if !ok {
+			return nil, ErrSubjectBatchUnsupported
+		}
+		return dms.FilterUsersInConversation(ctx, workspaceID, targetID, userIDs)
+
+	default:
+		// Fail secure, like CanAccess.
+		return nil, nil
+	}
+}
+
 // serviceAuthorizer is the production SubscriptionAuthorizer.
 //
 // Channel access is resolved via GetVisibleChannelByID, the same storage check

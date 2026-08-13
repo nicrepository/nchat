@@ -37,6 +37,7 @@ import {
   resolveDMMessageReferences,
   unfavoriteMessage,
 } from "./chatApi";
+import { markPresenceActivity } from "./chatSocket";
 import {
   normalizeBodyFormat,
   parseMessageAttachments,
@@ -960,6 +961,11 @@ export function useMessages({
       // An attachment is content: a message carrying one is sendable with an
       // empty body, and the server applies the same rule.
       if (!targetId || (!body.trim() && !attachmentIds?.length)) return { status: "stale" };
+
+      // Sending a message is unambiguous proof the person is here, and it goes
+      // over HTTP — so nothing about it would otherwise reach the presence
+      // tracker, which only sees WebSocket frames (issue #444).
+      markPresenceActivity();
 
       const sendKey = `${kind}:${targetId}`;
       const parentMessageId = stateRef.current.replyTo?.id;

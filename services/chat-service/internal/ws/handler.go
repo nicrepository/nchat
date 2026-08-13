@@ -162,6 +162,11 @@ func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logUpgrade(r, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
+	sessionID, ok := h.requireSessionID(w, r)
+	if !ok {
+		h.logUpgrade(r, http.StatusUnauthorized, "session_unresolved")
+		return
+	}
 	if h.hub == nil || h.workspaces == nil {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "WebSocket not available")
 		h.logUpgrade(r, http.StatusServiceUnavailable, "websocket_not_wired")
@@ -178,7 +183,28 @@ func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.limiter.release(userID)
-	runConnection(w, r, h.hub, h.logger, userID, workspaceID, h.config)
+	runConnection(w, r, h.hub, h.logger, userID, workspaceID, sessionID, h.config)
+}
+
+// requireSessionID reads the session this connection is opened under from the
+// request context, where BearerAuth put the validated token's "sid".
+//
+// Returns ("", true) when no session authority is configured: the deployment has
+// no way to re-check anything, and the upgrade is governed by the middleware
+// chain alone. When one *is* configured, a missing session ID is refused rather
+// than allowed through unwatched — RequireActiveSession guarantees a valid one
+// upstream, so its absence means the chain is not what it is supposed to be, and
+// a connection nothing can revoke is exactly what this exists to prevent.
+func (h *wsHandler) requireSessionID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if h.config.Sessions == nil || h.config.SessionIDFromContext == nil {
+		return "", true
+	}
+	sessionID := h.config.SessionIDFromContext(r)
+	if sessionID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return "", false
+	}
+	return sessionID, true
 }
 
 // logUpgrade records the outcome of one upgrade attempt so an operator can tell
@@ -246,8 +272,9 @@ func resolveWorkspace(w http.ResponseWriter, r *http.Request, workspaces Workspa
 //
 // The credential protocol is validated but never echoed. The fixed public
 // protocol is selected so standards-compliant browsers accept the handshake.
-func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID string, cfg HandlerConfig) {
+func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID, sessionID string, cfg HandlerConfig) {
 	logger = normalizeLogger(logger)
+	cfg = cfg.withDefaults()
 
 	if proto, ok := wsutil.SubprotocolHeader(r.Header); ok {
 		if !wsutil.IsValidSubprotocolToken(proto) {
@@ -272,6 +299,14 @@ func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slo
 	clientID := uuid.New().String()
 	snd := newWSSender(conn)
 	c := newClient(clientID, userID, workspaceID, snd)
+	// Server-side only, and set before the client is reachable: the connection
+	// carries the session the handshake proved, so the periodic re-check has an
+	// identity no frame can influence.
+	c.session = sessionGuard{
+		id:        sessionID,
+		validator: cfg.Sessions,
+		interval:  cfg.SessionRevalidateInterval,
+	}
 	if !hub.Register(c) {
 		logger.WarnContext(r.Context(), "ws: hub registration failed; closing connection", "client_id", clientID)
 		c.close()
@@ -333,6 +368,16 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			msg.TargetID = target.targetID
 		}
 
+		// Read before the dispatch, because the dispatch is what may create the
+		// subscription. Only a change here means a subscription was actually
+		// added, which is what a presence snapshot answers (RF-58).
+		var subscribeGeneration uint64
+		if msg.Type == ClientMessageTypeSubscribe {
+			subscribeGeneration = hub.subscriptionGeneration(c, targetKey{
+				workspaceID: c.workspaceID, targetType: msg.TargetType, targetID: msg.TargetID,
+			}.String())
+		}
+
 		if msgErr := hub.handleClientMessage(ctx, c, msg); msgErr != nil {
 			if handleReactionClientError(c, msgErr) {
 				continue
@@ -359,9 +404,16 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			}
 			continue
 		}
-		if msg.Type == ClientMessageTypeSubscribe && !handleSubscribeClientSuccess(c, msg) {
-			hub.Unregister(c)
-			return
+		if msg.Type == ClientMessageTypeSubscribe {
+			if !handleSubscribeClientSuccess(c, msg) {
+				hub.Unregister(c)
+				return
+			}
+			// After the acknowledgement, so the client has already been told the
+			// subscription exists before it is told who is in it (RF-58). The
+			// generation captured before the dispatch is what distinguishes a
+			// real join from a repeated subscribe to a target already held.
+			hub.handleSubscribed(c, msg.TargetType, msg.TargetID, subscribeGeneration)
 		}
 	}
 }

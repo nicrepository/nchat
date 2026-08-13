@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ── test helpers ─────────────────────────────────────────────────────────────
@@ -210,10 +212,22 @@ func newTestHub(auth SubscriptionAuthorizer) *Hub {
 		busCancel:               func() {},
 		logger:                  newTestLogger(),
 		remoteBcast:             make(chan broadcastReq, 256),
+		presenceSignal:          make(chan struct{}, 1),
+		presencePending:         make(map[presenceKey]presenceChange),
 		clients:                 make(map[string]*Client),
 		subs:                    make(map[string]map[string]struct{}),
 		clientSubs:              make(map[string]map[string]struct{}),
 		subscriptionGenerations: make(map[string]map[string]uint64),
+		deliveredRosters:        make(map[string]string),
+		asserted:                make(map[presenceKey]map[string]uint64),
+		assertionEpoch:          make(map[presenceKey]map[string]uint64),
+		pendingAssertions:       make(map[presenceKey]map[string]struct{}),
+		assertionLocks:          newAssertionSequencer(),
+		// Unique per hub, like the real one: two hubs in one test are two
+		// processes, and a shared origin would make each drop the other's events
+		// as its own echo.
+		presenceInstanceID: "runtime-" + uuid.NewString(),
+		reconcileSignal:    make(chan struct{}, 1),
 	}
 }
 

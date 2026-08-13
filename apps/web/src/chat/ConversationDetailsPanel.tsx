@@ -63,6 +63,8 @@ import {
   initialsFrom,
   senderLabel,
 } from "./messageDisplay";
+import PresenceDot from "./PresenceDot";
+import { presenceLabel, presenceTargetKey, usePresence } from "./presence";
 import type { ConversationDetailsState } from "./useConversationDetails";
 import {
   conversationDetailsPanelId,
@@ -100,11 +102,21 @@ const attachmentStatusLabel: Record<ChannelAttachment["status"], string> = {
   rejected: "Reprovado",
 };
 
-const presenceLabel = {
-  online: "Online",
-  away: "Ausente",
-  offline: "Offline",
-} as const;
+/**
+ * Presence has exactly one authority in this client, and it is the realtime
+ * store (RF-58).
+ *
+ * The details endpoint also reports a `presence` field, and this panel used to
+ * fall back to it while the store was still unknown. That made the panel a
+ * second source of truth: the same person could read "Online" here — from a
+ * value fetched once, at whatever moment the request happened to be answered —
+ * while the sidebar and the conversation header, which only ever read the
+ * store, showed nothing. Two answers for one fact is the bug, and the
+ * inconsistency was visible on screen.
+ *
+ * So the field is deliberately not read. Until the store has an answer this
+ * panel says the same thing every other surface says, which is nothing.
+ */
 
 interface SectionMessageProps {
   children: React.ReactNode;
@@ -187,10 +199,13 @@ interface MemberRowProps {
   member: ChannelMemberProfile | GroupParticipantProfile;
   subtitle: string;
   isCurrentUser: boolean;
+  /** The conversation this roster belongs to; presence is resolved within it. */
+  conversationKey: string;
 }
 
-function MemberRow({ member, subtitle, isCurrentUser }: MemberRowProps) {
+function MemberRow({ member, subtitle, isCurrentUser, conversationKey }: MemberRowProps) {
   const color = avatarColorFor(member.userId);
+  const presence = usePresence(member.userId, conversationKey);
   return (
     <li className="chat-details__member">
       <span
@@ -208,21 +223,18 @@ function MemberRow({ member, subtitle, isCurrentUser }: MemberRowProps) {
         ) : (
           initialsFrom(member.displayName)
         )}
-        {member.presence && (
-          <span
-            className={`chat-details__presence chat-details__presence--${member.presence}`}
-            data-testid="chat-details-presence"
-          />
-        )}
+        <PresenceDot state={presence} size="md" />
       </span>
       <span className="chat-details__member-text">
         <span className="chat-details__member-name">
           {member.displayName}
           {isCurrentUser && <span className="chat-details__badge">Você</span>}
         </span>
+        {/* The state as a word, beside the dot rather than instead of it: the
+            row survives greyscale, a screen reader and a colour-blind reader. */}
         <span className="chat-details__member-role">
           {subtitle}
-          {member.presence && ` · ${presenceLabel[member.presence]}`}
+          {presence !== "unknown" && ` · ${presenceLabel(presence)}`}
         </span>
       </span>
     </li>
@@ -318,6 +330,7 @@ function ChannelMembersSection({
           member={member}
           subtitle={member.role === "moderator" ? "Moderador" : "Membro"}
           isCurrentUser={Boolean(currentUserId) && member.userId === currentUserId}
+          conversationKey={presenceTargetKey("channel", details.id)}
         />
       ))}
     </ul>
@@ -348,6 +361,9 @@ function GroupParticipantsSection({
           member={participant}
           subtitle="Participante"
           isCurrentUser={Boolean(currentUserId) && participant.userId === currentUserId}
+          // A group is a dm conversation on the wire, so that is the target its
+          // presence is scoped by.
+          conversationKey={presenceTargetKey("dm", details.id)}
         />
       ))}
     </ul>
@@ -417,6 +433,7 @@ function ProfileLocalTimeRow({ timezone }: { timezone?: string }) {
 function DirectProfileSection({ details }: { details: DirectDetails }) {
   const profile = details.profile;
   const color = avatarColorFor(profile.userId);
+  const presence = usePresence(profile.userId, presenceTargetKey("dm", details.conversationId));
   return (
     <div className="chat-details__profile">
       <span
@@ -434,11 +451,7 @@ function DirectProfileSection({ details }: { details: DirectDetails }) {
         ) : (
           initialsFrom(profile.displayName)
         )}
-        {profile.presence && (
-          <span
-            className={`chat-details__profile-presence chat-details__presence--${profile.presence}`}
-          />
-        )}
+        <PresenceDot state={presence} size="lg" />
       </span>
 
       <p className="chat-details__profile-name" data-testid="chat-details-profile-name">
@@ -447,17 +460,19 @@ function DirectProfileSection({ details }: { details: DirectDetails }) {
       {profile.jobTitle && <p className="chat-details__profile-role">{profile.jobTitle}</p>}
 
       {/* Presence is a word, not only a colour: the dot repeats what the text
-          already says, so the state survives greyscale and a screen reader. */}
-      {profile.presence && (
+          already says, so the state survives greyscale and a screen reader.
+          Absent while unknown — a badge reading "Offline" before the server has
+          answered would be a claim about this person, not a placeholder. */}
+      {presence !== "unknown" && (
         <p
-          className={`chat-details__profile-status chat-details__profile-status--${profile.presence}`}
+          className={`chat-details__profile-status chat-details__profile-status--${presence}`}
           data-testid="chat-details-profile-status"
         >
           <span
-            className={`chat-details__status-dot chat-details__presence--${profile.presence}`}
+            className={`chat-details__status-dot chat-details__status-dot--${presence}`}
             aria-hidden="true"
           />
-          {presenceLabel[profile.presence]}
+          {presenceLabel(presence)}
         </p>
       )}
 

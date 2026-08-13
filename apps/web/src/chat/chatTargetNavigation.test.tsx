@@ -379,11 +379,22 @@ describe("navigating between DM and channel targets", () => {
     // Switching target resubscribes on the live socket instead of replacing it.
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(socket().closed).toBe(false);
-    expect(socket().subscriptions()).toContainEqual({
+    // And the conversation it left stays subscribed (issue #444): the sidebar is
+    // still watching that DM for new messages and presence, and the connection —
+    // not the view that happened to close — owns the subscription. Sending
+    // unsubscribe here is what used to make the sidebar go quiet for a
+    // conversation the user had merely navigated away from.
+    expect(socket().subscriptions()).not.toContainEqual({
       type: "unsubscribe",
       target_type: "dm",
       target_id: dmId,
     });
+    // One subscribe per target, however many views want it.
+    expect(
+      socket()
+        .subscriptions()
+        .filter((frame) => frame.type === "subscribe" && frame.target_id === channelId),
+    ).toHaveLength(1);
   });
 
   it("leaves no subscription or timeline state after a fast A → B → C switch", async () => {
@@ -413,16 +424,26 @@ describe("navigating between DM and channel targets", () => {
       }),
     );
 
-    // Every abandoned target is released, and no switch leaked a second socket.
+    // No switch leaked a second socket, and none of the abandoned targets was
+    // unsubscribed: the sidebar still watches every one of them, and a view
+    // closing is not the connection losing interest (issue #444).
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(socket().closed).toBe(false);
     for (const abandoned of [secretChannelId, channelId]) {
-      expect(socket().subscriptions()).toContainEqual({
+      expect(socket().subscriptions()).not.toContainEqual({
         type: "unsubscribe",
         target_type: "channel",
         target_id: abandoned,
       });
+      // Still exactly one subscribe each: revisiting a target nobody released
+      // costs no frame at all.
+      expect(
+        socket()
+          .subscriptions()
+          .filter((frame) => frame.type === "subscribe" && frame.target_id === abandoned),
+      ).toHaveLength(1);
     }
+    // What does go is the timeline state the view owned.
     expect(screen.queryByText(channelText)).not.toBeInTheDocument();
   });
 

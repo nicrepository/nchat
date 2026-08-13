@@ -2,9 +2,12 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
 // DefaultHeartbeatInterval is the recommended interval between server-initiated
@@ -14,6 +17,46 @@ const DefaultHeartbeatInterval = 30 * time.Second
 // DefaultHeartbeatTimeout is the maximum time the server waits for a pong
 // reply before treating the connection as dead and dropping the client.
 const DefaultHeartbeatTimeout = 10 * time.Second
+
+// DefaultSessionRevalidateInterval is how often a live connection re-checks that
+// the session that opened it is still active.
+//
+// A WebSocket is authenticated once, at the upgrade, and then lives for as long
+// as the tab does. Without this the only thing a logout, a revoked device or a
+// suspended user could not reach is the connection they were most likely to be
+// using: it would keep receiving events and keep holding the person present.
+//
+// A minute is the whole budget: one indexed lookup per connection per minute,
+// never per frame. It is deliberately not tighter — the check costs a database
+// round trip, and a revocation that lands within a minute is a bound the session
+// authority itself does not beat.
+const DefaultSessionRevalidateInterval = time.Minute
+
+// sessionRevalidateTimeout bounds one such check, so a stalled session store
+// cannot pin the heartbeat goroutine and stop the pings with it.
+const sessionRevalidateTimeout = 5 * time.Second
+
+// SessionValidator answers whether a session is still active. It is the same
+// contract the HTTP routes use through RequireActiveSession, satisfied by the
+// same store: this package re-asks the existing authority rather than owning a
+// second opinion about what a valid session is.
+type SessionValidator interface {
+	ValidateActiveSession(ctx context.Context, userID, sessionID string) error
+}
+
+// sessionGuard is what one connection needs to re-verify itself: the session
+// the handshake asserted, and the authority to ask about it.
+//
+// The id comes from the validated token's "sid" claim, put on the request by
+// the auth middleware. It is never read from a frame, never sent to the client
+// and never logged. A zero guard means no revalidation is wired.
+type sessionGuard struct {
+	id        string
+	validator SessionValidator
+	interval  time.Duration
+}
+
+func (g sessionGuard) enabled() bool { return g.validator != nil && g.id != "" }
 
 // startConnectionPumps is the lifecycle owner for a WebSocket connection's
 // I/O goroutines.
@@ -137,8 +180,23 @@ func startHeartbeat(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// The session check rides this goroutine rather than starting one of its
+	// own: it is a periodic lifecycle question about the same connection, on the
+	// same cancellation, with the same teardown. A second ticker is the whole
+	// cost — the cadences differ, the ownership does not.
+	var sessionTick <-chan time.Time
+	if c.session.enabled() {
+		sessionTicker := time.NewTicker(c.session.interval)
+		defer sessionTicker.Stop()
+		sessionTick = sessionTicker.C
+	}
+
 	for {
 		select {
+		case <-sessionTick:
+			if !revalidateSession(ctx, c, hub, logger) {
+				return
+			}
 		case <-ticker.C:
 			pingCtx, pingCancel := context.WithTimeout(ctx, timeout)
 			err := c.snd.Ping(pingCtx)
@@ -165,4 +223,49 @@ func startHeartbeat(
 			return
 		}
 	}
+}
+
+// revalidateSession re-asks the session authority about this connection and
+// reports whether the connection may continue.
+//
+// A definitive "no" — revoked, expired, absent, user suspended — closes the
+// connection through the ordinary path: hub.Unregister runs the same teardown a
+// dead peer gets, so the subscriptions are released, the presence tracker loses
+// the connection and the resulting offline is published by the code that
+// already knows how. Nothing about that cleanup is repeated here.
+//
+// Any other error is an infrastructure failure, not evidence that a session
+// ended, and it is treated as such: the connection stays and the next tick asks
+// again. This is the policy RequireActiveSession already applies at the
+// upgrade, where the same two error classes separate a 401 from a 500. Failing
+// closed here would instead turn one unavailable database into every connected
+// client being disconnected at once.
+//
+// Security: nothing about the session reaches the log — not the session ID, not
+// the user. Only the opaque server-generated client_id.
+func revalidateSession(ctx context.Context, c *Client, hub *Hub, logger *slog.Logger) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, sessionRevalidateTimeout)
+	err := c.session.validator.ValidateActiveSession(checkCtx, c.userID, c.session.id)
+	cancel()
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, domain.ErrInvalidToken) && !errors.Is(err, domain.ErrNotFound) {
+		if ctx.Err() != nil {
+			return false
+		}
+		logger.WarnContext(ctx, "ws: session revalidation failed; keeping connection",
+			"client_id", c.id,
+		)
+		return true
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	logger.InfoContext(ctx, "ws: session no longer active; dropping client",
+		"client_id", c.id,
+	)
+	hub.Unregister(c)
+	c.close()
+	return false
 }

@@ -204,16 +204,47 @@ func TestWSHandlerConfig_MapsWebSocketResourceControls(t *testing.T) {
 		WSMaxInvalidMessages:       3,
 	}
 
-	got := wsHandlerConfig(cfg)
+	got := wsHandlerConfig(cfg, nil)
 	want := ws.HandlerConfig{
 		MaxConnectionsPerUser:    7,
 		InboundMessagesPerMinute: 120,
 		InboundBurst:             20,
 		MaxInvalidMessages:       3,
 	}
-	if got != want {
+	if got.MaxConnectionsPerUser != want.MaxConnectionsPerUser ||
+		got.InboundMessagesPerMinute != want.InboundMessagesPerMinute ||
+		got.InboundBurst != want.InboundBurst ||
+		got.MaxInvalidMessages != want.MaxInvalidMessages {
 		t.Fatalf("expected websocket handler config %+v, got %+v", want, got)
 	}
+	// Without a session store there is nothing to re-check against, and the
+	// socket must not be handed a non-nil interface holding a nil store.
+	if got.Sessions != nil {
+		t.Fatalf("expected no session authority when none is configured, got %+v", got.Sessions)
+	}
+	// The session ID always comes from the request context the auth middleware
+	// wrote, never from the client.
+	if got.SessionIDFromContext == nil {
+		t.Fatal("expected the handler to read the session ID from the request context")
+	}
+}
+
+// A configured session store reaches the socket, which is what makes a revoked
+// session able to close a connection that is already open.
+func TestWSHandlerConfig_PassesTheSessionAuthorityToTheSocket(t *testing.T) {
+	sessions := stubSessionValidator{}
+
+	got := wsHandlerConfig(config.Config{}, sessions)
+
+	if got.Sessions == nil {
+		t.Fatal("expected the configured session validator to reach the WebSocket handler")
+	}
+}
+
+type stubSessionValidator struct{}
+
+func (stubSessionValidator) ValidateActiveSession(context.Context, string, string) error {
+	return nil
 }
 
 // TestApp_Shutdown_Idempotent verifies that Shutdown can be called multiple

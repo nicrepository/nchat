@@ -6,6 +6,8 @@ import { useSelfProfile } from "../profile/selfProfile";
 import { partitionDMs, type Channel, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
+import PresenceDot from "./PresenceDot";
+import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
 import { sortByActivity } from "./sidebarOrder";
 import type { SidebarState } from "./useChatSidebar";
 
@@ -126,7 +128,14 @@ interface AvatarProps {
   /** Optional picture. Initials are shown when absent or when loading fails. */
   src?: string;
   color?: string;
-  status?: "online" | "away" | "offline";
+  /**
+   * Live presence (RF-58). Absent for an avatar that stands for a conversation
+   * rather than a person — a group has no single state to report.
+   *
+   * The dot is decoration: the row that owns this avatar names the state in its
+   * accessible label, so nothing here has to be reachable on its own.
+   */
+  status?: PresenceState;
   size?: "sm" | "md";
 }
 
@@ -161,9 +170,7 @@ function Avatar({ initials, src, color = "purple", status, size = "sm" }: Avatar
       ) : (
         initials
       )}
-      {status && (
-        <span className={`chat-sidebar__avatar-status chat-sidebar__avatar-status--${status}`} />
-      )}
+      {status && <PresenceDot state={status} size={size} ringColor="var(--cs-sidebar-bg)" />}
     </span>
   );
 }
@@ -334,6 +341,75 @@ interface DMListProps {
   emptyMessage: string;
 }
 
+/**
+ * One conversation row.
+ *
+ * Its own component because presence is a subscription, and a subscription
+ * needs a hook: keeping it here means the row of the person who just went away
+ * re-renders and the other forty do not. The group branch calls the same hook
+ * with no id — a group has no single presence — so the rule of hooks holds
+ * without a second component.
+ */
+function DMRow({
+  dm,
+  isActive,
+  onSelect,
+}: {
+  dm: DMConversation;
+  isActive: boolean;
+  onSelect: (id: string) => void;
+}) {
+  const isGroup = dm.type === "group";
+  const counterpart = dm.counterpart;
+  // Scoped to this conversation: the counterpart is one of its two participants,
+  // so the server's roster for it is exactly the list that would have named them.
+  const presence = usePresence(
+    isGroup ? undefined : counterpart?.userId,
+    presenceTargetKey("dm", dm.id),
+  );
+  const baseLabel = isGroup ? `Grupo ${dm.name}` : `Mensagem direta com ${dm.name}`;
+  // Presence in words, in the row's accessible name. The dot is what a sighted
+  // user sees and this is what a screen reader hears, from the same value —
+  // and it is why the avatar does not need to become a focusable control to
+  // make the state reachable by keyboard.
+  const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`;
+
+  return (
+    <button
+      type="button"
+      role="option"
+      aria-selected={isActive}
+      aria-label={label}
+      className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
+      onClick={() => onSelect(dm.id)}
+    >
+      {/* The 1:1 avatar always renders — with a picture when there is
+          one, with initials otherwise — so the row height never shifts
+          depending on whether a counterpart has an avatar. */}
+      {isGroup ? (
+        <GroupAvatars dm={dm} />
+      ) : (
+        <Avatar
+          initials={initialsFrom(counterpart?.displayName ?? dm.name)}
+          src={counterpart?.avatarUrl}
+          color={avatarColorFor(counterpart?.userId ?? dm.id)}
+          status={presence}
+          size="sm"
+        />
+      )}
+      <span className="chat-sidebar__dm-name">{dm.name}</span>
+      {isGroup && (
+        <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
+      )}
+      {dm.unreadCount != null && dm.unreadCount > 0 && (
+        <span className="chat-sidebar__unread-badge" aria-label={`${dm.unreadCount} não lidas`}>
+          {dm.unreadCount}
+        </span>
+      )}
+    </button>
+  );
+}
+
 function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProps) {
   if (dms.length === 0) {
     return (
@@ -345,49 +421,9 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProp
 
   return (
     <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
-      {dms.map((dm) => {
-        const isActive = dm.id === activeDMId;
-        const isGroup = dm.type === "group";
-        const counterpart = dm.counterpart;
-
-        return (
-          <button
-            key={dm.id}
-            type="button"
-            role="option"
-            aria-selected={isActive}
-            aria-label={isGroup ? `Grupo ${dm.name}` : `Mensagem direta com ${dm.name}`}
-            className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
-            onClick={() => onSelect(dm.id)}
-          >
-            {/* The 1:1 avatar always renders — with a picture when there is
-                one, with initials otherwise — so the row height never shifts
-                depending on whether a counterpart has an avatar. */}
-            {isGroup ? (
-              <GroupAvatars dm={dm} />
-            ) : (
-              <Avatar
-                initials={initialsFrom(counterpart?.displayName ?? dm.name)}
-                src={counterpart?.avatarUrl}
-                color={avatarColorFor(counterpart?.userId ?? dm.id)}
-                size="sm"
-              />
-            )}
-            <span className="chat-sidebar__dm-name">{dm.name}</span>
-            {isGroup && (
-              <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
-            )}
-            {dm.unreadCount != null && dm.unreadCount > 0 && (
-              <span
-                className="chat-sidebar__unread-badge"
-                aria-label={`${dm.unreadCount} não lidas`}
-              >
-                {dm.unreadCount}
-              </span>
-            )}
-          </button>
-        );
-      })}
+      {dms.map((dm) => (
+        <DMRow key={dm.id} dm={dm} isActive={dm.id === activeDMId} onSelect={onSelect} />
+      ))}
     </div>
   );
 }
@@ -422,13 +458,24 @@ function SidebarUser() {
   const self = useSelfProfile();
   // "" covers absent / null / whitespace-only — normalised once, in profileApi.
   const displayName = self.status === "ready" ? self.profile.displayName : "";
+  // The viewer's own presence comes back from the server like everyone else's:
+  // their session announces itself into the conversations it subscribes to, and
+  // the echo is what this reads. Nothing here decides locally that "I" am
+  // online, so the footer shows what the server would tell anybody else.
+  //
+  // No conversation is passed, and none would be right: the footer is not
+  // rendering this person *inside* a conversation. It therefore never shows
+  // "offline" — which is correct, because a viewer looking at their own row is
+  // by definition connected.
+  const presence = usePresence(self.status === "ready" ? self.profile.id : undefined);
+  const baseLabel = displayName ? `Meu perfil de ${displayName}` : "Meu perfil";
 
   return (
     <div className="chat-sidebar__user-row">
       <Link
         to="/profile"
         className="chat-sidebar__user"
-        aria-label={displayName ? `Meu perfil de ${displayName}` : "Meu perfil"}
+        aria-label={presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`}
       >
         {self.status === "ready" ? (
           <>
@@ -439,6 +486,7 @@ function SidebarUser() {
               initials={displayName ? initialsFrom(displayName) : ""}
               src={self.profile.avatarUrl}
               color={avatarColorFor(self.profile.id)}
+              status={presence}
               size="md"
             />
             <span className="chat-sidebar__user-name">{displayName || "Meu perfil"}</span>

@@ -44,6 +44,8 @@ import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
+import PresenceDot from "./PresenceDot";
+import { presenceLabel, presenceTargetKey, usePresence } from "./presence";
 import {
   avatarColorFor,
   formatDayLabel,
@@ -264,9 +266,17 @@ interface HeaderDMProps {
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
+  /** The conversation being read; presence is resolved within it (RF-58). */
+  presenceTarget?: string;
 }
 
-export function HeaderDM({ name, counterpart, onStartCall, detailsToggle }: HeaderDMProps) {
+export function HeaderDM({
+  name,
+  counterpart,
+  onStartCall,
+  detailsToggle,
+  presenceTarget,
+}: HeaderDMProps) {
   const src = counterpart?.avatarUrl;
   // A load failure is scoped to the URL that was current when it happened, so a
   // change of src must clear it — otherwise navigating A → B → A would never
@@ -285,6 +295,7 @@ export function HeaderDM({ name, counterpart, onStartCall, detailsToggle }: Head
   // fallback matches across both surfaces. Keyed on the counterpart user id
   // (stable per person); legacy DMs without a counterpart fall back to the name.
   const color = avatarColorFor(counterpart?.userId ?? name);
+  const presence = usePresence(counterpart?.userId, presenceTarget);
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
@@ -303,8 +314,20 @@ export function HeaderDM({ name, counterpart, onStartCall, detailsToggle }: Head
         ) : (
           initialsFrom(counterpart?.displayName ?? name)
         )}
+        <PresenceDot state={presence} size="md" />
       </div>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {/* The header states the status in words as well: this is the surface a
+          reader is looking at while writing to this person, so "Ausente" being
+          discoverable without hovering a 9px dot is the point. */}
+      {presence !== "unknown" && (
+        <span
+          className={`chat-msg-area__header-presence chat-msg-area__header-presence--${presence}`}
+          data-testid="chat-msg-header-presence"
+        >
+          {presenceLabel(presence)}
+        </span>
+      )}
       {counterpart && onStartCall && (
         <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
           <button
@@ -412,6 +435,8 @@ interface MessageListProps {
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
   editDisabledIds: Set<string>;
   channelId?: string;
+  /** The conversation on screen, so a sender's presence is resolved in it. */
+  presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
   /** RF-05: set of currently-pinned message IDs in this target. */
@@ -439,6 +464,7 @@ function MessageList({
   onDeleteMessage,
   editDisabledIds,
   channelId,
+  presenceTarget,
   onTogglePin,
   pinnedIds,
   allowedReactionEmojis,
@@ -668,6 +694,7 @@ function MessageList({
             onDeleteMessage={onDeleteMessage}
             editDisabled={editDisabledIds.has(item.message.id)}
             channelId={channelId}
+            presenceTarget={presenceTarget}
             onTogglePin={onTogglePin}
             isPinned={pinnedIds?.has(item.message.id) ?? false}
             allowedReactionEmojis={allowedReactionEmojis}
@@ -1200,6 +1227,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           <HeaderDM
             name={resolvedName}
             counterpart={activeDM?.counterpart}
+            presenceTarget={targetId ? presenceTargetKey("dm", targetId) : undefined}
             onStartCall={ctx.startCall}
             detailsToggle={
               supportsDetails ? (
@@ -1243,6 +1271,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             onDeleteMessage={deleteMessageLocal}
             editDisabledIds={editDisabledIds}
             channelId={kind === "channel" ? targetId : undefined}
+            presenceTarget={targetId ? presenceTargetKey(kind, targetId) : undefined}
             onTogglePin={togglePin}
             pinnedIds={pinnedIds}
             allowedReactionEmojis={allowedReactionEmojis}

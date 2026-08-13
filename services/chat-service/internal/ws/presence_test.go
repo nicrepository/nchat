@@ -39,6 +39,7 @@ func newTestPresenceTracker(awayTimeout time.Duration, clk *fakeClock) *Presence
 		now:         clk.Now,
 		conns:       make(map[presenceKey]map[string]time.Time),
 		status:      make(map[presenceKey]PresenceStatus),
+		changedAt:   make(map[presenceKey]time.Time),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -417,5 +418,295 @@ func TestPresence_OnlineUserIDs_ReflectsActivityRestoringOnline(t *testing.T) {
 
 	if got := p.OnlineUserIDs("ws-1"); len(got) != 1 || got[0] != "user-1" {
 		t.Fatalf("expected the user back online after activity, got %v", got)
+	}
+}
+
+// ── change reporting (RF-58) ─────────────────────────────────────────────────
+//
+// The Changed flag is what decides whether an event goes on the wire, so the
+// cases where it must be false matter as much as the ones where it must be true.
+
+func TestPresence_Connect_ReportsChangeOnlyForTheFirstSession(t *testing.T) {
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(5*time.Minute, clk)
+
+	first := p.Connect("ws-1", "user-1", "conn-1")
+	if !first.Changed || first.Status != PresenceOnline {
+		t.Fatalf("first connection: expected a change to online, got %+v", first)
+	}
+	if !first.At.Equal(clk.Now()) {
+		t.Fatalf("first connection: expected the tracker clock, got %v", first.At)
+	}
+
+	second := p.Connect("ws-1", "user-1", "conn-2")
+	if second.Changed {
+		t.Fatalf("a second session must not re-assert presence, got %+v", second)
+	}
+	if second.Status != PresenceOnline {
+		t.Fatalf("second connection: expected online, got %q", second.Status)
+	}
+}
+
+func TestPresence_Disconnect_ReportsChangeOnlyForTheLastSession(t *testing.T) {
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(5*time.Minute, clk)
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	p.Connect("ws-1", "user-1", "conn-2")
+
+	if change := p.Disconnect("ws-1", "user-1", "conn-1"); change.Changed {
+		t.Fatalf("closing one of two sessions must change nothing, got %+v", change)
+	}
+	last := p.Disconnect("ws-1", "user-1", "conn-2")
+	if !last.Changed || last.Status != PresenceOffline {
+		t.Fatalf("last session: expected a change to offline, got %+v", last)
+	}
+
+	// An unknown user is already offline; there is nothing to report.
+	if change := p.Disconnect("ws-1", "user-unknown", "conn-x"); change.Changed {
+		t.Fatalf("an unknown user must report no change, got %+v", change)
+	}
+}
+
+func TestPresence_RecordActivity_ReportsOnlyTheAwayToOnlineTransition(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	if change := p.RecordActivity("ws-1", "user-1", "conn-1"); change.Changed {
+		t.Fatalf("activity on an online user must change nothing, got %+v", change)
+	}
+
+	clk.Advance(awayTimeout + time.Second)
+	p.checkAway()
+
+	back := p.RecordActivity("ws-1", "user-1", "conn-1")
+	if !back.Changed || back.Status != PresenceOnline {
+		t.Fatalf("expected the away → online transition, got %+v", back)
+	}
+	if !back.At.Equal(clk.Now()) {
+		t.Fatalf("expected the transition stamped with the tracker clock, got %v", back.At)
+	}
+
+	// A connection the tracker does not hold cannot refresh anything.
+	if change := p.RecordActivity("ws-1", "user-1", "conn-unknown"); change.Changed {
+		t.Fatalf("an unknown connection must change nothing, got %+v", change)
+	}
+}
+
+func TestPresence_StatusAt_ReportsWhenTheStatusChanged(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	start := time.Now()
+	clk := newFakeClock(start)
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	if status, at := p.StatusAt("ws-1", "user-1"); status != PresenceOffline || !at.IsZero() {
+		t.Fatalf("an unknown user: expected offline at the zero time, got %q/%v", status, at)
+	}
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	if _, at := p.StatusAt("ws-1", "user-1"); !at.Equal(start) {
+		t.Fatalf("expected the connect instant, got %v", at)
+	}
+
+	// Activity that changes nothing must not move the stamp: it is the instant
+	// the *status* took its value, not the last time anything happened.
+	clk.Advance(time.Minute)
+	p.RecordActivity("ws-1", "user-1", "conn-1")
+	if _, at := p.StatusAt("ws-1", "user-1"); !at.Equal(start) {
+		t.Fatalf("a no-op activity moved the status stamp to %v", at)
+	}
+
+	clk.Advance(awayTimeout + time.Second)
+	awayAt := clk.Now()
+	p.checkAway()
+	if status, at := p.StatusAt("ws-1", "user-1"); status != PresenceAway || !at.Equal(awayAt) {
+		t.Fatalf("expected away stamped at the transition, got %q/%v", status, at)
+	}
+}
+
+func TestPresence_Observer_ReportsAwayTransitions(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	type report struct {
+		workspaceID string
+		userID      string
+		status      PresenceStatus
+		at          time.Time
+	}
+	var reports []report
+	p.SetObserver(func(workspaceID, userID string, status PresenceStatus, at time.Time) {
+		reports = append(reports, report{workspaceID, userID, status, at})
+	})
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	if len(reports) != 0 {
+		t.Fatalf("Connect must report through its return value, not the observer: %+v", reports)
+	}
+
+	clk.Advance(awayTimeout + time.Second)
+	transitionAt := clk.Now()
+	p.checkAway()
+
+	if len(reports) != 1 {
+		t.Fatalf("expected exactly one away report, got %+v", reports)
+	}
+	got := reports[0]
+	if got.workspaceID != "ws-1" || got.userID != "user-1" || got.status != PresenceAway {
+		t.Fatalf("unexpected away report: %+v", got)
+	}
+	if !got.at.Equal(transitionAt) {
+		t.Fatalf("expected the transition instant, got %v", got.at)
+	}
+
+	// A second sweep must not repeat a transition that already happened.
+	clk.Advance(awayTimeout)
+	p.checkAway()
+	if len(reports) != 1 {
+		t.Fatalf("away was reported twice: %+v", reports)
+	}
+
+	// Removing the observer stops the reports without stopping the tracker.
+	p.SetObserver(nil)
+	p.RecordActivity("ws-1", "user-1", "conn-1")
+	clk.Advance(awayTimeout + time.Second)
+	p.checkAway()
+	if len(reports) != 1 {
+		t.Fatalf("a removed observer was still called: %+v", reports)
+	}
+	if got := p.Status("ws-1", "user-1"); got != PresenceAway {
+		t.Fatalf("the tracker stopped working without an observer: %q", got)
+	}
+}
+
+// ── disconnect re-reads what is left (RF-58) ─────────────────────────────────
+//
+// The connections that remain are the whole answer, and Disconnect is the moment
+// that answer changes. Leaving it to the periodic check meant a user could sit
+// on `online` for up to a quarter of the away timeout with nothing but idle tabs
+// behind it — a state the server was asserting and no longer had a reason to.
+
+func TestPresence_Disconnect_AllRemainingIdleGoesAwayAtOnce(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	// One tab, left alone long enough for the periodic check to call it away.
+	p.Connect("ws-1", "user-1", "conn-idle")
+	clk.Advance(awayTimeout + time.Second)
+	p.checkAway()
+
+	// A second tab opens: the user is online again, on the strength of that tab.
+	if change := p.Connect("ws-1", "user-1", "conn-fresh"); !change.Changed || change.Status != PresenceOnline {
+		t.Fatalf("a new connection must put the user online, got %+v", change)
+	}
+
+	// And closes. Nothing recent is left, so nothing holds the user online.
+	change := p.Disconnect("ws-1", "user-1", "conn-fresh")
+	if change.Status != PresenceAway || !change.Changed {
+		t.Fatalf("expected an immediate change to away, got %+v", change)
+	}
+	if got := p.Status("ws-1", "user-1"); got != PresenceAway {
+		t.Fatalf("expected away without waiting for the ticker, got %q", got)
+	}
+	// The periodic check has nothing left to do — it agrees, and reports nothing.
+	p.checkAway()
+	if got := p.Status("ws-1", "user-1"); got != PresenceAway {
+		t.Fatalf("the ticker disagreed with the disconnect: %q", got)
+	}
+}
+
+func TestPresence_Disconnect_EveryRemainingConnectionIdleGoesAway(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	p.Connect("ws-1", "user-1", "conn-a")
+	p.Connect("ws-1", "user-1", "conn-b")
+	clk.Advance(awayTimeout + time.Second)
+	p.Connect("ws-1", "user-1", "conn-c")
+
+	if change := p.Disconnect("ws-1", "user-1", "conn-c"); change.Status != PresenceAway || !change.Changed {
+		t.Fatalf("two idle connections must leave the user away, got %+v", change)
+	}
+}
+
+func TestPresence_Disconnect_OneRecentConnectionKeepsTheUserOnline(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	p.Connect("ws-1", "user-1", "conn-idle")
+	clk.Advance(awayTimeout + time.Second)
+	p.Connect("ws-1", "user-1", "conn-recent")
+	p.Connect("ws-1", "user-1", "conn-extra")
+
+	// The extra tab goes; the recent one is still recent, so nothing moved.
+	if change := p.Disconnect("ws-1", "user-1", "conn-extra"); change.Changed || change.Status != PresenceOnline {
+		t.Fatalf("a recent connection must hold the user online, got %+v", change)
+	}
+	// Even with an idle connection alongside it.
+	if got := p.Status("ws-1", "user-1"); got != PresenceOnline {
+		t.Fatalf("expected online, got %q", got)
+	}
+}
+
+func TestPresence_Disconnect_LastConnectionIsOfflineWhateverItsAge(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+	clk := newFakeClock(time.Now())
+	p := newTestPresenceTracker(awayTimeout, clk)
+
+	p.Connect("ws-1", "user-1", "conn-1")
+	clk.Advance(awayTimeout + time.Second)
+	p.checkAway() // the user is away before the disconnect, not online
+
+	change := p.Disconnect("ws-1", "user-1", "conn-1")
+	if change.Status != PresenceOffline || !change.Changed {
+		t.Fatalf("the last connection must report offline, got %+v", change)
+	}
+	if got := p.Status("ws-1", "user-1"); got != PresenceOffline {
+		t.Fatalf("expected offline, got %q", got)
+	}
+}
+
+// The boundary itself: a connection exactly at the timeout still counts as
+// active, which is the rule checkAway has always applied. Disconnect must not
+// draw it one nanosecond differently.
+func TestPresence_Disconnect_UsesTheSameBoundaryAsTheAwayCheck(t *testing.T) {
+	const awayTimeout = 5 * time.Minute
+
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+		want PresenceStatus
+	}{
+		{name: "exactly at the timeout is still active", age: awayTimeout, want: PresenceOnline},
+		{name: "one nanosecond past it is not", age: awayTimeout + time.Nanosecond, want: PresenceAway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := newFakeClock(time.Now())
+			p := newTestPresenceTracker(awayTimeout, clk)
+
+			p.Connect("ws-1", "user-1", "conn-old")
+			clk.Advance(tc.age)
+			p.Connect("ws-1", "user-1", "conn-new")
+
+			if change := p.Disconnect("ws-1", "user-1", "conn-new"); change.Status != tc.want {
+				t.Fatalf("disconnect says %q, want %q", change.Status, tc.want)
+			}
+
+			// The periodic check, given the same connection, must agree.
+			clk2 := newFakeClock(time.Now())
+			q := newTestPresenceTracker(awayTimeout, clk2)
+			q.Connect("ws-1", "user-1", "conn-old")
+			clk2.Advance(tc.age)
+			q.checkAway()
+			if got := q.Status("ws-1", "user-1"); got != tc.want {
+				t.Fatalf("the away check says %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

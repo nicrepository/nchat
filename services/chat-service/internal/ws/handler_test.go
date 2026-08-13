@@ -838,7 +838,14 @@ func TestHandlerConfigInvalidValuesFallBackToDefaults(t *testing.T) {
 		},
 	)
 
-	if h.config != DefaultHandlerConfig() {
+	// Compared field by field: the config now carries a function, which Go will
+	// not compare, and the defaulting is what this asserts.
+	defaults := DefaultHandlerConfig()
+	if h.config.MaxConnectionsPerUser != defaults.MaxConnectionsPerUser ||
+		h.config.InboundMessagesPerMinute != defaults.InboundMessagesPerMinute ||
+		h.config.InboundBurst != defaults.InboundBurst ||
+		h.config.MaxInvalidMessages != defaults.MaxInvalidMessages ||
+		h.config.SessionRevalidateInterval != defaults.SessionRevalidateInterval {
 		t.Fatalf("expected invalid handler config to normalize to defaults, got %+v", h.config)
 	}
 	if h.limiter.max != DefaultHandlerConfig().MaxConnectionsPerUser {

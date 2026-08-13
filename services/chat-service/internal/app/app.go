@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
@@ -45,14 +47,15 @@ type App struct {
 	Handler         http.Handler
 	TracingShutdown observability.ShutdownFunc
 
-	hub              *ws.Hub
-	presence         *ws.PresenceTracker
-	mentionCache     *storage.ValkeyMentionLabelCache
-	reactionLimiter  *ws.ValkeyReactionLimiter
-	callWorkerCancel context.CancelFunc
-	callWorkerWG     *sync.WaitGroup
-	closeDB          func()
-	shutdownOnce     sync.Once
+	hub               *ws.Hub
+	presence          *ws.PresenceTracker
+	presenceDirectory *ws.ValkeyPresenceDirectory
+	mentionCache      *storage.ValkeyMentionLabelCache
+	reactionLimiter   *ws.ValkeyReactionLimiter
+	callWorkerCancel  context.CancelFunc
+	callWorkerWG      *sync.WaitGroup
+	closeDB           func()
+	shutdownOnce      sync.Once
 }
 
 // Shutdown stops the WebSocket hub, presence tracker, and tracing exporter in
@@ -60,7 +63,8 @@ type App struct {
 //
 // Shutdown order:
 //  1. hub.Shutdown() — drains and closes all WebSocket connections.
-//  2. presence.Stop() — stops the background away-check goroutine.
+//  2. presence.Stop() — stops the background away-check goroutine, then the
+//     shared presence directory the hub was writing to.
 //  3. closeDB() — closes the PostgreSQL pool after in-flight queries drain.
 //  4. TracingShutdown(ctx) — flushes and closes the tracing exporter.
 func (a *App) Shutdown(ctx context.Context) error {
@@ -72,6 +76,10 @@ func (a *App) Shutdown(ctx context.Context) error {
 		}
 		a.hub.Shutdown()
 		a.presence.Stop()
+		// After the hub, which is the only writer to it.
+		if a.presenceDirectory != nil {
+			a.presenceDirectory.Close()
+		}
 		if a.mentionCache != nil {
 			a.mentionCache.Close()
 		}
@@ -198,15 +206,50 @@ func New(cfg config.Config) (*App, error) {
 		canonicalWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 		wsWorkspaces = canonicalWorkspaces
 	}
+	// Two identities, because they answer two different questions.
+	//
+	// instanceID is the logical one: configured through WS_INSTANCE_ID, meaningful
+	// to operators, and used by the bus to suppress its own echo. Nothing
+	// guarantees it is unique — a Deployment that sets a fixed value hands the
+	// same string to every pod, and WS_INSTANCE_ID is not provisioned in any
+	// manifest here at all, which is why it also needs a fallback.
+	//
+	// presenceInstanceID is the physical one: this execution of this process. The
+	// presence directory names the field it owns by it, and everything about
+	// single-writer ordering rests on no other process owning that field, so its
+	// uniqueness cannot be left to configuration. It is generated here, never
+	// read from the environment, never persisted, and changes on every restart —
+	// two pods sharing WS_INSTANCE_ID still write two different fields.
+	instanceID := cfg.WSInstanceID
+	if instanceID == "" {
+		instanceID = uuid.New().String()
+	}
+	presenceInstanceID := uuid.NewString()
+
 	var bus ws.BroadcastBus = ws.NopBus{}
 	if cfg.ValkeyWSBroadcastEnabled {
-		if valkeyBus, busErr := ws.NewValkeyBus(cfg.ValkeyURL, cfg.WSInstanceID, logger); busErr != nil {
+		if valkeyBus, busErr := ws.NewValkeyBus(cfg.ValkeyURL, instanceID, logger); busErr != nil {
 			logger.Warn("distributed ws broadcast disabled", "reason", "invalid_valkey_config")
 		} else {
 			bus = valkeyBus
 		}
 	}
-	options := []ws.HubOption{ws.WithPresence(presence)}
+	options := []ws.HubOption{ws.WithPresence(presence), ws.WithPresenceInstanceID(presenceInstanceID)}
+	// Shared presence state (RF-58). It only earns its keep when events already
+	// cross instances: with no bus this process is the whole cluster and its own
+	// connections are the complete answer, so a second source would be a cache
+	// of what it already knows. With a bus, it is what lets a client joining a
+	// conversation see the people connected to other replicas without waiting
+	// for one of them to move.
+	var presenceDirectory *ws.ValkeyPresenceDirectory
+	if cfg.ValkeyWSBroadcastEnabled {
+		if directory, dirErr := ws.NewValkeyPresenceDirectory(cfg.ValkeyURL, presenceInstanceID); dirErr != nil {
+			logger.Warn("shared presence directory disabled", "reason", "invalid_valkey_config")
+		} else {
+			presenceDirectory = directory
+			options = append(options, ws.WithPresenceDirectory(directory))
+		}
+	}
 	var reactionLimiter *ws.ValkeyReactionLimiter
 	if reactionSvc != nil {
 		if limiter, limiterErr := ws.NewValkeyReactionLimiter(
@@ -262,8 +305,8 @@ func New(cfg config.Config) (*App, error) {
 	if channelCategorySvc != nil && reactionLimiter != nil {
 		channelCategories = httpapi.NewChannelCategoryHandler(workspaceStore, channelCategorySvc, reactionLimiter)
 	}
-	hub := ws.NewHub(authorizer, logger, bus, cfg.WSInstanceID, options...)
-	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg))
+	hub := ws.NewHub(authorizer, logger, bus, instanceID, options...)
+	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator))
 
 	var callWorkerCancel context.CancelFunc
 	var callWorkerWG *sync.WaitGroup
@@ -322,17 +365,18 @@ func New(cfg config.Config) (*App, error) {
 	}
 
 	return &App{
-		Config:           cfg,
-		Logger:           logger,
-		Handler:          httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam),
-		TracingShutdown:  shutdown,
-		hub:              hub,
-		presence:         presence,
-		mentionCache:     mentionCache,
-		reactionLimiter:  reactionLimiter,
-		callWorkerCancel: callWorkerCancel,
-		callWorkerWG:     callWorkerWG,
-		closeDB:          closeDB,
+		Config:            cfg,
+		Logger:            logger,
+		Handler:           httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam),
+		TracingShutdown:   shutdown,
+		hub:               hub,
+		presence:          presence,
+		presenceDirectory: presenceDirectory,
+		mentionCache:      mentionCache,
+		reactionLimiter:   reactionLimiter,
+		callWorkerCancel:  callWorkerCancel,
+		callWorkerWG:      callWorkerWG,
+		closeDB:           closeDB,
 	}, nil
 }
 
@@ -356,13 +400,23 @@ func wireMentionLabelCache(valkeyURL string, ttlSeconds int, messageSvc *service
 	return cache
 }
 
-func wsHandlerConfig(cfg config.Config) ws.HandlerConfig {
-	return ws.HandlerConfig{
+// wsHandlerConfig builds the WebSocket resource controls, and hands the socket
+// the same session authority the HTTP routes are guarded with so a live
+// connection can be re-checked against it. When no session store is configured
+// the field stays nil and connections keep upgrade-time validation only, which
+// is the same degradation the HTTP routes already have.
+func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator) ws.HandlerConfig {
+	handlerCfg := ws.HandlerConfig{
 		MaxConnectionsPerUser:    cfg.WSMaxConnectionsPerUser,
 		InboundMessagesPerMinute: cfg.WSInboundMessagesPerMinute,
 		InboundBurst:             cfg.WSInboundBurst,
 		MaxInvalidMessages:       cfg.WSMaxInvalidMessages,
+		SessionIDFromContext:     httpapi.GetContextSessionID,
 	}
+	if sessions != nil {
+		handlerCfg.Sessions = sessions
+	}
+	return handlerCfg
 }
 
 // appWSWorkspaceResolver adapts storage.PGXWorkspaceStore to ws.WorkspaceResolver

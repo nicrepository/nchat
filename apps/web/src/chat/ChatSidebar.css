@@ -400,25 +400,9 @@
   background: linear-gradient(135deg, #0d9488, #2dd4bf);
 }
 
-.chat-sidebar__avatar-status {
-  position: absolute;
-  right: -1px;
-  bottom: -1px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  border: 2px solid var(--cs-sidebar-bg);
-}
-
-.chat-sidebar__avatar-status--online {
-  background: #22c55e;
-}
-.chat-sidebar__avatar-status--away {
-  background: #f59e0b;
-}
-.chat-sidebar__avatar-status--offline {
-  background: #94a3b8;
-}
+/* The presence indicator lives in PresenceDot.css (RF-58): one definition for
+   every surface, so the sidebar cannot drift from the details panel again. The
+   avatar passes its own background as the dot's ring colour. */
 
 /* ── Group avatars ───────────────────────────────────────────────────────────── */
 

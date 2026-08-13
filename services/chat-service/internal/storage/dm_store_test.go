@@ -620,3 +620,32 @@ func TestPGXDMStore_ListVisibleConversationsWithParticipantIDs_PropagatesRowFail
 		})
 	}
 }
+
+// FilterUsersInConversation is the batch form of GetVisibleConversationByID's
+// predicate: active workspace membership plus an active dm_members row, never
+// workspace membership alone.
+func TestPGXDMStore_FilterUsersInConversation_SQLVisibility(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`(?s)FROM unnest\(\$3::uuid\[\]\) AS candidate\(user_id\).*JOIN chat\.dm_conversations dc.*dc\.workspace_id = \$1.*dc\.id = \$2.*dc\.status = 'active'.*JOIN chat\.workspace_members wm.*wm\.user_id = candidate\.user_id.*wm\.status = 'active'.*JOIN chat\.dm_members dm.*dm\.user_id = candidate\.user_id.*dm\.status = 'active'`).
+		WithArgs("ws-1", "dm-1", []string{"user-1", "user-2"}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id"}).AddRow("user-2"))
+
+	store := storage.NewPGXDMStore(mock)
+	allowed, err := store.FilterUsersInConversation(
+		context.Background(), "ws-1", "dm-1", []string{"user-1", "user-2"},
+	)
+	if err != nil {
+		t.Fatalf("FilterUsersInConversation: %v", err)
+	}
+	if len(allowed) != 1 || allowed[0] != "user-2" {
+		t.Fatalf("expected only the participant, got %v", allowed)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}

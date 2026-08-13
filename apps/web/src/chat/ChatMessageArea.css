@@ -96,6 +96,29 @@
   letter-spacing: -0.01em;
 }
 
+/* The DM header's presence word (RF-58). A pill beside the name, sized so it
+   reads as metadata rather than as a second title. It is only rendered for a
+   state the server has stated, so it never occupies space with a placeholder. */
+.chat-msg-area__header-presence {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-muted, #5c7380);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.chat-msg-area__header-presence--online {
+  background: var(--color-success-tint, #dcfce7);
+  color: var(--color-success-ink, #166534);
+}
+
+.chat-msg-area__header-presence--away {
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+}
+
 /* Pushes the header actions to the trailing edge without a wrapper element. */
 .chat-msg-area__header-actions {
   margin-left: auto;
@@ -146,7 +169,10 @@
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  overflow: hidden;
+  /* Anchors the presence dot (RF-58). The picture is rounded by its own rule
+     rather than by clipping this box, because clipping here would cut the dot
+     off at the circle's edge along with it. */
+  position: relative;
 }
 
 /* Deterministic fallback colours, mirroring the sidebar palette so the same
@@ -174,6 +200,7 @@
 .chat-msg-area__header-avatar-img {
   width: 100%;
   height: 100%;
+  border-radius: 50%;
   object-fit: cover;
   display: block;
 }
@@ -236,6 +263,8 @@
   justify-content: center;
   flex-shrink: 0;
   align-self: flex-end;
+  /* Anchors the presence dot (RF-58); the avatar's own box is unchanged. */
+  position: relative;
 }
 
 .chat-msg-area__msg-body {

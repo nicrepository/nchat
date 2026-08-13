@@ -24,7 +24,8 @@ This PR adds the in-process WebSocket hub package (`internal/ws`) to `chat-servi
 
 - **Distributed fan-out**: No Valkey, Redis, or pub-sub. This hub is single-instance only.
 - **Frontend integration**: No client-side code.
-- **Notifications, presence, typing indicators**: Out of scope.
+- **Notifications, typing indicators**: Out of scope. Presence has since been added
+  on top of this hub — see [presence over WebSocket](api/presence-websocket.md).
 - **End-to-end encryption / MLS key service**: Out of scope.
 - **Message send over WebSocket**: Writes go through REST HTTP; WS is server-push only.
 - **Full load test framework**: Performance baselines to be measured later.

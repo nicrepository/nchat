@@ -376,7 +376,7 @@ func TestRemoteMembersAddedSelfEchoIsSuppressed(t *testing.T) {
 	subscribeForTest(hubB, subscriber, TargetTypeChannel, maChannel)
 
 	evt := membersAddedEvent()
-	evt.SourceInstanceID = hubB.instanceID
+	evt.SourceInstanceID = hubB.presenceInstanceID
 	bus.inject(evt)
 
 	if queued := deliverRemoteBroadcast(t, hubB); queued != 0 {
@@ -442,7 +442,7 @@ func TestPublishMembersAddedReachesTheBus(t *testing.T) {
 	if !ok {
 		t.Fatal("members.added never reached the bus; remote pods would never see it")
 	}
-	if published.Type != EventTypeMembersAdded || published.SourceInstanceID != "pod-a" {
+	if published.Type != EventTypeMembersAdded || published.SourceInstanceID != hub.presenceInstanceID {
 		t.Fatalf("published %+v", published)
 	}
 	// What A publishes must be something B accepts: the two halves of the round
