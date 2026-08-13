@@ -387,8 +387,11 @@ test.describe("painel de perfil em DM 1:1", () => {
     await expect(panel.getByTestId("chat-details-profile-name")).toHaveText("Juliane Lino");
     // Linhas presentes e honestas, nunca linhas vazias.
     await expect(panel.getByTestId("chat-details-profile-meta")).toContainText("Não informado");
-    // Presença não rastreada não vira "offline".
-    await expect(panel.getByTestId("chat-details-profile-status")).toHaveCount(0);
+    // RF-58: presença agora é afirmada pelo servidor em tempo real, e este
+    // perfil não tem sessão alguma — "Offline" é o que o servidor respondeu,
+    // não um palpite do cliente. O caso em que nada foi respondido ainda
+    // continua sem indicador: está coberto em presence-avatars.spec.ts.
+    await expect(panel.getByTestId("chat-details-profile-status")).toHaveText("Offline");
     // Ausência de dados não é erro.
     await expect(panel.getByText("Não foi possível carregar o perfil.")).toHaveCount(0);
   });

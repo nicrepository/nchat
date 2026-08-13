@@ -14,6 +14,8 @@ import InlineMessageEditor from "./InlineMessageEditor";
 import MessageAttachments from "./MessageAttachments";
 import MessageEditHistory from "./MessageEditHistory";
 import { formatTime, senderLabel } from "./messageDisplay";
+import { presenceLabel, usePresence, type PresenceState } from "./presence";
+import PresenceDot from "./PresenceDot";
 import RichTextRenderer from "./RichTextRenderer";
 import type { CodecFormat } from "./tiptapSerializer";
 
@@ -49,6 +51,8 @@ export interface MessageBubbleProps {
   onDeleteMessage: (messageId: string) => Promise<void>;
   editDisabled?: boolean;
   channelId?: string;
+  /** The conversation on screen; presence is resolved within it (RF-58). */
+  presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
   /** RF-05: whether this message is currently pinned in the active target. */
@@ -348,8 +352,10 @@ function MessageMeta({
   message,
   isMine,
   isGrouped,
+  senderPresence,
   onOpenHistory,
 }: Pick<MessageBubbleProps, "message" | "isMine" | "isGrouped"> & {
+  senderPresence: PresenceState;
   onOpenHistory: () => void;
 }) {
   if (isGrouped && !message.isEdited) return null;
@@ -358,6 +364,18 @@ function MessageMeta({
       {!isGrouped && !isMine && (
         <span className="chat-msg-area__msg-sender" data-testid="chat-msg-sender">
           {senderLabel(message)}
+        </span>
+      )}
+      {/* The dot next to the avatar is decorative and lives inside an
+          aria-hidden wrapper, so without this the sender's state would be
+          conveyed by colour alone. It sits beside the name, in the same place
+          and under the same condition, so a screen reader hears the person and
+          their state once per group rather than once per message — and says
+          nothing at all when the server has not answered yet, since "unknown"
+          is the absence of a state and not a fourth one. */}
+      {!isGrouped && !isMine && senderPresence !== "unknown" && (
+        <span className="sr-only" data-testid="chat-msg-sender-presence">
+          {`Status: ${presenceLabel(senderPresence)}`}
         </span>
       )}
       {!isGrouped && (
@@ -481,6 +499,7 @@ export default function MessageBubble({
   onDeleteMessage,
   editDisabled = false,
   channelId,
+  presenceTarget,
   onTogglePin,
   isPinned = false,
   allowedReactionEmojis,
@@ -500,6 +519,12 @@ export default function MessageBubble({
   const [editing, setEditing] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Read for every message, including the user's own, so the hook order does
+  // not depend on who wrote it. Only the other party's avatar is drawn.
+  //
+  // Scoped to the conversation being read: the sender wrote here, so this
+  // conversation's roster is the one that would have named them.
+  const senderPresence = usePresence(message.senderId, presenceTarget);
   const saveEdit = useCallback(
     async (body: string, format: CodecFormat) => {
       const updated = await onEditMessage(message.id, body, format);
@@ -546,6 +571,10 @@ export default function MessageBubble({
       {!isMine && (
         <div className="chat-msg-area__msg-avatar" aria-hidden="true">
           {senderInitials(message)}
+          {/* Decoration only, like the avatar it sits on: the sender's name is
+              already in the message meta above, and repeating "Ausente" once
+              per message would make a conversation unbearable to listen to. */}
+          <PresenceDot state={senderPresence} size="sm" />
         </div>
       )}
       <div className="chat-msg-area__msg-body">
@@ -553,6 +582,7 @@ export default function MessageBubble({
           message={message}
           isMine={isMine}
           isGrouped={isGrouped}
+          senderPresence={senderPresence}
           onOpenHistory={() => setHistoryOpen(true)}
         />
         <div

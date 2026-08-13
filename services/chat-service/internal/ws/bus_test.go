@@ -103,6 +103,13 @@ func newBusTestHub(auth SubscriptionAuthorizer, bus BroadcastBus) *Hub {
 		subs:                    make(map[string]map[string]struct{}),
 		clientSubs:              make(map[string]map[string]struct{}),
 		subscriptionGenerations: make(map[string]map[string]uint64),
+		deliveredRosters:        make(map[string]string),
+		asserted:                make(map[presenceKey]map[string]uint64),
+		assertionEpoch:          make(map[presenceKey]map[string]uint64),
+		pendingAssertions:       make(map[presenceKey]map[string]struct{}),
+		assertionLocks:          newAssertionSequencer(),
+		presenceInstanceID:      "runtime-instance-A",
+		reconcileSignal:         make(chan struct{}, 1),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.busCancel = cancel
@@ -497,7 +504,7 @@ func TestHub_Bus_SelfOriginEvent_Ignored(t *testing.T) {
 	}
 
 	e := remoteEvt(testEventIDEcho)
-	e.SourceInstanceID = "instance-A" // same as hub.instanceID
+	e.SourceInstanceID = hub.presenceInstanceID // this process's own origin
 	bus.inject(e)
 
 	time.Sleep(50 * time.Millisecond)
@@ -623,8 +630,10 @@ func TestHub_Bus_PublishedEvent_HasInstanceIDAndEventID(t *testing.T) {
 	if !ok {
 		t.Fatal("expected bus to have received a published event")
 	}
-	if evt.SourceInstanceID != "instance-A" {
-		t.Errorf("expected SourceInstanceID 'instance-A', got %q", evt.SourceInstanceID)
+	// The runtime identity, not the configured one: WS_INSTANCE_ID can be shared
+	// by two pods, and an origin two processes share suppresses the wrong echo.
+	if evt.SourceInstanceID != hub.presenceInstanceID {
+		t.Errorf("expected SourceInstanceID %q, got %q", hub.presenceInstanceID, evt.SourceInstanceID)
 	}
 	if evt.EventID == "" {
 		t.Error("expected non-empty EventID")

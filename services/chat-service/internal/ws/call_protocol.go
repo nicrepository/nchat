@@ -144,7 +144,7 @@ func (h *Hub) publishCallToUser(ctx context.Context, call domain.Call, userID st
 			CreatedAt: call.CreatedAt, OccurredAt: call.UpdatedAt, ExpiresAt: call.ExpiresAt,
 			AcceptedAt: call.AcceptedAt, EndedAt: call.EndedAt,
 		},
-		EventID: uuid.NewString(), SourceInstanceID: h.instanceID, CreatedAt: call.UpdatedAt,
+		EventID: uuid.NewString(), SourceInstanceID: h.presenceInstanceID, CreatedAt: call.UpdatedAt,
 	}
 	data, err := json.Marshal(event)
 	if err != nil {

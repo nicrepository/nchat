@@ -332,7 +332,11 @@ describe("ConversationDetailsPanel — canal: membros", () => {
     expect(screen.queryByText("Você")).not.toBeInTheDocument();
   });
 
-  it("shows a presence indicator for every online member", () => {
+  // RF-58/CQ-3: the endpoint still reports `presence`, and the panel no longer
+  // renders it. Presence has one authority in this client — the realtime store —
+  // so a panel that also read the HTTP field could show "Online" for someone the
+  // sidebar and the header were showing nothing for.
+  it("ignores the presence the endpoint reports", () => {
     renderPanel({
       state: state({
         details: {
@@ -349,9 +353,12 @@ describe("ConversationDetailsPanel — canal: membros", () => {
       }),
     });
 
-    expect(screen.getAllByTestId("chat-details-presence")).toHaveLength(2);
-    expect(screen.getByText(/Membro · Online/)).toBeInTheDocument();
-    expect(screen.getByText(/Moderador · Online/)).toBeInTheDocument();
+    // No indicator and no word, because the store has said nothing. Both rows
+    // are still there: the roster does not depend on presence.
+    expect(screen.queryAllByTestId("presence-dot")).toHaveLength(0);
+    expect(screen.queryByText(/· Online/)).not.toBeInTheDocument();
+    expect(screen.getByText("Membro")).toBeInTheDocument();
+    expect(screen.getByText("Moderador")).toBeInTheDocument();
   });
 
   it("says nobody is online — not that the channel is empty — and keeps the total", () => {
@@ -701,10 +708,11 @@ describe("ConversationDetailsPanel — grupo", () => {
     const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
       "listitem",
     );
-    // Unlike the channel panel, presence decorates a row and never removes it.
+    // Unlike the channel panel, presence decorates a row and never removes it —
+    // and with the store silent there is no decoration to draw (RF-58/CQ-3).
     expect(rows).toHaveLength(2);
     expect(screen.getByText("Desconectado")).toBeInTheDocument();
-    expect(screen.getByText(/Participante · Offline/)).toBeInTheDocument();
+    expect(screen.getAllByText("Participante")).toHaveLength(2);
   });
 
   it("marks the authenticated participant by id, not by name", () => {
@@ -899,7 +907,7 @@ describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () =
 });
 
 describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
-  it("shows the other participant's name, role and presence", () => {
+  it("shows the other participant's name and role", () => {
     renderProfilePanel(
       directDetails({
         displayName: "Juliane Lino",
@@ -911,8 +919,9 @@ describe("ConversationDetailsPanel — DM 1:1: dados do perfil", () => {
     expect(screen.getByTestId("chat-details-profile-name")).toHaveTextContent("Juliane Lino");
     // The subtitle repeats the job title exactly as the prototype does.
     expect(screen.getAllByText("Infraestrutura & Suporte").length).toBeGreaterThan(0);
-    // Presence is a word, never only a colour.
-    expect(screen.getByTestId("chat-details-profile-status")).toHaveTextContent("Online");
+    // The presence badge belongs to the realtime store, which has said nothing
+    // here, so it is absent rather than repeating a fetched field (RF-58/CQ-3).
+    expect(screen.queryByTestId("chat-details-profile-status")).not.toBeInTheDocument();
   });
 
   it("falls back to initials when there is no avatar", () => {
