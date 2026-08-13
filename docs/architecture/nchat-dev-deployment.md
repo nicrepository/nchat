@@ -46,17 +46,17 @@ segredos permanecem fora do deploy automático.
 
 ## Matriz real de comunicação
 
-| Origem                          | Destino                | Porta/protocolo                    | Evidência/estado                               |
-| ------------------------------- | ---------------------- | ---------------------------------- | ---------------------------------------------- |
-| Traefik                         | web e sete serviços Go | porta nomeada `http`/TCP           | rotas públicas do Ingress                      |
-| Traefik                         | LiveKit                | TCP 7880                           | signaling em `/livekit`                        |
-| auth-service                    | PostgreSQL             | TCP 5432                           | `DATABASE_URL`/pgx                             |
-| chat-service                    | PostgreSQL             | TCP 5432                           | `DATABASE_URL`/pgx                             |
-| chat-service                    | Valkey                 | TCP 6379                           | cache, rate limit e broadcast por `VALKEY_URL` |
-| notification-service            | PostgreSQL             | TCP 5432                           | outbox por `DATABASE_URL`                      |
-| media-service                   | LiveKit AWS dev/teste  | HTTPS TCP 443                      | `LIVEKIT_API_URL` do Deployment e readiness    |
-| migrations e postgres-bootstrap | PostgreSQL             | TCP 5432                           | schema, grants e papéis                        |
-| browser                         | LiveKit AWS dev/teste  | WSS/HTTPS                          | `serverUrl` retornado pelo media-service       |
+| Origem                          | Destino                | Porta/protocolo          | Evidência/estado                               |
+| ------------------------------- | ---------------------- | ------------------------ | ---------------------------------------------- |
+| Traefik                         | web e sete serviços Go | porta nomeada `http`/TCP | rotas públicas do Ingress                      |
+| Traefik                         | LiveKit                | TCP 7880                 | signaling em `/livekit`                        |
+| auth-service                    | PostgreSQL             | TCP 5432                 | `DATABASE_URL`/pgx                             |
+| chat-service                    | PostgreSQL             | TCP 5432                 | `DATABASE_URL`/pgx                             |
+| chat-service                    | Valkey                 | TCP 6379                 | cache, rate limit e broadcast por `VALKEY_URL` |
+| notification-service            | PostgreSQL             | TCP 5432                 | outbox por `DATABASE_URL`                      |
+| media-service                   | LiveKit AWS dev/teste  | HTTPS TCP 443            | `LIVEKIT_API_URL` do Deployment e readiness    |
+| migrations e postgres-bootstrap | PostgreSQL             | TCP 5432                 | schema, grants e papéis                        |
+| browser                         | LiveKit AWS dev/teste  | WSS/HTTPS                | `serverUrl` retornado pelo media-service       |
 
 Não há chamada HTTP/gRPC entre microsserviços no código atual. `file-service`,
 `admin-service` e `search-service` são executáveis, mas hoje expõem apenas contratos
