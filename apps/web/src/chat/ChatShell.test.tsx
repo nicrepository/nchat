@@ -93,6 +93,7 @@ beforeEach(() => {
   vi.mocked(issueCallToken).mockResolvedValue({
     token: "media-token",
     expiresAt: "2026-08-03T12:05:00Z",
+    serverUrl: "wss://livekit-dev.nic-labs.com",
   });
   vi.mocked(requestMediaPermission).mockReset();
   vi.mocked(requestMediaPermission).mockResolvedValue({ ok: true });

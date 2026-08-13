@@ -132,7 +132,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       if (!current()) return;
       const result = await issueCallToken(call.call_id);
       if (!current()) return;
-      await mediaRef.current?.connect(call, result.token);
+      await mediaRef.current?.connect(call, result.token, result.serverUrl);
       if (!current()) return;
       mediaCallIdRef.current = call.call_id;
       setMediaReady(true);

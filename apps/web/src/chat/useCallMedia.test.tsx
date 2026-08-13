@@ -54,11 +54,24 @@ function setup(makeLoader?: (factory: LiveKitSessionFactory) => LiveKitSessionLo
   });
   const loader = makeLoader?.(factory) ?? vi.fn(async () => factory);
   const view = renderHook(() => useCallMedia(loader));
+  const result = {
+    get current() {
+      const current = view.result.current;
+      return {
+        ...current,
+        connect: (
+          call: Parameters<typeof current.connect>[0],
+          token: Parameters<typeof current.connect>[1],
+          serverUrl = liveKitServerUrl,
+        ) => current.connect(call, token, serverUrl),
+      };
+    },
+  };
   const getSession = () => {
     if (!session) throw new Error("Session was not created");
     return session;
   };
-  return { ...view, factory, loader, getSession, sessions };
+  return { ...view, result, factory, loader, getSession, sessions };
 }
 
 function deferred<T>() {
@@ -75,6 +88,7 @@ const videoCall = {
   call_id: "00000000-0000-4000-8000-000000000801",
   call_type: "video" as const,
 };
+const liveKitServerUrl = "wss://livekit-dev.nic-labs.com";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -98,16 +112,13 @@ describe("useCallMedia", () => {
 
     await act(() => view.result.current.prepare());
     await act(() => view.result.current.startAudio());
-    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    await act(() => view.result.current.connect(videoCall, "participant-token", liveKitServerUrl));
 
     const session = view.getSession();
     expect(view.loader).toHaveBeenCalledOnce();
     expect(view.factory).toHaveBeenCalledOnce();
     expect(session.startAudio).toHaveBeenCalledOnce();
-    expect(session.connect).toHaveBeenCalledWith(
-      "ws://localhost:3000/livekit",
-      "participant-token",
-    );
+    expect(session.connect).toHaveBeenCalledWith(liveKitServerUrl, "participant-token");
     expect(session.enableCamera).toHaveBeenCalledOnce();
     expect(session.enableMicrophone).toHaveBeenCalledOnce();
     expect(view.result.current.status).toBe("connected");
@@ -119,7 +130,11 @@ describe("useCallMedia", () => {
     const view = setup();
 
     await act(() =>
-      view.result.current.connect({ ...videoCall, call_type: "audio" }, "participant-token"),
+      view.result.current.connect(
+        { ...videoCall, call_type: "audio" },
+        "participant-token",
+        liveKitServerUrl,
+      ),
     );
 
     expect(view.getSession().enableCamera).not.toHaveBeenCalled();
@@ -292,7 +307,11 @@ describe("useCallMedia", () => {
     async (callType) => {
       const view = setup();
       await act(() =>
-        view.result.current.connect({ ...videoCall, call_type: callType }, "participant-token"),
+        view.result.current.connect(
+          { ...videoCall, call_type: callType },
+          "participant-token",
+          liveKitServerUrl,
+        ),
       );
 
       act(() => view.getSession().callbacks.onAudioPlaybackChanged(false));
@@ -418,6 +437,7 @@ describe("useCallMedia", () => {
       view.result.current.connect(
         { ...videoCall, call_id: "00000000-0000-4000-8000-000000000802" },
         "fresh-token",
+        liveKitServerUrl,
       ),
     );
     const newSession = view.getSession();
@@ -453,10 +473,7 @@ describe("useCallMedia", () => {
 
     await act(() => view.result.current.connect(videoCall, "fresh-token"));
     expect(view.loader).toHaveBeenCalledTimes(2);
-    expect(view.getSession().connect).toHaveBeenCalledWith(
-      "ws://localhost:3000/livekit",
-      "fresh-token",
-    );
+    expect(view.getSession().connect).toHaveBeenCalledWith(liveKitServerUrl, "fresh-token");
   });
 
   it("does not create a session when the call ends before the import resolves", async () => {
@@ -666,6 +683,7 @@ describe("useCallMedia", () => {
         view.result.current.connect(
           { ...videoCall, call_id: "00000000-0000-4000-8000-000000000900" },
           "fresh-token",
+          liveKitServerUrl,
         ),
       );
       expect(view.result.current.microphoneEnabled).toBe(true);
@@ -711,6 +729,7 @@ describe("useCallMedia", () => {
         view.result.current.connect(
           { ...videoCall, call_id: "00000000-0000-4000-8000-000000000901" },
           "fresh-token",
+          liveKitServerUrl,
         ),
       );
 
@@ -782,6 +801,7 @@ describe("useCallMedia", () => {
         view.result.current.connect(
           { ...videoCall, call_id: "00000000-0000-4000-8000-000000000910" },
           "fresh-token",
+          liveKitServerUrl,
         ),
       );
       const sessionB = view.getSession();
@@ -833,6 +853,7 @@ describe("useCallMedia", () => {
         view.result.current.connect(
           { ...videoCall, call_id: "00000000-0000-4000-8000-000000000911" },
           "fresh-token",
+          liveKitServerUrl,
         ),
       );
       const sessionB = view.getSession();
@@ -881,6 +902,7 @@ describe("useCallMedia", () => {
         view.result.current.connect(
           { ...videoCall, call_id: "00000000-0000-4000-8000-000000000912" },
           "fresh-token",
+          liveKitServerUrl,
         ),
       );
       const sessionB = view.getSession();
@@ -948,6 +970,7 @@ describe("useCallMedia", () => {
         view.result.current.connect(
           { ...videoCall, call_id: "00000000-0000-4000-8000-000000000913" },
           "fresh-token",
+          liveKitServerUrl,
         ),
       );
       expect(view.result.current.microphoneEnabled).toBe(true);
