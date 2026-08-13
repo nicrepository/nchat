@@ -36,8 +36,27 @@ func (s *stubSidebarProvider) GetSidebar(_ context.Context, _ string) (service.S
 
 // sidebarRouter builds a test router wired with the given validator and stub.
 // allowAllSessionValidator accepts all sessions so tests focus on sidebar logic.
-func sidebarRouter(v *httpapi.TokenValidator, svc *stubSidebarProvider) http.Handler {
+func sidebarRouter(v *httpapi.TokenValidator, svc interface {
+	GetSidebar(context.Context, string) (service.SidebarData, error)
+}) http.Handler {
 	return httpapi.NewRouter(sidebarTestConfig(), nil, httpapi.ReadinessState{}, v, allowAllSessionValidator{}, httpapi.NewSidebarHandler(svc), httpapi.NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil)
+}
+
+type pinningSidebarProvider struct {
+	stubSidebarProvider
+	pinArgs   []string
+	unpinArgs []string
+	err       error
+}
+
+func (s *pinningSidebarProvider) PinConversation(_ context.Context, userID, targetType, targetID string) error {
+	s.pinArgs = []string{userID, targetType, targetID}
+	return s.err
+}
+
+func (s *pinningSidebarProvider) UnpinConversation(_ context.Context, userID, targetType, targetID string) error {
+	s.unpinArgs = []string{userID, targetType, targetID}
+	return s.err
 }
 
 // authGet returns an authenticated GET request to RouteSidebar.
@@ -45,6 +64,14 @@ func authGet(t *testing.T) *http.Request {
 	t.Helper()
 	tok := makeTestToken(t, testUserID, testHMACSecret, testIssuer, testAudience, time.Hour)
 	req := httptest.NewRequest(http.MethodGet, httpapi.RouteSidebar, nil)
+	setBearerToken(req, tok)
+	return req
+}
+
+func authSidebarPinRequest(t *testing.T, method, path string) *http.Request {
+	t.Helper()
+	tok := makeTestToken(t, testUserID, testHMACSecret, testIssuer, testAudience, time.Hour)
+	req := httptest.NewRequest(method, path, nil)
 	setBearerToken(req, tok)
 	return req
 }
@@ -69,6 +96,42 @@ func TestSidebarHandler_Unauthenticated_Returns401(t *testing.T) {
 	router.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestSidebarHandler_PinAndUnpinUseAuthenticatedUser(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &pinningSidebarProvider{}
+	router := sidebarRouter(v, svc)
+	channelID := "11111111-1111-1111-1111-111111111111"
+	path := "/api/chat/channels/" + channelID + "/sidebar-pin"
+
+	for _, method := range []string{http.MethodPost, http.MethodPost, http.MethodDelete, http.MethodDelete} {
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, authSidebarPinRequest(t, method, path))
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("%s expected 204, got %d: %s", method, rr.Code, rr.Body.String())
+		}
+	}
+	if got, want := strings.Join(svc.pinArgs, ","), strings.Join([]string{testUserID, service.PinTargetChannel, channelID}, ","); got != want {
+		t.Fatalf("pin args = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(svc.unpinArgs, ","), strings.Join([]string{testUserID, service.PinTargetChannel, channelID}, ","); got != want {
+		t.Fatalf("unpin args = %q, want %q", got, want)
+	}
+}
+
+func TestSidebarHandler_PinInaccessibleConversationReturnsGenericNotFound(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &pinningSidebarProvider{err: domain.ErrNotFound}
+	router := sidebarRouter(v, svc)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authSidebarPinRequest(t, http.MethodPost, "/api/chat/dm/11111111-1111-1111-1111-111111111111/sidebar-pin"))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected non-enumerating 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(strings.ToLower(rr.Body.String()), "private") {
+		t.Fatalf("response leaks access detail: %s", rr.Body.String())
 	}
 }
 
@@ -699,16 +762,17 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 	mustDecode(t, rr, &raw)
 	for _, dm := range raw.Data.DMs {
 		// created_at and last_message_at (issue #414) are the two ordering keys;
-		// they say when, never what, who or which message.
-		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at"} {
+		// pinned_at is the caller's private ordering preference; all three say
+		// when, never what, who or which message.
+		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at", "pinned_at"} {
 			if _, ok := dm[key]; !ok {
 				t.Fatalf("missing expected DM field %q in %v", key, dm)
 			}
 		}
 		counterpart, hasCounterpart := dm["counterpart"]
-		wantFields := 5
+		wantFields := 6
 		if hasCounterpart {
-			wantFields = 6
+			wantFields = 7
 		}
 		if len(dm) != wantFields {
 			t.Fatalf("expected exactly %d DM fields, got %d: %v", wantFields, len(dm), dm)

@@ -53,6 +53,7 @@ interface SidebarChannelResponse {
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
+  pinned_at?: unknown;
 }
 
 interface SidebarDMCounterpartResponse {
@@ -71,6 +72,7 @@ interface SidebarDMResponse {
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
+  pinned_at?: unknown;
 }
 
 interface SidebarResponse {
@@ -167,6 +169,7 @@ function sidebarTimestamp(raw: unknown): string | null {
 }
 
 function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
+  const pinnedAt = sidebarTimestamp(ch.pinned_at);
   return {
     id: ch.id,
     name: ch.display_name || ch.slug,
@@ -174,6 +177,7 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     canWrite: ch.can_write === true,
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
+    ...(pinnedAt ? { pinnedAt } : {}),
   };
 }
 
@@ -272,6 +276,7 @@ function mapSidebarCounterpart(raw: SidebarDMCounterpartResponse | undefined) {
 function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
   const type = parseDMConversationType(dm.type);
   if (type === undefined) return undefined;
+  const pinnedAt = sidebarTimestamp(dm.pinned_at);
   return {
     id: dm.id,
     type,
@@ -280,6 +285,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
+    ...(pinnedAt ? { pinnedAt } : {}),
   };
 }
 
@@ -363,6 +369,18 @@ export async function fetchSidebarData(): Promise<{
 
   const dms = mapSidebarDMs(sidebar.dm_conversations);
   return { currentUserId: sidebar.current_user_id ?? "", channels, dms, categories };
+}
+
+export async function setSidebarConversationPinned(
+  targetType: "channel" | "dm",
+  targetId: string,
+  pinned: boolean,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/sidebar-pin`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/sidebar-pin`;
+  await authenticatedFetch(target, { method: pinned ? "POST" : "DELETE" });
 }
 
 /**

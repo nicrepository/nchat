@@ -11,6 +11,21 @@ import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } fro
 import { sortByActivity } from "./sidebarOrder";
 import type { SidebarState } from "./useChatSidebar";
 
+function IconPin() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      className="chat-sidebar__icon"
+      aria-hidden="true"
+    >
+      <path d="M12 17v5M7 3h10l-2 5v4l3 3H6l3-3V8L7 3Z" />
+    </svg>
+  );
+}
+
 // ── Inline SVG icons ─────────────────────────────────────────────────────────
 
 function IconHash() {
@@ -283,9 +298,10 @@ interface ChannelListProps {
   activeChannelId: string | undefined;
   onSelect: (id: string) => void;
   labelId: string;
+  onPin: (id: string, pinned: boolean) => void;
 }
 
-function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelListProps) {
+function ChannelList({ channels, activeChannelId, onSelect, labelId, onPin }: ChannelListProps) {
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -299,31 +315,42 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId }: ChannelLi
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
         return (
-          <button
-            key={ch.id}
-            type="button"
-            role="option"
-            aria-selected={isActive}
-            aria-label={`Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`}
-            className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
-            onClick={() => onSelect(ch.id)}
-          >
-            {ch.type === "private" ? <IconLock /> : <IconHash />}
-            <span className="chat-sidebar__nav-item-name">{ch.name}</span>
-            {ch.type === "private" && (
-              <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
-                privado
-              </span>
-            )}
-            {ch.unreadCount != null && ch.unreadCount > 0 && (
-              <span
-                className="chat-sidebar__unread-badge"
-                aria-label={`${ch.unreadCount} não lidas`}
-              >
-                {ch.unreadCount}
-              </span>
-            )}
-          </button>
+          <div key={ch.id} className="chat-sidebar__item-row">
+            <button
+              type="button"
+              role="option"
+              aria-selected={isActive}
+              aria-label={`Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`}
+              className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
+              onClick={() => onSelect(ch.id)}
+            >
+              {ch.type === "private" ? <IconLock /> : <IconHash />}
+              <span className="chat-sidebar__nav-item-name">{ch.name}</span>
+              {ch.type === "private" && (
+                <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
+                  privado
+                </span>
+              )}
+              {ch.unreadCount != null && ch.unreadCount > 0 && (
+                <span
+                  className="chat-sidebar__unread-badge"
+                  aria-label={`${ch.unreadCount} não lidas`}
+                >
+                  {ch.unreadCount}
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              className="chat-sidebar__pin-action"
+              aria-pressed={Boolean(ch.pinnedAt)}
+              aria-label={ch.pinnedAt ? `Desafixar ${ch.name}` : `Fixar ${ch.name} no topo`}
+              title={ch.pinnedAt ? "Desafixar" : "Fixar no topo"}
+              onClick={() => onPin(ch.id, Boolean(ch.pinnedAt))}
+            >
+              <IconPin />
+            </button>
+          </div>
         );
       })}
     </div>
@@ -339,6 +366,7 @@ interface DMListProps {
   onSelect: (id: string) => void;
   labelId: string;
   emptyMessage: string;
+  onPin: (id: string, pinned: boolean) => void;
 }
 
 /**
@@ -354,10 +382,12 @@ function DMRow({
   dm,
   isActive,
   onSelect,
+  onPin,
 }: {
   dm: DMConversation;
   isActive: boolean;
   onSelect: (id: string) => void;
+  onPin: (id: string, pinned: boolean) => void;
 }) {
   const isGroup = dm.type === "group";
   const counterpart = dm.counterpart;
@@ -375,42 +405,54 @@ function DMRow({
   const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`;
 
   return (
-    <button
-      type="button"
-      role="option"
-      aria-selected={isActive}
-      aria-label={label}
-      className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
-      onClick={() => onSelect(dm.id)}
-    >
-      {/* The 1:1 avatar always renders — with a picture when there is
+    <div className="chat-sidebar__item-row">
+      <button
+        type="button"
+        role="option"
+        aria-selected={isActive}
+        aria-label={label}
+        className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
+        onClick={() => onSelect(dm.id)}
+      >
+        {/* The 1:1 avatar always renders — with a picture when there is
           one, with initials otherwise — so the row height never shifts
           depending on whether a counterpart has an avatar. */}
-      {isGroup ? (
-        <GroupAvatars dm={dm} />
-      ) : (
-        <Avatar
-          initials={initialsFrom(counterpart?.displayName ?? dm.name)}
-          src={counterpart?.avatarUrl}
-          color={avatarColorFor(counterpart?.userId ?? dm.id)}
-          status={presence}
-          size="sm"
-        />
-      )}
-      <span className="chat-sidebar__dm-name">{dm.name}</span>
-      {isGroup && (
-        <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
-      )}
-      {dm.unreadCount != null && dm.unreadCount > 0 && (
-        <span className="chat-sidebar__unread-badge" aria-label={`${dm.unreadCount} não lidas`}>
-          {dm.unreadCount}
-        </span>
-      )}
-    </button>
+        {isGroup ? (
+          <GroupAvatars dm={dm} />
+        ) : (
+          <Avatar
+            initials={initialsFrom(counterpart?.displayName ?? dm.name)}
+            src={counterpart?.avatarUrl}
+            color={avatarColorFor(counterpart?.userId ?? dm.id)}
+            status={presence}
+            size="sm"
+          />
+        )}
+        <span className="chat-sidebar__dm-name">{dm.name}</span>
+        {isGroup && (
+          <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
+        )}
+        {dm.unreadCount != null && dm.unreadCount > 0 && (
+          <span className="chat-sidebar__unread-badge" aria-label={`${dm.unreadCount} não lidas`}>
+            {dm.unreadCount}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
+        className="chat-sidebar__pin-action"
+        aria-pressed={Boolean(dm.pinnedAt)}
+        aria-label={dm.pinnedAt ? `Desafixar ${dm.name}` : `Fixar ${dm.name} no topo`}
+        title={dm.pinnedAt ? "Desafixar" : "Fixar no topo"}
+        onClick={() => onPin(dm.id, Boolean(dm.pinnedAt))}
+      >
+        <IconPin />
+      </button>
+    </div>
   );
 }
 
-function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProps) {
+function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, onPin }: DMListProps) {
   if (dms.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -422,7 +464,13 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage }: DMListProp
   return (
     <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {dms.map((dm) => (
-        <DMRow key={dm.id} dm={dm} isActive={dm.id === activeDMId} onSelect={onSelect} />
+        <DMRow
+          key={dm.id}
+          dm={dm}
+          isActive={dm.id === activeDMId}
+          onSelect={onSelect}
+          onPin={onPin}
+        />
       ))}
     </div>
   );
@@ -520,6 +568,10 @@ function SidebarUser() {
 interface ChatSidebarProps {
   state: SidebarState;
   retry: () => void;
+  setPinned?: (
+    target: { kind: "channel" | "dm"; targetId: string },
+    pinned: boolean,
+  ) => Promise<void>;
 }
 
 // Static because the sidebar is mounted once per app; each heading owns the id
@@ -528,7 +580,7 @@ const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
 const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
 const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
 
-export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
+export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
   // One dialog, one trigger, one piece of open state: two of them could be open
@@ -545,6 +597,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
+  const [pinError, setPinError] = useState("");
 
   useEffect(() => {
     if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
@@ -581,10 +634,13 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
   const dms = state.status === "ready" ? state.dms : undefined;
   const categories = state.status === "ready" ? state.categories : undefined;
 
-  const effectiveCategories =
-    categories && categories.length > 0
-      ? categories
-      : [{ id: undefined, name: "Geral", kind: "uncategorized" as const }];
+  const effectiveCategories = useMemo(
+    () =>
+      categories && categories.length > 0
+        ? categories
+        : [{ id: undefined, name: "Geral", kind: "uncategorized" as const }],
+    [categories],
+  );
 
   const groupedChannelsByCategory = useMemo(() => {
     if (!channels) return [];
@@ -605,7 +661,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         channels: ordered,
       };
     });
-  }, [channels, categories]);
+  }, [channels, effectiveCategories]);
 
   const { orderedDirects, orderedGroups } = useMemo(() => {
     const { directs, groups } = partitionDMs(dms ?? []);
@@ -618,6 +674,14 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
 
   function handleDMSelect(id: string) {
     navigate(`/chat/dm/${encodeURIComponent(id)}`);
+  }
+
+  function handlePin(kind: "channel" | "dm", id: string, pinned: boolean) {
+    if (!setPinned) return;
+    setPinError("");
+    void setPinned({ kind, targetId: id }, !pinned).catch(() =>
+      setPinError("Nao foi possivel atualizar a fixacao."),
+    );
   }
 
   function closeNewConversation() {
@@ -692,42 +756,53 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
         {state.status === "ready" && (
           <>
             <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              <div className="chat-sidebar__categories-list">
-                {groupedChannelsByCategory.map(({ category, channels: catChannels }) => {
-                  const categoryKey = category.id || "uncategorized";
-                  const isCollapsed = collapsedCategories[categoryKey] === true;
-
-                  return (
-                    <div key={categoryKey} className="chat-sidebar__category-group">
-                      <button
-                        type="button"
-                        className="chat-sidebar__category-header"
-                        onClick={() => toggleCategory(categoryKey)}
-                        aria-expanded={!isCollapsed}
-                        tabIndex={-1}
-                      >
-                        <span
-                          className={`chat-sidebar__category-chevron ${isCollapsed ? "chat-sidebar__category-chevron--collapsed" : ""}`}
+              {groupedChannelsByCategory.length <= 1 &&
+              groupedChannelsByCategory[0]?.category.kind === "uncategorized" ? (
+                <ChannelList
+                  channels={groupedChannelsByCategory[0]?.channels ?? []}
+                  activeChannelId={activeChannelId}
+                  onSelect={handleChannelSelect}
+                  labelId={CHANNELS_LABEL_ID}
+                  onPin={(id, pinned) => handlePin("channel", id, pinned)}
+                />
+              ) : (
+                <div className="chat-sidebar__categories-list">
+                  {groupedChannelsByCategory.map(({ category, channels: categoryChannels }) => {
+                    const categoryKey = category.id ?? "uncategorized";
+                    const headerId = `chat-sidebar-category-${categoryKey}`;
+                    const collapsed = Boolean(collapsedCategories[categoryKey]);
+                    return (
+                      <div key={categoryKey} className="chat-sidebar__category-group">
+                        <button
+                          type="button"
+                          id={headerId}
+                          className="chat-sidebar__category-header"
+                          aria-expanded={!collapsed}
+                          onClick={() => toggleCategory(categoryKey)}
                         >
-                          <IconChevronDown />
-                        </span>
-                        <span className="chat-sidebar__category-title">{category.name}</span>
-                      </button>
-
-                      {!isCollapsed && (
-                        <div className="chat-sidebar__category-channels">
-                          <ChannelList
-                            channels={catChannels}
-                            activeChannelId={activeChannelId}
-                            onSelect={handleChannelSelect}
-                            labelId={CHANNELS_LABEL_ID}
-                          />
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+                          <span
+                            className={`chat-sidebar__category-chevron${collapsed ? " chat-sidebar__category-chevron--collapsed" : ""}`}
+                          >
+                            <IconChevronDown />
+                          </span>
+                          <span className="chat-sidebar__category-title">{category.name}</span>
+                        </button>
+                        {!collapsed && (
+                          <div className="chat-sidebar__category-channels">
+                            <ChannelList
+                              channels={categoryChannels}
+                              activeChannelId={activeChannelId}
+                              onSelect={handleChannelSelect}
+                              labelId={headerId}
+                              onPin={(id, pinned) => handlePin("channel", id, pinned)}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </Section>
 
             <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
@@ -737,6 +812,7 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                 onSelect={handleDMSelect}
                 labelId={DIRECTS_LABEL_ID}
                 emptyMessage="Nenhuma mensagem direta."
+                onPin={(id, pinned) => handlePin("dm", id, pinned)}
               />
             </Section>
 
@@ -747,9 +823,15 @@ export default function ChatSidebar({ state, retry }: ChatSidebarProps) {
                 onSelect={handleDMSelect}
                 labelId={GROUPS_LABEL_ID}
                 emptyMessage="Nenhum grupo."
+                onPin={(id, pinned) => handlePin("dm", id, pinned)}
               />
             </Section>
           </>
+        )}
+        {pinError && (
+          <p className="chat-sidebar__pin-error" role="alert">
+            {pinError}
+          </p>
         )}
       </div>
 

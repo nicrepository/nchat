@@ -21,8 +21,13 @@
 }
 ```
 
+Cada item tambem pode conter `pinned_at` (RFC 3339 UTC), ou `null` quando a
+conversa nao esta fixada pelo usuario autenticado. A preferencia e individual e
+so e projetada depois da mesma autorizacao que admite o item na sidebar.
+
 | Campo             | Tipo                   | Significado                                                                |
 | ----------------- | ---------------------- | -------------------------------------------------------------------------- |
+| `pinned_at`       | RFC 3339 UTC ou `null` | Quando o usuario atual fixou a conversa; `null` quando ela nao esta fixa   |
 | `created_at`      | RFC 3339 UTC           | Quando a conversa foi criada. Chave de desempate das conversas vazias      |
 | `last_message_at` | RFC 3339 UTC ou `null` | `created_at` da mensagem mais recente persistida; `null` se nao ha nenhuma |
 
@@ -94,11 +99,13 @@ A ordem e computada no cliente (`apps/web/src/chat/sidebarOrder.ts`) e aplicada
 entao um canal nunca desloca um grupo ou uma DM. O comparador e total e nao
 depende da estabilidade do `Array.prototype.sort`:
 
-1. item **com** mensagem antes de item **sem** mensagem;
-2. entre os que tem, `last_message_at` decrescente;
-3. entre os que nao tem, `created_at` decrescente;
-4. empate: nome normalizado (trim + lowercase), ascendente;
-5. empate final: `id`, ascendente.
+1. item fixado antes de item nao fixado;
+2. entre fixados, `pinned_at` crescente (o mais antigo primeiro);
+3. item **com** mensagem antes de item **sem** mensagem;
+4. entre os que tem, `last_message_at` decrescente;
+5. entre os que nao tem, `created_at` decrescente;
+6. empate: nome normalizado (trim + lowercase), ascendente;
+7. empate final: `id`, ascendente.
 
 O passo 1 e o motivo de os dois campos serem separados: uma conversa vazia
 criada agora nao pode ultrapassar uma conversa escrita meses atras, e
