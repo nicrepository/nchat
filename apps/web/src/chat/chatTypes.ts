@@ -23,6 +23,8 @@ export interface ConversationActivity {
   lastMessageAt?: string | null;
   /** Server creation timestamp; the fallback key for conversations without messages. */
   createdAt?: string | null;
+  /** Server-side preference timestamp; null when this user has not pinned the conversation. */
+  pinnedAt?: string | null;
 }
 
 export interface Channel extends ConversationActivity {

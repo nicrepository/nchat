@@ -33,7 +33,7 @@ test.describe("RF-09 — citação entre canais", () => {
 
     const sourceBubble = await revealActions(page, source.id);
     await sourceBubble.getByRole("button", { name: "Citar em outra conversa" }).click();
-    await page.getByRole("button", { name: /Canal E2E/ }).click();
+    await page.getByRole("button", { name: "Canal E2E", exact: true }).click();
     await expect(page.getByTestId("chat-composer-reference")).toContainText(
       "conteúdo autorizado RF-09",
     );

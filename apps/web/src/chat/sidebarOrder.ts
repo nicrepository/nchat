@@ -113,6 +113,16 @@ function compareInstants(a: Instant, b: Instant): number {
  *     runtimes) stability of `Array.prototype.sort`.
  */
 export function compareByActivity(a: ActivityOrdered, b: ActivityOrdered): number {
+  const aPinned = parseInstant(a.pinnedAt);
+  const bPinned = parseInstant(b.pinnedAt);
+  if ((aPinned === undefined) !== (bPinned === undefined)) {
+    return aPinned === undefined ? 1 : -1;
+  }
+  if (aPinned !== undefined && bPinned !== undefined) {
+    const byPinnedAt = compareInstants(aPinned, bPinned);
+    if (byPinnedAt !== 0) return byPinnedAt;
+  }
+
   const aLast = parseInstant(a.lastMessageAt);
   const bLast = parseInstant(b.lastMessageAt);
 

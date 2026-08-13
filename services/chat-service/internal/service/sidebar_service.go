@@ -40,6 +40,7 @@ type SidebarChannel struct {
 	Channel       domain.Channel
 	CanWrite      bool
 	LastMessageAt *time.Time
+	PinnedAt      *time.Time
 }
 
 type sidebarChannelStore interface {
@@ -53,6 +54,64 @@ type SidebarService struct {
 	channels   sidebarChannelStore
 	members    storage.MemberStore
 	dms        storage.DMStore
+	pins       storage.SidebarPinStore
+}
+
+// WithPins adds the optional per-user preference store without changing the
+// existing constructor used by sidebar readers and tests.
+func (s *SidebarService) WithPins(pins storage.SidebarPinStore) *SidebarService {
+	s.pins = pins
+	return s
+}
+
+// PinConversation and UnpinConversation always resolve the workspace from the
+// same server-side sidebar context as GET. The client supplies only a target.
+func (s *SidebarService) PinConversation(ctx context.Context, userID, targetType, targetID string) error {
+	workspace, _, err := s.authorizeWorkspaceMember(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if s.pins == nil {
+		return fmt.Errorf("sidebar pins unavailable")
+	}
+	return s.pins.Pin(ctx, workspace.ID, userID, targetType, targetID)
+}
+
+func (s *SidebarService) UnpinConversation(ctx context.Context, userID, targetType, targetID string) error {
+	if _, _, err := s.authorizeWorkspaceMember(ctx, userID); err != nil {
+		return err
+	}
+	if s.pins == nil {
+		return fmt.Errorf("sidebar pins unavailable")
+	}
+	return s.pins.Unpin(ctx, userID, targetType, targetID)
+}
+
+func (s *SidebarService) authorizeWorkspaceMember(ctx context.Context, userID string) (domain.Workspace, domain.WorkspaceMember, error) {
+	if userID == "" {
+		return domain.Workspace{}, domain.WorkspaceMember{}, fmt.Errorf("%w: user_id is required", domain.ErrInvalidInput)
+	}
+	workspace, err := s.workspaces.GetDefaultWorkspace(ctx)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.Workspace{}, domain.WorkspaceMember{}, domain.ErrNotFound
+		}
+		return domain.Workspace{}, domain.WorkspaceMember{}, fmt.Errorf("get default workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.Workspace{}, domain.WorkspaceMember{}, domain.ErrForbidden
+	}
+	member, err := s.members.GetWorkspaceMember(ctx, workspace.ID, userID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.Workspace{}, domain.WorkspaceMember{}, domain.ErrForbidden
+		}
+		return domain.Workspace{}, domain.WorkspaceMember{}, fmt.Errorf("get workspace member: %w", err)
+	}
+	if member.Status != domain.MemberStatusActive {
+		return domain.Workspace{}, domain.WorkspaceMember{}, domain.ErrForbidden
+	}
+	return workspace, member, nil
 }
 
 func NewSidebarService(
@@ -77,44 +136,49 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 		return SidebarData{}, fmt.Errorf("%w: user_id is required", domain.ErrInvalidInput)
 	}
 
-	workspace, err := s.workspaces.GetDefaultWorkspace(ctx)
+	workspace, member, err := s.authorizeWorkspaceMember(ctx, userID)
 	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return SidebarData{}, domain.ErrNotFound
-		}
-		return SidebarData{}, fmt.Errorf("get default workspace: %w", err)
+		return SidebarData{}, err
 	}
-	if workspace.Status != domain.WorkspaceStatusActive {
-		return SidebarData{}, domain.ErrForbidden
-	}
-
-	member, err := s.members.GetWorkspaceMember(ctx, workspace.ID, userID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return SidebarData{}, domain.ErrForbidden
-		}
-		return SidebarData{}, fmt.Errorf("get workspace member: %w", err)
-	}
-	if member.Status != domain.MemberStatusActive {
-		return SidebarData{}, domain.ErrForbidden
-	}
-
 	channels, err := s.channels.ListVisibleChannelAccessByUser(ctx, workspace.ID, userID)
 	if err != nil {
 		return SidebarData{}, fmt.Errorf("list channels: %w", err)
 	}
+	pinnedAt := map[string]time.Time{}
+	if s.pins != nil {
+		pins, err := s.pins.ListVisible(ctx, workspace.ID, userID)
+		if err != nil {
+			return SidebarData{}, fmt.Errorf("list sidebar pins: %w", err)
+		}
+		for _, pin := range pins {
+			pinnedAt[pin.TargetType+"\x00"+pin.TargetID] = pin.PinnedAt
+		}
+	}
 	sidebarChannels := make([]SidebarChannel, 0, len(channels))
 	for _, access := range channels {
+		pinned := pinnedAt[storage.SidebarPinTargetChannel+"\x00"+access.Channel.ID]
+		var pinnedPtr *time.Time
+		if !pinned.IsZero() {
+			pinnedCopy := pinned
+			pinnedPtr = &pinnedCopy
+		}
 		sidebarChannels = append(sidebarChannels, SidebarChannel{
 			Channel:       access.Channel,
 			CanWrite:      domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
 			LastMessageAt: access.LastMessageAt,
+			PinnedAt:      pinnedPtr,
 		})
 	}
 
 	dms, err := s.dms.ListVisibleConversationsWithParticipantIDs(ctx, workspace.ID, userID)
 	if err != nil {
 		return SidebarData{}, fmt.Errorf("list dms: %w", err)
+	}
+	for i := range dms {
+		if pinned := pinnedAt[storage.SidebarPinTargetDM+"\x00"+dms[i].ID]; !pinned.IsZero() {
+			pinnedCopy := pinned
+			dms[i].PinnedAt = &pinnedCopy
+		}
 	}
 
 	return SidebarData{
