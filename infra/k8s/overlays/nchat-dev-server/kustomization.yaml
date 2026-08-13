@@ -123,16 +123,6 @@ replacements:
   - source:
       kind: ConfigMap
       name: nchat-dev-topology
-      fieldPath: data.NCHAT_DEV_NODE_CIDR
-    targets:
-      - select:
-          kind: NetworkPolicy
-          name: nchat-allow-livekit-api-egress
-        fieldPaths:
-          - spec.egress.0.to.0.ipBlock.cidr
-  - source:
-      kind: ConfigMap
-      name: nchat-dev-topology
       fieldPath: data.LIVEKIT_API_PORT
     targets:
       - select:
@@ -145,11 +135,6 @@ replacements:
           name: livekit
         fieldPaths:
           - spec.template.spec.containers.[name=livekit].ports.[name=http].containerPort
-      - select:
-          kind: NetworkPolicy
-          name: nchat-allow-livekit-api-egress
-        fieldPaths:
-          - spec.egress.0.ports.0.port
   - source:
       kind: ConfigMap
       name: nchat-dev-topology
