@@ -34,6 +34,17 @@ type WorkspaceResolver interface {
 	GetDefaultWorkspaceID(ctx context.Context) (string, error)
 }
 
+// UserDisplayNameResolver resolves a user's current display name, looked up
+// once per WebSocket connection — never once per typing event. typing.start
+// can fire up to the rate-limit cadence per user (20/30s, see typing.go), so a
+// per-event DB lookup would multiply load for no benefit; a new connection is
+// comparatively rare. A nil resolver, or any error from it, degrades to an
+// empty name rather than failing the upgrade (see resolveDisplayName) — this
+// is a display nicety, not an authorization input.
+type UserDisplayNameResolver interface {
+	GetDisplayName(ctx context.Context, userID string) (string, error)
+}
+
 // wsSender wraps a *websocket.Conn to satisfy the sender interface.
 //
 // Close cancels the internal context and calls CloseNow so that any Send or
@@ -177,13 +188,14 @@ func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logUpgrade(r, http.StatusInternalServerError, "workspace_unresolved")
 		return
 	}
+	displayName := resolveDisplayName(r.Context(), h.logger, h.config.DisplayNames, userID)
 	if !h.limiter.acquire(userID) {
 		httputil.WriteError(w, http.StatusTooManyRequests, "too_many_connections", "connection limit reached")
 		h.logUpgrade(r, http.StatusTooManyRequests, "connection_limit_reached")
 		return
 	}
 	defer h.limiter.release(userID)
-	runConnection(w, r, h.hub, h.logger, userID, workspaceID, sessionID, h.config)
+	runConnection(w, r, h.hub, h.logger, userID, workspaceID, displayName, sessionID, h.config)
 }
 
 // requireSessionID reads the session this connection is opened under from the
@@ -266,13 +278,29 @@ func resolveWorkspace(w http.ResponseWriter, r *http.Request, workspaces Workspa
 	return workspaceID, true
 }
 
+// resolveDisplayName looks up userID's display name once, for the lifetime of
+// this connection (see UserDisplayNameResolver). Unlike resolveWorkspace, a
+// failure here never fails the upgrade: it degrades to "" and logs a warning,
+// mirroring touchTypingStore's warn-and-continue pattern (typing.go).
+func resolveDisplayName(ctx context.Context, logger *slog.Logger, resolver UserDisplayNameResolver, userID string) string {
+	if resolver == nil {
+		return ""
+	}
+	name, err := resolver.GetDisplayName(ctx, userID)
+	if err != nil {
+		logger.WarnContext(ctx, "ws: display name lookup failed", "error", err)
+		return ""
+	}
+	return name
+}
+
 // runConnection upgrades the HTTP connection to WebSocket, registers the client
 // in the hub, starts the I/O pumps, and runs the read loop until the connection
 // closes. Cleanup is idempotent via stop/done and sync.Once in wsSender.
 //
 // The credential protocol is validated but never echoed. The fixed public
 // protocol is selected so standards-compliant browsers accept the handshake.
-func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID, sessionID string, cfg HandlerConfig) {
+func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slog.Logger, userID, workspaceID, displayName, sessionID string, cfg HandlerConfig) {
 	logger = normalizeLogger(logger)
 	cfg = cfg.withDefaults()
 
@@ -307,6 +335,9 @@ func runConnection(w http.ResponseWriter, r *http.Request, hub *Hub, logger *slo
 		validator: cfg.Sessions,
 		interval:  cfg.SessionRevalidateInterval,
 	}
+	// Server-side only, resolved once in ServeHTTP (see resolveDisplayName) —
+	// never re-queried per typing event, never taken from the client.
+	c.displayName = displayName
 	if !hub.Register(c) {
 		logger.WarnContext(r.Context(), "ws: hub registration failed; closing connection", "client_id", clientID)
 		c.close()

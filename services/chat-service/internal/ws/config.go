@@ -30,6 +30,12 @@ type HandlerConfig struct {
 	// SessionRevalidateInterval is the cadence of that re-check. It is a
 	// lifecycle interval, not per-message authentication.
 	SessionRevalidateInterval time.Duration
+	// DisplayNames resolves a user's display name once per connection, for
+	// server-authoritative typing.updated events (see UserDisplayNameResolver
+	// and Client.displayName). Nil disables the lookup: typing events carry no
+	// name and the frontend's own heuristic is the only source, same as before
+	// this existed.
+	DisplayNames UserDisplayNameResolver
 }
 
 // DefaultHandlerConfig returns conservative WebSocket resource-control defaults.
