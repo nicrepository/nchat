@@ -20,6 +20,7 @@
     "dev:env:config-check": "bash scripts/ci/dev-env-config-check.sh",
     "gateway:config-check": "bash scripts/ci/gateway-config-check.sh",
     "web:security-headers-check": "bash scripts/ci/web-security-headers-check.sh",
+    "web:livekit-integration-check": "bash scripts/ci/web-livekit-integration-check.sh",
     "k8s:render": "bash scripts/k8s/k8s-render.sh",
     "k8s:validate": "bash scripts/k8s/k8s-validate.sh",
     "k8s:apply:dev": "bash scripts/k8s/k8s-apply-dev.sh",
