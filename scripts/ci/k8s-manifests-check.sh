@@ -589,20 +589,14 @@ validate_nchat_dev() {
   if grep -q 'secretRef:' "$application" "$data" "$migrations"; then return 1; fi
   if grep -q 'REPLACE_ME_' "$application" "$data" "$migrations"; then return 1; fi
   if grep -Eq 'port: 3478|containerPort: 3478' "$application" "$data" "$migrations"; then return 1; fi
-<<<<<<< HEAD
-  # 0.0.0.0/0 used to be banned outright. RF-21 needs one flow that genuinely
-  # leaves the cluster — the Cloudflare URL Scanner lookup — and Cloudflare's
-  # anycast addresses are not a stable list to pin, so the ban is narrowed
-  # rather than dropped: the literal may appear only inside
-  # nchat-allow-link-safety-egress, and the private-range exclusions and the
-  # single port are asserted below. Every other manifest still may not use it.
+  # Public-internet egress is intentionally limited to exactly two policies:
+  # LiveKit API and RF-21 Cloudflare URL Scanner. Each policy is validated
+  # independently below; any additional 0.0.0.0/0 occurrence must fail CI.
   if grep -Eq '0\.0\.0\.0/0' "$data" "$migrations"; then return 1; fi
-  if [[ "$(grep -Ec 'cidr: 0\.0\.0\.0/0' "$application")" -ne 1 ]]; then
-    echo "error: 0.0.0.0/0 is allowed exactly once, in nchat-allow-link-safety-egress" >&2
+  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' "$application")" -ne 2 ]]; then
+    echo "error: 0.0.0.0/0 is allowed exactly twice, for LiveKit API and link-safety egress" >&2
     return 1
   fi
-=======
->>>>>>> origin/develop
   if grep -R -Eq '/containers/0|/env/-' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server"; then return 1; fi
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-livekit-api-egress)"
@@ -624,7 +618,10 @@ validate_nchat_dev() {
     return 1
   fi
   grep -Fq 'cidr: 0.0.0.0/0' <<<"$policy_block"
-  [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' "$application")" -eq 1 ]]
+  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-livekit-api-egress must contain exactly one 0.0.0.0/0 ipBlock" >&2
+    return 1
+  fi
   if [[ "$(port_pairs "$policy_block")" != "TCP/443" ]]; then
     echo "error: nchat-allow-livekit-api-egress must have exactly one port TCP/443" >&2
     return 1
@@ -874,6 +871,10 @@ validate_nchat_dev() {
   # And the egress that makes the lookup possible: without it the fail-closed
   # policy refuses every message carrying a link.
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-link-safety-egress)"
+  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-link-safety-egress must contain exactly one 0.0.0.0/0 ipBlock" >&2
+    return 1
+  fi
   # An ipBlock peer has no component label, so network_policy_flows prints it as
   # "<none>"; the port and the direction are what this asserts, and the cidr
   # itself is checked below.
