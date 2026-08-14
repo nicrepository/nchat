@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.25.12"
+  GO_VERSION: "1.25.13"
   NODE_VERSION: "24"
   PNPM_VERSION: "11.1.2"
 
@@ -214,6 +214,9 @@ jobs:
 
       - name: Check web security headers
         run: pnpm web:security-headers-check
+
+      - name: Check web LiveKit CSP integration (Docker build + envsubst + nginx + HTTP)
+        run: pnpm web:livekit-integration-check
 
       - name: Check TLS config
         run: pnpm tls:config-check

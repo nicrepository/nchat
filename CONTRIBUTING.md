@@ -31,6 +31,9 @@ Formato:
 <tipo>(<escopo opcional>): <descricao curta>
 ```
 
+Tambem e aceito o marcador de breaking change `!`, por exemplo
+`feat(api)!: change attachment contract` e `feat!: change public API`.
+
 Tipos aceitos:
 
 - `feat`
@@ -51,6 +54,16 @@ feat(chat): add message delivery contract
 security(auth): harden session validation
 docs(repo): document branch strategy
 ```
+
+## Validacao pelo CI
+
+- O CI valida nomes de branches de contribuicoes humanas conforme os formatos
+  acima.
+- Titulos de PR e commit subjects de trabalho devem seguir Conventional
+  Commits; merge commits de sincronizacao com a branch base sao ignorados.
+- PRs fora desses padroes nao podem ser mergeadas.
+- Automacoes aprovadas podem ter formato proprio de branch, mas continuam
+  sujeitas aos gates aplicaveis e a revisao humana.
 
 ## Definition of Done
 

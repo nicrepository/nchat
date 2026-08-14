@@ -42,7 +42,7 @@ else
   echo "Install the repository-approved actionlint version before running this check."
 fi
 
-for workflow in security.yml images.yml deploy-nchat-dev.yml; do
+for workflow in governance.yml security.yml images.yml deploy-nchat-dev.yml; do
   while IFS= read -r line; do
     [[ "$line" =~ uses:[[:space:]]*([^[:space:]#]+) ]] || continue
     reference="${BASH_REMATCH[1]}"

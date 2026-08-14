@@ -89,6 +89,26 @@ fi
 nginx_policy="$(sed -n 's/.*add_header Content-Security-Policy "\(.*\)".*/\1/p' "$NGINX_CONF")"
 assert_policy "nginx.conf" "$nginx_policy"
 
+# connect-src precisa preservar same-origin via $host e o slot configurável do
+# LiveKit por ambiente (issue #528): nenhum dos dois pode ser removido, e o
+# slot não pode virar um hardcode de domínio no fragmento genérico.
+value="$(directive_value "$nginx_policy" 'connect-src')"
+case " $value " in
+  *' wss://$host '*) ;;
+  *) fail "nginx.conf: connect-src perdeu wss://\$host." ;;
+esac
+case " $value " in
+  *' https://$host '*) ;;
+  *) fail "nginx.conf: connect-src não contém https://\$host." ;;
+esac
+case " $value " in
+  *' ${NCHAT_WEB_LIVEKIT_CONNECT_SRC} '*) ;;
+  *) fail "nginx.conf: connect-src não contém o slot \${NCHAT_WEB_LIVEKIT_CONNECT_SRC}." ;;
+esac
+case " $value " in
+  *'livekit-dev.nic-labs.com'*) fail "nginx.conf: connect-src não pode conter domínio de LiveKit hardcoded (use \${NCHAT_WEB_LIVEKIT_CONNECT_SRC})." ;;
+esac
+
 # O bundle é injetado pelo Vite como <script type="module" src=...>. Qualquer
 # script inline versionado voltaria a violar script-src 'self'.
 if grep -o '<script[^>]*>' "$INDEX_HTML" | grep -qv 'src='; then
@@ -100,6 +120,7 @@ extra_csp="$(
   git -C "$ROOT_DIR" grep -lI -i 'Content-Security-Policy' -- . \
     ':!infra/docker/web/nginx.conf' \
     ':!scripts/ci/web-security-headers-check.sh' \
+    ':!scripts/ci/web-livekit-integration-check.sh' \
     ':!*.md' || true
 )"
 if [ -n "$extra_csp" ]; then
@@ -107,6 +128,36 @@ if [ -n "$extra_csp" ]; then
 fi
 
 echo "Web security headers check (estático) passou."
+
+# --- Render check (envsubst) --------------------------------------------------
+#
+# Confirma que o render restrito a NCHAT_WEB_LIVEKIT_CONNECT_SRC (Dockerfile.web
+# / infra/k8s/base/web/deployment.yaml) expande só esse slot e não toca $host,
+# que é variável do próprio nginx, não do envsubst.
+
+if command -v envsubst >/dev/null 2>&1; then
+  dev_value="wss://livekit-dev.nic-labs.com https://livekit-dev.nic-labs.com"
+  rendered="$(NCHAT_WEB_LIVEKIT_CONNECT_SRC="$dev_value" envsubst '$NCHAT_WEB_LIVEKIT_CONNECT_SRC' <"$NGINX_CONF")"
+  rendered_policy="$(sed -n 's/.*add_header Content-Security-Policy "\(.*\)".*/\1/p' <<<"$rendered")"
+
+  case "$rendered_policy" in
+    *'wss://$host'*) ;;
+    *) fail "render: \$host não pode ser consumido pelo envsubst (deve permanecer literal para o nginx)." ;;
+  esac
+  case "$rendered_policy" in
+    *'https://$host'*) ;;
+    *) fail "render: \$host não pode ser consumido pelo envsubst (deve permanecer literal para o nginx)." ;;
+  esac
+  case "$rendered_policy" in
+    *"$dev_value"*) ;;
+    *) fail "render: NCHAT_WEB_LIVEKIT_CONNECT_SRC não foi expandido em connect-src." ;;
+  esac
+
+  assert_policy "nginx.conf (renderizado DEV)" "$rendered_policy"
+  echo "Render check (envsubst DEV) passou."
+else
+  echo "warning: envsubst não encontrado; render check ignorado." >&2
+fi
 
 # --- Modo live ---------------------------------------------------------------
 

@@ -50,6 +50,30 @@ Falsos positivos devem ser tratados explicitamente:
 4. Registrar qualquer ignore com escopo minimo e motivo.
 5. Nunca ignorar silenciosamente.
 
+## Modelo de confianca do Repository governance
+
+O workflow `Repository governance` usa o evento `pull_request`. Pull Requests
+sao codigo nao confiavel e o workflow possui somente:
+
+```yaml
+permissions:
+  contents: read
+```
+
+Nenhum secret e disponibilizado ou necessario ao check.
+
+Os scripts executados apos o checkout fazem parte do conteudo da PR. Portanto,
+uma PR que altere o proprio mecanismo de governance pode alterar o
+comportamento daquela execucao. Essa limitacao de self-modification e conhecida
+e deliberadamente aceita no modelo atual, compensada por revisao humana
+obrigatoria antes do merge. Alteracoes em mecanismos de governance devem
+receber atencao explicita durante o code review.
+
+Nao use `pull_request_target` com checkout ou execucao de codigo nao confiavel
+apenas para tentar resolver essa limitacao. Mudancas futuras que aumentem
+permissoes, adicionem secrets ou alterem este modelo de confianca exigem nova
+Security Review.
+
 ## TLS dev/staging
 
 - Endpoints publicos do MVP devem exigir TLS 1.3.
