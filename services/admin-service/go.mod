@@ -1,6 +1,6 @@
 module github.com/nicrepository/nchat/services/admin-service
 
-go 1.25.12
+go 1.25.13
 
 require github.com/nicrepository/nchat/libs/go/platform v0.0.0
 
