@@ -17,6 +17,11 @@ type sidebarProvider interface {
 	GetSidebar(ctx context.Context, userID string) (service.SidebarData, error)
 }
 
+type sidebarPinProvider interface {
+	PinConversation(ctx context.Context, userID, targetType, targetID string) error
+	UnpinConversation(ctx context.Context, userID, targetType, targetID string) error
+}
+
 // sidebarWorkspaceJSON is the JSON shape for workspace info in the sidebar response.
 type sidebarWorkspaceJSON struct {
 	ID   string `json:"id"`
@@ -59,6 +64,7 @@ type sidebarChannelJSON struct {
 	// for why these two keep a precision the detail endpoints do not need.
 	CreatedAt     string  `json:"created_at"`
 	LastMessageAt *string `json:"last_message_at"`
+	PinnedAt      *string `json:"pinned_at"`
 }
 
 // sidebarDMCounterpartJSON is the identity of the other participant of a 1:1
@@ -89,6 +95,7 @@ type sidebarDMJSON struct {
 	Counterpart   *sidebarDMCounterpartJSON `json:"counterpart,omitempty"`
 	CreatedAt     string                    `json:"created_at"`
 	LastMessageAt *string                   `json:"last_message_at"`
+	PinnedAt      *string                   `json:"pinned_at"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -183,6 +190,7 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 			CanWrite:      sidebarChannel.CanWrite,
 			CreatedAt:     formatSidebarTime(ch.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
+			PinnedAt:      formatSidebarTimePtr(sidebarChannel.PinnedAt),
 		})
 	}
 	return out
@@ -200,9 +208,53 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 			Counterpart:   mapDMCounterpart(dm, name),
 			CreatedAt:     formatSidebarTime(dm.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(dm.LastMessageAt),
+			PinnedAt:      formatSidebarTimePtr(dm.PinnedAt),
 		})
 	}
 	return out
+}
+
+func (h *SidebarHandler) PinChannel(w http.ResponseWriter, r *http.Request) {
+	h.pinConversation(w, r, service.PinTargetChannel, r.PathValue("channelID"), "channel_id", true)
+}
+
+func (h *SidebarHandler) UnpinChannel(w http.ResponseWriter, r *http.Request) {
+	h.pinConversation(w, r, service.PinTargetChannel, r.PathValue("channelID"), "channel_id", false)
+}
+
+func (h *SidebarHandler) PinDM(w http.ResponseWriter, r *http.Request) {
+	h.pinConversation(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id", true)
+}
+
+func (h *SidebarHandler) UnpinDM(w http.ResponseWriter, r *http.Request) {
+	h.pinConversation(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id", false)
+}
+
+func (h *SidebarHandler) pinConversation(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string, pinned bool) {
+	pins, ok := h.svc.(sidebarPinProvider)
+	if h.svc == nil || !ok {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "sidebar not available")
+		return
+	}
+	if !validateTargetID(w, targetID, targetParam) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var err error
+	if pinned {
+		err = pins.PinConversation(r.Context(), userID, targetType, targetID)
+	} else {
+		err = pins.UnpinConversation(r.Context(), userID, targetType, targetID)
+	}
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // formatSidebarTime renders an instant as RFC 3339 in UTC, so a client parses

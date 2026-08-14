@@ -39,7 +39,11 @@ export interface CallMediaController {
 export interface CallMediaSessionController extends CallMediaController {
   prepare: () => Promise<void>;
   startAudio: () => Promise<void>;
-  connect: (call: { call_id: string; call_type: CallType }, token: string) => Promise<void>;
+  connect: (
+    call: { call_id: string; call_type: CallType },
+    token: string,
+    serverUrl: string,
+  ) => Promise<void>;
   stop: () => Promise<void>;
 }
 
@@ -334,7 +338,11 @@ export function useCallMedia(
   }, [createReadySession, prepare, update]);
 
   const connect = useCallback(
-    (call: { call_id: string; call_type: CallType }, token: string): Promise<void> => {
+    (
+      call: { call_id: string; call_type: CallType },
+      token: string,
+      serverUrl: string,
+    ): Promise<void> => {
       if (connectedCallIdRef.current === call.call_id) return Promise.resolve();
       if (connectPromiseRef.current?.callId === call.call_id) {
         return connectPromiseRef.current.promise;
@@ -352,7 +360,7 @@ export function useCallMedia(
         try {
           session = await ensureSession();
           if (!session || generationRef.current !== generation) return;
-          await session.connect(liveKitServerUrl(), token);
+          await session.connect(serverUrl, token);
           if (sessionRef.current !== session || generationRef.current !== generation) return;
           if (call.call_type === "video") {
             await session.enableCamera();
@@ -477,12 +485,6 @@ export function useCallMedia(
     connect,
     stop,
   };
-}
-
-function liveKitServerUrl(): string {
-  const url = new URL("/livekit", window.location.origin);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.toString().replace(/\/$/, "");
 }
 
 function mediaErrorKind(error: unknown): string | undefined {

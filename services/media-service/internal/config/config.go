@@ -72,7 +72,7 @@ func (c Config) Validate() error {
 	}
 	if c.LiveKitEnabled {
 		if !validLiveKitAPIURL(c.LiveKitAPIURL) {
-			return errors.New("LiveKit API URL must be a valid HTTP or HTTPS URL")
+			return errors.New("LiveKit API URL must be a valid HTTP, HTTPS, or WSS URL")
 		}
 		if c.LiveKitAPIKey == "" {
 			return errors.New("LiveKit API key is required")
@@ -113,7 +113,7 @@ func configuredBool(key string, fallback bool) (bool, bool) {
 
 func validLiveKitAPIURL(raw string) bool {
 	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "wss") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
 	return parsed.Path == "" || parsed.Path == "/"

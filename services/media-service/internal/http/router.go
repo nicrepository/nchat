@@ -43,7 +43,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, dependencies ...RouterDep
 		tokenHandler = LiveKitDependenciesUnavailable(logger)
 	default:
 		tokenHandler = BearerAuth(deps.TokenValidator)(
-			deps.RateLimiter.Middleware(LiveKitToken(deps.TokenIssuer, logger)),
+			deps.RateLimiter.Middleware(LiveKitToken(deps.TokenIssuer, cfg.LiveKitAPIURL, logger)),
 		)
 	}
 	mux.Handle(RouteLiveKitToken, httputil.MethodNotAllowed(http.MethodPost, tokenHandler))

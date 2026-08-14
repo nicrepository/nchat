@@ -7,15 +7,19 @@ import { parseInstant } from "./sidebarOrder";
 import type { WSMessageCreatedEvent } from "./useChatWebSocket";
 import { useChatSidebar } from "./useChatSidebar";
 
-const { mockFetchSidebarData, websocket } = vi.hoisted(() => ({
+const { mockFetchSidebarData, mockSetSidebarConversationPinned, websocket } = vi.hoisted(() => ({
   mockFetchSidebarData: vi.fn(),
+  mockSetSidebarConversationPinned: vi.fn(),
   websocket: {
     onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     onConversationAvailable: null as (() => void) | null,
   },
 }));
 
-vi.mock("./chatApi", () => ({ fetchSidebarData: mockFetchSidebarData }));
+vi.mock("./chatApi", () => ({
+  fetchSidebarData: mockFetchSidebarData,
+  setSidebarConversationPinned: mockSetSidebarConversationPinned,
+}));
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
     ({
@@ -169,6 +173,43 @@ describe("useChatSidebar identity retry", () => {
     await operation;
 
     expect(mockFetchSidebarData).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useChatSidebar sidebar pins", () => {
+  beforeEach(() => {
+    mockFetchSidebarData.mockReset();
+    mockSetSidebarConversationPinned.mockReset();
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 2 }],
+      dms: [],
+    });
+  });
+
+  it("optimistically marks a conversation pinned and rolls back on persistence failure", async () => {
+    mockSetSidebarConversationPinned.mockRejectedValue(new Error("offline"));
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setPinned({ kind: "channel", targetId: channelA }, true);
+    });
+    expect(result.current.state.status).toBe("ready");
+    if (result.current.state.status === "ready") {
+      expect(result.current.state.channels[0]).toMatchObject({
+        pinnedAt: "0001-01-01T00:00:00Z",
+        unreadCount: 2,
+      });
+    }
+    await act(async () => {
+      await expect(operation).rejects.toThrow("offline");
+    });
+    if (result.current.state.status === "ready") {
+      expect(result.current.state.channels[0]).toMatchObject({ pinnedAt: null, unreadCount: 2 });
+    }
+    expect(mockSetSidebarConversationPinned).toHaveBeenCalledWith("channel", channelA, true);
   });
 });
 

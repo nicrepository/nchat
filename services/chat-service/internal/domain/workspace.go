@@ -376,6 +376,7 @@ type DMConversationWithParticipantIDs struct {
 	CounterpartDisplayName string
 	CounterpartAvatarURL   string
 	LastMessageAt          *time.Time
+	PinnedAt               *time.Time
 }
 
 // DMCandidate is the minimal profile data exposed when starting a direct DM.

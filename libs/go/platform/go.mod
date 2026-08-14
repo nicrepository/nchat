@@ -1,6 +1,6 @@
 module github.com/nicrepository/nchat/libs/go/platform
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/prometheus/client_golang v1.22.0

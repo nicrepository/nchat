@@ -60,8 +60,24 @@ expect_invalid_topology() {
 }
 
 validate_topology_contract() {
-  local variant="$TEMP_DIR/topology-variant.env" materialized="$TEMP_DIR/materialized.env" host248 host249
+  local variant="$TEMP_DIR/topology-variant.env" materialized="$TEMP_DIR/materialized.env"
+  local legacy="$TEMP_DIR/topology-legacy.env" legacy_root="$TEMP_DIR/topology-legacy-root"
+  local normalized="$TEMP_DIR/topology-normalized.env" host248 host249
   load_nchat_dev_topology "$TOPOLOGY_FIXTURE" || fail "valid topology fixture rejected"
+
+  cp "$TOPOLOGY_FIXTURE" "$legacy"
+  printf '%s\n' 'LIVEKIT_API_URL=http://legacy-livekit.invalid:7880' >>"$legacy"
+  [[ "$(wc -l <"$legacy")" -eq 12 ]] || fail "legacy topology fixture must contain 12 keys"
+  mkdir -p "$legacy_root/infra/k8s/overlays/nchat-dev-server"
+  cp "$legacy" "$legacy_root/infra/k8s/overlays/nchat-dev-server/topology.env"
+  (
+    unset NCHAT_DEV_TOPOLOGY_FILE NCHAT_DEV_NODE_IP NCHAT_DEV_NODE_CIDR NCHAT_DEV_HOST NCHAT_DEV_TURN_EXTERNAL_IP
+    prepare_nchat_dev_topology "$legacy_root" "$normalized"
+  ) ||
+    fail "legacy topology with LIVEKIT_API_URL rejected"
+  [[ "$(wc -l <"$normalized")" -eq 11 ]] || fail "normalized legacy topology must contain 11 keys"
+  ! grep -q '^LIVEKIT_API_URL=' "$normalized" || fail "legacy LIVEKIT_API_URL reached normalized topology"
+  cmp -s "$TOPOLOGY_FIXTURE" "$normalized" || fail "legacy LIVEKIT_API_URL changed normalized topology"
 
   make_topology_variant "$variant" NCHAT_DEV_NODE_IP 999.0.2.10
   expect_invalid_topology "$variant" "invalid IPv4 accepted"
@@ -107,7 +123,7 @@ validate_topology_contract() {
   make_topology_variant "$variant" NCHAT_DEV_HOST "$host249"
   expect_invalid_topology "$variant" "249-character topology host accepted despite derived TURN hostname"
   cp "$TOPOLOGY_FIXTURE" "$variant"
-  printf '%s\n' 'UNEXPECTED_KEY=value' >>"$variant"
+  printf '%s\n' 'UNKNOWN_KEY=value' >>"$variant"
   expect_invalid_topology "$variant" "unexpected topology key accepted"
   grep -v '^NCHAT_DEV_TURN_EXTERNAL_IP=' "$TOPOLOGY_FIXTURE" >"$variant"
   expect_invalid_topology "$variant" "missing TURN external IPv4 accepted"

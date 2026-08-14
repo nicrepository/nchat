@@ -112,9 +112,13 @@ func (liveKitAPIChecker) Critical() bool { return true }
 func (c liveKitAPIChecker) Check(ctx context.Context) health.CheckResult {
 	result := health.CheckResult{Name: c.Name(), Critical: c.Critical(), Status: health.CheckFail}
 	endpoint, err := url.Parse(c.rawURL)
-	if err != nil || endpoint.Hostname() == "" || endpoint.User != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
+	if err != nil || endpoint.Hostname() == "" || endpoint.User != nil ||
+		(endpoint.Scheme != "http" && endpoint.Scheme != "https" && endpoint.Scheme != "wss") {
 		result.Message = "invalid LiveKit URL"
 		return result
+	}
+	if endpoint.Scheme == "wss" {
+		endpoint.Scheme = "https"
 	}
 	timeout := c.timeout
 	if timeout <= 0 {

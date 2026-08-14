@@ -33,7 +33,13 @@ type liveKitTokenRequest struct {
 	CallID string `json:"call_id"`
 }
 
-func LiveKitToken(issuer LiveKitTokenIssuer, logger *slog.Logger) http.Handler {
+type liveKitTokenResponse struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	ServerURL string    `json:"serverUrl"`
+}
+
+func LiveKitToken(issuer LiveKitTokenIssuer, serverURL string, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -85,7 +91,9 @@ func LiveKitToken(issuer LiveKitTokenIssuer, logger *slog.Logger) http.Handler {
 		}
 
 		logLiveKitTokenResult(r, logger, startedAt, "call", "issued", http.StatusOK, "")
-		httputil.WriteJSON(w, http.StatusOK, issued)
+		httputil.WriteJSON(w, http.StatusOK, liveKitTokenResponse{
+			Token: issued.Token, ExpiresAt: issued.ExpiresAt, ServerURL: serverURL,
+		})
 	})
 }
 

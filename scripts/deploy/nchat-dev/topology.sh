@@ -2,7 +2,7 @@
 # This file is sourced by deploy.sh.
 # The caller must enable: set -Eeuo pipefail.
 
-NCHAT_DEV_TOPOLOGY_KEYS_RE='^(NCHAT_DEV_NODE_IP|NCHAT_DEV_NODE_CIDR|NCHAT_DEV_HOST|NCHAT_DEV_PUBLIC_URL|NCHAT_DEV_TURN_EXTERNAL_IP|LIVEKIT_API_PORT|LIVEKIT_API_URL|LIVEKIT_RTC_TCP_PORT|LIVEKIT_RTC_UDP_PORT|TURN_LISTEN_PORT|TURN_RELAY_MIN_PORT|TURN_RELAY_MAX_PORT)$'
+NCHAT_DEV_TOPOLOGY_KEYS_RE='^(NCHAT_DEV_NODE_IP|NCHAT_DEV_NODE_CIDR|NCHAT_DEV_HOST|NCHAT_DEV_PUBLIC_URL|NCHAT_DEV_TURN_EXTERNAL_IP|LIVEKIT_API_PORT|LIVEKIT_RTC_TCP_PORT|LIVEKIT_RTC_UDP_PORT|TURN_LISTEN_PORT|TURN_RELAY_MIN_PORT|TURN_RELAY_MAX_PORT)$'
 # Full RFC 1123 hostname: 1-63 char labels, alphanumeric with interior
 # hyphens only (no leading/trailing hyphen or dot, no empty label), joined by
 # single dots, 253 chars overall. `[a-z0-9.-]+` alone accepts underscores'
@@ -36,17 +36,22 @@ is_ipv4() {
 }
 
 load_nchat_dev_topology() {
-  local file="$1" key value
+  local file="$1" key value legacy_livekit_api_url_seen=''
   local -A seen=()
   [[ -f "$file" && ! -L "$file" ]] || return 1
   while IFS='=' read -r key value || [[ -n "$key$value" ]]; do
+    if [[ "$key" == LIVEKIT_API_URL ]]; then
+      [[ -z "$legacy_livekit_api_url_seen" && -n "$value" && "$value" != *[[:space:]]* ]] || return 1
+      legacy_livekit_api_url_seen=1
+      continue
+    fi
     [[ "$key" =~ $NCHAT_DEV_TOPOLOGY_KEYS_RE ]] || return 1
     [[ -z "${seen[$key]:-}" ]] || return 1
     [[ -n "$value" && "$value" != *[[:space:]]* ]] || return 1
     seen["$key"]=1
     printf -v "$key" '%s' "$value"
   done <"$file"
-  [[ "${#seen[@]}" -eq 12 ]] || return 1
+  [[ "${#seen[@]}" -eq 11 ]] || return 1
 
   is_ipv4 "$NCHAT_DEV_NODE_IP" || return 1
   [[ "$NCHAT_DEV_NODE_CIDR" == "$NCHAT_DEV_NODE_IP/32" ]] || return 1
@@ -60,7 +65,6 @@ load_nchat_dev_topology() {
     [[ "$port" =~ ^[0-9]{1,5}$ && "$port" -ge 1 && "$port" -le 65535 && "$port" -ne 3478 ]] || return 1
   done
   [[ "$TURN_RELAY_MIN_PORT" -le "$TURN_RELAY_MAX_PORT" ]] || return 1
-  [[ "$LIVEKIT_API_URL" == "http://$NCHAT_DEV_NODE_IP:$LIVEKIT_API_PORT" ]] || return 1
 }
 
 materialize_nchat_dev_topology() {
@@ -79,7 +83,6 @@ materialize_nchat_dev_topology() {
       NCHAT_DEV_HOST) [[ "$value" == REPLACE_ME_HOST ]] || return 1 ;;
       NCHAT_DEV_PUBLIC_URL) [[ "$value" == REPLACE_ME_PUBLIC_URL ]] || return 1 ;;
       NCHAT_DEV_TURN_EXTERNAL_IP) [[ "$value" == REPLACE_ME_TURN_EXTERNAL_IP ]] || return 1 ;;
-      LIVEKIT_API_URL) [[ "$value" == REPLACE_ME_LIVEKIT_API_URL ]] || return 1 ;;
       LIVEKIT_API_PORT) api_port="$value" ;;
       LIVEKIT_RTC_TCP_PORT) rtc_tcp_port="$value" ;;
       LIVEKIT_RTC_UDP_PORT) rtc_udp_port="$value" ;;
@@ -88,7 +91,7 @@ materialize_nchat_dev_topology() {
       TURN_RELAY_MAX_PORT) relay_max="$value" ;;
     esac
   done <"$example"
-  [[ "${#seen[@]}" -eq 12 ]] || return 1
+  [[ "${#seen[@]}" -eq 11 ]] || return 1
   [[ -n "$node_ip" && -n "$node_cidr" && -n "$host" && -n "$turn_external_ip" ]] || return 1
   [[ "$node_ip$node_cidr$host$turn_external_ip" != *[[:space:]]* ]] || return 1
 
@@ -101,7 +104,6 @@ materialize_nchat_dev_topology() {
       "NCHAT_DEV_PUBLIC_URL=https://$host" \
       "NCHAT_DEV_TURN_EXTERNAL_IP=$turn_external_ip" \
       "LIVEKIT_API_PORT=$api_port" \
-      "LIVEKIT_API_URL=http://$node_ip:$api_port" \
       "LIVEKIT_RTC_TCP_PORT=$rtc_tcp_port" \
       "LIVEKIT_RTC_UDP_PORT=$rtc_udp_port" \
       "TURN_LISTEN_PORT=$turn_port" \
@@ -120,11 +122,13 @@ prepare_nchat_dev_topology() {
   if [[ -n "$source_file" ]]; then
     load_nchat_dev_topology "$source_file" || return 1
     install -m 0600 "$source_file" "$destination" || return 1
+    sed -i '/^LIVEKIT_API_URL=/d' "$destination" || return 1
   elif [[ -n "${NCHAT_DEV_NODE_IP:-}" || -n "${NCHAT_DEV_NODE_CIDR:-}" || -n "${NCHAT_DEV_HOST:-}" || -n "${NCHAT_DEV_TURN_EXTERNAL_IP:-}" ]]; then
     materialize_nchat_dev_topology "$example" "$destination" || return 1
   elif [[ -e "$local_file" ]]; then
     load_nchat_dev_topology "$local_file" || return 1
     install -m 0600 "$local_file" "$destination" || return 1
+    sed -i '/^LIVEKIT_API_URL=/d' "$destination" || return 1
   else
     echo "error: provide NCHAT_DEV_TOPOLOGY_FILE or nchat-dev environment variables" >&2
     return 1
