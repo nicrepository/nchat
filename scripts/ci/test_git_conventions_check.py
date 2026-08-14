@@ -184,7 +184,7 @@ class GitConventionsCheckTest(unittest.TestCase):
             ],
         )
 
-    def test_pull_request_subjects_reads_git_output(self) -> None:
+    def test_pull_request_subjects_uses_git_to_exclude_merge_commits(self) -> None:
         base_sha = "a" * 40
         head_sha = "b" * 40
         completed_process = subprocess.CompletedProcess(
@@ -200,7 +200,7 @@ class GitConventionsCheckTest(unittest.TestCase):
             )
 
         run.assert_called_once_with(
-            ["git", "log", "--format=%s", f"{base_sha}..{head_sha}"],
+            ["git", "log", "--no-merges", "--format=%s", f"{base_sha}..{head_sha}"],
             check=True,
             capture_output=True,
             text=True,

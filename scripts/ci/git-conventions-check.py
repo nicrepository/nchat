@@ -71,7 +71,7 @@ def pull_request_subjects(base_sha: str, head_sha: str) -> tuple[str, ...]:
         raise ValueError("Pull request base and head SHAs must be full lowercase SHAs")
 
     result = subprocess.run(
-        ["git", "log", "--format=%s", f"{base_sha}..{head_sha}"],
+        ["git", "log", "--no-merges", "--format=%s", f"{base_sha}..{head_sha}"],
         check=True,
         capture_output=True,
         text=True,
