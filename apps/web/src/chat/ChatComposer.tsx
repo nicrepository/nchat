@@ -89,6 +89,13 @@ export interface ChatComposerProps {
   uploadTarget?: AttachmentUploadTarget | null;
   /** Called after a successful upload so the caller can refresh its file list. */
   onAttachmentUploaded?: () => void;
+  /**
+   * Typing indicator: real, content-changing composer activity. See
+   * UseChatEditorOptions.onActivity — this is a straight passthrough, so the
+   * composer stays unaware of what a caller does with it (send a
+   * typing.start, nothing at all).
+   */
+  onActivity?: (hasContent: boolean) => void;
 }
 
 export interface ComposerReplyPreview {
@@ -169,6 +176,7 @@ export default function ChatComposer({
   onSend,
   uploadTarget = null,
   onAttachmentUploaded,
+  onActivity,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -207,6 +215,7 @@ export default function ChatComposer({
     // document — but not while its own upload is still running.
     canSendEmpty: pendingAttachment !== null && !uploading,
     onSend: handleComposerSend,
+    onActivity,
   });
 
   // Both entry points funnel here, so there is exactly one place that decides

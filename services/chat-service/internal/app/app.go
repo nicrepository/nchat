@@ -52,6 +52,8 @@ type App struct {
 	presenceDirectory *ws.ValkeyPresenceDirectory
 	mentionCache      *storage.ValkeyMentionLabelCache
 	reactionLimiter   *ws.ValkeyReactionLimiter
+	typingLimiter     *ws.ValkeyReactionLimiter
+	typingStore       *ws.ValkeyTypingStore
 	callWorkerCancel  context.CancelFunc
 	callWorkerWG      *sync.WaitGroup
 	closeDB           func()
@@ -85,6 +87,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 		}
 		if a.reactionLimiter != nil {
 			a.reactionLimiter.Close()
+		}
+		if a.typingLimiter != nil {
+			a.typingLimiter.Close()
+		}
+		if a.typingStore != nil {
+			a.typingStore.Close()
 		}
 		// Close the DB pool only after the hub has drained connections that
 		// may still be issuing queries.
@@ -267,6 +275,30 @@ func New(cfg config.Config) (*App, error) {
 			}
 		}
 	}
+	// Typing indicator: independent of the reaction feature (reactionSvc may be
+	// nil while typing still works), so it gets its own Valkey-backed limiter
+	// and TTL backstop, each dialed from the same VALKEY_URL — the established
+	// pattern in this package, where every ws subsystem (bus, presence
+	// directory, reaction limiter) owns its own client rather than sharing one.
+	// Absent VALKEY_URL, typing.start is refused (ErrTypingFeatureDisabled,
+	// fail-closed per SECURITY.md's WS rate-limit requirement) and the TTL
+	// backstop is simply absent — delivery itself does not depend on Valkey.
+	var typingLimiter *ws.ValkeyReactionLimiter
+	if limiter, limiterErr := ws.NewValkeyReactionLimiter(
+		cfg.ValkeyURL, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds,
+	); limiterErr != nil {
+		logger.Warn("typing indicator rate limiting disabled", "reason", "invalid_valkey_config")
+	} else {
+		typingLimiter = limiter
+		options = append(options, ws.WithTypingLimiter(limiter, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds))
+	}
+	var typingStore *ws.ValkeyTypingStore
+	if store, storeErr := ws.NewValkeyTypingStore(cfg.ValkeyURL); storeErr != nil {
+		logger.Warn("typing ttl backstop disabled", "reason", "invalid_valkey_config")
+	} else {
+		typingStore = store
+		options = append(options, ws.WithTypingStore(store))
+	}
 	// RF-19 (issue #419): the configurable per-workspace send limit. It reuses
 	// the same Lua/Valkey limiter as reactions and edits — no second rate
 	// limiting mechanism — so it exists only when that limiter does. When it is
@@ -376,6 +408,8 @@ func New(cfg config.Config) (*App, error) {
 		presenceDirectory: presenceDirectory,
 		mentionCache:      mentionCache,
 		reactionLimiter:   reactionLimiter,
+		typingLimiter:     typingLimiter,
+		typingStore:       typingStore,
 		callWorkerCancel:  callWorkerCancel,
 		callWorkerWG:      callWorkerWG,
 		closeDB:           closeDB,

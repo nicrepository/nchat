@@ -36,6 +36,8 @@ import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
 import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
+import { useTypingIndicator } from "./useTypingIndicator";
+import type { WSTypingUpdatedEvent } from "./useChatWebSocket";
 import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetails } from "./useConversationDetails";
@@ -62,6 +64,22 @@ const reactionMenuLeaveDelayMs = 150;
 
 function recentReactionsKey(userID: string): string {
   return `nchat_recent_reactions:${userID}`;
+}
+
+/**
+ * "Fulano está digitando…" for one or two people, an aggregate count beyond
+ * that — never one line per typist, which is what would make the area jump
+ * around under a busy channel. `null` means nothing to show.
+ */
+function typingIndicatorText(
+  userIds: readonly string[],
+  namesByUserId: ReadonlyMap<string, string>,
+): string | null {
+  if (userIds.length === 0) return null;
+  const label = (id: string) => namesByUserId.get(id) ?? "Alguém";
+  if (userIds.length === 1) return `${label(userIds[0])} está digitando…`;
+  if (userIds.length === 2) return `${label(userIds[0])} e ${label(userIds[1])} estão digitando…`;
+  return `${userIds.length} pessoas estão digitando…`;
 }
 
 function allowedRecentReactions(
@@ -1005,6 +1023,18 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   }, []);
   const toggleDetails = useCallback(() => setDetailsOpen((open) => !open), []);
 
+  // Typing indicator: useTypingIndicator needs sendTyping, which useMessages
+  // only produces once called, but useMessages needs an onTypingUpdated
+  // callback to hand inbound events to useTypingIndicator. Breaking that
+  // cycle is the one job of this ref — a stable callback handed to
+  // useMessages that indirects to whatever useTypingIndicator currently
+  // returns, kept current by the layout effect below (same "ref holds the
+  // latest callback" shape as every onXRef in useMessages itself).
+  const typingHandleRemoteEventRef = useRef<(event: WSTypingUpdatedEvent) => void>(() => {});
+  const handleTypingUpdatedFromMessages = useCallback((event: WSTypingUpdatedEvent) => {
+    typingHandleRemoteEventRef.current(event);
+  }, []);
+
   const {
     state,
     sendMessage,
@@ -1013,6 +1043,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     selectReply,
     cancelReply,
     toggleReaction,
+    sendTyping,
     toggleFavorite,
     editMessageLocal,
     deleteMessageLocal,
@@ -1023,6 +1054,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
+    onTypingUpdated: handleTypingUpdatedFromMessages,
     // Someone added participants to the open conversation (issue #398). The
     // event names nobody, so the only correct response is to refetch — which is
     // also the same call the local add makes, so the two converge instead of
@@ -1046,6 +1078,55 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onAttachmentStatus: reloadOpenDetails,
     onMessageRemoved: reloadPins,
   });
+
+  const typing = useTypingIndicator({
+    kind,
+    targetId,
+    currentUserId: ctx.currentUserId,
+    sendTyping,
+    // Never start a typing session while the composer itself would refuse
+    // one — matches the disabled prop ChatComposer already receives below.
+    disabled: state.status !== "ready",
+  });
+  useLayoutEffect(() => {
+    typingHandleRemoteEventRef.current = typing.handleRemoteEvent;
+  });
+
+  // A content-changing edit starts/renews typing; the composer being emptied
+  // stops it immediately rather than waiting out the inactivity timer.
+  const handleComposerActivity = useCallback(
+    (hasContent: boolean) => {
+      if (hasContent) typing.notifyActivity();
+      else typing.stop();
+    },
+    [typing.notifyActivity, typing.stop],
+  );
+
+  // Resolves a typing user's id to a display name from whatever roster this
+  // conversation already has loaded — no extra fetch. A DM (1:1 or group)
+  // already carries every participant's name; a channel has no roster loaded
+  // here unless the details panel is open, so the fallback is the name most
+  // recently seen on one of that person's own messages, which for anyone who
+  // has posted at all is exactly the counterpart the mention system already
+  // trusts as authoritative (RF-58's presence dots make the same trade: they
+  // identify *who*, never resolve a name of their own).
+  const typingNameByUserId = useMemo(() => {
+    const names = new Map<string, string>();
+    if (kind === "dm" && activeDM) {
+      for (const participant of activeDM.participants) {
+        names.set(participant.id, participant.displayName);
+      }
+    }
+    for (const message of state.messages) {
+      if (!names.has(message.senderId)) names.set(message.senderId, message.senderDisplayName);
+    }
+    return names;
+  }, [kind, activeDM, state.messages]);
+
+  const typingIndicatorLabel = useMemo(
+    () => typingIndicatorText(typing.typingUserIds, typingNameByUserId),
+    [typing.typingUserIds, typingNameByUserId],
+  );
 
   useEffect(() => {
     if (!pendingReference) return;
@@ -1098,11 +1179,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
       const result = await sendMessage(body, pendingReferenceId || undefined, attachmentIds);
       if (result.status === "sent") {
+        // Sending is itself the clearest possible "stopped typing" signal —
+        // do not wait for the composer-cleared activity event or the
+        // inactivity timeout to catch up.
+        typing.stop();
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
       return result;
     },
-    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage],
+    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage, typing.stop],
   );
 
   const selectReferenceDestination = useCallback(
@@ -1305,6 +1390,21 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           </div>
         )}
 
+        {typingIndicatorLabel && (
+          <div
+            className="chat-msg-area__typing-indicator"
+            role="status"
+            data-testid="chat-typing-indicator"
+          >
+            <span className="chat-msg-area__typing-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            {typingIndicatorLabel}
+          </div>
+        )}
+
         {/*
         The composer is keyed by the conversation identity so switching targets
         destroys the TipTap instance and mounts an empty one. The editor body is
@@ -1333,6 +1433,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
           }
           onSend={handleSend}
+          onActivity={handleComposerActivity}
           // RF-32 (issue #458): the same composer serves channels and DMs, so
           // one target prop covers both. It is the route's own kind and id —
           // the very pair the composer is keyed by — so an attachment can never

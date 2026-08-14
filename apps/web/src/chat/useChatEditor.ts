@@ -78,6 +78,15 @@ export interface UseChatEditorOptions {
    */
   canSendEmpty?: boolean;
   onSend: (body: string) => Promise<SendResult>;
+  /**
+   * Called on real, content-changing editor activity — the typing indicator's
+   * one hook into the composer. Fires from TipTap's onUpdate, which only
+   * fires on an actual document mutation (never cursor movement, selection,
+   * or focus), so this is never a raw keydown listener. Not called from
+   * onCreate: opening a conversation with an existing draft must not read as
+   * "started typing".
+   */
+  onActivity?: (hasContent: boolean) => void;
 }
 
 // ── Shared extension factory ──────────────────────────────────────────────────
@@ -120,9 +129,18 @@ export function useChatEditor({
   testId = "chat-composer-input",
   canSendEmpty = false,
   onSend,
+  onActivity,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
+
+  // Ref, like handleSendRef below: onUpdate is captured once per extensions
+  // instance, so a new onActivity identity each render must not require
+  // recreating the editor.
+  const onActivityRef = useRef(onActivity);
+  useEffect(() => {
+    onActivityRef.current = onActivity;
+  });
 
   // Ref keeps the latest handleSend accessible to the submitOnEnter extension
   // without causing the extension (useMemo'd) to be recreated on every render.
@@ -163,7 +181,9 @@ export function useChatEditor({
         },
       },
       onUpdate: ({ editor: e }) => {
-        setHasContent(!e.isEmpty);
+        const hasContentNow = !e.isEmpty;
+        setHasContent(hasContentNow);
+        onActivityRef.current?.(hasContentNow);
       },
       content: initialContent,
       onCreate: ({ editor: e }) => setHasContent(!e.isEmpty),

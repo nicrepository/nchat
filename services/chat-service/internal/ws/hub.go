@@ -291,6 +291,12 @@ type Hub struct {
 	callStartLimit  int
 	callStartWindow int
 
+	// typingStore is the Valkey ghost-state backstop; nil-safe (typing.go).
+	typingStore                  TypingStore
+	typingLimiter                TypingLimiter
+	typingRateLimitMaxActions    int
+	typingRateLimitWindowSeconds int
+
 	register        chan registerReq
 	unregister      chan *Client
 	subReq          chan subscribeReq
@@ -388,6 +394,11 @@ type Hub struct {
 	clientSubs                 map[string]map[string]struct{} // clientID → set of targetKey strings
 	subscriptionGenerations    map[string]map[string]uint64   // clientID → targetKey → generation
 	nextSubscriptionGeneration uint64
+	// typingActive tracks which targets each client is currently marked typing
+	// on, so a disconnect or a lost subscription can promptly broadcast
+	// typing.stop instead of waiting out typingTTL. clientID → set of
+	// targetKey strings.
+	typingActive map[string]map[string]struct{}
 }
 
 // NewHub creates a Hub and starts its background goroutine.
@@ -436,6 +447,7 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 		subs:                    make(map[string]map[string]struct{}),
 		clientSubs:              make(map[string]map[string]struct{}),
 		subscriptionGenerations: make(map[string]map[string]uint64),
+		typingActive:            make(map[string]map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -2300,16 +2312,25 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if evt.Type == EventTypeTypingUpdated {
+		evt, ok = canonicalizeTypingEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 
 	// Remote bus payloads may contain body_text or legacy sender_email. Strip
 	// them so remote nodes route by IDs only; clients fetch by ID if needed.
 	evt.Payload = nil
 	evt.MessageUpdate = nil
-	// A presence block belongs to exactly one event type. Anything else carrying
-	// one is relaying a state nobody asked it about, so it is dropped here rather
-	// than forwarded alongside an unrelated event.
+	// A presence/typing block belongs to exactly one event type each. Anything
+	// else carrying one is relaying a state nobody asked it about, so it is
+	// dropped here rather than forwarded alongside an unrelated event.
 	if evt.Type != EventTypePresenceUpdated {
 		evt.Presence = nil
+	}
+	if evt.Type != EventTypeTypingUpdated {
+		evt.Typing = nil
 	}
 
 	return evt, true
@@ -2331,7 +2352,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	switch evt.Type {
 	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
-		EventTypePresenceUpdated,
+		EventTypePresenceUpdated, EventTypeTypingUpdated,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
@@ -2417,10 +2438,10 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 	// in the target, not about a message, and an attachment can outlive the
 	// message that carried it.
 	//
-	// presence.updated is about a person in the target rather than about
-	// anything in it, so it names no message either.
+	// presence.updated and typing.updated are both about a person in the target
+	// rather than about anything in it, so neither names a message either.
 	if evt.Type == EventTypeMembersAdded || evt.Type == EventTypeAttachmentStatus ||
-		evt.Type == EventTypePresenceUpdated {
+		evt.Type == EventTypePresenceUpdated || evt.Type == EventTypeTypingUpdated {
 		if evt.MessageID != "" {
 			return Event{}, false
 		}
@@ -2667,12 +2688,18 @@ func (h *Hub) dropClient(c *Client) {
 	// cover the difference is what made presence outlive both the subscription and
 	// the membership that justified it.
 	keys := h.clientSubscriptionKeys(c)
+	typingKeys := h.clientTypingKeys(c)
 
 	removed := h.removeClient(c)
 	if removed == nil {
 		return
 	}
 	removed.close()
+
+	// Broadcast typing.stop for anything this connection was still asserting,
+	// rather than waiting out typingTTL — the common case of an orderly
+	// disconnect should clear peers' indicators immediately.
+	h.stopAllTyping(context.Background(), removed, typingKeys)
 
 	if h.presence == nil {
 		return
@@ -2743,6 +2770,7 @@ func (h *Hub) removeClient(c *Client) *Client {
 	}
 	delete(h.clientSubs, c.id)
 	delete(h.subscriptionGenerations, c.id)
+	delete(h.typingActive, c.id)
 	return removed
 }
 
@@ -2759,6 +2787,7 @@ func (h *Hub) clearClients() []*Client {
 	h.subs = make(map[string]map[string]struct{})
 	h.clientSubs = make(map[string]map[string]struct{})
 	h.subscriptionGenerations = make(map[string]map[string]uint64)
+	h.typingActive = make(map[string]map[string]struct{})
 	return clients
 }
 
@@ -2977,6 +3006,10 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 	case ClientMessageTypeCallStart, ClientMessageTypeCallAccept, ClientMessageTypeCallDecline,
 		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallSync:
 		return h.handleCallMessage(ctx, c, msg)
+	case ClientMessageTypeTypingStart:
+		return h.handleTypingStart(ctx, c, msg)
+	case ClientMessageTypeTypingStop:
+		return h.handleTypingStop(ctx, c, msg)
 	default:
 		return fmt.Errorf("ws: unknown client message type %q", msg.Type)
 	}
@@ -3044,11 +3077,14 @@ func (h *Hub) broadcastSnapshot(key string) []broadcastSubscription {
 func (h *Hub) revokeSubscription(client *Client, key string) bool {
 	orphaned := false
 	reconcile := false
-	// All three run after h.mu is released: forget what reconciliation last sent a
+	stoppedTyping := false
+	// All four run after h.mu is released: forget what reconciliation last sent a
 	// target nobody watches here any more; withdraw the directory assertion if
-	// this was the last local cover for it; and, if the subject has stopped
-	// covering a target other people here are still watching, rebuild that
-	// target's roster so they stop being shown someone who left it.
+	// this was the last local cover for it; if the subject has stopped covering
+	// a target other people here are still watching, rebuild that target's
+	// roster so they stop being shown someone who left it; and if the client
+	// was mid-typing on this target, broadcast the stop now rather than
+	// leaving peers to wait out typingTTL.
 	defer func() {
 		if orphaned {
 			h.forgetReconciledTarget(key)
@@ -3056,6 +3092,9 @@ func (h *Hub) revokeSubscription(client *Client, key string) bool {
 		if reconcile {
 			h.reconcileAssertions(client.workspaceID, client.userID)
 			h.reconcileLostCoverage(client.workspaceID, client.userID, []string{key})
+		}
+		if stoppedTyping {
+			h.finishTypingStop(context.Background(), client, key)
 		}
 	}()
 
@@ -3078,6 +3117,15 @@ func (h *Hub) revokeSubscription(client *Client, key string) bool {
 	}
 	if generations, ok := h.subscriptionGenerations[client.id]; ok {
 		delete(generations, key)
+	}
+	if targets, ok := h.typingActive[client.id]; ok {
+		if _, typing := targets[key]; typing {
+			delete(targets, key)
+			if len(targets) == 0 {
+				delete(h.typingActive, client.id)
+			}
+			stoppedTyping = true
+		}
 	}
 	reconcile = true
 	return true

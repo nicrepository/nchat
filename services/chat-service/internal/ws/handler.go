@@ -385,6 +385,9 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			if isCallClientMessage(msg.Type) && handleCallClientError(c, msg.Type, msg.CallID, msgErr) {
 				continue
 			}
+			if isTypingClientMessage(msg.Type) && handleTypingClientError(c, msgErr) {
+				continue
+			}
 			if msg.Type == ClientMessageTypeSubscribe {
 				if c.ctx.Err() != nil || ctx.Err() != nil || errors.Is(msgErr, ErrClientNotRegistered) {
 					return

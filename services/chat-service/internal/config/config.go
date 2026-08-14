@@ -21,6 +21,8 @@ const (
 	defaultCallRingTimeoutSeconds       = 30
 	defaultCallStartRateLimitMaxActions = 10
 	defaultCallStartRateLimitWindowSecs = 60
+	defaultTypingRateLimitMaxActions    = 20
+	defaultTypingRateLimitWindowSecs    = 30
 
 	// wsInstanceIDMaxLen matches sourceInstanceIDMaxLen in the ws package.
 	// Kept in sync manually; both must allow the same set of valid identifiers.
@@ -69,6 +71,11 @@ type Config struct {
 	CallRingTimeoutSeconds          int
 	CallStartRateLimitMaxActions    int
 	CallStartRateLimitWindowSeconds int
+	// TypingRateLimitMaxActions and TypingRateLimitWindowSeconds control the
+	// shared per-user limiter (see ws.ValkeyReactionLimiter.AllowActionWithLimit)
+	// applied to typing.start. typing.stop is never rate-limited.
+	TypingRateLimitMaxActions    int
+	TypingRateLimitWindowSeconds int
 	// ValkeyWSBroadcastEnabled enables distributed WebSocket broadcast via
 	// Valkey Pub/Sub. When false, broadcast is in-process only (NopBus).
 	// Defaults to false; safe for local development and test environments.
@@ -113,12 +120,18 @@ func Load() Config {
 			"CALL_START_RATE_LIMIT_MAX_ACTIONS", defaultCallStartRateLimitMaxActions,
 		),
 		CallStartRateLimitWindowSeconds: getPositiveInt("CALL_START_RATE_LIMIT_WINDOW_SECONDS", defaultCallStartRateLimitWindowSecs),
-		ValkeyWSBroadcastEnabled:        platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
-		WSInstanceID:                    sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
-		WSMaxConnectionsPerUser:         getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
-		WSInboundMessagesPerMinute:      getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
-		WSInboundBurst:                  getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
-		WSMaxInvalidMessages:            getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
+		TypingRateLimitMaxActions: getPositiveInt(
+			"TYPING_RATE_LIMIT_MAX_ACTIONS", defaultTypingRateLimitMaxActions,
+		),
+		TypingRateLimitWindowSeconds: getPositiveInt(
+			"TYPING_RATE_LIMIT_WINDOW_SECONDS", defaultTypingRateLimitWindowSecs,
+		),
+		ValkeyWSBroadcastEnabled:   platformconfig.GetBool("VALKEY_WS_BROADCAST_ENABLED", false),
+		WSInstanceID:               sanitizeWSInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		WSMaxConnectionsPerUser:    getPositiveInt("WS_MAX_CONNECTIONS_PER_USER", wsDefaults.MaxConnectionsPerUser),
+		WSInboundMessagesPerMinute: getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
+		WSInboundBurst:             getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
+		WSMaxInvalidMessages:       getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
 	}
 }
 

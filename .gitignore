@@ -63,6 +63,7 @@ infra/k8s/secrets/public-certs/*
 !infra/k8s/secrets/public-certs/README.md
 
 # Logs and runtime files
+.nchat-local/
 *.log
 logs/
 tmp/
