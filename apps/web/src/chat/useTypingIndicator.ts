@@ -49,6 +49,7 @@ const REMOTE_EXPIRY_MS = 8_000;
 
 interface RemoteTypingEntry {
   updatedAtMs: number;
+  displayName?: string;
 }
 
 export interface UseTypingIndicatorOptions {
@@ -70,6 +71,12 @@ export interface TypingIndicatorController {
   handleRemoteEvent: (event: WSTypingUpdatedEvent) => void;
   /** Other users (never the local one) currently typing in this target. */
   typingUserIds: readonly string[];
+  /**
+   * Server-resolved display name for each currently-typing remote user, when
+   * known. A user id absent here means the caller should fall back to its own
+   * heuristic (DM roster / recent message sender / "Alguém").
+   */
+  typingDisplayNameByUserId: ReadonlyMap<string, string>;
 }
 
 export function useTypingIndicator({
@@ -80,6 +87,9 @@ export function useTypingIndicator({
   disabled = false,
 }: UseTypingIndicatorOptions): TypingIndicatorController {
   const [typingUserIds, setTypingUserIds] = useState<readonly string[]>([]);
+  const [typingDisplayNameByUserId, setTypingDisplayNameByUserId] = useState<ReadonlyMap<string, string>>(
+    new Map(),
+  );
 
   const sendTypingRef = useRef(sendTyping);
   useEffect(() => {
@@ -160,8 +170,14 @@ export function useTypingIndicator({
     }
   }, []);
 
-  const recomputeTypingUserIds = useCallback(() => {
-    setTypingUserIds(Array.from(remoteRef.current.keys()));
+  const recomputeTyping = useCallback(() => {
+    const ids = Array.from(remoteRef.current.keys());
+    const names = new Map<string, string>();
+    for (const [userId, entry] of remoteRef.current) {
+      if (entry.displayName) names.set(userId, entry.displayName);
+    }
+    setTypingUserIds(ids);
+    setTypingDisplayNameByUserId(names);
   }, []);
 
   const handleRemoteEvent = useCallback(
@@ -172,14 +188,16 @@ export function useTypingIndicator({
       clearRemoteTimer(userId);
 
       if (!typing.is_typing) {
-        if (remoteRef.current.delete(userId)) recomputeTypingUserIds();
+        if (remoteRef.current.delete(userId)) recomputeTyping();
         return;
       }
 
       const now = Date.now();
-      const isNewEntry = !remoteRef.current.has(userId);
-      remoteRef.current.set(userId, { updatedAtMs: now });
-      if (isNewEntry) recomputeTypingUserIds();
+      const previous = remoteRef.current.get(userId);
+      const displayName = typing.user_display_name || previous?.displayName;
+      const changed = !previous || previous.displayName !== displayName;
+      remoteRef.current.set(userId, { updatedAtMs: now, displayName });
+      if (changed) recomputeTyping();
 
       const timer = window.setTimeout(() => {
         remoteTimersRef.current.delete(userId);
@@ -189,12 +207,12 @@ export function useTypingIndicator({
         // every renewal, so this can only find a truly stale entry.
         if (entry && entry.updatedAtMs === now) {
           remoteRef.current.delete(userId);
-          recomputeTypingUserIds();
+          recomputeTyping();
         }
       }, REMOTE_EXPIRY_MS);
       remoteTimersRef.current.set(userId, timer);
     },
-    [currentUserId, clearRemoteTimer, recomputeTypingUserIds],
+    [currentUserId, clearRemoteTimer, recomputeTyping],
   );
 
   // Target change: nobody is known to be typing in the new conversation yet.
@@ -203,6 +221,7 @@ export function useTypingIndicator({
     remoteTimersRef.current.clear();
     remoteRef.current.clear();
     setTypingUserIds([]);
+    setTypingDisplayNameByUserId(new Map());
   }, [kind, targetId]);
 
   // Unmount: clear any outstanding local-expiry timers.
@@ -212,5 +231,5 @@ export function useTypingIndicator({
     };
   }, []);
 
-  return { notifyActivity, stop, handleRemoteEvent, typingUserIds };
+  return { notifyActivity, stop, handleRemoteEvent, typingUserIds, typingDisplayNameByUserId };
 }
