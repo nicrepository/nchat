@@ -355,6 +355,30 @@
   font-size: 15px;
 }
 
+/* RF-21: a message the backend accepted and is withholding while its links are
+   scanned. Only its own sender ever sees one, so this is a status note and not
+   a warning about content — it reads as "in progress", like the forwarded
+   marker above it, rather than as an error. */
+.chat-msg-area__pending-scan {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.chat-msg-area__pending-scan .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* Dimmed while it is withheld, so "sent" and "waiting" are not the same shape. */
+.chat-msg-area__msg-bubble--pending-scan {
+  opacity: 0.72;
+}
+
 .chat-msg-area__quote--clickable {
   cursor: pointer;
 }

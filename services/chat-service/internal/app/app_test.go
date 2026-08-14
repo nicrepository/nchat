@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
@@ -863,4 +864,137 @@ func TestDomainMessageToWSPayloadWithholdsAttachmentsOnRemovedMessage(t *testing
 	if payload.Attachments != nil {
 		t.Fatalf("removed message must not describe its attachments: %+v", payload.Attachments)
 	}
+}
+
+// TestNewRefusesInvalidLinkSafetyFlag verifies that a Safe Browsing flag that
+// could not be parsed stops the bootstrap instead of silently disabling the
+// control (RF-21). Config.Validate runs before anything is built, so no
+// database, tracing or handler wiring is involved.
+func TestNewRefusesInvalidLinkSafetyFlag(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "enabled")
+	cfg := config.Load()
+
+	a, err := New(cfg)
+
+	if err == nil {
+		t.Fatal("expected the bootstrap to refuse an unparseable CHAT_LINK_SAFETY_ENABLED")
+	}
+	if a != nil {
+		t.Fatal("no app may be built from a configuration that was refused")
+	}
+	if err.Error() != "CHAT_LINK_SAFETY_ENABLED must be a valid boolean" {
+		t.Fatalf("message is not the deterministic one: %v", err)
+	}
+}
+
+// --- RF-21 wiring --------------------------------------------------------
+//
+// The review found config, wiring and documentation disagreeing about what an
+// enabled-but-unbuildable checker means, so the three states are asserted on the
+// wiring function itself rather than only through Config.Validate.
+
+// Disabled is the only state in which a nil checker is correct: downstream,
+// nil means "the feature is off", and here that is exactly what was asked for.
+func TestWireLinkSafetySkipsWhenDisabled(t *testing.T) {
+	svc := &service.MessageService{}
+
+	worker, err := wireLinkSafety(config.Config{LinkSafetyEnabled: false}, svc, stubLinkStore{}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("a disabled check must need no credentials: %v", err)
+	}
+	if worker != nil {
+		t.Fatal("no scan worker may be built when the flag is off")
+	}
+	if svc.HasLinkSafety() {
+		t.Fatal("no gate may be installed when the flag is off")
+	}
+}
+
+func TestWireLinkSafetyInstallsGateWhenEnabled(t *testing.T) {
+	svc := &service.MessageService{}
+	cfg := config.Config{
+		LinkSafetyEnabled:           true,
+		LinkSafetyCloudflareAccount: "acct-123",
+		LinkSafetyCloudflareToken:   "token-abc",
+	}
+
+	worker, err := wireLinkSafety(cfg, svc, stubLinkStore{}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("a valid configuration must wire: %v", err)
+	}
+	if !svc.HasLinkSafety() {
+		t.Fatal("the flag was on and no gate was installed")
+	}
+	if worker == nil {
+		t.Fatal("the flag was on and no scan worker was built")
+	}
+}
+
+// The bypass this whole finding is about: enabled, the checker could not be
+// built, and the service carried on with a nil gate that reads as "off". It
+// must be a start-up failure instead — including for a failure mode the
+// constructor might only grow later.
+func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
+	for name, cfg := range map[string]config.Config{
+		"no credentials": {LinkSafetyEnabled: true},
+		"no token":       {LinkSafetyEnabled: true, LinkSafetyCloudflareAccount: "acct-123"},
+		"no account":     {LinkSafetyEnabled: true, LinkSafetyCloudflareToken: "token-abc"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := &service.MessageService{}
+
+			_, err := wireLinkSafety(cfg, svc, stubLinkStore{}, nil, nil, nil)
+
+			if err == nil {
+				t.Fatal("the bootstrap continued with the flag on and no gate")
+			}
+			if svc.HasLinkSafety() {
+				t.Fatal("a failed wiring must not leave a half-installed gate")
+			}
+			if strings.Contains(err.Error(), "acct-123") || strings.Contains(err.Error(), "token-abc") {
+				t.Fatalf("the error carries a configuration value: %v", err)
+			}
+		})
+	}
+}
+
+// The message service is what the gate attaches to; without it there is nothing
+// to protect, and silently returning nil would be the same bypass by another
+// route.
+func TestWireLinkSafetyFailsWithoutAMessageService(t *testing.T) {
+	cfg := config.Config{
+		LinkSafetyEnabled:           true,
+		LinkSafetyCloudflareAccount: "acct-123",
+		LinkSafetyCloudflareToken:   "token-abc",
+	}
+
+	if _, err := wireLinkSafety(cfg, nil, stubLinkStore{}, nil, nil, nil); err == nil {
+		t.Fatal("an enabled check with nothing to attach to must stop the bootstrap")
+	}
+	// And with no store either: the gate the send path consults *is* the store,
+	// so a nil one is the same absent-gate bypass by another route.
+	if _, err := wireLinkSafety(cfg, &service.MessageService{}, nil, nil, nil, nil); err == nil {
+		t.Fatal("an enabled check with no verdict store must stop the bootstrap")
+	}
+}
+
+// stubLinkStore is the RF-21 surface the bootstrap needs and nothing else. It
+// answers "no verdicts, no work", which is all these wiring tests require: what
+// is under test is whether the gate and the worker were installed, not what they
+// decide.
+type stubLinkStore struct{}
+
+func (stubLinkStore) LoadLinkVerdicts(context.Context, []string) (map[string]urlsafety.Verdict, error) {
+	return map[string]urlsafety.Verdict{}, nil
+}
+func (stubLinkStore) EnsureLinkScans(context.Context, []string) error { return nil }
+func (stubLinkStore) ClaimDueLinkScans(context.Context, int) ([]storage.LinkScanJob, error) {
+	return nil, nil
+}
+func (stubLinkStore) RecordLinkScanSubmission(context.Context, string, string) error { return nil }
+func (stubLinkStore) RecordLinkVerdict(context.Context, string, urlsafety.Verdict) error {
+	return nil
+}
+func (stubLinkStore) ResolveDecidedMessages(context.Context) ([]storage.ResolvedMessage, error) {
+	return nil, nil
 }

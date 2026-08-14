@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -142,6 +143,43 @@ func (s *integMessageStore) CreateMessage(_ context.Context, in storage.CreateMe
 	s.created = append(s.created, msg)
 	s.mu.Unlock()
 	return msg, nil
+}
+
+func (s *integMessageStore) LookupForwardReplay(_ context.Context, _ storage.ForwardReplayInput) (domain.Message, error) {
+	return domain.Message{}, domain.ErrNotFound
+}
+
+// RF-21 is not wired in this fixture, so every link verdict is absent and no
+// scan queue runs. SetLinkSafety is never called here, which is what makes the
+// hub integration assert broadcasting rather than scanning.
+func (s *integMessageStore) LoadLinkVerdicts(_ context.Context, _ []string) (map[string]urlsafety.Verdict, error) {
+	return map[string]urlsafety.Verdict{}, nil
+}
+
+func (s *integMessageStore) EnsureLinkScans(_ context.Context, _ []string) error { return nil }
+
+func (s *integMessageStore) ClaimDueLinkScans(_ context.Context, _ int) ([]storage.LinkScanJob, error) {
+	return nil, nil
+}
+
+func (s *integMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ string) error {
+	return nil
+}
+
+func (s *integMessageStore) RecordLinkVerdict(_ context.Context, _ string, _ urlsafety.Verdict) error {
+	return nil
+}
+
+func (s *integMessageStore) ResolveDecidedMessages(_ context.Context) ([]storage.ResolvedMessage, error) {
+	return nil, nil
+}
+
+func (s *integMessageStore) SnapshotForwardableMessage(_ context.Context, in storage.ForwardSnapshotInput) (storage.ForwardSnapshot, error) {
+	return storage.ForwardSnapshot{
+		SourceMessageID: in.SourceMessageID,
+		BodyText:        s.seed.BodyText,
+		BodyFormat:      s.seed.BodyFormat,
+	}, nil
 }
 
 func (s *integMessageStore) ForwardChannelMessage(_ context.Context, in storage.ForwardChannelMessageInput) (storage.ForwardChannelMessageResult, error) {

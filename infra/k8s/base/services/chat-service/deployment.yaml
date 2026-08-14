@@ -53,6 +53,15 @@ spec:
             - secretRef:
                 name: nchat-secrets
                 optional: true
+            # RF-21: the Cloudflare URL Scanner credentials, kept out of the
+            # shared nchat-secrets so no service that never calls Cloudflare
+            # receives the token through its own envFrom. Optional because an
+            # overlay with CHAT_LINK_SAFETY_ENABLED=false needs no credentials;
+            # with the flag on, an absent value stops start-up in
+            # Config.Validate rather than silently disabling the check.
+            - secretRef:
+                name: nchat-link-safety
+                optional: true
           env:
             - name: PORT
               value: "8082"

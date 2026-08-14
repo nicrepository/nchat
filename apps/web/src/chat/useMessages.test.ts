@@ -17,6 +17,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ApiRequestError } from "../lib/api";
 import { clearTokens, setTokens } from "../lib/authSession";
 import type {
   WSClientErrorEvent,
@@ -2501,5 +2502,125 @@ describe("useMessages — message deletion", () => {
 
     await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledOnce());
     expect(result.current.state.messages[0]).toEqual(deleted);
+  });
+});
+
+// ── RF-21: a link the backend refused ────────────────────────────────────────
+//
+// The backend is the authority. These tests assert what the client does with
+// its answer: recognise the code, say something a person can act on, and leave
+// the timeline showing that nothing was sent.
+
+describe("useMessages — blocked links", () => {
+  beforeEach(() => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+  });
+
+  async function readyHook() {
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    return result;
+  }
+
+  it("shows the security warning for a malicious_url refusal", async () => {
+    mockPostChannelMessage.mockRejectedValue(
+      new ApiRequestError(
+        403,
+        "malicious_url",
+        "this message contains a link blocked for security reasons",
+      ),
+    );
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(result.current.sendMessage("https://evil.example")).rejects.toBeTruthy();
+    });
+
+    expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
+    // Nothing may look sent: no optimistic message, and not stuck sending.
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.sending).toBe(false);
+  });
+
+  // RF-21 is asynchronous: a link nobody has scanned makes the backend accept
+  // the message and withhold it. The sender's own copy comes back with that
+  // status, and the client must render it rather than claim a delivery.
+  it("keeps a withheld message visible to its sender as pending", async () => {
+    mockPostChannelMessage.mockResolvedValue({
+      id: "msg-pending",
+      senderId: "user-me",
+      senderDisplayName: "Me",
+      senderEmail: "me@example.com",
+      kind: "user",
+      bodyText: "veja https://novo.example/x",
+      bodyFormat: "v2",
+      isRemoved: false,
+      status: "pending_link_scan",
+      deletedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      isEdited: false,
+      editCount: 0,
+      reactions: [],
+      isFavorited: false,
+      isForwarded: false,
+    });
+    const result = await readyHook();
+
+    await act(async () => {
+      await result.current.sendMessage("veja https://novo.example/x");
+    });
+
+    const sent = result.current.state.messages.at(-1);
+    expect(sent?.status).toBe("pending_link_scan");
+    // No error: it was accepted, not refused.
+    expect(result.current.state.sendError).toBeFalsy();
+  });
+
+  it("tells the user to retry when the check could not run", async () => {
+    mockPostChannelMessage.mockRejectedValue(
+      new ApiRequestError(
+        503,
+        "link_check_unavailable",
+        "the link could not be checked for safety, try again",
+      ),
+    );
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(result.current.sendMessage("https://example.com")).rejects.toBeTruthy();
+    });
+
+    expect(result.current.state.sendError).toContain("Tente novamente");
+    expect(result.current.state.sendError).not.toContain("bloqueado");
+    expect(result.current.state.messages).toEqual([]);
+  });
+
+  it("rethrows so the composer keeps the draft", async () => {
+    mockPostChannelMessage.mockRejectedValue(new ApiRequestError(403, "malicious_url", "blocked"));
+    const result = await readyHook();
+
+    // The composer clears its editor only on a resolved "sent"; a rejection is
+    // what preserves what the person typed.
+    await act(async () => {
+      await expect(result.current.sendMessage("https://evil.example")).rejects.toBeInstanceOf(
+        ApiRequestError,
+      );
+    });
+  });
+
+  it("leaves every other send failure exactly as it was", async () => {
+    mockPostChannelMessage.mockRejectedValue(
+      new ApiRequestError(500, "internal_error", "internal error"),
+    );
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(result.current.sendMessage("olá")).rejects.toBeTruthy();
+    });
+
+    expect(result.current.state.sendError).toBe("internal error");
   });
 });

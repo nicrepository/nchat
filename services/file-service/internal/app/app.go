@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/file-service/internal/config"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/events"
@@ -143,11 +144,25 @@ func (a *App) wireLinkPreviews(
 	limiter := httpapi.NewUserRateLimiter(linkPreviewRateLimitPerMinute, uploadRateLimitWindow)
 	a.linkPreviewLimiter = limiter
 	routerDeps.LinkPreviewRateLimiter = limiter
-	routerDeps.LinkPreviews = linkpreview.NewService(
+	previews := linkpreview.NewService(
 		time.Duration(cfg.LinkPreviewTimeoutSeconds)*time.Second,
 		time.Duration(cfg.LinkPreviewCacheTTLSeconds)*time.Second,
 		routerDeps.Metrics,
 	)
+	// RF-21. Config validation has already refused an enabled check without
+	// credentials, so a constructor failure here is not an operator mistake this
+	// service can serve through: without the checker every preview would proceed
+	// unchecked, which is the one outcome the flag was set to prevent.
+	if cfg.LinkSafetyEnabled {
+		scanner, err := urlsafety.NewCloudflareScanner(
+			cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken,
+		)
+		if err != nil {
+			return err
+		}
+		previews = previews.WithURLSafety(urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics)))
+	}
+	routerDeps.LinkPreviews = previews
 	return nil
 }
 

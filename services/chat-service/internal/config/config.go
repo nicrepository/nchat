@@ -1,7 +1,11 @@
 package config
 
 import (
+	"errors"
+	"os"
 	"regexp"
+	"strconv"
+	"strings"
 
 	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
@@ -88,10 +92,31 @@ type Config struct {
 	WSInboundMessagesPerMinute int
 	WSInboundBurst             int
 	WSMaxInvalidMessages       int
+
+	// LinkSafetyEnabled gates the RF-21 Safe Browsing check that runs before a
+	// message carrying a link is persisted. Off by default: enabling it makes
+	// message creation depend on a third party being reachable, and a
+	// deployment gets that by asking for it.
+	//
+	// Credentials are the whole rest of the configuration. Verdict TTL and
+	// provider timeout are constants in libs/go/platform/urlsafety, shared with
+	// file-service, so the two services cannot disagree about how long a host
+	// stays cleared.
+	//
+	// Enabled without credentials is a start-up error, not a degraded mode. A
+	// nil checker means one thing and one thing only — the flag is false — so
+	// there is no state in which the service runs believing the check is on
+	// while nothing is being checked.
+	LinkSafetyEnabled           bool
+	LinkSafetyCloudflareAccount string
+	LinkSafetyCloudflareToken   string
+
+	linkSafetyEnabledInvalid bool
 }
 
 func Load() Config {
 	wsDefaults := ws.DefaultHandlerConfig()
+	linkSafetyEnabled, linkSafetyEnabledInvalid := configuredBool("CHAT_LINK_SAFETY_ENABLED", false)
 	return Config{
 		ServiceName:                 serviceName,
 		Env:                         platformconfig.GetString("APP_ENV", "development"),
@@ -119,7 +144,67 @@ func Load() Config {
 		WSInboundMessagesPerMinute:      getPositiveInt("WS_INBOUND_MESSAGES_PER_MINUTE", wsDefaults.InboundMessagesPerMinute),
 		WSInboundBurst:                  getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
 		WSMaxInvalidMessages:            getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
+		LinkSafetyEnabled:               linkSafetyEnabled,
+		LinkSafetyCloudflareAccount:     platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", ""),
+		// Never logged, echoed in an error, or sent to a client.
+		LinkSafetyCloudflareToken: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", ""),
+		linkSafetyEnabledInvalid:  linkSafetyEnabledInvalid,
 	}
+}
+
+// Validate refuses a configuration that cannot be honoured.
+//
+// It is deliberately narrow. This service degrades rather than fails for a
+// missing dependency — no database means unready, no Valkey means reactions are
+// off — and that stays true. What it may not do is degrade a *security control*
+// silently, and RF-21 has two ways of doing exactly that:
+//
+//   - an unparseable flag. platformconfig.GetBool folds a bad value into its
+//     fallback, so CHAT_LINK_SAFETY_ENABLED=enabled would boot with Safe
+//     Browsing off and no symptom other than nothing ever being blocked;
+//   - an enabled flag with no credentials. The checker could not be built, the
+//     gate would be absent, and messages would be accepted unchecked by a
+//     deployment that explicitly asked for them to be checked.
+//
+// Both are start-up errors, the same way file-service treats them. There is no
+// third state: either the check is off on purpose, or it is on and it works.
+func (c Config) Validate() error {
+	return c.validateLinkSafety()
+}
+
+// validateLinkSafety checks the RF-21 settings.
+//
+// The error names the variable and never its value: a start-up message is a log
+// line, and the token must not appear in one.
+func (c Config) validateLinkSafety() error {
+	if c.linkSafetyEnabledInvalid {
+		return errors.New("CHAT_LINK_SAFETY_ENABLED must be a valid boolean")
+	}
+	if !c.LinkSafetyEnabled {
+		return nil
+	}
+	if c.LinkSafetyCloudflareAccount == "" {
+		return errors.New("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true")
+	}
+	if c.LinkSafetyCloudflareToken == "" {
+		return errors.New("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN is required when CHAT_LINK_SAFETY_ENABLED is true")
+	}
+	return nil
+}
+
+// configuredBool mirrors file-service's helper: an absent variable takes the
+// default, a parseable one is honoured, and an unparseable one is reported as
+// invalid rather than quietly becoming false.
+func configuredBool(key string, fallback bool) (value, invalid bool) {
+	raw, configured := os.LookupEnv(key)
+	if !configured {
+		return fallback, false
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return false, true
+	}
+	return parsed, false
 }
 
 func getPositiveInt(key string, fallback int) int {

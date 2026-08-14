@@ -206,10 +206,26 @@ type Config struct {
 	LinkPreviewTimeoutSeconds  int
 	LinkPreviewCacheTTLSeconds int
 
+	// LinkSafetyEnabled gates the RF-21 Safe Browsing check that runs in front
+	// of every preview fetch. Off by default like the feature it guards: turning
+	// it on makes the service depend on a third party being reachable, and a
+	// deployment gets that by asking for it.
+	//
+	// The credentials are the whole rest of the configuration. There is no
+	// endpoint, TTL or timeout knob: those are the semantics of a verdict shared
+	// with chat-service and live as constants in
+	// libs/go/platform/urlsafety, so the two services cannot disagree about how
+	// long a host stays cleared. An operator-supplied endpoint would also be a
+	// way to point a security check at something that always answers "safe".
+	LinkSafetyEnabled           bool
+	LinkSafetyCloudflareAccount string
+	LinkSafetyCloudflareToken   string
+
 	uploadsEnabledInvalid      bool
 	malwareScanRequiredInvalid bool
 	maxUploadBytesInvalid      bool
 	linkPreviewEnabledInvalid  bool
+	linkSafetyEnabledInvalid   bool
 }
 
 func Load() Config {
@@ -217,6 +233,7 @@ func Load() Config {
 	scanRequired, scanRequiredInvalid := configuredBool("FILE_MALWARE_SCAN_REQUIRED", true)
 	maxUploadBytes, maxUploadBytesInvalid := configuredInt64("FILE_MAX_UPLOAD_BYTES", domain.MaxMaxUploadBytes)
 	linkPreviewEnabled, linkPreviewEnabledInvalid := configuredBool("FILE_LINK_PREVIEW_ENABLED", false)
+	linkSafetyEnabled, linkSafetyEnabledInvalid := configuredBool("FILE_LINK_SAFETY_ENABLED", false)
 
 	return Config{
 		ServiceName: serviceName,
@@ -258,10 +275,20 @@ func Load() Config {
 		LinkPreviewCacheTTLSeconds: positiveInt(
 			"FILE_LINK_PREVIEW_CACHE_TTL_SECONDS", defaultLinkPreviewCacheTTLSeconds,
 		),
+		LinkSafetyEnabled: linkSafetyEnabled,
+		LinkSafetyCloudflareAccount: strings.TrimSpace(
+			platformconfig.GetString("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", ""),
+		),
+		// Not trimmed of anything but surrounding whitespace, and never logged,
+		// echoed in an error or sent to a client.
+		LinkSafetyCloudflareToken: strings.TrimSpace(
+			platformconfig.GetString("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", ""),
+		),
 		uploadsEnabledInvalid:      uploadsEnabledInvalid,
 		malwareScanRequiredInvalid: scanRequiredInvalid,
 		maxUploadBytesInvalid:      maxUploadBytesInvalid,
 		linkPreviewEnabledInvalid:  linkPreviewEnabledInvalid,
+		linkSafetyEnabledInvalid:   linkSafetyEnabledInvalid,
 	}
 }
 
@@ -279,6 +306,13 @@ func (c Config) Validate() error {
 	// Link previews are validated before the early return below, because they
 	// are independent of uploads: a deployment may run either, both or neither.
 	if err := c.validateLinkPreview(); err != nil {
+		return err
+	}
+	// Validated unconditionally, not from inside validateLinkPreview: a
+	// deployment that switches the check on must be held to its credentials even
+	// if it has previews switched off, so the mistake surfaces when it is made
+	// rather than when previews are later enabled.
+	if err := c.validateLinkSafety(); err != nil {
 		return err
 	}
 	if !c.UploadsEnabled {
@@ -441,6 +475,34 @@ func (c Config) validateLinkPreview() error {
 		)
 	}
 	return c.validateAuthDependencies()
+}
+
+// validateLinkSafety checks the RF-21 settings.
+//
+// It fails start-up rather than degrading, and that asymmetry is deliberate.
+// Every other optional dependency in this service can be absent because its
+// absence removes a capability; a Safe Browsing check that is switched on but
+// unconfigured would remove a *control* while the feature it guards keeps
+// running. A deployment that asked for the check and cannot perform it must not
+// boot into a state where the only visible symptom is that nothing is ever
+// blocked.
+//
+// The error names the variable and never its value: the token must not reach a
+// log line, and a start-up message is a log line.
+func (c Config) validateLinkSafety() error {
+	if c.linkSafetyEnabledInvalid {
+		return errors.New("FILE_LINK_SAFETY_ENABLED must be a valid boolean")
+	}
+	if !c.LinkSafetyEnabled {
+		return nil
+	}
+	if c.LinkSafetyCloudflareAccount == "" {
+		return errors.New("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when FILE_LINK_SAFETY_ENABLED is true")
+	}
+	if c.LinkSafetyCloudflareToken == "" {
+		return errors.New("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN is required when FILE_LINK_SAFETY_ENABLED is true")
+	}
+	return nil
 }
 
 // validScannerAddress accepts a plain "host:port" and nothing else.

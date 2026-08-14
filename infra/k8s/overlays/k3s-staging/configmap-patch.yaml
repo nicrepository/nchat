@@ -6,3 +6,8 @@ metadata:
 data:
   APP_ENV: staging
   LIVEKIT_ENABLED: "false"
+  # RF-21 Safe Browsing, on the same terms as every other supported overlay:
+  # stated explicitly so the environment cannot drift back to the application
+  # default, with the credentials in the nchat-link-safety Secret.
+  CHAT_LINK_SAFETY_ENABLED: "true"
+  FILE_LINK_SAFETY_ENABLED: "true"

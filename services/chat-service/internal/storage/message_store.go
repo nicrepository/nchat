@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -88,16 +89,77 @@ type CreateMessageInput struct {
 	// database in the same statement that inserts the message, and a message is
 	// not created at all when any of them fails.
 	AttachmentIDs []string
+
+	// Status is the lifecycle state the message is created in. Empty means
+	// active, which is what every path that carries no link uses.
+	//
+	// RF-21 is the only reason it is settable: a message whose links have not
+	// been scanned is created as MessageStatusPendingLinkScan, which every read
+	// path already excludes, so it is withheld from everyone until the worker
+	// promotes it. The service decides this; a client cannot ask for a status.
+	Status domain.MessageStatus
+
+	// LinkScanURLs are the canonical URLs this message is waiting on (RF-21),
+	// written in the same statement that creates it. They must already exist in
+	// chat.link_scans — EnsureLinkScans puts them there — because the join
+	// table references it.
+	LinkScanURLs []string
+}
+
+// messageStatusOrActive resolves the default. It exists so "no status supplied"
+// can only ever mean the state every message had before RF-21, and never the
+// zero value of a string reaching a CHECK constraint.
+func messageStatusOrActive(status domain.MessageStatus) domain.MessageStatus {
+	if status == "" {
+		return domain.MessageStatusActive
+	}
+	return status
+}
+
+// ForwardSnapshotInput identifies the source message a forward would copy. Every
+// field is server-derived; the client supplies only the source message ID, which
+// this query re-authorizes rather than trusts.
+type ForwardSnapshotInput struct {
+	WorkspaceID          string
+	DestinationChannelID string
+	ActorID              string
+	SourceMessageID      string
+}
+
+// ForwardSnapshot is the content a forward will persist, read once.
+//
+// It exists so the content that is *checked* and the content that is *written*
+// are the same bytes. Before it, the forwarding statement read source.body_text
+// for itself, so anything the service had validated beforehand described a row
+// the INSERT then re-read — a concurrent edit in between would have persisted
+// something nobody checked (RF-21).
+type ForwardSnapshot struct {
+	SourceMessageID string
+	BodyText        string
+	BodyFormat      domain.MessageBodyFormat
 }
 
 // ForwardChannelMessageInput contains only server-derived forwarding fields.
-// The store copies the source body and format atomically; callers never provide them.
+//
+// BodyText and BodyFormat are the ForwardSnapshot the caller has already read
+// and validated, and the statement writes exactly them rather than re-reading
+// the source. They are never client-supplied: the HTTP layer's forward payload
+// carries an ID and nothing else, and the service fills these from
+// SnapshotForwardableMessage.
 type ForwardChannelMessageInput struct {
 	WorkspaceID          string
 	DestinationChannelID string
 	ActorID              string
 	SourceMessageID      string
 	IdempotencyKey       string
+	BodyText             string
+	BodyFormat           domain.MessageBodyFormat
+
+	// Status and LinkScanURLs carry RF-21 exactly as they do for CreateMessage:
+	// a forwarded snapshot whose links are not cleared is written withheld, and
+	// the URLs it waits on are recorded in the same statement.
+	Status       domain.MessageStatus
+	LinkScanURLs []string
 }
 
 // ForwardChannelMessageResult distinguishes the original insert from an
@@ -105,6 +167,19 @@ type ForwardChannelMessageInput struct {
 type ForwardChannelMessageResult struct {
 	Message  domain.Message
 	Replayed bool
+}
+
+// ForwardReplayInput identifies the message an earlier forward already created.
+//
+// It is the ON CONFLICT key of ForwardChannelMessage plus the source, so the
+// same three answers the forwarding statement gives — replay, conflict, neither
+// — can be obtained without writing anything.
+type ForwardReplayInput struct {
+	WorkspaceID          string
+	DestinationChannelID string
+	ActorID              string
+	SourceMessageID      string
+	IdempotencyKey       string
 }
 
 // EditMessageInput contains only server-derived identity and validated body fields.
@@ -168,8 +243,35 @@ type MessageStore interface {
 	// same target as the new message. This is a non-enumerating storage backstop:
 	// callers cannot determine whether the referenced message exists.
 	CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error)
-	// ForwardChannelMessage atomically re-authorizes both channels, snapshots the
-	// active source message, and inserts or replays the forwarded destination message.
+	// SnapshotForwardableMessage returns the content a forward would copy, after
+	// applying the same source-side authorization the forwarding statement
+	// applies. It takes no lock and opens no transaction, so the caller may run
+	// a third-party safety check on the result without holding a connection.
+	// Returns ErrNotFound for every inaccessible or invalid source.
+	SnapshotForwardableMessage(ctx context.Context, input ForwardSnapshotInput) (ForwardSnapshot, error)
+	// LookupForwardReplay resolves an idempotency key against what is already
+	// persisted, without writing. It returns the earlier message, ErrNotFound
+	// when this key created nothing the caller may see, or ErrConflict when the
+	// key belongs to a forward of a different source — the same conflict
+	// ForwardChannelMessage reports, decided by the same rule.
+	LookupForwardReplay(ctx context.Context, input ForwardReplayInput) (domain.Message, error)
+	// LoadLinkVerdicts returns the fresh RF-21 verdicts for canonical URLs. A
+	// URL absent from the result has no usable verdict and is never safe.
+	LoadLinkVerdicts(ctx context.Context, canonicalURLs []string) (map[string]urlsafety.Verdict, error)
+	// EnsureLinkScans queues canonical URLs for scanning, idempotently.
+	EnsureLinkScans(ctx context.Context, canonicalURLs []string) error
+	// ClaimDueLinkScans leases URLs awaiting a verdict for one worker pass.
+	ClaimDueLinkScans(ctx context.Context, batchSize int) ([]LinkScanJob, error)
+	// RecordLinkScanSubmission stores the provider's scan id for a URL.
+	RecordLinkScanSubmission(ctx context.Context, canonicalURL, scanUUID string) error
+	// RecordLinkVerdict stores a final verdict. Non-final verdicts are refused.
+	RecordLinkVerdict(ctx context.Context, canonicalURL string, verdict urlsafety.Verdict) error
+	// ResolveDecidedMessages promotes or blocks withheld messages whose links
+	// have all been decided, returning what happened so the caller can publish.
+	ResolveDecidedMessages(ctx context.Context) ([]ResolvedMessage, error)
+	// ForwardChannelMessage atomically re-authorizes both channels and inserts or
+	// replays the forwarded destination message, writing the snapshot the caller
+	// supplies rather than re-reading the source.
 	ForwardChannelMessage(ctx context.Context, input ForwardChannelMessageInput) (ForwardChannelMessageResult, error)
 	EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error)
 	DeleteMessage(ctx context.Context, input DeleteMessageInput) (domain.Message, bool, error)
@@ -509,7 +611,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				(workspace_id, channel_id, dm_conversation_id, sender_id,
 				 kind, body_text, body_format, status,
 				 parent_message_id, forwarded_from_message_id, referenced_message_id)
-			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, 'active',
+			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $14::text,
 			       $8::uuid, $9::uuid, $10::uuid
 			FROM (
 				-- Channel message authorization branch.
@@ -562,6 +664,22 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			FROM inserted
 			CROSS JOIN attachment_candidates candidate
 			RETURNING attachment_id
+		),
+		-- RF-21. Same statement again, for the same reason: a withheld message
+		-- and the URLs it is waiting on are one atomic fact. A commit in which
+		-- the message exists without its links would be a message nothing can
+		-- ever promote — held forever with no verdict to wait for.
+		--
+		-- The chat.link_scans rows these reference are created before the
+		-- statement runs, by EnsureLinkScans, which is idempotent; a row that
+		-- ends up with no message is simply a URL that gets scanned once.
+		link_scan_links AS (
+			INSERT INTO chat.message_link_scans (message_id, canonical_url)
+			SELECT inserted.id, url
+			FROM inserted
+			CROSS JOIN unnest($15::text[]) AS urls(url)
+			ON CONFLICT DO NOTHING
+			RETURNING canonical_url
 		)
 		SELECT `+listMessageWithQuoteColumns("m", "$4", "q")+`
 		FROM inserted m
@@ -579,6 +697,8 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.MentionedUserIDs,
 		input.MentionedChannelIDs,
 		input.AttachmentIDs,
+		string(messageStatusOrActive(input.Status)),
+		input.LinkScanURLs,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
@@ -615,13 +735,109 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	return msg, nil
 }
 
+// SnapshotForwardableMessage reads what a forward would copy.
+//
+// The source-side predicates are character-for-character the ones the forwarding
+// statement applies, so a source this refuses is a source that would have been
+// refused there, with the same non-enumerating ErrNotFound. It is a plain read:
+// no transaction, no FOR SHARE, no reserved connection — the caller runs a
+// third-party lookup on the result, and holding a row lock across a network call
+// to Cloudflare is exactly what must not happen.
+func (s *PGXMessageStore) SnapshotForwardableMessage(
+	ctx context.Context, input ForwardSnapshotInput,
+) (ForwardSnapshot, error) {
+	var snapshot ForwardSnapshot
+	err := s.pool.QueryRow(ctx, `
+		SELECT m.id::text, m.body_text, m.body_format
+		FROM chat.messages m`+messageAccessJoins("$3")+`
+		WHERE m.id = $4::uuid
+		  AND m.workspace_id = $1::uuid
+		  AND m.channel_id IS NOT NULL
+		  AND m.channel_id <> $2::uuid
+		  AND m.kind = 'user'
+		  AND m.status = 'active'
+		  AND m.deleted_at IS NULL
+		  AND `+messageAccessPredicate("$3"),
+		input.WorkspaceID, input.DestinationChannelID, input.ActorID, input.SourceMessageID,
+	).Scan(&snapshot.SourceMessageID, &snapshot.BodyText, (*string)(&snapshot.BodyFormat))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ForwardSnapshot{}, domain.ErrNotFound
+		}
+		return ForwardSnapshot{}, fmt.Errorf("snapshot forwardable message: %w", err)
+	}
+	return snapshot, nil
+}
+
+// LookupForwardReplay answers "has this forward already happened?" without
+// writing anything.
+//
+// It exists so a retried forward is resolved *before* the RF-21 provider call.
+// Checking first and looking afterwards made a legitimate retry depend on
+// Cloudflare agreeing twice: a verdict that changed, or a provider that went
+// down, turned a replay of an already-persisted message into a refusal, which
+// is not what an idempotency key means.
+//
+// The predicate is the ON CONFLICT key — workspace, sender, channel, key — so a
+// row this finds is exactly the row the upsert would have returned. The
+// conflict rule is the same one, applied here instead of after an INSERT.
+//
+// One predicate is deliberately *not* repeated: the forwarding statement also
+// requires the source to still be readable, and this does not. The message it
+// returns is already in the destination channel and the caller is already
+// authorized to read that channel — the same access predicate every message
+// read applies — so losing access to the original afterwards does not make a
+// message the caller can list anyway into something withheld. What it must not
+// do is hand the row to someone else, and the sender and channel predicates are
+// what prevent that.
+func (s *PGXMessageStore) LookupForwardReplay(ctx context.Context, input ForwardReplayInput) (domain.Message, error) {
+	if input.IdempotencyKey == "" {
+		return domain.Message{}, domain.ErrNotFound
+	}
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`
+		FROM chat.messages m`+messageAccessJoins("$3")+`
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
+		WHERE m.workspace_id = $1::uuid
+		  AND m.channel_id = $2::uuid
+		  AND m.sender_id = $3::uuid
+		  AND m.forward_idempotency_key = $4
+		  AND `+messageAccessPredicate("$3"),
+		input.WorkspaceID, input.DestinationChannelID, input.ActorID, input.IdempotencyKey,
+	)
+	msg, err := scanMessageWithSenderAndQuote(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, domain.ErrNotFound
+		}
+		return domain.Message{}, fmt.Errorf("lookup forward replay: %w", err)
+	}
+	if msg.ForwardedFromMessageID != input.SourceMessageID {
+		return domain.Message{}, domain.ErrConflict
+	}
+	messages := []domain.Message{msg}
+	if err := s.loadReactionBatch(ctx, messages, input.ActorID); err != nil {
+		return domain.Message{}, err
+	}
+	if err := s.loadAttachmentBatch(ctx, messages); err != nil {
+		return domain.Message{}, err
+	}
+	return messages[0], nil
+}
+
 func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input ForwardChannelMessageInput) (ForwardChannelMessageResult, error) {
 	// This CTE is the authoritative authorization and consistency control.
 	// Keep source and destination predicates in this atomic statement; zero rows
 	// deliberately maps every inaccessible or invalid resource to ErrNotFound.
+	//
+	// The source row is still required to exist and be accessible — that is the
+	// authorization — but its body is no longer what gets written. The INSERT
+	// writes the snapshot in $6/$7, which the caller has already checked, so the
+	// content that was validated and the content that is persisted are the same
+	// bytes even if the source is edited in between (RF-21).
 	row := s.pool.QueryRow(ctx, `
 		WITH source AS (
-			SELECT m.id, m.body_text, m.body_format
+			SELECT m.id
 			FROM chat.messages m`+messageAccessJoins("$3")+`
 			WHERE m.id = $4::uuid
 			  AND m.workspace_id = $1::uuid
@@ -637,8 +853,8 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, sender_id, kind, body_text, body_format,
 				 status, forwarded_from_message_id, forward_idempotency_key)
-			SELECT $1::uuid, $2::uuid, $3::uuid, 'user', source.body_text,
-			       source.body_format, 'active', source.id, NULLIF($5, '')
+			SELECT $1::uuid, $2::uuid, $3::uuid, 'user', $6::text,
+			       $7::text, $8::text, source.id, NULLIF($5, '')
 			FROM source
 			JOIN chat.workspaces destination_workspace
 			  ON destination_workspace.id = $1::uuid AND destination_workspace.status = 'active'
@@ -659,12 +875,25 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, edit_count, deleted_at, created_at, updated_at,
 			          (xmax <> 0) AS replayed
+		),
+		-- RF-21, same atomicity argument as CreateMessage's: the withheld
+		-- forward and the URLs it waits on are one commit. ON CONFLICT DO
+		-- NOTHING makes a replay a no-op here too — the edges are already there
+		-- from the original insert.
+		link_scan_links AS (
+			INSERT INTO chat.message_link_scans (message_id, canonical_url)
+			SELECT inserted.id, url
+			FROM inserted
+			CROSS JOIN unnest($9::text[]) AS urls(url)
+			ON CONFLICT DO NOTHING
+			RETURNING canonical_url
 		)
 		SELECT `+listMessageWithQuoteColumns("m", "$3", "q")+`, m.replayed
 		FROM inserted m
 		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
 		input.WorkspaceID, input.DestinationChannelID, input.ActorID, input.SourceMessageID,
-		input.IdempotencyKey,
+		input.IdempotencyKey, input.BodyText, string(input.BodyFormat),
+		string(messageStatusOrActive(input.Status)), input.LinkScanURLs,
 	)
 	var replayed bool
 	msg, err := scanMessageWithSenderAndQuoteExtra(row, &replayed)

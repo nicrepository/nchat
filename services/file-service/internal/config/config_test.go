@@ -685,3 +685,75 @@ func TestValidateIgnoresLinkPreviewBudgetsWhileDisabled(t *testing.T) {
 		t.Fatalf("a disabled feature must not block start-up: %v", err)
 	}
 }
+
+// --- RF-21 link safety ---------------------------------------------------
+
+func TestLoadDefaultsLinkSafetyToDisabled(t *testing.T) {
+	cfg := Load()
+
+	if cfg.LinkSafetyEnabled {
+		t.Fatal("the safe browsing check must be off unless a deployment asks for it")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a deployment that does not use it must not be held to its credentials: %v", err)
+	}
+}
+
+func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", " acct-123 ")
+	t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", " token-abc ")
+
+	cfg := Load()
+
+	if !cfg.LinkSafetyEnabled {
+		t.Fatal("FILE_LINK_SAFETY_ENABLED was not read")
+	}
+	if cfg.LinkSafetyCloudflareAccount != "acct-123" || cfg.LinkSafetyCloudflareToken != "token-abc" {
+		t.Fatalf("credentials: %q / %q", cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken)
+	}
+}
+
+// An enabled check that cannot run is a control that silently stops existing.
+// Start-up refuses rather than booting into it.
+func TestValidateRefusesLinkSafetyWithoutCredentials(t *testing.T) {
+	cases := map[string]struct{ account, token string }{
+		"no account": {"", "token-abc"},
+		"no token":   {"acct-123", ""},
+		"neither":    {"", ""},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+			t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", testCase.account)
+			t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", testCase.token)
+
+			err := Load().Validate()
+			if err == nil {
+				t.Fatal("an enabled check without credentials must stop start-up")
+			}
+			// The variable is named; the value never is.
+			if testCase.token != "" && strings.Contains(err.Error(), testCase.token) {
+				t.Fatalf("the error repeated the token: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnparseableLinkSafetyFlag(t *testing.T) {
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "perhaps")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("an unparseable FILE_LINK_SAFETY_ENABLED must stop start-up")
+	}
+}
+
+// The check is validated even with previews off, so the mistake surfaces when
+// it is made rather than when previews are later enabled.
+func TestLinkSafetyIsValidatedIndependentlyOfPreviews(t *testing.T) {
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("expected the missing credentials to be refused with previews disabled")
+	}
+}

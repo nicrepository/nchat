@@ -15,6 +15,21 @@ const (
 	errCodeURLNotAllowed       = "url_not_allowed"
 	errCodeUpstreamUnavailable = "upstream_unavailable"
 	errCodeUpstreamTimeout     = "upstream_timeout"
+	// errCodeMaliciousURL is the RF-21 refusal. It is its own code, separate
+	// from url_not_allowed, because the two mean different things to a user: one
+	// says this service will not fetch that kind of address, the other says the
+	// link is dangerous. A client must be able to tell them apart without
+	// reading the message text.
+	errCodeMaliciousURL = "malicious_url"
+	// errCodeLinkCheckUnavailable says the verdict could not be obtained. It is
+	// separate from malicious_url for the same reason: one is permanent, the
+	// other is worth retrying.
+	errCodeLinkCheckUnavailable = "link_check_unavailable"
+	// errCodeLinkCheckPending says the scan was just queued and the preview
+	// should be requested again shortly. Distinct from the unavailable code
+	// because nothing is broken: URL Scanner is submit-then-poll and the
+	// submission has only now happened.
+	errCodeLinkCheckPending = "link_check_pending"
 )
 
 // maxLinkPreviewRequestBytes bounds the request body. The payload is one URL
@@ -118,6 +133,19 @@ func linkPreviewError(err error) (status int, code, message string) {
 		return http.StatusBadRequest, httputil.ErrCodeBadRequest, "url is not valid"
 	case errors.Is(err, linkpreview.ErrURLNotAllowed):
 		return http.StatusBadRequest, errCodeURLNotAllowed, "url is not allowed"
+	case errors.Is(err, linkpreview.ErrMaliciousURL):
+		// The verdict itself is the whole answer. Which category the provider
+		// reported is not repeated: it would tell whoever is probing exactly
+		// which of their domains are already known.
+		return http.StatusForbidden, errCodeMaliciousURL, "this link was blocked for security reasons"
+	case errors.Is(err, linkpreview.ErrSafetyUnavailable):
+		return http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
+			"the link could not be checked for safety, try again"
+	case errors.Is(err, linkpreview.ErrSafetyPending):
+		// 202: accepted, being checked, come back. No Open Graph fetch has
+		// happened and none will until the verdict is in.
+		return http.StatusAccepted, errCodeLinkCheckPending,
+			"this link is being checked for safety, try again shortly"
 	case errors.Is(err, linkpreview.ErrUnsupportedContentType):
 		return http.StatusUnsupportedMediaType, errCodeUnsupportedMedia,
 			"the linked resource is not an HTML page"

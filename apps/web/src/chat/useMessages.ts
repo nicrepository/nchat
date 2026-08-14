@@ -38,6 +38,7 @@ import {
   unfavoriteMessage,
 } from "./chatApi";
 import { markPresenceActivity } from "./chatSocket";
+import { ApiRequestError } from "../lib/api";
 import {
   normalizeBodyFormat,
   parseMessageAttachments,
@@ -211,6 +212,37 @@ const initialState: MessagesState = {
 
 const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
 const reactionConfirmTimeoutMs = 8_000;
+
+/**
+ * Copy for the send failures this client recognises by code (RF-21).
+ *
+ * Keyed on `code` and never on the message text: the code is the stable part of
+ * the contract, and matching on English prose from a server would break the
+ * moment that prose changed. The two entries are deliberately different
+ * sentences — one says the link is dangerous and is final, the other says the
+ * check could not run and is worth retrying — because telling someone to try
+ * again on a blocked link is as wrong as telling them a transient outage means
+ * their link is malicious.
+ *
+ * The security decision itself is entirely server-side. Nothing here inspects a
+ * URL, and there is no provider credential in this bundle: this only renders a
+ * verdict the backend already made and enforced.
+ */
+const sendErrorMessages: Record<string, string> = {
+  malicious_url: "Este link foi bloqueado por segurança.",
+  link_check_unavailable:
+    "Não foi possível verificar a segurança do link. Tente novamente em instantes.",
+};
+
+function sendErrorMessage(error: unknown): string {
+  if (error instanceof ApiRequestError) {
+    const known = sendErrorMessages[error.code];
+    if (known) return known;
+  }
+  // Unchanged for everything else: the previous behaviour is the fallback, so
+  // no existing error path is affected by RF-21.
+  return error instanceof Error ? error.message : "Não foi possível enviar a mensagem.";
+}
 
 function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
@@ -986,8 +1018,7 @@ export function useMessages({
       } catch (err: unknown) {
         // Stale failure: silently discard — do not update state for a previous target.
         if (stateRef.current.target !== sendKey) return { status: "stale" };
-        const message = err instanceof Error ? err.message : "Não foi possível enviar a mensagem.";
-        dispatch({ type: "send_error", error: message });
+        dispatch({ type: "send_error", error: sendErrorMessage(err) });
         // Re-throw for current-target failures so callers can preserve the draft.
         throw err;
       }

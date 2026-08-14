@@ -39,6 +39,29 @@ var (
 	// ErrPinLimitReached is returned when a channel already holds the maximum
 	// number of pinned messages (RF-05 abuse ceiling).
 	ErrPinLimitReached = errors.New("pin limit reached")
+	// ErrMaliciousURL reports a message body carrying a link the Safe Browsing
+	// provider considers a security threat, or one whose host has no reputation
+	// that could be consulted at all (RF-21). Both are permanent: the same body
+	// will be refused again.
+	//
+	// It is its own error and not an ErrInvalidInput, because a client must be
+	// able to tell "this link is dangerous" from "your request was malformed"
+	// without reading the message text.
+	ErrMaliciousURL = errors.New("message carries a malicious url")
+	// ErrURLCheckUnavailable reports that a link's safety could not be
+	// established. It is separate from ErrMaliciousURL because the two mean
+	// opposite things to the person typing: one says the link is bad, the other
+	// says to try again.
+	ErrURLCheckUnavailable = errors.New("url safety check unavailable")
+	// ErrURLCheckPending reports that a link is being scanned and no verdict
+	// exists yet (RF-21).
+	//
+	// It is separate from the other two because it means neither "bad" nor
+	// "broken": the scan was queued by this very request and will finish. Only
+	// editing uses it — creating and forwarding withhold the message instead,
+	// which is the better answer when there is no already-published version to
+	// preserve.
+	ErrURLCheckPending = errors.New("url safety check pending")
 	// ErrChannelDisplayNameRequired and ErrChannelDisplayNameTooLong report the
 	// two ways a channel name fails NormalizeChannelDisplayName.
 	//

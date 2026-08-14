@@ -456,3 +456,49 @@ spec:
       ports:
         - protocol: TCP
           port: 3310
+---
+# RF-21. The only rule in this overlay that leaves the cluster, and the reason
+# it has to exist: nchat-default-deny-egress covers every pod, so with the flags
+# on and no egress the Cloudflare lookup would time out, the fail-closed policy
+# would answer link_check_unavailable, and every message carrying a link would
+# be refused.
+#
+# The destination is stated as "the public internet minus everything private"
+# rather than as Cloudflare's addresses: the API is behind an anycast range that
+# changes, and pinning it would break the control on a routing change. The
+# exclusions are what keep this from becoming a hole — RFC 1918, the k3s pod and
+# service CIDRs, loopback, link-local (169.254.169.254 is the cloud metadata
+# endpoint) and the reserved blocks — so an SSRF through this rule reaches no
+# internal address. Port 443 only, and only for the two components that call it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-link-safety-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - chat
+          - file
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443

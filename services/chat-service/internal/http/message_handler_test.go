@@ -2009,3 +2009,70 @@ func TestMessageHandler_ListChannelMessages_WorkspaceInternalErrorReturns500(t *
 		t.Fatalf("expected 500 for workspace internal error, got %d", rec.Code)
 	}
 }
+
+// ── RF-21: the blocked-link error contract ───────────────────────────────────
+//
+// The frontend keys on the code, so the code is what these assert. A direct API
+// call is exactly the same path the composer uses, which is the point: the
+// refusal comes from the service, not from anything the client could skip.
+
+func TestMessageHandler_CreateChannelMessage_MaliciousURLReturnsStableCode(t *testing.T) {
+	msgs := &fakeMessageProvider{createChErr: domain.ErrMaliciousURL}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"https://evil.example"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error struct{ Code, Message string } `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Error.Code != "malicious_url" {
+		t.Fatalf("code: %q", body.Error.Code)
+	}
+	// Nothing about which link, which category or which provider.
+	for _, forbidden := range []string{"evil.example", "cloudflare", "risk_types"} {
+		if strings.Contains(strings.ToLower(rec.Body.String()), forbidden) {
+			t.Fatalf("response leaked %q: %s", forbidden, rec.Body.String())
+		}
+	}
+}
+
+func TestMessageHandler_CreateDMMessage_MaliciousURLReturnsStableCode(t *testing.T) {
+	msgs := &fakeMessageProvider{createDMErr: domain.ErrMaliciousURL}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/messages",
+		strings.NewReader(`{"body_text":"https://evil.example"}`))
+	r.SetPathValue("conversationID", testConversationID)
+	h.CreateDMMessage(rec, r)
+
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"malicious_url"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// An outage must not look like a bad link: different status, different code.
+func TestMessageHandler_CreateChannelMessage_CheckerOutageIsRetryable(t *testing.T) {
+	msgs := &fakeMessageProvider{createChErr: domain.ErrURLCheckUnavailable}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"https://example.com"}`))
+	r.SetPathValue("channelID", testChannelID)
+	h.CreateChannelMessage(rec, r)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"link_check_unavailable"`) {
+		t.Fatalf("code missing: %s", rec.Body.String())
+	}
+}

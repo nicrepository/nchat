@@ -101,9 +101,26 @@ func TestPGXMessageStoreForwardChannelMessagePostgreSQL(t *testing.T) {
 	}
 
 	store := storage.NewPGXMessageStore(pool)
+
+	// The forward is now two steps: read the snapshot, then write it. The read
+	// applies the same source-side authorization the write does, and the write
+	// persists these bytes rather than re-reading the row (RF-21).
+	snapshot, err := store.SnapshotForwardableMessage(ctx, storage.ForwardSnapshotInput{
+		WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor, SourceMessageID: source,
+	})
+	if err != nil {
+		t.Fatalf("SnapshotForwardableMessage: %v", err)
+	}
+	if snapshot.BodyText != "canonical snapshot" ||
+		snapshot.BodyFormat != domain.MessageBodyFormatV3 ||
+		snapshot.SourceMessageID != source {
+		t.Fatalf("snapshot: %+v", snapshot)
+	}
+
 	input := storage.ForwardChannelMessageInput{
 		WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor,
 		SourceMessageID: source, IdempotencyKey: "concurrent-action",
+		BodyText: snapshot.BodyText, BodyFormat: snapshot.BodyFormat,
 	}
 	results := make([]storage.ForwardChannelMessageResult, 2)
 	errs := make([]error, 2)
@@ -139,6 +156,72 @@ func TestPGXMessageStoreForwardChannelMessagePostgreSQL(t *testing.T) {
 		t.Fatalf("idempotent row count=%d err=%v", count, err)
 	}
 
+	// The same three answers the statement above gives, obtained without
+	// writing — this is what lets a retry be resolved before the RF-21 provider
+	// call rather than after it.
+	replayInput := storage.ForwardReplayInput{
+		WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor,
+		SourceMessageID: source, IdempotencyKey: input.IdempotencyKey,
+	}
+	replayed, err := store.LookupForwardReplay(ctx, replayInput)
+	if err != nil {
+		t.Fatalf("LookupForwardReplay: %v", err)
+	}
+	if replayed.ID != results[0].Message.ID ||
+		replayed.BodyText != "canonical snapshot" ||
+		replayed.ForwardedFromMessageID != source {
+		t.Fatalf("replay is not the row the statement returned: %+v", replayed)
+	}
+
+	for name, testCase := range map[string]struct {
+		input storage.ForwardReplayInput
+		want  error
+	}{
+		"key reused for another source": {
+			input: storage.ForwardReplayInput{
+				WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor,
+				SourceMessageID: dmMsg, IdempotencyKey: input.IdempotencyKey,
+			},
+			want: domain.ErrConflict,
+		},
+		"unused key": {
+			input: storage.ForwardReplayInput{
+				WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor,
+				SourceMessageID: source, IdempotencyKey: "never-used",
+			},
+			want: domain.ErrNotFound,
+		},
+		"no key at all": {
+			input: storage.ForwardReplayInput{
+				WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor,
+				SourceMessageID: source,
+			},
+			want: domain.ErrNotFound,
+		},
+		// The key is scoped to its sender. Someone else presenting it must not
+		// be handed the message it created.
+		"another sender's key": {
+			input: storage.ForwardReplayInput{
+				WorkspaceID: workspace, DestinationChannelID: dest, ActorID: author,
+				SourceMessageID: source, IdempotencyKey: input.IdempotencyKey,
+			},
+			want: domain.ErrNotFound,
+		},
+		"another workspace": {
+			input: storage.ForwardReplayInput{
+				WorkspaceID: otherWS, DestinationChannelID: dest, ActorID: actor,
+				SourceMessageID: source, IdempotencyKey: input.IdempotencyKey,
+			},
+			want: domain.ErrNotFound,
+		},
+	} {
+		t.Run("replay lookup: "+name, func(t *testing.T) {
+			if _, err := store.LookupForwardReplay(ctx, testCase.input); !errors.Is(err, testCase.want) {
+				t.Fatalf("want %v, got %v", testCase.want, err)
+			}
+		})
+	}
+
 	for name, deniedInput := range map[string]storage.ForwardChannelMessageInput{
 		"same channel": {
 			WorkspaceID: workspace, DestinationChannelID: origin, ActorID: actor, SourceMessageID: source,
@@ -170,8 +253,65 @@ func TestPGXMessageStoreForwardChannelMessagePostgreSQL(t *testing.T) {
 			if !errors.Is(err, domain.ErrNotFound) {
 				t.Fatalf("expected non-enumerating ErrNotFound, got %v", err)
 			}
+			// The snapshot read must refuse exactly the same set, or separating
+			// read from write would have opened a hole: a source the write
+			// rejects must not be readable through the new query either.
+			_, err = store.SnapshotForwardableMessage(t.Context(), storage.ForwardSnapshotInput{
+				WorkspaceID:          deniedInput.WorkspaceID,
+				DestinationChannelID: deniedInput.DestinationChannelID,
+				ActorID:              deniedInput.ActorID,
+				SourceMessageID:      deniedInput.SourceMessageID,
+			})
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("snapshot must be non-enumerating too, got %v", err)
+			}
 		})
 	}
+
+	// The TOCTOU property, against a real database: the content that was checked
+	// is the content that is persisted, even when the source changes in between.
+	// Before the fix the INSERT re-read source.body_text, so the edit below would
+	// have been the thing forwarded — unchecked.
+	t.Run("edit after snapshot does not change what is forwarded", func(t *testing.T) {
+		staged, err := store.SnapshotForwardableMessage(t.Context(), storage.ForwardSnapshotInput{
+			WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor, SourceMessageID: source,
+		})
+		if err != nil {
+			t.Fatalf("SnapshotForwardableMessage: %v", err)
+		}
+		if _, err := pool.Exec(t.Context(), `
+			UPDATE chat.messages SET body_text = $2 WHERE id = $1`,
+			source, "https://evil.example/login"); err != nil {
+			t.Fatalf("edit source: %v", err)
+		}
+
+		result, err := store.ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
+			WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor,
+			SourceMessageID: source, IdempotencyKey: "toctou-action",
+			BodyText: staged.BodyText, BodyFormat: staged.BodyFormat,
+		})
+		if err != nil {
+			t.Fatalf("ForwardChannelMessage: %v", err)
+		}
+		if result.Message.BodyText != staged.BodyText {
+			t.Fatalf("the statement persisted content nobody checked: %q", result.Message.BodyText)
+		}
+		var persisted string
+		if err := pool.QueryRow(t.Context(),
+			`SELECT body_text FROM chat.messages WHERE id = $1`, result.Message.ID,
+		).Scan(&persisted); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if persisted != staged.BodyText {
+			t.Fatalf("row holds %q, snapshot was %q", persisted, staged.BodyText)
+		}
+		// Restore, so the assertions after this subtest still describe the seed.
+		if _, err := pool.Exec(t.Context(), `
+			UPDATE chat.messages SET body_text = $2 WHERE id = $1`,
+			source, staged.BodyText); err != nil {
+			t.Fatalf("restore source: %v", err)
+		}
+	})
 
 	if _, err := pool.Exec(ctx, `
 		UPDATE chat.workspace_members SET status = 'suspended'
@@ -180,8 +320,16 @@ func TestPGXMessageStoreForwardChannelMessagePostgreSQL(t *testing.T) {
 	}
 	_, err = store.ForwardChannelMessage(ctx, storage.ForwardChannelMessageInput{
 		WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor, SourceMessageID: source,
+		BodyText: snapshot.BodyText, BodyFormat: snapshot.BodyFormat,
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("inactive actor must be non-enumerating, got %v", err)
+	}
+	// A suspended actor must not be able to read the snapshot either: the write
+	// refusing is not enough if the read leaks the body.
+	if _, err := store.SnapshotForwardableMessage(ctx, storage.ForwardSnapshotInput{
+		WorkspaceID: workspace, DestinationChannelID: dest, ActorID: actor, SourceMessageID: source,
+	}); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("inactive actor read the snapshot: %v", err)
 	}
 }

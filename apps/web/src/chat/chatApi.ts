@@ -747,7 +747,15 @@ function mapMessage(r: MessageResponse): Message {
     bodyText: isRemoved ? "" : (r.body_text ?? ""),
     bodyFormat: normalizeBodyFormat(r.body_format),
     isRemoved,
-    status: isRemoved ? "deleted" : "active",
+    // RF-21: a message the backend is withholding pending a link scan reports
+    // itself as such, so the composer can say it is being checked instead of
+    // pretending it was delivered. Any other value collapses to "active", so an
+    // unknown status can never be rendered as a state this client invented.
+    status: isRemoved
+      ? "deleted"
+      : r.status === "pending_link_scan"
+        ? "pending_link_scan"
+        : "active",
     deletedAt: r.deleted_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,

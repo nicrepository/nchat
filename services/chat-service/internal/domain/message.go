@@ -20,6 +20,14 @@ const (
 	MessageStatusActive MessageStatus = "active"
 	// MessageStatusDeleted marks a soft-deleted message kept as a placeholder.
 	MessageStatusDeleted MessageStatus = "deleted"
+	// MessageStatusPendingLinkScan marks a message accepted but withheld while
+	// Cloudflare URL Scanner decides about the links it carries (RF-21).
+	//
+	// It is not a visible state. Every read path filters `status = 'active'`, so
+	// a message in this state is delivered to nobody — including its sender's own
+	// listing — until it is promoted. The sender learns about it from the create
+	// response, which is the one place it is ever named.
+	MessageStatusPendingLinkScan MessageStatus = "pending_link_scan"
 )
 
 // MessageBodyFormat selects the grammar used to render BodyText.

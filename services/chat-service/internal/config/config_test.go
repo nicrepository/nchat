@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
@@ -173,5 +174,136 @@ func TestLoad_WSInstanceID_EmptyRemainsEmpty(t *testing.T) {
 	cfg := Load()
 	if cfg.WSInstanceID != "" {
 		t.Fatalf("empty WS_INSTANCE_ID must stay empty, got %q", cfg.WSInstanceID)
+	}
+}
+
+// --- RF-21 link safety ---------------------------------------------------
+
+func TestLoadDefaultsLinkSafetyToDisabled(t *testing.T) {
+	cfg := Load()
+
+	if cfg.LinkSafetyEnabled {
+		t.Fatal("the safe browsing check must be off unless a deployment asks for it")
+	}
+	if cfg.LinkSafetyCloudflareAccount != "" || cfg.LinkSafetyCloudflareToken != "" {
+		t.Fatal("credentials must have no defaults")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("an absent variable must take the default, not fail: %v", err)
+	}
+}
+
+// The finding: an unparseable value must not fold into false. A control that
+// switches itself off because someone wrote "enabled" has no symptom other than
+// nothing ever being blocked.
+func TestValidateRejectsUnparseableLinkSafetyFlag(t *testing.T) {
+	for _, raw := range []string{"enabled", "on", "yes", "", " ", "2"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("CHAT_LINK_SAFETY_ENABLED", raw)
+
+			cfg := Load()
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("%q was accepted", raw)
+			}
+			if err.Error() != "CHAT_LINK_SAFETY_ENABLED must be a valid boolean" {
+				t.Fatalf("message is not the deterministic one: %v", err)
+			}
+			if cfg.LinkSafetyEnabled {
+				t.Fatal("an invalid value must not read as enabled either")
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsParseableLinkSafetyFlag(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"true": true, "TRUE": true, "1": true,
+		"false": false, "FALSE": false, "0": false,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("CHAT_LINK_SAFETY_ENABLED", raw)
+			// Credentials so this stays a test about *parsing*: enabling
+			// without them is its own error, asserted separately below.
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
+
+			cfg := Load()
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("%q was rejected: %v", raw, err)
+			}
+			if cfg.LinkSafetyEnabled != want {
+				t.Fatalf("%q read as %v", raw, cfg.LinkSafetyEnabled)
+			}
+		})
+	}
+}
+
+func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
+
+	cfg := Load()
+
+	if !cfg.LinkSafetyEnabled {
+		t.Fatal("CHAT_LINK_SAFETY_ENABLED was not read")
+	}
+	if cfg.LinkSafetyCloudflareAccount != "acct-123" || cfg.LinkSafetyCloudflareToken != "token-abc" {
+		t.Fatalf("credentials: %q / %q", cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken)
+	}
+}
+
+// The other half of the finding: the flag parsed fine, but nothing was there to
+// build a checker from. Accepting that configuration is what produced the
+// enabled-but-unchecked state — the checker could not be created, the gate was
+// absent, and every message went through.
+func TestValidateRejectsEnabledLinkSafetyWithoutCredentials(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		account string
+		token   string
+		want    string
+	}{
+		"no account": {
+			account: "", token: "token-abc",
+			want: "CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
+		"no token": {
+			account: "acct-123", token: "",
+			want: "CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
+		"neither": {
+			account: "", token: "",
+			want: "CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", testCase.account)
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", testCase.token)
+
+			err := Load().Validate()
+			if err == nil {
+				t.Fatal("an enabled check with no way to run it was accepted")
+			}
+			if err.Error() != testCase.want {
+				t.Fatalf("message is not the deterministic one: %v", err)
+			}
+			if strings.Contains(err.Error(), testCase.token) && testCase.token != "" {
+				t.Fatal("the error repeated the token")
+			}
+		})
+	}
+}
+
+// Disabled is the one state in which absent credentials are correct, and it has
+// to stay valid: it is how an environment without a Cloudflare account runs.
+func TestValidateAcceptsDisabledLinkSafetyWithoutCredentials(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "false")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "")
+
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("an explicitly disabled check needs no credentials: %v", err)
 	}
 }

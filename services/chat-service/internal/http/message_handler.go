@@ -25,6 +25,21 @@ var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 // maxBodyBytes caps request body reads to prevent memory abuse.
 const maxBodyBytes = 1 << 16 // 64 KiB
 
+// RF-21 error codes. They are stable identifiers a client keys on, which is the
+// point: a frontend must be able to tell a blocked link from a malformed
+// request without parsing English. The two are separate because one is
+// permanent and the other is worth retrying.
+const (
+	errCodeMaliciousURL         = "malicious_url"
+	errCodeLinkCheckUnavailable = "link_check_unavailable"
+	// errCodeLinkCheckPending says the links are being scanned right now and
+	// the operation should be retried shortly. It is only ever returned by
+	// editing: creating and forwarding accept the message and withhold it
+	// instead, which is reported by the body's `status` field rather than by an
+	// error.
+	errCodeLinkCheckPending = "link_check_pending"
+)
+
 // workspaceResolver resolves the single default workspace.
 // Satisfied by storage.WorkspaceStore.
 type workspaceResolver interface {
@@ -1353,6 +1368,23 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflict")
 	case errors.Is(err, domain.ErrPinLimitReached):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "pin limit reached")
+	case errors.Is(err, domain.ErrMaliciousURL):
+		// The code is the contract; the text is a fallback. Which link was
+		// condemned and which category the provider reported are both withheld:
+		// repeating them would turn the send endpoint into a free oracle for
+		// checking whether a domain is already burned.
+		httputil.WriteError(w, http.StatusForbidden, errCodeMaliciousURL,
+			"this message contains a link blocked for security reasons")
+	case errors.Is(err, domain.ErrURLCheckUnavailable):
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
+			"the link could not be checked for safety, try again")
+	case errors.Is(err, domain.ErrURLCheckPending):
+		// 409 and not 503: nothing is broken, the scan this request queued is
+		// simply not finished. The already-published version of the message is
+		// untouched, which is the point — an edit is never shown to anyone in a
+		// state nobody has checked.
+		httputil.WriteError(w, http.StatusConflict, errCodeLinkCheckPending,
+			"the links in this edit are being checked for safety, try again shortly")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}

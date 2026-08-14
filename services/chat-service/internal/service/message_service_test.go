@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -68,18 +69,98 @@ type fakeMessageStore struct {
 	forwardedMessage        domain.Message
 	forwardReplayed         bool
 	forwardErr              error
+	forwardSnapshot         storage.ForwardSnapshot
+	snapshotErr             error
+	replayMessage           domain.Message
+	replayErr               error
+	linkVerdicts            map[string]urlsafety.Verdict
+	linkVerdictErr          error
+	ensureScansErr          error
+	ensuredURLs             []string
+	lastVerdictURLs         []string
+	linkVerdictCalls        int
 
 	lastCreateInput        storage.CreateMessageInput
 	lastHistoryInput       storage.ListMessageEditHistoryInput
 	lastDeleteInput        storage.DeleteMessageInput
 	lastForwardInput       storage.ForwardChannelMessageInput
+	lastSnapshotInput      storage.ForwardSnapshotInput
+	lastReplayInput        storage.ForwardReplayInput
 	createCalls            int
 	forwardCalls           int
+	snapshotCalls          int
+	replayCalls            int
 	getByIDCalls           int
 	listChannelCalls       int
 	listDMCalls            int
 	resolveMentionCalls    int
 	resolveAuthorizedCalls int
+}
+
+// LookupForwardReplay defaults to "no earlier forward", so every test that does
+// not set replayMessage/replayErr keeps exercising the create path.
+func (f *fakeMessageStore) LookupForwardReplay(_ context.Context, input storage.ForwardReplayInput) (domain.Message, error) {
+	f.replayCalls++
+	f.lastReplayInput = input
+	if f.replayErr != nil {
+		return domain.Message{}, f.replayErr
+	}
+	if f.replayMessage.ID == "" {
+		return domain.Message{}, domain.ErrNotFound
+	}
+	return f.replayMessage, nil
+}
+
+// --- RF-21 link scan queue -------------------------------------------------
+//
+// linkVerdicts is what the store already knows; a URL absent from it is pending,
+// which is the default and therefore what every test that says nothing gets.
+
+func (f *fakeMessageStore) LoadLinkVerdicts(_ context.Context, urls []string) (map[string]urlsafety.Verdict, error) {
+	f.linkVerdictCalls++
+	f.lastVerdictURLs = append([]string(nil), urls...)
+	if f.linkVerdictErr != nil {
+		return nil, f.linkVerdictErr
+	}
+	known := make(map[string]urlsafety.Verdict, len(urls))
+	for _, url := range urls {
+		if verdict, ok := f.linkVerdicts[url]; ok {
+			known[url] = verdict
+		}
+	}
+	return known, nil
+}
+
+func (f *fakeMessageStore) EnsureLinkScans(_ context.Context, urls []string) error {
+	f.ensuredURLs = append(f.ensuredURLs, urls...)
+	return f.ensureScansErr
+}
+
+func (f *fakeMessageStore) ClaimDueLinkScans(_ context.Context, _ int) ([]storage.LinkScanJob, error) {
+	return nil, nil
+}
+
+func (f *fakeMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ string) error { return nil }
+
+func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _ string, _ urlsafety.Verdict) error {
+	return nil
+}
+
+func (f *fakeMessageStore) ResolveDecidedMessages(_ context.Context) ([]storage.ResolvedMessage, error) {
+	return nil, nil
+}
+
+func (f *fakeMessageStore) SnapshotForwardableMessage(_ context.Context, input storage.ForwardSnapshotInput) (storage.ForwardSnapshot, error) {
+	f.snapshotCalls++
+	f.lastSnapshotInput = input
+	if f.snapshotErr != nil {
+		return storage.ForwardSnapshot{}, f.snapshotErr
+	}
+	snapshot := f.forwardSnapshot
+	if snapshot.SourceMessageID == "" {
+		snapshot.SourceMessageID = input.SourceMessageID
+	}
+	return snapshot, nil
 }
 
 func (f *fakeMessageStore) ForwardChannelMessage(_ context.Context, input storage.ForwardChannelMessageInput) (storage.ForwardChannelMessageResult, error) {
@@ -397,7 +478,15 @@ func TestMessageService_ForwardChannelMessage_Succeeds(t *testing.T) {
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: user1,
 		SourceMessageID: "source", IdempotencyKey: "action-1",
 	}
-	if store.lastForwardInput != want || store.forwardCalls != 1 {
+	// Compared field by field: the input now carries a []string of link-scan
+	// URLs (RF-21), so the struct is no longer comparable with ==.
+	got := store.lastForwardInput
+	sameForwardInput := got.WorkspaceID == want.WorkspaceID &&
+		got.DestinationChannelID == want.DestinationChannelID &&
+		got.ActorID == want.ActorID && got.SourceMessageID == want.SourceMessageID &&
+		got.IdempotencyKey == want.IdempotencyKey && got.BodyText == want.BodyText &&
+		got.BodyFormat == want.BodyFormat && got.Status == want.Status
+	if !sameForwardInput || store.forwardCalls != 1 {
 		t.Fatalf("unexpected forwarding input/calls: %+v / %d", store.lastForwardInput, store.forwardCalls)
 	}
 	if channels.getVisibleByIDCalls != 0 || store.getByIDCalls != 0 {

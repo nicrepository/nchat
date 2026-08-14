@@ -43,7 +43,7 @@ const mentionSearchRateLimit = 30
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler, antiSpam *AntiSpamGuard) http.Handler {
+func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler, antiSpam *AntiSpamGuard, sharedMetrics ...*observability.Metrics) http.Handler {
 	_ = logger
 	if wsHandler == nil {
 		wsHandler = unavailableWSHandler()
@@ -62,7 +62,18 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	state.Messages = state.Messages && messages.Ready()
 
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
+	// The registry is normally built here, but RF-21 needs one counter
+	// registered before the router exists — the link-safety worker is wired
+	// during service construction. So the bootstrap may hand its own in, and
+	// this stays the only place that decides what /metrics serves.
+	//
+	// Variadic rather than a thirteenth positional parameter: every caller but
+	// the bootstrap wants the default, and threading nil through fifteen test
+	// call sites would say nothing.
 	metrics := observability.NewMetrics(obsCfg)
+	if len(sharedMetrics) > 0 && sharedMetrics[0] != nil {
+		metrics = sharedMetrics[0]
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle(RouteHealthz, httputil.MethodNotAllowed(http.MethodGet, Healthz(cfg)))
@@ -216,7 +227,16 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 
 	// RF-13/RF-14 message editing, history, soft deletion, and workspace edit-window configuration.
 	// The edit handler applies the shared Valkey Lua limiter before touching DB.
-	mux.Handle("PATCH "+RouteMessage, authMiddleware(http.HandlerFunc(messages.EditMessage)))
+	// Editing spends the same write budget as sending, and for a reason beyond
+	// symmetry: since RF-21, an edit whose body carries an unscanned link queues
+	// a Cloudflare submission. Without a limiter here, one authenticated client
+	// could drain the account's scan quota by editing one message in a loop —
+	// the send path was capped and this one was not. The limiter runs before the
+	// handler, so a request over the cap never reaches the classification and
+	// never queues a scan.
+	mux.Handle("PATCH "+RouteMessage, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.EditMessage)),
+	))
 	mux.Handle("DELETE "+RouteMessage, authMiddleware(
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.DeleteMessage)),
 	))

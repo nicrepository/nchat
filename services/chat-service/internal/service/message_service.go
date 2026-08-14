@@ -99,6 +99,10 @@ type ForwardChannelMessageInput struct {
 type ForwardChannelMessageOutput struct {
 	Message  domain.Message
 	Replayed bool
+	// Pending is true when the forwarded snapshot carries a link with no verdict
+	// yet (RF-21). The message exists and the caller may report it, but nobody
+	// else has been shown it.
+	Pending bool
 }
 
 // ListChannelMessagesInput identifies the channel and caller for a message list.
@@ -198,6 +202,10 @@ type MessageService struct {
 
 	publishSlots      chan struct{}
 	droppedPublishCnt atomic.Int64
+
+	// linkSafety is the RF-21 gate. Nil means the deployment did not enable the
+	// check and every path behaves exactly as it did before it existed.
+	linkSafety URLSafetyChecker
 }
 
 // SetMentionLabelCache enables the optional read-through cache. Configure it
@@ -280,6 +288,16 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, senderID); err != nil {
 		return domain.Message{}, err
 	}
+	// RF-21, after authorization and before anything is written. After, so an
+	// unauthorized caller cannot spend provider quota on a channel they cannot
+	// post to; before, so a refusal leaves no row, no attachment binding and no
+	// broadcast — the publish below is reached only by a message that committed.
+	// RF-21 is asynchronous, so this yields one of three outcomes: publish now,
+	// withhold, or refuse. Only the refusal returns here.
+	links, err := s.classifyBodyLinks(ctx, body)
+	if err != nil {
+		return domain.Message{}, err
+	}
 
 	var mentionedUserIDs, mentionedChannelIDs []string
 	if bodyFormat == domain.MessageBodyFormatV3 {
@@ -327,6 +345,8 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		MentionedUserIDs:       mentionedUserIDs,
 		MentionedChannelIDs:    mentionedChannelIDs,
 		AttachmentIDs:          attachmentIDs,
+		Status:                 links.messageStatus(),
+		LinkScanURLs:           links.URLs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create channel message: %w", err)
@@ -338,6 +358,12 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		msg.Reference = &domain.MessageReference{Available: false}
 	} else {
 		msg = created[0]
+	}
+	if links.pending() {
+		// Accepted and withheld. Nothing is broadcast, nothing is notified, and
+		// no unread count moves: the row is pending_link_scan, which every read
+		// path already excludes. The worker publishes it if the scan clears.
+		return msg, nil
 	}
 	s.publishMessageCreated(ctx, workspaceID, "channel", channelID, msg)
 	return msg, nil
@@ -354,10 +380,75 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 		return ForwardChannelMessageOutput{}, fmt.Errorf("%w: forwarding identifiers are required", domain.ErrInvalidInput)
 	}
 
+	// Idempotency first, and before anything leaves this process.
+	//
+	// A retried forward is a request for the message that already exists, not a
+	// request to create one, so it must not depend on a third party agreeing
+	// twice: a verdict that flipped to malicious after the original send, or a
+	// provider that is simply down, would otherwise turn a legitimate retry of
+	// an already-persisted message into a refusal. Nothing new is published
+	// here, so nothing new needs checking.
+	//
+	// Two concurrent *first* attempts can both miss this and both check. That is
+	// allowed: the unique index below is still the only thing that decides which
+	// one inserts, one message is created, and the other is told it replayed. A
+	// duplicate provider lookup in a rare race is not worth a distributed lock.
+	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
+	if idempotencyKey != "" {
+		replay, err := s.messages.LookupForwardReplay(ctx, storage.ForwardReplayInput{
+			WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
+			ActorID: actorID, SourceMessageID: sourceMessageID,
+			IdempotencyKey: idempotencyKey,
+		})
+		switch {
+		case err == nil:
+			return ForwardChannelMessageOutput{Message: replay, Replayed: true}, nil
+		case errors.Is(err, domain.ErrNotFound):
+			// No earlier forward under this key: carry on and create one.
+		case errors.Is(err, domain.ErrConflict) || errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded):
+			return ForwardChannelMessageOutput{}, err
+		default:
+			return ForwardChannelMessageOutput{}, fmt.Errorf("lookup forward replay: %w", err)
+		}
+	}
+
+	// RF-21. A forward creates a *new* message, so it is a way to publish content
+	// that was written before the check existed — or while it was switched off —
+	// into a channel where it never passed one. It goes through the same gate.
+	//
+	// The order is what makes it correct rather than decorative. The snapshot is
+	// read first, outside any transaction and holding no row lock, so the
+	// provider call below never happens with a database connection pinned; the
+	// snapshot is then what is checked *and* what the statement writes, so a
+	// concurrent edit of the source cannot swap the content between the two. The
+	// source-side authorization the snapshot query applies is the same one the
+	// forwarding statement applies, and the destination-side authorization is
+	// untouched — it still lives in the atomic statement below.
+	snapshot, err := s.messages.SnapshotForwardableMessage(ctx, storage.ForwardSnapshotInput{
+		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
+		ActorID: actorID, SourceMessageID: sourceMessageID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return ForwardChannelMessageOutput{}, err
+		}
+		return ForwardChannelMessageOutput{}, fmt.Errorf("snapshot forwardable message: %w", err)
+	}
+	links, err := s.classifyBodyLinks(ctx, snapshot.BodyText)
+	if err != nil {
+		return ForwardChannelMessageOutput{}, err
+	}
+
 	result, err := s.messages.ForwardChannelMessage(ctx, storage.ForwardChannelMessageInput{
 		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
 		ActorID: actorID, SourceMessageID: sourceMessageID,
-		IdempotencyKey: strings.TrimSpace(input.IdempotencyKey),
+		IdempotencyKey: idempotencyKey,
+		BodyText:       snapshot.BodyText,
+		BodyFormat:     snapshot.BodyFormat,
+		Status:         links.messageStatus(),
+		LinkScanURLs:   links.URLs,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidInput) || errors.Is(err, domain.ErrNotFound) ||
@@ -367,10 +458,12 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 		}
 		return ForwardChannelMessageOutput{}, fmt.Errorf("forward channel message: %w", err)
 	}
-	if !result.Replayed {
+	if !result.Replayed && !links.pending() {
 		s.publishMessageCreated(ctx, workspaceID, "channel", destinationChannelID, result.Message)
 	}
-	return ForwardChannelMessageOutput{Message: result.Message, Replayed: result.Replayed}, nil
+	return ForwardChannelMessageOutput{
+		Message: result.Message, Replayed: result.Replayed, Pending: links.pending(),
+	}, nil
 }
 
 // CreateDMMessage posts a message to a DM conversation.
@@ -404,6 +497,13 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	if _, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, conversationID, senderID); err != nil {
 		return domain.Message{}, err
 	}
+	// RF-21, on the same terms as the channel path: after authorization, before
+	// persistence. A DM is the likelier phishing vector of the two, not the
+	// lesser one.
+	links, err := s.classifyBodyLinks(ctx, body)
+	if err != nil {
+		return domain.Message{}, err
+	}
 
 	parentID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ParentMessageID))
 	if err != nil {
@@ -432,6 +532,8 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
 		AttachmentIDs:          attachmentIDs,
+		Status:                 links.messageStatus(),
+		LinkScanURLs:           links.URLs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create dm message: %w", err)
@@ -443,6 +545,9 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		msg.Reference = &domain.MessageReference{Available: false}
 	} else {
 		msg = created[0]
+	}
+	if links.pending() {
+		return msg, nil
 	}
 	s.publishMessageCreated(ctx, workspaceID, "dm", conversationID, msg)
 	return msg, nil
@@ -511,6 +616,23 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	current, err := s.messages.GetMessageByIDInWorkspace(ctx, workspaceID, messageID, editorID)
 	if err != nil {
 		return domain.Message{}, err
+	}
+	// RF-21 applies to editing too, and not as an afterthought: a check that ran
+	// only on creation would be bypassed by sending a clean message and editing
+	// the link in. This is the same funnel — one body, one rule.
+	// Editing is the one path that cannot go pending. A withheld *edit* would
+	// mean either showing everyone the unscanned new body or silently keeping
+	// the old one while telling the author it was saved, and both are worse than
+	// asking the author to retry: the currently published version stays exactly
+	// as it is, and the scan the classification just queued makes the retry
+	// succeed shortly. A pending revision table is the upgrade if authors ever
+	// find the retry intrusive.
+	editLinks, err := s.classifyBodyLinks(ctx, body)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if editLinks.pending() {
+		return domain.Message{}, domain.ErrURLCheckPending
 	}
 	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, editorID, body, bodyFormat)
 	if err != nil {
