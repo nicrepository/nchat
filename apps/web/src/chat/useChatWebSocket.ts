@@ -122,6 +122,12 @@ export interface WSTypingUpdatedEvent {
   target_id: string;
   typing?: {
     user_id: string;
+    /**
+     * The typing user's display name, resolved server-side once per
+     * WebSocket connection. Absent when the server couldn't resolve one
+     * (rare) — the caller falls back to its own heuristic in that case.
+     */
+    user_display_name?: string;
     is_typing: boolean;
     updated_at?: string;
   };
