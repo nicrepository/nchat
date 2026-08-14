@@ -294,12 +294,21 @@ type PresencePayload struct {
 // whole envelope undecodable, and it is the ordering key a client uses to
 // discard a stale update without trusting its own clock.
 //
+// UserDisplayName is resolved server-side once per WebSocket connection (see
+// ws.UserDisplayNameResolver / Client.displayName) rather than guessed by each
+// recipient's client from whatever roster or message history it happens to
+// have loaded — that guess is what previously fell back to the literal
+// placeholder "Alguém" for a channel typist who hadn't posted yet. Empty when
+// the lookup failed or the user has no display name; clients keep their own
+// heuristic as a fallback in that case.
+//
 // There is deliberately no body, no draft, no character count: this payload
 // answers "is this person typing right now", nothing about what they wrote.
 type TypingEventPayload struct {
-	UserID    string `json:"user_id"`
-	IsTyping  bool   `json:"is_typing"`
-	UpdatedAt string `json:"updated_at"`
+	UserID          string `json:"user_id"`
+	UserDisplayName string `json:"user_display_name,omitempty"`
+	IsTyping        bool   `json:"is_typing"`
+	UpdatedAt       string `json:"updated_at"`
 }
 
 // PresenceSnapshotResponse answers a subscribe with the presence of the users

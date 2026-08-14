@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -307,6 +308,7 @@ func TestHub_TypingStartBroadcastsToSubscribersAndTouchesStore(t *testing.T) {
 	limiter := &fakeTypingLimiter{allowed: true}
 	store := newFakeTypingStore()
 	hub, a, b := newTypingTestHub(t, limiter, store)
+	a.displayName = "Ana Souza"
 
 	if err := hub.handleClientMessage(context.Background(), a, ClientMessage{
 		Type: ClientMessageTypeTypingStart, TargetType: TargetTypeChannel, TargetID: typingChannel,
@@ -338,6 +340,9 @@ func TestHub_TypingStartBroadcastsToSubscribersAndTouchesStore(t *testing.T) {
 		}
 		if evt.Typing.UserID != typingUserA {
 			t.Fatalf("UserID = %q, want the server-asserted identity, not any client-supplied one", evt.Typing.UserID)
+		}
+		if evt.Typing.UserDisplayName != "Ana Souza" {
+			t.Fatalf("UserDisplayName = %q, want the connection's resolved name", evt.Typing.UserDisplayName)
 		}
 		if !evt.Typing.IsTyping {
 			t.Fatal("IsTyping = false, want true")
@@ -554,6 +559,42 @@ func TestCanonicalizeRemoteTypingEventRejectsMalformed(t *testing.T) {
 				t.Fatal("expected canonicalization to reject the malformed event")
 			}
 		})
+	}
+}
+
+func TestCanonicalizeRemoteTypingEventTruncatesOversizedDisplayName(t *testing.T) {
+	evt := typingUpdatedEvent()
+	cp := *evt.Typing
+	cp.UserDisplayName = strings.Repeat("x", typingUserDisplayNameMaxLen+50)
+	evt.Typing = &cp
+
+	canonical, ok := canonicalizeRemoteEvent(evt)
+	if !ok {
+		t.Fatal("an oversized display name must not reject the whole event")
+	}
+	if got := len([]rune(canonical.Typing.UserDisplayName)); got != typingUserDisplayNameMaxLen {
+		t.Fatalf("UserDisplayName length = %d, want truncated to %d", got, typingUserDisplayNameMaxLen)
+	}
+}
+
+func TestCanonicalizeRemoteTypingEventTruncatesOnRuneBoundary(t *testing.T) {
+	// "á" is 2 bytes but 1 rune — a byte-boundary truncation at
+	// typingUserDisplayNameMaxLen could split it and produce invalid UTF-8.
+	evt := typingUpdatedEvent()
+	cp := *evt.Typing
+	name := strings.Repeat("á", typingUserDisplayNameMaxLen+10)
+	cp.UserDisplayName = name
+	evt.Typing = &cp
+
+	canonical, ok := canonicalizeRemoteEvent(evt)
+	if !ok {
+		t.Fatal("expected canonicalization to succeed")
+	}
+	if !utf8.ValidString(canonical.Typing.UserDisplayName) {
+		t.Fatalf("truncated name is not valid UTF-8: %q", canonical.Typing.UserDisplayName)
+	}
+	if got := utf8.RuneCountInString(canonical.Typing.UserDisplayName); got != typingUserDisplayNameMaxLen {
+		t.Fatalf("rune count = %d, want %d", got, typingUserDisplayNameMaxLen)
 	}
 }
 

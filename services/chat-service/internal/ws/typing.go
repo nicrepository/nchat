@@ -213,12 +213,13 @@ func (h *Hub) clearTypingStore(ctx context.Context, key, userID string) {
 // best-effort. No snapshot-on-subscribe exists for typing — it is inherently
 // "what's happening right now", not state a newly-opened conversation needs
 // to backfill.
-func (h *Hub) publishTypingUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID, userID string, isTyping bool) {
+func (h *Hub) publishTypingUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID, userID, userDisplayName string, isTyping bool) {
 	evt := Event{
 		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeTypingUpdated,
 		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
 		Typing: &TypingEventPayload{
-			UserID: userID, IsTyping: isTyping, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			UserID: userID, UserDisplayName: userDisplayName, IsTyping: isTyping,
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		},
 		EventID:          uuid.New().String(),
 		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
@@ -269,7 +270,7 @@ func (h *Hub) handleTypingStart(ctx context.Context, c *Client, msg ClientMessag
 	}
 	h.touchTypingState(c, key)
 	h.touchTypingStore(ctx, key, c.userID)
-	h.publishTypingUpdated(ctx, c.workspaceID, target.targetType, target.targetID, c.userID, true)
+	h.publishTypingUpdated(ctx, c.workspaceID, target.targetType, target.targetID, c.userID, c.displayName, true)
 	return nil
 }
 
@@ -292,7 +293,7 @@ func (h *Hub) handleTypingStop(ctx context.Context, c *Client, msg ClientMessage
 	}
 	h.clearTypingState(c, key)
 	h.clearTypingStore(ctx, key, c.userID)
-	h.publishTypingUpdated(ctx, c.workspaceID, target.targetType, target.targetID, c.userID, false)
+	h.publishTypingUpdated(ctx, c.workspaceID, target.targetType, target.targetID, c.userID, c.displayName, false)
 	return nil
 }
 
@@ -307,7 +308,7 @@ func (h *Hub) stopAllTyping(ctx context.Context, c *Client, keys []string) {
 			continue
 		}
 		h.clearTypingStore(ctx, key, c.userID)
-		h.publishTypingUpdated(ctx, parsed.workspaceID, parsed.targetType, parsed.targetID, c.userID, false)
+		h.publishTypingUpdated(ctx, parsed.workspaceID, parsed.targetType, parsed.targetID, c.userID, c.displayName, false)
 	}
 }
 
@@ -321,13 +322,20 @@ func (h *Hub) finishTypingStop(ctx context.Context, c *Client, key string) {
 		return
 	}
 	h.clearTypingStore(ctx, key, c.userID)
-	h.publishTypingUpdated(ctx, parsed.workspaceID, parsed.targetType, parsed.targetID, c.userID, false)
+	h.publishTypingUpdated(ctx, parsed.workspaceID, parsed.targetType, parsed.targetID, c.userID, c.displayName, false)
 }
 
 // typingUpdatedAtMaxLen bounds the timestamp string, mirroring
 // presenceUpdatedAtMaxLen: the client parses it only for ordering, so an
 // unbounded value is memory a producer chose, not a client's problem to hold.
 const typingUpdatedAtMaxLen = 64
+
+// typingUserDisplayNameMaxLen bounds the display name string. Unlike
+// UpdatedAt, an oversized value here is not evidence the whole event is
+// malformed — it is cosmetic — so it is truncated (on a rune boundary, never
+// a byte boundary, since display names carry multi-byte characters) rather
+// than causing the entire typing.updated to be dropped for every subscriber.
+const typingUserDisplayNameMaxLen = 128
 
 // canonicalizeTypingEvent validates a remote typing.updated event, mirroring
 // canonicalizePresenceEvent: the target must be a channel or DM (never the
@@ -348,6 +356,9 @@ func canonicalizeTypingEvent(evt Event) (Event, bool) {
 	}
 	if len(evt.Typing.UpdatedAt) > typingUpdatedAtMaxLen {
 		return Event{}, false
+	}
+	if runes := []rune(evt.Typing.UserDisplayName); len(runes) > typingUserDisplayNameMaxLen {
+		evt.Typing.UserDisplayName = string(runes[:typingUserDisplayNameMaxLen])
 	}
 	evt.Typing.UserID = userID.String()
 	evt.Payload = nil
