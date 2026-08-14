@@ -11,3 +11,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: nchat-config
+          env:
+            - name: NCHAT_WEB_LIVEKIT_CONNECT_SRC
+              value: "wss://livekit-dev.nic-labs.com https://livekit-dev.nic-labs.com"

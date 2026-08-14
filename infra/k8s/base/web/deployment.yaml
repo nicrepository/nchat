@@ -60,6 +60,14 @@ spec:
               value: "8080"
             - name: SERVICE_NAME
               value: web
+            # Allowlist de connect-src para LiveKit por ambiente (issue #528).
+            # Vazio no base; cada overlay que precisar de LiveKit define o
+            # valor (ver infra/k8s/overlays/nchat-dev-server/patches/web.yaml).
+            - name: NCHAT_WEB_LIVEKIT_CONNECT_SRC
+              value: ""
+          # Startup (envsubst restrito + exec nginx) vem só da imagem
+          # (Dockerfile.web CMD); nenhum command/args aqui, para não ter dois
+          # lugares definindo o mesmo fluxo (issue #528 review).
           ports:
             - name: http
               containerPort: 8080
@@ -98,6 +106,15 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # readOnlyRootFilesystem: true torna /etc/nginx/conf.d somente
+            # leitura na camada da imagem; o fragmento renderizado por
+            # envsubst precisa de um destino gravável nesse caminho exato
+            # para ser pego por "include /etc/nginx/conf.d/*.conf;" do
+            # nginx.conf principal da imagem base.
+            - name: conf-d
+              mountPath: /etc/nginx/conf.d
       volumes:
         - name: tmp
+          emptyDir: {}
+        - name: conf-d
           emptyDir: {}
