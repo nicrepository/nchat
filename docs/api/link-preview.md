@@ -74,17 +74,44 @@ primeira vence.
 | ------ | ------------------------ | ---------------------------------------------------- |
 | `400`  | `bad_request`            | corpo invalido, ou URL vazia/malformada/longa demais |
 | `400`  | `url_not_allowed`        | esquema, porta ou destino recusado pela politica     |
+| `403`  | `malicious_url`          | link recusado pelo Safe Browsing (RF-21)             |
 | `401`  | `unauthorized`           | access token ausente ou invalido                     |
 | `404`  | `preview_not_available`  | a pagina foi lida e nao tem metadado exibivel        |
 | `415`  | `unsupported_media_type` | a resposta remota nao e `text/html`                  |
 | `429`  | `rate_limited`           | orcamento por usuario esgotado (`Retry-After`)       |
 | `502`  | `upstream_unavailable`   | o site nao pode ser alcancado ou lido                |
+| `503`  | `link_check_unavailable` | veredito Safe Browsing indisponivel (RF-21)          |
 | `503`  | `service_unavailable`    | feature desabilitada ou dependencia ausente          |
 | `504`  | `upstream_timeout`       | o site nao respondeu dentro do orcamento             |
 
 As mensagens sao texto fixo. Uma recusa nunca diz **qual** destino foi recusado,
 nem repete endereco, hostname ou mensagem do servidor remoto: a diferenca entre
 "recusado" e "recusado porque resolveu para tal faixa" e um mapa da rede interna.
+
+## Safe Browsing (RF-21)
+
+Quando `FILE_LINK_SAFETY_ENABLED=true`, o veredito da **URL canonica completa**
+-- scheme, host, path e query, sem fragmento -- e consultado **antes** do fetch
+Open Graph. URL condenada, veredito indisponivel, ou veredito ainda inexistente:
+a pagina nunca e requisitada. Buscar primeiro e perguntar depois seria renderizar
+a pagina de phishing.
+
+A chave e a URL e nao o host, e essa distincao e o ponto: um preview renderiza
+uma _pagina_, entao decidi-lo pela reputacao do dominio que a hospeda liberava
+todo caminho naquele dominio.
+
+URL sem veredito nao e liberacao e tambem nao e fetch: o file-service registra um
+job duravel e responde `202 link_check_pending`. Um worker proprio submete o scan
+a Cloudflare, guarda o UUID e faz o polling, entao repetir o preview da mesma URL
+nao gera scan novo -- e um restart nao perde o que ja estava em andamento.
+
+E um controle **distinto** da politica abaixo e nao substitui nenhuma parte
+dela: o Safe Browsing responde se _aquela URL_ e maliciosa, a politica de destino
+responde se este backend pode abrir a conexao para aquele endereco. Um destino recusado pela politica continua
+recusado sem o provedor ser consultado.
+
+Contrato completo, cache, granularidade e configuracao em
+[link-safety.md](./link-safety.md).
 
 ## Seguranca
 
@@ -170,8 +197,10 @@ rede.
 
 Metrica: `nchat_file_link_previews_total{result}`, com o conjunto fechado `hit`,
 `success`, `invalid_url`, `blocked`, `unsupported_content_type`, `timeout`,
-`upstream_error`, `no_metadata`. `blocked` subindo merece alerta: sao chamadores
-apontando o fetcher para destinos que a politica recusa.
+`upstream_error`, `no_metadata`, `malicious`, `safety_unavailable`. `blocked`
+subindo merece alerta: sao chamadores apontando o fetcher para destinos que a
+politica recusa. `malicious` e `safety_unavailable` sao RF-21 -- veja tambem
+`nchat_url_safety_checks_total{result}` em [link-safety.md](./link-safety.md).
 
 A URL nunca e label -- e fornecida pelo chamador e ilimitada, entao um cliente
 hostil criaria uma serie por request. Ela tambem nao e logada: a rota nao emite

@@ -64,8 +64,13 @@ const (
 	RouteDMMessagePin          = "/api/chat/dm/{conversationID}/messages/{messageID}/pin"
 	RouteDMPins                = "/api/chat/dm/{conversationID}/pins"
 	RouteMessage               = "/api/chat/messages/{messageID}"
-	RouteMessageEditHistory    = "/api/chat/messages/{messageID}/history"
-	RouteWorkspaceSettings     = "/api/v1/workspaces/{workspaceID}/settings"
+	// RF-21 reconnect reconciliation. A literal segment under the same prefix as
+	// {messageID}: Go's mux prefers the literal, and the two are served for
+	// different methods anyway. No target segment, because a client reconnecting
+	// asks about its own messages and the server already knows whose they are.
+	RouteMessageLinkSafetyStatus = "/api/chat/messages/link-safety-status"
+	RouteMessageEditHistory      = "/api/chat/messages/{messageID}/history"
+	RouteWorkspaceSettings       = "/api/v1/workspaces/{workspaceID}/settings"
 	// RF-19 anti-spam policy (issue #419). It lives under /api/chat because that
 	// is the only prefix the gateways forward to chat-service (Traefik local and
 	// every k8s overlay route /api/chat, /api/auth, /api/admin, …, never

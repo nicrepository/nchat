@@ -589,6 +589,14 @@ validate_nchat_dev() {
   if grep -q 'secretRef:' "$application" "$data" "$migrations"; then return 1; fi
   if grep -q 'REPLACE_ME_' "$application" "$data" "$migrations"; then return 1; fi
   if grep -Eq 'port: 3478|containerPort: 3478' "$application" "$data" "$migrations"; then return 1; fi
+  # Public-internet egress is intentionally limited to exactly two policies:
+  # LiveKit API and RF-21 Cloudflare URL Scanner. Each policy is validated
+  # independently below; any additional 0.0.0.0/0 occurrence must fail CI.
+  if grep -Eq '0\.0\.0\.0/0' "$data" "$migrations"; then return 1; fi
+  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' "$application")" -ne 2 ]]; then
+    echo "error: 0.0.0.0/0 is allowed exactly twice, for LiveKit API and link-safety egress" >&2
+    return 1
+  fi
   if grep -R -Eq '/containers/0|/env/-' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server"; then return 1; fi
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-livekit-api-egress)"
@@ -610,7 +618,10 @@ validate_nchat_dev() {
     return 1
   fi
   grep -Fq 'cidr: 0.0.0.0/0' <<<"$policy_block"
-  [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' "$application")" -eq 1 ]]
+  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-livekit-api-egress must contain exactly one 0.0.0.0/0 ipBlock" >&2
+    return 1
+  fi
   if [[ "$(port_pairs "$policy_block")" != "TCP/443" ]]; then
     echo "error: nchat-allow-livekit-api-egress must have exactly one port TCP/443" >&2
     return 1
@@ -728,6 +739,7 @@ validate_nchat_dev() {
     nchat-allow-dns-egress \
     nchat-allow-file-clamav-egress \
     nchat-allow-file-data-egress \
+    nchat-allow-link-safety-egress \
     nchat-allow-livekit-api-egress \
     nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
@@ -847,6 +859,36 @@ validate_nchat_dev() {
     return 1
   fi
 
+  # The flags themselves are asserted for every supported overlay by
+  # validate_link_safety. What is specific here is the shape of the wiring: this
+  # overlay names each secret key explicitly rather than mounting the Secret
+  # wholesale, so it is four references — an account id and a token for each of
+  # the two services.
+  if [[ "$(grep -Fc 'name: nchat-link-safety' "$application")" -ne 4 ]]; then
+    echo "error: only chat-service and file-service may read nchat-link-safety, two keys each" >&2
+    return 1
+  fi
+  # And the egress that makes the lookup possible: without it the fail-closed
+  # policy refuses every message carrying a link.
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-link-safety-egress)"
+  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' <<<"$policy_block")" -ne 1 ]]; then
+    echo "error: nchat-allow-link-safety-egress must contain exactly one 0.0.0.0/0 ipBlock" >&2
+    return 1
+  fi
+  # An ipBlock peer has no component label, so network_policy_flows prints it as
+  # "<none>"; the port and the direction are what this asserts, and the cidr
+  # itself is checked below.
+  if [[ "$(network_policy_flows "$policy_block")" != 'egress <none> TCP/443' ]]; then
+    echo "error: nchat-allow-link-safety-egress must allow exactly TCP/443 to the public internet" >&2
+    return 1
+  fi
+  for private_range in 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16; do
+    if ! grep -Eq -- "^[[:space:]]*- ${private_range//./\\.}\$" <<<"$policy_block"; then
+      echo "error: nchat-allow-link-safety-egress must exclude $private_range" >&2
+      return 1
+    fi
+  done
+
   # WS_INBOUND_BURST=60 must be declared exactly once in nchat-config so the
   # web client's bootstrap burst (1 call.sync + 12 subscribe messages) is not
   # closed with 1008 (issue #455). The sustained rate must stay untouched.
@@ -885,6 +927,40 @@ validate_nchat_dev() {
   validate_clamav "$application"
 }
 
+# validate_link_safety asserts RF-21 in one rendered overlay.
+#
+# It is its own function, called for every supported overlay, because the
+# previous round asserted it inside the nchat-dev-server validator only — and
+# k3s-dev and k3s-staging shipped with the control off, which is precisely the
+# regression a per-environment assertion cannot catch.
+validate_link_safety() {
+  local name="$1" rendered="$2" flag
+  for flag in CHAT_LINK_SAFETY_ENABLED FILE_LINK_SAFETY_ENABLED; do
+    if [[ "$(grep -Fxc "  $flag: \"true\"" "$rendered")" -ne 1 ]]; then
+      echo "error: $flag must be exactly \"true\" in nchat-config for $name" >&2
+      return 1
+    fi
+  done
+  # The credentials the flags require reach only the two services that call
+  # Cloudflare. In a ConfigMap they would be readable by every pod that mounts
+  # it, and in nchat-secrets by every service that mounts that.
+  if grep -Eq '^  (CHAT|FILE)_LINK_SAFETY_CLOUDFLARE_' "$rendered"; then
+    echo "error: Safe Browsing credentials must not appear in a ConfigMap ($name)" >&2
+    return 1
+  fi
+  if ! grep -Fq 'name: nchat-link-safety' "$rendered"; then
+    echo "error: $name must wire the nchat-link-safety Secret" >&2
+    return 1
+  fi
+  # And the provider actually implemented. Domain Intelligence answered about a
+  # domain, which is the granularity RF-21 may not decide at; a manifest still
+  # naming it would mean the documentation and the code had drifted apart again.
+  if grep -qiE 'intel/domain|domain intelligence|INTEL_READ' "$rendered"; then
+    echo "error: $name still references Domain Intelligence as the RF-21 provider" >&2
+    return 1
+  fi
+}
+
 load_nchat_dev_topology "$NCHAT_DEV_TOPOLOGY_FILE"
 sh -n "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/data/postgres-bootstrap.sh"
 if grep -q '|' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/data/postgres-bootstrap.sh"; then
@@ -907,6 +983,16 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
     "infra/k8s/base=${rendered_by_overlay[infra/k8s/base]}" \
     "infra/k8s/overlays/k3s-dev=${rendered_by_overlay[infra/k8s/overlays/k3s-dev]}" \
     "infra/k8s/overlays/k3s-staging=${rendered_by_overlay[infra/k8s/overlays/k3s-staging]}"
+  # Every supported overlay that runs chat-service and file-service. base is
+  # excluded on purpose: it is the template the overlays patch, and it carries
+  # the application default so a new environment starts from "off" and has to
+  # say otherwise.
+  for overlay in \
+    infra/k8s/overlays/k3s-dev \
+    infra/k8s/overlays/k3s-staging \
+    infra/k8s/overlays/nchat-dev-server; do
+    validate_link_safety "$overlay" "${rendered_by_overlay[$overlay]}"
+  done
 fi
 
 echo "K8s manifests CI check passed."

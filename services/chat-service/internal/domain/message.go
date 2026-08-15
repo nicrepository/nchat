@@ -20,7 +20,71 @@ const (
 	MessageStatusActive MessageStatus = "active"
 	// MessageStatusDeleted marks a soft-deleted message kept as a placeholder.
 	MessageStatusDeleted MessageStatus = "deleted"
+	// MessageStatusPendingLinkScan marks a message accepted but withheld while
+	// Cloudflare URL Scanner decides about the links it carries (RF-21).
+	//
+	// It is not a visible state. Every read path filters `status = 'active'`, so
+	// a message in this state is delivered to nobody — including its sender's own
+	// listing — until it is promoted. The sender learns about it from the create
+	// response, which is the one place it is ever named.
+	MessageStatusPendingLinkScan MessageStatus = "pending_link_scan"
 )
+
+// isEditable reports whether a message in this state may have its body changed.
+//
+// Only `active`. A deleted message has nothing to edit, and a withheld one must
+// not be edited at all: applying the change would broadcast the new body to
+// every subscriber of the target, which is exactly the delivery the withholding
+// prevents — and it would also decouple the content from the scan that is
+// running against it. Waiting until the scan resolves costs the author one
+// retry; the alternative costs the guarantee.
+func (s MessageStatus) isEditable() bool {
+	return s == MessageStatusActive
+}
+
+// LinkSafetyState is the authoritative answer to "what happened to the message
+// I am still showing as being checked?" (RF-21).
+//
+// It exists because realtime delivery is best-effort. A message.blocked
+// published while its author's socket was down reaches nobody, and the author's
+// client would otherwise show "checking links…" forever — the message is gone
+// from the database's point of view and no further event is coming. On reconnect
+// the client asks for the current state of the ids it still holds as pending,
+// and these are the four answers.
+//
+// Absence from a reply is deliberately not one of the four. A message this
+// service will not talk about — someone else's, another workspace's, one that
+// never existed — is simply omitted, so the caller cannot use the endpoint to
+// discover which ids are real, and the client leaves an unanswered id alone
+// rather than guessing.
+type LinkSafetyState string
+
+const (
+	// LinkSafetyStatePending is still withheld: no verdict yet.
+	LinkSafetyStatePending LinkSafetyState = "pending"
+	// LinkSafetyStateActive was cleared and published.
+	LinkSafetyStateActive LinkSafetyState = "active"
+	// LinkSafetyStateBlocked was refused because a link in it was malicious.
+	LinkSafetyStateBlocked LinkSafetyState = "blocked"
+	// LinkSafetyStateDeleted is gone for a reason this service cannot attribute
+	// to the link check. It is separate from blocked on purpose: telling an
+	// author their link was malicious when it may simply have been deleted is a
+	// claim we have no evidence for.
+	LinkSafetyStateDeleted LinkSafetyState = "deleted"
+)
+
+// LinkSafetyReasonMaliciousLink is the only reason a blocked state carries.
+//
+// Fixed, like the websocket event's: which category Cloudflare reported is not
+// the author's to receive, and repeating it would make this an oracle for what
+// the provider already knows.
+const LinkSafetyReasonMaliciousLink = "malicious_link"
+
+// MessageLinkSafetyState pairs one message id with its current state.
+type MessageLinkSafetyState struct {
+	MessageID string
+	State     LinkSafetyState
+}
 
 // MessageBodyFormat selects the grammar used to render BodyText.
 type MessageBodyFormat string
@@ -79,6 +143,12 @@ type Message struct {
 	// Attachments are the files bound to this message (RF-32), read through
 	// chat.message_attachments. Empty for every message that carries none.
 	Attachments []MessageAttachment
+
+	// CreateFingerprint identifies the operation that created this message, and
+	// is populated only by the idempotency replay lookup. It never leaves the
+	// service layer — no HTTP response carries it — and exists so a reused key
+	// can be told from a genuine retry.
+	CreateFingerprint string
 }
 
 // MaxMessageAttachments bounds how many attachments one message may be created
@@ -121,10 +191,19 @@ type MessageEditHistory struct {
 	VersionedAt  time.Time
 }
 
-// ValidateMessageEdit enforces author, deletion, and workspace-window rules.
+// ValidateMessageEdit enforces author, state, and workspace-window rules.
 // now must come from the server/database, never from the request payload.
+//
+// The state rule is an allowlist rather than a "not deleted" check, and that is
+// deliberate. It used to permit every status except deleted, so RF-21's new
+// withheld state was editable by default — and editing one published a
+// message.updated carrying the new body to everyone subscribed to the target,
+// which is precisely the content the withholding exists to keep from them.
+// Adding a state to MessageStatus must not silently make it editable, so the
+// question this asks is "is this state editable?" and not "is this state one of
+// the ones I remembered to exclude?".
 func ValidateMessageEdit(message Message, requesterID string, editWindowSeconds *int, now time.Time) error {
-	if message.SenderID != requesterID || message.Status == MessageStatusDeleted || !message.DeletedAt.IsZero() {
+	if message.SenderID != requesterID || !message.DeletedAt.IsZero() || !message.Status.isEditable() {
 		return ErrEditForbidden
 	}
 	if editWindowSeconds != nil && now.Sub(message.CreatedAt) > time.Duration(*editWindowSeconds)*time.Second {

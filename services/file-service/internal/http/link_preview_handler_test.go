@@ -313,6 +313,18 @@ func TestLinkPreviewMapsServiceErrors(t *testing.T) {
 		"unclassified": {
 			errors.New("boom"), http.StatusBadGateway, "upstream_unavailable",
 		},
+		// RF-21. Its own code, separate from url_not_allowed: one says this
+		// service will not fetch that kind of address, the other says the link
+		// is dangerous, and a client must tell them apart without reading text.
+		"malicious url": {
+			linkpreview.ErrMaliciousURL, http.StatusForbidden, "malicious_url",
+		},
+		// And separate again from a verdict that could not be obtained, which is
+		// the only one of the three worth retrying.
+		"safety unavailable": {
+			linkpreview.ErrSafetyUnavailable, http.StatusServiceUnavailable,
+			"link_check_unavailable",
+		},
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {

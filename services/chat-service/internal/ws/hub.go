@@ -832,6 +832,43 @@ func (h *Hub) PublishConversationAvailable(
 	}
 }
 
+// PublishMessageBlocked tells one author their message was refused (RF-21).
+//
+// Addressed to a single recipient, on the same mechanism conversation.available
+// already uses. That is the whole point: a blocked message was shown to nobody,
+// so announcing it to the target would tell the conversation that something they
+// never saw has been removed.
+//
+// The payload is the message id and a fixed reason. No body, no URL, no scan id,
+// no provider response — the author needs to stop seeing "checking links…", and
+// nothing else about the verdict is theirs to receive.
+func (h *Hub) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
+	if workspaceID == "" || recipientUserID == "" || messageID == "" {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageBlocked,
+		WorkspaceID: workspaceID, MessageID: messageID,
+		RecipientUserID:  recipientUserID,
+		Reason:           MessageBlockedReasonMaliciousLink,
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal message.blocked event", "error", err)
+		return
+	}
+	// Local sessions first, directly. The bus copy is suppressed on this instance
+	// by the SourceInstanceID echo check, so a recipient connected here is told
+	// exactly once.
+	h.deliverToLocalUserSessions(evt, data)
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		// Deliberately no user id and no message id in the log line.
+		h.logger.WarnContext(ctx, "ws: message.blocked bus publish failed", "error", err)
+	}
+}
+
 // deliverToLocalUserSessions enqueues data to every live session of
 // evt.RecipientUserID in evt.WorkspaceID on this instance.
 //
@@ -2329,7 +2366,8 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
+	case EventTypeMessageBlocked,
+		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
 		EventTypePresenceUpdated,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,

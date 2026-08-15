@@ -33,6 +33,36 @@ data:
   FILE_MALWARE_SCAN_REQUIRED: "true"
   # Plain host:port dial target. No scheme, no path, no credentials.
   FILE_MALWARE_SCANNER_ADDRESS: clamav:3310
+  # RF-21 Safe Browsing. Must Have, so it is stated here and asserted in CI:
+  # the application default is false, which means leaving these out would ship
+  # the MVP environment with link checking off. The credentials are not here —
+  # they are the nchat-link-safety Secret, mounted only by these two services.
+  #
+  # Enabling without that Secret is a deliberate CrashLoopBackOff, not a
+  # degraded mode: both services refuse to start rather than accept links
+  # nobody checked.
+  CHAT_LINK_SAFETY_ENABLED: "true"
+  FILE_LINK_SAFETY_ENABLED: "true"
+  # RF-21 capacity. Stated explicitly per environment rather than left to the
+  # application default, because the right numbers depend on the Cloudflare plan
+  # this cluster is billed under and no code may assume one.
+  #
+  # The unit is a *new canonical URL*. Cached verdicts, URLs already queued and
+  # duplicates inside one message are free, so these limit provider spend rather
+  # than usage. Credentials stay in the nchat-link-safety Secret; nothing here is
+  # sensitive.
+  CHAT_LINK_SAFETY_WORKSPACE_BUDGET: "20"
+  CHAT_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  CHAT_LINK_SAFETY_MAX_PENDING_JOBS: "100"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "10"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
+  FILES_LINK_SAFETY_NEW_URL_BUDGET: "40"
+  FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  FILES_LINK_SAFETY_MAX_PENDING_JOBS: "100"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "10"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
   # The external, fail-closed authority over one scan. It must stay below
   # clamd's own MaxScanTime (420000 ms) and it derives the worker's 330 s claim
   # lease; the ordering 300 < 330 < 420 is asserted in CI.

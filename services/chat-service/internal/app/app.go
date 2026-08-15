@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
@@ -54,6 +56,8 @@ type App struct {
 	reactionLimiter   *ws.ValkeyReactionLimiter
 	callWorkerCancel  context.CancelFunc
 	callWorkerWG      *sync.WaitGroup
+	linkScanCancel    context.CancelFunc
+	linkScanWG        *sync.WaitGroup
 	closeDB           func()
 	shutdownOnce      sync.Once
 }
@@ -73,6 +77,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 		if a.callWorkerCancel != nil {
 			a.callWorkerCancel()
 			a.callWorkerWG.Wait()
+		}
+		// Before the hub: the link-scan worker publishes through it, so stopping
+		// it first is what keeps a promotion from racing the hub's shutdown.
+		if a.linkScanCancel != nil {
+			a.linkScanCancel()
+			a.linkScanWG.Wait()
 		}
 		a.hub.Shutdown()
 		a.presence.Stop()
@@ -108,9 +118,19 @@ func (a *App) Shutdown(ctx context.Context) error {
 // In every degraded state the pod never becomes Ready, so the Service sends
 // it no traffic.
 func New(cfg config.Config) (*App, error) {
+	// Before anything is built: a configuration that cannot be honoured must not
+	// become a running service. Nothing is logged here — the error reaches the
+	// caller, and it names the variable and never its value.
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	logger := platformlog.New(cfg.ServiceName, cfg.Env)
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
+	// One registry for the whole process, built here rather than inside the
+	// router because RF-21's counter is registered during service wiring, which
+	// happens first. The router serves this exact object.
+	obsMetrics := observability.NewMetrics(obsCfg)
 
 	// JWT token validator — nil when secret is not configured.
 	validator, err := httpapi.NewTokenValidator(cfg.AuthJWTHMACSecret, cfg.AuthJWTIssuer, cfg.AuthJWTAudience)
@@ -137,6 +157,7 @@ func New(cfg config.Config) (*App, error) {
 	var channelCategorySvc *service.ChannelCategoryService
 	var memberSvc *service.MemberService
 	var callSvc *service.CallService
+	var linkScanSvc *service.LinkScanService
 
 	var closeDB func()
 	databaseReady := false
@@ -175,6 +196,19 @@ func New(cfg config.Config) (*App, error) {
 			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore).WithPins(sidebarPinStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
+			// RF-21. Wired here, where the message service exists, and fatal:
+			// starting with the flag on and no gate would accept links nobody
+			// checked. A deployment without a database never reaches this block
+			// and needs no gate — its message routes answer 503 already.
+			//
+			// The publisher is attached later (the hub does not exist yet), so
+			// the worker is built here and given it below.
+			linkScanSvc, err = wireLinkSafety(cfg, messageSvc, messages, nil, obsMetrics, logger)
+			if err != nil {
+				closeDB()
+				_ = shutdown(context.Background())
+				return nil, err
+			}
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
 			// One MemberService instance for both consumers: mention autocomplete
 			// reads channel members through it, and issue #398 writes them. Two
@@ -329,6 +363,27 @@ func New(cfg config.Config) (*App, error) {
 		messageSvc.SetPublisher(&hubBroadcaster{hub: hub})
 	}
 
+	// RF-21's worker starts here, for the same reason: a message it promotes has
+	// to be broadcast, and the hub is what broadcasts. It shares the call
+	// worker's lifecycle machinery rather than inventing a second one.
+	var linkScanWorkerCancel context.CancelFunc
+	var linkScanWorkerWG *sync.WaitGroup
+	if linkScanSvc != nil {
+		linkScanSvc.SetPublisher(&hubBroadcaster{hub: hub})
+		// The refusal channel is sender-scoped and therefore a different object:
+		// a blocked message goes to its author alone, never to the conversation
+		// it was never shown in.
+		linkScanSvc.SetBlockedPublisher(&hubBroadcaster{hub: hub})
+		workerCtx, cancel := context.WithCancel(context.Background())
+		linkScanWorkerCancel = cancel
+		linkScanWorkerWG = &sync.WaitGroup{}
+		linkScanWorkerWG.Add(1)
+		go func() {
+			defer linkScanWorkerWG.Done()
+			service.RunLinkScanWorker(workerCtx, linkScanSvc, service.LinkScanPollInterval, logger)
+		}()
+	}
+
 	// Pins broadcast over the same hub; wired after the hub exists (RF-05).
 	if pinSvc != nil {
 		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
@@ -369,7 +424,7 @@ func New(cfg config.Config) (*App, error) {
 	return &App{
 		Config:            cfg,
 		Logger:            logger,
-		Handler:           httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam),
+		Handler:           httpapi.NewRouter(cfg, logger, readiness, validator, sessionValidator, sidebar, messageHandler, wsHandler, directMessages, channels, channelCategories, antiSpam, obsMetrics),
 		TracingShutdown:   shutdown,
 		hub:               hub,
 		presence:          presence,
@@ -378,9 +433,100 @@ func New(cfg config.Config) (*App, error) {
 		reactionLimiter:   reactionLimiter,
 		callWorkerCancel:  callWorkerCancel,
 		callWorkerWG:      callWorkerWG,
+		linkScanCancel:    linkScanWorkerCancel,
+		linkScanWG:        linkScanWorkerWG,
 		closeDB:           closeDB,
 	}, nil
 }
+
+// wireLinkSafety attaches the RF-21 Safe Browsing gate to message creation,
+// editing and forwarding.
+//
+// It returns an error rather than logging one, and that is the whole point of
+// the function's shape. A nil checker is read downstream as "the feature is
+// off", so leaving it nil while the flag is on would mean the service runs
+// believing links are checked while every link is accepted — the exact bypass
+// the flag exists to prevent. Config.Validate already refuses missing
+// credentials, and this is the second lock on the same door: if the constructor
+// ever grows a new failure mode, it stops the process instead of quietly
+// reopening that bypass.
+//
+// This is start-up only. A provider that becomes unreachable *later* is a
+// different thing entirely: the queue exists, the worker keeps retrying, and the
+// messages waiting on it stay withheld rather than being released.
+//
+// Two things are wired, and they are deliberately different objects. The gate the
+// send path consults is the *store* — one indexed read of chat.link_scans, no
+// network, so an interactive request can never wait on Cloudflare. The provider
+// client goes to the worker instead, which is the only thing allowed to submit
+// and poll.
+//
+// linkSafetyStore is only the two halves of RF-21 the bootstrap touches — the
+// verdicts the send path reads and the queue the worker drains — rather than the
+// whole MessageStore. Narrow because it is also what a test has to provide.
+type linkSafetyStore interface {
+	service.URLSafetyChecker
+	service.LinkScanQueue
+}
+
+func wireLinkSafety(
+	cfg config.Config, messageSvc *service.MessageService,
+	store linkSafetyStore, publisher service.MessageEventPublisher,
+	metrics *observability.Metrics, logger *slog.Logger,
+) (*service.LinkScanService, error) {
+	if !cfg.LinkSafetyEnabled {
+		return nil, nil
+	}
+	if messageSvc == nil || store == nil {
+		return nil, errLinkSafetyUnwired
+	}
+	_ = publisher // attached after the hub exists; see SetPublisher below.
+	scanner, err := urlsafety.NewCloudflareScanner(
+		cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken,
+	)
+	if err != nil {
+		// The constructor's message names no value, but it is not repeated
+		// either: this returns a fixed error so nothing about the credentials
+		// can reach a log through it.
+		return nil, errLinkSafetyUnwired
+	}
+	// The shared counter, registered on this service's own registry so
+	// chat-service reports verdict outcomes exactly as file-service does. Its
+	// labels are the closed set the shared package defines; no URL, host, user or
+	// message id is ever one.
+	safety := urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics))
+	messageSvc.SetLinkSafety(store)
+	// What a workspace, and this deployment, may spend on new provider work.
+	// Applied at admission, before any message is created and before any job is
+	// queued, so a refusal costs the provider nothing.
+	messageSvc.SetLinkScanCapacity(storage.LinkScanCapacity{
+		WorkspaceNewURLBudget: cfg.LinkSafetyWorkspaceBudget,
+		BudgetWindow:          time.Duration(cfg.LinkSafetyBudgetWindowSeconds) * time.Second,
+		MaxPendingJobs:        cfg.LinkSafetyMaxPendingJobs,
+	})
+	// The pipeline gauges and counters. Without them a Cloudflare outage is
+	// indistinguishable from a quiet system: messages simply stop appearing.
+	// One reporter, shared by the request path and the worker, so the admission
+	// counter and the pipeline counters land on the same registry — registering
+	// twice would produce nothing at all.
+	pipeline := urlsafety.NewPipelineMetrics(metrics, cfg.ServiceName)
+	messageSvc.SetAdmissionMetrics(pipeline)
+
+	worker := service.NewLinkScanService(store, safety, publisher, logger)
+	worker.SetMetrics(pipeline)
+	worker.SetCapacity(service.LinkScanWorkerCapacity{
+		ProviderSubmitLimit:  cfg.LinkSafetyProviderSubmitLimit,
+		ProviderSubmitWindow: time.Duration(cfg.LinkSafetyProviderSubmitWindowSeconds) * time.Second,
+		UncertainTimeout:     time.Duration(cfg.LinkSafetySubmitUncertainTimeoutSeconds) * time.Second,
+	})
+	return worker, nil
+}
+
+// errLinkSafetyUnwired stops the bootstrap when RF-21 is switched on and the
+// gate could not be installed. It carries no configuration value.
+var errLinkSafetyUnwired = errors.New(
+	"link safety is enabled but the checker could not be built; refusing to start unprotected",
+)
 
 // wireMentionLabelCache creates the Valkey-backed mention label cache and
 // attaches it to messageSvc, using the configured TTL. Returns the cache
@@ -490,6 +636,15 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 		MessageID: result.MessageID, TargetType: targetType, TargetID: targetID,
 		Added: result.Added, Reactions: reactions,
 	}, nil
+}
+
+// PublishMessageBlocked forwards the RF-21 refusal to its author.
+//
+// targetID is the recipient's user id: the outbox row for a blocked message
+// records the sender as the audience, which is what keeps the announcement off
+// the conversation.
+func (b *hubBroadcaster) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
+	b.hub.PublishMessageBlocked(ctx, workspaceID, recipientUserID, messageID)
 }
 
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {

@@ -107,6 +107,20 @@ export interface WSReactionUpdatedEvent {
   };
 }
 
+/**
+ * RF-21: the author's message was refused by the link-safety check.
+ *
+ * Recipient-scoped rather than target-scoped — the server addresses it to one
+ * user — so it carries no target and is routed before the subscription guard,
+ * exactly like conversation.available. The payload is the message id and a
+ * fixed reason; no body, no URL, no scan id, no provider detail.
+ */
+export interface WSMessageBlockedEvent {
+  type: "message.blocked";
+  message_id: string;
+  reason?: string;
+}
+
 export interface WSMessageUpdatedEvent {
   type: "message.updated";
   target_type: "channel" | "dm";
@@ -253,6 +267,7 @@ interface UseChatWebSocketOptions {
   targetId: string;
   additionalTargets?: readonly WSSubscriptionTarget[];
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
+  onMessageBlocked?: (event: WSMessageBlockedEvent) => void;
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
@@ -289,6 +304,7 @@ export function useChatWebSocket({
   targetId,
   additionalTargets,
   onMessageCreated,
+  onMessageBlocked,
   onMessageUpdated,
   onReactionUpdated,
   onPinUpdated,
@@ -317,6 +333,7 @@ export function useChatWebSocket({
   const primaryTargetSignature = JSON.stringify(subscriptionTargets[0] ?? null);
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
+  const onMessageBlockedRef = useRef(onMessageBlocked);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
   const onPinRef = useRef(onPinUpdated);
@@ -338,6 +355,7 @@ export function useChatWebSocket({
   const subscriptionControlRef = useRef<SubscriptionControl | null>(null);
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
+    onMessageBlockedRef.current = onMessageBlocked;
     onMessageUpdatedRef.current = onMessageUpdated;
     onReactionRef.current = onReactionUpdated;
     onPinRef.current = onPinUpdated;
@@ -523,6 +541,15 @@ export function useChatWebSocket({
           onConversationAvailableRef.current?.(
             normalizedData as unknown as WSConversationAvailableEvent,
           );
+          return;
+        }
+        // Routed before the subscription guard for the same reason
+        // conversation.available is: it is addressed to a user rather than to a
+        // conversation, so it carries no target to match against. Without this
+        // the author of a blocked message would never be told, and their
+        // composer would sit on "checking links…" forever.
+        if (d["type"] === "message.blocked" && typeof d["message_id"] === "string") {
+          onMessageBlockedRef.current?.(normalizedData as unknown as WSMessageBlockedEvent);
           return;
         }
         if (!control.expected.has(incomingTargetKey)) return;

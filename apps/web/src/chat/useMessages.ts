@@ -31,6 +31,7 @@ import {
   fetchChannelMessages,
   fetchDMMessage,
   fetchDMMessages,
+  fetchLinkSafetyStatuses,
   postChannelMessage,
   postDMMessage,
   resolveChannelMessageReferences,
@@ -38,6 +39,7 @@ import {
   unfavoriteMessage,
 } from "./chatApi";
 import { markPresenceActivity } from "./chatSocket";
+import { ApiRequestError } from "../lib/api";
 import {
   normalizeBodyFormat,
   parseMessageAttachments,
@@ -47,6 +49,7 @@ import {
 } from "./chatTypes";
 import {
   useChatWebSocket,
+  type WSMessageBlockedEvent,
   type WSMessageCreatedEvent,
   type WSMessageUpdatedEvent,
   type WSClientErrorEvent,
@@ -72,6 +75,16 @@ export type LastMutation = "initial" | "append" | "prepend" | "ws_append" | "non
 
 const referenceRevalidationMs = 15_000;
 const referenceRevalidationBatchSize = 100;
+
+/**
+ * How many withheld messages one reconnect may ask about.
+ *
+ * Matches the server's cap. A client holds a message in this state only between
+ * sending it and its scan resolving, so the realistic count is one or two; the
+ * bound is here so a long-lived tab that accumulated them cannot turn a
+ * reconnect into an unbounded query.
+ */
+const linkSafetyReconcileBatchSize = 100;
 
 export interface MessagesState {
   status: MessagesStatus;
@@ -117,6 +130,16 @@ type Action =
   | { type: "sending" }
   | { type: "sent"; message: Message }
   | { type: "send_error"; error: string }
+  /**
+   * RF-21: a message this client is showing as pending has reached a terminal
+   * state. `malicious_link` is the refusal; `unavailable` is a message that is
+   * simply gone, which must not be reported as a blocked link.
+   */
+  | {
+      type: "message_blocked";
+      messageId: string;
+      reason?: "malicious_link" | "unavailable";
+    }
   | { type: "prepending" }
   | { type: "prepended"; page: MessagePage }
   | { type: "prepend_error" }
@@ -212,6 +235,53 @@ const initialState: MessagesState = {
 const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
 const reactionConfirmTimeoutMs = 8_000;
 
+/**
+ * Copy for the send failures this client recognises by code (RF-21).
+ *
+ * Keyed on `code` and never on the message text: the code is the stable part of
+ * the contract, and matching on English prose from a server would break the
+ * moment that prose changed. The two entries are deliberately different
+ * sentences — one says the link is dangerous and is final, the other says the
+ * check could not run and is worth retrying — because telling someone to try
+ * again on a blocked link is as wrong as telling them a transient outage means
+ * their link is malicious.
+ *
+ * The security decision itself is entirely server-side. Nothing here inspects a
+ * URL, and there is no provider credential in this bundle: this only renders a
+ * verdict the backend already made and enforced.
+ */
+const sendErrorMessages: Record<string, string> = {
+  malicious_url: "Este link foi bloqueado por segurança.",
+  link_check_unavailable:
+    "Não foi possível verificar a segurança do link. Tente novamente em instantes.",
+  // The backend declined to start a new scan right now — a spent window or a
+  // full queue. Deliberately worded like the unavailable case and deliberately
+  // not like the blocked one: nothing was decided about this link, and telling
+  // someone their link looks dangerous because a queue was full is a claim with
+  // nothing behind it.
+  link_check_capacity: "Não foi possível verificar os links agora. Tente novamente em instantes.",
+};
+
+/**
+ * The copy for a pending message that is gone for a reason nobody attributed to
+ * the link check.
+ *
+ * Separate from the blocked copy on purpose. Telling an author their link was
+ * malicious when the evidence only says the message no longer exists is a claim
+ * we cannot make, and it is the inference this whole path is built to avoid.
+ */
+const pendingMessageUnavailable = "Esta mensagem não está mais disponível.";
+
+function sendErrorMessage(error: unknown): string {
+  if (error instanceof ApiRequestError) {
+    const known = sendErrorMessages[error.code];
+    if (known) return known;
+  }
+  // Unchanged for everything else: the previous behaviour is the fallback, so
+  // no existing error path is affected by RF-21.
+  return error instanceof Error ? error.message : "Não foi possível enviar a mensagem.";
+}
+
 function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
     case "loading":
@@ -260,6 +330,25 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         replyTo: null,
       };
     }
+    case "message_blocked": {
+      // Only a message this client is still showing as pending is affected. A
+      // late event for something already resolved, or for a message this view
+      // never held, is a no-op.
+      const blocked = state.messages.find(
+        (m) => m.id === action.messageId && m.status === "pending_link_scan",
+      );
+      if (!blocked) return state;
+      return {
+        ...state,
+        messages: state.messages.filter((m) => m.id !== action.messageId),
+        sending: false,
+        sendError:
+          action.reason === "unavailable"
+            ? pendingMessageUnavailable
+            : sendErrorMessages.malicious_url,
+        lastMutation: "none",
+      };
+    }
     case "send_error":
       return { ...state, sending: false, sendError: action.error };
     case "prepending":
@@ -282,9 +371,33 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       return { ...state, loadingMore: false, lastMutation: "none" };
     case "ws_received": {
       // Dedup: if the message is already present (e.g. our own POST response
-      // arrived before the WS event), this is a pure no-op.
-      const alreadyPresent = state.messages.some((m) => m.id === action.message.id);
-      if (alreadyPresent) return { ...state, realtimeError: null };
+      // arrived before the WS event), this is normally a pure no-op.
+      const existingIndex = state.messages.findIndex((m) => m.id === action.message.id);
+      if (existingIndex >= 0) {
+        const existing = state.messages[existingIndex];
+        // RF-21: the one case where "already present" is not a no-op.
+        //
+        // A message whose links were still being scanned was returned to its
+        // own sender as pending_link_scan and shown to nobody else. When the
+        // scan clears, the backend promotes it and broadcasts message.created
+        // with the same id — so discarding the event by id, as this branch used
+        // to do unconditionally, left the sender looking at "checking links…"
+        // forever while everyone else saw the message.
+        //
+        // The event carries the authoritative published row, so it replaces the
+        // local one in place: same position, no duplicate, no re-sort. Only this
+        // transition is special-cased; every other repeat delivery stays the
+        // no-op it was, which is what keeps at-least-once outbox delivery safe.
+        if (
+          existing.status === "pending_link_scan" &&
+          action.message.status !== "pending_link_scan"
+        ) {
+          const messages = [...state.messages];
+          messages[existingIndex] = action.message;
+          return { ...state, messages, realtimeError: null };
+        }
+        return { ...state, realtimeError: null };
+      }
 
       // Insert in stable (createdAt, id) order to handle out-of-order delivery.
       // Most WS messages are newer than all existing ones, so a quick tail-check
@@ -986,8 +1099,7 @@ export function useMessages({
       } catch (err: unknown) {
         // Stale failure: silently discard — do not update state for a previous target.
         if (stateRef.current.target !== sendKey) return { status: "stale" };
-        const message = err instanceof Error ? err.message : "Não foi possível enviar a mensagem.";
-        dispatch({ type: "send_error", error: message });
+        dispatch({ type: "send_error", error: sendErrorMessage(err) });
         // Re-throw for current-target failures so callers can preserve the draft.
         throw err;
       }
@@ -1005,6 +1117,21 @@ export function useMessages({
   //
   // Target check: events for other channels/DMs are ignored (defence-in-depth on
   // top of the WS hook's own filter).
+  // RF-21: the author's message was refused.
+  //
+  // Without this the composer's "checking links…" bubble had no event that would
+  // ever change it — the backend took the message to a terminal state and told
+  // nobody — so the author was left believing a send was still in flight.
+  //
+  // The event is addressed to the author alone and carries no content, so there
+  // is nothing to render from it: the pending bubble is removed and the send
+  // error explains why. Removing rather than rewriting is deliberate — the
+  // message was never published, so leaving a husk of it in the transcript would
+  // suggest otherwise.
+  const handleWsMessageBlocked = useCallback((evt: WSMessageBlockedEvent) => {
+    dispatch({ type: "message_blocked", messageId: evt.message_id });
+  }, []);
+
   const handleWsMessageCreated = useCallback(
     (evt: WSMessageCreatedEvent) => {
       const loadKey = `${kind}:${targetId}`;
@@ -1243,9 +1370,81 @@ export function useMessages({
     });
   }, []);
 
+  /**
+   * RF-21 reconnect reconciliation.
+   *
+   * Realtime tells this client that a withheld message was published or refused.
+   * It is best-effort: an author whose socket was down when the verdict landed
+   * receives nothing, and — for a refusal in particular — nothing else is ever
+   * coming, because the message no longer exists to be fetched. The bubble would
+   * say "checking links…" forever.
+   *
+   * So on every subscription that comes back ready, the messages this client
+   * still holds as pending are checked against the server's own answer. Absence
+   * of an event is never read as a verdict: this asks, and acts only on what it
+   * is told.
+   *
+   * Nothing happens when there is nothing pending, which is the overwhelmingly
+   * common case — no request is made at all.
+   */
+  const reconcilePendingLinkScans = useCallback(() => {
+    const pendingIds = stateRef.current.messages
+      .filter((message) => message.status === "pending_link_scan")
+      .slice(-linkSafetyReconcileBatchSize)
+      .map((message) => message.id);
+    if (pendingIds.length === 0) return;
+
+    const fallbackKey = "link-safety-reconcile";
+    // Registered with the websocket fallbacks so a target change aborts it, the
+    // same way every other authoritative refetch here is cancelled: an answer
+    // about channel A must never be applied to channel B.
+    const ctrl = startWsFallback(fallbackKey);
+    const loadKey = `${kind}:${targetId}`;
+    void fetchLinkSafetyStatuses(pendingIds, ctrl.signal).then(
+      (statuses) => {
+        finishWsFallback(fallbackKey, ctrl);
+        if (ctrl.signal.aborted || !isCurrentTarget(loadKey)) return;
+        for (const status of statuses) {
+          // Still being scanned, or an id the server would not talk about (which
+          // is simply absent from the reply). Either way there is nothing to
+          // apply, and the bubble stays as it is.
+          if (status.state === "pending") continue;
+          if (status.state === "active") {
+            // The state alone is not the message. Fetching the authoritative row
+            // reuses the same path a missed message.created takes, so a promotion
+            // recovered here and one delivered in realtime produce exactly the
+            // same result — and neither can duplicate the other, because both
+            // replace by id.
+            fetchMessageUpdateSnapshot(status.messageId, false);
+            continue;
+          }
+          dispatch({
+            type: "message_blocked",
+            messageId: status.messageId,
+            reason: status.state === "blocked" ? "malicious_link" : "unavailable",
+          });
+        }
+      },
+      () => {
+        finishWsFallback(fallbackKey, ctrl);
+        // A failed reconciliation says nothing about the message. Removing the
+        // bubble, promoting it, or reporting it as blocked would all be inventing
+        // an answer the server never gave; the next reconnect asks again.
+      },
+    );
+  }, [
+    fetchMessageUpdateSnapshot,
+    finishWsFallback,
+    isCurrentTarget,
+    kind,
+    startWsFallback,
+    targetId,
+  ]);
+
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });
-  }, []);
+    reconcilePendingLinkScans();
+  }, [reconcilePendingLinkScans]);
 
   // RF-05: keep the pin callback in a ref so it never restarts the socket.
   const onPinUpdatedRef = useRef(onPinUpdated);
@@ -1302,6 +1501,7 @@ export function useMessages({
     kind,
     targetId,
     onMessageCreated: handleWsMessageCreated,
+    onMessageBlocked: handleWsMessageBlocked,
     onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: handleReactionUpdated,
     onPinUpdated: handlePinUpdated,

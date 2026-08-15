@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"io"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -683,5 +684,98 @@ func TestValidateIgnoresLinkPreviewBudgetsWhileDisabled(t *testing.T) {
 
 	if err := Load().Validate(); err != nil {
 		t.Fatalf("a disabled feature must not block start-up: %v", err)
+	}
+}
+
+// --- RF-21 link safety ---------------------------------------------------
+
+func TestLoadDefaultsLinkSafetyToDisabled(t *testing.T) {
+	cfg := Load()
+
+	if cfg.LinkSafetyEnabled {
+		t.Fatal("the safe browsing check must be off unless a deployment asks for it")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a deployment that does not use it must not be held to its credentials: %v", err)
+	}
+}
+
+func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", " acct-123 ")
+	t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", " token-abc ")
+
+	cfg := Load()
+
+	if !cfg.LinkSafetyEnabled {
+		t.Fatal("FILE_LINK_SAFETY_ENABLED was not read")
+	}
+	if cfg.LinkSafetyCloudflareAccount != "acct-123" || cfg.LinkSafetyCloudflareToken != "token-abc" {
+		t.Fatalf("credentials: %q / %q", cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken)
+	}
+}
+
+// An enabled check that cannot run is a control that silently stops existing.
+// Start-up refuses rather than booting into it.
+func TestValidateRefusesLinkSafetyWithoutCredentials(t *testing.T) {
+	cases := map[string]struct{ account, token string }{
+		"no account": {"", "token-abc"},
+		"no token":   {"acct-123", ""},
+		"neither":    {"", ""},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+			t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", testCase.account)
+			t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", testCase.token)
+
+			err := Load().Validate()
+			if err == nil {
+				t.Fatal("an enabled check without credentials must stop start-up")
+			}
+			// The variable is named; the value never is.
+			if testCase.token != "" && strings.Contains(err.Error(), testCase.token) {
+				t.Fatalf("the error repeated the token: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnparseableLinkSafetyFlag(t *testing.T) {
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "perhaps")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("an unparseable FILE_LINK_SAFETY_ENABLED must stop start-up")
+	}
+}
+
+// The check is validated even with previews off, so the mistake surfaces when
+// it is made rather than when previews are later enabled.
+func TestLinkSafetyIsValidatedIndependentlyOfPreviews(t *testing.T) {
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("expected the missing credentials to be refused with previews disabled")
+	}
+}
+
+// The same structural guarantee in file-service: no setting can make an
+// uncertain submission be sent again, because no field exists to carry the
+// policy. See the chat-service config test for the reasoning.
+func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
+	t.Setenv("FILES_LINK_SAFETY_MAX_UNCERTAIN_RESUBMITS", "5")
+
+	cfg := Load()
+	for _, name := range []string{
+		"LinkSafetyMaxUncertainResubmits",
+		"LinkSafetyUncertainResubmits",
+		"LinkSafetyAllowUncertainResubmit",
+	} {
+		if _, exists := reflect.TypeOf(cfg).FieldByName(name); exists {
+			t.Fatalf("Config carries %q — an uncertain submission must not be configurable", name)
+		}
+	}
+	if cfg.LinkSafetySubmitUncertainTimeoutSeconds <= 0 {
+		t.Fatalf("the staleness threshold is unset: %d", cfg.LinkSafetySubmitUncertainTimeoutSeconds)
 	}
 }
