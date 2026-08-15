@@ -155,17 +155,11 @@ func TestResultReadsTheDocumentedVerdictField(t *testing.T) {
 		want Verdict
 	}{
 		"malicious": {
-			body: `{"task":{"uuid":"abc","success":true},"verdicts":{"overall":{"malicious":true,"categories":["phishing"]}}}`,
+			body: `{"task":{"uuid":"182bd5e5-6e1a","success":true},"verdicts":{"overall":{"malicious":true,"categories":["phishing"]}}}`,
 			want: VerdictMalicious,
 		},
 		"benign": {
-			body: `{"task":{"uuid":"abc","success":true},"verdicts":{"overall":{"malicious":false,"categories":[]}}}`,
-			want: VerdictSafe,
-		},
-		// success is documented but optional in practice; its absence is not by
-		// itself a failed scan.
-		"no success field": {
-			body: `{"task":{"uuid":"abc"},"verdicts":{"overall":{"malicious":false}}}`,
+			body: `{"task":{"uuid":"182bd5e5-6e1a","success":true},"verdicts":{"overall":{"malicious":false,"categories":[]}}}`,
 			want: VerdictSafe,
 		},
 	} {
@@ -242,6 +236,32 @@ func TestResultRefusesUnusableAnswers(t *testing.T) {
 		"task unsuccessful": func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{"task":{"uuid":"abc","success":false},"verdicts":{"overall":{"malicious":false}}}`))
 		},
+		// success absent is not success. A truncated write, a proxy envelope or a
+		// future response shape all land here, and none of them describe a
+		// completed scan.
+		"task success absent": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"task":{"uuid":"abc"},"verdicts":{"overall":{"malicious":false}}}`))
+		},
+		"task absent entirely": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"verdicts":{"overall":{"malicious":false}}}`))
+		},
+		// Nothing ties this body to a scan.
+		"task uuid absent": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"task":{"success":true},"verdicts":{"overall":{"malicious":false}}}`))
+		},
+		"task uuid blank": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"task":{"uuid":"   ","success":true},"verdicts":{"overall":{"malicious":false}}}`))
+		},
+		// The one that matters most: a cached, misrouted or substituted response
+		// describing a different URL's scan must not clear this one.
+		"task uuid mismatched": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"task":{"uuid":"some-other-scan","success":true},"verdicts":{"overall":{"malicious":false}}}`))
+		},
+		// And a mismatched id must not condemn it either — the verdict simply
+		// does not apply.
+		"task uuid mismatched and malicious": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"task":{"uuid":"some-other-scan","success":true},"verdicts":{"overall":{"malicious":true}}}`))
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			scanner, _ := scannerAgainst(t, handler)
@@ -251,8 +271,10 @@ func TestResultRefusesUnusableAnswers(t *testing.T) {
 			if !errors.Is(err, ErrUnavailable) {
 				t.Fatalf("want ErrUnavailable, got %v", err)
 			}
-			if verdict == VerdictSafe {
-				t.Fatalf("%s produced a safe verdict", name)
+			// Neither direction: an unusable report yields no verdict at all, so
+			// it can be neither cached as safe nor acted on as malicious.
+			if verdict.IsFinal() {
+				t.Fatalf("%s produced a final verdict: %v", name, verdict)
 			}
 		})
 	}

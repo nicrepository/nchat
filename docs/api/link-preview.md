@@ -90,14 +90,24 @@ nem repete endereco, hostname ou mensagem do servidor remoto: a diferenca entre
 
 ## Safe Browsing (RF-21)
 
-Quando `FILE_LINK_SAFETY_ENABLED=true`, a reputacao do host e consultada
-**antes** do fetch Open Graph: host condenado, ou veredito indisponivel, e a
-pagina nunca e requisitada. Buscar primeiro e perguntar depois seria renderizar
+Quando `FILE_LINK_SAFETY_ENABLED=true`, o veredito da **URL canonica completa**
+-- scheme, host, path e query, sem fragmento -- e consultado **antes** do fetch
+Open Graph. URL condenada, veredito indisponivel, ou veredito ainda inexistente:
+a pagina nunca e requisitada. Buscar primeiro e perguntar depois seria renderizar
 a pagina de phishing.
 
+A chave e a URL e nao o host, e essa distincao e o ponto: um preview renderiza
+uma *pagina*, entao decidi-lo pela reputacao do dominio que a hospeda liberava
+todo caminho naquele dominio.
+
+URL sem veredito nao e liberacao e tambem nao e fetch: o file-service registra um
+job duravel e responde `202 link_check_pending`. Um worker proprio submete o scan
+a Cloudflare, guarda o UUID e faz o polling, entao repetir o preview da mesma URL
+nao gera scan novo -- e um restart nao perde o que ja estava em andamento.
+
 E um controle **distinto** da politica abaixo e nao substitui nenhuma parte
-dela: o Safe Browsing responde reputacao, a politica de destino responde se este
-backend pode abrir a conexao. Um destino recusado pela politica continua
+dela: o Safe Browsing responde se *aquela URL* e maliciosa, a politica de destino
+responde se este backend pode abrir a conexao para aquele endereco. Um destino recusado pela politica continua
 recusado sem o provedor ser consultado.
 
 Contrato completo, cache, granularidade e configuracao em

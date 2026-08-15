@@ -30,29 +30,32 @@ func (f *fakeWorkspaceResolver) GetDefaultWorkspace(_ context.Context) (domain.W
 }
 
 type fakeMessageProvider struct {
-	channelOut    service.ListChannelMessagesOutput
-	channelOutErr error
-	createdMsg    domain.Message
-	createChErr   error
-	channelMsg    domain.Message
-	channelMsgErr error
-	dmOut         service.ListDMMessagesOutput
-	dmOutErr      error
-	createDMMsg   domain.Message
-	createDMErr   error
-	dmMsg         domain.Message
-	dmMsgErr      error
-	editedMsg     domain.Message
-	editErr       error
-	deletedMsg    domain.Message
-	deleteErr     error
-	history       []domain.MessageEditHistory
-	historyErr    error
-	referenceOut  []service.MessageReferenceResolution
-	referenceErr  error
-	forwardedMsg  domain.Message
-	forwardReplay bool
-	forwardErr    error
+	lastLinkSafetyInput service.LinkSafetyStatusInput
+	linkSafetyStates    []domain.MessageLinkSafetyState
+	linkSafetyErr       error
+	channelOut          service.ListChannelMessagesOutput
+	channelOutErr       error
+	createdMsg          domain.Message
+	createChErr         error
+	channelMsg          domain.Message
+	channelMsgErr       error
+	dmOut               service.ListDMMessagesOutput
+	dmOutErr            error
+	createDMMsg         domain.Message
+	createDMErr         error
+	dmMsg               domain.Message
+	dmMsgErr            error
+	editedMsg           domain.Message
+	editErr             error
+	deletedMsg          domain.Message
+	deleteErr           error
+	history             []domain.MessageEditHistory
+	historyErr          error
+	referenceOut        []service.MessageReferenceResolution
+	referenceErr        error
+	forwardedMsg        domain.Message
+	forwardReplay       bool
+	forwardErr          error
 
 	lastCreateChannelInput service.CreateChannelMessageInput
 	lastCreateDMInput      service.CreateDMMessageInput
@@ -82,6 +85,11 @@ func (f *fakeMessageProvider) DeleteMessage(_ context.Context, in service.Delete
 func (f *fakeMessageProvider) GetMessageEditHistory(_ context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
 	f.lastHistoryInput = in
 	return f.history, f.historyErr
+}
+
+func (f *fakeMessageProvider) MessageLinkSafetyStates(_ context.Context, in service.LinkSafetyStatusInput) ([]domain.MessageLinkSafetyState, error) {
+	f.lastLinkSafetyInput = in
+	return f.linkSafetyStates, f.linkSafetyErr
 }
 
 type fakeMentionProvider struct {
@@ -219,6 +227,10 @@ const (
 	testConversationID = "33333333-3333-3333-3333-333333333333"
 	msgTestUserID      = "44444444-4444-4444-4444-444444444444"
 	testMessageID      = "55555555-5555-5555-5555-555555555555"
+	// otherMessageID stands for an id this caller has no claim to: somebody
+	// else's message, another workspace's, or one that never existed. The three
+	// are deliberately indistinguishable in every answer.
+	otherMessageID = "66666666-6666-6666-6666-666666666666"
 )
 
 func activeWorkspace() domain.Workspace {
@@ -2074,5 +2086,129 @@ func TestMessageHandler_CreateChannelMessage_CheckerOutageIsRetryable(t *testing
 	}
 	if !strings.Contains(rec.Body.String(), `"link_check_unavailable"`) {
 		t.Fatalf("code missing: %s", rec.Body.String())
+	}
+}
+
+// ── RF-21 reconnect reconciliation ────────────────────────────────────────────
+
+// The endpoint answers with a state and, for a refusal, a fixed reason. What it
+// must never answer with is the content: the author is told their message was
+// blocked, not what the scanner saw. This asserts the omission directly, on the
+// serialized bytes, because that is where a leak would appear.
+func TestMessageHandler_LinkSafetyStatus_AnswersStateWithoutContent(t *testing.T) {
+	messages := &fakeMessageProvider{linkSafetyStates: []domain.MessageLinkSafetyState{
+		{MessageID: testMessageID, State: domain.LinkSafetyStateBlocked},
+		{MessageID: otherMessageID, State: domain.LinkSafetyStatePending},
+	}}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+	request := requestWithUser(http.MethodPost, httpapi.RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":["`+testMessageID+`","`+otherMessageID+`"]}`))
+	recorder := httptest.NewRecorder()
+
+	handler.GetMessageLinkSafetyStatus(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, forbidden := range []string{
+		"body_text", "canonical_url", "\"url\"", "scan_uuid", "query", "cloudflare", "verdict",
+	} {
+		if strings.Contains(strings.ToLower(body), forbidden) {
+			t.Fatalf("the response carries %q: %s", forbidden, body)
+		}
+	}
+	statuses := decodeBody(t, recorder)["data"].(map[string]any)["statuses"].([]any)
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %v", statuses)
+	}
+	blocked := statuses[0].(map[string]any)
+	if blocked["state"] != "blocked" || blocked["reason"] != domain.LinkSafetyReasonMaliciousLink {
+		t.Fatalf("blocked = %v", blocked)
+	}
+	// Only a refusal carries a reason. A pending message has nothing to explain,
+	// and inventing one would be a claim about a decision nobody has made.
+	if pending := statuses[1].(map[string]any); pending["reason"] != nil {
+		t.Fatalf("pending carries a reason: %v", pending)
+	}
+}
+
+// The caller's identity comes from the session and nothing else, so the id the
+// query is scoped by is never something the request body can choose.
+func TestMessageHandler_LinkSafetyStatus_ScopesToTheAuthenticatedSender(t *testing.T) {
+	messages := &fakeMessageProvider{}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+	request := requestWithUser(http.MethodPost, httpapi.RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":["`+testMessageID+`"]}`))
+	recorder := httptest.NewRecorder()
+
+	handler.GetMessageLinkSafetyStatus(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if messages.lastLinkSafetyInput.SenderID != msgTestUserID {
+		t.Fatalf("sender = %q, want the authenticated user", messages.lastLinkSafetyInput.SenderID)
+	}
+	if messages.lastLinkSafetyInput.WorkspaceID == "" {
+		t.Fatal("the workspace was not resolved server-side")
+	}
+}
+
+func TestMessageHandler_LinkSafetyStatus_RequiresAuthentication(t *testing.T) {
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{})
+	// No user in the context: an unauthenticated caller must not be able to ask
+	// about any id at all.
+	request := httptest.NewRequest(http.MethodPost, httpapi.RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":["`+testMessageID+`"]}`))
+	recorder := httptest.NewRecorder()
+
+	handler.GetMessageLinkSafetyStatus(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// An id the service will not talk about is simply absent from the answer. It is
+// the same absence for a message that never existed, one belonging to somebody
+// else, and one in another workspace — so the endpoint cannot be used to find
+// out which ids are real.
+func TestMessageHandler_LinkSafetyStatus_OmitsRatherThanDenies(t *testing.T) {
+	messages := &fakeMessageProvider{linkSafetyStates: []domain.MessageLinkSafetyState{}}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+	request := requestWithUser(http.MethodPost, httpapi.RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":["`+otherMessageID+`"]}`))
+	recorder := httptest.NewRecorder()
+
+	handler.GetMessageLinkSafetyStatus(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	statuses := decodeBody(t, recorder)["data"].(map[string]any)["statuses"].([]any)
+	if len(statuses) != 0 {
+		t.Fatalf("statuses = %v, want an empty list", statuses)
+	}
+}
+
+func TestMessageHandler_LinkSafetyStatus_RejectsAnUnboundedBatch(t *testing.T) {
+	messages := &fakeMessageProvider{
+		linkSafetyErr: fmt.Errorf("%w: message_ids must contain 1-%d values",
+			domain.ErrInvalidInput, service.MaxLinkSafetyStatusBatchSize),
+	}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+	ids := make([]string, service.MaxLinkSafetyStatusBatchSize+1)
+	for i := range ids {
+		ids[i] = `"` + testMessageID + `"`
+	}
+	request := requestWithUser(http.MethodPost, httpapi.RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":[`+strings.Join(ids, ",")+`]}`))
+	recorder := httptest.NewRecorder()
+
+	handler.GetMessageLinkSafetyStatus(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }

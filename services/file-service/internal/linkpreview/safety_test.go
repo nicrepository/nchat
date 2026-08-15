@@ -11,39 +11,52 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
+	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
 
 // stubSafety is a Safe Browsing verdict the test decides, plus a count of how
 // often it was consulted.
 //
-// The unit is a canonical URL now, not a hostname, and the lookup never blocks:
-// Cloudflare URL Scanner is submit-then-poll, so a URL with no verdict yet is a
-// miss and Submit is what starts the scan. `known` is what has already been
-// decided; anything else is pending.
+// The unit is a canonical URL, not a hostname, and neither method blocks on the
+// provider: Cloudflare URL Scanner is submit-then-poll, so a URL with no verdict
+// yet is a miss and EnsureScan records that a background worker must obtain one.
 type stubSafety struct {
 	calls      atomic.Int64
 	submits    atomic.Int64
 	verdict    urlsafety.Verdict
 	hasVerdict bool
 	submitErr  error
+	loadErr    error
 	askedURL   atomic.Value
+	// admissionResult stages a capacity refusal. Empty means "admitted".
+	admissionResult string
 }
 
-func (s *stubSafety) Lookup(canonicalURL string) (urlsafety.Verdict, bool) {
+func (s *stubSafety) LoadVerdict(_ context.Context, canonicalURL string) (urlsafety.Verdict, bool, error) {
 	s.calls.Add(1)
 	s.askedURL.Store(canonicalURL)
-	if !s.hasVerdict {
-		return urlsafety.VerdictUnknown, false
+	if s.loadErr != nil {
+		return urlsafety.VerdictUnknown, false, s.loadErr
 	}
-	return s.verdict, true
+	if !s.hasVerdict {
+		return urlsafety.VerdictUnknown, false, nil
+	}
+	return s.verdict, true, nil
 }
 
-func (s *stubSafety) Submit(_ context.Context, _ string) (string, error) {
+// EnsureScan records the *need* for a scan rather than submitting one, which is
+// what makes a repeated preview of the same pending URL free.
+func (s *stubSafety) AdmitScan(
+	_ context.Context, _ string, _ service.LinkScanCapacity,
+) (service.LinkScanAdmission, error) {
 	s.submits.Add(1)
 	if s.submitErr != nil {
-		return "", s.submitErr
+		return service.LinkScanAdmission{}, s.submitErr
 	}
-	return "scan-1", nil
+	if s.admissionResult != "" {
+		return service.LinkScanAdmission{NewScanCost: 1, Result: s.admissionResult}, nil
+	}
+	return service.LinkScanAdmission{NewScanCost: 1, Result: service.AdmissionAllowed}, nil
 }
 
 // decided builds a stub that already holds a verdict.
@@ -263,22 +276,24 @@ type expiringSafety struct {
 // Lookup answers from the remembered verdict while it is live. An expired one is
 // a miss, which is exactly what the real cache does — and what makes the preview
 // re-decide instead of riding a clearance that has lapsed.
-func (s *expiringSafety) Lookup(_ string) (urlsafety.Verdict, bool) {
+func (s *expiringSafety) LoadVerdict(_ context.Context, _ string) (urlsafety.Verdict, bool, error) {
 	if s.cached != "" && s.clock.Now().Before(s.expires) {
-		return s.cached, true
+		return s.cached, true, nil
 	}
-	return urlsafety.VerdictUnknown, false
+	return urlsafety.VerdictUnknown, false, nil
 }
 
 // Submit is what a miss triggers, and here it also stands in for the scan
 // finishing: the provider's current opinion becomes the new cached verdict. That
 // keeps the test about the *preview* cache not outliving the verdict, without
 // modelling a worker.
-func (s *expiringSafety) Submit(_ context.Context, _ string) (string, error) {
+func (s *expiringSafety) AdmitScan(
+	_ context.Context, _ string, _ service.LinkScanCapacity,
+) (service.LinkScanAdmission, error) {
 	s.calls.Add(1)
 	s.cached = s.verdict
 	s.expires = s.clock.Now().Add(s.verdictTTL)
-	return "scan-1", nil
+	return service.LinkScanAdmission{NewScanCost: 1, Result: service.AdmissionAllowed}, nil
 }
 
 // The regression: a preview cached while a URL was safe must not keep being

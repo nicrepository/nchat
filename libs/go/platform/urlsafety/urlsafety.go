@@ -218,6 +218,29 @@ func (s *Service) Submit(ctx context.Context, canonicalURL string) (string, erro
 	return scanID, nil
 }
 
+// FindRecentScan forwards a reconciliation lookup to the provider, when the
+// provider can answer one.
+//
+// Deliberately a pass-through and deliberately uncached. It recovers a scan
+// *id* for a submission whose outcome was lost, and the verdict is then read
+// through Poll, which is where the strictness lives — a search result must never
+// become a second, weaker route to a clearance, so nothing here writes to the
+// cache or touches the verdict counter.
+//
+// A provider that cannot search is a working deployment: the caller keeps the
+// attempt uncertain and waits out its horizon rather than submitting again.
+func (s *Service) FindRecentScan(
+	ctx context.Context, canonicalURL string, since time.Time,
+) (ScanRecord, int, error) {
+	searcher, ok := s.scanner.(interface {
+		FindRecentScan(context.Context, string, time.Time) (ScanRecord, int, error)
+	})
+	if !ok {
+		return ScanRecord{}, 0, ErrSearchUnsupported
+	}
+	return searcher.FindRecentScan(ctx, canonicalURL, since)
+}
+
 // Poll reads a submitted scan and, if it finished, remembers the verdict.
 //
 // This is the one place a provider answer becomes a fact this deployment acts

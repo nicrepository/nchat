@@ -62,6 +62,20 @@ var (
 	// which is the better answer when there is no already-published version to
 	// preserve.
 	ErrURLCheckPending = errors.New("url safety check pending")
+	// ErrLinkScanCapacity reports that the operation would require new provider
+	// work this deployment is not currently willing to spend.
+	//
+	// It is its own error, and keeping it apart from ErrMaliciousURL is the whole
+	// point: a full queue or a spent window says nothing whatsoever about the
+	// links in the message. Reporting one as the other would show a sender a
+	// security warning for an operational condition, and would teach an operator
+	// to read a spike in refusals as an attack on their users rather than as a
+	// provider that has stopped keeping up.
+	//
+	// It is also not ErrURLCheckUnavailable. Unavailable means the check failed;
+	// this means the check was never attempted, on purpose, and retrying shortly
+	// is the right response.
+	ErrLinkScanCapacity = errors.New("link scan capacity exceeded")
 	// ErrChannelDisplayNameRequired and ErrChannelDisplayNameTooLong report the
 	// two ways a channel name fails NormalizeChannelDisplayName.
 	//

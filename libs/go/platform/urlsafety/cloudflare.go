@@ -232,15 +232,39 @@ func (c *CloudflareScanner) GetScanResult(ctx context.Context, scanID string) (V
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
 		return VerdictUnknown, ErrUnavailable
 	}
-	// A report the provider itself marks unsuccessful describes a scan that did
-	// not complete, whatever else it carries. It is not a clean page.
-	if decoded.Task.Success != nil && !*decoded.Task.Success {
+	return verdictFromReport(decoded, scanID)
+}
+
+// verdictFromReport turns a decoded report into a verdict, or refuses it.
+//
+// Every check here is a way the answer could fail to be *about the scan we
+// asked for*, and each one used to be either absent or too lenient:
+//
+//   - task.success had to be present and true. It was previously only rejected
+//     when explicitly false, so a report that omitted the field — a truncated
+//     write, a proxy's error envelope, a future response shape — was read as a
+//     completed scan;
+//   - task.uuid had to be present. Without it there is nothing tying the body to
+//     a scan at all;
+//   - task.uuid had to equal the id we requested. This is the one that matters
+//     most: a cached, misrouted or substituted response describing a *different*
+//     URL's scan would otherwise have cleared this URL. The verdict is only ever
+//     accepted for the scan it names.
+//
+// Anything failing any of them is ErrUnavailable — never a verdict, never
+// cached, never persisted as final.
+func verdictFromReport(report resultResponse, scanID string) (Verdict, error) {
+	if report.Task.Success == nil || !*report.Task.Success {
 		return VerdictUnknown, ErrUnavailable
 	}
-	if decoded.Verdicts.Overall == nil || decoded.Verdicts.Overall.Malicious == nil {
+	reportedID := strings.TrimSpace(report.Task.UUID)
+	if reportedID == "" || reportedID != strings.TrimSpace(scanID) {
 		return VerdictUnknown, ErrUnavailable
 	}
-	if *decoded.Verdicts.Overall.Malicious {
+	if report.Verdicts.Overall == nil || report.Verdicts.Overall.Malicious == nil {
+		return VerdictUnknown, ErrUnavailable
+	}
+	if *report.Verdicts.Overall.Malicious {
 		return VerdictMalicious, nil
 	}
 	return VerdictSafe, nil

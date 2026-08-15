@@ -150,6 +150,9 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // attachment_ids
 			pgxmock.AnyArg(), // status (RF-21: active, or withheld for scanning)
 			pgxmock.AnyArg(), // link_scan_urls
+			pgxmock.AnyArg(), // create idempotency key
+			pgxmock.AnyArg(), // link safety fingerprint
+			pgxmock.AnyArg(), // create request fingerprint
 		).
 		WillReturnRows(rows)
 }
@@ -201,7 +204,8 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(),
 				).
 				WillReturnError(dbErr)
 
@@ -231,7 +235,7 @@ func TestPGXMessageStore_ForwardChannelMessage_SnapshotsAndPersistsProvenance(t 
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -254,7 +258,7 @@ func TestPGXMessageStore_ForwardChannelMessage_DeniedIsNonEnumerating(t *testing
 	mock := newMock(t)
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()))
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor", SourceMessageID: "source",
@@ -273,7 +277,7 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotentReplay(t *testing.T) {
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -295,7 +299,7 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotencyFingerprintConflict(t 
 	row[10] = "different-source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
 
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -403,7 +407,7 @@ func TestPGXMessageStore_ForwardChannelMessage_PreservesInfrastructureError(t *t
 	databaseErr := errors.New("database unavailable")
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(databaseErr)
 
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -547,7 +551,8 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg()).
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -569,7 +574,8 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"11111111-1111-1111-1111-111111111111"},
 			[]string{"22222222-2222-2222-2222-222222222222"},
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -599,6 +605,7 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"99999999-9999-9999-9999-999999999999"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -1682,7 +1689,7 @@ func TestPGXMessageStore_ForwardChannelMessage_WritesTheSuppliedSnapshot(t *test
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "checked body", "v2",
-			pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(

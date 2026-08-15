@@ -30,6 +30,10 @@ const (
 	// because nothing is broken: URL Scanner is submit-then-poll and the
 	// submission has only now happened.
 	errCodeLinkCheckPending = "link_check_pending"
+	// errCodeLinkCheckCapacity says this service declined to start a new scan
+	// right now. Retryable, and not a verdict — a client must not present it as
+	// a blocked link.
+	errCodeLinkCheckCapacity = "link_check_capacity"
 )
 
 // maxLinkPreviewRequestBytes bounds the request body. The payload is one URL
@@ -138,6 +142,13 @@ func linkPreviewError(err error) (status int, code, message string) {
 		// reported is not repeated: it would tell whoever is probing exactly
 		// which of their domains are already known.
 		return http.StatusForbidden, errCodeMaliciousURL, "this link was blocked for security reasons"
+	case errors.Is(err, linkpreview.ErrSafetyCapacity):
+		// 429 and not 403. This service declined to start a new scan right now —
+		// a spent window or a full queue — and that says nothing about the link.
+		// Reporting it as malicious would show a security warning for an
+		// operational condition. Which ceiling refused it stays internal.
+		return http.StatusTooManyRequests, errCodeLinkCheckCapacity,
+			"links could not be checked right now, try again shortly"
 	case errors.Is(err, linkpreview.ErrSafetyUnavailable):
 		return http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
 			"the link could not be checked for safety, try again"

@@ -1031,6 +1031,63 @@ export async function fetchChannelMessage(
   return mapMessage(res.data);
 }
 
+/**
+ * RF-21 reconnect reconciliation.
+ *
+ * A message withheld for a link scan resolves asynchronously, and the verdict is
+ * announced over the websocket. That announcement is best-effort: an author
+ * whose connection was down while their message was refused receives nothing,
+ * and their client would keep showing "checking links…" for a message that no
+ * longer exists. On reconnect it asks here what actually happened.
+ *
+ * The reply carries a state and, for a refusal, a fixed reason — never a body,
+ * a URL or anything the scanner said. Ids the server will not talk about are
+ * absent from the reply rather than reported as denied, so an absent id means
+ * "no answer", never "gone".
+ */
+export type LinkSafetyState = "pending" | "active" | "blocked" | "deleted";
+
+export interface LinkSafetyStatus {
+  messageId: string;
+  state: LinkSafetyState;
+  reason?: string;
+}
+
+interface LinkSafetyStatusEnvelope {
+  data: {
+    statuses?: { message_id: string; state: string; reason?: string }[];
+  };
+}
+
+const linkSafetyStates: LinkSafetyState[] = ["pending", "active", "blocked", "deleted"];
+
+export async function fetchLinkSafetyStatuses(
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<LinkSafetyStatus[]> {
+  const response = await authenticatedFetch<LinkSafetyStatusEnvelope>(
+    `${CHAT_BASE}/messages/link-safety-status`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message_ids: messageIds }),
+      signal,
+    },
+  );
+  // A state this client does not know is dropped rather than guessed at. The
+  // caller leaves an unanswered message alone, which is the conservative
+  // outcome — the same one an absent id produces.
+  return (response.data.statuses ?? []).flatMap((status) =>
+    linkSafetyStates.includes(status.state as LinkSafetyState)
+      ? [{
+          messageId: status.message_id,
+          state: status.state as LinkSafetyState,
+          reason: status.reason,
+        }]
+      : [],
+  );
+}
+
 export async function editMessage(
   messageId: string,
   body: string,

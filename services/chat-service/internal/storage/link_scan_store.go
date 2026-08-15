@@ -26,10 +26,26 @@ import (
 // alike are two queues an operator only has to learn once.
 
 const (
-	// linkScanLease is how long a claimed row is left alone. It has to outlive
-	// one provider exchange with room to spare, so a worker that is merely slow
-	// does not have its row stolen and submitted twice.
+	// linkScanLease is how long a claimed row is left alone.
+	//
+	// It has to outlive the work the claim protects, and the claim now protects
+	// exactly one provider exchange: the worker takes one row at a time,
+	// immediately before processing it, rather than leasing a batch and working
+	// through it serially. That is what fixes the review's finding — a batch of
+	// eight at a ten-second ceiling is an eighty-second worst case under a
+	// sixty-second lease, so the last rows in a slow batch were reclaimable while
+	// still being processed, and could be submitted twice.
+	//
+	// With one row per claim the relationship is stated rather than hoped for:
+	// the lease is the provider's own request timeout plus a wide margin for the
+	// database round trips around it. The assertion below keeps it that way.
 	linkScanLease = 60 * time.Second
+
+	// providerExchangeCeiling mirrors urlsafety's per-request timeout. It is
+	// restated here because this is where the lease has to be compared against
+	// it, and a lease shorter than the work it protects is the bug this constant
+	// exists to make unrepresentable.
+	providerExchangeCeiling = 10 * time.Second
 
 	// linkScanBackoffSteps caps how far the retry stretches: the next attempt is
 	// lease * min(attempts, steps) out, so a provider outage costs
@@ -43,6 +59,19 @@ const (
 	maxPendingResolveBatch = 100
 )
 
+// A lease that does not outlive one provider exchange lets a second worker
+// reclaim a row that is still being processed. Checked at compile time so the
+// two numbers cannot drift apart in a later edit.
+const _ = uint(linkScanLease - providerExchangeCeiling)
+
+// ErrLinkScanConflict reports that a compare-and-set lost.
+//
+// It is not a failure of the operation so much as a statement about who owns the
+// row: another worker advanced it while this one was talking to the provider. A
+// caller must not retry the provider call on it — the work has already been done
+// or reassigned — and must not treat it as an error worth alarming about.
+var ErrLinkScanConflict = errors.New("link scan: superseded by another worker")
+
 // LinkScanJob is one claimed canonical URL, with everything the worker needs to
 // either submit it or read its result.
 type LinkScanJob struct {
@@ -52,19 +81,76 @@ type LinkScanJob struct {
 	ScanUUID string
 	// Attempts includes this claim. It is a diagnostic, not a budget.
 	Attempts int
+
+	// SubmitStartedAt is when the outstanding submission attempt was handed to
+	// the provider, and zero when there is none. Together with ScanUUID it is
+	// what separates "never submitted" from "submitted, outcome unknown" — the
+	// distinction that stops a restart from resubmitting a scan the provider has
+	// already accepted and billed.
+	SubmitStartedAt time.Time
+	// SubmitGeneration is the compare-and-set token for the current attempt.
+	// Every write about that attempt carries it, so a worker whose lease expired
+	// mid-submission cannot overwrite the attempt that replaced it.
+	SubmitGeneration int
 }
 
-// ResolvedMessage is a withheld message whose links have all been decided.
-type ResolvedMessage struct {
-	Message domain.Message
-	// Published is true when the message was promoted to active and must now be
-	// broadcast exactly once; false when it was blocked and must never be.
-	Published bool
-	// TargetType is "channel" or "dm", so the caller can publish to the right
-	// topic without re-deriving it.
+// ResolveSummary counts what one promotion pass decided. It carries no message
+// content because the pass no longer publishes anything: the event it wrote to
+// the outbox does.
+type ResolveSummary struct {
+	Published int
+	Blocked   int
+}
+
+// Total reports how many withheld messages the pass decided.
+func (s ResolveSummary) Total() int { return s.Published + s.Blocked }
+
+// PublishEvent is one resolved message waiting to be announced.
+type PublishEvent struct {
+	MessageID   string
+	WorkspaceID string
+	// EventType is "message.created" for a promotion or "message.blocked" for a
+	// refusal. The two go to different audiences, which is why the dispatcher
+	// must not infer one from the other.
+	EventType string
+	// TargetType is "channel", "dm" or "sender". The first two address a
+	// conversation; "sender" addresses one user, and is what keeps a blocked
+	// message from being announced to a target it was never shown in.
 	TargetType string
 	TargetID   string
+	Message    domain.Message
+
+	// Cancelled marks an event whose message no longer exists, so the dispatcher
+	// retires it instead of retrying something that can never succeed.
+	Cancelled bool
 }
+
+// Outbox event types and audiences. Closed sets, mirrored by the CHECK
+// constraints on the table.
+const (
+	EventMessageCreated = "message.created"
+	EventMessageBlocked = "message.blocked"
+
+	TargetSender = "sender"
+)
+
+// Blocked reports whether this event announces a refusal rather than a
+// publication.
+func (e PublishEvent) Blocked() bool { return e.EventType == EventMessageBlocked }
+
+const (
+	// publishRetryBase paces redelivery. Shorter than the scan lease because the
+	// work is local — one hub publish — and a message already active but not yet
+	// announced is a message somebody is waiting to see.
+	publishRetryBase = 5 * time.Second
+
+	// publishBackoffSteps caps the stretch, so a hub refusing traffic settles at
+	// one attempt per half-minute instead of a storm.
+	publishBackoffSteps = 6
+
+	// maxPublishBatch bounds one dispatcher pass.
+	maxPublishBatch = 50
+)
 
 // LoadLinkVerdicts returns the fresh verdicts known for canonicalURLs.
 //
@@ -104,14 +190,22 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 		// Only a value this package recognises becomes a verdict. A row carrying
 		// anything else is treated as absent, so a corrupted or future status
 		// cannot clear a message.
-		if verdict := urlsafety.Verdict(status); verdict.IsFinal() {
-			verdicts[url] = verdict
+		if verdictIsLoadable(status) {
+			verdicts[url] = urlsafety.Verdict(status)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("load link verdicts: %w", err)
 	}
 	return verdicts, nil
+}
+
+// verdictIsLoadable reports whether a stored status may be served as a verdict.
+//
+// One place, so "what counts as an answer" cannot drift between the read path
+// and the writer that is supposed to have refused it.
+func verdictIsLoadable(status string) bool {
+	return urlsafety.Verdict(status).IsFinal()
 }
 
 // EnsureLinkScans records that these canonical URLs need a verdict.
@@ -156,6 +250,203 @@ func (s *PGXMessageStore) EnsureLinkScans(ctx context.Context, canonicalURLs []s
 	return nil
 }
 
+// LinkScanBacklog summarises the queue for the metrics gauges.
+//
+// Two numbers an operator cannot get any other way: how many URLs are waiting,
+// split by whether they still need submitting or are being polled, and how long
+// the oldest one has been waiting. Without them a provider outage is invisible —
+// messages simply stop appearing, with nothing to point at.
+//
+// One aggregate query per worker pass, against the same partial index the claim
+// uses, so it costs nothing when the queue is empty.
+func (s *PGXMessageStore) LinkScanBacklog(ctx context.Context) (map[string]int, time.Duration, error) {
+	// Three states, not two. submit_uncertain is reported on its own because it
+	// is the one a restart will not clear and must not clear — a growing
+	// uncertain backlog means submissions whose outcome nobody can recover, and
+	// folding it into submit_pending would hide exactly that.
+	rows, err := s.pool.Query(ctx, `
+		SELECT CASE
+		         WHEN scan_uuid IS NOT NULL THEN 'polling'
+		         WHEN submit_attempt_started_at IS NOT NULL THEN 'submit_uncertain'
+		         ELSE 'submit_pending'
+		       END AS state,
+		       count(*),
+		       COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)
+		FROM chat.link_scans
+		WHERE status = 'pending'
+		GROUP BY 1`)
+	if err != nil {
+		return nil, 0, fmt.Errorf("link scan backlog: %w", err)
+	}
+	defer rows.Close()
+
+	byState := make(map[string]int, 2)
+	var oldestSeconds float64
+	for rows.Next() {
+		var state string
+		var count int
+		var ageSeconds float64
+		if err := rows.Scan(&state, &count, &ageSeconds); err != nil {
+			return nil, 0, fmt.Errorf("scan link scan backlog: %w", err)
+		}
+		byState[state] = count
+		if ageSeconds > oldestSeconds {
+			oldestSeconds = ageSeconds
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("link scan backlog: %w", err)
+	}
+	return byState, time.Duration(oldestSeconds * float64(time.Second)), nil
+}
+
+// ReopenExpiredVerdicts puts lapsed verdicts back in the queue.
+//
+// A verdict is only usable while it is fresh, and the promotion now enforces
+// that — but enforcing it alone would strand a message forever: its URL is
+// decided, so nothing re-scans it, and it is stale, so nothing promotes it. This
+// is the other half. A decided row that a withheld message still depends on, and
+// whose verdict has lapsed, goes back to pending and is scanned again.
+//
+// Scoped to URLs a withheld message is actually waiting on. Reopening every
+// expired verdict in the table would re-scan the entire history on a schedule,
+// which is a quota bill for answers nobody is waiting for; a verdict that
+// nothing is blocked on is simply re-scanned on demand, by the send that next
+// names it.
+//
+// Idempotent by construction: a row already pending is not matched, so repeated
+// passes and concurrent workers cannot produce a second scan for one URL.
+func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE chat.link_scans ls
+		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
+		       attempts = 0, next_attempt_at = NULL, updated_at = now()
+		 WHERE ls.status <> 'pending'
+		   AND ls.decided_at <= now() - ($1 * interval '1 second')
+		   AND EXISTS (
+		       SELECT 1
+		       FROM chat.message_link_scans mls
+		       JOIN chat.messages m ON m.id = mls.message_id
+		       WHERE mls.canonical_url = ls.canonical_url
+		         AND m.status = 'pending_link_scan'
+		   )`,
+		urlsafety.VerdictTTL.Seconds(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("reopen expired verdicts: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// linkSafetyStatesQuery answers, for messages the caller wrote, what became of
+// them.
+//
+// # Where "blocked" comes from
+//
+// A refused message is stored as `deleted`, which is what it is to every other
+// reader: something that was never published. That alone cannot distinguish it
+// from a message its author deleted, so the reason is derived from the
+// link-safety rows themselves — the association recorded at creation, joined to
+// the verdict for the URL it named. Those are durable state about the decision.
+//
+// Deliberately not derived from chat.message_publish_outbox. That table is a
+// delivery mechanism: a row there means "an announcement is owed", not "this is
+// what happened", and it is retired once delivered. Reading business state out
+// of it would make the answer depend on whether a dispatcher had run.
+//
+// The association is matched on the fingerprint the message currently carries,
+// the same binding the promotion uses, so a verdict recorded for other content
+// cannot explain this one.
+//
+// # The scoping is the authorization
+//
+// workspace + active membership + `sender_id = the caller`. A message is only
+// ever described to the person who wrote it, so there is no ordering in which
+// this endpoint answers about somebody else's message. Rows that do not match
+// produce no output at all rather than a "not allowed" answer, which is what
+// keeps missing, foreign and inaccessible indistinguishable.
+//
+// # Known ceiling
+//
+// A malicious verdict older than VerdictTTL is requeued for re-scanning as soon
+// as anybody sends the same URL again, and while it is pending it no longer
+// explains the block: the answer degrades from `blocked` to `deleted`. That is
+// the conservative direction — the author is told the message is gone rather
+// than told something we can no longer evidence — and it is out of reach of the
+// flow this serves, which reconciles within one session of the block.
+const linkSafetyStatesQuery = `
+	SELECT m.id::text,
+	       m.status,
+	       EXISTS (
+	           SELECT 1
+	           FROM chat.message_link_scans mls
+	           JOIN chat.link_scans ls ON ls.canonical_url = mls.canonical_url
+	           WHERE mls.message_id = m.id
+	             AND mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')
+	             AND ls.status = 'malicious'
+	       ) AS malicious
+	FROM chat.messages m
+	JOIN chat.workspace_members wm
+	  ON wm.workspace_id = m.workspace_id
+	 AND wm.user_id = $2::uuid
+	 AND wm.status = 'active'
+	WHERE m.workspace_id = $1::uuid
+	  AND m.sender_id = $2::uuid
+	  AND m.id = ANY($3::uuid[])`
+
+// LinkSafetyStates returns the current state of the caller's own messages.
+//
+// Only ids that resolve to a message this caller wrote appear in the result. An
+// id that names nothing, somebody else's message, or another workspace's is
+// absent, and absence carries no information beyond "this service will not talk
+// about that id".
+func (s *PGXMessageStore) LinkSafetyStates(
+	ctx context.Context, workspaceID, senderID string, messageIDs []string,
+) ([]domain.MessageLinkSafetyState, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, linkSafetyStatesQuery, workspaceID, senderID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("read link safety states: %w", err)
+	}
+	defer rows.Close()
+
+	states := make([]domain.MessageLinkSafetyState, 0, len(messageIDs))
+	for rows.Next() {
+		var id, status string
+		var malicious bool
+		if err := rows.Scan(&id, &status, &malicious); err != nil {
+			return nil, fmt.Errorf("scan link safety state: %w", err)
+		}
+		states = append(states, domain.MessageLinkSafetyState{
+			MessageID: id, State: linkSafetyState(status, malicious),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read link safety states: %w", err)
+	}
+	return states, nil
+}
+
+// linkSafetyState maps a stored row to the state its author is told about.
+//
+// A separate function so the mapping is unit-testable without a database, and
+// so the one branch that matters — a deleted message is only *blocked* when a
+// malicious verdict explains it — is stated in one place.
+func linkSafetyState(status string, malicious bool) domain.LinkSafetyState {
+	switch {
+	case status == string(domain.MessageStatusPendingLinkScan):
+		return domain.LinkSafetyStatePending
+	case status == string(domain.MessageStatusActive):
+		return domain.LinkSafetyStateActive
+	case malicious:
+		return domain.LinkSafetyStateBlocked
+	default:
+		return domain.LinkSafetyStateDeleted
+	}
+}
+
 // claimDueLinkScansQuery takes a batch of due rows and leases them in one
 // statement.
 //
@@ -189,7 +480,9 @@ const claimDueLinkScansQuery = `
 	       updated_at = now()
 	  FROM due
 	 WHERE ls.canonical_url = due.canonical_url
-	RETURNING ls.canonical_url, COALESCE(ls.scan_uuid, ''), ls.attempts`
+	RETURNING ls.canonical_url, COALESCE(ls.scan_uuid, ''), ls.attempts,
+	          COALESCE(ls.submit_attempt_started_at, 'epoch'::timestamptz),
+	          ls.submit_generation`
 
 // ClaimDueLinkScans leases up to batchSize URLs awaiting a verdict.
 func (s *PGXMessageStore) ClaimDueLinkScans(ctx context.Context, batchSize int) ([]LinkScanJob, error) {
@@ -206,8 +499,15 @@ func (s *PGXMessageStore) ClaimDueLinkScans(ctx context.Context, batchSize int) 
 	var jobs []LinkScanJob
 	for rows.Next() {
 		var job LinkScanJob
-		if err := rows.Scan(&job.CanonicalURL, &job.ScanUUID, &job.Attempts); err != nil {
+		if err := rows.Scan(&job.CanonicalURL, &job.ScanUUID, &job.Attempts,
+			&job.SubmitStartedAt, &job.SubmitGeneration); err != nil {
 			return nil, fmt.Errorf("scan link scan job: %w", err)
+		}
+		// 'epoch' stands in for NULL so one scan target serves both, and it is
+		// normalised back here: a zero time means "no attempt outstanding", which
+		// is what SubmitState reads.
+		if job.SubmitStartedAt.Equal(time.Unix(0, 0).UTC()) {
+			job.SubmitStartedAt = time.Time{}
 		}
 		jobs = append(jobs, job)
 	}
@@ -217,20 +517,34 @@ func (s *PGXMessageStore) ClaimDueLinkScans(ctx context.Context, batchSize int) 
 	return jobs, nil
 }
 
-// RecordLinkScanSubmission stores the provider's scan id.
+// RecordLinkScanSubmission stores the provider's scan id, closing the window the
+// intent opened.
 //
-// Only a row still pending is updated. A URL that was decided while this
-// submission was in flight keeps its verdict: the answer already obtained is not
-// replaced by a scan that has not finished.
-func (s *PGXMessageStore) RecordLinkScanSubmission(ctx context.Context, canonicalURL, scanUUID string) error {
-	_, err := s.pool.Exec(ctx, `
+// Only a row still pending, still without a scan id, and still on the generation
+// this attempt owns is updated. A URL decided while the submission was in flight
+// keeps its verdict; an attempt superseded by another worker's does not get to
+// write over it. Clearing submit_attempt_started_at in the same statement is what
+// moves the row out of the uncertain state — the id is now known locally, so
+// there is nothing left to reconcile.
+func (s *PGXMessageStore) RecordLinkScanSubmission(
+	ctx context.Context, canonicalURL, scanUUID string, generation int,
+) error {
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans
-		   SET scan_uuid = $2, updated_at = now()
-		 WHERE canonical_url = $1 AND status = 'pending'`,
-		canonicalURL, scanUUID,
+		   SET scan_uuid = $2, submit_attempt_started_at = NULL, updated_at = now()
+		 WHERE canonical_url = $1 AND status = 'pending' AND scan_uuid IS NULL
+		   AND submit_generation = $3`,
+		canonicalURL, scanUUID, generation,
 	)
 	if err != nil {
 		return fmt.Errorf("record link scan submission: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Somebody else already bound a scan to this URL, or it was decided while
+		// this submission was in flight. Either way this worker's scan id is not
+		// the one that counts, and saying so lets the caller record it as a lost
+		// race rather than retrying into a resubmission loop.
+		return ErrLinkScanConflict
 	}
 	return nil
 }
@@ -241,20 +555,31 @@ func (s *PGXMessageStore) RecordLinkScanSubmission(ctx context.Context, canonica
 // is the same rule the shared package applies: a zero value, a value from a
 // future version, or a provider client bug must not be able to write a row that
 // later reads as safe.
+//
+// The write is bound to the scan it came from. A worker whose lease expired
+// while it was waiting on the provider may still be holding a verdict for a scan
+// that has since been superseded — the row was reclaimed, resubmitted, and now
+// carries a different scan id. Matching scan_uuid in the predicate is what stops
+// that stale answer from overwriting the current one; zero rows affected means
+// this worker lost the race, and ErrLinkScanConflict says so rather than
+// pretending the write succeeded.
 func (s *PGXMessageStore) RecordLinkVerdict(
-	ctx context.Context, canonicalURL string, verdict urlsafety.Verdict,
+	ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict,
 ) error {
 	if !verdict.IsFinal() {
 		return fmt.Errorf("%w: refusing to store a non-final verdict", domain.ErrInvalidInput)
 	}
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans
 		   SET status = $2, decided_at = now(), next_attempt_at = NULL, updated_at = now()
-		 WHERE canonical_url = $1 AND status = 'pending'`,
-		canonicalURL, string(verdict),
+		 WHERE canonical_url = $1 AND status = 'pending' AND scan_uuid = $3`,
+		canonicalURL, string(verdict), scanUUID,
 	)
 	if err != nil {
 		return fmt.Errorf("record link verdict: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLinkScanConflict
 	}
 	return nil
 }
@@ -273,86 +598,266 @@ func (s *PGXMessageStore) RecordLinkVerdict(
 // UPDATE finds the row still pending, and only that one gets a RETURNING row to
 // publish from. The other publishes nothing.
 const resolvePendingMessagesQuery = `
-	WITH decided AS (
+	WITH candidate AS (
 		SELECT m.id,
-		       bool_or(ls.status = 'malicious') AS blocked,
-		       bool_and(ls.status <> 'pending') AS complete
+		       m.link_safety_fingerprint AS fingerprint,
+		       -- A verdict is only usable while it is fresh. The send path already
+		       -- refuses an expired clearance; this is the same rule applied here,
+		       -- which is what the review found missing — the resolver only asked
+		       -- whether a row had stopped being pending, so a clearance decided
+		       -- hours ago still promoted a message.
+		       bool_or(ls.status = 'malicious'
+		               AND ls.decided_at > now() - ($2 * interval '1 second')) AS blocked,
+		       bool_and(ls.status = 'safe'
+		                AND ls.decided_at > now() - ($2 * interval '1 second')) AS all_fresh_safe
 		FROM chat.messages m
-		JOIN chat.message_link_scans mls ON mls.message_id = m.id
+		JOIN chat.message_link_scans mls
+		  ON mls.message_id = m.id
+		 -- The binding: only associations recorded for the content this message
+		 -- currently carries may decide it, so a verdict obtained for other
+		 -- content cannot publish this one.
+		 AND mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')
 		JOIN chat.link_scans ls ON ls.canonical_url = mls.canonical_url
 		WHERE m.status = 'pending_link_scan'
-		GROUP BY m.id
+		GROUP BY m.id, m.link_safety_fingerprint
 		LIMIT $1
+	),
+	promoted AS (
+		UPDATE chat.messages m
+		   SET status = CASE WHEN candidate.blocked THEN 'deleted' ELSE 'active' END,
+		       deleted_at = CASE WHEN candidate.blocked THEN now() ELSE m.deleted_at END,
+		       updated_at = now()
+		  FROM candidate
+		 WHERE m.id = candidate.id
+		   -- Compare-and-set, not read-then-write: the row must still be withheld
+		   -- and must still carry the fingerprint the verdicts were read for.
+		   -- Zero rows affected means it changed underneath, and nothing is
+		   -- published.
+		   AND m.status = 'pending_link_scan'
+		   AND COALESCE(m.link_safety_fingerprint, '') = COALESCE(candidate.fingerprint, '')
+		   AND (candidate.blocked OR candidate.all_fresh_safe)
+		RETURNING m.id, m.workspace_id, m.sender_id, NOT candidate.blocked AS published,
+		          COALESCE(m.channel_id::text, '') AS channel_id,
+		          COALESCE(m.dm_conversation_id::text, '') AS conversation_id
+	),
+	queued AS (
+		-- Two terminal outcomes, both announced durably. A promotion goes to the
+		-- target; a block goes only to its author, who would otherwise be left
+		-- watching a message that never resolves.
+		INSERT INTO chat.message_publish_outbox
+			(message_id, workspace_id, event_type, target_type, target_id)
+		SELECT promoted.id, promoted.workspace_id,
+		       CASE WHEN promoted.published THEN 'message.created' ELSE 'message.blocked' END,
+		       CASE
+		         WHEN NOT promoted.published THEN 'sender'
+		         WHEN promoted.channel_id <> '' THEN 'channel'
+		         ELSE 'dm'
+		       END,
+		       (CASE
+		          WHEN NOT promoted.published THEN promoted.sender_id::text
+		          WHEN promoted.channel_id <> '' THEN promoted.channel_id
+		          ELSE promoted.conversation_id
+		        END)::uuid
+		FROM promoted
+		ON CONFLICT (message_id) DO NOTHING
+		RETURNING message_id
+	),
+	notified AS (
+		-- RF-21 delays mention notifications rather than dropping them: a withheld
+		-- message must produce no side effect aimed at anyone else, so its
+		-- mentions were parked at creation and are released here, in the same
+		-- transaction that makes the message publishable. A blocked message never
+		-- reaches this step.
+		INSERT INTO chat.notification_outbox
+			(workspace_id, message_id, recipient_user_id, kind, status)
+		SELECT promoted.workspace_id, promoted.id, mention.user_id, 'mention', 'pending'
+		FROM promoted
+		JOIN chat.message_pending_mentions mention ON mention.message_id = promoted.id
+		WHERE promoted.published
+		ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
+		RETURNING message_id
 	)
-	UPDATE chat.messages m
-	   SET status = CASE WHEN decided.blocked THEN 'deleted' ELSE 'active' END,
-	       deleted_at = CASE WHEN decided.blocked THEN now() ELSE m.deleted_at END,
-	       updated_at = now()
-	  FROM decided
-	 WHERE m.id = decided.id
-	   AND m.status = 'pending_link_scan'
-	   AND (decided.blocked OR decided.complete)
-	RETURNING m.id, NOT decided.blocked AS published,
-	          COALESCE(m.channel_id::text, ''), COALESCE(m.dm_conversation_id::text, '')`
+	SELECT id::text, published FROM promoted`
 
 // ResolveDecidedMessages promotes or blocks withheld messages whose links have
-// all been decided, and returns what happened so the caller can broadcast.
+// all been decided.
 //
-// The returned messages are re-read afterwards rather than assembled from the
-// UPDATE, because a broadcast payload needs sender display info and the quote
-// preview, which the UPDATE does not have. Re-reading is safe here in a way it
-// is not elsewhere: the row is already committed as active, so what is read is
-// what every other reader will see.
-func (s *PGXMessageStore) ResolveDecidedMessages(ctx context.Context) ([]ResolvedMessage, error) {
-	rows, err := s.pool.Query(ctx, resolvePendingMessagesQuery, maxPendingResolveBatch)
+// It no longer returns anything to broadcast, and that is the point of this
+// round's change: promotion and the event announcing it are now written in one
+// statement, so the caller has nothing to do afterwards that a crash could skip.
+// What comes back is a summary — how many were released, how many were blocked —
+// for logging and metrics only.
+//
+// The UPDATE's own predicate (status = 'pending_link_scan') is what makes the
+// promotion exactly-once: two replicas may both evaluate the rule, only one
+// finds the row still pending, and the outbox row is keyed by message id so even
+// a double promotion could only ever produce one event.
+func (s *PGXMessageStore) ResolveDecidedMessages(ctx context.Context) (ResolveSummary, error) {
+	rows, err := s.pool.Query(ctx, resolvePendingMessagesQuery,
+		maxPendingResolveBatch, urlsafety.VerdictTTL.Seconds())
 	if err != nil {
-		return nil, fmt.Errorf("resolve decided messages: %w", err)
+		return ResolveSummary{}, fmt.Errorf("resolve decided messages: %w", err)
 	}
-	type outcome struct {
-		id             string
-		published      bool
-		channelID      string
-		conversationID string
-	}
-	var outcomes []outcome
+	defer rows.Close()
+
+	var summary ResolveSummary
 	for rows.Next() {
-		var got outcome
-		if err := rows.Scan(&got.id, &got.published, &got.channelID, &got.conversationID); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan resolved message: %w", err)
+		var id string
+		var published bool
+		if err := rows.Scan(&id, &published); err != nil {
+			return ResolveSummary{}, fmt.Errorf("scan resolved message: %w", err)
 		}
-		outcomes = append(outcomes, got)
+		if published {
+			summary.Published++
+			continue
+		}
+		summary.Blocked++
+	}
+	if err := rows.Err(); err != nil {
+		return ResolveSummary{}, fmt.Errorf("resolve decided messages: %w", err)
+	}
+	return summary, nil
+}
+
+// claimPublishEventsQuery leases due publish events.
+//
+// The same claim shape as the scan queue's, for the same reasons: SKIP LOCKED so
+// several replicas can drain it without coordinating, and a backoff that grows
+// with the attempt count so a hub that is refusing traffic does not become a
+// retry storm.
+const claimPublishEventsQuery = `
+	WITH due AS (
+		SELECT o.message_id
+		FROM chat.message_publish_outbox o
+		WHERE o.status = 'pending'
+		  AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= now())
+		ORDER BY o.next_attempt_at NULLS FIRST, o.created_at
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+	)
+	UPDATE chat.message_publish_outbox o
+	   SET attempts = LEAST(o.attempts + 1, 32767),
+	       next_attempt_at = now() + ($2 * LEAST(o.attempts + 1, $3) * interval '1 second'),
+	       updated_at = now()
+	  FROM due
+	 WHERE o.message_id = due.message_id
+	RETURNING o.message_id::text, o.workspace_id::text, o.event_type,
+	          o.target_type, o.target_id::text`
+
+// ClaimPublishEvents leases up to batchSize undelivered promotion events and
+// returns them with the message payload the broadcast needs.
+//
+// The message is read back here rather than stored in the outbox row: a
+// broadcast payload carries sender display info and a quote preview, and
+// duplicating those into the event would mean maintaining two copies of the
+// message shape. The row is already committed as active, so what is read is what
+// every other reader sees.
+func (s *PGXMessageStore) ClaimPublishEvents(ctx context.Context, batchSize int) ([]PublishEvent, error) {
+	if batchSize <= 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, claimPublishEventsQuery,
+		batchSize, publishRetryBase.Seconds(), publishBackoffSteps)
+	if err != nil {
+		return nil, fmt.Errorf("claim publish events: %w", err)
+	}
+	var events []PublishEvent
+	for rows.Next() {
+		var event PublishEvent
+		if err := rows.Scan(&event.MessageID, &event.WorkspaceID, &event.EventType,
+			&event.TargetType, &event.TargetID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan publish event: %w", err)
+		}
+		events = append(events, event)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("resolve decided messages: %w", err)
+		return nil, fmt.Errorf("claim publish events: %w", err)
 	}
 
-	resolved := make([]ResolvedMessage, 0, len(outcomes))
-	for _, got := range outcomes {
-		entry := ResolvedMessage{Published: got.published}
-		entry.TargetType, entry.TargetID = "channel", got.channelID
-		if got.channelID == "" {
-			entry.TargetType, entry.TargetID = "dm", got.conversationID
-		}
-		if !got.published {
-			// A blocked message is never broadcast, so nothing about it needs to
-			// be read back. Only the fact that it was blocked matters.
-			entry.Message = domain.Message{ID: got.id}
-			resolved = append(resolved, entry)
+	ready := make([]PublishEvent, 0, len(events))
+	for _, event := range events {
+		// A refusal carries no body: the author is told their message was blocked,
+		// and nothing about the content or the provider travels with it.
+		if event.Blocked() {
+			ready = append(ready, event)
 			continue
 		}
-		message, err := s.readPublishedMessage(ctx, got.id)
-		if err != nil {
-			// The promotion is committed; failing to build its payload must not
-			// undo it. Skipping the broadcast leaves the message visible on the
-			// next read, which is the same outcome a dropped websocket frame has.
+		message, err := s.readPublishedMessage(ctx, event.MessageID)
+		switch {
+		case errors.Is(err, domain.ErrNotFound):
+			// The message was deleted between promotion and delivery, so there is
+			// nothing left to announce — ever. Previously this was skipped and the
+			// row stayed pending, retried forever and kept the backlog gauge
+			// climbing over work that could never succeed. Cancelling is the
+			// terminal state that says so.
+			event.Cancelled = true
+			ready = append(ready, event)
+		case err != nil:
+			// A transient database failure is not a reason to cancel: the row stays
+			// pending and the next pass tries again.
 			continue
+		default:
+			event.Message = message
+			ready = append(ready, event)
 		}
-		entry.Message = message
-		resolved = append(resolved, entry)
 	}
-	return resolved, nil
+	return ready, nil
+}
+
+// CancelPublishEvent retires an event that can never be delivered.
+//
+// Distinct from MarkPublished so the two are distinguishable in the table and in
+// the metric: "delivered" and "there was nothing left to deliver" are different
+// operational facts, and collapsing them would hide a message being deleted out
+// from under its own announcement.
+func (s *PGXMessageStore) CancelPublishEvent(ctx context.Context, messageID string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE chat.message_publish_outbox
+		   SET status = 'cancelled', next_attempt_at = NULL, updated_at = now()
+		 WHERE message_id = $1::uuid AND status = 'pending'`,
+		messageID,
+	)
+	if err != nil {
+		return fmt.Errorf("cancel publish event: %w", err)
+	}
+	return nil
+}
+
+// MarkPublished retires a delivered event.
+//
+// Delivery is at-least-once: a dispatcher can publish and then fail before this
+// lands, so the same message.created may go out twice. The client deduplicates
+// by message id, which is what makes that safe — and it is a far better failure
+// than the alternative this replaced, where a crash after the commit meant the
+// event was never sent at all.
+func (s *PGXMessageStore) MarkPublished(ctx context.Context, messageID string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE chat.message_publish_outbox
+		   SET status = 'delivered', next_attempt_at = NULL, updated_at = now()
+		 WHERE message_id = $1::uuid AND status = 'pending'`,
+		messageID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark message published: %w", err)
+	}
+	return nil
+}
+
+// PublishOutboxBacklog reports undelivered events and the age of the oldest, for
+// the dispatcher's gauges.
+func (s *PGXMessageStore) PublishOutboxBacklog(ctx context.Context) (int, time.Duration, error) {
+	var pending int
+	var ageSeconds float64
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*), COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)
+		FROM chat.message_publish_outbox
+		WHERE status = 'pending'`).Scan(&pending, &ageSeconds)
+	if err != nil {
+		return 0, 0, fmt.Errorf("publish outbox backlog: %w", err)
+	}
+	return pending, time.Duration(ageSeconds * float64(time.Second)), nil
 }
 
 // readPublishedMessage re-reads a just-promoted message with the columns a

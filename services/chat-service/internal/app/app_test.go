@@ -987,14 +987,46 @@ type stubLinkStore struct{}
 func (stubLinkStore) LoadLinkVerdicts(context.Context, []string) (map[string]urlsafety.Verdict, error) {
 	return map[string]urlsafety.Verdict{}, nil
 }
-func (stubLinkStore) EnsureLinkScans(context.Context, []string) error { return nil }
+func (stubLinkStore) AdmitLinkScans(
+	context.Context, string, []string, storage.LinkScanCapacity,
+) (storage.LinkScanAdmission, error) {
+	return storage.LinkScanAdmission{Result: storage.AdmissionAllowed}, nil
+}
 func (stubLinkStore) ClaimDueLinkScans(context.Context, int) ([]storage.LinkScanJob, error) {
 	return nil, nil
 }
-func (stubLinkStore) RecordLinkScanSubmission(context.Context, string, string) error { return nil }
-func (stubLinkStore) RecordLinkVerdict(context.Context, string, urlsafety.Verdict) error {
+func (stubLinkStore) BeginLinkScanSubmit(context.Context, string, int) (int, error) { return 1, nil }
+
+func (stubLinkStore) RecordLinkScanSubmission(context.Context, string, string, int) error { return nil }
+
+func (stubLinkStore) AdoptScanUUID(context.Context, string, string, int) error { return nil }
+
+func (stubLinkStore) ReserveProviderSubmit(context.Context, int, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (stubLinkStore) PruneLinkScanBudget(context.Context, time.Duration) error { return nil }
+func (stubLinkStore) RecordLinkVerdict(context.Context, string, string, urlsafety.Verdict) error {
 	return nil
 }
-func (stubLinkStore) ResolveDecidedMessages(context.Context) ([]storage.ResolvedMessage, error) {
+func (stubLinkStore) ResolveDecidedMessages(context.Context) (storage.ResolveSummary, error) {
+	return storage.ResolveSummary{}, nil
+}
+
+func (stubLinkStore) ClaimPublishEvents(context.Context, int) ([]storage.PublishEvent, error) {
 	return nil, nil
+}
+
+func (stubLinkStore) MarkPublished(context.Context, string) error { return nil }
+
+func (stubLinkStore) CancelPublishEvent(context.Context, string) error { return nil }
+
+func (stubLinkStore) ReopenExpiredVerdicts(context.Context) (int, error) { return 0, nil }
+
+func (stubLinkStore) PublishOutboxBacklog(context.Context) (int, time.Duration, error) {
+	return 0, 0, nil
+}
+
+func (stubLinkStore) LinkScanBacklog(context.Context) (map[string]int, time.Duration, error) {
+	return map[string]int{}, 0, nil
 }

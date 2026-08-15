@@ -99,11 +99,109 @@ type CreateMessageInput struct {
 	// promotes it. The service decides this; a client cannot ask for a status.
 	Status domain.MessageStatus
 
+	// RequestFingerprint is the identity of the operation this key stands for.
+	// Persisted beside the key so a replay can be told from a reuse.
+	RequestFingerprint string
+
+	// IdempotencyKey makes a retried send return the original message instead of
+	// creating a second one. Empty means no idempotency, which is what every
+	// caller that does not supply the header gets.
+	//
+	// It matters more since RF-21: a withheld message is invisible to everyone
+	// but its author, so a client with a dropped response has every reason to
+	// send again — and would otherwise get a second withheld message and a
+	// second scan.
+	IdempotencyKey string
+
 	// LinkScanURLs are the canonical URLs this message is waiting on (RF-21),
 	// written in the same statement that creates it. They must already exist in
 	// chat.link_scans — EnsureLinkScans puts them there — because the join
 	// table references it.
 	LinkScanURLs []string
+
+	// LinkSafetyFingerprint identifies the content those URLs were extracted
+	// from. It is stamped on the message and on every association in the same
+	// statement, so the promotion can require that the verdicts it is reading
+	// belong to the content it is about to publish.
+	LinkSafetyFingerprint string
+}
+
+// createIdempotencyConstraint is the unique index that makes a retried send
+// collide instead of creating a second message. Named here because the error
+// path has to tell that collision apart from every other unique violation.
+const createIdempotencyConstraint = "messages_create_idempotency_unique"
+
+// ErrCreateReplay reports that this idempotency key already created a message.
+//
+// It is not an error the caller surfaces: it means "somebody won the race, go
+// and read what they wrote". CreateMessage returns it instead of a message, and
+// the service answers by looking the original up.
+var ErrCreateReplay = errors.New("create message: idempotency key already used")
+
+// CreateReplayInput identifies a possible replay of an earlier send.
+//
+// Every field is part of the identity, which is what stops a key from replaying
+// across users or destinations: presenting somebody else's key simply matches
+// nothing and creates the caller's own message.
+type CreateReplayInput struct {
+	WorkspaceID      string
+	ChannelID        string
+	DMConversationID string
+	SenderID         string
+	IdempotencyKey   string
+	// RequestFingerprint identifies the whole operation — body, format, parent,
+	// references and attachments — so a key reused for a different send is a
+	// conflict rather than a replay of something the caller did not ask for.
+	RequestFingerprint string
+}
+
+// LookupCreateReplay returns the message an earlier send with this key created.
+//
+// It is the same shape as LookupForwardReplay, deliberately: that pattern was
+// reviewed and approved in the previous round, and a second idempotency
+// mechanism with different semantics is how two paths start disagreeing.
+//
+// Returns ErrNotFound when this key created nothing the caller may see. The
+// caller compares the body itself — a key reused for different content is a
+// conflict, not a replay — because only the caller knows what it was about to
+// write.
+func (s *PGXMessageStore) LookupCreateReplay(
+	ctx context.Context, input CreateReplayInput,
+) (domain.Message, error) {
+	if strings.TrimSpace(input.IdempotencyKey) == "" {
+		return domain.Message{}, domain.ErrNotFound
+	}
+	var storedFingerprint string
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+listMessageWithQuoteColumns("m", "$2", "q")+`,
+		       COALESCE(m.create_request_fingerprint, '')
+		FROM chat.messages m
+		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
+		WHERE m.workspace_id = $1::uuid
+		  AND m.sender_id = $2::uuid
+		  AND COALESCE(m.channel_id, m.dm_conversation_id) = $3::uuid
+		  AND m.create_idempotency_key = $4`,
+		input.WorkspaceID, input.SenderID,
+		nullableUUID(replayTarget(input)), input.IdempotencyKey,
+	)
+	message, err := scanMessageWithSenderAndQuoteExtra(row, &storedFingerprint)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, domain.ErrNotFound
+		}
+		return domain.Message{}, fmt.Errorf("lookup create replay: %w", err)
+	}
+	message.CreateFingerprint = storedFingerprint
+	return message, nil
+}
+
+// replayTarget is the destination half of the key's identity: a channel or a DM
+// conversation, whichever this send names.
+func replayTarget(input CreateReplayInput) string {
+	if input.ChannelID != "" {
+		return input.ChannelID
+	}
+	return input.DMConversationID
 }
 
 // messageStatusOrActive resolves the default. It exists so "no status supplied"
@@ -155,11 +253,13 @@ type ForwardChannelMessageInput struct {
 	BodyText             string
 	BodyFormat           domain.MessageBodyFormat
 
-	// Status and LinkScanURLs carry RF-21 exactly as they do for CreateMessage:
-	// a forwarded snapshot whose links are not cleared is written withheld, and
-	// the URLs it waits on are recorded in the same statement.
-	Status       domain.MessageStatus
-	LinkScanURLs []string
+	// Status, LinkScanURLs and LinkSafetyFingerprint carry RF-21 exactly as they
+	// do for CreateMessage: a forwarded snapshot whose links are not cleared is
+	// written withheld, the URLs it waits on are recorded in the same statement,
+	// and the fingerprint binds the eventual promotion to this exact snapshot.
+	Status                domain.MessageStatus
+	LinkScanURLs          []string
+	LinkSafetyFingerprint string
 }
 
 // ForwardChannelMessageResult distinguishes the original insert from an
@@ -258,17 +358,52 @@ type MessageStore interface {
 	// LoadLinkVerdicts returns the fresh RF-21 verdicts for canonical URLs. A
 	// URL absent from the result has no usable verdict and is never safe.
 	LoadLinkVerdicts(ctx context.Context, canonicalURLs []string) (map[string]urlsafety.Verdict, error)
-	// EnsureLinkScans queues canonical URLs for scanning, idempotently.
-	EnsureLinkScans(ctx context.Context, canonicalURLs []string) error
+	// LookupCreateReplay resolves a send idempotency key against what is already
+	// persisted, without writing.
+	LookupCreateReplay(ctx context.Context, input CreateReplayInput) (domain.Message, error)
+	// AdmitLinkScans reserves capacity for the URLs that need new provider work
+	// and queues them, atomically. It replaces the unconditional EnsureLinkScans:
+	// creating a job is spending money at the provider, so it now has to be
+	// admitted rather than simply performed.
+	AdmitLinkScans(ctx context.Context, workspaceID string, canonicalURLs []string, capacity LinkScanCapacity) (LinkScanAdmission, error)
 	// ClaimDueLinkScans leases URLs awaiting a verdict for one worker pass.
 	ClaimDueLinkScans(ctx context.Context, batchSize int) ([]LinkScanJob, error)
-	// RecordLinkScanSubmission stores the provider's scan id for a URL.
-	RecordLinkScanSubmission(ctx context.Context, canonicalURL, scanUUID string) error
+	// BeginLinkScanSubmit records the intent to submit before the provider is
+	// called, so a crash leaves an attempt that can be reconciled rather than one
+	// indistinguishable from a URL nobody ever submitted.
+	BeginLinkScanSubmit(ctx context.Context, canonicalURL string, expectedGeneration int) (int, error)
+	// RecordLinkScanSubmission stores the provider's scan id for a URL, bound to
+	// the attempt generation that obtained it.
+	RecordLinkScanSubmission(ctx context.Context, canonicalURL, scanUUID string, generation int) error
+	// AdoptScanUUID binds a scan id recovered from the provider's search to the
+	// uncertain attempt that produced it.
+	AdoptScanUUID(ctx context.Context, canonicalURL, scanUUID string, generation int) error
+	// ReserveProviderSubmit takes one submission from the deployment-wide
+	// provider allowance, shared across replicas.
+	ReserveProviderSubmit(ctx context.Context, limit int, window time.Duration) (bool, error)
+	// PruneLinkScanBudget drops budget windows that can no longer be counted into.
+	PruneLinkScanBudget(ctx context.Context, olderThan time.Duration) error
 	// RecordLinkVerdict stores a final verdict. Non-final verdicts are refused.
-	RecordLinkVerdict(ctx context.Context, canonicalURL string, verdict urlsafety.Verdict) error
+	RecordLinkVerdict(ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error
+	// ReopenExpiredVerdicts requeues lapsed verdicts that withheld messages are
+	// still waiting on, so a stale clearance neither promotes nor strands.
+	ReopenExpiredVerdicts(ctx context.Context) (int, error)
+	// LinkSafetyStates reports what became of the caller's own messages, so a
+	// client that missed the realtime verdict can recover it. Scoped to
+	// senderID; ids it will not answer about are omitted rather than denied.
+	LinkSafetyStates(ctx context.Context, workspaceID, senderID string, messageIDs []string) ([]domain.MessageLinkSafetyState, error)
+	// LinkScanBacklog reports queue depth by state and the age of the oldest
+	// waiting URL, for the pipeline gauges.
+	LinkScanBacklog(ctx context.Context) (map[string]int, time.Duration, error)
 	// ResolveDecidedMessages promotes or blocks withheld messages whose links
-	// have all been decided, returning what happened so the caller can publish.
-	ResolveDecidedMessages(ctx context.Context) ([]ResolvedMessage, error)
+	// have all been decided, writing the promotion event in the same statement.
+	ResolveDecidedMessages(ctx context.Context) (ResolveSummary, error)
+	// ClaimPublishEvents leases undelivered promotion events for broadcast.
+	ClaimPublishEvents(ctx context.Context, batchSize int) ([]PublishEvent, error)
+	// MarkPublished retires a delivered promotion event.
+	MarkPublished(ctx context.Context, messageID string) error
+	// PublishOutboxBacklog reports undelivered events and the oldest one's age.
+	PublishOutboxBacklog(ctx context.Context) (int, time.Duration, error)
 	// ForwardChannelMessage atomically re-authorizes both channels and inserts or
 	// replays the forwarded destination message, writing the snapshot the caller
 	// supplies rather than re-reading the source.
@@ -610,9 +745,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, dm_conversation_id, sender_id,
 				 kind, body_text, body_format, status,
-				 parent_message_id, forwarded_from_message_id, referenced_message_id)
+				 parent_message_id, forwarded_from_message_id, referenced_message_id,
+				 create_idempotency_key, create_request_fingerprint, link_safety_fingerprint)
 			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $14::text,
-			       $8::uuid, $9::uuid, $10::uuid
+			       $8::uuid, $9::uuid, $10::uuid, NULLIF($16, ''), NULLIF($18, ''), NULLIF($17, '')
 			FROM (
 				-- Channel message authorization branch.
 				SELECT 1
@@ -645,14 +781,31 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, edit_count, deleted_at, created_at, updated_at
 		),
+		-- A published message notifies its mentions immediately, exactly as it
+		-- always has. A withheld one must not: a notification is a side effect
+		-- aimed at somebody who is not allowed to know the message exists yet,
+		-- and RF-21's rule is that a pending message produces none of those.
 		mention_outbox AS (
 			INSERT INTO chat.notification_outbox
 				(workspace_id, message_id, recipient_user_id, kind, status)
 			SELECT inserted.workspace_id, inserted.id, user_mentions.user_id, 'mention', 'pending'
 			FROM inserted
 			CROSS JOIN user_mentions
+			WHERE inserted.status = 'active'
 			ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
 			RETURNING id
+		),
+		-- Dropping the mentions instead would lose them for good once the scan
+		-- cleared, so they are parked and released by the promotion, in the same
+		-- transaction that makes the message publishable.
+		pending_mentions AS (
+			INSERT INTO chat.message_pending_mentions (message_id, user_id)
+			SELECT inserted.id, user_mentions.user_id
+			FROM inserted
+			CROSS JOIN user_mentions
+			WHERE inserted.status = 'pending_link_scan'
+			ON CONFLICT DO NOTHING
+			RETURNING message_id
 		),
 		-- Same statement as the INSERT above, so the message and its links are one
 		-- atomic fact: there is no commit in which one exists without the other.
@@ -674,8 +827,8 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		-- statement runs, by EnsureLinkScans, which is idempotent; a row that
 		-- ends up with no message is simply a URL that gets scanned once.
 		link_scan_links AS (
-			INSERT INTO chat.message_link_scans (message_id, canonical_url)
-			SELECT inserted.id, url
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			SELECT inserted.id, url, COALESCE(NULLIF($17, ''), '')
 			FROM inserted
 			CROSS JOIN unnest($15::text[]) AS urls(url)
 			ON CONFLICT DO NOTHING
@@ -699,6 +852,9 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.AttachmentIDs,
 		string(messageStatusOrActive(input.Status)),
 		input.LinkScanURLs,
+		input.IdempotencyKey,
+		input.LinkSafetyFingerprint,
+		input.RequestFingerprint,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
@@ -713,8 +869,15 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		if errors.As(err, &pgErr) {
 			switch pgErr.Code {
 			case "23505", "23503": // unique_violation, foreign_key_violation
-				// The attachment may have been linked between invalid_attachments
-				// and attachment_links. Keep that race non-enumerating too.
+				// A collision on the idempotency index is not a failure: it is a
+				// concurrent retry of this very send, and the caller resolves it
+				// by reading back what the winner created. Every other unique
+				// violation keeps the non-enumerating answer — the attachment may
+				// have been linked between invalid_attachments and
+				// attachment_links, and that race must stay indistinguishable.
+				if pgErr.ConstraintName == createIdempotencyConstraint {
+					return domain.Message{}, ErrCreateReplay
+				}
 				return domain.Message{}, domain.ErrNotFound
 			case "23514", "23502": // check_violation, not_null_violation
 				return domain.Message{}, domain.ErrInvalidInput
@@ -852,9 +1015,10 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 		inserted AS (
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, sender_id, kind, body_text, body_format,
-				 status, forwarded_from_message_id, forward_idempotency_key)
+				 status, forwarded_from_message_id, forward_idempotency_key,
+				 link_safety_fingerprint)
 			SELECT $1::uuid, $2::uuid, $3::uuid, 'user', $6::text,
-			       $7::text, $8::text, source.id, NULLIF($5, '')
+			       $7::text, $8::text, source.id, NULLIF($5, ''), NULLIF($10, '')
 			FROM source
 			JOIN chat.workspaces destination_workspace
 			  ON destination_workspace.id = $1::uuid AND destination_workspace.status = 'active'
@@ -881,8 +1045,8 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 		-- NOTHING makes a replay a no-op here too — the edges are already there
 		-- from the original insert.
 		link_scan_links AS (
-			INSERT INTO chat.message_link_scans (message_id, canonical_url)
-			SELECT inserted.id, url
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			SELECT inserted.id, url, COALESCE(NULLIF($10, ''), '')
 			FROM inserted
 			CROSS JOIN unnest($9::text[]) AS urls(url)
 			ON CONFLICT DO NOTHING
@@ -894,6 +1058,7 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 		input.WorkspaceID, input.DestinationChannelID, input.ActorID, input.SourceMessageID,
 		input.IdempotencyKey, input.BodyText, string(input.BodyFormat),
 		string(messageStatusOrActive(input.Status)), input.LinkScanURLs,
+		input.LinkSafetyFingerprint,
 	)
 	var replayed bool
 	msg, err := scanMessageWithSenderAndQuoteExtra(row, &replayed)
@@ -1295,7 +1460,8 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 		FROM chat.messages m`+messageAccessJoins("$3")+`
 		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q")+`
 		WHERE m.id = $1 AND m.workspace_id = $2
-		  AND `+messageAccessPredicate("$3"),
+		  AND `+messageAccessPredicate("$3")+`
+		  AND `+messageVisibilityPredicate("m", "$3"),
 		messageID, workspaceID, userID,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
@@ -1339,6 +1505,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
 			  AND chat.channel_visible_to_user(c.id, $3::uuid)
+			  AND `+messageVisibilityPredicate("m", "$3")+`
 			  AND (m.created_at, m.id) < ($4, $5::uuid)
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $6`,
@@ -1362,6 +1529,7 @@ func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListCha
 			  AND m.channel_id = $2
 			  AND c.status = 'active'
 			  AND chat.channel_visible_to_user(c.id, $3::uuid)
+			  AND `+messageVisibilityPredicate("m", "$3")+`
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $4`,
 			input.WorkspaceID, input.ChannelID, input.UserID,
@@ -1409,6 +1577,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
+			  AND `+messageVisibilityPredicate("m", "$3")+`
 			  AND (m.created_at, m.id) < ($4, $5::uuid)
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $6`,
@@ -1433,6 +1602,7 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 			WHERE m.workspace_id = $1
 			  AND m.dm_conversation_id = $2
 			  AND dc.status = 'active'
+			  AND `+messageVisibilityPredicate("m", "$3")+`
 			ORDER BY m.created_at DESC, m.id DESC
 			LIMIT $4`,
 			input.WorkspaceID, input.ConversationID, input.UserID,

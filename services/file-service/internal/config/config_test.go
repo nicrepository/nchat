@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"io"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -755,5 +756,26 @@ func TestLinkSafetyIsValidatedIndependentlyOfPreviews(t *testing.T) {
 
 	if err := Load().Validate(); err == nil {
 		t.Fatal("expected the missing credentials to be refused with previews disabled")
+	}
+}
+
+// The same structural guarantee in file-service: no setting can make an
+// uncertain submission be sent again, because no field exists to carry the
+// policy. See the chat-service config test for the reasoning.
+func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
+	t.Setenv("FILES_LINK_SAFETY_MAX_UNCERTAIN_RESUBMITS", "5")
+
+	cfg := Load()
+	for _, name := range []string{
+		"LinkSafetyMaxUncertainResubmits",
+		"LinkSafetyUncertainResubmits",
+		"LinkSafetyAllowUncertainResubmit",
+	} {
+		if _, exists := reflect.TypeOf(cfg).FieldByName(name); exists {
+			t.Fatalf("Config carries %q — an uncertain submission must not be configurable", name)
+		}
+	}
+	if cfg.LinkSafetySubmitUncertainTimeoutSeconds <= 0 {
+		t.Fatalf("the staleness threshold is unset: %d", cfg.LinkSafetySubmitUncertainTimeoutSeconds)
 	}
 }

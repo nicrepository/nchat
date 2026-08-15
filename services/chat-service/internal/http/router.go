@@ -256,6 +256,15 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("GET "+RouteMessageEditHistory, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageEditHistory)),
 	))
+	// RF-21 reconnect reconciliation. POST because it carries a batch of ids in
+	// the body, but it is a read: the list budget is the right one, and it is the
+	// same budget the reference batch above spends for the same reason. A client
+	// calls it once per subscription that came back with something still pending,
+	// so the cap is well clear of the flow and there to bound a caller that
+	// decides otherwise.
+	mux.Handle("POST "+RouteMessageLinkSafetyStatus, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageLinkSafetyStatus)),
+	))
 	mux.Handle("PATCH "+RouteWorkspaceSettings, authMiddleware(
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceEditWindow)),
 	))

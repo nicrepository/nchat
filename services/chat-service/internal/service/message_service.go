@@ -2,14 +2,18 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
@@ -53,6 +57,79 @@ const maxMessageBodyRunes = 40_000
 const maxEditHistoryOffset = 10_000
 const MaxMessageReferenceBatchSize = 100
 
+// MaxLinkSafetyStatusBatchSize bounds one reconnect reconciliation.
+//
+// The same ceiling as a reference batch, because it is the same kind of request:
+// a client asking about the ids on one screen. A client holds a withheld message
+// only between sending it and its scan resolving, so a hundred at once is already
+// far more than the flow produces — the bound is here so a caller cannot turn a
+// reconnect into an arbitrarily large query.
+const MaxLinkSafetyStatusBatchSize = 100
+
+// normalizeMessageIDBatch validates and canonicalises a batch of message ids.
+//
+// Shared by every endpoint that takes a list of ids from a client: it bounds the
+// batch, rejects anything that is not a UUID before a query runs, and collapses
+// duplicates so a caller cannot multiply the work by repeating one id.
+func normalizeMessageIDBatch(rawIDs []string, maxSize int) ([]string, error) {
+	if len(rawIDs) == 0 || len(rawIDs) > maxSize {
+		return nil, fmt.Errorf("%w: message_ids must contain 1-%d values", domain.ErrInvalidInput, maxSize)
+	}
+	ids := make([]string, 0, len(rawIDs))
+	seen := make(map[string]struct{}, len(rawIDs))
+	for _, rawID := range rawIDs {
+		parsed, err := uuid.Parse(strings.TrimSpace(rawID))
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid message id", domain.ErrInvalidInput)
+		}
+		id := parsed.String()
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// LinkSafetyStatusInput asks what became of messages the caller sent.
+type LinkSafetyStatusInput struct {
+	WorkspaceID string
+	SenderID    string
+	MessageIDs  []string
+}
+
+// MessageLinkSafetyStates reports the authoritative state of the caller's own
+// withheld messages (RF-21).
+//
+// This is the client's recovery path, not an alternative to realtime. A verdict
+// is announced over the websocket as it happens; this exists because that
+// announcement is best-effort and an author whose connection was down while
+// their message was refused would otherwise wait on an event that already came
+// and went.
+//
+// It answers only about messages the caller wrote, and answers with a state and
+// nothing else: no body, no URL, no verdict detail, no scan identifier. An id it
+// will not talk about is absent from the result rather than reported as denied.
+func (s *MessageService) MessageLinkSafetyStates(
+	ctx context.Context, input LinkSafetyStatusInput,
+) ([]domain.MessageLinkSafetyState, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	senderID := strings.TrimSpace(input.SenderID)
+	if workspaceID == "" || senderID == "" {
+		return nil, fmt.Errorf("%w: workspace_id and sender_id are required", domain.ErrInvalidInput)
+	}
+	messageIDs, err := normalizeMessageIDBatch(input.MessageIDs, MaxLinkSafetyStatusBatchSize)
+	if err != nil {
+		return nil, err
+	}
+	states, err := s.messages.LinkSafetyStates(ctx, workspaceID, senderID, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("read link safety states: %w", err)
+	}
+	return states, nil
+}
+
 // CreateChannelMessageInput is the caller-provided input for posting to a channel.
 // Status, timestamps, edited_at, deleted_at, and workspace_id are not caller-settable.
 type CreateChannelMessageInput struct {
@@ -69,6 +146,10 @@ type CreateChannelMessageInput struct {
 	// (RF-32). Everything about them is re-derived server-side; see
 	// normalizeAttachmentIDs and the storage layer's invalid_attachments CTE.
 	AttachmentIDs []string
+	// IdempotencyKey makes a retried send return the original message. Optional,
+	// and supplied by the client through the Idempotency-Key header — the same
+	// contract forwarding already uses.
+	IdempotencyKey string
 }
 
 // CreateDMMessageInput is the caller-provided input for posting to a DM conversation.
@@ -86,6 +167,9 @@ type CreateDMMessageInput struct {
 	// AttachmentIDs are candidate files.attachments ids supplied by the client
 	// (RF-32), validated exactly as the channel path validates them.
 	AttachmentIDs []string
+	// IdempotencyKey makes a retried send return the original message, exactly as
+	// on the channel path.
+	IdempotencyKey string
 }
 
 type ForwardChannelMessageInput struct {
@@ -206,6 +290,11 @@ type MessageService struct {
 	// linkSafety is the RF-21 gate. Nil means the deployment did not enable the
 	// check and every path behaves exactly as it did before it existed.
 	linkSafety URLSafetyChecker
+	// linkScanCapacity is what a workspace, and the deployment, may spend on new
+	// provider work. Zero values disable the corresponding ceiling.
+	linkScanCapacity storage.LinkScanCapacity
+	// admissionMetrics reports capacity decisions. Nil is the no-op reporter.
+	admissionMetrics *urlsafety.PipelineMetrics
 }
 
 // SetMentionLabelCache enables the optional read-through cache. Configure it
@@ -263,24 +352,16 @@ func (s *MessageService) DroppedPublishCount() int64 {
 // The caller cannot set status, timestamps, edited_at, or deleted_at.
 func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateChannelMessageInput) (domain.Message, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	channelID := strings.TrimSpace(input.ChannelID)
-	senderID := strings.TrimSpace(input.SenderID)
-	body := strings.TrimSpace(input.BodyText)
-
-	if workspaceID == "" || channelID == "" || senderID == "" {
-		return domain.Message{}, fmt.Errorf("%w: workspace_id, channel_id, and sender_id are required", domain.ErrInvalidInput)
-	}
-	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs)
+	request, err := normalizeCreateRequest(createRequestInput{
+		WorkspaceID: workspaceID, TargetID: input.ChannelID, TargetField: "channel_id",
+		SenderID: input.SenderID, BodyText: input.BodyText,
+		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
+	})
 	if err != nil {
 		return domain.Message{}, err
 	}
-	if err := validateMessageContent(body, len(attachmentIDs)); err != nil {
-		return domain.Message{}, err
-	}
-	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
-	if err != nil {
-		return domain.Message{}, err
-	}
+	channelID, senderID := request.TargetID, request.SenderID
+	body, bodyFormat, attachmentIDs := request.Body, request.BodyFormat, request.AttachmentIDs
 
 	// SQL-enforce channel visibility: workspace active + workspace member active +
 	// channel active + private-channel membership. Returns ErrNotFound for all
@@ -292,47 +373,38 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	// unauthorized caller cannot spend provider quota on a channel they cannot
 	// post to; before, so a refusal leaves no row, no attachment binding and no
 	// broadcast — the publish below is reached only by a message that committed.
+	// Idempotency first, before anything external: a retry asks for the message
+	// that already exists, not for a second one.
+	replayInput := channelReplayInput(workspaceID, channelID, senderID, body, bodyFormat, attachmentIDs, input)
+	if existing, replayed, err := s.resolveCreateReplay(ctx, replayInput); err != nil || replayed {
+		return existing, err
+	}
 	// RF-21 is asynchronous, so this yields one of three outcomes: publish now,
 	// withhold, or refuse. Only the refusal returns here.
-	links, err := s.classifyBodyLinks(ctx, body)
+	links, err := s.classifyBodyLinks(ctx, workspaceID, body)
 	if err != nil {
 		return domain.Message{}, err
 	}
 
-	var mentionedUserIDs, mentionedChannelIDs []string
-	if bodyFormat == domain.MessageBodyFormatV3 {
-		mentionedUserIDs, mentionedChannelIDs = extractMentionIDs(body)
+	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, channelID, senderID, body, bodyFormat)
+	if err != nil {
+		return domain.Message{}, err
 	}
-	if len(mentionedUserIDs)+len(mentionedChannelIDs) > 0 {
-		labels, err := s.messages.ResolveAuthorizedMentionLabels(
-			ctx, workspaceID, channelID, senderID, mentionedUserIDs, mentionedChannelIDs,
-		)
-		if err != nil {
-			return domain.Message{}, fmt.Errorf("resolve authorized mention labels: %w", err)
-		}
-		if err := validateMentionRefs(mentionedUserIDs, mentionedChannelIDs, labels); err != nil {
-			return domain.Message{}, err
-		}
-		body = rewriteMentionLabels(body, labels)
-	}
+	body = mentions.Body
+	mentionedUserIDs, mentionedChannelIDs := mentions.UserIDs, mentions.ChannelIDs
 
-	parentID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", senderID, strings.TrimSpace(input.ParentMessageID))
+	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
+		WorkspaceID: workspaceID, ChannelID: channelID, SenderID: senderID,
+		TargetType: "channel", TargetID: channelID,
+		ParentMessageID: input.ParentMessageID, ForwardedFromMessageID: input.ForwardedFromMessageID,
+		ReferencedMessageID: input.ReferencedMessageID,
+	})
 	if err != nil {
 		return domain.Message{}, err
 	}
-	forwardedID, err := s.validateRefMessage(ctx, workspaceID, channelID, "", senderID, strings.TrimSpace(input.ForwardedFromMessageID))
-	if err != nil {
-		return domain.Message{}, err
-	}
-	referencedID, reference, err := s.validateReferencedMessage(ctx, workspaceID, senderID, strings.TrimSpace(input.ReferencedMessageID))
-	if err != nil {
-		return domain.Message{}, err
-	}
-	if reference != nil && reference.TargetType == "channel" && reference.TargetID == channelID {
-		return domain.Message{}, domain.ErrInvalidMessageReference
-	}
+	parentID, forwardedID, referencedID := refs.ParentID, refs.ForwardedID, refs.ReferencedID
 
-	msg, err := s.messages.CreateMessage(ctx, storage.CreateMessageInput{
+	msg, err := s.persistMessage(ctx, storage.CreateMessageInput{
 		WorkspaceID:            workspaceID,
 		ChannelID:              channelID,
 		SenderID:               senderID,
@@ -345,14 +417,194 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		MentionedUserIDs:       mentionedUserIDs,
 		MentionedChannelIDs:    mentionedChannelIDs,
 		AttachmentIDs:          attachmentIDs,
-		Status:                 links.messageStatus(),
-		LinkScanURLs:           links.URLs,
-	})
+	}, links, body, replayInput, "create channel message")
 	if err != nil {
-		return domain.Message{}, fmt.Errorf("create channel message: %w", err)
+		return domain.Message{}, err
 	}
-	// The validation preview is never serialized: authorization and source state
-	// may have changed while the destination message was being persisted.
+	return s.announceCreatedMessage(ctx, workspaceID, senderID, "channel", channelID, msg, links), nil
+}
+
+// The four steps a send goes through before it is a row, extracted because both
+// create paths perform each one identically and were carrying their own copy.
+//
+// The split follows what the steps actually are, not an arbitrary line count:
+// normalise the request, resolve the mentions in it, validate the messages it
+// points at, and — after persistence — decide whether anybody is told about it.
+// Authorization is deliberately *not* among them: a channel and a DM authorize
+// differently, and folding two different rules into one helper is how the wrong
+// one gets applied.
+
+// createRequestInput is the raw, untrusted shape of a send.
+type createRequestInput struct {
+	WorkspaceID string
+	TargetID    string
+	// TargetField names the target in the error message, so a caller is told
+	// which field they omitted rather than a generic one.
+	TargetField   string
+	SenderID      string
+	BodyText      string
+	BodyFormat    domain.MessageBodyFormat
+	AttachmentIDs []string
+}
+
+// createRequest is the same send after normalisation: trimmed, bounded, and with
+// every value in the form the rest of the path expects.
+type createRequest struct {
+	TargetID      string
+	SenderID      string
+	Body          string
+	BodyFormat    domain.MessageBodyFormat
+	AttachmentIDs []string
+}
+
+// normalizeCreateRequest applies the rules that hold for any send, before
+// anything is authorized, queried or written.
+//
+// Everything here is decidable from the request alone — required fields,
+// attachment count and shape, body length, body format — which is why it runs
+// first: input that could never name a valid message costs no query and no
+// provider quota.
+func normalizeCreateRequest(input createRequestInput) (createRequest, error) {
+	request := createRequest{
+		TargetID: strings.TrimSpace(input.TargetID),
+		SenderID: strings.TrimSpace(input.SenderID),
+		Body:     strings.TrimSpace(input.BodyText),
+	}
+	if strings.TrimSpace(input.WorkspaceID) == "" || request.TargetID == "" || request.SenderID == "" {
+		return createRequest{}, fmt.Errorf("%w: workspace_id, %s, and sender_id are required",
+			domain.ErrInvalidInput, input.TargetField)
+	}
+	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs)
+	if err != nil {
+		return createRequest{}, err
+	}
+	if err := validateMessageContent(request.Body, len(attachmentIDs)); err != nil {
+		return createRequest{}, err
+	}
+	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
+	if err != nil {
+		return createRequest{}, err
+	}
+	request.AttachmentIDs, request.BodyFormat = attachmentIDs, bodyFormat
+	return request, nil
+}
+
+// outgoingMentions is a body with its mentions resolved: the ids the message
+// records, and the text rewritten to carry the labels those ids currently have.
+type outgoingMentions struct {
+	Body       string
+	UserIDs    []string
+	ChannelIDs []string
+}
+
+// resolveOutgoingMentions authorizes the mentions in a body and rewrites their
+// labels.
+//
+// Only v3 bodies carry mention tokens, and a body with none does no work at all
+// — no query, no rewrite. The authorization is the point: a mention is resolved
+// against what the *sender* may see in this target, so naming a private channel
+// or a user they cannot reach is refused here rather than leaking a label.
+func (s *MessageService) resolveOutgoingMentions(
+	ctx context.Context, workspaceID, channelID, senderID, body string,
+	bodyFormat domain.MessageBodyFormat,
+) (outgoingMentions, error) {
+	mentions := outgoingMentions{Body: body}
+	if bodyFormat != domain.MessageBodyFormatV3 {
+		return mentions, nil
+	}
+	mentions.UserIDs, mentions.ChannelIDs = extractMentionIDs(body)
+	if len(mentions.UserIDs)+len(mentions.ChannelIDs) == 0 {
+		return mentions, nil
+	}
+	labels, err := s.messages.ResolveAuthorizedMentionLabels(
+		ctx, workspaceID, channelID, senderID, mentions.UserIDs, mentions.ChannelIDs,
+	)
+	if err != nil {
+		return outgoingMentions{}, fmt.Errorf("resolve authorized mention labels: %w", err)
+	}
+	if err := validateMentionRefs(mentions.UserIDs, mentions.ChannelIDs, labels); err != nil {
+		return outgoingMentions{}, err
+	}
+	mentions.Body = rewriteMentionLabels(mentions.Body, labels)
+	return mentions, nil
+}
+
+// createReferenceInput names the three messages a send may point at, and the
+// target it is being posted to.
+type createReferenceInput struct {
+	WorkspaceID      string
+	ChannelID        string
+	DMConversationID string
+	SenderID         string
+	// TargetType and TargetID describe where this message is going, and exist
+	// only to refuse a reference that points back at it.
+	TargetType             string
+	TargetID               string
+	ParentMessageID        string
+	ForwardedFromMessageID string
+	ReferencedMessageID    string
+}
+
+// createReferences is the validated result: ids that exist, belong to this
+// workspace, and are readable by the sender. Empty means "none given".
+type createReferences struct {
+	ParentID     string
+	ForwardedID  string
+	ReferencedID string
+}
+
+// validateCreateReferences checks every message a send points at.
+//
+// Each is validated against the sender's current access, so a reference cannot
+// be used to pull content out of somewhere they cannot read — and every failure
+// is the same non-enumerating error, so a caller cannot tell "does not exist"
+// from "exists but is not yours".
+//
+// The last rule is the one that needs the target: a cross-target reference to
+// the conversation the message is already being posted to is not a reference,
+// it is a self-link, and RF-09 refuses it.
+func (s *MessageService) validateCreateReferences(
+	ctx context.Context, input createReferenceInput,
+) (createReferences, error) {
+	parentID, err := s.validateRefMessage(ctx, input.WorkspaceID, input.ChannelID,
+		input.DMConversationID, input.SenderID, strings.TrimSpace(input.ParentMessageID))
+	if err != nil {
+		return createReferences{}, err
+	}
+	forwardedID, err := s.validateRefMessage(ctx, input.WorkspaceID, input.ChannelID,
+		input.DMConversationID, input.SenderID, strings.TrimSpace(input.ForwardedFromMessageID))
+	if err != nil {
+		return createReferences{}, err
+	}
+	referencedID, reference, err := s.validateReferencedMessage(ctx, input.WorkspaceID,
+		input.SenderID, strings.TrimSpace(input.ReferencedMessageID))
+	if err != nil {
+		return createReferences{}, err
+	}
+	if reference != nil && reference.TargetType == input.TargetType && reference.TargetID == input.TargetID {
+		return createReferences{}, domain.ErrInvalidMessageReference
+	}
+	return createReferences{ParentID: parentID, ForwardedID: forwardedID, ReferencedID: referencedID}, nil
+}
+
+// announceCreatedMessage completes a persisted message and decides who learns
+// about it.
+//
+// Two things, and they belong together because the second depends on the first
+// being finished. The reference preview is resolved *again*, after the write,
+// because the one obtained during validation describes a moment that has passed:
+// authorization and source state may both have changed while the row was being
+// persisted, and the response must never serialize the older answer.
+//
+// Then the RF-21 decision, in one place rather than at the end of each create:
+// a withheld message is announced to nobody. Nothing is broadcast, nothing is
+// notified and no unread count moves, because the row is pending_link_scan and
+// every read path already excludes it. The worker publishes it if the scan
+// clears, and blocks it if it does not.
+func (s *MessageService) announceCreatedMessage(
+	ctx context.Context, workspaceID, senderID, targetType, targetID string,
+	msg domain.Message, links linkDecision,
+) domain.Message {
 	created := []domain.Message{msg}
 	if err := s.resolveMessageReferences(ctx, workspaceID, senderID, created); err != nil {
 		msg.Reference = &domain.MessageReference{Available: false}
@@ -360,13 +612,221 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		msg = created[0]
 	}
 	if links.pending() {
-		// Accepted and withheld. Nothing is broadcast, nothing is notified, and
-		// no unread count moves: the row is pending_link_scan, which every read
-		// path already excludes. The worker publishes it if the scan clears.
-		return msg, nil
+		return msg
 	}
-	s.publishMessageCreated(ctx, workspaceID, "channel", channelID, msg)
+	s.publishMessageCreated(ctx, workspaceID, targetType, targetID, msg)
+	return msg
+}
+
+// createIdentity is everything about a send that makes it *this* send.
+//
+// The previous round compared only the body, which meant a key reused with the
+// same text but a different attachment, format, parent or reference replayed the
+// original — the caller believed their new message had been created, and it had
+// not. Every field the create statement persists is here; a field that changes
+// what gets written must be added, and the version tag below is how that change
+// is made visible rather than silent.
+type createIdentity struct {
+	DestinationType     string
+	DestinationID       string
+	BodyText            string
+	BodyFormat          string
+	ParentMessageID     string
+	ForwardedFromID     string
+	ReferencedMessageID string
+	AttachmentIDs       []string
+}
+
+// createIdentityVersion tags the fingerprint's construction, so adding a field
+// invalidates old values rather than letting a request that differs in the new
+// field compare equal to one recorded before it existed.
+const createIdentityVersion = "create.v1"
+
+// fingerprint serialises the identity deterministically.
+//
+// Length-prefixed rather than delimited, so no combination of fields can be
+// confused with a different one by concatenation — ("ab","c") and ("a","bc")
+// must not hash alike. Attachments are sorted because the client's ordering of a
+// set it re-sends is not part of what the message means; that is future-proofing
+// while domain.MaxMessageAttachments is 1, and it costs one sort of a
+// single-element slice. Everything else is taken in a fixed order.
+func (i createIdentity) fingerprint() string {
+	attachments := append([]string(nil), i.AttachmentIDs...)
+	sort.Strings(attachments)
+
+	digest := sha256.New()
+	for _, field := range []string{
+		createIdentityVersion,
+		i.DestinationType, i.DestinationID,
+		i.BodyText, i.BodyFormat,
+		i.ParentMessageID, i.ForwardedFromID, i.ReferencedMessageID,
+	} {
+		writeFingerprintField(digest, field)
+	}
+	for _, attachment := range attachments {
+		writeFingerprintField(digest, attachment)
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+// persistMessage writes the message and resolves a concurrent replay.
+//
+// It carries the three things both create paths must get right and were
+// repeating verbatim: the link-safety decision (initial status, the URLs to wait
+// on, and the fingerprint binding the eventual promotion to this content), the
+// idempotency key and its operation identity, and the read-back when two
+// identical sends race and this one loses.
+//
+// The caller keeps everything that genuinely differs between a channel and a DM
+// — authorization, references, mentions — and hands over only the part that is
+// the same.
+func (s *MessageService) persistMessage(
+	ctx context.Context, input storage.CreateMessageInput, links linkDecision,
+	body string, replayInput storage.CreateReplayInput, operation string,
+) (domain.Message, error) {
+	input.Status = links.messageStatus()
+	input.LinkScanURLs = links.URLs
+	input.LinkSafetyFingerprint = links.fingerprint(body)
+	input.IdempotencyKey = replayInput.IdempotencyKey
+	input.RequestFingerprint = replayInput.RequestFingerprint
+
+	msg, err := s.messages.CreateMessage(ctx, input)
+	switch {
+	case errors.Is(err, storage.ErrCreateReplay):
+		return s.readBackRaceWinner(ctx, replayInput)
+	case err != nil:
+		return domain.Message{}, fmt.Errorf("%s: %w", operation, err)
+	}
 	return msg, nil
+}
+
+// channelReplayInput describes a channel send as an idempotent operation.
+//
+// The key alone is not the identity: the destination, the sender and every field
+// that changes what gets written are, so a key reused for a different send is a
+// conflict rather than a replay of something the caller did not ask for.
+func channelReplayInput(
+	workspaceID, channelID, senderID, body string,
+	bodyFormat domain.MessageBodyFormat, attachmentIDs []string,
+	input CreateChannelMessageInput,
+) storage.CreateReplayInput {
+	return storage.CreateReplayInput{
+		WorkspaceID: workspaceID, ChannelID: channelID, SenderID: senderID,
+		IdempotencyKey: strings.TrimSpace(input.IdempotencyKey),
+		RequestFingerprint: createIdentity{
+			DestinationType: "channel", DestinationID: channelID,
+			BodyText: body, BodyFormat: string(bodyFormat),
+			ParentMessageID:     strings.TrimSpace(input.ParentMessageID),
+			ForwardedFromID:     strings.TrimSpace(input.ForwardedFromMessageID),
+			ReferencedMessageID: strings.TrimSpace(input.ReferencedMessageID),
+			AttachmentIDs:       attachmentIDs,
+		}.fingerprint(),
+	}
+}
+
+// dmReplayInput is channelReplayInput for a DM. Kept separate rather than
+// generalised: the two carry different destination fields and different input
+// types, and collapsing them would mean a shape that is neither.
+func dmReplayInput(
+	workspaceID, conversationID, senderID, body string,
+	bodyFormat domain.MessageBodyFormat, attachmentIDs []string,
+	input CreateDMMessageInput,
+) storage.CreateReplayInput {
+	return storage.CreateReplayInput{
+		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
+		IdempotencyKey: strings.TrimSpace(input.IdempotencyKey),
+		RequestFingerprint: createIdentity{
+			DestinationType: "dm", DestinationID: conversationID,
+			BodyText: body, BodyFormat: string(bodyFormat),
+			ParentMessageID:     strings.TrimSpace(input.ParentMessageID),
+			ForwardedFromID:     strings.TrimSpace(input.ForwardedFromMessageID),
+			ReferencedMessageID: strings.TrimSpace(input.ReferencedMessageID),
+			AttachmentIDs:       attachmentIDs,
+		}.fingerprint(),
+	}
+}
+
+// resolveCreateReplay answers a retried send from what is already persisted.
+//
+// It runs before the link classification for the same reason the forward's does:
+// a replay creates nothing, so it must not queue a scan, spend provider quota or
+// depend on the provider agreeing a second time. A message withheld for a scan
+// is exactly the case a client is most likely to retry — it sees no delivery —
+// so this is what stops a flaky connection from producing five withheld copies
+// and five scans.
+//
+// The body is compared here rather than in SQL: only this layer knows what the
+// caller was about to write, and a key reused for different content is a
+// conflict rather than a replay.
+func (s *MessageService) resolveCreateReplay(
+	ctx context.Context, input storage.CreateReplayInput,
+) (domain.Message, bool, error) {
+	if input.IdempotencyKey == "" {
+		return domain.Message{}, false, nil
+	}
+	existing, err := s.messages.LookupCreateReplay(ctx, input)
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		return domain.Message{}, false, nil
+	case err != nil:
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return domain.Message{}, false, err
+		}
+		return domain.Message{}, false, fmt.Errorf("lookup create replay: %w", err)
+	case existing.CreateFingerprint != input.RequestFingerprint:
+		// Same key, different operation. Reporting a conflict rather than
+		// silently returning the old message is what keeps the key honest: a
+		// client that reused it by mistake learns so instead of losing a send.
+		//
+		// The comparison is over the whole operation, not just the body — that
+		// was the finding: an attachment, a format or a parent could differ and
+		// still replay.
+		return domain.Message{}, false, domain.ErrConflict
+	}
+	return existing, true, nil
+}
+
+// readBackRaceWinner resolves two identical sends that raced.
+//
+// The unique index is the authority: exactly one message exists, and the loser's
+// INSERT is the one that collided. Reading back what the winner wrote is what
+// turns that collision into the answer the client asked for, rather than a
+// failure it cannot act on and would only retry into the same race.
+//
+// A collision with nothing to read back is a genuine conflict — the key belongs
+// to a different message — and is reported as one.
+func (s *MessageService) readBackRaceWinner(
+	ctx context.Context, replayInput storage.CreateReplayInput,
+) (domain.Message, error) {
+	existing, replayed, err := s.resolveCreateReplay(ctx, replayInput)
+	switch {
+	case err != nil:
+		return domain.Message{}, err
+	case replayed:
+		return existing, nil
+	}
+	return domain.Message{}, domain.ErrConflict
+}
+
+// passThrough decides which failures reach the caller unchanged.
+//
+// The distinction it preserves: a domain error is an *answer* — not found, not
+// allowed, conflicting — and the HTTP layer maps it to a status directly, so
+// prefixing it with an internal operation name only adds noise to what the
+// client is told. Anything else is an internal failure, and the operation that
+// produced it is the most useful thing to record about it.
+//
+// The sentinel list is per call site rather than a blanket rule, because which
+// answers a step can legitimately produce is part of what that step means. It
+// was written out three times in the forward path, identically enough to be
+// worth stating once and differently enough to be worth passing in.
+func passThrough(err error, operation string, unchanged ...error) error {
+	for _, sentinel := range unchanged {
+		if errors.Is(err, sentinel) {
+			return err
+		}
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 // ForwardChannelMessage creates a server-side snapshot of an authorized source
@@ -405,11 +865,9 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 			return ForwardChannelMessageOutput{Message: replay, Replayed: true}, nil
 		case errors.Is(err, domain.ErrNotFound):
 			// No earlier forward under this key: carry on and create one.
-		case errors.Is(err, domain.ErrConflict) || errors.Is(err, context.Canceled) ||
-			errors.Is(err, context.DeadlineExceeded):
-			return ForwardChannelMessageOutput{}, err
 		default:
-			return ForwardChannelMessageOutput{}, fmt.Errorf("lookup forward replay: %w", err)
+			return ForwardChannelMessageOutput{}, passThrough(err, "lookup forward replay",
+				domain.ErrConflict, context.Canceled, context.DeadlineExceeded)
 		}
 	}
 
@@ -430,13 +888,10 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 		ActorID: actorID, SourceMessageID: sourceMessageID,
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, context.Canceled) ||
-			errors.Is(err, context.DeadlineExceeded) {
-			return ForwardChannelMessageOutput{}, err
-		}
-		return ForwardChannelMessageOutput{}, fmt.Errorf("snapshot forwardable message: %w", err)
+		return ForwardChannelMessageOutput{}, passThrough(err, "snapshot forwardable message",
+			domain.ErrNotFound, context.Canceled, context.DeadlineExceeded)
 	}
-	links, err := s.classifyBodyLinks(ctx, snapshot.BodyText)
+	links, err := s.classifyBodyLinks(ctx, workspaceID, snapshot.BodyText)
 	if err != nil {
 		return ForwardChannelMessageOutput{}, err
 	}
@@ -444,19 +899,17 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 	result, err := s.messages.ForwardChannelMessage(ctx, storage.ForwardChannelMessageInput{
 		WorkspaceID: workspaceID, DestinationChannelID: destinationChannelID,
 		ActorID: actorID, SourceMessageID: sourceMessageID,
-		IdempotencyKey: idempotencyKey,
-		BodyText:       snapshot.BodyText,
-		BodyFormat:     snapshot.BodyFormat,
-		Status:         links.messageStatus(),
-		LinkScanURLs:   links.URLs,
+		IdempotencyKey:        idempotencyKey,
+		BodyText:              snapshot.BodyText,
+		BodyFormat:            snapshot.BodyFormat,
+		Status:                links.messageStatus(),
+		LinkScanURLs:          links.URLs,
+		LinkSafetyFingerprint: links.fingerprint(snapshot.BodyText),
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrInvalidInput) || errors.Is(err, domain.ErrNotFound) ||
-			errors.Is(err, domain.ErrConflict) || errors.Is(err, context.Canceled) ||
-			errors.Is(err, context.DeadlineExceeded) {
-			return ForwardChannelMessageOutput{}, err
-		}
-		return ForwardChannelMessageOutput{}, fmt.Errorf("forward channel message: %w", err)
+		return ForwardChannelMessageOutput{}, passThrough(err, "forward channel message",
+			domain.ErrInvalidInput, domain.ErrNotFound, domain.ErrConflict,
+			context.Canceled, context.DeadlineExceeded)
 	}
 	if !result.Replayed && !links.pending() {
 		s.publishMessageCreated(ctx, workspaceID, "channel", destinationChannelID, result.Message)
@@ -472,24 +925,16 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 // The caller cannot set status, timestamps, edited_at, or deleted_at.
 func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMessageInput) (domain.Message, error) {
 	workspaceID := strings.TrimSpace(input.WorkspaceID)
-	conversationID := strings.TrimSpace(input.ConversationID)
-	senderID := strings.TrimSpace(input.SenderID)
-	body := strings.TrimSpace(input.BodyText)
-
-	if workspaceID == "" || conversationID == "" || senderID == "" {
-		return domain.Message{}, fmt.Errorf("%w: workspace_id, conversation_id, and sender_id are required", domain.ErrInvalidInput)
-	}
-	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs)
+	request, err := normalizeCreateRequest(createRequestInput{
+		WorkspaceID: workspaceID, TargetID: input.ConversationID, TargetField: "conversation_id",
+		SenderID: input.SenderID, BodyText: input.BodyText,
+		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
+	})
 	if err != nil {
 		return domain.Message{}, err
 	}
-	if err := validateMessageContent(body, len(attachmentIDs)); err != nil {
-		return domain.Message{}, err
-	}
-	bodyFormat, err := normalizeBodyFormat(input.BodyFormat)
-	if err != nil {
-		return domain.Message{}, err
-	}
+	conversationID, senderID := request.TargetID, request.SenderID
+	body, bodyFormat, attachmentIDs := request.Body, request.BodyFormat, request.AttachmentIDs
 
 	// SQL-enforce DM visibility: workspace active + workspace member active +
 	// DM conversation active + active DM membership. Returns ErrNotFound for all
@@ -500,28 +945,28 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	// RF-21, on the same terms as the channel path: after authorization, before
 	// persistence. A DM is the likelier phishing vector of the two, not the
 	// lesser one.
-	links, err := s.classifyBodyLinks(ctx, body)
+	replayInput := dmReplayInput(workspaceID, conversationID, senderID, body, bodyFormat, attachmentIDs, input)
+	if existing, replayed, err := s.resolveCreateReplay(ctx, replayInput); err != nil || replayed {
+		return existing, err
+	}
+
+	links, err := s.classifyBodyLinks(ctx, workspaceID, body)
 	if err != nil {
 		return domain.Message{}, err
 	}
 
-	parentID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ParentMessageID))
+	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
+		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
+		TargetType: "dm", TargetID: conversationID,
+		ParentMessageID: input.ParentMessageID, ForwardedFromMessageID: input.ForwardedFromMessageID,
+		ReferencedMessageID: input.ReferencedMessageID,
+	})
 	if err != nil {
 		return domain.Message{}, err
 	}
-	forwardedID, err := s.validateRefMessage(ctx, workspaceID, "", conversationID, senderID, strings.TrimSpace(input.ForwardedFromMessageID))
-	if err != nil {
-		return domain.Message{}, err
-	}
-	referencedID, reference, err := s.validateReferencedMessage(ctx, workspaceID, senderID, strings.TrimSpace(input.ReferencedMessageID))
-	if err != nil {
-		return domain.Message{}, err
-	}
-	if reference != nil && reference.TargetType == "dm" && reference.TargetID == conversationID {
-		return domain.Message{}, domain.ErrInvalidMessageReference
-	}
+	parentID, forwardedID, referencedID := refs.ParentID, refs.ForwardedID, refs.ReferencedID
 
-	msg, err := s.messages.CreateMessage(ctx, storage.CreateMessageInput{
+	msg, err := s.persistMessage(ctx, storage.CreateMessageInput{
 		WorkspaceID:            workspaceID,
 		DMConversationID:       conversationID,
 		SenderID:               senderID,
@@ -532,25 +977,11 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
 		AttachmentIDs:          attachmentIDs,
-		Status:                 links.messageStatus(),
-		LinkScanURLs:           links.URLs,
-	})
+	}, links, body, replayInput, "create dm message")
 	if err != nil {
-		return domain.Message{}, fmt.Errorf("create dm message: %w", err)
+		return domain.Message{}, err
 	}
-	// Resolve again after persistence so the HTTP response never reuses the
-	// preview obtained during pre-validation.
-	created := []domain.Message{msg}
-	if err := s.resolveMessageReferences(ctx, workspaceID, senderID, created); err != nil {
-		msg.Reference = &domain.MessageReference{Available: false}
-	} else {
-		msg = created[0]
-	}
-	if links.pending() {
-		return msg, nil
-	}
-	s.publishMessageCreated(ctx, workspaceID, "dm", conversationID, msg)
-	return msg, nil
+	return s.announceCreatedMessage(ctx, workspaceID, senderID, "dm", conversationID, msg, links), nil
 }
 
 func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
@@ -617,9 +1048,28 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	if err != nil {
 		return domain.Message{}, err
 	}
+	// Eligibility before cost, which is the order the previous round had wrong.
+	//
+	// Classifying a body queues Cloudflare scans, and it used to happen before
+	// anything had established that this edit could ever be applied — so an
+	// authenticated user could spend the account's scan quota editing a message
+	// they do not own, or one that is already deleted, and only find out
+	// afterwards. Refusing here costs one comparison against a row that was
+	// already read.
+	//
+	// The window is deliberately not checked here: it lives on the workspace and
+	// reading it would cost the query this check exists to avoid. It is enforced
+	// where it has always been enforced — inside EditMessage's transaction, under
+	// FOR UPDATE, against the database's own clock — so an edit that squeaks past
+	// this and expires in between is still refused. This is an optimisation in
+	// front of the authority, never a replacement for it.
+	if err := domain.ValidateMessageEdit(current, editorID, nil, time.Now()); err != nil {
+		return domain.Message{}, err
+	}
 	// RF-21 applies to editing too, and not as an afterthought: a check that ran
 	// only on creation would be bypassed by sending a clean message and editing
 	// the link in. This is the same funnel — one body, one rule.
+	//
 	// Editing is the one path that cannot go pending. A withheld *edit* would
 	// mean either showing everyone the unscanned new body or silently keeping
 	// the old one while telling the author it was saved, and both are worse than
@@ -627,7 +1077,7 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	// as it is, and the scan the classification just queued makes the retry
 	// succeed shortly. A pending revision table is the upgrade if authors ever
 	// find the retry intrusive.
-	editLinks, err := s.classifyBodyLinks(ctx, body)
+	editLinks, err := s.classifyBodyLinks(ctx, workspaceID, body)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -882,33 +1332,19 @@ func (s *MessageService) ResolveMessageReferenceBatch(ctx context.Context, input
 	if workspaceID == "" || callerID == "" || (channelID == "") == (dmConversationID == "") {
 		return nil, fmt.Errorf("%w: workspace_id, caller_id, and exactly one target are required", domain.ErrInvalidInput)
 	}
-	if len(input.MessageIDs) == 0 || len(input.MessageIDs) > MaxMessageReferenceBatchSize {
-		return nil, fmt.Errorf("%w: message_ids must contain 1-%d values", domain.ErrInvalidInput, MaxMessageReferenceBatchSize)
-	}
-
-	messageIDs := make([]string, 0, len(input.MessageIDs))
-	seen := make(map[string]struct{}, len(input.MessageIDs))
-	for _, rawID := range input.MessageIDs {
-		parsed, err := uuid.Parse(strings.TrimSpace(rawID))
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid message id", domain.ErrInvalidInput)
-		}
-		id := parsed.String()
-		if _, exists := seen[id]; exists {
-			continue
-		}
-		seen[id] = struct{}{}
-		messageIDs = append(messageIDs, id)
-	}
-
-	if channelID != "" {
-		if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID); err != nil {
-			return nil, err
-		}
-	} else if _, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, dmConversationID, callerID); err != nil {
+	messageIDs, err := normalizeMessageIDBatch(input.MessageIDs, MaxMessageReferenceBatchSize)
+	if err != nil {
 		return nil, err
 	}
 
+	if err := s.authorizeTarget(ctx, workspaceID, channelID, dmConversationID, callerID); err != nil {
+		return nil, err
+	}
+
+	// Two reads, and the split is the authorization. The first says which of the
+	// caller's destination messages carry a reference at all; the second
+	// re-authorizes each *origin* separately, because being able to read a reply
+	// says nothing about being able to read what it replies to.
 	referencedIDs, err := s.messages.ListReferencedMessageIDs(ctx, workspaceID, callerID, channelID, dmConversationID, messageIDs)
 	if err != nil {
 		return nil, fmt.Errorf("list destination references: %w", err)
@@ -921,18 +1357,52 @@ func (s *MessageService) ResolveMessageReferenceBatch(ctx context.Context, input
 	if err != nil {
 		return nil, fmt.Errorf("resolve destination references: %w", err)
 	}
+	return assembleReferenceResolutions(messageIDs, referencedIDs, resolved), nil
+}
 
+// authorizeTarget re-checks that the caller may currently read the conversation
+// they are asking about, whichever kind it is.
+//
+// Exactly one of channelID and dmConversationID is set; the callers that reach
+// here have already established that. Both paths answer ErrNotFound for
+// everything invisible, so neither can be used to discover that a target exists.
+func (s *MessageService) authorizeTarget(
+	ctx context.Context, workspaceID, channelID, dmConversationID, callerID string,
+) error {
+	if channelID != "" {
+		_, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID)
+		return err
+	}
+	_, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, dmConversationID, callerID)
+	return err
+}
+
+// assembleReferenceResolutions pairs every requested message with the preview
+// its origin resolved to.
+//
+// Every requested id gets an entry, and the default is Available: false. That is
+// the non-enumerating part of the contract: a destination that carries no
+// reference, one whose origin was deleted, and one whose origin the caller may
+// not read are all reported identically, so the response says nothing about
+// which of the three happened.
+func assembleReferenceResolutions(
+	messageIDs []string, referencedIDs map[string]string,
+	resolved map[string]domain.MessageReference,
+) []MessageReferenceResolution {
 	result := make([]MessageReferenceResolution, 0, len(messageIDs))
 	for _, destinationID := range messageIDs {
-		ref := domain.MessageReference{Available: false}
+		reference := domain.MessageReference{Available: false}
+		// The empty check is not redundant with the lookup: a destination with no
+		// reference maps to "", and resolving "" against the map would hand every
+		// unreferenced message whatever happened to be stored under that key.
 		if sourceID := referencedIDs[destinationID]; sourceID != "" {
 			if available, ok := resolved[sourceID]; ok {
-				ref = available
+				reference = available
 			}
 		}
-		result = append(result, MessageReferenceResolution{MessageID: destinationID, Reference: ref})
+		result = append(result, MessageReferenceResolution{MessageID: destinationID, Reference: reference})
 	}
-	return result, nil
+	return result
 }
 
 // validateMessageBody is the rule for every path where a body is the whole

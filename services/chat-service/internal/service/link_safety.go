@@ -2,13 +2,19 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 // URLSafetyChecker answers what is already known about a set of canonical URLs
@@ -31,10 +37,34 @@ type URLSafetyChecker interface {
 	// absent from the map has no usable verdict and must be treated as pending —
 	// never as safe.
 	LoadLinkVerdicts(ctx context.Context, canonicalURLs []string) (map[string]urlsafety.Verdict, error)
-	// EnsureLinkScans records that these canonical URLs need a verdict, so the
-	// worker will submit them. It is idempotent: ten messages naming one URL
-	// produce one scan.
-	EnsureLinkScans(ctx context.Context, canonicalURLs []string) error
+	// AdmitLinkScans reserves capacity for the URLs that need new provider work
+	// and queues them, in one transaction.
+	//
+	// It replaced an unconditional "queue these": creating a scan job is spending
+	// money at a third party, and the message limiter counted messages while the
+	// provider bills URLs. A caller must treat a refusal as a refusal of the
+	// whole operation — the admission is all-or-nothing, so a partially queued
+	// message would be one whose remaining links are withheld forever.
+	AdmitLinkScans(ctx context.Context, workspaceID string, canonicalURLs []string, capacity storage.LinkScanCapacity) (storage.LinkScanAdmission, error)
+}
+
+// SetLinkScanCapacity configures what one workspace, and the deployment, may
+// spend on new provider work.
+//
+// Optional in the sense that zero values disable the corresponding ceiling, and
+// deliberately not defaulted to something restrictive here: the right numbers
+// depend on the Cloudflare plan this deployment is billed under, so they come
+// from configuration and this package does not guess. See config.Config.
+func (s *MessageService) SetLinkScanCapacity(capacity storage.LinkScanCapacity) {
+	s.linkScanCapacity = capacity
+}
+
+// SetAdmissionMetrics attaches the capacity counters.
+//
+// Optional, like every other reporter here: nil is the no-op, and every method
+// on *PipelineMetrics tolerates a nil receiver.
+func (s *MessageService) SetAdmissionMetrics(metrics *urlsafety.PipelineMetrics) {
+	s.admissionMetrics = metrics
 }
 
 // SetLinkSafety enables the RF-21 check on every path that accepts a body.
@@ -83,6 +113,16 @@ type linkDecision struct {
 // pending reports whether the message must be withheld.
 func (d linkDecision) pending() bool { return len(d.PendingURLs) > 0 }
 
+// fingerprint identifies the content this decision was made about, so the
+// promotion can refuse to publish anything else. Empty for a body with no links
+// at all: there is nothing to withhold and nothing to bind.
+func (d linkDecision) fingerprint(body string) string {
+	if len(d.URLs) == 0 {
+		return ""
+	}
+	return linkSafetyFingerprint(body, d.URLs)
+}
+
 // messageStatus is the state a message carrying these links is created in.
 //
 // It returns the empty status for a cleared body rather than spelling out
@@ -113,50 +153,114 @@ func (d linkDecision) messageStatus() domain.MessageStatus {
 //   - only an explicit, fresh clearance publishes immediately.
 //
 // Nothing here ever turns an error or an absence into a clearance.
-func (s *MessageService) classifyBodyLinks(ctx context.Context, body string) (linkDecision, error) {
+func (s *MessageService) classifyBodyLinks(
+	ctx context.Context, workspaceID, body string,
+) (linkDecision, error) {
 	if s.linkSafety == nil || body == "" {
 		return linkDecision{}, nil
 	}
 	urls, err := extractURLs(body)
+	if err != nil || len(urls) == 0 {
+		return linkDecision{}, err
+	}
+	verdicts, err := s.loadVerdicts(ctx, urls)
 	if err != nil {
 		return linkDecision{}, err
 	}
-	if len(urls) == 0 {
-		return linkDecision{}, nil
-	}
-	verdicts, err := s.linkSafety.LoadLinkVerdicts(ctx, urls)
+	decision, err := aggregateLinkDecision(urls, verdicts)
 	if err != nil {
-		if ctx.Err() != nil {
-			return linkDecision{}, ctx.Err()
-		}
-		// The store is the authority; not being able to read it is not a
-		// clearance. It is reported as unavailable, which is retryable.
-		return linkDecision{}, domain.ErrURLCheckUnavailable
+		return linkDecision{}, err
 	}
+	return decision, s.admitScans(ctx, workspaceID, decision)
+}
+
+// loadVerdicts reads what is already known, translating a store failure into the
+// policy's own vocabulary.
+//
+// Not being able to read the verdict table is not a clearance. It is reported as
+// unavailable, which is retryable, and the caller refuses the send.
+func (s *MessageService) loadVerdicts(
+	ctx context.Context, urls []string,
+) (map[string]urlsafety.Verdict, error) {
+	verdicts, err := s.linkSafety.LoadLinkVerdicts(ctx, urls)
+	if err == nil {
+		return verdicts, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, domain.ErrURLCheckUnavailable
+}
+
+// aggregateLinkDecision turns per-URL verdicts into one decision about the
+// message.
+//
+// The policy lives here, in one place, stated as a fold over the URLs:
+//
+//   - one condemned URL refuses the whole message, immediately. Nothing is
+//     recorded and nothing is submitted — the message is already refused, so the
+//     remaining URLs would only spend quota on an answer nobody will read;
+//   - a URL with no fresh clearance is pending. Absent, expired, or any value
+//     that is not an explicit clearance all land here, which is what keeps a
+//     corrupted or future status from reading as safe;
+//   - only when every URL is explicitly cleared does the message publish now.
+func aggregateLinkDecision(urls []string, verdicts map[string]urlsafety.Verdict) (linkDecision, error) {
 	decision := linkDecision{URLs: urls}
 	for _, canonical := range urls {
 		switch verdicts[canonical] {
 		case urlsafety.VerdictMalicious:
-			// One condemned link is enough. Nothing is recorded and nothing is
-			// submitted: the message is already refused.
 			return linkDecision{}, domain.ErrMaliciousURL
 		case urlsafety.VerdictSafe:
 			// Cleared and still fresh — this URL holds nothing up.
 		default:
-			// Absent, expired, or any value that is not an explicit clearance.
 			decision.PendingURLs = append(decision.PendingURLs, canonical)
-		}
-	}
-	if decision.pending() {
-		if err := s.linkSafety.EnsureLinkScans(ctx, decision.PendingURLs); err != nil {
-			if ctx.Err() != nil {
-				return linkDecision{}, ctx.Err()
-			}
-			return linkDecision{}, domain.ErrURLCheckUnavailable
 		}
 	}
 	return decision, nil
 }
+
+// admitScans reserves capacity for the undecided URLs and queues them.
+//
+// Three outcomes, and the caller sees a different error for each because they
+// mean different things to a person:
+//
+//   - admitted. The jobs exist, the message is withheld, and the worker will
+//     decide it;
+//   - refused for capacity. Nothing was queued and nothing may be — this is the
+//     all-or-nothing rule, because a message whose fourth link never got a job
+//     would stay withheld forever. Reported as its own error, never as a
+//     malicious link: a spent window says nothing about the content;
+//   - failed. Not a clearance either. A message withheld with no scan scheduled
+//     to release it waits forever, so the send is refused instead.
+//
+// A body with nothing to decide never reaches the admission at all, which is
+// what makes a message full of already-cleared links free regardless of how
+// spent the budget is.
+func (s *MessageService) admitScans(
+	ctx context.Context, workspaceID string, decision linkDecision,
+) error {
+	if !decision.pending() {
+		return nil
+	}
+	admission, err := s.linkSafety.AdmitLinkScans(ctx, workspaceID, decision.PendingURLs, s.linkScanCapacity)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		s.admissionMetrics.ObserveAdmission(urlsafety.AdmissionRejected, urlsafety.AttemptError)
+		return domain.ErrURLCheckUnavailable
+	}
+	if !admission.Allowed() {
+		s.admissionMetrics.ObserveAdmission(urlsafety.AdmissionRejected, admission.Result)
+		return fmt.Errorf("%w: %s", domain.ErrLinkScanCapacity, admission.Result)
+	}
+	s.admissionMetrics.ObserveAdmission(urlsafety.AdmissionAllowed, admissionReasonOK)
+	return nil
+}
+
+// admissionReasonOK fills the reason label for an allowed operation, so the
+// dimension is always present and a dashboard never has to handle a missing one.
+const admissionReasonOK = "ok"
 
 // extractURLs returns the distinct canonical URLs a message body links to, in
 // the order they first appear.
@@ -337,4 +441,56 @@ func unescapeRichText(text string) string {
 		index++
 	}
 	return string(out)
+}
+
+// linkSafetyFingerprintVersion tags the fingerprint's construction.
+//
+// Bumping it invalidates every stored fingerprint at once, which is what a
+// change to *what goes into* the fingerprint requires: an old value computed a
+// different way must not accidentally equal a new one, and it must not silently
+// compare equal to nothing either. A withheld message whose fingerprint no
+// longer matches simply never promotes, which is the safe direction.
+const linkSafetyFingerprintVersion = "rf21.v1"
+
+// linkSafetyFingerprint identifies the content a link-safety verdict is about.
+//
+// A verdict is a statement about a specific body and a specific set of URLs.
+// Promotion compares this value to the one recorded when the scan was queued, so
+// a clearance obtained for one content can never publish another — the
+// time-of-check/time-of-use gap the security review found.
+//
+// The inputs are exactly the two things that decide link safety: the body that
+// was scanned, and the canonical URLs extracted from it. Everything else about a
+// message — reactions, favourites, edit count — is deliberately excluded,
+// because changing them does not change what a scanner would say.
+//
+// Determinism is the whole requirement. The URL set is sorted, so the order the
+// parser happened to find them in does not change the value; the body is fed in
+// with an explicit length prefix, so no combination of body and URLs can be
+// confused with a different one by concatenation. It is a comparison key, never
+// an authentication mechanism — nothing here needs to resist forgery, because
+// nothing outside this process ever supplies it.
+func linkSafetyFingerprint(body string, canonicalURLs []string) string {
+	sorted := append([]string(nil), canonicalURLs...)
+	sort.Strings(sorted)
+
+	digest := sha256.New()
+	writeFingerprintField(digest, linkSafetyFingerprintVersion)
+	writeFingerprintField(digest, body)
+	for _, url := range sorted {
+		writeFingerprintField(digest, url)
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+// writeFingerprintField length-prefixes one field.
+//
+// Without the prefix, ("ab", "c") and ("a", "bc") would hash identically, and a
+// body ending in a URL-looking suffix could collide with a different body
+// carrying that URL. The prefix makes the encoding unambiguous.
+func writeFingerprintField(digest io.Writer, field string) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(field)))
+	_, _ = digest.Write(length[:])
+	_, _ = digest.Write([]byte(field))
 }

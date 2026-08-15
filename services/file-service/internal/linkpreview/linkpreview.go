@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
+	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
 
 // Error classes. They are the contract with the HTTP layer, which maps each to
@@ -83,6 +84,16 @@ var (
 	// broken: the provider is submit-then-poll, the submission just happened,
 	// and retrying shortly succeeds. No Open Graph fetch happens in this state.
 	ErrSafetyPending = errors.New("link preview: safety check pending")
+	// ErrSafetyCapacity marks a URL this service declined to start a new scan
+	// for: the window is spent or the queue is full.
+	//
+	// Its own error, kept apart from both neighbours on purpose. It is not
+	// ErrMaliciousURL — a full queue says nothing about the link, and a client
+	// shown a security warning for an operational condition learns the wrong
+	// thing. It is not ErrSafetyUnavailable either: unavailable means the check
+	// failed, this means it was deliberately not attempted. Neither is a
+	// clearance, and nothing is fetched in either case.
+	ErrSafetyCapacity = errors.New("link preview: safety scan capacity exceeded")
 )
 
 // Preview is what the client receives. Every field is plain text or a plain
@@ -149,12 +160,27 @@ const negativeTTL = time.Minute
 // hole this replaced — a phishing page on a compromised path inherited the
 // clearance of its host.
 //
-// Lookup never blocks: Cloudflare URL Scanner is submit-then-poll, so a URL
-// nobody has scanned has no verdict yet, and Submit is what starts one. The
-// preview answers "being checked" rather than waiting.
+// Neither method blocks on the provider: Cloudflare URL Scanner is
+// submit-then-poll, so a URL nobody has scanned has no verdict yet. LoadVerdict
+// reads what is already known and EnsureScan records that a verdict is needed —
+// a background worker is what actually talks to Cloudflare. The preview answers
+// "being checked" rather than waiting.
+//
+// AdmitScan and not Submit, and that distinction is the correction: the preview
+// used to submit a scan itself and discard the provider's id, so nothing ever
+// polled it and every retry of the same preview submitted again. Recording the
+// *need* for a scan is idempotent, so a client refreshing a pending preview
+// costs one row update and no provider quota at all.
+//
+// Admit and not Ensure, and that is this round's: queueing a scan is spending
+// money at a third party, and nothing counted how much. A client asking for
+// previews of URLs nobody has seen before could introduce unbounded new scans,
+// and the per-request limiter did not touch that, because the unit it counts is
+// a request and the unit the provider bills is a URL. A URL already answered or
+// already queued still costs nothing and is always admitted.
 type URLSafetyChecker interface {
-	Lookup(canonicalURL string) (urlsafety.Verdict, bool)
-	Submit(ctx context.Context, canonicalURL string) (string, error)
+	LoadVerdict(ctx context.Context, canonicalURL string) (urlsafety.Verdict, bool, error)
+	AdmitScan(ctx context.Context, canonicalURL string, capacity service.LinkScanCapacity) (service.LinkScanAdmission, error)
 }
 
 // Service answers preview requests, in front of a cache.
@@ -164,6 +190,9 @@ type Service struct {
 	ttl      time.Duration
 	observer Observer
 	safety   URLSafetyChecker
+	// scanCapacity is what this service will spend on new provider work. Zero
+	// values disable the corresponding ceiling.
+	scanCapacity service.LinkScanCapacity
 }
 
 // NewService builds the service. timeout bounds one whole remote exchange and
@@ -188,6 +217,15 @@ func newService(f *fetcher, ttl time.Duration, observer Observer, now func() tim
 // Returns the service for chaining; when never called, no check runs.
 func (s *Service) WithURLSafety(safety URLSafetyChecker) *Service {
 	s.safety = safety
+	return s
+}
+
+// WithScanCapacity configures what this service will spend on new provider
+// work. Zero values disable the corresponding ceiling; the numbers that matter
+// come from configuration, because the right rate depends on the Cloudflare
+// plan this deployment is billed under.
+func (s *Service) WithScanCapacity(capacity service.LinkScanCapacity) *Service {
+	s.scanCapacity = capacity
 	return s
 }
 
@@ -279,15 +317,36 @@ func (s *Service) checkSafety(ctx context.Context, target *url.URL) error {
 		// reported as a temporary one.
 		return ErrMaliciousURL
 	}
-	verdict, ok := s.safety.Lookup(canonical)
-	if !ok {
-		// No verdict yet. The scan is started here and the caller is told to come
-		// back; what must not happen is the fetch, because fetching first and
-		// asking afterwards is rendering the phishing page. Submitting is
-		// best-effort — a failure to queue is still an unavailable verdict, never
-		// a clearance.
-		if _, err := s.safety.Submit(ctx, canonical); err != nil && ctx.Err() != nil {
+	verdict, ok, err := s.safety.LoadVerdict(ctx, canonical)
+	if err != nil {
+		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		// The store is the authority; not being able to read it is not a
+		// clearance.
+		return ErrSafetyUnavailable
+	}
+	if !ok {
+		// No verdict yet. The need for one is recorded and the caller is told to
+		// come back; what must not happen is the fetch, because fetching first
+		// and asking afterwards is rendering the phishing page.
+		//
+		// Recording is idempotent, so a client polling this endpoint produces one
+		// durable job and not one scan per request. A failure to record is still
+		// an unavailable verdict, never a clearance.
+		admission, err := s.safety.AdmitScan(ctx, canonical, s.scanCapacity)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return ErrSafetyUnavailable
+		}
+		if !admission.Allowed() {
+			// This service declined to start a new scan right now. Its own error:
+			// a spent window or a full queue says nothing about the link, and
+			// reporting it as malicious would show a security warning for an
+			// operational condition. Still not a clearance — nothing is fetched.
+			return ErrSafetyCapacity
 		}
 		return ErrSafetyPending
 	}

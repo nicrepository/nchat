@@ -65,6 +65,14 @@ type fakeMessageStore struct {
 	deleteChanged           bool
 	deleteErr               error
 	editHistory             []domain.MessageEditHistory
+	linkSafetyStates        []domain.MessageLinkSafetyState
+	admissionResult         string
+	admittedWorkspace       string
+	admittedCapacity        storage.LinkScanCapacity
+	linkSafetyErr           error
+	linkSafetyWorkspace     string
+	linkSafetySender        string
+	linkSafetyIDs           []string
 	historyErr              error
 	forwardedMessage        domain.Message
 	forwardReplayed         bool
@@ -73,6 +81,16 @@ type fakeMessageStore struct {
 	snapshotErr             error
 	replayMessage           domain.Message
 	replayErr               error
+	createReplayMessage     domain.Message
+	// createReplayOnRetry is what the *second* lookup finds: the concurrent case,
+	// where the first lookup misses and the insert then collides.
+	createReplayOnRetry domain.Message
+	createReplayErr     error
+	// createReplayFingerprint forces a stored fingerprint, so a test can express
+	// "same key, different operation" without constructing the real hash.
+	createReplayFingerprint string
+	createReplayCalls       int
+	lastCreateReplayInput   storage.CreateReplayInput
 	linkVerdicts            map[string]urlsafety.Verdict
 	linkVerdictErr          error
 	ensureScansErr          error
@@ -116,6 +134,33 @@ func (f *fakeMessageStore) LookupForwardReplay(_ context.Context, input storage.
 // linkVerdicts is what the store already knows; a URL absent from it is pending,
 // which is the default and therefore what every test that says nothing gets.
 
+// LookupCreateReplay answers "has this send already happened?". Empty by
+// default, so every test that says nothing keeps exercising the create path.
+func (f *fakeMessageStore) LookupCreateReplay(_ context.Context, input storage.CreateReplayInput) (domain.Message, error) {
+	f.createReplayCalls++
+	f.lastCreateReplayInput = input
+	if f.createReplayErr != nil {
+		return domain.Message{}, f.createReplayErr
+	}
+	// The stored message echoes the requested fingerprint unless a test says
+	// otherwise, so "same key, same operation" is the default and a mismatch has
+	// to be asked for explicitly.
+	stamp := func(message domain.Message) domain.Message {
+		if f.createReplayFingerprint != "" {
+			message.CreateFingerprint = f.createReplayFingerprint
+			return message
+		}
+		message.CreateFingerprint = input.RequestFingerprint
+		return message
+	}
+	if f.createReplayCalls > 1 && f.createReplayOnRetry.ID != "" {
+		return stamp(f.createReplayOnRetry), nil
+	}
+	if f.createReplayMessage.ID == "" {
+		return domain.Message{}, domain.ErrNotFound
+	}
+	return stamp(f.createReplayMessage), nil
+}
 func (f *fakeMessageStore) LoadLinkVerdicts(_ context.Context, urls []string) (map[string]urlsafety.Verdict, error) {
 	f.linkVerdictCalls++
 	f.lastVerdictURLs = append([]string(nil), urls...)
@@ -131,23 +176,88 @@ func (f *fakeMessageStore) LoadLinkVerdicts(_ context.Context, urls []string) (m
 	return known, nil
 }
 
-func (f *fakeMessageStore) EnsureLinkScans(_ context.Context, urls []string) error {
+// AdmitLinkScans records what was asked and replays whatever the test staged.
+//
+// The default is "everything new is admitted", so tests that are not about
+// capacity keep reading as they did. A test that *is* about capacity stages a
+// refusal and then asserts that nothing was queued.
+func (f *fakeMessageStore) AdmitLinkScans(
+	_ context.Context, workspaceID string, urls []string, capacity storage.LinkScanCapacity,
+) (storage.LinkScanAdmission, error) {
+	f.admittedWorkspace = workspaceID
+	f.admittedCapacity = capacity
+	if f.ensureScansErr != nil {
+		return storage.LinkScanAdmission{}, f.ensureScansErr
+	}
+	if f.admissionResult != "" && f.admissionResult != storage.AdmissionAllowed {
+		// Refused: nothing is queued, which is what the caller must observe.
+		return storage.LinkScanAdmission{
+			NewScanCost: len(urls), Result: f.admissionResult,
+		}, nil
+	}
 	f.ensuredURLs = append(f.ensuredURLs, urls...)
-	return f.ensureScansErr
+	return storage.LinkScanAdmission{
+		NewScanCost: len(urls), Result: storage.AdmissionAllowed,
+	}, nil
 }
 
 func (f *fakeMessageStore) ClaimDueLinkScans(_ context.Context, _ int) ([]storage.LinkScanJob, error) {
 	return nil, nil
 }
 
-func (f *fakeMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ string) error { return nil }
+func (f *fakeMessageStore) BeginLinkScanSubmit(_ context.Context, _ string, generation int) (int, error) {
+	return generation + 1, nil
+}
 
-func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _ string, _ urlsafety.Verdict) error {
+func (f *fakeMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ string, _ int) error {
 	return nil
 }
 
-func (f *fakeMessageStore) ResolveDecidedMessages(_ context.Context) ([]storage.ResolvedMessage, error) {
+func (f *fakeMessageStore) AdoptScanUUID(_ context.Context, _, _ string, _ int) error { return nil }
+
+func (f *fakeMessageStore) ReserveProviderSubmit(_ context.Context, _ int, _ time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeMessageStore) PruneLinkScanBudget(_ context.Context, _ time.Duration) error { return nil }
+
+func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _, _ string, _ urlsafety.Verdict) error {
+	return nil
+}
+
+func (f *fakeMessageStore) ResolveDecidedMessages(_ context.Context) (storage.ResolveSummary, error) {
+	return storage.ResolveSummary{}, nil
+}
+func (f *fakeMessageStore) ClaimPublishEvents(_ context.Context, _ int) ([]storage.PublishEvent, error) {
 	return nil, nil
+}
+
+func (f *fakeMessageStore) MarkPublished(_ context.Context, _ string) error { return nil }
+
+func (f *fakeMessageStore) CancelPublishEvent(_ context.Context, _ string) error { return nil }
+
+func (f *fakeMessageStore) ReopenExpiredVerdicts(_ context.Context) (int, error) { return 0, nil }
+
+// LinkSafetyStates records what it was asked and replays what the test staged,
+// so a test can assert on the scoping the store is handed rather than only on
+// the answer it returns.
+func (f *fakeMessageStore) LinkSafetyStates(
+	_ context.Context, workspaceID, senderID string, messageIDs []string,
+) ([]domain.MessageLinkSafetyState, error) {
+	f.linkSafetyWorkspace, f.linkSafetySender = workspaceID, senderID
+	f.linkSafetyIDs = messageIDs
+	if f.linkSafetyErr != nil {
+		return nil, f.linkSafetyErr
+	}
+	return f.linkSafetyStates, nil
+}
+
+func (f *fakeMessageStore) PublishOutboxBacklog(_ context.Context) (int, time.Duration, error) {
+	return 0, 0, nil
+}
+
+func (f *fakeMessageStore) LinkScanBacklog(_ context.Context) (map[string]int, time.Duration, error) {
+	return map[string]int{}, 0, nil
 }
 
 func (f *fakeMessageStore) SnapshotForwardableMessage(_ context.Context, input storage.ForwardSnapshotInput) (storage.ForwardSnapshot, error) {
@@ -262,7 +372,10 @@ func TestMessageService_EditMessage_RewritesAddedMention(t *testing.T) {
 	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
 	store := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+			// Explicitly active: editing is only permitted in that state, so a
+			// fixture with a zero-value status is not an editable message.
 			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			Status: domain.MessageStatusActive,
 		}},
 		authorizedMentionLabels: map[string]string{"user:" + mentionedUserID: "Alice"},
 	}
@@ -285,6 +398,7 @@ func TestMessageService_EditMessage_RemovesExistingMention(t *testing.T) {
 	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
 	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
 		ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		Status:   domain.MessageStatusActive,
 		BodyText: `@[Alice](mention:user:` + mentionedUserID + `)`, BodyFormat: domain.MessageBodyFormatV3,
 	}}}
 
@@ -305,7 +419,10 @@ func TestMessageService_EditMessage_RejectsUnauthorizedMention(t *testing.T) {
 	const mentionedUserID = "99999999-9999-9999-9999-999999999999"
 	store := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+			// Explicitly active: editing is only permitted in that state, so a
+			// fixture with a zero-value status is not an editable message.
 			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			Status: domain.MessageStatusActive,
 		}},
 		authorizedMentionLabels: map[string]string{},
 	}

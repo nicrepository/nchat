@@ -46,42 +46,85 @@ import (
 // must not be handed to a third-party scanner, and silently removing them would
 // submit a different URL from the one that was written.
 func CanonicalizeURL(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || len(raw) > maxURLLength {
-		return "", ErrNotCheckable
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return "", ErrNotCheckable
-	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", ErrNotCheckable
-	}
-	if parsed.User != nil {
-		return "", ErrNotCheckable
-	}
-	host, err := NormalizeHost(parsed.Hostname())
+	parsed, err := parseScannableURL(raw)
 	if err != nil {
 		return "", err
 	}
-	if port := parsed.Port(); port != "" && !isDefaultPort(scheme, port) {
-		host += ":" + port
+	authority, err := canonicalAuthority(parsed)
+	if err != nil {
+		return "", err
 	}
-
-	canonical := scheme + "://" + host
-	path := parsed.EscapedPath()
-	if path == "" {
-		path = "/"
-	}
-	canonical += path
-	if parsed.RawQuery != "" {
-		canonical += "?" + parsed.RawQuery
-	}
+	canonical := authority + canonicalPathAndQuery(parsed)
 	if len(canonical) > maxURLLength {
 		return "", ErrNotCheckable
 	}
 	return canonical, nil
+}
+
+// parseScannableURL parses raw and refuses anything the provider cannot scan.
+//
+// Three refusals, each a security decision rather than a parsing one:
+//
+//   - a scheme other than http/https. The provider fetches pages; a javascript:
+//     or data: URL is not one, and a mailto: has no page to fetch;
+//   - userinfo. A URL carrying credentials must not be handed to a third-party
+//     scanner, and silently stripping them would submit a different URL from the
+//     one that was written;
+//   - anything past the length bound, which also bounds the cache key, the
+//     database column and the submission body.
+func parseScannableURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > maxURLLength {
+		return nil, ErrNotCheckable
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, ErrNotCheckable
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, ErrNotCheckable
+	}
+	if parsed.User != nil {
+		return nil, ErrNotCheckable
+	}
+	return parsed, nil
+}
+
+// canonicalAuthority builds "scheme://host[:port]".
+//
+// The host is lower-cased and punycoded by NormalizeHost, because that is the
+// name that exists in DNS — submitting the Unicode spelling would scan a name
+// the provider resolves differently, and an IDN homograph would come back "no
+// risk found" for free. A default port is dropped because RFC 3986 §6.2.3 makes
+// it equivalent to the empty one.
+func canonicalAuthority(parsed *url.URL) (string, error) {
+	host, err := NormalizeHost(parsed.Hostname())
+	if err != nil {
+		return "", err
+	}
+	if port := parsed.Port(); port != "" && !isDefaultPort(parsed.Scheme, port) {
+		host += ":" + port
+	}
+	return parsed.Scheme + "://" + host, nil
+}
+
+// canonicalPathAndQuery returns the part of the URL the origin server sees.
+//
+// Taken as written — EscapedPath and RawQuery — and that is the whole point:
+// sorting, decoding, re-encoding or collapsing any of it is a way for two URLs
+// the origin server treats differently to end up sharing a verdict. An empty
+// path becomes "/" because RFC 3986 §6.2.3 makes them the same resource, and the
+// fragment is dropped because it never reaches the server at all.
+func canonicalPathAndQuery(parsed *url.URL) string {
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if parsed.RawQuery == "" {
+		return path
+	}
+	return path + "?" + parsed.RawQuery
 }
 
 // isDefaultPort reports the port that carries no information for a scheme.

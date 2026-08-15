@@ -221,6 +221,37 @@ type Config struct {
 	LinkSafetyCloudflareAccount string
 	LinkSafetyCloudflareToken   string
 
+	// What this service is willing to spend at the provider (RF-21 capacity).
+	//
+	// The unit is a *new canonical URL*: one with no fresh verdict and no scan
+	// already queued. Previewing the same link repeatedly is free, because it is
+	// free for the provider too.
+	//
+	// The budget is service-wide rather than per tenant, and that is a limitation
+	// stated rather than papered over: a preview request carries no workspace
+	// this service can trust — it is fetched for a link, not for a tenant — and
+	// deriving one from a header would be a boundary any client could choose.
+	// Per-caller fairness stays in the request limiter.
+
+	// LinkSafetyNewURLBudget is how many new canonical URLs this service may
+	// introduce per window. Zero disables the budget.
+	LinkSafetyNewURLBudget int
+	// LinkSafetyBudgetWindowSeconds is the fixed window it counts in.
+	LinkSafetyBudgetWindowSeconds int
+	// LinkSafetyMaxPendingJobs caps undecided scans. Zero disables the cap.
+	LinkSafetyMaxPendingJobs int
+	// LinkSafetyProviderSubmitLimit and LinkSafetyProviderSubmitWindowSeconds
+	// bound submissions to Cloudflare across every replica. This is the one that
+	// has to match the plan: a per-process limiter multiplied by the replica
+	// count is not a limit on the thing the provider counts.
+	LinkSafetyProviderSubmitLimit         int
+	LinkSafetyProviderSubmitWindowSeconds int
+	// LinkSafetySubmitUncertainTimeoutSeconds is when a submission whose outcome
+	// was never recorded starts being reported as stale. It gates no action —
+	// there is deliberately no setting that lets an uncertain submission be sent
+	// again. See the chat-service config for the full reasoning.
+	LinkSafetySubmitUncertainTimeoutSeconds int
+
 	uploadsEnabledInvalid      bool
 	malwareScanRequiredInvalid bool
 	maxUploadBytesInvalid      bool
@@ -281,6 +312,15 @@ func Load() Config {
 		),
 		// Not trimmed of anything but surrounding whitespace, and never logged,
 		// echoed in an error or sent to a client.
+		LinkSafetyNewURLBudget:        platformconfig.GetInt("FILES_LINK_SAFETY_NEW_URL_BUDGET", 120),
+		LinkSafetyBudgetWindowSeconds: platformconfig.GetInt("FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS", 3600),
+		LinkSafetyMaxPendingJobs:      platformconfig.GetInt("FILES_LINK_SAFETY_MAX_PENDING_JOBS", 500),
+		LinkSafetyProviderSubmitLimit: platformconfig.GetInt(
+			"FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT", 30),
+		LinkSafetyProviderSubmitWindowSeconds: platformconfig.GetInt(
+			"FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS", 60),
+		LinkSafetySubmitUncertainTimeoutSeconds: platformconfig.GetInt(
+			"FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", 900),
 		LinkSafetyCloudflareToken: strings.TrimSpace(
 			platformconfig.GetString("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", ""),
 		),
@@ -501,6 +541,53 @@ func (c Config) validateLinkSafety() error {
 	}
 	if c.LinkSafetyCloudflareToken == "" {
 		return errors.New("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN is required when FILE_LINK_SAFETY_ENABLED is true")
+	}
+	return c.validateLinkSafetyCapacity()
+}
+
+// validateLinkSafetyCapacity refuses capacity settings that could not do their
+// job.
+//
+// The two readings of "0" are opposite and getting it wrong is silent either
+// way, so the semantics are stated rather than inferred:
+//
+//   - a limit of zero *disables* that ceiling. A deployment that has not decided
+//     on a number gets no ceiling rather than a ceiling of nothing, because a
+//     control that fails into "no preview works" is one somebody switches off;
+//   - a window of zero is refused when its limit is enabled. A window is the
+//     unit a limit is counted in, so a limit without one is not weaker, it is
+//     meaningless — and treating it as disabled would hide a typo that removed
+//     the protection.
+func (c Config) validateLinkSafetyCapacity() error {
+	for _, setting := range []struct {
+		name  string
+		value int
+	}{
+		{"FILES_LINK_SAFETY_NEW_URL_BUDGET", c.LinkSafetyNewURLBudget},
+		{"FILES_LINK_SAFETY_MAX_PENDING_JOBS", c.LinkSafetyMaxPendingJobs},
+		{"FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT", c.LinkSafetyProviderSubmitLimit},
+	} {
+		if setting.value < 0 {
+			return errors.New(setting.name + " must not be negative")
+		}
+	}
+	for _, window := range []struct {
+		name  string
+		value int
+		limit int
+	}{
+		{"FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS", c.LinkSafetyBudgetWindowSeconds, c.LinkSafetyNewURLBudget},
+		{"FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS", c.LinkSafetyProviderSubmitWindowSeconds, c.LinkSafetyProviderSubmitLimit},
+	} {
+		if window.limit > 0 && window.value <= 0 {
+			return errors.New(window.name + " must be greater than zero when its limit is enabled")
+		}
+	}
+	if c.LinkSafetySubmitUncertainTimeoutSeconds <= 0 {
+		// Refused rather than treated as "report immediately": a threshold of zero
+		// marks every submission stale the moment it starts, which is the same as
+		// having no signal. It never enables an action either way.
+		return errors.New("FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS must be greater than zero")
 	}
 	return nil
 }

@@ -758,6 +758,11 @@ func (s *PGXDMStore) ListVisibleConversationsWithParticipantIDs(ctx context.Cont
 		    FROM chat.messages m
 		    WHERE m.workspace_id = dc.workspace_id
 		      AND m.dm_conversation_id = dc.id
+		      -- RF-21: a message still being link-scanned must not reorder
+		      -- anyone's sidebar or light up a conversation. It has been shown to
+		      -- nobody, so it is not activity yet; it becomes activity when the
+		      -- scan promotes it, which updates this timestamp naturally.
+		      AND m.status <> 'pending_link_scan'
 		    ORDER BY m.created_at DESC, m.id DESC
 		    LIMIT 1
 		) lm ON true

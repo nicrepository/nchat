@@ -21,6 +21,7 @@ import { ApiRequestError } from "../lib/api";
 import { clearTokens, setTokens } from "../lib/authSession";
 import type {
   WSClientErrorEvent,
+  WSMessageBlockedEvent,
   WSMessageCreatedEvent,
   WSMessageUpdatedEvent,
   WSMessagePayload,
@@ -35,6 +36,7 @@ import type { Message, MessagePage } from "./chatTypes";
 
 // Captures the latest onMessageCreated callback so tests can fire WS events.
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
+let capturedOnMessageBlocked: ((evt: WSMessageBlockedEvent) => void) | null = null;
 let capturedOnMessageUpdated: ((evt: WSMessageUpdatedEvent) => void) | null = null;
 let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
 let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
@@ -46,6 +48,7 @@ const mockToggleReaction = vi.fn(() => true);
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
+    onMessageBlocked,
     onMessageUpdated,
     onReactionUpdated,
     onPinUpdated,
@@ -56,6 +59,7 @@ vi.mock("./useChatWebSocket", () => ({
     kind: string;
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
+    onMessageBlocked?: (evt: WSMessageBlockedEvent) => void;
     onMessageUpdated?: (evt: WSMessageUpdatedEvent) => void;
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
     onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
@@ -64,6 +68,7 @@ vi.mock("./useChatWebSocket", () => ({
     onSubscribed?: (evt: WSSubscribedEvent) => void;
   }) => {
     capturedOnMessageCreated = onMessageCreated;
+    capturedOnMessageBlocked = onMessageBlocked ?? null;
     capturedOnMessageUpdated = onMessageUpdated ?? null;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
     capturedOnPinUpdated = onPinUpdated ?? null;
@@ -77,6 +82,7 @@ vi.mock("./useChatWebSocket", () => ({
 // ── chatApi mocks ─────────────────────────────────────────────────────────────
 
 const {
+  mockFetchLinkSafetyStatuses,
   mockFetchChannelMessages,
   mockFetchChannelMessage,
   mockFetchDMMessages,
@@ -95,6 +101,13 @@ const {
     vi.fn<(id: string, body: string, parentMessageId?: string) => Promise<Message>>(),
   mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockDeleteMessage: vi.fn<(id: string) => Promise<Message>>(),
+  mockFetchLinkSafetyStatuses:
+    vi.fn<
+      (
+        messageIds: string[],
+        signal?: AbortSignal,
+      ) => Promise<{ messageId: string; state: string; reason?: string }[]>
+    >(),
   mockFetchChannelMessages:
     vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
   mockFetchChannelMessage:
@@ -142,6 +155,8 @@ vi.mock("./chatApi", () => ({
   editMessage: (id: string, body: string, bodyFormat: number) =>
     mockEditMessage(id, body, bodyFormat),
   deleteMessage: (id: string) => mockDeleteMessage(id),
+  fetchLinkSafetyStatuses: (messageIds: string[], signal?: AbortSignal) =>
+    mockFetchLinkSafetyStatuses(messageIds, signal),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -202,6 +217,15 @@ function fireWsEventWithPayload(
   });
 }
 
+/** Fire the RF-21 terminal refusal, which is addressed to the author alone. */
+function fireWsBlockedEvent(messageId: string): void {
+  capturedOnMessageBlocked?.({
+    type: "message.blocked",
+    message_id: messageId,
+    reason: "malicious_link",
+  });
+}
+
 /** Fire a message.created event WITHOUT a payload (fallback path). */
 function fireWsEventNoPayload(
   targetType: "channel" | "dm",
@@ -245,6 +269,7 @@ function fireFullDelete(messageId: string, targetId = "ch-1"): void {
 beforeEach(() => {
   setTokens("test-access-token");
   capturedOnMessageCreated = null;
+  capturedOnMessageBlocked = null;
   capturedOnMessageUpdated = null;
   capturedOnReactionUpdated = null;
   capturedOnReactionError = null;
@@ -2524,6 +2549,30 @@ describe("useMessages — blocked links", () => {
     return result;
   }
 
+  // The capacity refusal, which is a different claim entirely: the backend
+  // declined to start a new scan right now and decided nothing about the link.
+  // Showing the security warning for it would tell someone their link looks
+  // dangerous because a queue was full.
+  it("shows a retry message, not a security warning, for a capacity refusal", async () => {
+    mockPostChannelMessage.mockRejectedValue(
+      new ApiRequestError(429, "link_check_capacity", "links could not be checked right now"),
+    );
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(result.current.sendMessage("https://novo.example/a")).rejects.toBeTruthy();
+    });
+
+    expect(result.current.state.sendError).toBe(
+      "Não foi possível verificar os links agora. Tente novamente em instantes.",
+    );
+    expect(result.current.state.sendError).not.toMatch(/bloqueado por segurança/);
+    // The backend refused before creating anything, so there is no pending
+    // bubble to show and nothing is stuck sending.
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.sending).toBe(false);
+  });
+
   it("shows the security warning for a malicious_url refusal", async () => {
     mockPostChannelMessage.mockRejectedValue(
       new ApiRequestError(
@@ -2579,6 +2628,133 @@ describe("useMessages — blocked links", () => {
     expect(result.current.state.sendError).toBeFalsy();
   });
 
+  // The reconciliation the review found missing. A withheld message is returned
+  // to its own sender with the same id it will keep, so when the scan clears and
+  // the backend broadcasts message.created for that id, discarding the event as
+  // "already present" left the sender stuck on "checking links…" while everyone
+  // else saw the message.
+  it("replaces a pending message with the published one on message.created", async () => {
+    const createdAt = new Date().toISOString();
+    mockPostChannelMessage.mockResolvedValue({
+      id: "msg-pending",
+      senderId: "user-me",
+      senderDisplayName: "Me",
+      senderEmail: "me@example.com",
+      kind: "user",
+      bodyText: "veja https://novo.example/x",
+      bodyFormat: "v2",
+      isRemoved: false,
+      status: "pending_link_scan",
+      deletedAt: null,
+      createdAt,
+      updatedAt: createdAt,
+      isEdited: false,
+      editCount: 0,
+      reactions: [],
+      isFavorited: false,
+      isForwarded: false,
+    });
+    const result = await readyHook();
+
+    await act(async () => {
+      await result.current.sendMessage("veja https://novo.example/x");
+    });
+    expect(result.current.state.messages.filter((m) => m.id === "msg-pending")).toHaveLength(1);
+    expect(result.current.state.messages.at(-1)?.status).toBe("pending_link_scan");
+
+    // The scan cleared: the backend promoted it and broadcast the published row.
+    await act(async () => {
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({
+          id: "msg-pending",
+          sender_id: "user-me",
+          body_text: "veja https://novo.example/x",
+          status: "active",
+          created_at: createdAt,
+        }),
+      );
+    });
+
+    // One message, not two, and it is now the authoritative published version.
+    const matching = result.current.state.messages.filter((m) => m.id === "msg-pending");
+    expect(matching).toHaveLength(1);
+    expect(matching[0].status).toBe("active");
+    expect(matching[0].bodyText).toBe("veja https://novo.example/x");
+  });
+
+  // Delivery from the outbox is at-least-once, so the same event may arrive
+  // twice. The second one must stay the no-op it always was.
+  it("keeps a single message when the published event is delivered twice", async () => {
+    const result = await readyHook();
+    const payload = makePayload({ id: "msg-dup", status: "active" });
+
+    await act(async () => {
+      fireWsEventWithPayload("channel", "ch-1", payload);
+      fireWsEventWithPayload("channel", "ch-1", payload);
+    });
+
+    expect(result.current.state.messages.filter((m) => m.id === "msg-dup")).toHaveLength(1);
+  });
+
+  // RF-21: the refusal must reach the author, or the composer sits on
+  // "checking links…" forever — the backend took the message to a terminal
+  // state and, before this event existed, told nobody.
+  it("removes a pending message when the scan refuses it", async () => {
+    const createdAt = new Date().toISOString();
+    mockPostChannelMessage.mockResolvedValue({
+      id: "msg-blocked",
+      senderId: "user-me",
+      senderDisplayName: "Me",
+      senderEmail: "me@example.com",
+      kind: "user",
+      bodyText: "veja https://evil.example/x",
+      bodyFormat: "v2",
+      isRemoved: false,
+      status: "pending_link_scan",
+      deletedAt: null,
+      createdAt,
+      updatedAt: createdAt,
+      isEdited: false,
+      editCount: 0,
+      reactions: [],
+      isFavorited: false,
+      isForwarded: false,
+    });
+    const result = await readyHook();
+
+    await act(async () => {
+      await result.current.sendMessage("veja https://evil.example/x");
+    });
+    expect(result.current.state.messages.some((m) => m.id === "msg-blocked")).toBe(true);
+
+    await act(async () => {
+      fireWsBlockedEvent("msg-blocked");
+    });
+
+    // The message was never published, so nothing of it remains in the
+    // transcript — and the author is told why.
+    expect(result.current.state.messages.some((m) => m.id === "msg-blocked")).toBe(false);
+    expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
+    expect(result.current.state.sending).toBe(false);
+  });
+
+  // A refusal for something this view never held, or already resolved, changes
+  // nothing: outbox delivery is at-least-once, so a repeat must be harmless.
+  it("ignores a blocked event for a message it is not holding as pending", async () => {
+    const result = await readyHook();
+    const before = result.current.state.messages.length;
+
+    await act(async () => {
+      fireWsBlockedEvent("msg-unknown");
+      fireWsBlockedEvent("msg-unknown");
+    });
+
+    expect(result.current.state.messages).toHaveLength(before);
+    expect(result.current.state.sendError).toBeFalsy();
+  });
+
   it("tells the user to retry when the check could not run", async () => {
     mockPostChannelMessage.mockRejectedValue(
       new ApiRequestError(
@@ -2622,5 +2798,271 @@ describe("useMessages — blocked links", () => {
     });
 
     expect(result.current.state.sendError).toBe("internal error");
+  });
+});
+
+// ── RF-21: recovering a verdict that realtime never delivered ────────────────
+//
+// The gap this closes, stated plainly: a withheld message resolves
+// asynchronously and the verdict is announced over the websocket. If the author
+// is disconnected at that moment the announcement reaches nobody, and for a
+// refusal nothing else is ever coming — the message no longer exists to be
+// fetched, no further event will be emitted, and the composer sits on
+// "checking segurança dos links…" for good.
+//
+// So on every subscription that comes back ready, the client asks the server
+// what became of the messages it still holds as pending. Absence of an event is
+// never read as a verdict; only an answer is acted on.
+
+describe("useMessages — reconnect reconciliation of withheld messages", () => {
+  const pendingCreatedAt = "2026-01-01T10:00:00.000Z";
+
+  beforeEach(() => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchLinkSafetyStatuses.mockReset();
+  });
+
+  /** Renders the hook with one message already withheld, as after a send. */
+  async function hookWithPendingMessage(id = "msg-pending") {
+    mockPostChannelMessage.mockResolvedValue(
+      makeMessage({
+        id,
+        senderId: "user-me",
+        bodyText: "veja https://novo.example/x",
+        status: "pending_link_scan",
+        createdAt: pendingCreatedAt,
+        updatedAt: pendingCreatedAt,
+      }),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    await act(async () => {
+      await result.current.sendMessage("veja https://novo.example/x");
+    });
+    expect(result.current.state.messages.some((m) => m.id === id)).toBe(true);
+    return result;
+  }
+
+  /** Fires the acknowledgement a resubscribe produces after a reconnect. */
+  async function reconnect() {
+    await act(async () => {
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "ch-1",
+      });
+      await Promise.resolve();
+    });
+  }
+
+  // [B] The finding itself: the refusal happened while the socket was down.
+  it("clears a pending message the server refused while the socket was down", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "blocked", reason: "malicious_link" },
+    ]);
+
+    // No message.blocked ever arrives — that is the whole scenario.
+    await reconnect();
+
+    await waitFor(() =>
+      expect(result.current.state.messages.some((m) => m.id === "msg-pending")).toBe(false),
+    );
+    expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
+    expect(result.current.state.sending).toBe(false);
+    // Recovered without the user reloading anything.
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  // [C] The same loss in the other direction: the promotion was missed.
+  it("promotes a pending message the server published while the socket was down", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "active" },
+    ]);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-pending",
+        senderId: "user-me",
+        bodyText: "veja https://novo.example/x",
+        status: "active",
+        createdAt: pendingCreatedAt,
+        updatedAt: pendingCreatedAt,
+      }),
+    );
+
+    await reconnect();
+
+    await waitFor(() => {
+      const matching = result.current.state.messages.filter((m) => m.id === "msg-pending");
+      expect(matching).toHaveLength(1);
+      expect(matching[0].status).toBe("active");
+    });
+    // The authoritative row, not a locally patched status.
+    expect(mockFetchChannelMessage).toHaveBeenCalledWith("ch-1", "msg-pending", expect.anything());
+  });
+
+  // [D] Nothing has been decided yet, so nothing may change.
+  it("leaves a message pending when the server says it is still being scanned", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "pending" },
+    ]);
+
+    await reconnect();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const message = result.current.state.messages.find((m) => m.id === "msg-pending");
+    expect(message?.status).toBe("pending_link_scan");
+    expect(result.current.state.sendError).toBeFalsy();
+  });
+
+  // [E] A failed reconciliation says nothing about the message. Removing the
+  // bubble or reporting a block would be inventing an answer nobody gave.
+  it("keeps the message pending when reconciliation fails", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockRejectedValue(new Error("network"));
+
+    await reconnect();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const message = result.current.state.messages.find((m) => m.id === "msg-pending");
+    expect(message?.status).toBe("pending_link_scan");
+    expect(result.current.state.sendError).toBeFalsy();
+  });
+
+  // An id the server will not talk about is absent from the reply, and absence
+  // is not a verdict — the same conservative outcome as a failure.
+  it("keeps the message pending when the server omits it from the answer", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([]);
+
+    await reconnect();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.state.messages.find((m) => m.id === "msg-pending")?.status).toBe(
+      "pending_link_scan",
+    );
+    expect(result.current.state.sendError).toBeFalsy();
+  });
+
+  // §20: gone is not the same claim as blocked.
+  it("removes a message that is simply gone without blaming a malicious link", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "deleted" },
+    ]);
+
+    await reconnect();
+
+    await waitFor(() =>
+      expect(result.current.state.messages.some((m) => m.id === "msg-pending")).toBe(false),
+    );
+    expect(result.current.state.sendError).toBe("Esta mensagem não está mais disponível.");
+    expect(result.current.state.sendError).not.toMatch(/bloqueado por segurança/);
+  });
+
+  // [F] Realtime and reconciliation are two channels carrying the same fact.
+  // Whichever order they land in, the result is one transition.
+  it("is idempotent when the blocked event and reconciliation both arrive", async () => {
+    for (const realtimeFirst of [true, false]) {
+      mockFetchLinkSafetyStatuses.mockResolvedValue([
+        { messageId: "msg-pending", state: "blocked", reason: "malicious_link" },
+      ]);
+      const result = await hookWithPendingMessage();
+
+      if (realtimeFirst) {
+        await act(async () => {
+          capturedOnMessageBlocked?.({ type: "message.blocked", message_id: "msg-pending" });
+        });
+        await reconnect();
+      } else {
+        await reconnect();
+        await waitFor(() =>
+          expect(result.current.state.messages.some((m) => m.id === "msg-pending")).toBe(false),
+        );
+        await act(async () => {
+          capturedOnMessageBlocked?.({ type: "message.blocked", message_id: "msg-pending" });
+        });
+      }
+
+      await waitFor(() =>
+        expect(result.current.state.messages.filter((m) => m.id === "msg-pending")).toHaveLength(0),
+      );
+      expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
+    }
+  });
+
+  it("is idempotent when the published event and reconciliation both arrive", async () => {
+    const published = makeMessage({
+      id: "msg-pending",
+      senderId: "user-me",
+      bodyText: "veja https://novo.example/x",
+      status: "active",
+      createdAt: pendingCreatedAt,
+      updatedAt: pendingCreatedAt,
+    });
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "active" },
+    ]);
+    mockFetchChannelMessage.mockResolvedValue(published);
+    const result = await hookWithPendingMessage();
+
+    await act(async () => {
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({
+          id: "msg-pending",
+          sender_id: "user-me",
+          body_text: "veja https://novo.example/x",
+          status: "active",
+          created_at: pendingCreatedAt,
+        }),
+      );
+    });
+    await reconnect();
+
+    await waitFor(() => {
+      const matching = result.current.state.messages.filter((m) => m.id === "msg-pending");
+      expect(matching).toHaveLength(1);
+      expect(matching[0].status).toBe("active");
+    });
+  });
+
+  // The overwhelmingly common case: nothing is pending, so nothing is asked.
+  it("makes no request when nothing is being scanned", async () => {
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await reconnect();
+
+    expect(mockFetchLinkSafetyStatuses).not.toHaveBeenCalled();
+  });
+
+  // Only the ids this client is actually waiting on, never the transcript.
+  it("asks only about the messages it is holding as pending", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-old", status: "active" })],
+      nextCursor: "",
+    });
+    mockFetchLinkSafetyStatuses.mockResolvedValue([]);
+    await hookWithPendingMessage();
+
+    await reconnect();
+
+    await waitFor(() => expect(mockFetchLinkSafetyStatuses).toHaveBeenCalled());
+    expect(mockFetchLinkSafetyStatuses.mock.calls[0][0]).toEqual(["msg-pending"]);
   });
 });

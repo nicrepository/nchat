@@ -370,6 +370,10 @@ func New(cfg config.Config) (*App, error) {
 	var linkScanWorkerWG *sync.WaitGroup
 	if linkScanSvc != nil {
 		linkScanSvc.SetPublisher(&hubBroadcaster{hub: hub})
+		// The refusal channel is sender-scoped and therefore a different object:
+		// a blocked message goes to its author alone, never to the conversation
+		// it was never shown in.
+		linkScanSvc.SetBlockedPublisher(&hubBroadcaster{hub: hub})
 		workerCtx, cancel := context.WithCancel(context.Background())
 		linkScanWorkerCancel = cancel
 		linkScanWorkerWG = &sync.WaitGroup{}
@@ -492,7 +496,30 @@ func wireLinkSafety(
 	// message id is ever one.
 	safety := urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics))
 	messageSvc.SetLinkSafety(store)
-	return service.NewLinkScanService(store, safety, publisher, logger), nil
+	// What a workspace, and this deployment, may spend on new provider work.
+	// Applied at admission, before any message is created and before any job is
+	// queued, so a refusal costs the provider nothing.
+	messageSvc.SetLinkScanCapacity(storage.LinkScanCapacity{
+		WorkspaceNewURLBudget: cfg.LinkSafetyWorkspaceBudget,
+		BudgetWindow:          time.Duration(cfg.LinkSafetyBudgetWindowSeconds) * time.Second,
+		MaxPendingJobs:        cfg.LinkSafetyMaxPendingJobs,
+	})
+	// The pipeline gauges and counters. Without them a Cloudflare outage is
+	// indistinguishable from a quiet system: messages simply stop appearing.
+	// One reporter, shared by the request path and the worker, so the admission
+	// counter and the pipeline counters land on the same registry — registering
+	// twice would produce nothing at all.
+	pipeline := urlsafety.NewPipelineMetrics(metrics, cfg.ServiceName)
+	messageSvc.SetAdmissionMetrics(pipeline)
+
+	worker := service.NewLinkScanService(store, safety, publisher, logger)
+	worker.SetMetrics(pipeline)
+	worker.SetCapacity(service.LinkScanWorkerCapacity{
+		ProviderSubmitLimit:  cfg.LinkSafetyProviderSubmitLimit,
+		ProviderSubmitWindow: time.Duration(cfg.LinkSafetyProviderSubmitWindowSeconds) * time.Second,
+		UncertainTimeout:     time.Duration(cfg.LinkSafetySubmitUncertainTimeoutSeconds) * time.Second,
+	})
+	return worker, nil
 }
 
 // errLinkSafetyUnwired stops the bootstrap when RF-21 is switched on and the
@@ -609,6 +636,15 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 		MessageID: result.MessageID, TargetType: targetType, TargetID: targetID,
 		Added: result.Added, Reactions: reactions,
 	}, nil
+}
+
+// PublishMessageBlocked forwards the RF-21 refusal to its author.
+//
+// targetID is the recipient's user id: the outbox row for a blocked message
+// records the sender as the audience, which is what keeps the announcement off
+// the conversation.
+func (b *hubBroadcaster) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
+	b.hub.PublishMessageBlocked(ctx, workspaceID, recipientUserID, messageID)
 }
 
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {

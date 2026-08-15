@@ -20,8 +20,26 @@ type EventType string
 
 const (
 	// EventTypeMessageCreated is emitted after a message has been persisted.
-	EventTypeMessageCreated  EventType = "message.created"
-	EventTypeMessageUpdated  EventType = "message.updated"
+	EventTypeMessageCreated EventType = "message.created"
+	EventTypeMessageUpdated EventType = "message.updated"
+	// EventTypeMessageBlocked tells one author that their withheld message was
+	// refused by the link-safety check (RF-21).
+	//
+	// It carries no body and no verdict detail — only the message id and a fixed
+	// reason — and it is addressed to a single recipient rather than to a
+	// conversation. Everyone else was never shown the message and must not learn
+	// that it existed.
+	EventTypeMessageBlocked EventType = "message.blocked"
+)
+
+// MessageBlockedReasonMaliciousLink is the only reason message.blocked carries.
+//
+// A constant rather than a message from the provider: whichever category
+// Cloudflare reported is not the author's to receive, and repeating it would
+// make the endpoint an oracle for which domains are already known.
+const MessageBlockedReasonMaliciousLink = "malicious_link"
+
+const (
 	EventTypeReactionUpdated EventType = "reaction.updated"
 	// EventTypePinUpdated is emitted after a message is pinned or unpinned in a
 	// channel or DM (RF-05). Delivered to readable target subscribers only.
@@ -386,8 +404,14 @@ type Event struct {
 	// can find that user's local sessions without any shared subscription state.
 	// It is always a value the publishing transaction confirmed, never one taken
 	// from a request body.
-	RecipientUserID string            `json:"recipient_user_id,omitempty"`
-	Call            *CallEventPayload `json:"call,omitempty"`
+	RecipientUserID string `json:"recipient_user_id,omitempty"`
+	// Reason is a fixed, closed-set explanation for a terminal event.
+	//
+	// Set only for message.blocked, where the author needs to know their message
+	// was refused and nothing more. It is a controlled enum precisely so no
+	// provider text, URL or verdict detail can ever travel in it.
+	Reason string            `json:"reason,omitempty"`
+	Call   *CallEventPayload `json:"call,omitempty"`
 	// EventID is a server-generated UUID assigned at publish time.
 	// Used for idempotency and observability; not a security boundary.
 	EventID string `json:"event_id,omitempty"`

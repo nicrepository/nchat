@@ -1,4 +1,4 @@
--- 000023_message_link_safety.down.sql
+-- 000024_message_link_safety.down.sql
 --
 -- The join table goes first (it references both others), then the scan queue,
 -- then the status constraint returns to its two-value form.
@@ -8,6 +8,21 @@
 -- publish the messages that control was holding.
 
 BEGIN;
+
+ALTER TABLE chat.messages
+    DROP COLUMN IF EXISTS create_request_fingerprint;
+
+ALTER TABLE chat.messages
+    DROP COLUMN IF EXISTS link_safety_fingerprint;
+
+DROP INDEX IF EXISTS chat.messages_create_idempotency_unique;
+
+ALTER TABLE chat.messages
+    DROP COLUMN IF EXISTS create_idempotency_key;
+
+DROP TABLE IF EXISTS chat.message_pending_mentions;
+
+DROP TABLE IF EXISTS chat.message_publish_outbox;
 
 DROP TABLE IF EXISTS chat.message_link_scans;
 

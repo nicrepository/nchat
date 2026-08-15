@@ -62,6 +62,11 @@ type App struct {
 	cleanupDone        <-chan struct{}
 	scanCancel         context.CancelFunc
 	scanDone           <-chan struct{}
+	// linkScanCancel/linkScanDone own the RF-21 URL scan worker, on exactly the
+	// same terms as the three above: it holds the pool, so it must be stopped
+	// and waited for before the pool closes.
+	linkScanCancel context.CancelFunc
+	linkScanDone   <-chan struct{}
 	// statusPublisher is the bus connection the scan worker announces verdicts
 	// on. Nil whenever no bus is configured, which is a supported deployment:
 	// verdicts are still persisted and clients still see them on their next read.
@@ -103,8 +108,33 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 
 	metrics := observability.NewMetrics(obsCfg)
 	routerDeps := httpapi.RouterDependencies{Observability: metrics}
+
+	// One pool for the whole process, opened before any feature is wired.
+	//
+	// It used to be opened inside the attachment wiring, which made every other
+	// database-backed capability an accidental dependant of FILE_UPLOADS_ENABLED:
+	// RF-21's durable scan queue needs persistence and has nothing to do with
+	// uploads, so a deployment running link previews without uploads had no pool
+	// for it. The decision is now stated once, by needsDatabase, and the pool is
+	// shared rather than opened twice.
+	if needsDatabase(cfg) {
+		if deps.openDB == nil {
+			_ = shutdownTracing(shutdown)
+			return nil, errDependenciesUnavailable
+		}
+		pool, err := deps.openDB(
+			context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, cfg.DBMaxConnections,
+		)
+		if err != nil {
+			// The DSN and the driver message never reach the caller or the log.
+			_ = shutdownTracing(shutdown)
+			return nil, errDependenciesUnavailable
+		}
+		application.pool = pool
+	}
 	if cfg.UploadsEnabled {
 		if err := application.wireAttachments(cfg, logger, metrics, deps, &routerDeps); err != nil {
+			application.closePool()
 			_ = shutdownTracing(shutdown)
 			return nil, err
 		}
@@ -112,7 +142,7 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 	// Independent of uploads: link previews touch no database, no storage and
 	// no key material, so a deployment may run them with uploads switched off.
 	if cfg.LinkPreviewEnabled {
-		if err := application.wireLinkPreviews(cfg, metrics, &routerDeps); err != nil {
+		if err := application.wireLinkPreviews(cfg, metrics, &routerDeps, logger); err != nil {
 			_ = shutdownTracing(shutdown)
 			return nil, err
 		}
@@ -121,13 +151,36 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 	return application, nil
 }
 
+// needsDatabase reports whether any enabled capability requires persistence.
+//
+// Stated in one place because the alternative is what the review found: the pool
+// belonged to whichever feature happened to open it, and every other
+// database-backed capability inherited that feature's flag as a hidden
+// prerequisite.
+//
+// Link previews alone need nothing persistent — they are an in-memory cache in
+// front of a fetch. Link *safety* does: Cloudflare URL Scanner is submit-then-
+// poll, so the verdict queue has to survive a restart.
+func needsDatabase(cfg config.Config) bool {
+	return cfg.UploadsEnabled || (cfg.LinkPreviewEnabled && cfg.LinkSafetyEnabled)
+}
+
+// closePool releases the shared pool if one was opened. Safe to call twice.
+func (a *App) closePool() {
+	if a.pool != nil {
+		a.pool.Close()
+		a.pool = nil
+	}
+}
+
 // wireLinkPreviews builds the RF-10 route's dependencies.
 //
 // The token validator is shared with the attachment routes when those are also
 // enabled: it is derived entirely from configuration, so building a second one
 // would only mean two objects answering identically.
 func (a *App) wireLinkPreviews(
-	cfg config.Config, metrics *observability.Metrics, routerDeps *httpapi.RouterDependencies,
+	cfg config.Config, metrics *observability.Metrics,
+	routerDeps *httpapi.RouterDependencies, logger *slog.Logger,
 ) error {
 	if routerDeps.TokenValidator == nil {
 		validator, err := httpapi.NewTokenValidator(
@@ -160,7 +213,31 @@ func (a *App) wireLinkPreviews(
 		if err != nil {
 			return err
 		}
-		previews = previews.WithURLSafety(urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics)))
+		if a.pool == nil {
+			// needsDatabase should have opened one. Refusing rather than degrading
+			// is the same rule the flag has everywhere else: enabled with no way to
+			// run the check would serve previews of links nobody scanned.
+			return errors.New("link safety is enabled but no database is configured")
+		}
+		linkScans := storage.NewPGXLinkScanStore(a.pool)
+		capacity := service.LinkScanCapacity{
+			NewURLBudget:   cfg.LinkSafetyNewURLBudget,
+			BudgetWindow:   time.Duration(cfg.LinkSafetyBudgetWindowSeconds) * time.Second,
+			MaxPendingJobs: cfg.LinkSafetyMaxPendingJobs,
+		}
+		previews = previews.WithURLSafety(linkScans).WithScanCapacity(capacity)
+
+		worker := service.NewLinkScanService(
+			linkScans,
+			urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics)),
+			logger,
+		)
+		worker.SetCapacity(service.LinkScanWorkerCapacity{
+			ProviderSubmitLimit:  cfg.LinkSafetyProviderSubmitLimit,
+			ProviderSubmitWindow: time.Duration(cfg.LinkSafetyProviderSubmitWindowSeconds) * time.Second,
+			UncertainTimeout:     time.Duration(cfg.LinkSafetySubmitUncertainTimeoutSeconds) * time.Second,
+		})
+		a.startLinkScanWorker(worker, urlsafety.NewPipelineMetrics(metrics, cfg.ServiceName), logger)
 	}
 	routerDeps.LinkPreviews = previews
 	return nil
@@ -189,14 +266,14 @@ func (a *App) wireAttachments(
 	if err != nil {
 		return err
 	}
-	if deps.openDB == nil || deps.openAdmission == nil || deps.openFence == nil {
+	if deps.openAdmission == nil || deps.openFence == nil {
 		return errDependenciesUnavailable
 	}
-	pool, err := deps.openDB(
-		context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds, cfg.DBMaxConnections,
-	)
-	if err != nil {
-		// The DSN and the driver message never reach the caller or the log.
+	// The pool is the process-wide one, opened by New before any feature wiring.
+	// Failing here rather than opening a second one keeps "how many pools does
+	// this service hold" a question with one answer.
+	pool := a.pool
+	if pool == nil {
 		return errDependenciesUnavailable
 	}
 	// Cluster-wide upload admission. It needs connections it can reserve for the
@@ -209,13 +286,13 @@ func (a *App) wireAttachments(
 		PerUser: cfg.UploadMaxConcurrentPerUser,
 	}, logger)
 	if err != nil {
-		pool.Close()
+		// The pool is owned by the App and released by Shutdown; closing it here
+		// would pull it out from under the other features already wired on it.
 		return errDependenciesUnavailable
 	}
 
 	attachmentMetrics := httpapi.NewAttachmentMetrics(metrics)
 	limiter := httpapi.NewUserRateLimiter(uploadRateLimitPerMinute, uploadRateLimitWindow)
-	a.pool = pool
 	a.rateLimiter = limiter
 
 	routerDeps.TokenValidator = validator
@@ -237,7 +314,8 @@ func (a *App) wireAttachments(
 
 	fence, err := deps.openFence(pool, logger)
 	if err != nil {
-		pool.Close()
+		// The pool is owned by the App and released by Shutdown; closing it here
+		// would pull it out from under the other features already wired on it.
 		return errDependenciesUnavailable
 	}
 
@@ -389,6 +467,27 @@ func (a *App) startCleanupWorker(cleanups *service.ObjectCleanupService, logger 
 	a.cleanupDone = done
 }
 
+// startLinkScanWorker drains the RF-21 URL scan queue for as long as the app
+// lives (issue #135).
+//
+// Owned exactly like the other three workers: cancelled by Shutdown and waited
+// for before the pool closes, so a provider exchange in flight never loses its
+// connection underneath it. Started only when the feature is enabled — a
+// deployment with RF-21 off has nothing for it to do.
+func (a *App) startLinkScanWorker(
+	scans *service.LinkScanService, metrics *urlsafety.PipelineMetrics, logger *slog.Logger,
+) {
+	scans.SetMetrics(metrics)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		worker.NewLinkScan(scans, logger).Start(ctx)
+	}()
+	a.linkScanCancel = cancel
+	a.linkScanDone = done
+}
+
 func (a *App) Shutdown(ctx context.Context) error {
 	if a == nil {
 		return nil
@@ -410,7 +509,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 		previewStopped := a.stopPreviewWorker(ctx)
 		cleanupStopped := a.stopWorker(ctx, a.cleanupCancel, a.cleanupDone)
 		scanStopped := a.stopWorker(ctx, a.scanCancel, a.scanDone)
-		if previewStopped && cleanupStopped && scanStopped {
+		linkScanStopped := a.stopWorker(ctx, a.linkScanCancel, a.linkScanDone)
+		if previewStopped && cleanupStopped && scanStopped && linkScanStopped {
 			if a.pool != nil {
 				a.pool.Close()
 			}

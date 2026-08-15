@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -305,5 +306,64 @@ func TestValidateAcceptsDisabledLinkSafetyWithoutCredentials(t *testing.T) {
 
 	if err := Load().Validate(); err != nil {
 		t.Fatalf("an explicitly disabled check needs no credentials: %v", err)
+	}
+}
+
+// The correction this round is structural, and this is what "structural" means:
+// there is no setting that can turn it back on.
+//
+// A submission whose outcome was never recorded is never sent again — not after
+// a horizon, not after a restart, not with any environment variable. The
+// previous round bounded that resubmission at one and made it configurable; the
+// review's point was that a bound is not the same as an absence, and an operator
+// can raise a bound.
+//
+// So the assertion is about the *shape of the config*, not about a default: no
+// field exists to carry the policy, and setting the retired variable changes
+// nothing at all.
+func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
+	// The retired variable, set to the value that used to enable the behaviour.
+	t.Setenv("CHAT_LINK_SAFETY_MAX_UNCERTAIN_RESUBMITS", "5")
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-1")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-1")
+
+	cfg := Load()
+	if err := cfg.Validate(); err != nil {
+		// It is not rejected either: an unknown variable is simply ignored, which
+		// is this service's convention. What matters is that it is inert.
+		t.Fatalf("Validate: %v", err)
+	}
+
+	// No field carries it. reflect rather than a compile-time reference, because
+	// a compile-time reference to a removed field would not compile and this test
+	// has to keep failing if somebody adds it back.
+	for _, name := range []string{
+		"LinkSafetyMaxUncertainResubmits",
+		"LinkSafetyUncertainResubmits",
+		"LinkSafetyAllowUncertainResubmit",
+	} {
+		if _, exists := reflect.TypeOf(cfg).FieldByName(name); exists {
+			t.Fatalf("Config carries %q — an uncertain submission must not be configurable", name)
+		}
+	}
+
+	// The threshold that remains is a reporting one, and it is still required:
+	// it says when an unresolved submission becomes something to look at.
+	if cfg.LinkSafetySubmitUncertainTimeoutSeconds <= 0 {
+		t.Fatalf("the staleness threshold is unset: %d", cfg.LinkSafetySubmitUncertainTimeoutSeconds)
+	}
+}
+
+// A staleness threshold of zero is refused rather than treated as "report
+// everything immediately", which would be the same as having no signal.
+func TestUncertainStalenessThresholdMustBePositive(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-1")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-1")
+	t.Setenv("CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", "0")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("a zero staleness threshold was accepted")
 	}
 }
