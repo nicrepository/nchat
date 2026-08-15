@@ -2880,9 +2880,7 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
   // [C] The same loss in the other direction: the promotion was missed.
   it("promotes a pending message the server published while the socket was down", async () => {
     const result = await hookWithPendingMessage();
-    mockFetchLinkSafetyStatuses.mockResolvedValue([
-      { messageId: "msg-pending", state: "active" },
-    ]);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([{ messageId: "msg-pending", state: "active" }]);
     mockFetchChannelMessage.mockResolvedValue(
       makeMessage({
         id: "msg-pending",
@@ -2908,9 +2906,7 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
   // [D] Nothing has been decided yet, so nothing may change.
   it("leaves a message pending when the server says it is still being scanned", async () => {
     const result = await hookWithPendingMessage();
-    mockFetchLinkSafetyStatuses.mockResolvedValue([
-      { messageId: "msg-pending", state: "pending" },
-    ]);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([{ messageId: "msg-pending", state: "pending" }]);
 
     await reconnect();
     await act(async () => {
@@ -2958,9 +2954,7 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
   // §20: gone is not the same claim as blocked.
   it("removes a message that is simply gone without blaming a malicious link", async () => {
     const result = await hookWithPendingMessage();
-    mockFetchLinkSafetyStatuses.mockResolvedValue([
-      { messageId: "msg-pending", state: "deleted" },
-    ]);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([{ messageId: "msg-pending", state: "deleted" }]);
 
     await reconnect();
 
@@ -3011,9 +3005,7 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
       createdAt: pendingCreatedAt,
       updatedAt: pendingCreatedAt,
     });
-    mockFetchLinkSafetyStatuses.mockResolvedValue([
-      { messageId: "msg-pending", state: "active" },
-    ]);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([{ messageId: "msg-pending", state: "active" }]);
     mockFetchChannelMessage.mockResolvedValue(published);
     const result = await hookWithPendingMessage();
 

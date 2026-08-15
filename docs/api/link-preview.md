@@ -97,7 +97,7 @@ a pagina nunca e requisitada. Buscar primeiro e perguntar depois seria renderiza
 a pagina de phishing.
 
 A chave e a URL e nao o host, e essa distincao e o ponto: um preview renderiza
-uma *pagina*, entao decidi-lo pela reputacao do dominio que a hospeda liberava
+uma _pagina_, entao decidi-lo pela reputacao do dominio que a hospeda liberava
 todo caminho naquele dominio.
 
 URL sem veredito nao e liberacao e tambem nao e fetch: o file-service registra um
@@ -106,7 +106,7 @@ a Cloudflare, guarda o UUID e faz o polling, entao repetir o preview da mesma UR
 nao gera scan novo -- e um restart nao perde o que ja estava em andamento.
 
 E um controle **distinto** da politica abaixo e nao substitui nenhuma parte
-dela: o Safe Browsing responde se *aquela URL* e maliciosa, a politica de destino
+dela: o Safe Browsing responde se _aquela URL_ e maliciosa, a politica de destino
 responde se este backend pode abrir a conexao para aquele endereco. Um destino recusado pela politica continua
 recusado sem o provedor ser consultado.
 

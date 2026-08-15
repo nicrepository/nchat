@@ -346,7 +346,11 @@ func TestRepeatedURLIsOneScan(t *testing.T) {
 // An IP literal has no reputation to consult, and refusing it is what stops
 // "host the phishing page on a bare address" from being the obvious bypass.
 func TestUncheckableURLIsBlocked(t *testing.T) {
-	for name, body := range map[string]string{
+	// gosec reads the "credentials" case as a hardcoded secret. It is the
+	// opposite: a URL carrying a user:password@ userinfo component is one of the
+	// things this refuses, so the component has to be present for the case to
+	// test anything. Nothing here is a real credential.
+	for name, body := range map[string]string{ //nolint:gosec // G101: refusal fixture, not a secret
 		"ipv4":        "veja http://192.0.2.10/login",
 		"ipv6":        "veja http://[2001:db8::1]/login",
 		"credentials": "veja https://user:pw@example.com/login",
@@ -1156,9 +1160,10 @@ func TestLinkSafetyStatesCollapsesRepeatedIDs(t *testing.T) {
 	}
 }
 
-// messageID returns a stable UUID for the nth fixture message.
-func messageID(n int) string {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte{byte(n)}).String()
+// messageID returns a stable UUID for the nth fixture message. The parameter is
+// a byte because that is what it is: one seed byte for the name hash.
+func messageID(n byte) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte{n}).String()
 }
 
 // ── Admission: what a message costs the provider ──────────────────────────────

@@ -151,7 +151,12 @@ func TestCanonicalPreservesPathAndQueryVerbatim(t *testing.T) {
 }
 
 func TestCanonicalRefusesWhatCannotBeScanned(t *testing.T) {
-	for name, raw := range map[string]string{
+	// gosec reads the "credentials" case as a hardcoded secret. It is the
+	// opposite: a URL carrying a user:password@ userinfo component is exactly
+	// what canonicalization must refuse, so the component has to be present for
+	// the case to test anything. The value is the RFC's own example.com
+	// placeholder and nothing here is a real credential.
+	for name, raw := range map[string]string{ //nolint:gosec // G101: refusal fixture, not a secret
 		"empty":            "",
 		"blank":            "   ",
 		"no scheme":        "example.com/a",

@@ -17,12 +17,12 @@ chamar a API diretamente, pular o preview ou modificar o frontend nao muda nada.
 
 ## Onde o check roda
 
-| Fluxo                                   | Servico      | Efeito                       |
-| --------------------------------------- | ------------ | ---------------------------- |
-| `POST /api/chat/channels/{id}/messages` | chat-service | malicious: nao criada; sem veredito: retida |
-| `POST /api/chat/dm/{id}/messages`       | chat-service | malicious: nao criada; sem veredito: retida |
-| `PATCH /api/chat/messages/{id}`         | chat-service | malicious: recusada; sem veredito: 409 `link_check_pending` |
-| `POST .../messages/forward`             | chat-service | malicious: nao criada; sem veredito: retida |
+| Fluxo                                   | Servico      | Efeito                                                               |
+| --------------------------------------- | ------------ | -------------------------------------------------------------------- |
+| `POST /api/chat/channels/{id}/messages` | chat-service | malicious: nao criada; sem veredito: retida                          |
+| `POST /api/chat/dm/{id}/messages`       | chat-service | malicious: nao criada; sem veredito: retida                          |
+| `PATCH /api/chat/messages/{id}`         | chat-service | malicious: recusada; sem veredito: 409 `link_check_pending`          |
+| `POST .../messages/forward`             | chat-service | malicious: nao criada; sem veredito: retida                          |
 | `POST /api/files/link-preview`          | file-service | Open Graph **nao** e buscado; sem veredito: 202 `link_check_pending` |
 
 ### Os tres resultados
@@ -33,7 +33,7 @@ chamar a API diretamente, pular o preview ou modificar o frontend nao muda nada.
   HTTP 403 `malicious_url`;
 - **pending** -- qualquer URL sem veredito: a mensagem e persistida com status
   `pending_link_scan`, que **todo** caminho de leitura ja exclui (`status =
-  'active'`), e ninguem alem do remetente sabe que ela existe. O worker submete o
+'active'`), e ninguem alem do remetente sabe que ela existe. O worker submete o
   scan, e quando todas as URLs sao decididas promove (uma unica vez) ou bloqueia.
 
 **Editar uma mensagem `pending_link_scan` e proibido.** A regra de elegibilidade
@@ -69,7 +69,7 @@ mensagem retida aguarda), e a mensagem promove quando chegar veredito fresco.
 `chat.message_pending_mentions` e sao movidas para `chat.notification_outbox` na
 mesma transacao da promocao. Mensagem bloqueada nunca gera notificacao.
 
-A edicao e a unica excecao ao pending: reter uma *edicao* significaria mostrar a
+A edicao e a unica excecao ao pending: reter uma _edicao_ significaria mostrar a
 todos um corpo nao verificado, ou manter o antigo enquanto se diz ao autor que
 salvou. Ambos sao piores que pedir para tentar de novo -- a versao publicada fica
 intacta e o scan que a classificacao acabou de enfileirar faz o retry funcionar.
@@ -111,12 +111,12 @@ deduplica por message id. Exactly-once de rede nao existe e nao e afirmado aqui.
 Quatro afirmacoes distintas, porque confundi-las e como se afirma entrega
 confiavel sobre um transporte que nao a oferece:
 
-| Camada | Garante | Nao garante |
-|---|---|---|
-| Banco | e a fonte de verdade do estado da mensagem | nada sobre entrega |
-| `message_publish_outbox` | que o evento e **processado** no backend, sobrevivendo a crash e a restart | que algum cliente o recebeu |
-| WebSocket | entrega em tempo real, best-effort | entrega, ordem ou recebimento |
-| Reconciliacao no reconnect | **convergencia do cliente** para o estado autoritativo | latencia |
+| Camada                     | Garante                                                                    | Nao garante                   |
+| -------------------------- | -------------------------------------------------------------------------- | ----------------------------- |
+| Banco                      | e a fonte de verdade do estado da mensagem                                 | nada sobre entrega            |
+| `message_publish_outbox`   | que o evento e **processado** no backend, sobrevivendo a crash e a restart | que algum cliente o recebeu   |
+| WebSocket                  | entrega em tempo real, best-effort                                         | entrega, ordem ou recebimento |
+| Reconciliacao no reconnect | **convergencia do cliente** para o estado autoritativo                     | latencia                      |
 
 O outbox nao e transformado em ACK de browser. Guardar o evento ate um navegador
 confirmar traria sessao, multi-device, cleanup e contabilidade de entrega para
@@ -140,11 +140,11 @@ restart que caisse na janela.
 
 A correcao registra a **intencao antes** da chamada, o que separa os tres casos:
 
-| Linha | Significado | O que o worker faz |
-|---|---|---|
-| `scan_uuid IS NULL`, `submit_attempt_started_at IS NULL` | nunca submetida | submete |
+| Linha                                                        | Significado              | O que o worker faz            |
+| ------------------------------------------------------------ | ------------------------ | ----------------------------- |
+| `scan_uuid IS NULL`, `submit_attempt_started_at IS NULL`     | nunca submetida          | submete                       |
 | `scan_uuid IS NULL`, `submit_attempt_started_at IS NOT NULL` | **outcome desconhecido** | reconcilia, **nunca** submete |
-| `scan_uuid IS NOT NULL` | submetida e confirmada | faz poll |
+| `scan_uuid IS NOT NULL`                                      | submetida e confirmada   | faz poll                      |
 
 Erro do provedor cai no estado do meio de proposito: o client nao distingue
 "Cloudflare recusou" de "Cloudflare aceitou e a resposta se perdeu" -- as duas
@@ -420,7 +420,7 @@ duas URLs que o servidor de origem trata de forma diferente compartilharem um
 veredito.
 
 Domain Intelligence (`/intel/domain`) nao participa deste caminho. Ele responde
-sobre um *dominio*, que e exatamente a granularidade em que RF-21 nao pode
+sobre um _dominio_, que e exatamente a granularidade em que RF-21 nao pode
 decidir. Um fast deny por host esta na issue #526.
 
 ### Privacidade da submissao
@@ -643,12 +643,12 @@ e proposital: o orcamento limita gasto no provedor, nao uso do produto.
 
 **Controles:**
 
-| Controle | Escopo | Onde e aplicado |
-|---|---|---|
-| max 10 URLs distintas por mensagem | mensagem | extracao, antes de qualquer query |
-| orcamento de URLs novas | workspace, janela fixa | admissao, na mesma transacao que cria os jobs |
-| backlog cap | deployment | admissao |
-| provider submit rate | deployment, entre replicas | worker, antes do POST |
+| Controle                           | Escopo                     | Onde e aplicado                               |
+| ---------------------------------- | -------------------------- | --------------------------------------------- |
+| max 10 URLs distintas por mensagem | mensagem                   | extracao, antes de qualquer query             |
+| orcamento de URLs novas            | workspace, janela fixa     | admissao, na mesma transacao que cria os jobs |
+| backlog cap                        | deployment                 | admissao                                      |
+| provider submit rate               | deployment, entre replicas | worker, antes do POST                         |
 
 O orcamento de workspace e **compartilhado** por create de canal, create de DM,
 edit e forward. Cada um tinha seu proprio limiter e nenhum contava URL, entao
@@ -757,17 +757,17 @@ o breakdown por veredito seja necessario ali.
 
 Metricas do pipeline, todas com label `service`:
 
-| Metrica | Tipo | Labels | Para que serve |
-|---|---|---|---|
-| `nchat_link_scan_pending` | gauge | `service`, `state` | profundidade da fila; `state=submit_uncertain` e a serie que importa aqui |
-| `nchat_link_scan_oldest_pending_age_seconds` | gauge | `service` | ha quanto tempo a mais antiga espera |
-| `nchat_link_scan_attempts_total` | counter | `service`, `operation`, `result` | passos do pipeline; `result=throttled` e limite proprio, `uncertain` e janela de incerteza |
-| `nchat_link_scan_provider_duration_seconds` | histogram | `service`, `operation` | latencia de uma troca com Cloudflare |
-| `nchat_link_scan_revalidations_total` | counter | `service`, `reason` | vereditos reabertos por expiracao |
-| `nchat_link_scan_admissions_total` | counter | `service`, `result`, `reason` | **capacidade**: quantas operacoes foram recusadas e por qual teto |
-| `nchat_link_scan_submit_reconciliation_total` | counter | `service`, `result` | **janela de incerteza**: `adopted`, `not_found`, `error`, `ambiguous`, `stale`, `unsupported` |
-| `nchat_message_publish_outbox_pending` | gauge | `service` | eventos escritos e nao entregues |
-| `nchat_message_publish_outbox_oldest_pending_age_seconds` | gauge | `service` | idade do mais antigo |
+| Metrica                                                   | Tipo      | Labels                           | Para que serve                                                                                |
+| --------------------------------------------------------- | --------- | -------------------------------- | --------------------------------------------------------------------------------------------- |
+| `nchat_link_scan_pending`                                 | gauge     | `service`, `state`               | profundidade da fila; `state=submit_uncertain` e a serie que importa aqui                     |
+| `nchat_link_scan_oldest_pending_age_seconds`              | gauge     | `service`                        | ha quanto tempo a mais antiga espera                                                          |
+| `nchat_link_scan_attempts_total`                          | counter   | `service`, `operation`, `result` | passos do pipeline; `result=throttled` e limite proprio, `uncertain` e janela de incerteza    |
+| `nchat_link_scan_provider_duration_seconds`               | histogram | `service`, `operation`           | latencia de uma troca com Cloudflare                                                          |
+| `nchat_link_scan_revalidations_total`                     | counter   | `service`, `reason`              | vereditos reabertos por expiracao                                                             |
+| `nchat_link_scan_admissions_total`                        | counter   | `service`, `result`, `reason`    | **capacidade**: quantas operacoes foram recusadas e por qual teto                             |
+| `nchat_link_scan_submit_reconciliation_total`             | counter   | `service`, `result`              | **janela de incerteza**: `adopted`, `not_found`, `error`, `ambiguous`, `stale`, `unsupported` |
+| `nchat_message_publish_outbox_pending`                    | gauge     | `service`                        | eventos escritos e nao entregues                                                              |
+| `nchat_message_publish_outbox_oldest_pending_age_seconds` | gauge     | `service`                        | idade do mais antigo                                                                          |
 
 Todos os valores de label vem de conjuntos fechados definidos em
 `libs/go/platform/urlsafety`. Nao ha parametro em nenhuma dessas funcoes que

@@ -274,13 +274,13 @@ func (s *LinkScanService) advance(ctx context.Context, job LinkScanJob) {
 	switch {
 	case job.ScanUUID != "":
 		s.pollClaim(ctx, job)
-	case job.State == StateSubmitUncertain:
+	case job.State == StateSubmitting || job.State == StateSubmitUncertain:
 		// An attempt was handed to the provider and its outcome was never written
-		// down. The one state that must not submit: the provider may already have
+		// down. Both states must not submit: the provider may already have
 		// accepted, and asking again is how one logical scan becomes two billed
-		// ones.
+		// ones. submitting is what remains if parking as submit_uncertain failed.
 		s.reconcileUncertainSubmit(ctx, job)
-	default:
+	case job.State == StateSubmitPending:
 		s.submitClaim(ctx, job)
 	}
 }

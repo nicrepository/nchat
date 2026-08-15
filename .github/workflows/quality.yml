@@ -21,6 +21,25 @@ concurrency:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    # `pnpm test:coverage` includes the Go coverage gate, which merges in the
+    # RF-21 Link Safety profile when a database is offered. Ephemeral and local
+    # to this job; the *_test name is what the suites insist on.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nchat
+          POSTGRES_PASSWORD: nchat
+          POSTGRES_DB: nchat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nchat -d nchat_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      # Read only by scripts/ci/go-coverage-check.sh, so `pnpm test` and the race
+      # step keep skipping every opt-in PostgreSQL suite.
+      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:nchat@localhost:5432/nchat_test?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,6 +115,13 @@ jobs:
 
       - name: Run Go race tests
         run: bash scripts/ci/go-test.sh -race
+
+      # The RF-21 suites read the schema the real migrations produce, across both
+      # the chat and files domains, so the official runner applies them.
+      - name: Apply migrations to the coverage database
+        run: bash scripts/db/migrate.sh up
+        env:
+          MIGRATIONS_DATABASE_URL: ${{ env.LINK_SAFETY_TEST_DATABASE_URL }}
 
       - name: Test coverage
         run: pnpm test:coverage

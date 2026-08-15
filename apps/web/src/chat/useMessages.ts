@@ -259,8 +259,7 @@ const sendErrorMessages: Record<string, string> = {
   // not like the blocked one: nothing was decided about this link, and telling
   // someone their link looks dangerous because a queue was full is a claim with
   // nothing behind it.
-  link_check_capacity:
-    "Não foi possível verificar os links agora. Tente novamente em instantes.",
+  link_check_capacity: "Não foi possível verificar os links agora. Tente novamente em instantes.",
 };
 
 /**
@@ -389,7 +388,10 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         // local one in place: same position, no duplicate, no re-sort. Only this
         // transition is special-cased; every other repeat delivery stays the
         // no-op it was, which is what keeps at-least-once outbox delivery safe.
-        if (existing.status === "pending_link_scan" && action.message.status !== "pending_link_scan") {
+        if (
+          existing.status === "pending_link_scan" &&
+          action.message.status !== "pending_link_scan"
+        ) {
           const messages = [...state.messages];
           messages[existingIndex] = action.message;
           return { ...state, messages, realtimeError: null };
@@ -1430,7 +1432,14 @@ export function useMessages({
         // an answer the server never gave; the next reconnect asks again.
       },
     );
-  }, [fetchMessageUpdateSnapshot, finishWsFallback, isCurrentTarget, kind, startWsFallback, targetId]);
+  }, [
+    fetchMessageUpdateSnapshot,
+    finishWsFallback,
+    isCurrentTarget,
+    kind,
+    startWsFallback,
+    targetId,
+  ]);
 
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });

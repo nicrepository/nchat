@@ -430,7 +430,7 @@ func (s *PGXLinkScanStore) BeginSubmit(
 		       submit_generation = submit_generation + 1,
 		       updated_at = now()
 		 WHERE url_digest = $1
-		   AND state IN ('submit_pending', 'submitting')
+		   AND state = 'submit_pending'
 		   AND scan_uuid IS NULL
 		   AND submit_generation = $2
 		RETURNING submit_generation`,
@@ -468,7 +468,7 @@ func (s *PGXLinkScanStore) MarkSubmitUncertain(
 }
 
 // AdoptScanUUID binds a scan id recovered from the provider's search to the
-// uncertain attempt that produced it.
+// outstanding attempt that produced it.
 //
 // The same compare-and-set the ordinary submission uses. Reconciliation recovers
 // an *id*; the verdict is still read through the ordinary result path, which is
@@ -480,7 +480,7 @@ func (s *PGXLinkScanStore) AdoptScanUUID(
 		UPDATE files.link_scans
 		   SET state = 'polling', scan_uuid = $2, submit_attempt_started_at = NULL,
 		       lease_until = NULL, updated_at = now()
-		 WHERE url_digest = $1 AND state = 'submit_uncertain'
+		 WHERE url_digest = $1 AND state IN ('submitting', 'submit_uncertain')
 		   AND scan_uuid IS NULL AND submit_generation = $3`,
 		urlDigest, scanUUID, generation,
 	)

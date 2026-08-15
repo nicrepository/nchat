@@ -1079,11 +1079,13 @@ export async function fetchLinkSafetyStatuses(
   // outcome — the same one an absent id produces.
   return (response.data.statuses ?? []).flatMap((status) =>
     linkSafetyStates.includes(status.state as LinkSafetyState)
-      ? [{
-          messageId: status.message_id,
-          state: status.state as LinkSafetyState,
-          reason: status.reason,
-        }]
+      ? [
+          {
+            messageId: status.message_id,
+            state: status.state as LinkSafetyState,
+            reason: status.reason,
+          },
+        ]
       : [],
   );
 }

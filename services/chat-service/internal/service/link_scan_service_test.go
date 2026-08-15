@@ -43,13 +43,19 @@ type fakeQueue struct {
 	// how a stale worker's write is simulated without a second goroutine.
 	submitConflict  bool
 	verdictConflict bool
+	verdictErr      error
 	events          []storage.PublishEvent
 	claimEventsErr  error
 	published       []string
 	cancelled       []string
+	cancelErr       error
 	reopened        int
 	reopens         int
+	reopenErr       error
 	markErr         error
+	pruneErr        error
+	backlogErr      error
+	outboxErr       error
 
 	begun            []string
 	beginConflict    bool
@@ -58,7 +64,6 @@ type fakeQueue struct {
 	persistErr       error
 	adopted          []string
 	adoptConflict    bool
-	resubmitsAllowed int
 	resubmitCleared  []string
 	providerReserved int
 	reserveErr       error
@@ -156,7 +161,7 @@ func (q *fakeQueue) PruneLinkScanBudget(_ context.Context, _ time.Duration) erro
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.prunes++
-	return nil
+	return q.pruneErr
 }
 
 func (q *fakeQueue) RecordLinkVerdict(_ context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error {
@@ -166,6 +171,9 @@ func (q *fakeQueue) RecordLinkVerdict(_ context.Context, canonicalURL, scanUUID 
 		// The row moved on to a different scan while this worker was polling, so
 		// its answer describes a scan nobody is waiting on.
 		return storage.ErrLinkScanConflict
+	}
+	if q.verdictErr != nil {
+		return q.verdictErr
 	}
 	q.verdicts[canonicalURL] = verdict
 	q.boundScan = scanUUID
@@ -211,12 +219,18 @@ func (q *fakeQueue) ReopenExpiredVerdicts(_ context.Context) (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.reopens++
+	if q.reopenErr != nil {
+		return 0, q.reopenErr
+	}
 	return q.reopened, nil
 }
 
 func (q *fakeQueue) CancelPublishEvent(_ context.Context, messageID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.cancelErr != nil {
+		return q.cancelErr
+	}
 	q.cancelled = append(q.cancelled, messageID)
 	return nil
 }
@@ -224,12 +238,18 @@ func (q *fakeQueue) CancelPublishEvent(_ context.Context, messageID string) erro
 func (q *fakeQueue) PublishOutboxBacklog(_ context.Context) (int, time.Duration, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.outboxErr != nil {
+		return 0, 0, q.outboxErr
+	}
 	return len(q.events), 0, nil
 }
 
 func (q *fakeQueue) LinkScanBacklog(_ context.Context) (map[string]int, time.Duration, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.backlogErr != nil {
+		return nil, 0, q.backlogErr
+	}
 	return map[string]int{urlsafety.StateSubmitPending: len(q.jobs)}, 0, nil
 }
 

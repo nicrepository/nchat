@@ -147,9 +147,6 @@ const (
 	// publishBackoffSteps caps the stretch, so a hub refusing traffic settles at
 	// one attempt per half-minute instead of a storm.
 	publishBackoffSteps = 6
-
-	// maxPublishBatch bounds one dispatcher pass.
-	maxPublishBatch = 50
 )
 
 // LoadLinkVerdicts returns the fresh verdicts known for canonicalURLs.

@@ -69,7 +69,25 @@ quality:
 backend:
   stage: backend
   image: golang:1.25-bookworm
+  # The RF-21 Link Safety tests only run against a real PostgreSQL and the
+  # coverage gate merges their profile in. Ephemeral service credentials, local
+  # to this job; the database name must end in _test because the suites refuse
+  # any other.
+  services:
+    - name: postgres:16
+      alias: postgres
+  variables:
+    POSTGRES_USER: nchat
+    POSTGRES_PASSWORD: nchat
+    POSTGRES_DB: nchat_test
+    MIGRATIONS_DATABASE_URL: "postgresql://nchat:nchat@postgres:5432/nchat_test?sslmode=disable"
+    # Read only by scripts/ci/go-coverage-check.sh, so go-test.sh keeps skipping
+    # every opt-in PostgreSQL suite.
+    LINK_SAFETY_TEST_DATABASE_URL: "postgresql://nchat:nchat@postgres:5432/nchat_test?sslmode=disable"
   before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends postgresql-client
+    - rm -rf /var/lib/apt/lists/*
     - export PATH="$(go env GOPATH)/bin:$PATH"
     - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
   script:
@@ -77,6 +95,7 @@ backend:
     - bash scripts/ci/go-vet.sh
     - bash scripts/ci/go-test.sh
     - bash scripts/ci/health-contract-check.sh
+    - bash scripts/db/migrate.sh up
     - bash scripts/ci/go-coverage-check.sh
     - bash scripts/ci/go-lint.sh
 

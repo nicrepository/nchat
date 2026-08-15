@@ -35,6 +35,11 @@ type fakeLinkStore struct {
 	claimErr        error
 
 	admitErr         error
+	beginErr         error
+	uncertainErr     error
+	verdictErr       error
+	pruneErr         error
+	backlogErr       error
 	budgetUsed       int
 	begins           int
 	persistCalls     int
@@ -126,8 +131,11 @@ func (s *fakeLinkStore) undecided() int {
 func (s *fakeLinkStore) BeginSubmit(_ context.Context, urlDigest []byte, generation int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.beginErr != nil {
+		return 0, s.beginErr
+	}
 	row := s.rowByDigest(urlDigest)
-	if row == nil || row.scanUUID != "" || row.submitGeneration != generation {
+	if row == nil || row.state != service.StateSubmitPending || row.scanUUID != "" || row.submitGeneration != generation {
 		return 0, service.ErrLinkScanConflict
 	}
 	s.begins++
@@ -140,6 +148,9 @@ func (s *fakeLinkStore) BeginSubmit(_ context.Context, urlDigest []byte, generat
 func (s *fakeLinkStore) MarkSubmitUncertain(_ context.Context, urlDigest []byte, generation int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.uncertainErr != nil {
+		return s.uncertainErr
+	}
 	row := s.rowByDigest(urlDigest)
 	if row == nil || row.submitGeneration != generation || row.state != service.StateSubmitting {
 		return nil
@@ -154,7 +165,8 @@ func (s *fakeLinkStore) AdoptScanUUID(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row := s.rowByDigest(urlDigest)
-	if row == nil || row.submitGeneration != generation || row.state != service.StateSubmitUncertain {
+	if row == nil || row.submitGeneration != generation ||
+		(row.state != service.StateSubmitting && row.state != service.StateSubmitUncertain) {
 		return service.ErrLinkScanConflict
 	}
 	row.state, row.scanUUID, row.submitStartedAt = service.StatePolling, scanUUID, time.Time{}
@@ -184,7 +196,7 @@ func (s *fakeLinkStore) PruneLinkScanBudget(_ context.Context, _ time.Duration) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.prunes++
-	return nil
+	return s.pruneErr
 }
 
 // rowByDigest finds a row the way the real store's primary key does. Callers
@@ -262,6 +274,9 @@ func (s *fakeLinkStore) RecordVerdict(
 	if s.verdictConflict {
 		return service.ErrLinkScanConflict
 	}
+	if s.verdictErr != nil {
+		return s.verdictErr
+	}
 	for _, row := range s.rows {
 		if row.state == "polling" && row.scanUUID == scanUUID {
 			row.state, row.verdict = "done", verdict
@@ -276,6 +291,9 @@ func (s *fakeLinkStore) RecordVerdict(
 func (s *fakeLinkStore) Backlog(_ context.Context) (map[string]int, time.Duration, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.backlogErr != nil {
+		return nil, 0, s.backlogErr
+	}
 	byState := map[string]int{}
 	for _, row := range s.rows {
 		if row.state != "done" {
