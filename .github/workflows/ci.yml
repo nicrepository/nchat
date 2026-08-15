@@ -52,7 +52,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: nchat
-          POSTGRES_PASSWORD: nchat
+          POSTGRES_PASSWORD: REPLACE_ME
           POSTGRES_DB: nchat_test
         ports:
           - 5432:5432
@@ -62,7 +62,7 @@ jobs:
     env:
       # Read only by scripts/ci/go-coverage-check.sh, so `pnpm test` and the race
       # step keep skipping every opt-in PostgreSQL suite.
-      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:nchat@localhost:5432/nchat_test?sslmode=disable
+      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,7 +127,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: nchat
-          POSTGRES_PASSWORD: nchat
+          POSTGRES_PASSWORD: REPLACE_ME
           POSTGRES_DB: nchat_test
         ports:
           - 5432:5432
@@ -135,7 +135,7 @@ jobs:
           --health-cmd "pg_isready -U nchat -d nchat_test"
           --health-interval 10s --health-timeout 5s --health-retries 10
     env:
-      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:nchat@localhost:5432/nchat_test?sslmode=disable
+      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
