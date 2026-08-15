@@ -9,6 +9,11 @@ COPY apps/web apps/web
 RUN pnpm --filter @nchat/web build
 
 FROM nginxinc/nginx-unprivileged:1.29.3-alpine
-COPY infra/docker/web/nginx.conf /etc/nginx/conf.d/default.conf
+# Fora de /etc/nginx/templates/: esse diretório é auto-processado pelo
+# docker-entrypoint.d do nginx com envsubst sobre TODAS as env vars do
+# processo. O render abaixo é explícito e restrito a uma única variável.
+COPY infra/docker/web/nginx.conf /etc/nginx/web-template/default.conf.template
 COPY --from=build /src/apps/web/dist /usr/share/nginx/html
 USER 101:101
+ENV NCHAT_WEB_LIVEKIT_CONNECT_SRC=""
+CMD ["/bin/sh", "-c", "envsubst '$NCHAT_WEB_LIVEKIT_CONNECT_SRC' < /etc/nginx/web-template/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]

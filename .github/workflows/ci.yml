@@ -262,6 +262,9 @@ jobs:
       - name: Check web security headers
         run: pnpm web:security-headers-check
 
+      - name: Check web LiveKit CSP integration (Docker build + envsubst + nginx + HTTP)
+        run: pnpm web:livekit-integration-check
+
       - name: Check TLS config
         run: pnpm tls:config-check
 
