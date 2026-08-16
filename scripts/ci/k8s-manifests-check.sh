@@ -864,7 +864,28 @@ validate_nchat_dev() {
   # overlay names each secret key explicitly rather than mounting the Secret
   # wholesale, so it is four references — an account id and a token for each of
   # the two services.
-  if [[ "$(grep -Fc 'name: nchat-link-safety' "$application")" -ne 4 ]]; then
+  # Count only SecretKeySelector references. The rendered application may also
+  # contain the SealedSecret itself, whose metadata and template legitimately
+  # repeat the same Secret name and must not be mistaken for workload readers.
+  if [[ "$(
+    awk '
+      /^[[:space:]]+secretKeyRef:[[:space:]]*$/ {
+        in_ref = 1
+        ref_indent = match($0, /[^[:space:]]/) - 1
+        next
+      }
+      in_ref {
+        current_indent = match($0, /[^[:space:]]/) - 1
+        if ($0 !~ /^[[:space:]]*$/ && current_indent <= ref_indent) {
+          in_ref = 0
+        }
+      }
+      in_ref && /^[[:space:]]+name:[[:space:]]+nchat-link-safety[[:space:]]*$/ {
+        count++
+      }
+      END { print count + 0 }
+    ' "$application"
+  )" -ne 4 ]]; then
     echo "error: only chat-service and file-service may read nchat-link-safety, two keys each" >&2
     return 1
   fi
