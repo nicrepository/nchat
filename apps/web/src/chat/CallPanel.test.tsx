@@ -3,8 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import CallPanel from "./CallPanel";
-import type { CallMediaController } from "./useCallMedia";
+import type { CallMediaController, ParticipantMedia } from "./useCallMedia";
 import type { CallController } from "./useCallSignaling";
+import type { ResourceCallController, ResourceCallTarget } from "./useResourceCallSession";
 
 const currentUserId = "00000000-0000-4000-8000-000000000301";
 const otherUserId = "00000000-0000-4000-8000-000000000302";
@@ -58,6 +59,8 @@ function media(overrides: Partial<CallMediaController> = {}): CallMediaControlle
     pendingControl: null,
     bindLocalMedia: vi.fn(),
     bindRemoteMedia: vi.fn(),
+    participants: [],
+    bindRemoteAudio: vi.fn(),
     toggleMicrophone: vi.fn(async () => undefined),
     toggleCamera: vi.fn(async () => undefined),
     activateAudio: vi.fn(async () => undefined),
@@ -597,5 +600,353 @@ describe("CallPanel", () => {
 
     expect(calls.clearTerminal).not.toHaveBeenCalled();
     vi.useRealTimers();
+  });
+});
+
+// ── RF-24: resource room (channel/group) ────────────────────────────────────
+
+const idleCalls: CallController = {
+  call: null,
+  pending: false,
+  error: null,
+  mediaReady: false,
+  mediaActivationRequired: false,
+  start: vi.fn(() => true),
+  accept: vi.fn(() => true),
+  decline: vi.fn(() => true),
+  cancel: vi.fn(() => true),
+  end: vi.fn(() => true),
+  retryMedia: vi.fn(async () => undefined),
+  activateMedia: vi.fn(async () => undefined),
+  clearTerminal: vi.fn(),
+};
+
+const channelTarget: ResourceCallTarget = {
+  kind: "channel",
+  id: "00000000-0000-4000-8000-000000000701",
+  name: "geral",
+  callType: "video",
+};
+
+function resourceController(
+  overrides: Partial<ResourceCallController> = {},
+): ResourceCallController {
+  return {
+    active: channelTarget,
+    status: "active",
+    error: null,
+    errorOperation: null,
+    join: vi.fn(async () => undefined),
+    leave: vi.fn(async () => undefined),
+    ...overrides,
+  };
+}
+
+function participant(overrides: Partial<ParticipantMedia> = {}): ParticipantMedia {
+  return {
+    identity: "00000000-0000-4000-8000-000000000801",
+    hasVideo: false,
+    hasAudio: true,
+    bindVideo: vi.fn(),
+    ...overrides,
+  };
+}
+
+function renderResourcePanel(
+  resource: ResourceCallController,
+  mediaController?: ReturnType<typeof media>,
+  calls: CallController = idleCalls,
+) {
+  return render(
+    <CallPanel
+      calls={calls}
+      currentUserId={currentUserId}
+      identityStatus="ready"
+      retryIdentity={retryIdentity}
+      participantName="Ana Lima"
+      media={mediaController}
+      resource={resource}
+    />,
+  );
+}
+
+describe("CallPanel resource room (RF-24)", () => {
+  it("renders the channel name and participant count, local tile included", () => {
+    renderResourcePanel(
+      resourceController(),
+      media({ participants: [participant(), participant({ identity: "identity-b" })] }),
+    );
+
+    expect(screen.getByText("geral")).toBeInTheDocument();
+    expect(screen.getByText("Chamada de vídeo · 3 participantes")).toBeInTheDocument();
+    expect(screen.getByText("Você")).toBeInTheDocument();
+  });
+
+  it("renders a tile per participant with no fixed limit", () => {
+    const many = Array.from({ length: 15 }, (_, i) => participant({ identity: `identity-${i}` }));
+    renderResourcePanel(resourceController(), media({ participants: many }));
+
+    expect(screen.getByText("Chamada de vídeo · 16 participantes")).toBeInTheDocument();
+    for (const p of many) {
+      expect(screen.getByTestId(`participant-tile-${p.identity}`)).toBeInTheDocument();
+    }
+  });
+
+  it("shows the avatar fallback for a participant without video and a tile for one with video", () => {
+    renderResourcePanel(
+      resourceController(),
+      media({
+        participants: [
+          participant({ identity: "no-video", hasVideo: false }),
+          participant({ identity: "has-video", hasVideo: true }),
+        ],
+      }),
+    );
+
+    const withoutVideo = screen.getByTestId("participant-tile-no-video");
+    // Fallback avatar only renders for the participant without video.
+    expect(withoutVideo.querySelector(".call-panel__fallback--tile")).not.toBeNull();
+    const withVideo = screen.getByTestId("participant-tile-has-video");
+    expect(withVideo.querySelector(".call-panel__fallback--tile")).toBeNull();
+  });
+
+  it("shows a connecting status while joining", () => {
+    renderResourcePanel(resourceController({ status: "connecting" }), media());
+    expect(screen.getByText("Entrando na chamada…")).toBeInTheDocument();
+  });
+
+  it("shows the join error with a retry that calls join() again", async () => {
+    const resource = resourceController({
+      status: "error",
+      error: "Não foi possível entrar.",
+      errorOperation: "join",
+    });
+    renderResourcePanel(resource, media());
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível entrar.");
+    await userEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+    expect(resource.join).toHaveBeenCalledExactlyOnceWith(channelTarget);
+    expect(resource.leave).not.toHaveBeenCalled();
+  });
+
+  it("shows the leave error with a retry that calls leave() again, never join()", async () => {
+    const resource = resourceController({
+      status: "error",
+      error: "Não foi possível sair da chamada. Tente novamente.",
+      errorOperation: "leave",
+    });
+    renderResourcePanel(resource, media());
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Não foi possível sair da chamada. Tente novamente.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Tentar sair novamente" }));
+    expect(resource.leave).toHaveBeenCalledOnce();
+    expect(resource.join).not.toHaveBeenCalled();
+  });
+
+  it("leave() disconnects only locally: no call.end, no signaling call involved", async () => {
+    const resource = resourceController();
+    renderResourcePanel(resource, media());
+
+    await userEvent.click(screen.getByRole("button", { name: "Sair da chamada" }));
+
+    expect(resource.leave).toHaveBeenCalledOnce();
+    expect(idleCalls.end).not.toHaveBeenCalled();
+  });
+
+  it("hides the camera control for an audio-only resource room", () => {
+    renderResourcePanel(
+      resourceController({ active: { ...channelTarget, callType: "audio" } }),
+      media(),
+    );
+
+    expect(screen.queryByRole("button", { name: /câmera/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /microfone/i })).toBeInTheDocument();
+  });
+
+  it("toggles the local microphone from the resource room controls", async () => {
+    const mediaController = media();
+    renderResourcePanel(resourceController(), mediaController);
+
+    await userEvent.click(screen.getByRole("button", { name: "Desativar microfone" }));
+
+    expect(mediaController.toggleMicrophone).toHaveBeenCalledOnce();
+  });
+
+  it("toggles the local camera from the resource room controls", async () => {
+    const mediaController = media();
+    renderResourcePanel(resourceController(), mediaController);
+
+    await userEvent.click(screen.getByRole("button", { name: "Desativar câmera" }));
+
+    expect(mediaController.toggleCamera).toHaveBeenCalledOnce();
+  });
+
+  it("prevents the native dialog cancel (Escape) from closing the resource room", () => {
+    renderResourcePanel(resourceController(), media());
+
+    const event = new Event("cancel", { cancelable: true });
+    screen.getByTestId("resource-call-panel").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("renders nothing when there is no active resource room", () => {
+    const { container } = renderResourcePanel(resourceController({ active: null }), media());
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("swallows a rejected leave() at the click handler instead of leaving it unhandled", async () => {
+    const resource = resourceController({
+      leave: vi.fn(async () => {
+        throw new Error("cleanup failed");
+      }),
+    });
+    renderResourcePanel(resource, media());
+
+    await userEvent.click(screen.getByRole("button", { name: "Sair da chamada" }));
+
+    expect(resource.leave).toHaveBeenCalledOnce();
+  });
+});
+
+// ── RF-24 code review achado 2: audio activation recovery ──────────────────
+
+describe("CallPanel resource room audio activation (RF-24 code review achado 2)", () => {
+  it("offers an explicit action when browser audio activation is required", async () => {
+    const mediaController = media({ audioActivationRequired: true });
+    renderResourcePanel(resourceController(), mediaController);
+
+    const activate = screen.getByRole("button", { name: "Ativar áudio da chamada" });
+    await userEvent.click(activate);
+
+    expect(mediaController.activateAudio).toHaveBeenCalledOnce();
+  });
+
+  it("shows the loading state while the adapter is still being fetched", () => {
+    renderResourcePanel(resourceController(), media({ mediaLoading: true }));
+
+    expect(screen.getByRole("button", { name: "Carregando áudio da chamada" })).toBeDisabled();
+  });
+
+  it("shows the activating state while startAudio() is pending", () => {
+    renderResourcePanel(resourceController(), media({ audioStarting: true }));
+
+    expect(screen.getByRole("button", { name: "Ativando áudio da chamada" })).toBeDisabled();
+  });
+
+  it("hides the activation action once audio is confirmed playable", () => {
+    renderResourcePanel(resourceController(), media({ audioActivationRequired: false }));
+
+    expect(screen.queryByRole("button", { name: /áudio da chamada/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a recoverable error visible without leaving the room", () => {
+    renderResourcePanel(
+      resourceController(),
+      media({ audioActivationRequired: true, error: "O navegador bloqueou o áudio." }),
+    );
+
+    expect(screen.getByRole("button", { name: "Ativar áudio da chamada" })).toBeInTheDocument();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("RF-23 audio activation recovery is unaffected by the RF-24 addition", () => {
+    const calls = controller("active", currentUserId);
+    renderPanel(calls, media({ audioActivationRequired: true }));
+
+    expect(screen.getByRole("button", { name: "Ativar áudio da chamada" })).toBeInTheDocument();
+  });
+});
+
+// ── RF-24 code review achado 3: RF-23 x RF-24 arbitration ───────────────────
+
+describe("CallPanel RF-23 visible while RF-24 is active (RF-24 code review achado 3)", () => {
+  it("shows the incoming direct call and lets the user see who is calling while the resource room stays active", () => {
+    const calls = controller("ringing");
+    renderResourcePanel(resourceController(), media(), calls);
+
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+    expect(screen.getByRole("alert", { name: "Chamada de vídeo de Ana Lima" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Atender" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
+  });
+
+  it("declining the incoming call keeps the resource room active and calls decline()", async () => {
+    const calls = controller("ringing");
+    renderResourcePanel(resourceController(), media(), calls);
+
+    await userEvent.click(screen.getByRole("button", { name: "Recusar" }));
+
+    expect(calls.decline).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("accepting the incoming call invokes accept()", async () => {
+    const calls = controller("ringing");
+    renderResourcePanel(resourceController(), media(), calls);
+
+    await userEvent.click(screen.getByRole("button", { name: "Atender" }));
+
+    expect(calls.accept).toHaveBeenCalledOnce();
+  });
+
+  it("does not show the incoming banner for an outgoing (non-incoming) ringing call", () => {
+    const calls = controller("ringing", currentUserId);
+    renderResourcePanel(resourceController(), media(), calls);
+
+    expect(screen.queryByRole("alert", { name: /Chamada de/ })).not.toBeInTheDocument();
+  });
+
+  it("does not show the incoming banner once the resource room is not active", () => {
+    const calls = controller("ringing");
+    renderPanel(calls, media());
+
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("RF-24 code review round 2 achado 3: Recusar stays enabled and still calls decline() while Atender's preflight is pending", async () => {
+    const calls = { ...controller("ringing"), pending: true };
+    renderResourcePanel(resourceController(), media(), calls);
+
+    expect(screen.getByRole("button", { name: "Atender" })).toBeDisabled();
+    const recusar = screen.getByRole("button", { name: "Recusar" });
+    expect(recusar).toBeEnabled();
+
+    await userEvent.click(recusar);
+
+    expect(calls.decline).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+});
+
+// ── Precedence: an active RF-23 call always outranks an active RF-24 room ───
+
+describe("CallPanel precedence between an active RF-23 call and an active RF-24 room", () => {
+  it("shows the RF-23 dialog once the direct call is confirmed active, even while the resource room is still marked active", () => {
+    const calls = controller("active", currentUserId);
+    renderResourcePanel(resourceController(), media(), calls);
+
+    expect(
+      screen.getByRole("dialog", { name: "Chamada de vídeo com Ana Lima" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+  });
+
+  it("keeps showing the RF-24 room while the direct call is only ringing, not yet active", () => {
+    const calls = controller("ringing");
+    renderResourcePanel(resourceController(), media(), calls);
+
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /Chamada de vídeo com/ })).not.toBeInTheDocument();
+  });
+
+  it("shows the RF-24 room again once the direct call reaches a terminal state without ever taking over media", () => {
+    const calls = controller("ended", currentUserId);
+    renderResourcePanel(resourceController(), media(), calls);
+
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
   });
 });

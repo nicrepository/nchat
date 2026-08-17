@@ -410,6 +410,81 @@
   opacity: 0.45;
 }
 
+/* RF-24: an RF-23 direct call ringing in while this resource room is active. */
+
+.call-panel__incoming {
+  z-index: 6;
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 clamp(16px, 3vw, 32px);
+  padding: 10px 14px;
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: var(--radius-md, 10px);
+  color: #fff;
+  background: rgb(109 40 217 / 32%);
+  font-size: 13px;
+}
+
+.call-panel__incoming-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.call-panel__incoming-actions .call-panel__control {
+  min-width: 0;
+  flex-direction: row;
+  gap: 6px;
+}
+
+.call-panel__incoming-actions .call-panel__control-icon {
+  width: 32px;
+  height: 32px;
+}
+
+/* RF-24: resource room grid (channel/group) — no fixed tile count. */
+
+.call-panel__stage--grid {
+  display: block;
+  overflow-y: auto;
+  padding-top: 12px;
+}
+
+.call-panel__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  width: 100%;
+}
+
+.call-panel__tile {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: var(--radius-md, 10px);
+  background: #161220;
+}
+
+.call-panel__media--tile {
+  width: 100%;
+  height: 100%;
+}
+
+.call-panel__fallback--tile {
+  position: absolute;
+  inset: 0;
+  gap: 6px;
+}
+
+.call-panel__fallback--tile .call-panel__avatar--remote {
+  width: clamp(56px, 22%, 88px);
+  height: clamp(56px, 22%, 88px);
+  font-size: clamp(18px, 8%, 28px);
+}
+
 @keyframes call-pulse {
   50% {
     opacity: 0.35;
