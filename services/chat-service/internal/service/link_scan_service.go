@@ -99,14 +99,15 @@ const (
 	operationResolve = urlsafety.OperationResolve
 	operationPublish = urlsafety.OperationPublish
 
-	attemptResultSuccess   = urlsafety.AttemptSuccess
-	attemptResultPending   = urlsafety.AttemptPending
-	attemptResultRetry     = urlsafety.AttemptRetry
-	attemptResultError     = urlsafety.AttemptError
-	attemptResultLeaseLost = urlsafety.AttemptLeaseLost
-	attemptResultCancelled = urlsafety.AttemptCancelled
-	attemptResultThrottled = urlsafety.AttemptThrottled
-	attemptResultUncertain = urlsafety.AttemptUncertain
+	attemptResultSuccess      = urlsafety.AttemptSuccess
+	attemptResultPending      = urlsafety.AttemptPending
+	attemptResultRetry        = urlsafety.AttemptRetry
+	attemptResultError        = urlsafety.AttemptError
+	attemptResultLeaseLost    = urlsafety.AttemptLeaseLost
+	attemptResultCancelled    = urlsafety.AttemptCancelled
+	attemptResultThrottled    = urlsafety.AttemptThrottled
+	attemptResultUncertain    = urlsafety.AttemptUncertain
+	attemptResultInconclusive = urlsafety.AttemptInconclusive
 )
 
 // How the worker behaves in the submission window, and how much a deployment is
@@ -195,11 +196,15 @@ type LinkScanWorkerCapacity struct {
 
 // MessageBlockedPublisher announces to an author that their message was refused.
 //
-// The payload is deliberately just an id and the fact of the block: no body, no
-// URL, no scan id, no provider detail. The author needs to stop seeing "checking
-// links…"; nothing else about the verdict is theirs to receive.
+// The payload is deliberately just an id, a fixed reason, and the fact of the
+// block: no body, no URL, no scan id, no provider detail. The author needs to
+// stop seeing "checking links…"; nothing else about the verdict is theirs to
+// receive. reason is one of the closed set the ws package defines
+// (MessageBlockedReasonMaliciousLink, MessageBlockedReasonLinkCheckInconclusive)
+// and is what lets a refusal for an inconclusive scan read differently from one
+// for a malicious link, on the one event both share.
 type MessageBlockedPublisher interface {
-	PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string)
+	PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID, reason string)
 }
 
 // NewLinkScanService builds the worker's use case. publisher may be nil, in
@@ -609,6 +614,13 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job storage.LinkScanJob
 		// clearance — the row stays pending and is read again next time.
 		s.observeAttempt(operationPoll, attemptResultPending)
 		return
+	case errors.Is(err, urlsafety.ErrScanInconclusive):
+		// The provider confirms this exact scan finished and produced no usable
+		// verdict — the production incident this branch exists for. It is
+		// terminal and fail-closed: recorded once, below, and never polled again.
+		// There is no path from here into resubmission.
+		s.recordVerdict(ctx, job, urlsafety.VerdictInconclusive)
+		return
 	case err != nil:
 		s.observeAttempt(operationPoll, attemptResultRetry)
 		s.logFailure(ctx, "poll link scan", job, err)
@@ -624,9 +636,22 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job storage.LinkScanJob
 		s.logFailure(ctx, "poll link scan", job, urlsafety.ErrUnavailable)
 		return
 	}
+	s.recordVerdict(ctx, job, verdict)
+}
+
+// recordVerdict writes a terminal poll outcome — safe, malicious, or
+// inconclusive — and reports the attempt. Shared by pollClaim's ordinary
+// success path and its ErrScanInconclusive branch, because both are "this scan
+// id is decided, write it down and stop polling"; only the outcome label
+// differs.
+func (s *LinkScanService) recordVerdict(ctx context.Context, job storage.LinkScanJob, verdict urlsafety.Verdict) {
+	result := attemptResultSuccess
+	if verdict == urlsafety.VerdictInconclusive {
+		result = attemptResultInconclusive
+	}
 	switch err := s.queue.RecordLinkVerdict(ctx, job.CanonicalURL, job.ScanUUID, verdict); {
 	case err == nil:
-		s.observeAttempt(operationPoll, attemptResultSuccess)
+		s.observeAttempt(operationPoll, result)
 	case errors.Is(err, storage.ErrLinkScanConflict):
 		// This worker's lease had already been lost and the row now carries a
 		// different scan. Its answer describes a scan nobody is waiting on.
@@ -710,7 +735,7 @@ func (s *LinkScanService) deliver(ctx context.Context, event storage.PublishEven
 			s.observeAttempt(operationPublish, attemptResultRetry)
 			return
 		}
-		s.blockedPublisher.PublishMessageBlocked(ctx, event.WorkspaceID, event.TargetID, event.MessageID)
+		s.blockedPublisher.PublishMessageBlocked(ctx, event.WorkspaceID, event.TargetID, event.MessageID, event.Reason)
 	} else {
 		s.publisher.PublishMessageCreated(
 			ctx, event.WorkspaceID, event.TargetType, event.TargetID, event.Message,

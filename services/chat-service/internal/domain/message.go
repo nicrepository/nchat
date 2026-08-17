@@ -73,17 +73,25 @@ const (
 	LinkSafetyStateDeleted LinkSafetyState = "deleted"
 )
 
-// LinkSafetyReasonMaliciousLink is the only reason a blocked state carries.
-//
-// Fixed, like the websocket event's: which category Cloudflare reported is not
-// the author's to receive, and repeating it would make this an oracle for what
-// the provider already knows.
-const LinkSafetyReasonMaliciousLink = "malicious_link"
+// LinkSafetyReasonMaliciousLink and LinkSafetyReasonLinkCheckInconclusive are
+// the only reasons a blocked state carries — a closed set, like the websocket
+// event's. Which category Cloudflare reported is not the author's to receive,
+// and repeating it would make this an oracle for what the provider already
+// knows; a scan that finished without a usable verdict is reported as such and
+// not conflated with malicious, because it is not evidence the link is unsafe.
+const (
+	LinkSafetyReasonMaliciousLink         = "malicious_link"
+	LinkSafetyReasonLinkCheckInconclusive = "link_check_inconclusive"
+)
 
-// MessageLinkSafetyState pairs one message id with its current state.
+// MessageLinkSafetyState pairs one message id with its current state and, for
+// a blocked state, why.
 type MessageLinkSafetyState struct {
 	MessageID string
 	State     LinkSafetyState
+	// Reason is one of the LinkSafetyReason* constants, and is only ever set
+	// when State is LinkSafetyStateBlocked.
+	Reason string
 }
 
 // MessageBodyFormat selects the grammar used to render BodyText.

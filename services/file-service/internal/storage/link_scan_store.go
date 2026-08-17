@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
@@ -198,7 +199,8 @@ func reserveScanCapacity(
 	if capacity.MaxPendingJobs > 0 {
 		var pending int
 		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM files.link_scans WHERE state <> 'done'`,
+			`SELECT count(*) FROM files.link_scans
+			 WHERE state IN ('submit_pending', 'submitting', 'submit_uncertain', 'polling')`,
 		).Scan(&pending); err != nil {
 			return service.LinkScanAdmission{}, fmt.Errorf("read link scan backlog: %w", err)
 		}
@@ -336,7 +338,7 @@ const claimDueLinkScansQuery = `
 	WITH due AS (
 		SELECT ls.url_digest
 		FROM files.link_scans ls
-		WHERE ls.state <> 'done'
+		WHERE ls.state IN ('submit_pending', 'submitting', 'submit_uncertain', 'polling')
 		  AND (ls.next_attempt_at IS NULL OR ls.next_attempt_at <= now())
 		  AND (ls.lease_until IS NULL OR ls.lease_until <= now())
 		ORDER BY ls.next_attempt_at NULLS FIRST, ls.created_at
@@ -503,17 +505,35 @@ func (s *PGXLinkScanStore) AdoptScanUUID(
 func (s *PGXLinkScanStore) RecordVerdict(
 	ctx context.Context, urlDigest []byte, scanUUID string, verdict urlsafety.Verdict, ttl time.Duration,
 ) error {
-	if !verdict.IsFinal() {
+	if !verdict.IsFinal() && verdict != urlsafety.VerdictInconclusive {
 		return fmt.Errorf("link scan: refusing to store a non-final verdict")
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE files.link_scans
-		   SET state = 'done', verdict = $3,
-		       verdict_expires_at = now() + ($4 * interval '1 second'),
-		       lease_until = NULL, next_attempt_at = NULL, updated_at = now()
-		 WHERE url_digest = $1 AND state = 'polling' AND scan_uuid = $2`,
-		urlDigest, scanUUID, string(verdict), ttl.Seconds(),
-	)
+
+	var tag pgconn.CommandTag
+	var err error
+	if verdict == urlsafety.VerdictInconclusive {
+		// Terminal, and deliberately without a TTL: unlike a safe/malicious
+		// clearance this never expires back into the claim query on a timer — see
+		// ClaimDueScans and Backlog, which exclude this state outright — so there
+		// is no automatic resubmit loop for a scan that already finished without
+		// a usable verdict.
+		tag, err = s.pool.Exec(ctx, `
+			UPDATE files.link_scans
+			   SET state = 'inconclusive', verdict = NULL, verdict_expires_at = NULL,
+			       lease_until = NULL, next_attempt_at = NULL, updated_at = now()
+			 WHERE url_digest = $1 AND state = 'polling' AND scan_uuid = $2`,
+			urlDigest, scanUUID,
+		)
+	} else {
+		tag, err = s.pool.Exec(ctx, `
+			UPDATE files.link_scans
+			   SET state = 'done', verdict = $3,
+			       verdict_expires_at = now() + ($4 * interval '1 second'),
+			       lease_until = NULL, next_attempt_at = NULL, updated_at = now()
+			 WHERE url_digest = $1 AND state = 'polling' AND scan_uuid = $2`,
+			urlDigest, scanUUID, string(verdict), ttl.Seconds(),
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("record link verdict: %w", err)
 	}
@@ -534,13 +554,16 @@ func (s *PGXLinkScanStore) Backlog(ctx context.Context) (map[string]int, time.Du
 	// person reading the gauge. Reporting them together is also what makes this
 	// number comparable with chat-service, whose row cannot tell them apart at
 	// all.
+	// 'inconclusive' is excluded, not just uncounted: it is terminal, and a
+	// backlog gauge that kept counting it would misrepresent a scan the pipeline
+	// has deliberately stopped polling as work still outstanding.
 	rows, err := s.pool.Query(ctx, `
 		SELECT CASE WHEN state IN ('submitting', 'submit_uncertain')
 		            THEN 'submit_uncertain' ELSE state END AS state,
 		       count(*),
 		       COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)
 		FROM files.link_scans
-		WHERE state <> 'done'
+		WHERE state IN ('submit_pending', 'submitting', 'submit_uncertain', 'polling')
 		GROUP BY 1`)
 	if err != nil {
 		return nil, 0, fmt.Errorf("link scan backlog: %w", err)
