@@ -30,7 +30,37 @@ type LiveKitTokenIssuer interface {
 }
 
 type liveKitTokenRequest struct {
-	CallID string `json:"call_id"`
+	CallID       string `json:"call_id"`
+	ResourceKind string `json:"resource_kind"`
+	ResourceID   string `json:"resource_id"`
+}
+
+// parseLiveKitTokenTarget resolves the request into exactly one resource
+// target. call_id (RF-23) and resource_kind/resource_id (RF-24) are mutually
+// exclusive; resource_kind only ever accepts "channel" or "dm" — never
+// "call", which stays reachable exclusively through call_id.
+func parseLiveKitTokenTarget(request liveKitTokenRequest) (domain.ResourceKind, string, error) {
+	hasCall := request.CallID != ""
+	hasResource := request.ResourceKind != "" || request.ResourceID != ""
+	if hasCall == hasResource {
+		return "", "", domain.ErrInvalidInput
+	}
+	if hasCall {
+		id, err := uuid.Parse(request.CallID)
+		if err != nil {
+			return "", "", domain.ErrInvalidInput
+		}
+		return domain.ResourceKindCall, id.String(), nil
+	}
+	kind := domain.ResourceKind(request.ResourceKind)
+	if kind != domain.ResourceKindChannel && kind != domain.ResourceKindDM {
+		return "", "", domain.ErrInvalidInput
+	}
+	id, err := uuid.Parse(request.ResourceID)
+	if err != nil {
+		return "", "", domain.ErrInvalidInput
+	}
+	return kind, id.String(), nil
 }
 
 type liveKitTokenResponse struct {
@@ -72,25 +102,25 @@ func LiveKitToken(issuer LiveKitTokenIssuer, serverURL string, logger *slog.Logg
 			writeLiveKitTokenDecodeError(w, r, logger, startedAt, err)
 			return
 		}
-		callID, err := uuid.Parse(request.CallID)
+		kind, resourceID, err := parseLiveKitTokenTarget(request)
 		if err != nil {
-			writeLiveKitTokenError(w, r, logger, startedAt, "call", domain.ErrInvalidInput)
+			writeLiveKitTokenError(w, r, logger, startedAt, "unknown", domain.ErrInvalidInput)
 			return
 		}
 
 		issued, err := issuer.Issue(r.Context(), service.IssueTokenInput{
-			Kind:            domain.ResourceKindCall,
-			ResourceID:      callID.String(),
+			Kind:            kind,
+			ResourceID:      resourceID,
 			UserID:          principal.UserID,
 			SessionID:       principal.SessionID,
 			AccessExpiresAt: principal.AccessExpiresAt,
 		})
 		if err != nil {
-			writeLiveKitTokenError(w, r, logger, startedAt, "call", err)
+			writeLiveKitTokenError(w, r, logger, startedAt, string(kind), err)
 			return
 		}
 
-		logLiveKitTokenResult(r, logger, startedAt, "call", "issued", http.StatusOK, "")
+		logLiveKitTokenResult(r, logger, startedAt, string(kind), "issued", http.StatusOK, "")
 		httputil.WriteJSON(w, http.StatusOK, liveKitTokenResponse{
 			Token: issued.Token, ExpiresAt: issued.ExpiresAt, ServerURL: serverURL,
 		})

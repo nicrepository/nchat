@@ -85,7 +85,7 @@ func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (Issued
 	if err != nil {
 		return IssuedToken{}, domain.ErrUnauthorized
 	}
-	if input.Kind != domain.ResourceKindCall {
+	if !input.Kind.Valid() {
 		return IssuedToken{}, domain.ErrInvalidInput
 	}
 

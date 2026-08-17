@@ -81,6 +81,33 @@ func TestLiveKitTokenHandlerIssuesCallTokenFromPrincipal(t *testing.T) {
 	}
 }
 
+func TestLiveKitTokenHandlerIssuesResourceTokenFromPrincipal(t *testing.T) {
+	for _, kind := range []domain.ResourceKind{domain.ResourceKindChannel, domain.ResourceKindDM} {
+		t.Run(string(kind), func(t *testing.T) {
+			expiresAt := time.Date(2026, 7, 21, 15, 4, 5, 0, time.UTC)
+			issuer := &fakeTokenIssuer{result: service.IssuedToken{
+				Token: "signed-livekit-token", ExpiresAt: expiresAt,
+			}}
+			response := serveLiveKitHandler(
+				LiveKitToken(issuer, handlerTestServerURL, slog.Default()),
+				`{"resource_kind":"`+string(kind)+`","resource_id":"`+handlerTestResource+`"}`,
+				authenticatedRequestContext(),
+			)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+			}
+			if issuer.calls != 1 {
+				t.Fatalf("expected one issuer call, got %d", issuer.calls)
+			}
+			if issuer.input.Kind != kind || issuer.input.ResourceID != handlerTestResource ||
+				issuer.input.UserID != handlerTestUserID || issuer.input.SessionID != handlerTestSessionID {
+				t.Fatalf("issuer received untrusted or incorrect input: %+v", issuer.input)
+			}
+		})
+	}
+}
+
 func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 	tests := []struct {
 		name string
@@ -97,6 +124,15 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 		{name: "grants", body: `{"call_id":"` + handlerTestResource + `","grants":{}}`, want: http.StatusBadRequest},
 		{name: "ttl", body: `{"call_id":"` + handlerTestResource + `","ttl":3600}`, want: http.StatusBadRequest},
 		{name: "oversized", body: `{"call_id":"` + strings.Repeat("a", liveKitTokenBodyLimit) + `"}`, want: http.StatusRequestEntityTooLarge},
+		{name: "both call_id and resource_kind", body: `{"call_id":"` + handlerTestResource + `","resource_kind":"channel","resource_id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
+		{name: "resource_kind without resource_id", body: `{"resource_kind":"channel"}`, want: http.StatusBadRequest},
+		{name: "resource_id without resource_kind", body: `{"resource_id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
+		{name: "resource_kind call rejected", body: `{"resource_kind":"call","resource_id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
+		{name: "resource_kind room rejected", body: `{"resource_kind":"room","resource_id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
+		{name: "resource_kind invalid uuid", body: `{"resource_kind":"channel","resource_id":"not-a-uuid"}`, want: http.StatusBadRequest},
+		{name: "resource_kind with user_id", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","user_id":"` + handlerTestUserID + `"}`, want: http.StatusBadRequest},
+		{name: "resource_kind with session_id", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","session_id":"` + handlerTestSessionID + `"}`, want: http.StatusBadRequest},
+		{name: "resource_kind with workspace_id", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","workspace_id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

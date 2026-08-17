@@ -86,6 +86,7 @@ const dmAuthorizationQuery = authsession.ActiveSessionCTE + `,
 		 AND dm.user_id = active.user_id
 		 AND dm.status = 'active'
 		WHERE dc.status = 'active'
+		  AND dc.type = 'group'
 	)
 	SELECT
 		(SELECT session_expires_at FROM active_session) AS session_expires_at,
