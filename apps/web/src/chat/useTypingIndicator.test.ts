@@ -158,9 +158,7 @@ describe("useTypingIndicator — outbound activity and timers", () => {
       { initialProps: { targetId: "chan-1" } },
     );
     act(() => result.current.notifyActivity());
-    act(() =>
-      result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })),
-    );
+    act(() => result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })));
     expect(result.current.typingUserIds).toEqual([OTHER_USER]);
 
     sendTyping.mockClear();
@@ -186,9 +184,7 @@ describe("useTypingIndicator — remote typing expiry", () => {
   it("expires a remote typing entry after the local defensive window if never renewed", () => {
     vi.useFakeTimers();
     const { result } = setup();
-    act(() =>
-      result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })),
-    );
+    act(() => result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })));
     expect(result.current.typingUserIds).toEqual([OTHER_USER]);
 
     act(() => vi.advanceTimersByTime(8_000)); // REMOTE_EXPIRY_MS
@@ -199,13 +195,9 @@ describe("useTypingIndicator — remote typing expiry", () => {
   it("does not expire a remote entry that was renewed before the defensive window elapsed", () => {
     vi.useFakeTimers();
     const { result } = setup();
-    act(() =>
-      result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })),
-    );
+    act(() => result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })));
     act(() => vi.advanceTimersByTime(5_000));
-    act(() =>
-      result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" })),
-    ); // renews the 8s window from here
+    act(() => result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" }))); // renews the 8s window from here
     act(() => vi.advanceTimersByTime(5_000)); // 10s since the first event, only 5s since the renewal
     expect(result.current.typingUserIds).toEqual([OTHER_USER]);
   });
