@@ -32,12 +32,18 @@ const (
 	EventTypeMessageBlocked EventType = "message.blocked"
 )
 
-// MessageBlockedReasonMaliciousLink is the only reason message.blocked carries.
+// MessageBlockedReasonMaliciousLink and MessageBlockedReasonLinkCheckInconclusive
+// are the only reasons message.blocked carries — a closed set.
 //
-// A constant rather than a message from the provider: whichever category
+// Constants rather than a message from the provider: whichever category
 // Cloudflare reported is not the author's to receive, and repeating it would
-// make the endpoint an oracle for which domains are already known.
-const MessageBlockedReasonMaliciousLink = "malicious_link"
+// make the endpoint an oracle for which domains are already known. The two are
+// kept distinct so a scan that finished without a usable verdict is never
+// announced to its author as "malicious" — it is fail-closed, not a finding.
+const (
+	MessageBlockedReasonMaliciousLink         = "malicious_link"
+	MessageBlockedReasonLinkCheckInconclusive = "link_check_inconclusive"
+)
 
 const (
 	EventTypeReactionUpdated EventType = "reaction.updated"

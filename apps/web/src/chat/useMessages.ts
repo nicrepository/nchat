@@ -133,13 +133,14 @@ type Action =
   | { type: "send_error"; error: string }
   /**
    * RF-21: a message this client is showing as pending has reached a terminal
-   * state. `malicious_link` is the refusal; `unavailable` is a message that is
-   * simply gone, which must not be reported as a blocked link.
+   * state. `malicious_link` and `link_check_inconclusive` are the two refusal
+   * reasons the server distinguishes; `unavailable` is a message that is simply
+   * gone, which must not be reported as either.
    */
   | {
       type: "message_blocked";
       messageId: string;
-      reason?: "malicious_link" | "unavailable";
+      reason?: "malicious_link" | "link_check_inconclusive" | "unavailable";
     }
   | { type: "prepending" }
   | { type: "prepended"; page: MessagePage }
@@ -255,6 +256,10 @@ const sendErrorMessages: Record<string, string> = {
   malicious_url: "Este link foi bloqueado por segurança.",
   link_check_unavailable:
     "Não foi possível verificar a segurança do link. Tente novamente em instantes.",
+  // A terminal outcome, not a transient one — the scan finished and produced no
+  // usable verdict, so unlike link_check_unavailable this deliberately carries
+  // no "try again" implication: retrying does not resubmit anything.
+  link_check_inconclusive: "Não foi possível verificar a segurança deste link.",
   // The backend declined to start a new scan right now — a spent window or a
   // full queue. Deliberately worded like the unavailable case and deliberately
   // not like the blocked one: nothing was decided about this link, and telling
@@ -262,6 +267,10 @@ const sendErrorMessages: Record<string, string> = {
   // nothing behind it.
   link_check_capacity: "Não foi possível verificar os links agora. Tente novamente em instantes.",
 };
+
+function blockedMessageReason(reason?: string): "malicious_link" | "link_check_inconclusive" {
+  return reason === "link_check_inconclusive" ? reason : "malicious_link";
+}
 
 /**
  * The copy for a pending message that is gone for a reason nobody attributed to
@@ -343,10 +352,18 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         ...state,
         messages: state.messages.filter((m) => m.id !== action.messageId),
         sending: false,
+        // "unavailable" is the one explicit sentinel for "the message itself is
+        // gone" (reconciliation found no blocked verdict behind it). Every other
+        // reason — a recognised one, or one this client does not know yet — is a
+        // link refusal, and defaults to the malicious wording rather than the
+        // "gone" one: downgrading an unrecognised-but-real refusal to "message
+        // unavailable" would discard a verdict already established.
         sendError:
           action.reason === "unavailable"
             ? pendingMessageUnavailable
-            : sendErrorMessages.malicious_url,
+            : action.reason === "link_check_inconclusive"
+              ? sendErrorMessages.link_check_inconclusive
+              : sendErrorMessages.malicious_url,
         lastMutation: "none",
       };
     }
@@ -1130,7 +1147,11 @@ export function useMessages({
   // message was never published, so leaving a husk of it in the transcript would
   // suggest otherwise.
   const handleWsMessageBlocked = useCallback((evt: WSMessageBlockedEvent) => {
-    dispatch({ type: "message_blocked", messageId: evt.message_id });
+    dispatch({
+      type: "message_blocked",
+      messageId: evt.message_id,
+      reason: blockedMessageReason(evt.reason),
+    });
   }, []);
 
   const handleWsMessageCreated = useCallback(
@@ -1423,7 +1444,8 @@ export function useMessages({
           dispatch({
             type: "message_blocked",
             messageId: status.messageId,
-            reason: status.state === "blocked" ? "malicious_link" : "unavailable",
+            reason:
+              status.state === "blocked" ? blockedMessageReason(status.reason) : "unavailable",
           });
         }
       },

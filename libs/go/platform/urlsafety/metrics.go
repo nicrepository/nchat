@@ -10,13 +10,14 @@ import (
 // asks about, so a label derived from it would let one hostile client create an
 // unbounded number of series.
 const (
-	resultHit       = "hit"
-	resultMiss      = "miss"
-	resultSubmitted = "submitted"
-	resultPending   = "pending"
-	resultSafe      = "safe"
-	resultMalicious = "malicious"
-	resultError     = "error"
+	resultHit          = "hit"
+	resultMiss         = "miss"
+	resultSubmitted    = "submitted"
+	resultPending      = "pending"
+	resultSafe         = "safe"
+	resultMalicious    = "malicious"
+	resultError        = "error"
+	resultInconclusive = "inconclusive"
 )
 
 // Metrics counts verdict outcomes.

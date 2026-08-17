@@ -208,6 +208,267 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		}
 	})
 
+	// The RF-21 incident this branch fixes: Cloudflare answers HTTP 200,
+	// task.status=finished, task.success=false, hasVerdicts=false. That is
+	// VerdictInconclusive from the provider layer, and this proves the row it
+	// produces is genuinely terminal against the real claim, backlog, reopen and
+	// re-request queries — not just what a Go fake believes about them.
+	t.Run("an inconclusive verdict is terminal, excluded from claims and backlog, and never reopened", func(t *testing.T) {
+		resetQueue(t)
+		if err := store.EnsureLinkScans(ctx, []string{goodURL}); err != nil {
+			t.Fatalf("EnsureLinkScans: %v", err)
+		}
+		job := claimOne(t, goodURL)
+		generation, err := store.BeginLinkScanSubmit(ctx, goodURL, job.SubmitGeneration)
+		if err != nil {
+			t.Fatalf("BeginLinkScanSubmit: %v", err)
+		}
+		if err := store.RecordLinkScanSubmission(ctx, goodURL, "scan-inconclusive", generation); err != nil {
+			t.Fatalf("RecordLinkScanSubmission: %v", err)
+		}
+		if err := store.RecordLinkVerdict(ctx, goodURL, "scan-inconclusive", urlsafety.VerdictInconclusive); err != nil {
+			t.Fatalf("RecordLinkVerdict(inconclusive): %v", err)
+		}
+		var status string
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.link_scans WHERE canonical_url = $1`, goodURL).Scan(&status); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if status != "inconclusive" {
+			t.Fatalf("status = %q, want inconclusive", status)
+		}
+
+		// Never a usable verdict.
+		verdicts, err := store.LoadLinkVerdicts(ctx, []string{goodURL})
+		if err != nil {
+			t.Fatalf("LoadLinkVerdicts: %v", err)
+		}
+		if len(verdicts) != 0 {
+			t.Fatalf("an inconclusive scan produced a loadable verdict: %v", verdicts)
+		}
+
+		// Never claimed again, even once the row would otherwise look due.
+		due(t, goodURL)
+		jobs, err := store.ClaimDueLinkScans(ctx, 10)
+		if err != nil {
+			t.Fatalf("ClaimDueLinkScans: %v", err)
+		}
+		for _, claimed := range jobs {
+			if claimed.CanonicalURL == goodURL {
+				t.Fatal("an inconclusive url was claimed again")
+			}
+		}
+
+		// Never counted as backlog.
+		byState, _, err := store.LinkScanBacklog(ctx)
+		if err != nil {
+			t.Fatalf("LinkScanBacklog: %v", err)
+		}
+		if n, present := byState["inconclusive"]; present && n > 0 {
+			t.Fatalf("backlog counted an inconclusive row: %v", byState)
+		}
+
+		// A worker restart re-runs EnsureLinkScans for the same URL — this is the
+		// dedup/admission path a fresh message naming the URL would go through.
+		// It must not resubmit or reopen the terminal row.
+		if err := store.EnsureLinkScans(ctx, []string{goodURL}); err != nil {
+			t.Fatalf("EnsureLinkScans (re-request): %v", err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.link_scans WHERE canonical_url = $1`, goodURL).Scan(&status); err != nil {
+			t.Fatalf("read status after re-request: %v", err)
+		}
+		if status != "inconclusive" {
+			t.Fatalf("status = %q, a re-request reopened the row", status)
+		}
+		jobs, err = store.ClaimDueLinkScans(ctx, 10)
+		if err != nil {
+			t.Fatalf("ClaimDueLinkScans after re-request: %v", err)
+		}
+		for _, claimed := range jobs {
+			if claimed.CanonicalURL == goodURL {
+				t.Fatal("a re-request submitted a fresh claim for an inconclusive url")
+			}
+		}
+
+		// ReopenExpiredVerdicts is scoped to safe/malicious; even with a message
+		// depending on it, an inconclusive row must not be swept back to pending.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.messages
+				(id, workspace_id, channel_id, sender_id, kind, body_text, body_format,
+				 status, link_safety_fingerprint)
+			VALUES ($1, $2, $3, $4, 'user', 'inconclusive body', 'v2', 'pending_link_scan', $5)
+			ON CONFLICT (id) DO NOTHING`,
+			refused, workspace, channel, author, fingerprint); err != nil {
+			t.Fatalf("seed withheld message: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			refused, goodURL, fingerprint); err != nil {
+			t.Fatalf("seed association: %v", err)
+		}
+		reopened, err := store.ReopenExpiredVerdicts(ctx)
+		if err != nil {
+			t.Fatalf("ReopenExpiredVerdicts: %v", err)
+		}
+		if reopened != 0 {
+			t.Fatalf("reopened %d rows, want an inconclusive row never reopened", reopened)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.link_scans WHERE canonical_url = $1`, goodURL).Scan(&status); err != nil {
+			t.Fatalf("read status after reopen sweep: %v", err)
+		}
+		if status != "inconclusive" {
+			t.Fatalf("status = %q, the reopen sweep touched an inconclusive row", status)
+		}
+
+		// The message waiting on it still resolves — to blocked, not stranded.
+		summary, err := store.ResolveDecidedMessages(ctx)
+		if err != nil {
+			t.Fatalf("ResolveDecidedMessages: %v", err)
+		}
+		if summary.Blocked != 1 || summary.Published != 0 {
+			t.Fatalf("summary = %+v, want the withheld message blocked by the inconclusive verdict", summary)
+		}
+		var msgStatus string
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.messages WHERE id = $1`, refused).Scan(&msgStatus); err != nil {
+			t.Fatalf("read message status: %v", err)
+		}
+		if msgStatus != "deleted" {
+			t.Fatalf("message status = %q, want deleted", msgStatus)
+		}
+		var eventType, targetType, blockReason string
+		if err := pool.QueryRow(ctx, `
+			SELECT event_type, target_type, COALESCE(block_reason, '')
+			FROM chat.message_publish_outbox WHERE message_id = $1`, refused,
+		).Scan(&eventType, &targetType, &blockReason); err != nil {
+			t.Fatalf("read blocked event: %v", err)
+		}
+		if eventType != storage.EventMessageBlocked || targetType != storage.TargetSender {
+			t.Fatalf("event = %s/%s, want a refusal addressed to its author", eventType, targetType)
+		}
+		if blockReason != "link_check_inconclusive" {
+			t.Fatalf("block_reason = %q, want link_check_inconclusive", blockReason)
+		}
+		// No mention/notification for a message that was never shown to anyone.
+		var notified int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM chat.notification_outbox WHERE message_id = $1`, refused,
+		).Scan(&notified); err != nil {
+			t.Fatalf("count notifications: %v", err)
+		}
+		if notified != 0 {
+			t.Fatalf("notified = %d, want no notification for a blocked message", notified)
+		}
+
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, refused); err != nil {
+			t.Fatalf("clean withheld message: %v", err)
+		}
+	})
+
+	// The dedup point: two messages naming the same URL share one scan row.
+	// Settled inconclusive, both must resolve to blocked from that single scan —
+	// nothing here ever calls the provider a second time for the same URL.
+	t.Run("two messages sharing a URL settle from one inconclusive scan", func(t *testing.T) {
+		const (
+			first  = "e3000000-0000-4000-8000-00000000000e"
+			second = "e3000000-0000-4000-8000-00000000000f"
+		)
+		resetQueue(t)
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = ANY($1::uuid[])`,
+			[]string{first, second}); err != nil {
+			t.Fatalf("clean messages: %v", err)
+		}
+
+		// Both admissions name the same URL — this is the dedup point.
+		if err := store.EnsureLinkScans(ctx, []string{goodURL}); err != nil {
+			t.Fatalf("EnsureLinkScans (first): %v", err)
+		}
+		if err := store.EnsureLinkScans(ctx, []string{goodURL}); err != nil {
+			t.Fatalf("EnsureLinkScans (second): %v", err)
+		}
+		var rows int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM chat.link_scans WHERE canonical_url = $1`, goodURL).Scan(&rows); err != nil {
+			t.Fatalf("count rows: %v", err)
+		}
+		if rows != 1 {
+			t.Fatalf("rows = %d, want exactly one scan for two admissions of the same url", rows)
+		}
+
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.messages
+				(id, workspace_id, channel_id, sender_id, kind, body_text, body_format,
+				 status, link_safety_fingerprint)
+			VALUES ($1, $3, $4, $5, 'user', 'first',  'v2', 'pending_link_scan', $6),
+			       ($2, $3, $4, $5, 'user', 'second', 'v2', 'pending_link_scan', $6)`,
+			first, second, workspace, channel, author, fingerprint); err != nil {
+			t.Fatalf("seed messages: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			VALUES ($1, $3, $4), ($2, $3, $4)`,
+			first, second, goodURL, fingerprint); err != nil {
+			t.Fatalf("seed associations: %v", err)
+		}
+
+		job := claimOne(t, goodURL)
+		generation, err := store.BeginLinkScanSubmit(ctx, goodURL, job.SubmitGeneration)
+		if err != nil {
+			t.Fatalf("BeginLinkScanSubmit: %v", err)
+		}
+		if err := store.RecordLinkScanSubmission(ctx, goodURL, "scan-shared", generation); err != nil {
+			t.Fatalf("RecordLinkScanSubmission: %v", err)
+		}
+		// One Submit, exactly: a second claim of the same url must find nothing.
+		jobs, err := store.ClaimDueLinkScans(ctx, 10)
+		if err != nil {
+			t.Fatalf("ClaimDueLinkScans: %v", err)
+		}
+		for _, j := range jobs {
+			if j.CanonicalURL == goodURL {
+				t.Fatal("the shared url was claimed a second time before it was decided")
+			}
+		}
+		if err := store.RecordLinkVerdict(ctx, goodURL, "scan-shared", urlsafety.VerdictInconclusive); err != nil {
+			t.Fatalf("RecordLinkVerdict(inconclusive): %v", err)
+		}
+
+		summary, err := store.ResolveDecidedMessages(ctx)
+		if err != nil {
+			t.Fatalf("ResolveDecidedMessages: %v", err)
+		}
+		if summary.Blocked != 2 || summary.Published != 0 {
+			t.Fatalf("summary = %+v, want both messages blocked by the one inconclusive scan", summary)
+		}
+		for _, id := range []string{first, second} {
+			var status string
+			if err := pool.QueryRow(ctx,
+				`SELECT status FROM chat.messages WHERE id = $1`, id).Scan(&status); err != nil {
+				t.Fatalf("read status for %s: %v", id, err)
+			}
+			if status != "deleted" {
+				t.Fatalf("message %s status = %q, want deleted", id, status)
+			}
+			var blockReason string
+			if err := pool.QueryRow(ctx, `
+				SELECT COALESCE(block_reason, '') FROM chat.message_publish_outbox WHERE message_id = $1`,
+				id).Scan(&blockReason); err != nil {
+				t.Fatalf("read block reason for %s: %v", id, err)
+			}
+			if blockReason != "link_check_inconclusive" {
+				t.Fatalf("message %s block_reason = %q, want link_check_inconclusive", id, blockReason)
+			}
+		}
+
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = ANY($1::uuid[])`,
+			[]string{first, second}); err != nil {
+			t.Fatalf("clean withheld messages: %v", err)
+		}
+	})
+
 	// [§50] The compare-and-set, from the losing side. Each of these is a worker
 	// whose lease expired while it was talking to the provider, arriving late with
 	// an answer about a row that has moved on.

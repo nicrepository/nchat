@@ -643,8 +643,8 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 // targetID is the recipient's user id: the outbox row for a blocked message
 // records the sender as the audience, which is what keeps the announcement off
 // the conversation.
-func (b *hubBroadcaster) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
-	b.hub.PublishMessageBlocked(ctx, workspaceID, recipientUserID, messageID)
+func (b *hubBroadcaster) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID, reason string) {
+	b.hub.PublishMessageBlocked(ctx, workspaceID, recipientUserID, messageID, reason)
 }
 
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {

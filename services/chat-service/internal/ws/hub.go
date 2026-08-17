@@ -841,16 +841,18 @@ func (h *Hub) PublishConversationAvailable(
 //
 // The payload is the message id and a fixed reason. No body, no URL, no scan id,
 // no provider response — the author needs to stop seeing "checking links…", and
-// nothing else about the verdict is theirs to receive.
-func (h *Hub) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
-	if workspaceID == "" || recipientUserID == "" || messageID == "" {
+// nothing else about the verdict is theirs to receive. reason must be one of
+// the MessageBlockedReason* constants; an empty or unrecognised value is a
+// caller bug, not something this method may paper over.
+func (h *Hub) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID, reason string) {
+	if workspaceID == "" || recipientUserID == "" || messageID == "" || reason == "" {
 		return
 	}
 	evt := Event{
 		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageBlocked,
 		WorkspaceID: workspaceID, MessageID: messageID,
 		RecipientUserID:  recipientUserID,
-		Reason:           MessageBlockedReasonMaliciousLink,
+		Reason:           reason,
 		EventID:          uuid.New().String(),
 		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
 	}

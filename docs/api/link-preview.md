@@ -105,6 +105,17 @@ job duravel e responde `202 link_check_pending`. Um worker proprio submete o sca
 a Cloudflare, guarda o UUID e faz o polling, entao repetir o preview da mesma URL
 nao gera scan novo -- e um restart nao perde o que ja estava em andamento.
 
+**Um scan `inconclusive` fica `202 link_check_pending` para sempre.** Ao
+contrario do fluxo de mensagem em [link-safety.md](./link-safety.md), o
+preview nao tem um terceiro codigo para "o scan terminou e nao decidiu nada" --
+`checkSafety` trata qualquer veredito nao carregavel (nenhum veredito ainda, ou
+`inconclusive`) da mesma forma: nunca busca a pagina, sempre responde pending.
+O card nunca aparece, que e o resultado fail-closed correto, mas o cliente nao
+tem como distinguir "ainda escaneando" de "nunca vai decidir" so pelo codigo de
+erro. `inconclusive` e terminal no store (ve "Inconclusivo" em
+[link-safety.md](./link-safety.md#inconclusivo)) -- nenhum polling novo
+acontece -- mas essa distincao nao atravessa para o contrato HTTP do preview.
+
 E um controle **distinto** da politica abaixo e nao substitui nenhuma parte
 dela: o Safe Browsing responde se _aquela URL_ e maliciosa, a politica de destino
 responde se este backend pode abrir a conexao para aquele endereco. Um destino recusado pela politica continua

@@ -85,6 +85,25 @@ const (
 // read again by its id. Neither is ever a clearance.
 var ErrScanPending = errors.New("url safety: scan still in progress")
 
+// ErrScanInconclusive marks a scan the provider confirms is the one requested
+// and confirms has reached a terminal state, but which produced no verdict this
+// package can act on — the real production case this exists for is
+// task.success=false with task.status="finished".
+//
+// It is its own error and neither of the other two: not ErrScanPending, because
+// the scan is not running and asking again will not change the answer; not
+// ErrUnavailable, because the exchange itself succeeded and the identity of the
+// scan is confirmed — this is a known, terminal, unusable answer, not a failure
+// to obtain one. A caller must stop polling this scan id and must never treat
+// this as a clearance in either direction.
+var ErrScanInconclusive = errors.New("url safety: scan finished without a usable verdict")
+
+// taskStatusFinished is the only task.status value verdictFromReport trusts as
+// "the provider is truly done with this scan". It gates ErrScanInconclusive:
+// without it, a success=false report with no other information is refused as
+// ErrUnavailable rather than assumed to be terminal.
+const taskStatusFinished = "finished"
+
 // CloudflareScanner submits URLs to Cloudflare URL Scanner and reads verdicts.
 type CloudflareScanner struct {
 	baseURL   string
@@ -147,10 +166,19 @@ type resultResponse struct {
 	Task struct {
 		UUID    string `json:"uuid"`
 		Success *bool  `json:"success"`
+		// Status is the provider's own lifecycle label for the scan (observed
+		// value: "finished"). It is what distinguishes a terminal report with no
+		// verdict from one that simply cannot be trusted yet.
+		Status string `json:"status"`
 	} `json:"task"`
 	Verdicts struct {
 		Overall *struct {
-			Malicious *bool `json:"malicious"`
+			// HasVerdicts is a pointer for the same reason Malicious is: "the
+			// provider did not send this field" must not read the same as "the
+			// provider sent false". A finished scan with no verdicts at all is
+			// exactly the report this package must refuse rather than clear.
+			HasVerdicts *bool `json:"hasVerdicts"`
+			Malicious   *bool `json:"malicious"`
 		} `json:"overall"`
 	} `json:"verdicts"`
 }
@@ -199,10 +227,13 @@ func (c *CloudflareScanner) SubmitScan(ctx context.Context, canonicalURL string)
 
 // GetScanResult reads a submitted scan.
 //
-// Three outcomes and no fourth: a finished report yields VerdictSafe or
-// VerdictMalicious, a scan still running yields ErrScanPending, and everything
-// else yields ErrUnavailable. A pending scan is not a verdict and a failure is
-// not a verdict, so neither can be stored as one.
+// Four outcomes: a finished report with a usable verdict yields VerdictSafe or
+// VerdictMalicious; a scan still running yields ErrScanPending; a scan the
+// provider confirms is finished and confirms is the one requested, but which
+// produced no usable verdict, yields ErrScanInconclusive; everything else — an
+// untrusted or malformed answer, a transport failure — yields ErrUnavailable. A
+// pending scan is not a verdict, an inconclusive scan is not a verdict, and a
+// failure is not a verdict, so none of the three can be stored as one.
 func (c *CloudflareScanner) GetScanResult(ctx context.Context, scanID string) (Verdict, error) {
 	if strings.TrimSpace(scanID) == "" {
 		return VerdictUnknown, ErrUnavailable
@@ -235,33 +266,60 @@ func (c *CloudflareScanner) GetScanResult(ctx context.Context, scanID string) (V
 	return verdictFromReport(decoded, scanID)
 }
 
-// verdictFromReport turns a decoded report into a verdict, or refuses it.
+// verdictFromReport turns a decoded report into a verdict, refuses it as
+// untrusted, or reports it as a known terminal scan with no usable verdict.
 //
-// Every check here is a way the answer could fail to be *about the scan we
-// asked for*, and each one used to be either absent or too lenient:
+// The identity check runs first and unconditionally: a report cannot be
+// inconclusive, safe or malicious about a scan it does not demonstrably
+// describe. task.uuid has to be present and has to equal the id requested —
+// this is the one check that matters most, because a cached, misrouted or
+// substituted response describing a *different* URL's scan would otherwise
+// clear or condemn this one.
+//
+// Past that, every remaining check is a way the answer could still fail to
+// carry a usable verdict even though it does describe the right scan:
 //
 //   - task.success had to be present and true. It was previously only rejected
 //     when explicitly false, so a report that omitted the field — a truncated
 //     write, a proxy's error envelope, a future response shape — was read as a
 //     completed scan;
-//   - task.uuid had to be present. Without it there is nothing tying the body to
-//     a scan at all;
-//   - task.uuid had to equal the id we requested. This is the one that matters
-//     most: a cached, misrouted or substituted response describing a *different*
-//     URL's scan would otherwise have cleared this URL. The verdict is only ever
-//     accepted for the scan it names.
+//   - verdicts.overall.hasVerdicts had to be present and true. This is the field
+//     the production incident this function was rewritten for turned on: a
+//     report can have task.success=false, task.status="finished" and
+//     hasVerdicts=false all at once — the scan genuinely ran and genuinely
+//     produced nothing, and that is not the same fact as "the exchange failed";
+//   - verdicts.overall.malicious had to be present, once the two checks above
+//     passed.
 //
-// Anything failing any of them is ErrUnavailable — never a verdict, never
-// cached, never persisted as final.
+// A failure of the identity check is always ErrUnavailable — an untrusted
+// answer is never inconclusive, whatever else it says. A failure of one of the
+// later checks is ErrScanInconclusive when the provider's own task.status says
+// "finished" — a report this package has independent evidence is terminal — and
+// ErrUnavailable otherwise, because there is no basis yet for treating a scan
+// that has not confirmed it is done as anything but a failed exchange to retry.
+// Neither outcome is ever a verdict, never cached as a clearance, never
+// persisted as one.
 func verdictFromReport(report resultResponse, scanID string) (Verdict, error) {
-	if report.Task.Success == nil || !*report.Task.Success {
-		return VerdictUnknown, ErrUnavailable
-	}
 	reportedID := strings.TrimSpace(report.Task.UUID)
 	if reportedID == "" || reportedID != strings.TrimSpace(scanID) {
 		return VerdictUnknown, ErrUnavailable
 	}
-	if report.Verdicts.Overall == nil || report.Verdicts.Overall.Malicious == nil {
+	finished := strings.TrimSpace(report.Task.Status) == taskStatusFinished
+
+	if report.Task.Success == nil || !*report.Task.Success {
+		if finished {
+			return VerdictUnknown, ErrScanInconclusive
+		}
+		return VerdictUnknown, ErrUnavailable
+	}
+	if report.Verdicts.Overall == nil ||
+		report.Verdicts.Overall.HasVerdicts == nil || !*report.Verdicts.Overall.HasVerdicts {
+		if finished {
+			return VerdictUnknown, ErrScanInconclusive
+		}
+		return VerdictUnknown, ErrUnavailable
+	}
+	if report.Verdicts.Overall.Malicious == nil {
 		return VerdictUnknown, ErrUnavailable
 	}
 	if *report.Verdicts.Overall.Malicious {

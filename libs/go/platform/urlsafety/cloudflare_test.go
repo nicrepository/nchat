@@ -155,11 +155,11 @@ func TestResultReadsTheDocumentedVerdictField(t *testing.T) {
 		want Verdict
 	}{
 		"malicious": {
-			body: `{"task":{"uuid":"182bd5e5-6e1a","success":true},"verdicts":{"overall":{"malicious":true,"categories":["phishing"]}}}`,
+			body: `{"task":{"uuid":"182bd5e5-6e1a","success":true,"status":"finished"},"verdicts":{"overall":{"hasVerdicts":true,"malicious":true,"categories":["phishing"]}}}`,
 			want: VerdictMalicious,
 		},
 		"benign": {
-			body: `{"task":{"uuid":"182bd5e5-6e1a","success":true},"verdicts":{"overall":{"malicious":false,"categories":[]}}}`,
+			body: `{"task":{"uuid":"182bd5e5-6e1a","success":true,"status":"finished"},"verdicts":{"overall":{"hasVerdicts":true,"malicious":false,"categories":[]}}}`,
 			want: VerdictSafe,
 		},
 	} {
@@ -277,6 +277,69 @@ func TestResultRefusesUnusableAnswers(t *testing.T) {
 				t.Fatalf("%s produced a final verdict: %v", name, verdict)
 			}
 		})
+	}
+}
+
+// TestResultReportsInconclusiveOnTerminalNoVerdict covers the production
+// incident this file was rewritten for: a scan the provider confirms is the
+// one requested and confirms finished, but which produced no usable verdict.
+// It must never be conflated with a transient failure (which is retried) or
+// with a clean scan (which is never a clearance).
+func TestResultReportsInconclusiveOnTerminalNoVerdict(t *testing.T) {
+	for name, body := range map[string]string{
+		// The real production body, sanitised: task.success=false,
+		// task.status="finished", hasVerdicts=false, uuid matches.
+		"the observed production report": `{"task":{"uuid":"abc","success":false,"status":"finished"},
+			"verdicts":{"overall":{"hasVerdicts":false,"malicious":false}}}`,
+		// success=true but hasVerdicts=false: still no usable verdict, and the
+		// provider still says the task is done.
+		"succeeded but produced no verdicts": `{"task":{"uuid":"abc","success":true,"status":"finished"},
+			"verdicts":{"overall":{"hasVerdicts":false,"malicious":false}}}`,
+		// hasVerdicts entirely absent is the same fact as false: never a reason
+		// to treat the report as more trustworthy.
+		"hasVerdicts absent": `{"task":{"uuid":"abc","success":true,"status":"finished"},
+			"verdicts":{"overall":{"malicious":false}}}`,
+		// overall itself absent, task confirmed finished.
+		"overall absent": `{"task":{"uuid":"abc","success":false,"status":"finished"},"verdicts":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			scanner, _ := scannerAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+
+			verdict, err := scanner.GetScanResult(context.Background(), "abc")
+
+			if !errors.Is(err, ErrScanInconclusive) {
+				t.Fatalf("want ErrScanInconclusive, got verdict=%v err=%v", verdict, err)
+			}
+			if errors.Is(err, ErrUnavailable) {
+				t.Fatal("ErrScanInconclusive must not also be ErrUnavailable")
+			}
+			if verdict.IsFinal() {
+				t.Fatalf("an inconclusive report produced a final verdict: %v", verdict)
+			}
+		})
+	}
+}
+
+// TestResultNeverInconclusiveWithoutAConfirmedUUID: a report whose identity
+// cannot be trusted must fall back to ErrUnavailable, never to
+// ErrScanInconclusive — "we don't know if this is our scan" and "our scan
+// finished with nothing to report" are different facts, and only the second
+// one may ever stop the polling.
+func TestResultNeverInconclusiveWithoutAConfirmedUUID(t *testing.T) {
+	scanner, _ := scannerAgainst(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"task":{"uuid":"some-other-scan","success":false,"status":"finished"},
+			"verdicts":{"overall":{"hasVerdicts":false,"malicious":false}}}`))
+	})
+
+	verdict, err := scanner.GetScanResult(context.Background(), "abc")
+
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("want ErrUnavailable, got verdict=%v err=%v", verdict, err)
+	}
+	if errors.Is(err, ErrScanInconclusive) {
+		t.Fatal("a mismatched scan id must never be reported as a known-terminal inconclusive scan")
 	}
 }
 
