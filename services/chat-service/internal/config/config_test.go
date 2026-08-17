@@ -1,6 +1,8 @@
 package config
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
@@ -173,5 +175,195 @@ func TestLoad_WSInstanceID_EmptyRemainsEmpty(t *testing.T) {
 	cfg := Load()
 	if cfg.WSInstanceID != "" {
 		t.Fatalf("empty WS_INSTANCE_ID must stay empty, got %q", cfg.WSInstanceID)
+	}
+}
+
+// --- RF-21 link safety ---------------------------------------------------
+
+func TestLoadDefaultsLinkSafetyToDisabled(t *testing.T) {
+	cfg := Load()
+
+	if cfg.LinkSafetyEnabled {
+		t.Fatal("the safe browsing check must be off unless a deployment asks for it")
+	}
+	if cfg.LinkSafetyCloudflareAccount != "" || cfg.LinkSafetyCloudflareToken != "" {
+		t.Fatal("credentials must have no defaults")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("an absent variable must take the default, not fail: %v", err)
+	}
+}
+
+// The finding: an unparseable value must not fold into false. A control that
+// switches itself off because someone wrote "enabled" has no symptom other than
+// nothing ever being blocked.
+func TestValidateRejectsUnparseableLinkSafetyFlag(t *testing.T) {
+	for _, raw := range []string{"enabled", "on", "yes", "", " ", "2"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("CHAT_LINK_SAFETY_ENABLED", raw)
+
+			cfg := Load()
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("%q was accepted", raw)
+			}
+			if err.Error() != "CHAT_LINK_SAFETY_ENABLED must be a valid boolean" {
+				t.Fatalf("message is not the deterministic one: %v", err)
+			}
+			if cfg.LinkSafetyEnabled {
+				t.Fatal("an invalid value must not read as enabled either")
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsParseableLinkSafetyFlag(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"true": true, "TRUE": true, "1": true,
+		"false": false, "FALSE": false, "0": false,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("CHAT_LINK_SAFETY_ENABLED", raw)
+			// Credentials so this stays a test about *parsing*: enabling
+			// without them is its own error, asserted separately below.
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
+
+			cfg := Load()
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("%q was rejected: %v", raw, err)
+			}
+			if cfg.LinkSafetyEnabled != want {
+				t.Fatalf("%q read as %v", raw, cfg.LinkSafetyEnabled)
+			}
+		})
+	}
+}
+
+func TestLoadReadsLinkSafetyCredentials(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
+
+	cfg := Load()
+
+	if !cfg.LinkSafetyEnabled {
+		t.Fatal("CHAT_LINK_SAFETY_ENABLED was not read")
+	}
+	if cfg.LinkSafetyCloudflareAccount != "acct-123" || cfg.LinkSafetyCloudflareToken != "token-abc" {
+		t.Fatalf("credentials: %q / %q", cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken)
+	}
+}
+
+// The other half of the finding: the flag parsed fine, but nothing was there to
+// build a checker from. Accepting that configuration is what produced the
+// enabled-but-unchecked state — the checker could not be created, the gate was
+// absent, and every message went through.
+func TestValidateRejectsEnabledLinkSafetyWithoutCredentials(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		account string
+		token   string
+		want    string
+	}{
+		"no account": {
+			account: "", token: "token-abc",
+			want: "CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
+		"no token": {
+			account: "acct-123", token: "",
+			want: "CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
+		"neither": {
+			account: "", token: "",
+			want: "CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID is required when CHAT_LINK_SAFETY_ENABLED is true",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", testCase.account)
+			t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", testCase.token)
+
+			err := Load().Validate()
+			if err == nil {
+				t.Fatal("an enabled check with no way to run it was accepted")
+			}
+			if err.Error() != testCase.want {
+				t.Fatalf("message is not the deterministic one: %v", err)
+			}
+			if strings.Contains(err.Error(), testCase.token) && testCase.token != "" {
+				t.Fatal("the error repeated the token")
+			}
+		})
+	}
+}
+
+// Disabled is the one state in which absent credentials are correct, and it has
+// to stay valid: it is how an environment without a Cloudflare account runs.
+func TestValidateAcceptsDisabledLinkSafetyWithoutCredentials(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "false")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "")
+
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("an explicitly disabled check needs no credentials: %v", err)
+	}
+}
+
+// The correction this round is structural, and this is what "structural" means:
+// there is no setting that can turn it back on.
+//
+// A submission whose outcome was never recorded is never sent again — not after
+// a horizon, not after a restart, not with any environment variable. The
+// previous round bounded that resubmission at one and made it configurable; the
+// review's point was that a bound is not the same as an absence, and an operator
+// can raise a bound.
+//
+// So the assertion is about the *shape of the config*, not about a default: no
+// field exists to carry the policy, and setting the retired variable changes
+// nothing at all.
+func TestNoConfigurationCanEnableAnUncertainResubmit(t *testing.T) {
+	// The retired variable, set to the value that used to enable the behaviour.
+	t.Setenv("CHAT_LINK_SAFETY_MAX_UNCERTAIN_RESUBMITS", "5")
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-1")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-1")
+
+	cfg := Load()
+	if err := cfg.Validate(); err != nil {
+		// It is not rejected either: an unknown variable is simply ignored, which
+		// is this service's convention. What matters is that it is inert.
+		t.Fatalf("Validate: %v", err)
+	}
+
+	// No field carries it. reflect rather than a compile-time reference, because
+	// a compile-time reference to a removed field would not compile and this test
+	// has to keep failing if somebody adds it back.
+	for _, name := range []string{
+		"LinkSafetyMaxUncertainResubmits",
+		"LinkSafetyUncertainResubmits",
+		"LinkSafetyAllowUncertainResubmit",
+	} {
+		if _, exists := reflect.TypeOf(cfg).FieldByName(name); exists {
+			t.Fatalf("Config carries %q — an uncertain submission must not be configurable", name)
+		}
+	}
+
+	// The threshold that remains is a reporting one, and it is still required:
+	// it says when an unresolved submission becomes something to look at.
+	if cfg.LinkSafetySubmitUncertainTimeoutSeconds <= 0 {
+		t.Fatalf("the staleness threshold is unset: %d", cfg.LinkSafetySubmitUncertainTimeoutSeconds)
+	}
+}
+
+// A staleness threshold of zero is refused rather than treated as "report
+// everything immediately", which would be the same as having no signal.
+func TestUncertainStalenessThresholdMustBePositive(t *testing.T) {
+	t.Setenv("CHAT_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-1")
+	t.Setenv("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-1")
+	t.Setenv("CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", "0")
+
+	if err := Load().Validate(); err == nil {
+		t.Fatal("a zero staleness threshold was accepted")
 	}
 }

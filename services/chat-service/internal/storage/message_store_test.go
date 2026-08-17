@@ -34,12 +34,28 @@ const createMsgSQL = `(?s)invalid_refs AS.*m\.status = 'active'.*m\.deleted_at I
 	`chat\.dm_conversations.*dc\.status.*active.*` +
 	`chat\.dm_members.*dm\.status.*active`
 
+// forwardMsgSQL pins the shape of the forwarding statement.
+//
+// The source CTE is still there and still required — it is the authorization,
+// and source.id is still the provenance the new row records. What it must no
+// longer do is supply the content: the body and format come from $6 and $7, the
+// snapshot the caller already checked, so nothing is re-read between the check
+// and the write (RF-21). A regression to source.body_text would reopen that
+// window, which is why the parameters are asserted positively and the column
+// reference is asserted absent by forwardMsgSQLRereadsSource below.
 const forwardMsgSQL = `(?s)WITH source AS.*` +
 	`m\.channel_id <>.*m\.kind = 'user'.*m\.status = 'active'.*FOR SHARE OF m.*` +
-	`INSERT INTO chat\.messages.*source\.body_text.*source\.body_format.*source\.id.*` +
+	`INSERT INTO chat\.messages.*\$6::text.*\$7::text.*source\.id.*` +
 	`destination_workspace.*destination_member.*destination_channel.*` +
 	`chat\.channel_visible_to_user\(destination_channel\.id, \$3::uuid\).*` +
 	`ON CONFLICT.*forward_idempotency_key`
+
+// snapshotForwardSQL pins the read: the same source-side predicates, and
+// deliberately no FOR SHARE, no BEGIN — the caller runs a third-party lookup on
+// the result and must not be holding a row lock while it does.
+const snapshotForwardSQL = `(?s)SELECT m\.id::text, m\.body_text, m\.body_format.*` +
+	`FROM chat\.messages m.*` +
+	`m\.channel_id <>.*m\.kind = 'user'.*m\.status = 'active'.*m\.deleted_at IS NULL`
 
 // messageCols returns the column names matching messageColumns("") scan order.
 func messageCols() []string {
@@ -132,6 +148,11 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // mentioned_user_ids
 			pgxmock.AnyArg(), // mentioned_channel_ids
 			pgxmock.AnyArg(), // attachment_ids
+			pgxmock.AnyArg(), // status (RF-21: active, or withheld for scanning)
+			pgxmock.AnyArg(), // link_scan_urls
+			pgxmock.AnyArg(), // create idempotency key
+			pgxmock.AnyArg(), // link safety fingerprint
+			pgxmock.AnyArg(), // create request fingerprint
 		).
 		WillReturnRows(rows)
 }
@@ -183,7 +204,8 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(),
 				).
 				WillReturnError(dbErr)
 
@@ -212,12 +234,14 @@ func TestPGXMessageStore_ForwardChannelMessage_SnapshotsAndPersistsProvenance(t 
 	row[7] = "v3"
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
-		WithArgs("ws-1", "destination", "actor", "source", "action-1").
+		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
 		SourceMessageID: "source", IdempotencyKey: "action-1",
+		BodyText: "copied snapshot", BodyFormat: domain.MessageBodyFormatV3,
 	})
 	if err != nil {
 		t.Fatalf("ForwardChannelMessage: %v", err)
@@ -233,10 +257,12 @@ func TestPGXMessageStore_ForwardChannelMessage_SnapshotsAndPersistsProvenance(t 
 func TestPGXMessageStore_ForwardChannelMessage_DeniedIsNonEnumerating(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(forwardMsgSQL).
-		WithArgs("ws-1", "destination", "actor", "source", "").
+		WithArgs("ws-1", "destination", "actor", "source", "", "copied snapshot", "v3",
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()))
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor", SourceMessageID: "source",
+		BodyText: "copied snapshot", BodyFormat: domain.MessageBodyFormatV3,
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
@@ -250,12 +276,14 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotentReplay(t *testing.T) {
 	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
-		WithArgs("ws-1", "destination", "actor", "source", "action-1").
+		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
 		SourceMessageID: "source", IdempotencyKey: "action-1",
+		BodyText: "copied snapshot", BodyFormat: domain.MessageBodyFormatV3,
 	})
 
 	if err != nil || !result.Replayed || result.Message.ID != "forwarded" {
@@ -270,11 +298,67 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotencyFingerprintConflict(t 
 	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
 	row[10] = "different-source"
 	mock.ExpectQuery(forwardMsgSQL).
-		WithArgs("ws-1", "destination", "actor", "source", "action-1").
+		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
 
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+		BodyText: "copied snapshot", BodyFormat: domain.MessageBodyFormatV3,
+	})
+
+	if err != domain.ErrConflict {
+		t.Fatalf("expected direct ErrConflict, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// lookupForwardReplaySQL pins the read that resolves an idempotency key without
+// writing. Two properties matter: it selects on the ON CONFLICT key of the
+// forwarding statement — workspace, channel, sender, key — so it finds exactly
+// the row that statement would have returned, and it is a plain SELECT with no
+// INSERT and no lock, because it runs before the RF-21 provider call.
+const lookupForwardReplaySQL = `(?s)SELECT.*FROM chat\.messages m.*` +
+	`m\.workspace_id = \$1::uuid.*m\.channel_id = \$2::uuid.*` +
+	`m\.sender_id = \$3::uuid.*m\.forward_idempotency_key = \$4.*` +
+	`chat\.channel_visible_to_user\(c\.id, \$3::uuid\)`
+
+func TestPGXMessageStore_LookupForwardReplay_ReturnsTheEarlierMessage(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
+	row[10] = "source"
+	mock.ExpectQuery(lookupForwardReplaySQL).
+		WithArgs("ws-1", "destination", "user-1", "action-1").
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
+	expectReactionBatch(mock, emptyReactionRows())
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	msg, err := storage.NewPGXMessageStore(mock).LookupForwardReplay(t.Context(), storage.ForwardReplayInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "user-1",
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+	})
+
+	if err != nil || msg.ID != "forwarded" || msg.ForwardedFromMessageID != "source" {
+		t.Fatalf("unexpected replay: %+v err=%v", msg, err)
+	}
+	checkExpectations(t, mock)
+}
+
+// Same key, different source: the conflict the forwarding statement reported
+// after its upsert is now reported before it, by the same rule.
+func TestPGXMessageStore_LookupForwardReplay_ConflictsOnADifferentSource(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
+	row[10] = "different-source"
+	mock.ExpectQuery(lookupForwardReplaySQL).
+		WithArgs("ws-1", "destination", "user-1", "action-1").
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
+
+	_, err := storage.NewPGXMessageStore(mock).LookupForwardReplay(t.Context(), storage.ForwardReplayInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "user-1",
 		SourceMessageID: "source", IdempotencyKey: "action-1",
 	})
 
@@ -284,15 +368,51 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotencyFingerprintConflict(t 
 	checkExpectations(t, mock)
 }
 
+// No row is "this forward has not happened", which is what lets the caller fall
+// through to the check-and-insert path.
+func TestPGXMessageStore_LookupForwardReplay_MissIsNotFound(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(lookupForwardReplaySQL).
+		WithArgs("ws-1", "destination", "user-1", "action-1").
+		WillReturnError(pgx.ErrNoRows)
+
+	_, err := storage.NewPGXMessageStore(mock).LookupForwardReplay(t.Context(), storage.ForwardReplayInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "user-1",
+		SourceMessageID: "source", IdempotencyKey: "action-1",
+	})
+
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// Without a key there is nothing to replay and no reason to query at all.
+func TestPGXMessageStore_LookupForwardReplay_NoKeyQueriesNothing(t *testing.T) {
+	mock := newMock(t)
+
+	_, err := storage.NewPGXMessageStore(mock).LookupForwardReplay(t.Context(), storage.ForwardReplayInput{
+		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "user-1",
+		SourceMessageID: "source",
+	})
+
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_ForwardChannelMessage_PreservesInfrastructureError(t *testing.T) {
 	mock := newMock(t)
 	databaseErr := errors.New("database unavailable")
 	mock.ExpectQuery(forwardMsgSQL).
-		WithArgs("ws-1", "destination", "actor", "source", "").
+		WithArgs("ws-1", "destination", "actor", "source", "", "copied snapshot", "v3",
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(databaseErr)
 
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor", SourceMessageID: "source",
+		BodyText: "copied snapshot", BodyFormat: domain.MessageBodyFormatV3,
 	})
 
 	if !errors.Is(err, databaseErr) {
@@ -431,7 +551,8 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 				WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg()).
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -453,7 +574,8 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"11111111-1111-1111-1111-111111111111"},
 			[]string{"22222222-2222-2222-2222-222222222222"},
-			pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -482,7 +604,8 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"99999999-9999-9999-9999-999999999999"},
-			pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -1505,6 +1628,81 @@ func TestPGXMessageStore_ListDMMessages_KeysetSQLContainsIDTieBreaker(t *testing
 	})
 	if err != nil {
 		t.Fatalf("ListDMMessages keyset tie-break: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// ── RF-21: the forwardable snapshot ──────────────────────────────────────────
+
+func TestPGXMessageStore_SnapshotForwardableMessage_ReadsSourceContent(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(snapshotForwardSQL).
+		WithArgs("ws-1", "destination", "actor", "source").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "body_text", "body_format"}).
+			AddRow("source", "veja https://example.com", "v3"))
+
+	snapshot, err := storage.NewPGXMessageStore(mock).SnapshotForwardableMessage(
+		t.Context(), storage.ForwardSnapshotInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "destination",
+			ActorID: "actor", SourceMessageID: "source",
+		})
+	if err != nil {
+		t.Fatalf("SnapshotForwardableMessage: %v", err)
+	}
+	if snapshot.SourceMessageID != "source" || snapshot.BodyText != "veja https://example.com" ||
+		snapshot.BodyFormat != domain.MessageBodyFormatV3 {
+		t.Fatalf("snapshot: %+v", snapshot)
+	}
+	// No ExpectBegin and no ExpectCommit were registered, and the expectations
+	// are met: the read opened no transaction. That is the property the safety
+	// check depends on — the provider call that follows must not happen with a
+	// row locked or a connection reserved.
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_SnapshotForwardableMessage_DeniedIsNonEnumerating(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(snapshotForwardSQL).
+		WithArgs("ws-1", "destination", "actor", "source").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "body_text", "body_format"}))
+
+	_, err := storage.NewPGXMessageStore(mock).SnapshotForwardableMessage(
+		t.Context(), storage.ForwardSnapshotInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "destination",
+			ActorID: "actor", SourceMessageID: "source",
+		})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// The forwarding statement must write the caller's snapshot, never re-read the
+// source. Passing a body that differs from anything the source could hold and
+// asserting it reached the parameters is what pins that.
+func TestPGXMessageStore_ForwardChannelMessage_WritesTheSuppliedSnapshot(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := listMessageWithQuoteRow("forwarded", "ws-1", "destination", "", now)
+	row[6] = "checked body"
+	row[7] = "v2"
+	row[10] = "source"
+	mock.ExpectQuery(forwardMsgSQL).
+		WithArgs("ws-1", "destination", "actor", "source", "action-1", "checked body", "v2",
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
+
+	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(
+		t.Context(), storage.ForwardChannelMessageInput{
+			WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor",
+			SourceMessageID: "source", IdempotencyKey: "action-1",
+			BodyText: "checked body", BodyFormat: domain.MessageBodyFormatV2,
+		})
+	if err != nil {
+		t.Fatalf("ForwardChannelMessage: %v", err)
+	}
+	if result.Message.BodyText != "checked body" {
+		t.Fatalf("persisted body: %q", result.Message.BodyText)
 	}
 	checkExpectations(t, mock)
 }

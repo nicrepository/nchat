@@ -765,7 +765,15 @@ function mapMessage(r: MessageResponse): Message {
     bodyText: isRemoved ? "" : (r.body_text ?? ""),
     bodyFormat: normalizeBodyFormat(r.body_format),
     isRemoved,
-    status: isRemoved ? "deleted" : "active",
+    // RF-21: a message the backend is withholding pending a link scan reports
+    // itself as such, so the composer can say it is being checked instead of
+    // pretending it was delivered. Any other value collapses to "active", so an
+    // unknown status can never be rendered as a state this client invented.
+    status: isRemoved
+      ? "deleted"
+      : r.status === "pending_link_scan"
+        ? "pending_link_scan"
+        : "active",
     deletedAt: r.deleted_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -1021,6 +1029,65 @@ export async function fetchChannelMessage(
   const url = `${messagesPath("channel", channelId)}/${encodeURIComponent(messageId)}`;
   const res = await authenticatedFetch<MessageEnvelope>(url, { method: "GET", signal });
   return mapMessage(res.data);
+}
+
+/**
+ * RF-21 reconnect reconciliation.
+ *
+ * A message withheld for a link scan resolves asynchronously, and the verdict is
+ * announced over the websocket. That announcement is best-effort: an author
+ * whose connection was down while their message was refused receives nothing,
+ * and their client would keep showing "checking links…" for a message that no
+ * longer exists. On reconnect it asks here what actually happened.
+ *
+ * The reply carries a state and, for a refusal, a fixed reason — never a body,
+ * a URL or anything the scanner said. Ids the server will not talk about are
+ * absent from the reply rather than reported as denied, so an absent id means
+ * "no answer", never "gone".
+ */
+export type LinkSafetyState = "pending" | "active" | "blocked" | "deleted";
+
+export interface LinkSafetyStatus {
+  messageId: string;
+  state: LinkSafetyState;
+  reason?: string;
+}
+
+interface LinkSafetyStatusEnvelope {
+  data: {
+    statuses?: { message_id: string; state: string; reason?: string }[];
+  };
+}
+
+const linkSafetyStates: LinkSafetyState[] = ["pending", "active", "blocked", "deleted"];
+
+export async function fetchLinkSafetyStatuses(
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<LinkSafetyStatus[]> {
+  const response = await authenticatedFetch<LinkSafetyStatusEnvelope>(
+    `${CHAT_BASE}/messages/link-safety-status`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message_ids: messageIds }),
+      signal,
+    },
+  );
+  // A state this client does not know is dropped rather than guessed at. The
+  // caller leaves an unanswered message alone, which is the conservative
+  // outcome — the same one an absent id produces.
+  return (response.data.statuses ?? []).flatMap((status) =>
+    linkSafetyStates.includes(status.state as LinkSafetyState)
+      ? [
+          {
+            messageId: status.message_id,
+            state: status.state as LinkSafetyState,
+            reason: status.reason,
+          },
+        ]
+      : [],
+  );
 }
 
 export async function editMessage(

@@ -36,6 +36,7 @@ const (
 	pgDMAllowed             = "95000000-0000-4000-8000-000000000001"
 	pgDMNoParticipation     = "95000000-0000-4000-8000-000000000002"
 	pgDMCrossWorkspace      = "95000000-0000-4000-8000-000000000003"
+	pgDMDirect              = "95000000-0000-4000-8000-000000000004"
 	pgCallActive            = "96000000-0000-4000-8000-000000000001"
 	pgCallRinging           = "96000000-0000-4000-8000-000000000002"
 	pgCallNonParticipant    = "96000000-0000-4000-8000-000000000003"
@@ -100,6 +101,7 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 		{name: "inactive channel inaccessible", kind: domain.ResourceKindChannel, resourceID: pgChannelInactive, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "DM without participation inaccessible", kind: domain.ResourceKindDM, resourceID: pgDMNoParticipation, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "cross workspace DM inaccessible", kind: domain.ResourceKindDM, resourceID: pgDMCrossWorkspace, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		{name: "direct DM cannot use resource mode even with active participation", kind: domain.ResourceKindDM, resourceID: pgDMDirect, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "missing resource matches inaccessible result", kind: domain.ResourceKindChannel, resourceID: pgMissingResource, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 	}
 
@@ -212,11 +214,13 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 		INSERT INTO chat.dm_conversations (id, workspace_id, type, status, created_by, direct_pair_key) VALUES
 			('95000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000001', NULL),
 			('95000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL),
-			('95000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000002', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL);
+			('95000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000002', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL),
+			('95000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', 'direct', 'active', '91000000-0000-4000-8000-000000000001', '2:1-user:2:2-user');
 		INSERT INTO chat.dm_members (conversation_id, user_id) VALUES
 			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001'),
 			('95000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000002'),
-			('95000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001');
+			('95000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001'),
+			('95000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001');
 		INSERT INTO chat.calls (id, workspace_id, request_id, caller_id, callee_id, call_type, status, expires_at) VALUES
 			('96000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'video', 'active', now() + interval '30 seconds'),
 			('96000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'audio', 'ringing', now() + interval '30 seconds'),

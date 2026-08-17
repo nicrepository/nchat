@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -142,6 +143,88 @@ func (s *integMessageStore) CreateMessage(_ context.Context, in storage.CreateMe
 	s.created = append(s.created, msg)
 	s.mu.Unlock()
 	return msg, nil
+}
+
+func (s *integMessageStore) LookupForwardReplay(_ context.Context, _ storage.ForwardReplayInput) (domain.Message, error) {
+	return domain.Message{}, domain.ErrNotFound
+}
+
+// RF-21 is not wired in this fixture, so every link verdict is absent and no
+// scan queue runs. SetLinkSafety is never called here, which is what makes the
+// hub integration assert broadcasting rather than scanning.
+
+// LookupCreateReplay answers "has this send already happened?". Empty by
+// default, so every test that says nothing keeps exercising the create path.
+func (s *integMessageStore) LookupCreateReplay(_ context.Context, input storage.CreateReplayInput) (domain.Message, error) {
+	return domain.Message{}, domain.ErrNotFound
+}
+func (s *integMessageStore) LoadLinkVerdicts(_ context.Context, _ []string) (map[string]urlsafety.Verdict, error) {
+	return map[string]urlsafety.Verdict{}, nil
+}
+
+func (s *integMessageStore) AdmitLinkScans(
+	_ context.Context, _ string, urls []string, _ storage.LinkScanCapacity,
+) (storage.LinkScanAdmission, error) {
+	return storage.LinkScanAdmission{NewScanCost: len(urls), Result: storage.AdmissionAllowed}, nil
+}
+
+func (s *integMessageStore) ClaimDueLinkScans(_ context.Context, _ int) ([]storage.LinkScanJob, error) {
+	return nil, nil
+}
+
+func (s *integMessageStore) BeginLinkScanSubmit(_ context.Context, _ string, generation int) (int, error) {
+	return generation + 1, nil
+}
+
+func (s *integMessageStore) AdoptScanUUID(_ context.Context, _, _ string, _ int) error { return nil }
+
+func (s *integMessageStore) ReserveProviderSubmit(_ context.Context, _ int, _ time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (s *integMessageStore) PruneLinkScanBudget(_ context.Context, _ time.Duration) error { return nil }
+
+func (s *integMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ string, _ int) error {
+	return nil
+}
+
+func (s *integMessageStore) RecordLinkVerdict(_ context.Context, _, _ string, _ urlsafety.Verdict) error {
+	return nil
+}
+
+func (s *integMessageStore) ResolveDecidedMessages(_ context.Context) (storage.ResolveSummary, error) {
+	return storage.ResolveSummary{}, nil
+}
+func (s *integMessageStore) ClaimPublishEvents(_ context.Context, _ int) ([]storage.PublishEvent, error) {
+	return nil, nil
+}
+
+func (s *integMessageStore) MarkPublished(_ context.Context, _ string) error { return nil }
+
+func (s *integMessageStore) CancelPublishEvent(_ context.Context, _ string) error { return nil }
+
+func (s *integMessageStore) ReopenExpiredVerdicts(_ context.Context) (int, error) { return 0, nil }
+
+func (s *integMessageStore) LinkSafetyStates(
+	_ context.Context, _, _ string, _ []string,
+) ([]domain.MessageLinkSafetyState, error) {
+	return nil, nil
+}
+
+func (s *integMessageStore) PublishOutboxBacklog(_ context.Context) (int, time.Duration, error) {
+	return 0, 0, nil
+}
+
+func (s *integMessageStore) LinkScanBacklog(_ context.Context) (map[string]int, time.Duration, error) {
+	return map[string]int{}, 0, nil
+}
+
+func (s *integMessageStore) SnapshotForwardableMessage(_ context.Context, in storage.ForwardSnapshotInput) (storage.ForwardSnapshot, error) {
+	return storage.ForwardSnapshot{
+		SourceMessageID: in.SourceMessageID,
+		BodyText:        s.seed.BodyText,
+		BodyFormat:      s.seed.BodyFormat,
+	}, nil
 }
 
 func (s *integMessageStore) ForwardChannelMessage(_ context.Context, in storage.ForwardChannelMessageInput) (storage.ForwardChannelMessageResult, error) {

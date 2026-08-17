@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/services/chat-service/internal/config"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	ws "github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
@@ -1385,5 +1387,149 @@ func TestNewRouter_AntiSpamAdminRouteDoesNotShadowOtherChatRoutes(t *testing.T) 
 		if recorder.Code != http.StatusNotFound {
 			t.Fatalf("%s: expected 404, got %d", url, recorder.Code)
 		}
+	}
+}
+
+// --- RF-21: the edit limiter runs before anything expensive ------------------
+
+// countingEditProvider records every EditMessage that reaches the service, and
+// panics on anything else. It stands in for the whole downstream chain: reaching
+// EditMessage is what would classify the body, queue a Cloudflare scan and spend
+// provider quota, so counting it is counting all of that.
+type countingEditProvider struct {
+	edits atomic.Int64
+}
+
+func (p *countingEditProvider) EditMessage(context.Context, service.EditMessageInput) (domain.Message, error) {
+	p.edits.Add(1)
+	return domain.Message{ID: "msg-1"}, nil
+}
+
+func (p *countingEditProvider) ListChannelMessages(context.Context, service.ListChannelMessagesInput) (service.ListChannelMessagesOutput, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) CreateChannelMessage(context.Context, service.CreateChannelMessageInput) (domain.Message, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) ForwardChannelMessage(context.Context, service.ForwardChannelMessageInput) (service.ForwardChannelMessageOutput, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) GetChannelMessage(context.Context, service.GetChannelMessageInput) (domain.Message, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) ListDMMessages(context.Context, service.ListDMMessagesInput) (service.ListDMMessagesOutput, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) CreateDMMessage(context.Context, service.CreateDMMessageInput) (domain.Message, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) GetDMMessage(context.Context, service.GetDMMessageInput) (domain.Message, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) ResolveMessageReferenceBatch(context.Context, service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) DeleteMessage(context.Context, service.DeleteMessageInput) (domain.Message, error) {
+	panic("unexpected call")
+}
+func (p *countingEditProvider) GetMessageEditHistory(context.Context, service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
+	panic("unexpected call")
+}
+
+func (p *countingEditProvider) MessageLinkSafetyStates(context.Context, service.LinkSafetyStatusInput) ([]domain.MessageLinkSafetyState, error) {
+	panic("unexpected call")
+}
+
+// TestNewRouter_PatchMessage_Returns429WithoutReachingTheService proves the
+// control the security review asked for.
+//
+// Editing queues a Cloudflare scan for any link in the new body, so an
+// unlimited PATCH is an unlimited way to spend the account's scan quota — one
+// authenticated client editing a message in a loop. The limiter is wired ahead
+// of the handler, and this asserts the consequence rather than the status code:
+// past the budget, the service is never entered, so nothing classifies a body,
+// nothing queues a scan and nothing reaches the provider.
+func TestNewRouter_PatchMessage_Returns429WithoutReachingTheService(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	provider := &countingEditProvider{}
+	router := NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		ReadinessState{},
+		validator,
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		NewMessageHandler(nil, provider, nil),
+		nil, nil, nil, nil, nil,
+	)
+
+	patch := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(
+			http.MethodPatch, "/api/chat/messages/11111111-1111-4111-8111-111111111111",
+			strings.NewReader(`{"body":"veja https://novo.example/x","body_format":"v2"}`),
+		)
+		request.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	// Spend the budget. These are allowed through and are expected to reach the
+	// service — that is what makes the next assertion meaningful.
+	for i := 0; i < msgPostRateLimit; i++ {
+		if code := patch().Code; code == http.StatusTooManyRequests {
+			t.Fatalf("budget exhausted early at request %d", i)
+		}
+	}
+	allowed := provider.edits.Load()
+
+	response := patch()
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 past the budget, got %d", response.Code)
+	}
+	// The whole point: the refused request added no call. Nothing classified a
+	// body, nothing queued a durable scan, nothing spent provider quota.
+	if got := provider.edits.Load(); got != allowed {
+		t.Fatalf("a rate-limited PATCH reached the service: %d calls before, %d after", allowed, got)
+	}
+}
+
+// The reconnect reconciliation route is security-sensitive — it describes
+// messages by id — so registration is asserted, not assumed: it must sit behind
+// authentication, and an anonymous caller must never reach the service that
+// would answer.
+func TestNewRouter_LinkSafetyStatus_RequiresAuthenticationBeforeTheService(t *testing.T) {
+	validator, err := NewTokenValidator(routerTestSigningKey(), routerTestIssuer, routerTestAudience)
+	if err != nil {
+		t.Fatalf("new token validator: %v", err)
+	}
+	// countingEditProvider panics on this call, so reaching the service at all
+	// fails the test rather than quietly returning something.
+	provider := &countingEditProvider{}
+	router := NewRouter(
+		testConfig(),
+		platformlog.New("chat-service", "test"),
+		ReadinessState{},
+		validator,
+		allowRouterSessionValidator{},
+		NewSidebarHandler(nil),
+		NewMessageHandler(nil, provider, nil),
+		nil, nil, nil, nil, nil,
+	)
+
+	request := httptest.NewRequest(http.MethodPost, RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":["11111111-1111-4111-8111-111111111111"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without a token, got %d: %s", response.Code, response.Body.String())
 	}
 }

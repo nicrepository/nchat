@@ -260,18 +260,45 @@ const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function
   );
 });
 
+interface CallActionButtonsProps {
+  onAudio: () => void;
+  onVideo: () => void;
+}
+
+/** Shared by a channel header, a group header and a 1:1 DM header (RF-23/RF-24). */
+function CallActionButtons({ onAudio, onVideo }: CallActionButtonsProps) {
+  return (
+    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
+      <button type="button" aria-label="Iniciar chamada de áudio" onClick={onAudio}>
+        Áudio
+      </button>
+      <button type="button" aria-label="Iniciar chamada de vídeo" onClick={onVideo}>
+        Vídeo
+      </button>
+    </div>
+  );
+}
+
 interface HeaderChannelProps {
   name: string;
   detailsToggle?: React.ReactNode;
+  /** RF-24: joins the channel's shared call room; absent while unavailable. */
+  onJoinCall?: (callType: "audio" | "video") => void;
 }
 
-function HeaderChannel({ name, detailsToggle }: HeaderChannelProps) {
+export function HeaderChannel({ name, detailsToggle, onJoinCall }: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
       <span className="chat-msg-area__header-icon" aria-hidden="true">
         <IconHash />
       </span>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {onJoinCall && (
+        <CallActionButtons
+          onAudio={() => onJoinCall("audio")}
+          onVideo={() => onJoinCall("video")}
+        />
+      )}
       {detailsToggle}
     </header>
   );
@@ -282,6 +309,8 @@ interface HeaderDMProps {
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
+  /** RF-24: joins a group's shared call room. Never used for a 1:1 (counterpart set). */
+  onJoinGroupCall?: (callType: "audio" | "video") => void;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
   /** The conversation being read; presence is resolved within it (RF-58). */
@@ -292,6 +321,7 @@ export function HeaderDM({
   name,
   counterpart,
   onStartCall,
+  onJoinGroupCall,
   detailsToggle,
   presenceTarget,
 }: HeaderDMProps) {
@@ -347,22 +377,16 @@ export function HeaderDM({
         </span>
       )}
       {counterpart && onStartCall && (
-        <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
-          <button
-            type="button"
-            aria-label="Iniciar chamada de áudio"
-            onClick={() => onStartCall(counterpart.userId, "audio")}
-          >
-            Áudio
-          </button>
-          <button
-            type="button"
-            aria-label="Iniciar chamada de vídeo"
-            onClick={() => onStartCall(counterpart.userId, "video")}
-          >
-            Vídeo
-          </button>
-        </div>
+        <CallActionButtons
+          onAudio={() => onStartCall(counterpart.userId, "audio")}
+          onVideo={() => onStartCall(counterpart.userId, "video")}
+        />
+      )}
+      {!counterpart && onJoinGroupCall && (
+        <CallActionButtons
+          onAudio={() => onJoinGroupCall("audio")}
+          onVideo={() => onJoinGroupCall("video")}
+        />
       )}
       {detailsToggle}
     </header>
@@ -1289,6 +1313,21 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         : "Abrir perfil da conversa"
       : "Detalhes do grupo";
 
+  // RF-24: join buttons resolve to a resource room only for a channel or a
+  // group DM — a 1:1 (detailsKind === "direct") keeps using RF-23's
+  // onStartCall above. ctx.joinResourceCall is undefined while a call of
+  // either kind is already in progress (ChatShell owns that guard).
+  const joinChannelCall =
+    kind === "channel" && targetId && ctx.joinResourceCall
+      ? (callType: "audio" | "video") =>
+          ctx.joinResourceCall!({ kind: "channel", id: targetId, name: resolvedName, callType })
+      : undefined;
+  const joinGroupCall =
+    kind === "dm" && detailsKind === "group" && targetId && ctx.joinResourceCall
+      ? (callType: "audio" | "video") =>
+          ctx.joinResourceCall!({ kind: "dm", id: targetId, name: resolvedName, callType })
+      : undefined;
+
   return (
     <div
       className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
@@ -1304,6 +1343,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         {kind === "channel" ? (
           <HeaderChannel
             name={resolvedName}
+            onJoinCall={joinChannelCall}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle
@@ -1321,6 +1361,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             counterpart={activeDM?.counterpart}
             presenceTarget={targetId ? presenceTargetKey("dm", targetId) : undefined}
             onStartCall={ctx.startCall}
+            onJoinGroupCall={joinGroupCall}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle

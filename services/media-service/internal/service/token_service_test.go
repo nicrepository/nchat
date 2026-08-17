@@ -233,6 +233,38 @@ func TestTokenServiceRejectsInvalidConfigurationAndPrincipal(t *testing.T) {
 	}
 }
 
+func TestTokenServiceIssuesChannelAndDMTokensThroughTheSameAuthorizer(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	for _, kind := range []domain.ResourceKind{domain.ResourceKindChannel, domain.ResourceKindDM} {
+		t.Run(string(kind), func(t *testing.T) {
+			authorizer := &tokenAuthorizerStub{result: AuthorizedResource{
+				ID: serviceTestResource, SessionExpiresAt: now.Add(20 * time.Minute),
+			}}
+			signer := &tokenSignerStub{result: SignedToken{Token: "token", ExpiresAt: now.Add(5 * time.Minute)}}
+			svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
+
+			result, err := svc.Issue(context.Background(), IssueTokenInput{
+				Kind: kind, ResourceID: serviceTestResource,
+				UserID: serviceTestUserID, SessionID: serviceTestSessionID,
+				AccessExpiresAt: now.Add(10 * time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("issue %s: %v", kind, err)
+			}
+			if result.Token == "" {
+				t.Fatalf("expected token for %s", kind)
+			}
+			if authorizer.input.Kind != kind {
+				t.Fatalf("authorizer did not receive kind %s: %+v", kind, authorizer.input)
+			}
+			wantRoom := string(kind) + ":aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+			if signer.input.Room != wantRoom {
+				t.Fatalf("expected room %q, got %q", wantRoom, signer.input.Room)
+			}
+		})
+	}
+}
+
 func TestTokenServiceRejectsInvalidCanonicalResourceFromStorage(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	authorizer := &tokenAuthorizerStub{result: AuthorizedResource{

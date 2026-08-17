@@ -445,6 +445,25 @@ func TestChatMigration_AddsV3MentionsAndDirectedOutbox(t *testing.T) {
 	}
 }
 
+func TestChatLinkScanInconclusiveMigrationKeepsTTLIndexVerdictOnly(t *testing.T) {
+	up := readChatMigration(t, "000026_link_scan_inconclusive.up.sql")
+	if !strings.Contains(up, "WHERE status IN ('safe', 'malicious')") {
+		t.Fatal("the verdict TTL index must exclude inconclusive scans")
+	}
+}
+
+func TestChatLinkScanInconclusiveDownMigrationNeverRequeuesTerminalRows(t *testing.T) {
+	down := readChatMigration(t, "000026_link_scan_inconclusive.down.sql")
+	if strings.Contains(down, "SET status = 'pending'") || strings.Contains(down, "scan_uuid = NULL") {
+		t.Fatal("rollback must not turn inconclusive scans back into provider work")
+	}
+	for _, expected := range []string{"RAISE EXCEPTION", "WHERE status = 'inconclusive'"} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("safe inconclusive rollback must contain %q", expected)
+		}
+	}
+}
+
 func TestChatMigration_AddsMessageReactionsWithRollback(t *testing.T) {
 	migration := readChatMigration(t, "000008_message_reactions.up.sql")
 	for _, expected := range []string{

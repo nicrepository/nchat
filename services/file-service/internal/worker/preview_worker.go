@@ -62,7 +62,32 @@ const (
 	workerNamePreview       = "preview"
 	workerNameObjectCleanup = "object_cleanup"
 	workerNameMalwareScan   = "malware_scan"
+	workerNameLinkScan      = "link_scan"
 )
+
+// linkScanPollInterval is how often outstanding RF-21 URL scans are advanced.
+//
+// The same cadence as the preview and antimalware polls, and for the same
+// reason: it is the latency budget of the feature. A link preview is withheld
+// until its URL has a verdict, so this is what somebody waits before their card
+// renders — and it matches the fastest cadence Cloudflare recommends polling a
+// scan at.
+const linkScanPollInterval = 10 * time.Second
+
+// NewLinkScan builds the worker that drains the RF-21 URL scan queue.
+//
+// The fourth job on the same loop, and deliberately not a fourth implementation
+// of it: all of them claim a batch, process it, and stop when their context
+// ends.
+func NewLinkScan(processor PreviewProcessor, logger *slog.Logger) *Preview {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Preview{
+		processor: processor, interval: linkScanPollInterval,
+		name: workerNameLinkScan, logger: logger,
+	}
+}
 
 // NewMalwareScan builds the worker that drains the antimalware scan queue
 // (RF-22).

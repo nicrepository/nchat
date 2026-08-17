@@ -43,6 +43,40 @@ func messageAccessPredicate(userArg string) string {
 	)`
 }
 
+// messageVisibilityPredicate hides a message that is still being link-scanned
+// from everyone except the person who wrote it (RF-21).
+//
+// It is one definition, applied by every query that returns message rows,
+// because the alternative is what the security review found: `status` was
+// checked in some reads and not in others, so a withheld message was invisible
+// in the paths somebody had remembered and readable in the paths they had not —
+// GET by id, channel history and DM history among them.
+//
+// Why it is not simply `status = 'active'`: a deleted message is deliberately
+// still returned, as a tombstone, and the read paths depend on that. So this
+// excludes exactly one state and leaves the rest of the contract alone.
+//
+// Why the sender is exempt: their client has to be able to rebuild "this is
+// still being checked" after a reload, and the message is their own. The
+// exemption is scoped to the row's own sender_id, so it cannot widen to anyone
+// else — and it is deliberately absent from the projections (sidebar activity,
+// favourites listing, last message), which stay active-only because they are
+// read *about* a conversation rather than *by* an author.
+func messageVisibilityPredicate(alias, userArg string) string {
+	return `(` + alias + `.status <> 'pending_link_scan' OR ` + alias + `.sender_id = ` + userArg + `::uuid)`
+}
+
+// messageNotPendingPredicate excludes withheld messages outright.
+//
+// Used by the projections that summarise a conversation for a viewer — the
+// sidebar's last-activity timestamp and the favourites list. A withheld message
+// must not reorder somebody's sidebar or light up a conversation, and unlike a
+// direct read there is no "it is mine" case worth serving there: the author
+// already knows they just sent it.
+func messageNotPendingPredicate(alias string) string {
+	return alias + `.status <> 'pending_link_scan'`
+}
+
 // AddFavoriteInput identifies the message the authenticated user wants to favorite.
 // UserID always comes from the authenticated context, never from the payload.
 type AddFavoriteInput struct {
@@ -151,7 +185,8 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 		LEFT JOIN auth.users u
 		  ON u.id = m.sender_id
 		WHERE f.user_id = $2
-		  AND ` + messageAccessPredicate("$2")
+		  AND ` + messageAccessPredicate("$2") + `
+		  AND ` + messageNotPendingPredicate("m")
 
 	args := []any{input.WorkspaceID, input.UserID}
 	if input.BeforeCursor != nil {

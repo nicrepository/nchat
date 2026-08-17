@@ -680,3 +680,138 @@ func TestShutdownStopsTheLinkPreviewLimiter(t *testing.T) {
 		t.Fatalf("second shutdown: %v", err)
 	}
 }
+
+// --- CQ-4: database-backed features are independent of uploads --------------
+//
+// The finding: the pool was opened inside the attachment wiring, so every other
+// capability that needs persistence inherited FILE_UPLOADS_ENABLED as a hidden
+// prerequisite. RF-21's verdict queue is durable and has nothing to do with
+// uploads, so a deployment running link previews with uploads off had no pool
+// for it.
+
+// linkSafetyConfig enables previews and link safety with uploads switched off.
+func linkSafetyConfig(t *testing.T) config.Config {
+	t.Helper()
+	cfg := healthOnlyConfig()
+	cfg.LinkPreviewEnabled = true
+	cfg.LinkPreviewTimeoutSeconds = 5
+	cfg.LinkPreviewCacheTTLSeconds = 900
+	cfg.LinkSafetyEnabled = true
+	cfg.LinkSafetyCloudflareAccount = "acct-123"
+	cfg.LinkSafetyCloudflareToken = "token-abc"
+	// The uncertainty horizon has no safe default of zero: without one an
+	// unresolvable submission is either reconciled forever or resubmitted
+	// immediately, so config validation refuses it. A hand-built Config has to
+	// supply it, exactly as Load does.
+	cfg.LinkSafetySubmitUncertainTimeoutSeconds = 900
+	cfg.DatabaseURL = "postgres://nchat@localhost:5432/nchat"
+	cfg.DBConnectTimeoutSeconds = 5
+	cfg.DBMaxConnections = 10
+	cfg.AuthJWTHMACSecret = strings.Repeat("s", 32)
+	cfg.AuthJWTIssuer = "nchat-auth"
+	cfg.AuthJWTAudience = "nchat-api"
+	return cfg
+}
+
+// The case the finding is about: no uploads, link safety on, and the service
+// still gets its pool.
+func TestLinkSafetyGetsADatabaseWithoutUploads(t *testing.T) {
+	pool := &stubPool{}
+	application, err := newApp(linkSafetyConfig(t), appDependencies{
+		openDB: openStub(pool), tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("link safety must not require uploads: %v", err)
+	}
+	if application.pool == nil {
+		t.Fatal("no pool was opened for the durable verdict queue")
+	}
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if !pool.closed {
+		t.Fatal("shutdown must close the connection pool")
+	}
+}
+
+// Both features on: one pool, shared. Opening a second would double the
+// connection budget for no reason.
+func TestUploadsAndLinkSafetyShareOnePool(t *testing.T) {
+	pool := &stubPool{}
+	var opens int
+	cfg := uploadsEnabledConfig(t)
+	cfg.LinkPreviewEnabled = true
+	cfg.LinkPreviewTimeoutSeconds = 5
+	cfg.LinkPreviewCacheTTLSeconds = 900
+	cfg.LinkSafetyEnabled = true
+	cfg.LinkSafetyCloudflareAccount = "acct-123"
+	cfg.LinkSafetyCloudflareToken = "token-abc"
+	cfg.LinkSafetySubmitUncertainTimeoutSeconds = 900
+
+	application, err := newApp(cfg, appDependencies{
+		openDB: func(ctx context.Context, dsn string, timeout, maxConns int) (storage.Pool, error) {
+			opens++
+			return openStub(pool)(ctx, dsn, timeout, maxConns)
+		},
+		openAdmission: admissionStub(), openFence: fenceStub(),
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opens != 1 {
+		t.Fatalf("the process opened %d pools", opens)
+	}
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+// Nothing that needs persistence is enabled, so no pool is opened at all: a
+// health-only deployment must not require a database.
+func TestNoDatabaseWhenNothingNeedsOne(t *testing.T) {
+	var opens int
+	cfg := healthOnlyConfig()
+	cfg.LinkPreviewEnabled = true
+	cfg.LinkPreviewTimeoutSeconds = 5
+	cfg.LinkPreviewCacheTTLSeconds = 900
+	cfg.AuthJWTHMACSecret = strings.Repeat("s", 32)
+	cfg.AuthJWTIssuer = "nchat-auth"
+	cfg.AuthJWTAudience = "nchat-api"
+
+	application, err := newApp(cfg, appDependencies{
+		openDB: func(context.Context, string, int, int) (storage.Pool, error) {
+			opens++
+			return &stubPool{}, nil
+		},
+		tracingShutdown: noopShutdown,
+	})
+	if err != nil {
+		t.Fatalf("previews alone must not need a database: %v", err)
+	}
+	if opens != 0 {
+		t.Fatalf("a pool was opened for a deployment that needs none (%d)", opens)
+	}
+	if application.pool != nil {
+		t.Fatal("a pool was retained for a deployment that needs none")
+	}
+}
+
+// An unreachable database is a start-up failure for link safety exactly as it is
+// for uploads: the check cannot run, so the service must not serve previews of
+// links nobody scanned.
+func TestLinkSafetyFailsWhenTheDatabaseIsUnreachable(t *testing.T) {
+	_, err := newApp(linkSafetyConfig(t), appDependencies{
+		openDB: func(context.Context, string, int, int) (storage.Pool, error) {
+			return nil, errors.New("dial tcp db-primary.internal:5432: connection refused")
+		},
+		tracingShutdown: noopShutdown,
+	})
+	if err == nil {
+		t.Fatal("an unreachable database must stop start-up")
+	}
+	// The DSN and driver message never reach the caller.
+	if strings.Contains(err.Error(), "db-primary.internal") {
+		t.Fatalf("the error leaked the DSN: %v", err)
+	}
+}

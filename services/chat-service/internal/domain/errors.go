@@ -39,6 +39,43 @@ var (
 	// ErrPinLimitReached is returned when a channel already holds the maximum
 	// number of pinned messages (RF-05 abuse ceiling).
 	ErrPinLimitReached = errors.New("pin limit reached")
+	// ErrMaliciousURL reports a message body carrying a link the Safe Browsing
+	// provider considers a security threat, or one whose host has no reputation
+	// that could be consulted at all (RF-21). Both are permanent: the same body
+	// will be refused again.
+	//
+	// It is its own error and not an ErrInvalidInput, because a client must be
+	// able to tell "this link is dangerous" from "your request was malformed"
+	// without reading the message text.
+	ErrMaliciousURL = errors.New("message carries a malicious url")
+	// ErrURLCheckUnavailable reports that a link's safety could not be
+	// established. It is separate from ErrMaliciousURL because the two mean
+	// opposite things to the person typing: one says the link is bad, the other
+	// says to try again.
+	ErrURLCheckUnavailable = errors.New("url safety check unavailable")
+	// ErrURLCheckPending reports that a link is being scanned and no verdict
+	// exists yet (RF-21).
+	//
+	// It is separate from the other two because it means neither "bad" nor
+	// "broken": the scan was queued by this very request and will finish. Only
+	// editing uses it — creating and forwarding withhold the message instead,
+	// which is the better answer when there is no already-published version to
+	// preserve.
+	ErrURLCheckPending = errors.New("url safety check pending")
+	// ErrLinkScanCapacity reports that the operation would require new provider
+	// work this deployment is not currently willing to spend.
+	//
+	// It is its own error, and keeping it apart from ErrMaliciousURL is the whole
+	// point: a full queue or a spent window says nothing whatsoever about the
+	// links in the message. Reporting one as the other would show a sender a
+	// security warning for an operational condition, and would teach an operator
+	// to read a spike in refusals as an attack on their users rather than as a
+	// provider that has stopped keeping up.
+	//
+	// It is also not ErrURLCheckUnavailable. Unavailable means the check failed;
+	// this means the check was never attempted, on purpose, and retrying shortly
+	// is the right response.
+	ErrLinkScanCapacity = errors.New("link scan capacity exceeded")
 	// ErrChannelDisplayNameRequired and ErrChannelDisplayNameTooLong report the
 	// two ways a channel name fails NormalizeChannelDisplayName.
 	//

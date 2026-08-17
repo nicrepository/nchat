@@ -62,6 +62,13 @@ spec:
             - secretRef:
                 name: nchat-file-encryption
                 optional: true
+            # RF-21: the Cloudflare URL Scanner credentials for link previews.
+            # Shared with chat-service, scoped to the two services that call
+            # Cloudflare, and optional for the same reason as above — the flag
+            # decides, and an enabled flag with no credentials stops start-up.
+            - secretRef:
+                name: nchat-link-safety
+                optional: true
           env:
             - name: PORT
               value: "8083"

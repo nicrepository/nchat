@@ -587,8 +587,25 @@ export default function MessageBubble({
         />
         <div
           ref={bubbleRef}
-          className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}`}
+          className={`chat-msg-area__msg-bubble${message.isRemoved ? " chat-msg-area__msg-bubble--removed" : ""}${
+            message.status === "pending_link_scan" ? " chat-msg-area__msg-bubble--pending-scan" : ""
+          }`}
         >
+          {/*
+            RF-21. Only the sender ever receives a message in this state — the
+            backend withholds it from every other reader — so this is what stops
+            the composer from claiming a delivery that has not happened. The
+            state is rendered, never decided: nothing here inspects a link, and
+            the notice disappears only when the backend promotes the message.
+          */}
+          {message.status === "pending_link_scan" && (
+            <div className="chat-msg-area__pending-scan" data-testid="chat-message-pending-scan">
+              <span className="material-symbols-outlined" aria-hidden="true">
+                shield
+              </span>
+              Verificando segurança dos links…
+            </div>
+          )}
           {message.isForwarded && !message.isRemoved && (
             <div className="chat-msg-area__forwarded" data-testid="chat-message-forwarded">
               <span className="material-symbols-outlined" aria-hidden="true">

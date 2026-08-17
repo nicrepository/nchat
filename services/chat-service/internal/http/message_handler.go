@@ -25,6 +25,25 @@ var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 // maxBodyBytes caps request body reads to prevent memory abuse.
 const maxBodyBytes = 1 << 16 // 64 KiB
 
+// RF-21 error codes. They are stable identifiers a client keys on, which is the
+// point: a frontend must be able to tell a blocked link from a malformed
+// request without parsing English. The two are separate because one is
+// permanent and the other is worth retrying.
+const (
+	errCodeMaliciousURL         = "malicious_url"
+	errCodeLinkCheckUnavailable = "link_check_unavailable"
+	// errCodeLinkCheckPending says the links are being scanned right now and
+	// the operation should be retried shortly. It is only ever returned by
+	// editing: creating and forwarding accept the message and withhold it
+	// instead, which is reported by the body's `status` field rather than by an
+	// error.
+	errCodeLinkCheckPending = "link_check_pending"
+	// errCodeLinkCheckCapacity says this deployment declined to start new scans
+	// right now. It is retryable and it is not a verdict — the client must not
+	// present it as a blocked link.
+	errCodeLinkCheckCapacity = "link_check_capacity"
+)
+
 // workspaceResolver resolves the single default workspace.
 // Satisfied by storage.WorkspaceStore.
 type workspaceResolver interface {
@@ -44,6 +63,7 @@ type messageProvider interface {
 	EditMessage(ctx context.Context, in service.EditMessageInput) (domain.Message, error)
 	DeleteMessage(ctx context.Context, in service.DeleteMessageInput) (domain.Message, error)
 	GetMessageEditHistory(ctx context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
+	MessageLinkSafetyStates(ctx context.Context, in service.LinkSafetyStatusInput) ([]domain.MessageLinkSafetyState, error)
 }
 
 type editRateLimiter interface {
@@ -197,6 +217,27 @@ type reactionJSON struct {
 type listMessagesResponseData struct {
 	Messages   []messageJSON `json:"messages"`
 	NextCursor string        `json:"next_cursor,omitempty"`
+}
+
+// linkSafetyStatusRequest asks what became of messages the caller is still
+// showing as being checked (RF-21).
+type linkSafetyStatusRequest struct {
+	MessageIDs []string `json:"message_ids"`
+}
+
+// linkSafetyStatusJSON is one answer, and is deliberately almost empty.
+//
+// A state, and a reason only when there is one. No body, no URL, no canonical
+// URL, no query, no scan identifier and nothing the provider said: the author is
+// told that their message was refused, not what the scanner knows.
+type linkSafetyStatusJSON struct {
+	MessageID string `json:"message_id"`
+	State     string `json:"state"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type linkSafetyStatusResponseData struct {
+	Statuses []linkSafetyStatusJSON `json:"statuses"`
 }
 
 type resolveMessageReferencesRequest struct {
@@ -1006,12 +1047,22 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Optional, and the same header forwarding already uses: a retried send
+	// returns the original message instead of creating a second one. It matters
+	// more since RF-21, because a message withheld for a link scan is delivered
+	// to nobody, so a client with a dropped response has every reason to retry.
+	idempotencyKey, ok := parseIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
 	msg, err := h.messages.CreateChannelMessage(r.Context(), service.CreateChannelMessageInput{
 		WorkspaceID:         wsID,
 		ChannelID:           channelID,
 		SenderID:            userID, // always from auth context — never from body
 		BodyText:            req.BodyText,
 		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
+		IdempotencyKey:      idempotencyKey,
 		ParentMessageID:     req.ParentMessageID,
 		ReferencedMessageID: req.ReferencedMessageID,
 		AttachmentIDs:       req.AttachmentIDs,
@@ -1151,12 +1202,22 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Optional, and the same header forwarding already uses: a retried send
+	// returns the original message instead of creating a second one. It matters
+	// more since RF-21, because a message withheld for a link scan is delivered
+	// to nobody, so a client with a dropped response has every reason to retry.
+	idempotencyKey, ok := parseIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
 	msg, err := h.messages.CreateDMMessage(r.Context(), service.CreateDMMessageInput{
 		WorkspaceID:         wsID,
 		ConversationID:      convID,
 		SenderID:            userID,
 		BodyText:            req.BodyText,
 		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
+		IdempotencyKey:      idempotencyKey,
 		ParentMessageID:     req.ParentMessageID,
 		ReferencedMessageID: req.ReferencedMessageID,
 		AttachmentIDs:       req.AttachmentIDs,
@@ -1309,6 +1370,50 @@ func (h *MessageHandler) resolveMessageReferences(w http.ResponseWriter, r *http
 	httputil.WriteJSON(w, http.StatusOK, response)
 }
 
+// GetMessageLinkSafetyStatus answers what became of the caller's own withheld
+// messages (RF-21).
+//
+// The recovery path for a verdict whose realtime announcement was missed. A
+// message.blocked is published once, to its author, and an author who was
+// offline at that moment gets nothing — their client would otherwise show
+// "checking links…" for a message that no longer exists. On reconnect it asks
+// here instead.
+//
+// Ids the service will not answer about are omitted from the response rather
+// than reported as forbidden, so this cannot be used to learn whether a message
+// id exists. Nothing is logged about which ids were asked for.
+func (h *MessageHandler) GetMessageLinkSafetyStatus(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var req linkSafetyStatusRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	states, err := h.messages.MessageLinkSafetyStates(r.Context(), service.LinkSafetyStatusInput{
+		WorkspaceID: workspaceID, SenderID: userID, MessageIDs: req.MessageIDs,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	response := linkSafetyStatusResponseData{Statuses: make([]linkSafetyStatusJSON, 0, len(states))}
+	for _, state := range states {
+		status := linkSafetyStatusJSON{MessageID: state.MessageID, State: string(state.State), Reason: state.Reason}
+		response.Statuses = append(response.Statuses, status)
+	}
+	httputil.WriteJSON(w, http.StatusOK, response)
+}
+
 func mapMessages(msgs []domain.Message) []messageJSON {
 	out := make([]messageJSON, 0, len(msgs))
 	for _, m := range msgs {
@@ -1353,6 +1458,37 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflict")
 	case errors.Is(err, domain.ErrPinLimitReached):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "pin limit reached")
+	case errors.Is(err, domain.ErrMaliciousURL):
+		// The code is the contract; the text is a fallback. Which link was
+		// condemned and which category the provider reported are both withheld:
+		// repeating them would turn the send endpoint into a free oracle for
+		// checking whether a domain is already burned.
+		httputil.WriteError(w, http.StatusForbidden, errCodeMaliciousURL,
+			"this message contains a link blocked for security reasons")
+	case errors.Is(err, domain.ErrLinkScanCapacity):
+		// 429 and not 403, and its own code. The message was refused because this
+		// deployment is not currently willing to buy more scans — a spent window
+		// or a full queue — and that says nothing whatsoever about its links.
+		// Reporting it as malicious_url would show a security warning for an
+		// operational condition, and would teach an operator to read a spike in
+		// refusals as an attack on their users.
+		//
+		// Which ceiling refused it is deliberately not in the response: it is an
+		// internal capacity detail, and a client that could tell "my workspace is
+		// spent" from "the deployment is full" could use the endpoint to probe
+		// another tenant's activity.
+		httputil.WriteError(w, http.StatusTooManyRequests, errCodeLinkCheckCapacity,
+			"the links could not be checked right now, try again shortly")
+	case errors.Is(err, domain.ErrURLCheckUnavailable):
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
+			"the link could not be checked for safety, try again")
+	case errors.Is(err, domain.ErrURLCheckPending):
+		// 409 and not 503: nothing is broken, the scan this request queued is
+		// simply not finished. The already-published version of the message is
+		// untouched, which is the point — an edit is never shown to anyone in a
+		// state nobody has checked.
+		httputil.WriteError(w, http.StatusConflict, errCodeLinkCheckPending,
+			"the links in this edit are being checked for safety, try again shortly")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}

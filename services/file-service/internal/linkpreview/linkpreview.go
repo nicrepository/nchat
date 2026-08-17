@@ -44,6 +44,9 @@ import (
 	"errors"
 	"net/url"
 	"time"
+
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
+	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
 
 // Error classes. They are the contract with the HTTP layer, which maps each to
@@ -66,6 +69,31 @@ var (
 	// ErrNoMetadata marks a document that was fetched and parsed and carried
 	// nothing worth showing. It is an expected outcome, not a failure.
 	ErrNoMetadata = errors.New("link preview: no metadata")
+	// ErrMaliciousURL marks a URL the Safe Browsing provider reported as a
+	// security threat, or whose host carries no reputation that could be
+	// consulted at all (RF-21). Both are permanent refusals: retrying the same
+	// link will not change the answer.
+	ErrMaliciousURL = errors.New("link preview: url is not safe")
+	// ErrSafetyUnavailable marks a URL whose safety could not be established.
+	// It is deliberately not ErrUpstream: the linked site may be perfectly
+	// reachable, and the caller is being told to try again rather than that the
+	// link is bad.
+	ErrSafetyUnavailable = errors.New("link preview: safety check unavailable")
+	// ErrSafetyPending marks a URL whose scan has been queued but not finished
+	// (RF-21). It is distinct from ErrSafetyUnavailable because nothing is
+	// broken: the provider is submit-then-poll, the submission just happened,
+	// and retrying shortly succeeds. No Open Graph fetch happens in this state.
+	ErrSafetyPending = errors.New("link preview: safety check pending")
+	// ErrSafetyCapacity marks a URL this service declined to start a new scan
+	// for: the window is spent or the queue is full.
+	//
+	// Its own error, kept apart from both neighbours on purpose. It is not
+	// ErrMaliciousURL — a full queue says nothing about the link, and a client
+	// shown a security warning for an operational condition learns the wrong
+	// thing. It is not ErrSafetyUnavailable either: unavailable means the check
+	// failed, this means it was deliberately not attempted. Neither is a
+	// clearance, and nothing is fetched in either case.
+	ErrSafetyCapacity = errors.New("link preview: safety scan capacity exceeded")
 )
 
 // Preview is what the client receives. Every field is plain text or a plain
@@ -108,6 +136,8 @@ const (
 	resultTimeout         = "timeout"
 	resultUpstreamError   = "upstream_error"
 	resultNoMetadata      = "no_metadata"
+	resultMalicious       = "malicious"
+	resultSafetyUnknown   = "safety_unavailable"
 )
 
 // negativeTTL is how long a terminal failure is remembered.
@@ -118,12 +148,51 @@ const (
 // remote side may recover and a refusal must not outlive a fixed page by long.
 const negativeTTL = time.Minute
 
+// URLSafetyChecker reports what is already known about a canonical URL (RF-21).
+//
+// It is declared here, at the consumer, and satisfied by *urlsafety.Service —
+// this package depends on the question, not on Cloudflare. Nil is a supported
+// value and means the deployment did not enable the check: the preview then
+// behaves exactly as it did before RF-21.
+//
+// The unit is a canonical URL and not a hostname. A preview is a rendering of
+// one *page*, so deciding it by the reputation of the domain hosting it was the
+// hole this replaced — a phishing page on a compromised path inherited the
+// clearance of its host.
+//
+// Neither method blocks on the provider: Cloudflare URL Scanner is
+// submit-then-poll, so a URL nobody has scanned has no verdict yet. LoadVerdict
+// reads what is already known and EnsureScan records that a verdict is needed —
+// a background worker is what actually talks to Cloudflare. The preview answers
+// "being checked" rather than waiting.
+//
+// AdmitScan and not Submit, and that distinction is the correction: the preview
+// used to submit a scan itself and discard the provider's id, so nothing ever
+// polled it and every retry of the same preview submitted again. Recording the
+// *need* for a scan is idempotent, so a client refreshing a pending preview
+// costs one row update and no provider quota at all.
+//
+// Admit and not Ensure, and that is this round's: queueing a scan is spending
+// money at a third party, and nothing counted how much. A client asking for
+// previews of URLs nobody has seen before could introduce unbounded new scans,
+// and the per-request limiter did not touch that, because the unit it counts is
+// a request and the unit the provider bills is a URL. A URL already answered or
+// already queued still costs nothing and is always admitted.
+type URLSafetyChecker interface {
+	LoadVerdict(ctx context.Context, canonicalURL string) (urlsafety.Verdict, bool, error)
+	AdmitScan(ctx context.Context, canonicalURL string, capacity service.LinkScanCapacity) (service.LinkScanAdmission, error)
+}
+
 // Service answers preview requests, in front of a cache.
 type Service struct {
 	fetcher  *fetcher
 	cache    *cache
 	ttl      time.Duration
 	observer Observer
+	safety   URLSafetyChecker
+	// scanCapacity is what this service will spend on new provider work. Zero
+	// values disable the corresponding ceiling.
+	scanCapacity service.LinkScanCapacity
 }
 
 // NewService builds the service. timeout bounds one whole remote exchange and
@@ -144,6 +213,22 @@ func newService(f *fetcher, ttl time.Duration, observer Observer, now func() tim
 	}
 }
 
+// WithURLSafety enables the RF-21 reputation check in front of every fetch.
+// Returns the service for chaining; when never called, no check runs.
+func (s *Service) WithURLSafety(safety URLSafetyChecker) *Service {
+	s.safety = safety
+	return s
+}
+
+// WithScanCapacity configures what this service will spend on new provider
+// work. Zero values disable the corresponding ceiling; the numbers that matter
+// come from configuration, because the right rate depends on the Cloudflare
+// plan this deployment is billed under.
+func (s *Service) WithScanCapacity(capacity service.LinkScanCapacity) *Service {
+	s.scanCapacity = capacity
+	return s
+}
+
 // Preview returns the metadata for rawURL.
 func (s *Service) Preview(ctx context.Context, rawURL string) (Preview, error) {
 	target, err := canonicalURL(rawURL)
@@ -153,6 +238,26 @@ func (s *Service) Preview(ctx context.Context, rawURL string) (Preview, error) {
 		s.observe(err)
 		return Preview{}, err
 	}
+	// Reputation is judged ahead of the preview cache, not behind it.
+	//
+	// Behind it, the two lifetimes would compose the wrong way round: a preview
+	// may be reused for up to a day while a verdict is only trusted for minutes,
+	// so a cache hit would keep serving a card for a URL whose reputation had
+	// already turned. Asking first makes the shorter lifetime the authority —
+	// once the verdict expires the next request re-consults, and a URL that has
+	// become malicious is refused even though its Open Graph entry is still
+	// perfectly valid.
+	//
+	// It costs nothing per request: the checker has its own cache, so a hit here
+	// is a map lookup and not a call to the provider.
+	if err := s.checkSafety(ctx, target); err != nil {
+		if ctx.Err() != nil {
+			return Preview{}, ctx.Err()
+		}
+		s.observe(err)
+		return Preview{}, err
+	}
+
 	key := target.String()
 	if entry, ok := s.cache.get(key); ok {
 		if entry.err != nil {
@@ -174,6 +279,13 @@ func (s *Service) Preview(ctx context.Context, rawURL string) (Preview, error) {
 	return preview, err
 }
 
+// load fetches and parses one document. Reputation has already been judged by
+// the caller, before the cache and therefore before this — a preview of a
+// phishing page is a phishing page rendered by this service.
+//
+// That check is not a replacement for the address policy below: that one decides
+// whether this deployment may connect to the destination at all, and it still
+// runs, at every hop, for every URL that gets this far.
 func (s *Service) load(ctx context.Context, key string, target *url.URL) (Preview, error) {
 	final, body, err := s.fetcher.fetch(ctx, target)
 	if err != nil {
@@ -185,6 +297,69 @@ func (s *Service) load(ctx context.Context, key string, target *url.URL) (Previe
 	}
 	preview.URL = key
 	return preview, nil
+}
+
+// checkSafety refuses a URL the provider condemned, and refuses one it could
+// not answer about.
+//
+// Fail-closed is the deliberate choice, and it is cheap here: an unavailable
+// verdict costs the user a card they can retry, never a message they cannot
+// send. The alternative — previewing a link of unknown reputation — would make
+// a provider outage the moment the control silently stops existing.
+func (s *Service) checkSafety(ctx context.Context, target *url.URL) error {
+	if s.safety == nil {
+		return nil
+	}
+	canonical, err := urlsafety.CanonicalizeURL(target.String())
+	if err != nil {
+		// A URL with no consultable reputation — an IP literal, credentials in
+		// the URL — cannot be cleared, and a permanent condition must not be
+		// reported as a temporary one.
+		return ErrMaliciousURL
+	}
+	verdict, ok, err := s.safety.LoadVerdict(ctx, canonical)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// The store is the authority; not being able to read it is not a
+		// clearance.
+		return ErrSafetyUnavailable
+	}
+	if !ok {
+		// No verdict yet. The need for one is recorded and the caller is told to
+		// come back; what must not happen is the fetch, because fetching first
+		// and asking afterwards is rendering the phishing page.
+		//
+		// Recording is idempotent, so a client polling this endpoint produces one
+		// durable job and not one scan per request. A failure to record is still
+		// an unavailable verdict, never a clearance.
+		admission, err := s.safety.AdmitScan(ctx, canonical, s.scanCapacity)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return ErrSafetyUnavailable
+		}
+		if !admission.Allowed() {
+			// This service declined to start a new scan right now. Its own error:
+			// a spent window or a full queue says nothing about the link, and
+			// reporting it as malicious would show a security warning for an
+			// operational condition. Still not a clearance — nothing is fetched.
+			return ErrSafetyCapacity
+		}
+		return ErrSafetyPending
+	}
+	switch {
+	case verdict == urlsafety.VerdictMalicious:
+		return ErrMaliciousURL
+	case verdict != urlsafety.VerdictSafe:
+		// Any state that is not an explicit clearance is refused. This case
+		// exists so adding a verdict to the shared package cannot quietly
+		// become "allowed" here.
+		return ErrSafetyUnavailable
+	}
+	return nil
 }
 
 func (s *Service) ttlFor(err error) time.Duration {
@@ -222,6 +397,10 @@ func resultFor(err error) string {
 		return resultTimeout
 	case errors.Is(err, ErrNoMetadata):
 		return resultNoMetadata
+	case errors.Is(err, ErrMaliciousURL):
+		return resultMalicious
+	case errors.Is(err, ErrSafetyUnavailable):
+		return resultSafetyUnknown
 	default:
 		return resultUpstreamError
 	}

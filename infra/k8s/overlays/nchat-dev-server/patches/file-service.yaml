@@ -62,3 +62,19 @@ spec:
                   name: nchat-file-encryption
                   key: FILE_ENCRYPTION_PREVIOUS_KEYS
                   optional: true
+            # RF-21 Safe Browsing for link previews. Same Cloudflare account as
+            # chat-service, same Secret, each service reading it under its own
+            # variable name. Not optional for the same reason the key ring is
+            # not: with FILE_LINK_SAFETY_ENABLED=true, Config.Validate refuses
+            # to start on a missing credential rather than serving previews of
+            # links nobody checked.
+            - name: FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
+            - name: FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN

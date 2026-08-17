@@ -6,3 +6,28 @@ metadata:
 data:
   APP_ENV: staging
   LIVEKIT_ENABLED: "false"
+  # RF-21 Safe Browsing, on the same terms as every other supported overlay:
+  # stated explicitly so the environment cannot drift back to the application
+  # default, with the credentials in the nchat-link-safety Secret.
+  CHAT_LINK_SAFETY_ENABLED: "true"
+  FILE_LINK_SAFETY_ENABLED: "true"
+  # RF-21 capacity. Stated explicitly per environment rather than left to the
+  # application default, because the right numbers depend on the Cloudflare plan
+  # this cluster is billed under and no code may assume one.
+  #
+  # The unit is a *new canonical URL*. Cached verdicts, URLs already queued and
+  # duplicates inside one message are free, so these limit provider spend rather
+  # than usage. Credentials stay in the nchat-link-safety Secret; nothing here is
+  # sensitive.
+  CHAT_LINK_SAFETY_WORKSPACE_BUDGET: "60"
+  CHAT_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  CHAT_LINK_SAFETY_MAX_PENDING_JOBS: "500"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "30"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
+  FILES_LINK_SAFETY_NEW_URL_BUDGET: "120"
+  FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  FILES_LINK_SAFETY_MAX_PENDING_JOBS: "500"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "30"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"

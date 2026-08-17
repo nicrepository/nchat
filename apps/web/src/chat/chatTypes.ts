@@ -154,7 +154,16 @@ export type ActiveItem = { kind: "channel"; id: string } | { kind: "dm"; id: str
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 export type MessageKind = "user" | "system";
-export type MessageStatus = "active" | "deleted";
+/**
+ * RF-21 adds a third state. `pending_link_scan` is a message the backend
+ * accepted and is withholding while Cloudflare URL Scanner decides about the
+ * links in it: only its own sender ever receives one, in the create response,
+ * and nobody else is shown it until the backend promotes it.
+ *
+ * It is not a client-side decision. The frontend renders this state; it never
+ * infers it, and it cannot clear it.
+ */
+export type MessageStatus = "active" | "deleted" | "pending_link_scan";
 export type MessageBodyFormat = "v1" | "v2" | "v3";
 
 export function normalizeBodyFormat(raw?: string): MessageBodyFormat {

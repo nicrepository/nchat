@@ -622,6 +622,39 @@ func TestPreviewMigrationIndexesTheWorkerQueue(t *testing.T) {
 	}
 }
 
+func TestLinkScanInconclusiveMigrationBlocksLegacyClaims(t *testing.T) {
+	up := readFilesMigration(t, "000008_link_scan_inconclusive.up.sql")
+	for _, expected := range []string{
+		"CREATE FUNCTION files.reject_inconclusive_link_scan_update()",
+		"RETURN NULL;",
+		"BEFORE UPDATE ON files.link_scans",
+		"WHEN (OLD.state = 'inconclusive')",
+		"WHERE state IN ('submit_pending', 'submitting', 'submit_uncertain', 'polling')",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Fatalf("inconclusive migration must contain %q", expected)
+		}
+	}
+}
+
+func TestLinkScanInconclusiveDownMigrationNeverRequeuesTerminalRows(t *testing.T) {
+	down := readFilesMigration(t, "000008_link_scan_inconclusive.down.sql")
+	if strings.Contains(down, "SET state = 'submit_pending'") ||
+		strings.Contains(down, "scan_uuid = NULL") {
+		t.Fatal("rollback must not turn inconclusive scans back into provider work")
+	}
+	for _, expected := range []string{
+		"RAISE EXCEPTION",
+		"WHERE state = 'inconclusive'",
+		"DROP TRIGGER",
+		"DROP FUNCTION files.reject_inconclusive_link_scan_update()",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("safe inconclusive rollback must contain %q", expected)
+		}
+	}
+}
+
 // The rollback drops derived data only. It must not need an emptiness guard and
 // must not reach outside the files schema.
 func TestPreviewDownMigrationDropsOnlyDerivedState(t *testing.T) {
