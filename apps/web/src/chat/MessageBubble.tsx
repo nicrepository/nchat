@@ -221,7 +221,9 @@ function MessageReactions({
               aria-pressed={reaction.reactedByMe}
               aria-disabled={!canToggleReaction(message.reactions, reaction.emoji)}
               title={
-                canToggleReaction(message.reactions, reaction.emoji) ? undefined : reactionToggleHint
+                canToggleReaction(message.reactions, reaction.emoji)
+                  ? undefined
+                  : reactionToggleHint
               }
               onClick={() => onToggleReaction(message.id, reaction.emoji)}
             >
@@ -344,7 +346,9 @@ function MessageReactions({
                     type="button"
                     aria-label={`Reagir com ${emoji}`}
                     aria-disabled={!canToggleReaction(message.reactions, emoji)}
-                    title={canToggleReaction(message.reactions, emoji) ? undefined : reactionToggleHint}
+                    title={
+                      canToggleReaction(message.reactions, emoji) ? undefined : reactionToggleHint
+                    }
                     onClick={() => selectReaction(emoji)}
                   >
                     {emoji}
