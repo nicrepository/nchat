@@ -833,6 +833,117 @@ describe("ChatMessageArea — channel header", () => {
     expect(header.querySelector("img")).toBeNull();
   });
 
+  it("RF-24: wires the channel header call buttons to joinResourceCall with resource_kind channel", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const joinResourceCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  joinResourceCall,
+                }}
+              />
+            }
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de vídeo" }));
+
+    expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith({
+      kind: "channel",
+      id: "geral",
+      name: "geral",
+      callType: "video",
+    });
+  });
+
+  it("RF-24: wires the group header call buttons to joinResourceCall with resource_kind dm, never for a 1:1", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const joinResourceCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-grp"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
+                  joinResourceCall,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de áudio" }));
+
+    expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith({
+      kind: "dm",
+      id: "dm-grp",
+      name: "Equipe Infra",
+      callType: "audio",
+    });
+  });
+
+  it("RF-24: a 1:1 DM never offers joinResourceCall buttons even when the context provides it", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const joinResourceCall = vi.fn();
+    const startCall = vi.fn(() => true);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-1",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [],
+                      counterpart: { userId: "user-1", displayName: "Juliane" },
+                    },
+                  ],
+                  joinResourceCall,
+                  startCall,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de áudio" }));
+
+    expect(startCall).toHaveBeenCalledOnce();
+    expect(joinResourceCall).not.toHaveBeenCalled();
+  });
+
   it("colours the header fallback deterministically from the counterpart id, matching the sidebar", async () => {
     const dmWithUser = (id: string, userId: string) => ({
       id,

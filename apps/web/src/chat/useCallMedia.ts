@@ -17,6 +17,18 @@ export type CallMediaStatus =
   | "permission-denied"
   | "error";
 
+// One resource-room participant (RF-24), keyed by LiveKit participant.identity
+// — the canonical user UUID, never participant.sid. Present in this list from
+// ParticipantConnected/existing-on-connect through ParticipantDisconnected,
+// independent of whether camera/microphone are currently published, so a
+// grid tile can render an avatar fallback instead of disappearing.
+export interface ParticipantMedia {
+  identity: string;
+  hasVideo: boolean;
+  hasAudio: boolean;
+  bindVideo: RefCallback<HTMLDivElement>;
+}
+
 export interface CallMediaController {
   status: CallMediaStatus;
   microphoneEnabled: boolean;
@@ -31,6 +43,11 @@ export interface CallMediaController {
   pendingControl: "microphone" | "camera" | null;
   bindLocalMedia: RefCallback<HTMLDivElement>;
   bindRemoteMedia: RefCallback<HTMLDivElement>;
+  // RF-24 grid API. Populated from the same event stream as the legacy
+  // fields above but kept independent: a resource room never touches
+  // bindRemoteMedia's flat container, and a direct call never touches these.
+  participants: ParticipantMedia[];
+  bindRemoteAudio: RefCallback<HTMLDivElement>;
   toggleMicrophone: () => Promise<void>;
   toggleCamera: () => Promise<void>;
   activateAudio: () => Promise<void>;
@@ -59,6 +76,7 @@ interface MediaState {
   audioActivationRequired: boolean;
   error: string | null;
   pendingControl: "microphone" | "camera" | null;
+  participants: ParticipantMedia[];
 }
 
 const initialState: MediaState = {
@@ -73,7 +91,15 @@ const initialState: MediaState = {
   audioActivationRequired: false,
   error: null,
   pendingControl: null,
+  participants: [],
 };
+
+interface ParticipantMediaEntry {
+  hasVideo: boolean;
+  hasAudio: boolean;
+  videoElement: HTMLMediaElement | null;
+  container: HTMLDivElement | null;
+}
 
 // Unique identity for one control operation. Compared by reference (===),
 // never by its "control" field alone, so a toggle from a superseded session
@@ -101,6 +127,11 @@ export function useCallMedia(
     promise: Promise<void>;
   } | null>(null);
   const disconnectPromiseRef = useRef<Promise<void> | null>(null);
+  // The session a failed stop() is still trying to disconnect. Kept set only
+  // across a rejection (cleared on success) so a retried stop() calls
+  // disconnect() again on the very same Room instead of finding sessionRef
+  // already nulled and silently no-op'ing — see stop() below.
+  const disconnectingSessionRef = useRef<LiveKitSession | null>(null);
   const connectedCallIdRef = useRef("");
   const audioActivationRequiredRef = useRef(false);
   // Identity of the in-flight control operation (not just its kind): guards
@@ -117,6 +148,12 @@ export function useCallMedia(
   const remoteContainerRef = useRef<HTMLDivElement | null>(null);
   const localElementRef = useRef<HTMLMediaElement | null>(null);
   const remoteElementsRef = useRef(new Set<HTMLMediaElement>());
+  // RF-24 grid bookkeeping, independent of the legacy flat container above.
+  const remoteAudioContainerRef = useRef<HTMLDivElement | null>(null);
+  const remoteAudioElementsRef = useRef(new Set<HTMLMediaElement>());
+  const participantsMapRef = useRef(new Map<string, ParticipantMediaEntry>());
+  const participantOrderRef = useRef<string[]>([]);
+  const participantBindRef = useRef(new Map<string, RefCallback<HTMLDivElement>>());
 
   const update = useCallback((patch: Partial<MediaState>) => {
     if (mountedRef.current) setState((current) => ({ ...current, ...patch }));
@@ -129,6 +166,90 @@ export function useCallMedia(
     remoteElementsRef.current.clear();
     localContainerRef.current?.replaceChildren();
     remoteContainerRef.current?.replaceChildren();
+
+    for (const element of remoteAudioElementsRef.current) element.remove();
+    remoteAudioElementsRef.current.clear();
+    remoteAudioContainerRef.current?.replaceChildren();
+    participantsMapRef.current.clear();
+    participantOrderRef.current = [];
+    participantBindRef.current.clear();
+  }, []);
+
+  const bindVideoFor = useCallback((identity: string): RefCallback<HTMLDivElement> => {
+    let bind = participantBindRef.current.get(identity);
+    if (!bind) {
+      bind = (container) => {
+        const entry = participantsMapRef.current.get(identity);
+        if (!entry) return;
+        entry.container = container;
+        if (container && entry.videoElement) container.replaceChildren(entry.videoElement);
+      };
+      participantBindRef.current.set(identity, bind);
+    }
+    return bind;
+  }, []);
+
+  const syncParticipants = useCallback(() => {
+    const participants: ParticipantMedia[] = participantOrderRef.current.map((identity) => {
+      const entry = participantsMapRef.current.get(identity);
+      return {
+        identity,
+        hasVideo: entry?.hasVideo ?? false,
+        hasAudio: entry?.hasAudio ?? false,
+        bindVideo: bindVideoFor(identity),
+      };
+    });
+    update({ participants });
+  }, [bindVideoFor, update]);
+
+  const ensureParticipant = useCallback((identity: string) => {
+    if (participantsMapRef.current.has(identity)) return;
+    participantsMapRef.current.set(identity, {
+      hasVideo: false,
+      hasAudio: false,
+      videoElement: null,
+      container: null,
+    });
+    participantOrderRef.current.push(identity);
+  }, []);
+
+  const removeParticipant = useCallback((identity: string) => {
+    participantsMapRef.current.delete(identity);
+    participantBindRef.current.delete(identity);
+    participantOrderRef.current = participantOrderRef.current.filter((id) => id !== identity);
+  }, []);
+
+  // Invalidates a session the SDK itself declared dead (RoomEvent.Disconnected,
+  // never Reconnecting/Reconnected), so a later connect()/createReadySession()
+  // for a new call never inherits stale bookkeeping pointing at a Room that no
+  // longer exists. Mirrors stop()'s synchronous bookkeeping reset, but leaves
+  // React state to the caller (onDisconnected sets its own status/error in the
+  // same update as clearing every other field) and never awaits — this runs
+  // inside a synchronous adapter callback.
+  const invalidateDeadSession = useCallback(
+    (generation: number) => {
+      if (generationRef.current !== generation) return;
+      const session = sessionRef.current;
+      sessionRef.current = null;
+      sessionPromiseRef.current = null;
+      connectPromiseRef.current = null;
+      audioStartPromiseRef.current = null;
+      connectedCallIdRef.current = "";
+      pendingControlRef.current = null;
+      audioActivationRequiredRef.current = false;
+      microphoneEnabledRef.current = false;
+      generationRef.current += 1;
+      clearElements();
+      if (session && !disconnectPromiseRef.current) {
+        disconnectPromiseRef.current = session.disconnect().catch(() => undefined);
+      }
+    },
+    [clearElements],
+  );
+
+  const bindRemoteAudio = useCallback<RefCallback<HTMLDivElement>>((element) => {
+    remoteAudioContainerRef.current = element;
+    if (element) element.replaceChildren(...remoteAudioElementsRef.current);
   }, []);
 
   const callbacksFor = useCallback(
@@ -151,10 +272,30 @@ export function useCallMedia(
           update({ hasLocalVideo: element instanceof HTMLVideoElement });
         },
         onRemoteElement(element) {
-          if (!current() || remoteElementsRef.current.has(element)) return;
-          remoteElementsRef.current.add(element);
-          remoteContainerRef.current?.append(element);
-          syncRemoteState();
+          if (!current()) return;
+          if (!remoteElementsRef.current.has(element)) {
+            remoteElementsRef.current.add(element);
+            remoteContainerRef.current?.append(element);
+            syncRemoteState();
+          }
+
+          const identity = element.dataset.participantIdentity;
+          if (!identity) return;
+          ensureParticipant(identity);
+          const entry = participantsMapRef.current.get(identity);
+          if (!entry) return;
+          if (element instanceof HTMLVideoElement) {
+            entry.videoElement = element;
+            entry.hasVideo = true;
+            if (entry.container) entry.container.replaceChildren(element);
+          } else {
+            entry.hasAudio = true;
+            if (!remoteAudioElementsRef.current.has(element)) {
+              remoteAudioElementsRef.current.add(element);
+              remoteAudioContainerRef.current?.append(element);
+            }
+          }
+          syncParticipants();
         },
         onElementRemoved(element) {
           if (!current()) return;
@@ -163,16 +304,63 @@ export function useCallMedia(
             update({ hasLocalVideo: false });
           }
           remoteElementsRef.current.delete(element);
+          remoteAudioElementsRef.current.delete(element);
           element.remove();
           syncRemoteState();
+
+          const identity = element.dataset.participantIdentity;
+          if (!identity) return;
+          const entry = participantsMapRef.current.get(identity);
+          if (!entry) return;
+          if (entry.videoElement === element) {
+            entry.videoElement = null;
+            entry.hasVideo = false;
+          } else if (!(element instanceof HTMLVideoElement)) {
+            entry.hasAudio = false;
+          }
+          syncParticipants();
+        },
+        onParticipantConnected(identity) {
+          if (!current()) return;
+          ensureParticipant(identity);
+          syncParticipants();
+        },
+        onParticipantDisconnected(identity) {
+          if (!current()) return;
+          removeParticipant(identity);
+          syncParticipants();
+        },
+        // Camera mute keeps the publication (and the attached element) alive
+        // — this is never a track removal, so the element/entry.videoElement
+        // is deliberately preserved for an instant restore on unmute, only
+        // the tile's visible content and hasVideo flag change.
+        onRemoteVideoAvailabilityChanged(identity, available) {
+          if (!current()) return;
+          const entry = participantsMapRef.current.get(identity);
+          if (!entry) return;
+          if (available && entry.videoElement) {
+            entry.hasVideo = true;
+            if (entry.container) entry.container.replaceChildren(entry.videoElement);
+          } else {
+            entry.hasVideo = false;
+            entry.container?.replaceChildren();
+          }
+          syncParticipants();
         },
         onDisconnected() {
-          if (current()) {
-            update({
-              status: "error",
-              error: "A conexão de mídia foi encerrada. Tente novamente.",
-            });
-          }
+          if (!current()) return;
+          // Terminal SDK-level disconnect: the Room is dead. Without fully
+          // invalidating it here, connectedCallIdRef/sessionRef/participants
+          // would keep pointing at it, so a retry with the same call_id would
+          // hit the "already connected" dedup in connect() and never
+          // actually reconnect. bumps generationRef so any late callback
+          // from the dead session is ignored by every other current() guard.
+          invalidateDeadSession(generation);
+          update({
+            ...initialState,
+            status: "error",
+            error: "A conexão de mídia foi encerrada. Tente novamente.",
+          });
         },
         onReconnecting() {
           if (current()) update({ status: "reconnecting" });
@@ -196,7 +384,7 @@ export function useCallMedia(
         },
       };
     },
-    [update],
+    [ensureParticipant, invalidateDeadSession, removeParticipant, syncParticipants, update],
   );
 
   const loadFactory = useCallback((): Promise<LiveKitSessionFactory> => {
@@ -246,25 +434,80 @@ export function useCallMedia(
     if (sessionRef.current) return sessionRef.current;
     if (sessionPromiseRef.current) return sessionPromiseRef.current;
     const generation = generationRef.current;
-    const loading = loadFactory()
-      .then((factory) => {
-        if (!mountedRef.current || generationRef.current !== generation) return null;
-        if (sessionRef.current) return sessionRef.current;
-        const session = factory(callbacksFor(generation));
-        sessionRef.current = session;
-        disconnectPromiseRef.current = null;
-        return session;
-      })
-      .finally(() => {
-        if (sessionPromiseRef.current === loading) sessionPromiseRef.current = null;
-      });
+    const loading = (async () => {
+      // Never start a new Room while the previous one is still tearing down:
+      // stop()/invalidateDeadSession() clear sessionRef synchronously but the
+      // underlying session.disconnect() keeps running in the background, so
+      // without this wait a leave()-then-join() (or an RF-23 accept arriving
+      // while an RF-24 resource room is still releasing camera/mic) could
+      // construct a second Room before the first one is gone.
+      const pendingDisconnect = disconnectPromiseRef.current;
+      // A rejected previous disconnect only needs to be *settled* here, not
+      // successful: the real failure already reaches stop()'s own caller.
+      if (pendingDisconnect) await pendingDisconnect.catch(() => undefined);
+      // A settled-but-failed disconnect leaves the old Room parked in
+      // disconnectingSessionRef (see stop()): its cleanup is still
+      // unconfirmed, so no new Room may be created until an explicit
+      // stop()/leave() retries that disconnect for real and it succeeds.
+      if (disconnectingSessionRef.current) {
+        throw new Error("A sessão de mídia anterior ainda não foi encerrada.");
+      }
+      if (!mountedRef.current || generationRef.current !== generation) return null;
+      if (sessionRef.current) return sessionRef.current;
+      const factory = await loadFactory();
+      if (!mountedRef.current || generationRef.current !== generation) return null;
+      if (sessionRef.current) return sessionRef.current;
+      const session = factory(callbacksFor(generation));
+      sessionRef.current = session;
+      disconnectPromiseRef.current = null;
+      return session;
+    })().finally(() => {
+      if (sessionPromiseRef.current === loading) sessionPromiseRef.current = null;
+    });
     sessionPromiseRef.current = loading;
     return loading;
   }, [callbacksFor, loadFactory]);
 
-  const stop = useCallback(async () => {
-    if (disconnectPromiseRef.current) return disconnectPromiseRef.current;
-    const session = sessionRef.current;
+  // The one persistent, retryable teardown contract for any session whose
+  // cleanup must be confirmed before a new Room may exist — used by both
+  // stop() (RF-24 leave, RF-23 handoff) and connect()'s own failure path
+  // (Security Review: a session that reached LiveKit or enabled camera/mic
+  // before failing is exactly as sensitive as one stop() tears down, so it
+  // must never get a cheaper best-effort disconnect). Success releases the
+  // session; failure keeps it in disconnectingSessionRef so a later retry
+  // calls disconnect() again on the very same Room instead of forgetting it.
+  const trackedDisconnect = useCallback((session: LiveKitSession): Promise<void> => {
+    disconnectingSessionRef.current = session;
+    const cleanup = session.disconnect();
+    disconnectPromiseRef.current = cleanup;
+    cleanup.then(
+      () => {
+        if (disconnectPromiseRef.current === cleanup) disconnectPromiseRef.current = null;
+        if (disconnectingSessionRef.current === session) disconnectingSessionRef.current = null;
+      },
+      () => {
+        // Kept for retry: the next stop() must call disconnect() again on
+        // this same session instead of finding no session at all.
+        if (disconnectPromiseRef.current === cleanup) disconnectPromiseRef.current = null;
+      },
+    );
+    return cleanup;
+  }, []);
+
+  // An explicit stop() is a cleanup guarantee (RF-24 leave, RF-23 handoff):
+  // its caller relies on a resolved stop() meaning the Room is actually
+  // gone, so a real LiveKitSession.disconnect() rejection must reject stop()
+  // too — never silently swallowed into a false success. Bookkeeping (refs,
+  // participants, React state) is still reset synchronously up front either
+  // way, since the old Room must never be reused regardless of how its
+  // disconnect ends up settling.
+  const stop = useCallback((): Promise<void> => {
+    const inFlight = disconnectPromiseRef.current;
+    if (inFlight) return inFlight;
+    // Falls back to the session a previous, failed stop() was still
+    // disconnecting: sessionRef is already null by then, but the Room
+    // instance itself must be retried, not silently skipped.
+    const session = sessionRef.current ?? disconnectingSessionRef.current;
     sessionRef.current = null;
     sessionPromiseRef.current = null;
     connectPromiseRef.current = null;
@@ -276,18 +519,16 @@ export function useCallMedia(
     generationRef.current += 1;
     clearElements();
     update(initialState);
-    if (!session) return;
-    const disconnecting = session.disconnect().catch(() => undefined);
-    disconnectPromiseRef.current = disconnecting;
-    await disconnecting;
-    if (disconnectPromiseRef.current === disconnecting) disconnectPromiseRef.current = null;
-  }, [clearElements, update]);
+    if (!session) return Promise.resolve();
+    return trackedDisconnect(session);
+  }, [clearElements, trackedDisconnect, update]);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      void stop();
+      // Best-effort: the owner is gone, nothing left to retry a rejection.
+      void stop().catch(() => undefined);
     };
   }, [stop]);
 
@@ -298,6 +539,16 @@ export function useCallMedia(
       await prepare();
       return;
     }
+    // Same rule as ensureSession(): never create a session while the
+    // previous one is still tearing down.
+    const generationBeforeWait = generationRef.current;
+    const pendingDisconnect = disconnectPromiseRef.current;
+    if (pendingDisconnect) await pendingDisconnect.catch(() => undefined);
+    // Same rule as ensureSession(): an unconfirmed cleanup blocks a new Room
+    // here too. startAudio() never auto-retries the failed disconnect —
+    // that stays an explicit stop()/leave() action — so this just no-ops.
+    if (disconnectingSessionRef.current) return;
+    if (!mountedRef.current || generationRef.current !== generationBeforeWait) return;
     const session = createReadySession();
     if (!session) return;
     const generation = generationRef.current;
@@ -379,7 +630,14 @@ export function useCallMedia(
               sessionRef.current = null;
               generationRef.current += 1;
               clearElements();
-              await session.disconnect().catch(() => undefined);
+              // Tracked, not best-effort: this session may already have
+              // reached LiveKit or enabled camera/mic, so a rejection here
+              // must leave it in disconnectingSessionRef for a real retry —
+              // never lost the way a bare .catch(() => undefined) would.
+              // The primary connect failure below is what this call
+              // actually reports; the cleanup outcome is only swallowed
+              // here to avoid overriding it, never discarded from state.
+              await trackedDisconnect(session).catch(() => undefined);
             }
             connectedCallIdRef.current = "";
             microphoneEnabledRef.current = false;
@@ -405,7 +663,7 @@ export function useCallMedia(
       void connecting.then(clearPendingConnection, clearPendingConnection);
       return connecting;
     },
-    [clearElements, ensureSession, update],
+    [clearElements, ensureSession, trackedDisconnect, update],
   );
 
   const toggleMicrophone = useCallback(async () => {
@@ -477,6 +735,7 @@ export function useCallMedia(
     ...state,
     bindLocalMedia,
     bindRemoteMedia,
+    bindRemoteAudio,
     toggleMicrophone,
     toggleCamera,
     activateAudio: startAudio,

@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefCallback } from "react";
 
 import "./CallPanel.css";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import type { CallMediaController, CallMediaStatus } from "./useCallMedia";
 import type { CallController } from "./useCallSignaling";
+import type { ResourceCallController } from "./useResourceCallSession";
 
 interface CallPanelProps {
   calls: CallController;
@@ -14,6 +15,8 @@ interface CallPanelProps {
   participantName: string;
   participantAvatarUrl?: string;
   media?: CallMediaController;
+  /** RF-24 resource room (channel/group). Renders instead of the RF-23 dialog while active. */
+  resource?: ResourceCallController;
 }
 
 const terminalLabels = {
@@ -41,6 +44,7 @@ export default function CallPanel({
   participantName,
   participantAvatarUrl,
   media,
+  resource,
 }: CallPanelProps) {
   const call = calls.call;
   const dialogCallId = call?.call_id;
@@ -56,6 +60,12 @@ export default function CallPanel({
   const terminal = call && call.status in terminalLabels;
   const retryingMedia = Boolean(dialogCallId && retryingMediaCallId === dialogCallId);
   const activatingMedia = Boolean(dialogCallId && activatingMediaCallId === dialogCallId);
+  // RF-23's dialog and RF-24's ResourceCallPanel take turns rendering for the
+  // very same call_id (e.g. a call that goes ringing → active never changes
+  // dialogCallId): this must be in the modal effect's deps below, or a
+  // handoff that mounts this <dialog> for the first time on an unchanged
+  // dialogCallId never calls showModal() on it — invisible in the DOM.
+  const showsResourcePanel = Boolean(resource?.active && call?.status !== "active");
 
   useEffect(() => {
     if (!terminal) return;
@@ -73,7 +83,58 @@ export default function CallPanel({
       identityRetryPromiseRef.current = null;
       if (dialog.open && typeof dialog.close === "function") dialog.close();
     };
-  }, [dialogCallId]);
+  }, [dialogCallId, showsResourcePanel]);
+
+  const identityReady = identityStatus === "ready" && currentUserId !== "";
+  // Computed even when there is no active/ringing call, and read by the RF-24
+  // branch below: a direct call ringing in while a resource room is active
+  // must never be invisible — RF-24's media ownership does not decide
+  // whether the callee gets to see or decline an incoming RF-23 call.
+  const incoming = identityReady && call?.status === "ringing" && call.callee_id === currentUserId;
+  // Recusar's own in-flight state, independent of calls.pending (which only
+  // ever reflects Atender's preflight): Recusar must stay clickable while
+  // Atender's own permission preflight is pending. Computed here — before
+  // the RF-24 early return — so both the RF-23 dialog below and the RF-24
+  // incoming banner (in ResourceCallPanel) share the exact same behaviour
+  // instead of drifting apart.
+  const declining = call !== null && decliningCallId === call.call_id && !calls.error;
+  function declineCall() {
+    if (!call || declining) return;
+    if (calls.decline()) setDecliningCallId(call.call_id);
+  }
+
+  // RF-24 and RF-23 share one LiveKit Room (`media`), so only one of them can
+  // ever hold it. Precedence: RF-23 active > RF-24 active. Once signaling
+  // confirms this call "active", ChatShell has already begun (or is
+  // beginning) the handoff — show the RF-23 dialog immediately, even while
+  // that handoff/token/connect is still in flight or resource.active hasn't
+  // cleared yet, so the call is never hidden behind ResourceCallPanel and
+  // never silently falls back to it. Below "active" (ringing, or no RF-23
+  // call at all), RF-24 still owns the panel, and an incoming ringing call
+  // stays visible via the banner inside ResourceCallPanel. Checked after
+  // every hook above so this early return never changes the hooks called per
+  // render.
+  if (showsResourcePanel && resource) {
+    return (
+      <ResourceCallPanel
+        resource={resource}
+        media={media}
+        currentUserId={currentUserId}
+        incomingCall={
+          incoming && call
+            ? {
+                participantName,
+                video: call.call_type === "video",
+                acceptPending: calls.pending,
+                declining,
+                onAccept: calls.accept,
+                onDecline: declineCall,
+              }
+            : undefined
+        }
+      />
+    );
+  }
 
   if (!call && !calls.error) return null;
   if (!call) {
@@ -84,17 +145,10 @@ export default function CallPanel({
     );
   }
 
-  const identityReady = identityStatus === "ready" && currentUserId !== "";
-  const incoming = identityReady && call.status === "ringing" && call.callee_id === currentUserId;
   const callId = call.call_id;
   const active = call.status === "active";
   const video = call.call_type === "video";
   const ending = endingCallId === call.call_id && !calls.error;
-  // RF-23: Recusar must stay clickable while accept()'s own permission
-  // preflight is pending — calls.pending is shared across every operation
-  // so it can't gate this button. It's only disabled by its own in-flight
-  // decline (the incoming footer only renders while status is "ringing").
-  const declining = decliningCallId === call.call_id && !calls.error;
   const activeReady = active && identityReady;
   // A restored/reconciled call never opens the browser permission prompt on
   // its own (RF-23): it stays active in signaling but requires this explicit
@@ -128,10 +182,6 @@ export default function CallPanel({
 
   function endCall() {
     if (!ending && calls.end()) setEndingCallId(callId);
-  }
-
-  function declineCall() {
-    if (!declining && calls.decline()) setDecliningCallId(callId);
   }
 
   async function retryMedia() {
@@ -345,24 +395,12 @@ export default function CallPanel({
             />
           )}
         {identityReady && incoming && (
-          <>
-            <CallAction
-              label="Atender"
-              icon="call"
-              variant="accept"
-              autoFocus
-              disabled={calls.pending}
-              onClick={calls.accept}
-            />
-            <CallAction
-              label="Recusar"
-              icon="call_end"
-              variant="danger"
-              aria-busy={declining}
-              disabled={declining}
-              onClick={declineCall}
-            />
-          </>
+          <IncomingCallActions
+            acceptPending={calls.pending}
+            declining={declining}
+            onAccept={calls.accept}
+            onDecline={declineCall}
+          />
         )}
         {identityReady && call.status === "ringing" && !incoming && (
           <CallAction
@@ -488,5 +526,269 @@ function CallAction({
       </span>
       <span>{shortLabel}</span>
     </button>
+  );
+}
+
+interface IncomingCallActionsProps {
+  /** Atender's own gate: calls.pending, shared with every other RF-23 command. */
+  acceptPending: boolean;
+  /** Recusar's own gate — never calls.pending, so it stays clickable during Atender's preflight. */
+  declining: boolean;
+  onAccept: () => unknown;
+  onDecline: () => unknown;
+}
+
+/**
+ * Shared by the RF-23 dialog's incoming footer and the RF-24 banner
+ * (ResourceCallPanel), so the two can never drift apart on which state gates
+ * which button.
+ */
+function IncomingCallActions({
+  acceptPending,
+  declining,
+  onAccept,
+  onDecline,
+}: IncomingCallActionsProps) {
+  return (
+    <>
+      <CallAction
+        label="Atender"
+        icon="call"
+        variant="accept"
+        autoFocus
+        disabled={acceptPending}
+        onClick={onAccept}
+      />
+      <CallAction
+        label="Recusar"
+        icon="call_end"
+        variant="danger"
+        aria-busy={declining}
+        disabled={declining}
+        onClick={onDecline}
+      />
+    </>
+  );
+}
+
+// ── RF-24: resource room (channel/group) ────────────────────────────────────
+
+interface IncomingDirectCall {
+  participantName: string;
+  video: boolean;
+  acceptPending: boolean;
+  declining: boolean;
+  onAccept: () => unknown;
+  onDecline: () => unknown;
+}
+
+interface ResourceCallPanelProps {
+  resource: ResourceCallController;
+  media?: CallMediaController;
+  currentUserId: string;
+  /** RF-23 direct call ringing in while this resource room is active. */
+  incomingCall?: IncomingDirectCall;
+}
+
+function ResourceCallPanel({
+  resource,
+  media,
+  currentUserId,
+  incomingCall,
+}: ResourceCallPanelProps) {
+  const target = resource.active;
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!target || !dialog) return;
+    if (!dialog.open && typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
+    return () => {
+      if (dialog.open && typeof dialog.close === "function") dialog.close();
+    };
+  }, [target]);
+
+  if (!target) return null;
+
+  const video = target.callType === "video";
+  const participants = media?.participants ?? [];
+  // +1 counts the local participant, who is never in media.participants.
+  const participantCount = participants.length + 1;
+  const connecting = resource.status === "connecting";
+  const error = resource.error ?? (resource.status === "active" ? media?.error : null);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="call-panel call-panel--grid"
+      aria-label={`Chamada de ${video ? "vídeo" : "áudio"} em ${target.name}`}
+      onCancel={(event) => event.preventDefault()}
+      data-testid="resource-call-panel"
+    >
+      <header className="call-panel__header">
+        <div>
+          <strong>{target.name}</strong>
+          <span>
+            {video ? "Chamada de vídeo" : "Chamada de áudio"} ·{" "}
+            {connecting
+              ? "Entrando…"
+              : `${participantCount} participante${participantCount === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        <span className="call-panel__privacy">
+          <span className="material-symbols-outlined" aria-hidden="true">
+            lock
+          </span>
+          Chamada privada
+        </span>
+      </header>
+
+      {incomingCall && (
+        <div
+          className="call-panel__incoming"
+          role="alert"
+          aria-label={`Chamada de ${incomingCall.video ? "vídeo" : "áudio"} de ${incomingCall.participantName}`}
+        >
+          <span>
+            {incomingCall.participantName} está chamando ({incomingCall.video ? "vídeo" : "áudio"})
+          </span>
+          <div className="call-panel__incoming-actions">
+            <IncomingCallActions
+              acceptPending={incomingCall.acceptPending}
+              declining={incomingCall.declining}
+              onAccept={incomingCall.onAccept}
+              onDecline={incomingCall.onDecline}
+            />
+          </div>
+        </div>
+      )}
+
+      <main className="call-panel__stage call-panel__stage--grid">
+        <div className="call-panel__grid" data-testid="call-grid">
+          <ParticipantTile
+            identity={currentUserId}
+            label="Você"
+            hasVideo={video && (media?.hasLocalVideo ?? false)}
+            bindVideo={media?.bindLocalMedia}
+          />
+          {participants.map((participant) => (
+            <ParticipantTile
+              key={participant.identity}
+              identity={participant.identity}
+              label="Participante"
+              hasVideo={participant.hasVideo}
+              bindVideo={participant.bindVideo}
+            />
+          ))}
+        </div>
+        {/* Hidden sink: every remote participant's audio plays here regardless
+            of whether their tile currently shows video. */}
+        <div ref={media?.bindRemoteAudio} className="call-panel__audio-media" />
+
+        {connecting ? (
+          <p className="call-panel__status" role="status" aria-live="polite">
+            <span aria-hidden="true" />
+            Entrando na chamada…
+          </p>
+        ) : (
+          error && (
+            <div className="call-panel__error" role="alert">
+              <span>{error}</span>
+              {resource.errorOperation === "leave" ? (
+                <button type="button" onClick={() => void resource.leave().catch(() => undefined)}>
+                  Tentar sair novamente
+                </button>
+              ) : (
+                <button type="button" onClick={() => void resource.join(target)}>
+                  Tentar novamente
+                </button>
+              )}
+            </div>
+          )
+        )}
+      </main>
+
+      <footer className="call-panel__controls" aria-label="Controles da chamada">
+        {media && (media.mediaLoading || media.audioStarting || media.audioActivationRequired) && (
+          <CallAction
+            label={
+              media.mediaLoading
+                ? "Carregando áudio da chamada"
+                : media.audioStarting
+                  ? "Ativando áudio da chamada"
+                  : "Ativar áudio da chamada"
+            }
+            shortLabel={
+              media.mediaLoading
+                ? "Carregando áudio"
+                : media.audioStarting
+                  ? "Ativando áudio"
+                  : "Ativar áudio"
+            }
+            icon="volume_up"
+            disabled={media.mediaLoading || media.audioStarting}
+            onClick={() => void media.activateAudio()}
+          />
+        )}
+        <CallAction
+          label={media?.microphoneEnabled ? "Desativar microfone" : "Ativar microfone"}
+          shortLabel={media?.microphoneEnabled ? "Microfone" : "Microfone desligado"}
+          icon={media?.microphoneEnabled ? "mic" : "mic_off"}
+          pressed={media?.microphoneEnabled ?? false}
+          muted={!media?.microphoneEnabled}
+          disabled={connecting || media?.pendingControl === "microphone"}
+          onClick={() => void media?.toggleMicrophone()}
+        />
+        <CallAction
+          label="Sair da chamada"
+          shortLabel="Sair"
+          icon="call_end"
+          variant="danger"
+          autoFocus
+          // leave() can now reject when cleanup itself fails (never a false
+          // "left"): resource.error/status already surface that, so this
+          // click handler only needs to stop it becoming an unhandled
+          // rejection. Re-clicking retries the very same failed attempt.
+          onClick={() => void resource.leave().catch(() => undefined)}
+        />
+        {video && (
+          <CallAction
+            label={media?.cameraEnabled ? "Desativar câmera" : "Ativar câmera"}
+            shortLabel={media?.cameraEnabled ? "Câmera" : "Câmera desligada"}
+            icon={media?.cameraEnabled ? "videocam" : "videocam_off"}
+            pressed={media?.cameraEnabled ?? false}
+            muted={!media?.cameraEnabled}
+            disabled={connecting || media?.pendingControl === "camera"}
+            onClick={() => void media?.toggleCamera()}
+          />
+        )}
+      </footer>
+    </dialog>
+  );
+}
+
+interface ParticipantTileProps {
+  identity: string;
+  label: string;
+  hasVideo: boolean;
+  bindVideo?: RefCallback<HTMLDivElement>;
+}
+
+function ParticipantTile({ identity, label, hasVideo, bindVideo }: ParticipantTileProps) {
+  return (
+    <div className="call-panel__tile" data-testid={`participant-tile-${identity}`}>
+      <div
+        ref={bindVideo}
+        className="call-panel__media call-panel__media--tile"
+        data-testid={`participant-video-${identity}`}
+      />
+      {!hasVideo && (
+        <div className="call-panel__fallback call-panel__fallback--tile">
+          <ParticipantAvatar id={identity} name={label} size="remote" />
+        </div>
+      )}
+      <span className="call-panel__participant-label">{label}</span>
+    </div>
   );
 }
