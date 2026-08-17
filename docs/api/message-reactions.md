@@ -4,7 +4,7 @@ Cada usuário pode manter no máximo cinco reações distintas ativas em uma mes
 mensagem, independentemente de a conversa ser uma DM, grupo ou canal. Reações
 de outras pessoas não consomem esse limite.
 
-Repetir uma reação já selecionada continua sendo um *toggle*: ela é removida e
+Repetir uma reação já selecionada continua sendo um _toggle_: ela é removida e
 libera imediatamente uma vaga. Uma sexta reação distinta é rejeitada pelo
 servidor e não publica um evento `reaction.updated`.
 
