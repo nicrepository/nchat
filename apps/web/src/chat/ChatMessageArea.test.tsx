@@ -1778,6 +1778,100 @@ describe("ChatMessageArea — RF-12 typing indicator display name", () => {
     expect(indicator).toHaveTextContent("Elias Rocha está digitando");
     expect(indicator).not.toHaveTextContent("Alguém");
   });
+
+  it("shows an aggregate label for two, then three or more, simultaneous typists", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: { user_id: "user-a", user_display_name: "Ana", is_typing: true },
+      }),
+    );
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: { user_id: "user-b", user_display_name: "Bruno", is_typing: true },
+      }),
+    );
+    expect(await screen.findByTestId("chat-typing-indicator")).toHaveTextContent(
+      "Ana e Bruno estão digitando",
+    );
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: { user_id: "user-c", user_display_name: "Carla", is_typing: true },
+      }),
+    );
+    expect(await screen.findByTestId("chat-typing-indicator")).toHaveTextContent(
+      "3 pessoas estão digitando",
+    );
+  });
+
+  it("in a DM, falls back to the roster's display name when the server sends none", async () => {
+    mockFetchDMMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-juliane"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-juliane",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [
+                        {
+                          id: "user-elias",
+                          displayName: "Elias Rocha",
+                          initials: "ER",
+                          color: "purple",
+                          status: "online",
+                        },
+                      ],
+                    },
+                  ],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "dm",
+        target_id: "dm-juliane",
+        typing: { user_id: "user-elias", is_typing: true },
+      }),
+    );
+
+    const indicator = await screen.findByTestId("chat-typing-indicator");
+    expect(indicator).toHaveTextContent("Elias Rocha está digitando");
+  });
 });
 
 // ── Message grouping (same sender / same minute) ──────────────────────────────
