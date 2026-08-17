@@ -7,7 +7,9 @@ import type { WSTypingUpdatedEvent } from "./useChatWebSocket";
 const CURRENT_USER = "user-me";
 const OTHER_USER = "user-other";
 
-function typingEvent(overrides: Partial<NonNullable<WSTypingUpdatedEvent["typing"]>> = {}): WSTypingUpdatedEvent {
+function typingEvent(
+  overrides: Partial<NonNullable<WSTypingUpdatedEvent["typing"]>> = {},
+): WSTypingUpdatedEvent {
   return {
     type: "typing.updated",
     target_type: "channel",
@@ -67,7 +69,9 @@ describe("useTypingIndicator — server-resolved display names", () => {
       result.current.handleRemoteEvent(typingEvent({ user_display_name: "Diana Reis" }));
     });
     act(() => {
-      result.current.handleRemoteEvent(typingEvent({ is_typing: false, user_display_name: "Diana Reis" }));
+      result.current.handleRemoteEvent(
+        typingEvent({ is_typing: false, user_display_name: "Diana Reis" }),
+      );
     });
     expect(result.current.typingUserIds).toEqual([]);
     expect(result.current.typingDisplayNameByUserId.has(OTHER_USER)).toBe(false);
@@ -76,7 +80,9 @@ describe("useTypingIndicator — server-resolved display names", () => {
   it("ignores the local user's own echoed event", () => {
     const { result } = setup();
     act(() => {
-      result.current.handleRemoteEvent(typingEvent({ user_id: CURRENT_USER, user_display_name: "Me" }));
+      result.current.handleRemoteEvent(
+        typingEvent({ user_id: CURRENT_USER, user_display_name: "Me" }),
+      );
     });
     expect(result.current.typingUserIds).toEqual([]);
     expect(result.current.typingDisplayNameByUserId.size).toBe(0);
