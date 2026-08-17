@@ -1408,10 +1408,7 @@ func (h *MessageHandler) GetMessageLinkSafetyStatus(w http.ResponseWriter, r *ht
 	}
 	response := linkSafetyStatusResponseData{Statuses: make([]linkSafetyStatusJSON, 0, len(states))}
 	for _, state := range states {
-		status := linkSafetyStatusJSON{MessageID: state.MessageID, State: string(state.State)}
-		if state.State == domain.LinkSafetyStateBlocked {
-			status.Reason = domain.LinkSafetyReasonMaliciousLink
-		}
+		status := linkSafetyStatusJSON{MessageID: state.MessageID, State: string(state.State), Reason: state.Reason}
 		response.Statuses = append(response.Statuses, status)
 	}
 	httputil.WriteJSON(w, http.StatusOK, response)

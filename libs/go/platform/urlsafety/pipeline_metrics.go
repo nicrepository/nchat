@@ -66,6 +66,12 @@ const (
 	// down. The provider may or may not have accepted it; the row is left for
 	// reconciliation rather than submitted again.
 	AttemptUncertain = "uncertain"
+	// AttemptInconclusive marks a poll whose scan the provider confirms is
+	// finished but produced no usable verdict. Distinct from AttemptRetry and
+	// AttemptError: nothing failed and nothing will be retried — the row is
+	// terminal, and an operator seeing these needs to know the pipeline stopped
+	// polling on purpose, not that the provider is unwell.
+	AttemptInconclusive = "inconclusive"
 
 	// Reconciliation outcomes, for the uncertain-submission window.
 	ReconcileAdopted = "adopted"

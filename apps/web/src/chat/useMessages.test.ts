@@ -218,11 +218,11 @@ function fireWsEventWithPayload(
 }
 
 /** Fire the RF-21 terminal refusal, which is addressed to the author alone. */
-function fireWsBlockedEvent(messageId: string): void {
+function fireWsBlockedEvent(messageId: string, reason?: string): void {
   capturedOnMessageBlocked?.({
     type: "message.blocked",
     message_id: messageId,
-    reason: "malicious_link",
+    ...(reason === undefined ? {} : { reason }),
   });
 }
 
@@ -2858,6 +2858,22 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
     });
   }
 
+  it.each([
+    ["malicious_link", "Este link foi bloqueado por segurança."],
+    [undefined, "Este link foi bloqueado por segurança."],
+    ["future_block_reason", "Este link foi bloqueado por segurança."],
+    ["link_check_inconclusive", "Não foi possível verificar a segurança deste link."],
+  ])("uses the blocked wording for realtime reason %s", async (reason, wording) => {
+    const result = await hookWithPendingMessage();
+
+    act(() => fireWsBlockedEvent("msg-pending", reason));
+
+    await waitFor(() =>
+      expect(result.current.state.messages.some((m) => m.id === "msg-pending")).toBe(false),
+    );
+    expect(result.current.state.sendError).toBe(wording);
+  });
+
   // [B] The finding itself: the refusal happened while the socket was down.
   it("clears a pending message the server refused while the socket was down", async () => {
     const result = await hookWithPendingMessage();
@@ -2876,6 +2892,46 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
     // Recovered without the user reloading anything.
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
   });
+
+  // RF-21 inconclusive: the scan itself finished terminal-but-undecided, so the
+  // server never announces a promotion for it — the same "nothing else is ever
+  // coming" gap as [B], with the inconclusive reason instead of malicious_link,
+  // and a distinct message from the one shown for a malicious link.
+  it("clears a pending message the server refused as inconclusive while the socket was down", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "blocked", reason: "link_check_inconclusive" },
+    ]);
+
+    // No message.blocked ever arrives — the checking state must not poll forever.
+    await reconnect();
+
+    await waitFor(() =>
+      expect(result.current.state.messages.some((m) => m.id === "msg-pending")).toBe(false),
+    );
+    expect(result.current.state.sendError).toBe(
+      "Não foi possível verificar a segurança deste link.",
+    );
+    expect(result.current.state.sendError).not.toBe("Este link foi bloqueado por segurança.");
+    expect(result.current.state.sending).toBe(false);
+  });
+
+  it.each([undefined, "future_block_reason"])(
+    "keeps the historical malicious wording for reconnect blocked reason %s",
+    async (reason) => {
+      const result = await hookWithPendingMessage();
+      mockFetchLinkSafetyStatuses.mockResolvedValue([
+        { messageId: "msg-pending", state: "blocked", ...(reason === undefined ? {} : { reason }) },
+      ]);
+
+      await reconnect();
+
+      await waitFor(() =>
+        expect(result.current.state.messages.some((m) => m.id === "msg-pending")).toBe(false),
+      );
+      expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
+    },
+  );
 
   // [C] The same loss in the other direction: the promotion was missed.
   it("promotes a pending message the server published while the socket was down", async () => {
@@ -2994,6 +3050,27 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
       );
       expect(result.current.state.sendError).toBe("Este link foi bloqueado por segurança.");
     }
+  });
+
+  it("converges after duplicate inconclusive realtime and reconnect events", async () => {
+    const result = await hookWithPendingMessage();
+    mockFetchLinkSafetyStatuses.mockResolvedValue([
+      { messageId: "msg-pending", state: "blocked", reason: "link_check_inconclusive" },
+    ]);
+
+    act(() => {
+      fireWsBlockedEvent("msg-pending", "link_check_inconclusive");
+      fireWsBlockedEvent("msg-pending", "link_check_inconclusive");
+    });
+    await reconnect();
+
+    await waitFor(() =>
+      expect(result.current.state.messages.filter((m) => m.id === "msg-pending")).toHaveLength(0),
+    );
+    expect(result.current.state.sendError).toBe(
+      "Não foi possível verificar a segurança deste link.",
+    );
+    expect(result.current.state.sending).toBe(false);
   });
 
   it("is idempotent when the published event and reconciliation both arrive", async () => {

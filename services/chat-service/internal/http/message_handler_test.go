@@ -2097,7 +2097,7 @@ func TestMessageHandler_CreateChannelMessage_CheckerOutageIsRetryable(t *testing
 // serialized bytes, because that is where a leak would appear.
 func TestMessageHandler_LinkSafetyStatus_AnswersStateWithoutContent(t *testing.T) {
 	messages := &fakeMessageProvider{linkSafetyStates: []domain.MessageLinkSafetyState{
-		{MessageID: testMessageID, State: domain.LinkSafetyStateBlocked},
+		{MessageID: testMessageID, State: domain.LinkSafetyStateBlocked, Reason: domain.LinkSafetyReasonMaliciousLink},
 		{MessageID: otherMessageID, State: domain.LinkSafetyStatePending},
 	}}
 	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)

@@ -70,6 +70,17 @@ const (
 	// VerdictMalicious means the provider finished a scan and reported the URL
 	// as malicious.
 	VerdictMalicious Verdict = "malicious"
+	// VerdictInconclusive means the provider confirms the scan finished but
+	// produced no verdict this package can act on.
+	//
+	// It is deliberately not IsFinal(): IsFinal answers "is this a usable safety
+	// clearance", and inconclusive is neither an allow nor a deny — it is fail-
+	// closed, exactly like an unknown answer, with one difference that matters to
+	// the callers that persist it: it is terminal for the scan that produced it,
+	// so a caller that already recorded it must stop asking the provider about
+	// that scan id rather than retry it. Nothing in this package ever promotes it
+	// to a clearance.
+	VerdictInconclusive Verdict = "inconclusive"
 )
 
 // IsFinal reports whether a Verdict is one this package will act on.
@@ -145,7 +156,9 @@ type Scanner interface {
 	// SubmitScan asks for a canonical URL to be scanned and returns the scan id.
 	SubmitScan(ctx context.Context, canonicalURL string) (string, error)
 	// GetScanResult reads a submitted scan. It returns ErrScanPending while the
-	// scan is still running, and must never return VerdictSafe with an error.
+	// scan is still running, ErrScanInconclusive when the provider confirms the
+	// scan is finished but produced no usable verdict, and must never return
+	// VerdictSafe with an error.
 	GetScanResult(ctx context.Context, scanID string) (Verdict, error)
 }
 
@@ -254,7 +267,13 @@ func (s *Service) FindRecentScan(
 //     failure, with FailureTTL, so it is retried rather than served;
 //   - a pending scan is reported as pending and cached as nothing. It is not an
 //     outcome yet, and giving it a TTL would make "still running" expire into
-//     something.
+//     something;
+//   - an inconclusive scan is reported as inconclusive and, like pending, cached
+//     as nothing here: the cache in this package is a URL-level safety
+//     clearance, and inconclusive is not one. The durable per-scan terminal
+//     state that stops the polling belongs to the caller's own queue, which is
+//     also what keeps this package from ever inventing a clearance TTL for an
+//     answer that was never a clearance.
 func (s *Service) Poll(ctx context.Context, canonicalURL, scanID string) (Verdict, error) {
 	if s.scanner == nil {
 		s.observe(resultError)
@@ -267,6 +286,10 @@ func (s *Service) Poll(ctx context.Context, canonicalURL, scanID string) (Verdic
 	if errors.Is(err, ErrScanPending) {
 		s.observe(resultPending)
 		return VerdictUnknown, ErrScanPending
+	}
+	if errors.Is(err, ErrScanInconclusive) {
+		s.observe(resultInconclusive)
+		return VerdictUnknown, ErrScanInconclusive
 	}
 	if err != nil || !verdict.IsFinal() {
 		s.cache.set(canonicalURL, VerdictUnknown, FailureTTL)

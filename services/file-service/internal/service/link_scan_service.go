@@ -476,6 +476,12 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job LinkScanJob) {
 		// clearance.
 		s.metrics.ObserveAttempt(urlsafety.OperationPoll, urlsafety.AttemptPending)
 		return
+	case errors.Is(err, urlsafety.ErrScanInconclusive):
+		// The provider confirms this exact scan finished and produced no usable
+		// verdict. Terminal and fail-closed: recorded once, below, and never
+		// polled again — no path from here into resubmission.
+		s.recordVerdict(ctx, job, urlsafety.VerdictInconclusive)
+		return
 	case err != nil:
 		s.metrics.ObserveAttempt(urlsafety.OperationPoll, urlsafety.AttemptRetry)
 		s.logFailure(ctx, "poll link scan", job, err)
@@ -487,9 +493,22 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job LinkScanJob) {
 		s.logFailure(ctx, "poll link scan", job, urlsafety.ErrUnavailable)
 		return
 	}
+	s.recordVerdict(ctx, job, verdict)
+}
+
+// recordVerdict writes a terminal poll outcome — safe, malicious, or
+// inconclusive — and reports the attempt. Shared by pollClaim's ordinary
+// success path and its ErrScanInconclusive branch: both are "this scan id is
+// decided, write it down and stop polling", differing only in the outcome
+// label and in the TTL, which RecordVerdict itself ignores for inconclusive.
+func (s *LinkScanService) recordVerdict(ctx context.Context, job LinkScanJob, verdict urlsafety.Verdict) {
+	result := urlsafety.AttemptSuccess
+	if verdict == urlsafety.VerdictInconclusive {
+		result = urlsafety.AttemptInconclusive
+	}
 	switch err := s.store.RecordVerdict(ctx, job.URLDigest, job.ScanUUID, verdict, urlsafety.VerdictTTL); {
 	case err == nil:
-		s.metrics.ObserveAttempt(urlsafety.OperationPoll, urlsafety.AttemptSuccess)
+		s.metrics.ObserveAttempt(urlsafety.OperationPoll, result)
 	case errors.Is(err, ErrLinkScanConflict):
 		// This worker's lease was already lost and the row now carries a
 		// different scan. Its answer describes a scan nobody is waiting on.
