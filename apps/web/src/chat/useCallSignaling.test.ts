@@ -2554,7 +2554,6 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       kind: "channel",
       id: "00000000-0000-4000-8000-000000000710",
       name: "geral",
-      callType: "audio",
     };
 
     beforeEach(() => {

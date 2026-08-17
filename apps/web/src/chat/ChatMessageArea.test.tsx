@@ -874,14 +874,46 @@ describe("ChatMessageArea — channel header", () => {
       </MemoryRouter>,
     );
 
-    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de vídeo" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada" }));
 
     expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith({
       kind: "channel",
       id: "geral",
       name: "geral",
-      callType: "video",
     });
+  });
+
+  it("RF-24 follow-up: the channel header offers a single Chamada action, never separate Áudio/Vídeo", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  joinResourceCall: vi.fn(),
+                }}
+              />
+            }
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("button", { name: "Iniciar chamada" });
+    expect(
+      screen.queryByRole("button", { name: "Iniciar chamada de áudio" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Iniciar chamada de vídeo" }),
+    ).not.toBeInTheDocument();
   });
 
   it("RF-24: wires the group header call buttons to joinResourceCall with resource_kind dm, never for a 1:1", async () => {
@@ -909,13 +941,12 @@ describe("ChatMessageArea — channel header", () => {
       </MemoryRouter>,
     );
 
-    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de áudio" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada" }));
 
     expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith({
       kind: "dm",
       id: "dm-grp",
       name: "Equipe Infra",
-      callType: "audio",
     });
   });
 

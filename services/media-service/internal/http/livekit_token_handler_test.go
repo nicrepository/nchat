@@ -133,6 +133,12 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 		{name: "resource_kind with user_id", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","user_id":"` + handlerTestUserID + `"}`, want: http.StatusBadRequest},
 		{name: "resource_kind with session_id", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","session_id":"` + handlerTestSessionID + `"}`, want: http.StatusBadRequest},
 		{name: "resource_kind with workspace_id", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","workspace_id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
+		// Security (issue #540 follow-up): the participant display name shown
+		// in the LiveKit room is server-resolved from the authenticated
+		// principal, never accepted from the request body — DisallowUnknownFields
+		// rejects it the same way it rejects every other unknown field.
+		{name: "resource_kind with display_name", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","display_name":"Admin"}`, want: http.StatusBadRequest},
+		{name: "call_id with display_name", body: `{"call_id":"` + handlerTestResource + `","display_name":"Admin"}`, want: http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

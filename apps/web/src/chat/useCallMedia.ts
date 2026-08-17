@@ -24,9 +24,18 @@ export type CallMediaStatus =
 // grid tile can render an avatar fallback instead of disappearing.
 export interface ParticipantMedia {
   identity: string;
+  /** Server-issued LiveKit participant name; falls back to "Participante" when absent. */
+  displayName: string;
   hasVideo: boolean;
   hasAudio: boolean;
   bindVideo: RefCallback<HTMLDivElement>;
+}
+
+const fallbackParticipantDisplayName = "Participante";
+
+/** Trims a raw participant name; "" (including whitespace-only) means "no name known". */
+function normalizeParticipantDisplayName(name: string): string {
+  return name.trim();
 }
 
 export interface CallMediaController {
@@ -95,6 +104,7 @@ const initialState: MediaState = {
 };
 
 interface ParticipantMediaEntry {
+  displayName: string;
   hasVideo: boolean;
   hasAudio: boolean;
   videoElement: HTMLMediaElement | null;
@@ -194,6 +204,7 @@ export function useCallMedia(
       const entry = participantsMapRef.current.get(identity);
       return {
         identity,
+        displayName: entry?.displayName ?? fallbackParticipantDisplayName,
         hasVideo: entry?.hasVideo ?? false,
         hasAudio: entry?.hasAudio ?? false,
         bindVideo: bindVideoFor(identity),
@@ -202,9 +213,29 @@ export function useCallMedia(
     update({ participants });
   }, [bindVideoFor, update]);
 
-  const ensureParticipant = useCallback((identity: string) => {
-    if (participantsMapRef.current.has(identity)) return;
+  // displayName defaults to "" (never seen it yet — e.g. a track arriving
+  // before the SDK's own participant-connected callback) and is normalized to
+  // the visible fallback here, once, so every other reader of the map can
+  // trust displayName is always non-empty.
+  //
+  // identity is, and stays, the only key: a track event and a
+  // ParticipantConnected event can arrive in either order for the same
+  // participant, so this must upsert rather than create-or-ignore. An
+  // already-known entry only ever has its name *improved* — a normalized,
+  // non-empty name overwrites a fallback or an older name, but an empty/
+  // blank one (e.g. the nameless call from onRemoteElement, or a later event
+  // that genuinely carries none) never regresses an already-known real name
+  // back to the fallback. hasVideo/hasAudio/videoElement/container are
+  // untouched here; only displayName is ever revised in place.
+  const ensureParticipant = useCallback((identity: string, displayName = "") => {
+    const normalized = normalizeParticipantDisplayName(displayName);
+    const entry = participantsMapRef.current.get(identity);
+    if (entry) {
+      if (normalized !== "" && normalized !== entry.displayName) entry.displayName = normalized;
+      return;
+    }
     participantsMapRef.current.set(identity, {
+      displayName: normalized !== "" ? normalized : fallbackParticipantDisplayName,
       hasVideo: false,
       hasAudio: false,
       videoElement: null,
@@ -320,9 +351,9 @@ export function useCallMedia(
           }
           syncParticipants();
         },
-        onParticipantConnected(identity) {
+        onParticipantConnected(identity, displayName) {
           if (!current()) return;
-          ensureParticipant(identity);
+          ensureParticipant(identity, displayName);
           syncParticipants();
         },
         onParticipantDisconnected(identity) {

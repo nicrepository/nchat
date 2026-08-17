@@ -36,8 +36,9 @@ func (a *PGXResourceAuthorizer) Authorize(ctx context.Context, input service.Aut
 
 	var sessionExpiresAt pgtype.Timestamptz
 	var resourceID pgtype.Text
+	var displayName pgtype.Text
 	if err := a.pool.QueryRow(ctx, query, input.SessionID, input.UserID, input.ResourceID).
-		Scan(&sessionExpiresAt, &resourceID); err != nil {
+		Scan(&sessionExpiresAt, &resourceID, &displayName); err != nil {
 		return service.AuthorizedResource{}, fmt.Errorf("authorize media resource: %w", err)
 	}
 	if !sessionExpiresAt.Valid {
@@ -49,8 +50,23 @@ func (a *PGXResourceAuthorizer) Authorize(ctx context.Context, input service.Aut
 	return service.AuthorizedResource{
 		ID:               resourceID.String,
 		SessionExpiresAt: sessionExpiresAt.Time.UTC(),
+		DisplayName:      displayName.String,
 	}, nil
 }
+
+// authorizedResourceSelect resolves the caller's own presentation name
+// alongside the session/resource check — server-derived only, from the same
+// active_session the authorization decision already uses. It is never part
+// of the authorization decision itself (a name never grants or denies
+// access): a caller with no resolvable name still gets session_expires_at
+// and resource_id decided exactly as before, just an empty display_name.
+const authorizedResourceSelect = `
+	SELECT
+		(SELECT session_expires_at FROM active_session) AS session_expires_at,
+		(SELECT id::text FROM authorized_resource) AS resource_id,
+		(SELECT ` + authsession.DisplayNameExpr + `
+		   FROM auth.users AS u
+		   JOIN active_session AS active ON active.user_id = u.id) AS display_name`
 
 const channelAuthorizationQuery = authsession.ActiveSessionCTE + `,
 	authorized_resource AS (
@@ -66,9 +82,7 @@ const channelAuthorizationQuery = authsession.ActiveSessionCTE + `,
 		WHERE c.status = 'active'
 		  AND chat.channel_visible_to_user(c.id, active.user_id)
 	)
-	SELECT
-		(SELECT session_expires_at FROM active_session) AS session_expires_at,
-		(SELECT id::text FROM authorized_resource) AS resource_id`
+	` + authorizedResourceSelect
 
 const dmAuthorizationQuery = authsession.ActiveSessionCTE + `,
 	authorized_resource AS (
@@ -88,9 +102,7 @@ const dmAuthorizationQuery = authsession.ActiveSessionCTE + `,
 		WHERE dc.status = 'active'
 		  AND dc.type = 'group'
 	)
-	SELECT
-		(SELECT session_expires_at FROM active_session) AS session_expires_at,
-		(SELECT id::text FROM authorized_resource) AS resource_id`
+	` + authorizedResourceSelect
 
 const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 	authorized_resource AS (
@@ -106,6 +118,4 @@ const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 		WHERE c.status = 'active'
 		  AND (c.caller_id = active.user_id OR c.callee_id = active.user_id)
 	)
-	SELECT
-		(SELECT session_expires_at FROM active_session) AS session_expires_at,
-		(SELECT id::text FROM authorized_resource) AS resource_id`
+	` + authorizedResourceSelect

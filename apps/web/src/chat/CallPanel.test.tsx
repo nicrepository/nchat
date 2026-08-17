@@ -625,7 +625,6 @@ const channelTarget: ResourceCallTarget = {
   kind: "channel",
   id: "00000000-0000-4000-8000-000000000701",
   name: "geral",
-  callType: "video",
 };
 
 function resourceController(
@@ -645,6 +644,7 @@ function resourceController(
 function participant(overrides: Partial<ParticipantMedia> = {}): ParticipantMedia {
   return {
     identity: "00000000-0000-4000-8000-000000000801",
+    displayName: "Pedro Almeida",
     hasVideo: false,
     hasAudio: true,
     bindVideo: vi.fn(),
@@ -678,7 +678,7 @@ describe("CallPanel resource room (RF-24)", () => {
     );
 
     expect(screen.getByText("geral")).toBeInTheDocument();
-    expect(screen.getByText("Chamada de vídeo · 3 participantes")).toBeInTheDocument();
+    expect(screen.getByText("Chamada · 3 participantes")).toBeInTheDocument();
     expect(screen.getByText("Você")).toBeInTheDocument();
   });
 
@@ -686,7 +686,7 @@ describe("CallPanel resource room (RF-24)", () => {
     const many = Array.from({ length: 15 }, (_, i) => participant({ identity: `identity-${i}` }));
     renderResourcePanel(resourceController(), media({ participants: many }));
 
-    expect(screen.getByText("Chamada de vídeo · 16 participantes")).toBeInTheDocument();
+    expect(screen.getByText("Chamada · 16 participantes")).toBeInTheDocument();
     for (const p of many) {
       expect(screen.getByTestId(`participant-tile-${p.identity}`)).toBeInTheDocument();
     }
@@ -755,14 +755,46 @@ describe("CallPanel resource room (RF-24)", () => {
     expect(idleCalls.end).not.toHaveBeenCalled();
   });
 
-  it("hides the camera control for an audio-only resource room", () => {
+  it("always offers the camera control, even before it is turned on (issue #540 follow-up)", () => {
     renderResourcePanel(
-      resourceController({ active: { ...channelTarget, callType: "audio" } }),
-      media(),
+      resourceController(),
+      media({ cameraEnabled: false, hasLocalVideo: false }),
     );
 
-    expect(screen.queryByRole("button", { name: /câmera/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ativar câmera" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /microfone/i })).toBeInTheDocument();
+  });
+
+  it("shows each remote participant's real display name on their tile, never a generic label", () => {
+    renderResourcePanel(
+      resourceController(),
+      media({
+        participants: [
+          participant({
+            identity: "identity-pedro",
+            displayName: "Pedro Almeida",
+            hasVideo: false,
+          }),
+          participant({ identity: "identity-maria", displayName: "Maria Silva", hasVideo: true }),
+        ],
+      }),
+    );
+
+    expect(screen.getByTestId("participant-tile-identity-pedro")).toHaveTextContent(
+      "Pedro Almeida",
+    );
+    expect(screen.getByTestId("participant-tile-identity-maria")).toHaveTextContent("Maria Silva");
+    // Avatar fallback initials come from the real name, not from "Participante".
+    expect(screen.getByText("PA")).toBeInTheDocument();
+  });
+
+  it("falls back to a generic label when a participant has no resolved display name", () => {
+    renderResourcePanel(
+      resourceController(),
+      media({ participants: [participant({ displayName: "Participante" })] }),
+    );
+
+    expect(screen.getByText("Participante")).toBeInTheDocument();
   });
 
   it("toggles the local microphone from the resource room controls", async () => {

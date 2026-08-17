@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { issueResourceCallToken, type ResourceCallKind } from "./callApi";
-import type { CallType } from "./callState";
 import type { CallMediaBridge } from "./useCallSignaling";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
@@ -12,7 +11,6 @@ export interface ResourceCallTarget {
   id: string;
   /** Channel or group display name, for the panel header — never sent to the server. */
   name: string;
-  callType: CallType;
 }
 
 export interface ResourceCallController {
@@ -140,8 +138,15 @@ export function useResourceCallSession(media: CallMediaBridge): ResourceCallCont
       if (attemptGenerationRef.current !== generation) return;
       const result = await issueResourceCallToken(target.kind, target.id);
       if (attemptGenerationRef.current !== generation) return;
+      // RF-24 follow-up: a resource room is one call, camera and microphone
+      // are just controls within it — "audio"/"video" is not a concept of
+      // this room. "audio" is passed only because useCallMedia.connect()
+      // still uses call_type internally to decide whether to auto-enable the
+      // camera (kept for RF-23 compatibility); the camera must never turn on
+      // by itself here, so this stays "audio" unconditionally and the user
+      // enables the camera explicitly via toggleCamera().
       await mediaRef.current.connect(
-        { call_id: `${target.kind}:${target.id}`, call_type: target.callType },
+        { call_id: `${target.kind}:${target.id}`, call_type: "audio" },
         result.token,
         result.serverUrl,
       );
