@@ -87,9 +87,9 @@ export function useTypingIndicator({
   disabled = false,
 }: UseTypingIndicatorOptions): TypingIndicatorController {
   const [typingUserIds, setTypingUserIds] = useState<readonly string[]>([]);
-  const [typingDisplayNameByUserId, setTypingDisplayNameByUserId] = useState<ReadonlyMap<string, string>>(
-    new Map(),
-  );
+  const [typingDisplayNameByUserId, setTypingDisplayNameByUserId] = useState<
+    ReadonlyMap<string, string>
+  >(new Map());
 
   const sendTypingRef = useRef(sendTyping);
   useEffect(() => {
@@ -216,20 +216,35 @@ export function useTypingIndicator({
   );
 
   // Target change: nobody is known to be typing in the new conversation yet.
-  useEffect(() => {
-    for (const timer of remoteTimersRef.current.values()) window.clearTimeout(timer);
-    remoteTimersRef.current.clear();
-    remoteRef.current.clear();
+  // The externally-visible state is reset during render, comparing against
+  // the previously rendered target via useState (not a ref — reading/writing
+  // ref.current during render is unsafe, react-hooks/refs). This is React's
+  // documented pattern for adjusting state when a prop changes, and avoids
+  // the extra commit an effect-driven reset would cause
+  // (react-hooks/set-state-in-effect).
+  const targetKey = `${kind}:${targetId}`;
+  const [trackedTargetKey, setTrackedTargetKey] = useState(targetKey);
+  if (trackedTargetKey !== targetKey) {
+    setTrackedTargetKey(targetKey);
     setTypingUserIds([]);
     setTypingDisplayNameByUserId(new Map());
-  }, [kind, targetId]);
+  }
 
-  // Unmount: clear any outstanding local-expiry timers.
+  // Target change and unmount: drop remote-typing bookkeeping bound to the
+  // previous target, including its pending local-expiry timers. Ref access
+  // belongs in an effect, not render, so this owns the remoteRef/
+  // remoteTimersRef side of the reset above. Maps are captured at
+  // effect-setup time (not read from the ref inside the cleanup) since a ref
+  // may no longer hold the same value by the time cleanup runs.
   useEffect(() => {
+    const timers = remoteTimersRef.current;
+    const remote = remoteRef.current;
     return () => {
-      for (const timer of remoteTimersRef.current.values()) window.clearTimeout(timer);
+      for (const timer of timers.values()) window.clearTimeout(timer);
+      timers.clear();
+      remote.clear();
     };
-  }, []);
+  }, [kind, targetId]);
 
   return { notifyActivity, stop, handleRemoteEvent, typingUserIds, typingDisplayNameByUserId };
 }

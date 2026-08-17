@@ -175,31 +175,6 @@ Ainda nao existe nesta etapa:
 
 ## Local development infrastructure
 
-### Inicialização completa no Linux
-
-Para instalar as dependências ausentes, iniciar a infraestrutura Docker, aplicar as
-migrações, subir os sete serviços Go, iniciar o frontend e o gateway e abrir o NChat no
-navegador padrão:
-
-```bash
-./scripts/dev/nchat-local.sh up
-```
-
-Na primeira execução, o script pode pedir a senha do `sudo` apenas para adicionar
-`127.0.0.1 nchat.local` ao `/etc/hosts`. Secrets de desenvolvimento são gerados em
-`.nchat-local/` e não são versionados. Comandos auxiliares:
-
-```bash
-./scripts/dev/nchat-local.sh status
-./scripts/dev/nchat-local.sh logs
-./scripts/dev/nchat-local.sh restart
-./scripts/dev/nchat-local.sh down
-```
-
-Use `--no-browser` para não abrir o navegador e `--editor` para abrir também o projeto
-no VS Code. Os mesmos fluxos estão disponíveis como `make dev-local-up`,
-`make dev-local-status`, `make dev-local-logs` e `make dev-local-down`.
-
 Prerequisites:
 
 - Docker

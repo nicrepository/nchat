@@ -1,10 +1,7 @@
-.PHONY: help install dev-local-up dev-local-down dev-local-restart dev-local-status dev-local-logs dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-up migrations-down migrations-status migrations-reset migrations-smoke dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
+.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-up migrations-down migrations-status migrations-reset migrations-smoke dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
 
 help:
 	@echo "NChat development commands"
-	@echo "  make dev-local-up Start the complete project locally and open it"
-	@echo "  make dev-local-down Stop the complete local project"
-	@echo "  make dev-local-status Show complete local project status"
 	@echo "  make install     Install frontend dependencies"
 	@echo "  make dev-web     Run web app locally"
 	@echo "  make dev-env-up  Start local data services"
@@ -72,21 +69,6 @@ help:
 
 install:
 	pnpm install
-
-dev-local-up:
-	bash scripts/dev/nchat-local.sh up
-
-dev-local-down:
-	bash scripts/dev/nchat-local.sh down
-
-dev-local-restart:
-	bash scripts/dev/nchat-local.sh restart
-
-dev-local-status:
-	bash scripts/dev/nchat-local.sh status
-
-dev-local-logs:
-	bash scripts/dev/nchat-local.sh logs
 
 dev-web:
 	pnpm dev:web

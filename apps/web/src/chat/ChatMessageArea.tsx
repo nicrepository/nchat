@@ -1092,24 +1092,28 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     typingHandleRemoteEventRef.current = typing.handleRemoteEvent;
   });
 
+  // Destructured so useCallback/useEffect below can depend on these specific,
+  // stable functions rather than the whole `typing` object, whose identity
+  // changes every render.
+  const { notifyActivity: typingNotifyActivity, stop: typingStop } = typing;
+
   // A content-changing edit starts/renews typing; the composer being emptied
   // stops it immediately rather than waiting out the inactivity timer.
   const handleComposerActivity = useCallback(
     (hasContent: boolean) => {
-      if (hasContent) typing.notifyActivity();
-      else typing.stop();
+      if (hasContent) typingNotifyActivity();
+      else typingStop();
     },
-    [typing.notifyActivity, typing.stop],
+    [typingNotifyActivity, typingStop],
   );
 
-  // Resolves a typing user's id to a display name from whatever roster this
-  // conversation already has loaded — no extra fetch. A DM (1:1 or group)
-  // already carries every participant's name; a channel has no roster loaded
-  // here unless the details panel is open, so the fallback is the name most
-  // recently seen on one of that person's own messages, which for anyone who
-  // has posted at all is exactly the counterpart the mention system already
-  // trusts as authoritative (RF-58's presence dots make the same trade: they
-  // identify *who*, never resolve a name of their own).
+  // Second-tier fallback only: the server now resolves and sends the
+  // authoritative name on the typing event itself
+  // (typing.typingDisplayNameByUserId, see useTypingIndicator). This
+  // heuristic — DM roster, else the name most recently seen on that user's
+  // own message — only fires when the server's resolution was empty (lookup
+  // failure, no display name on file), and "Alguém" (inside
+  // typingIndicatorText) is the last resort after that.
   const typingNameByUserId = useMemo(() => {
     const names = new Map<string, string>();
     if (kind === "dm" && activeDM) {
@@ -1123,10 +1127,13 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     return names;
   }, [kind, activeDM, state.messages]);
 
-  const typingIndicatorLabel = useMemo(
-    () => typingIndicatorText(typing.typingUserIds, typingNameByUserId),
-    [typing.typingUserIds, typingNameByUserId],
-  );
+  const typingIndicatorLabel = useMemo(() => {
+    const names = new Map(typingNameByUserId); // heuristic, tier 2
+    for (const [userId, name] of typing.typingDisplayNameByUserId) {
+      if (name) names.set(userId, name); // server-authoritative, wins
+    }
+    return typingIndicatorText(typing.typingUserIds, names);
+  }, [typing.typingUserIds, typing.typingDisplayNameByUserId, typingNameByUserId]);
 
   useEffect(() => {
     if (!pendingReference) return;
@@ -1182,12 +1189,12 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         // Sending is itself the clearest possible "stopped typing" signal —
         // do not wait for the composer-cleared activity event or the
         // inactivity timeout to catch up.
-        typing.stop();
+        typingStop();
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
       return result;
     },
-    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage, typing.stop],
+    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage, typingStop],
   );
 
   const selectReferenceDestination = useCallback(

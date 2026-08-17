@@ -680,3 +680,114 @@ func TestHub_TypingIsNeverPersistedToPostgres(t *testing.T) {
 		t.Fatalf("typing.stop: %v", err)
 	}
 }
+
+// ── handleTypingClientError ─────────────────────────────────────────────────
+
+func TestHandleTypingClientError_RateLimitIsStructuredAndHandled(t *testing.T) {
+	c := newClient("client-1", "user-1", "workspace-1", &fakeSender{})
+	if !handleTypingClientError(c, ErrTypingRateLimited) {
+		t.Fatal("expected rate limit to be handled separately")
+	}
+
+	var got struct {
+		Type       string `json:"type"`
+		Operation  string `json:"operation"`
+		Code       string `json:"code"`
+		RetryAfter int    `json:"retry_after"`
+	}
+	if err := json.Unmarshal(<-c.outbox, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != "error" || got.Operation != "typing" || got.Code != "rate_limited" ||
+		got.RetryAfter != defaultTypingRateLimitWindowSeconds {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+}
+
+func TestHandleTypingClientError_FeatureDisabledUsesNeutralResponse(t *testing.T) {
+	c := newClient("client-1", "user-1", "workspace-1", &fakeSender{})
+	if !handleTypingClientError(c, ErrTypingFeatureDisabled) {
+		t.Fatal("expected disabled feature to be handled separately")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(<-c.outbox, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["type"] != "error" || got["code"] != "temporarily_unavailable" {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+}
+
+func TestHandleTypingClientError_NotSubscribedUsesNeutralResponse(t *testing.T) {
+	c := newClient("client-1", "user-1", "workspace-1", &fakeSender{})
+	if !handleTypingClientError(c, ErrTypingNotSubscribed) {
+		t.Fatal("expected not-subscribed to be handled separately")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(<-c.outbox, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["type"] != "error" || got["code"] != "typing_not_subscribed" {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+}
+
+func TestHandleTypingClientError_UnknownErrorIsNotHandled(t *testing.T) {
+	c := newClient("client-1", "user-1", "workspace-1", &fakeSender{})
+	if handleTypingClientError(c, errors.New("some other failure")) {
+		t.Fatal("expected an unclassified error to fall through to the generic path")
+	}
+	assertNoMessage(t, c, 50*time.Millisecond)
+}
+
+// ── ValkeyTypingStore ────────────────────────────────────────────────────────
+
+func TestNewValkeyTypingStore_RejectsIncompleteConfiguration(t *testing.T) {
+	for _, url := range []string{"", "://invalid"} {
+		if store, err := NewValkeyTypingStore(url); err == nil || store != nil {
+			t.Fatalf("expected %q to be rejected", url)
+		}
+	}
+}
+
+func TestValkeyTypingStore_TouchSetsKeyWithTTLAndClearRemovesIt(t *testing.T) {
+	server := newFakeValkeyServer()
+	store, err := NewValkeyTypingStore(server.start(t))
+	if err != nil {
+		t.Fatalf("new typing store: %v", err)
+	}
+	t.Cleanup(store.Close)
+
+	id := typingStoreID("channel:"+typingChannel, typingUserA)
+	if err := store.Touch(context.Background(), id, typingTTL); err != nil {
+		t.Fatalf("touch: %v", err)
+	}
+
+	key := typingKeyPrefix + id
+	value, ok := server.stringValue(key)
+	if !ok || value != "1" {
+		t.Fatalf("key %s = %q, %v; want \"1\", true", key, value, ok)
+	}
+	if got := server.ttlOf(key); got != int64(typingTTL.Seconds()) {
+		t.Fatalf("ttl = %ds, want %ds", got, int64(typingTTL.Seconds()))
+	}
+
+	if err := store.Clear(context.Background(), id); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if _, ok := server.stringValue(key); ok {
+		t.Fatalf("key %s still present after Clear", key)
+	}
+}
+
+func TestNopTypingStore_IsANoOp(t *testing.T) {
+	var store NopTypingStore
+	if err := store.Touch(context.Background(), "any-id", typingTTL); err != nil {
+		t.Fatalf("touch: %v", err)
+	}
+	if err := store.Clear(context.Background(), "any-id"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+}
