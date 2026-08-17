@@ -119,6 +119,21 @@ const (
 	EventTypeCallCancelled EventType = "call.cancelled"
 	EventTypeCallTimedOut  EventType = "call.timed_out"
 	EventTypeCallEnded     EventType = "call.ended"
+
+	// EventTypeTypingUpdated carries one user's typing state in a channel or DM.
+	//
+	// It routes by (workspace, target) exactly like presence.updated, and for
+	// the same reason: fan-out already re-authorizes every subscriber, so that
+	// is the whole authorization story here too. Unlike presence, the state is
+	// client-declared (typing.start/typing.stop) rather than inferred from
+	// arbitrary traffic — the server never invents a typing state, it only
+	// relays and expires the one the client asserted, and only for a target the
+	// asserting connection is currently authorized on.
+	//
+	// The payload never carries what was typed, only that someone is typing.
+	// Ephemeral by design: never persisted to Postgres, backed by a short-TTL
+	// Valkey key that self-clears if no stop is ever sent.
+	EventTypeTypingUpdated EventType = "typing.updated"
 )
 
 // CurrentEventSchemaVersion is the version of the outbound WebSocket event
@@ -140,6 +155,8 @@ const (
 	ClientMessageTypeCallCancel     ClientMessageType = "call.cancel"
 	ClientMessageTypeCallEnd        ClientMessageType = "call.end"
 	ClientMessageTypeCallSync       ClientMessageType = "call.sync"
+	ClientMessageTypeTypingStart    ClientMessageType = "typing.start"
+	ClientMessageTypeTypingStop     ClientMessageType = "typing.stop"
 )
 
 // MessagePayload carries the full message DTO for message.created events.
@@ -292,6 +309,32 @@ type PresencePayload struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+// TypingEventPayload is one user's typing state in a channel or DM.
+//
+// IsTyping is exactly what the client asserted (typing.start => true,
+// typing.stop or expiry => false) — never inferred. UpdatedAt is when the
+// server accepted that assertion, as an RFC 3339 string for the same reason
+// PresencePayload's is: a producer's formatting must not be able to make the
+// whole envelope undecodable, and it is the ordering key a client uses to
+// discard a stale update without trusting its own clock.
+//
+// UserDisplayName is resolved server-side once per WebSocket connection (see
+// ws.UserDisplayNameResolver / Client.displayName) rather than guessed by each
+// recipient's client from whatever roster or message history it happens to
+// have loaded — that guess is what previously fell back to the literal
+// placeholder "Alguém" for a channel typist who hadn't posted yet. Empty when
+// the lookup failed or the user has no display name; clients keep their own
+// heuristic as a fallback in that case.
+//
+// There is deliberately no body, no draft, no character count: this payload
+// answers "is this person typing right now", nothing about what they wrote.
+type TypingEventPayload struct {
+	UserID          string `json:"user_id"`
+	UserDisplayName string `json:"user_display_name,omitempty"`
+	IsTyping        bool   `json:"is_typing"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
 // PresenceSnapshotResponse answers a subscribe with the presence of the users
 // already in that target (RF-58).
 //
@@ -399,6 +442,8 @@ type Event struct {
 	Attachment *AttachmentStatusPayload `json:"attachment,omitempty"`
 	// Presence carries one user's online/away/offline state (RF-58).
 	Presence *PresencePayload `json:"presence,omitempty"`
+	// Typing carries one user's typing state in a channel or DM.
+	Typing *TypingEventPayload `json:"typing,omitempty"`
 	// RecipientUserID routes a user-scoped event to exactly one user.
 	//
 	// Set only for conversation.available, which is not delivered by

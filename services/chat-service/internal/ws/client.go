@@ -45,12 +45,18 @@ type Client struct {
 	// it is never part of the WebSocket protocol in either direction, and the
 	// client cannot name, change or observe it. Zero when no session authority
 	// is wired, which leaves the connection with upgrade-time validation only.
-	session   sessionGuard
-	outbox    chan []byte
-	snd       sender
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closeOnce sync.Once
+	session sessionGuard
+	// displayName is this connection's user's display name, resolved once at
+	// connect time (see UserDisplayNameResolver, handler.go), never re-queried
+	// per typing event. Empty when the lookup failed or is disabled —
+	// publishTypingUpdated then sends no name and the frontend falls back to
+	// its own heuristic.
+	displayName string
+	outbox      chan []byte
+	snd         sender
+	ctx         context.Context
+	cancel      context.CancelFunc
+	closeOnce   sync.Once
 }
 
 // newClient creates a Client with a bounded outbox.
