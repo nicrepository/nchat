@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
 const testReactionMessageID = "11111111-1111-1111-1111-111111111111"
@@ -103,6 +105,26 @@ func TestHub_ReactionToggleStopsWhenRateLimited(t *testing.T) {
 	}
 	if handler.messageID != "" {
 		t.Fatal("rate-limited toggle reached storage")
+	}
+}
+
+func TestHub_ReactionLimitDoesNotBroadcastRejectedToggle(t *testing.T) {
+	handler := &fakeReactionHandler{err: domain.ErrReactionLimitReached}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "test-reaction-limit-rejected",
+		WithReactionHandler(handler), WithReactionLimiter(fakeReactionLimiter{allowed: true}))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeReactionToggle, MessageID: testReactionMessageID, Emoji: "👍",
+	})
+	if !errors.Is(err, domain.ErrReactionLimitReached) {
+		t.Fatalf("expected reaction limit error, got %v", err)
+	}
+	select {
+	case event := <-client.outbox:
+		t.Fatalf("rejected reaction broadcast %s", event)
+	default:
 	}
 }
 

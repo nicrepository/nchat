@@ -16,6 +16,7 @@ import MessageEditHistory from "./MessageEditHistory";
 import { formatTime, senderLabel } from "./messageDisplay";
 import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import PresenceDot from "./PresenceDot";
+import { canToggleReaction, maxReactionsPerUserPerMessage } from "./reactionLimit";
 import RichTextRenderer from "./RichTextRenderer";
 import type { CodecFormat } from "./tiptapSerializer";
 
@@ -201,8 +202,10 @@ function MessageReactions({
 
   const selectReaction = (emoji: string) => {
     onToggleReaction(message.id, emoji);
-    onPickerOpenChange(message.id, false);
+    if (canToggleReaction(message.reactions, emoji)) onPickerOpenChange(message.id, false);
   };
+
+  const reactionToggleHint = `Você pode adicionar no máximo ${maxReactionsPerUserPerMessage} reações por mensagem. Remova uma reação sua para adicionar outra.`;
 
   if (message.isRemoved) return null;
   return (
@@ -216,6 +219,10 @@ function MessageReactions({
               className={`chat-msg-area__reaction${reaction.reactedByMe ? " chat-msg-area__reaction--mine" : ""}`}
               aria-label={`${reaction.reactedByMe ? "Remover" : "Adicionar"} reação ${reaction.emoji}`}
               aria-pressed={reaction.reactedByMe}
+              aria-disabled={!canToggleReaction(message.reactions, reaction.emoji)}
+              title={
+                canToggleReaction(message.reactions, reaction.emoji) ? undefined : reactionToggleHint
+              }
               onClick={() => onToggleReaction(message.id, reaction.emoji)}
             >
               <span aria-hidden="true">{reaction.emoji}</span> {reaction.count}
@@ -237,6 +244,8 @@ function MessageReactions({
               key={emoji}
               type="button"
               aria-label={`Reagir rapidamente com ${emoji}`}
+              aria-disabled={!canToggleReaction(message.reactions, emoji)}
+              title={canToggleReaction(message.reactions, emoji) ? undefined : reactionToggleHint}
               onClick={() => onToggleReaction(message.id, emoji)}
             >
               {emoji}
@@ -334,6 +343,8 @@ function MessageReactions({
                     key={emoji}
                     type="button"
                     aria-label={`Reagir com ${emoji}`}
+                    aria-disabled={!canToggleReaction(message.reactions, emoji)}
+                    title={canToggleReaction(message.reactions, emoji) ? undefined : reactionToggleHint}
                     onClick={() => selectReaction(emoji)}
                   >
                     {emoji}

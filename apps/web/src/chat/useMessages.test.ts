@@ -641,6 +641,9 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
     expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
+
+    act(() => capturedOnReactionError?.({ type: "error", code: "reaction_limit_reached", limit: 5 }));
+    expect(result.current.state.actionError).toBe("Você pode adicionar no máximo 5 reações por mensagem.");
   });
 
   it("maps subscribe errors to realtime state without showing a reaction failure", async () => {

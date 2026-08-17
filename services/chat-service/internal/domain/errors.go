@@ -39,6 +39,10 @@ var (
 	// ErrPinLimitReached is returned when a channel already holds the maximum
 	// number of pinned messages (RF-05 abuse ceiling).
 	ErrPinLimitReached = errors.New("pin limit reached")
+	// ErrReactionLimitReached rejects a new distinct reaction once a user has
+	// five active reactions on one message. It wraps ErrConflict so existing
+	// transport error families retain their normal semantics.
+	ErrReactionLimitReached = fmt.Errorf("%w: reaction limit reached", ErrConflict)
 	// ErrMaliciousURL reports a message body carrying a link the Safe Browsing
 	// provider considers a security threat, or one whose host has no reputation
 	// that could be consulted at all (RF-21). Both are permanent: the same body

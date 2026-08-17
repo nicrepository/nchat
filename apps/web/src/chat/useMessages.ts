@@ -39,6 +39,7 @@ import {
   unfavoriteMessage,
 } from "./chatApi";
 import { markPresenceActivity } from "./chatSocket";
+import { canToggleReaction, maxReactionsPerUserPerMessage } from "./reactionLimit";
 import { ApiRequestError } from "../lib/api";
 import {
   normalizeBodyFormat,
@@ -1351,6 +1352,7 @@ export function useMessages({
     const messages: Record<string, string> = {
       rate_limited: "Muitas reações em sequência. Aguarde um minuto e tente novamente.",
       temporarily_unavailable: "Reações temporariamente indisponíveis.",
+      reaction_limit_reached: "Você pode adicionar no máximo 5 reações por mensagem.",
     };
     for (const timer of pendingReactionTimersRef.current.values()) window.clearTimeout(timer);
     pendingReactionTimersRef.current.clear();
@@ -1514,6 +1516,14 @@ export function useMessages({
 
   const toggleReaction = useCallback(
     (messageId: string, emoji: string) => {
+      const message = stateRef.current.messages.find((candidate) => candidate.id === messageId);
+      if (message && !canToggleReaction(message.reactions, emoji)) {
+        dispatch({
+          type: "reaction_error",
+          error: `Você pode adicionar no máximo ${maxReactionsPerUserPerMessage} reações por mensagem.`,
+        });
+        return;
+      }
       dispatch({ type: "reaction_optimistic", messageId, emoji });
       if (!sendReactionToggle(messageId, emoji)) {
         dispatch({

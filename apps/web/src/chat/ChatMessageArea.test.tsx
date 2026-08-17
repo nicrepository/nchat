@@ -1317,6 +1317,35 @@ describe("ChatMessageArea — message list", () => {
     expect(mockFetchAllowedReactionEmojis).toHaveBeenCalledTimes(1);
   });
 
+  it("blocks a sixth distinct reaction while keeping an existing reaction removable", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [
+            { emoji: "👍", count: 1, reactedByMe: true },
+            { emoji: "🎉", count: 1, reactedByMe: true },
+            { emoji: "😂", count: 1, reactedByMe: true },
+            { emoji: "🔥", count: 1, reactedByMe: true },
+            { emoji: "👀", count: 1, reactedByMe: true },
+          ],
+        }),
+      ]),
+    );
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    await userEvent.click(screen.getByRole("button", { name: "Reagir com ❤️" }));
+
+    expect(wsMockState.toggleReaction).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Você pode adicionar no máximo 5 reações por mensagem.",
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Remover reação 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+  });
+
   it("does not render a persistent add-reaction button when the message has zero reactions", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelArea();

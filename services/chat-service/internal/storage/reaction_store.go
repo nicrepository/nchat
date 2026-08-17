@@ -41,7 +41,8 @@ func (s *PGXReactionStore) ToggleReaction(ctx context.Context, input ToggleReact
 
 	// Acquire before the next statement takes its READ COMMITTED snapshot. A
 	// lock inside the toggle statement would wait correctly but retain a stale
-	// pre-wait snapshot, allowing duplicate inserts on consecutive toggles.
+	// pre-wait snapshot. The key is per message and user, so adding different
+	// emojis from two tabs cannot both consume the final reaction slot.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, reactionAdvisoryKey(input)); err != nil {
 		return result, fmt.Errorf("acquire reaction tuple lock: %w", err)
 	}
@@ -99,16 +100,23 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 			UNION ALL SELECT * FROM private_channel
 			UNION ALL SELECT * FROM direct_message
 		),
-		deleted AS (
+	deleted AS (
 			DELETE FROM chat.message_reactions r
 			USING authorized a
 			WHERE r.message_id = $3 AND r.user_id = $2 AND r.emoji = $4
-			RETURNING r.message_id
-		),
-		inserted AS (
-			INSERT INTO chat.message_reactions (message_id, user_id, emoji)
-			SELECT $3, $2, $4 FROM authorized
-			WHERE NOT EXISTS (SELECT 1 FROM deleted)
+		RETURNING r.message_id
+	),
+	user_reaction_count AS MATERIALIZED (
+		SELECT count(*)::int AS count
+		FROM chat.message_reactions r
+		JOIN authorized a ON true
+		WHERE r.message_id = $3 AND r.user_id = $2
+	),
+	inserted AS (
+		INSERT INTO chat.message_reactions (message_id, user_id, emoji)
+		SELECT $3, $2, $4 FROM authorized
+		WHERE NOT EXISTS (SELECT 1 FROM deleted)
+		  AND (SELECT count FROM user_reaction_count) < 5
 			RETURNING emoji, user_id, created_at
 		),
 		final_reactions AS MATERIALIZED (
@@ -126,6 +134,9 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 			GROUP BY emoji
 		)
 		SELECT a.channel_id, a.dm_id, EXISTS (SELECT 1 FROM inserted),
+		       NOT EXISTS (SELECT 1 FROM deleted)
+		         AND NOT EXISTS (SELECT 1 FROM inserted)
+		         AND (SELECT count FROM user_reaction_count) >= 5 AS limit_reached,
 		       COALESCE(g.emoji, ''), COALESCE(g.count, 0), COALESCE(g.reacted_by_me, false)
 		FROM authorized a
 		LEFT JOIN aggregated g ON true
@@ -138,12 +149,16 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 	found := false
 	for rows.Next() {
 		found = true
+		var limitReached bool
 		var reaction domain.MessageReaction
 		if err := rows.Scan(
-			&result.ChannelID, &result.DMID, &result.Added,
+			&result.ChannelID, &result.DMID, &result.Added, &limitReached,
 			&reaction.Emoji, &reaction.Count, &reaction.ReactedByMe,
 		); err != nil {
 			return ToggleReactionResult{}, fmt.Errorf("scan reaction toggle: %w", err)
+		}
+		if limitReached {
+			return ToggleReactionResult{}, fmt.Errorf("%w: maximum of 5 active reactions per user and message", domain.ErrReactionLimitReached)
 		}
 		if reaction.Emoji != "" {
 			result.Reactions = append(result.Reactions, reaction)
@@ -158,11 +173,11 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 	return result, nil
 }
 
-// reactionAdvisoryKey scopes serialization to exactly one toggle tuple. Hash
-// collisions can only add contention; the reaction primary key still enforces
-// correctness. NUL separators are unambiguous for UUIDs and allowed emoji.
+// reactionAdvisoryKey scopes serialization to one user's reactions on one
+// message. Hash collisions can only add contention; the reaction primary key
+// still enforces uniqueness. NUL separators are unambiguous for UUIDs.
 func reactionAdvisoryKey(input ToggleReactionInput) int64 {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(input.MessageID + "\x00" + input.UserID + "\x00" + input.Emoji))
+	_, _ = h.Write([]byte(input.MessageID + "\x00" + input.UserID))
 	return int64(h.Sum64()) //nolint:gosec // Intentional uint64→int64 reinterpretation for PostgreSQL advisory locks.
 }
