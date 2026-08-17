@@ -32,6 +32,7 @@ const liveKitMock = vi.hoisted(() => {
 
   interface MockRemoteParticipant {
     identity: string;
+    name?: string;
     getTrackPublication: (source: string) => MockPublication | undefined;
   }
 
@@ -153,9 +154,11 @@ function cameraPublication(isMuted: boolean, isSubscribed = true) {
 function fakeRemoteParticipant(
   identity: string,
   camera?: { isMuted: boolean; isSubscribed?: boolean },
+  name?: string,
 ) {
   return {
     identity,
+    name,
     getTrackPublication: (source: string) =>
       source === liveKitMock.sources.Camera && camera
         ? {
@@ -282,23 +285,42 @@ describe("createLiveKitSpikeSession", () => {
     expect(video.dataset.participantIdentity).toBe(participant.identity);
   });
 
-  it("reports participants already in the room once connect() completes", async () => {
+  it("reports participants already in the room once connect() completes, with their display name", async () => {
     const { handlers, room, session } = setup();
-    room.remoteParticipants.set("a", fakeRemoteParticipant("identity-a"));
-    room.remoteParticipants.set("b", fakeRemoteParticipant("identity-b"));
+    room.remoteParticipants.set(
+      "a",
+      fakeRemoteParticipant("identity-a", undefined, "Pedro Almeida"),
+    );
+    room.remoteParticipants.set("b", fakeRemoteParticipant("identity-b", undefined, "Maria Silva"));
 
     await session.connect("ws://127.0.0.1:7880", "participant-token");
 
-    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-a");
-    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-b");
+    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-a", "Pedro Almeida");
+    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-b", "Maria Silva");
     expect(handlers.onParticipantConnected).toHaveBeenCalledTimes(2);
   });
 
-  it("reports a participant joining after connect and one leaving", () => {
+  it("reports an existing participant with no name as an empty display name, never the identity", async () => {
+    const { handlers, room, session } = setup();
+    room.remoteParticipants.set("a", fakeRemoteParticipant("identity-a"));
+
+    await session.connect("ws://127.0.0.1:7880", "participant-token");
+
+    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith("identity-a", "");
+  });
+
+  it("reports a participant joining after connect (with display name) and one leaving", () => {
     const { handlers, room } = setup();
 
-    room.emit(liveKitMock.events.ParticipantConnected, { sid: "c-sid", identity: "identity-c" });
-    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith("identity-c");
+    room.emit(liveKitMock.events.ParticipantConnected, {
+      sid: "c-sid",
+      identity: "identity-c",
+      name: "Ana Lima",
+    });
+    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith(
+      "identity-c",
+      "Ana Lima",
+    );
 
     room.emit(liveKitMock.events.ParticipantDisconnected, { sid: "c-sid", identity: "identity-c" });
     expect(handlers.onParticipantDisconnected).toHaveBeenCalledExactlyOnceWith("identity-c");

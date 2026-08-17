@@ -26,3 +26,21 @@ func TestActiveSessionCTEContainsRequiredGuards(t *testing.T) {
 		}
 	}
 }
+
+// A substring check (e.g. strings.Contains for "full_name" and
+// "display_name" as two independent assertions) would still pass if the two
+// NULLIF arguments were swapped in the COALESCE call — it proves the words
+// are present, never their order. DisplayNameExpr is deliberately one small,
+// stable constant, so comparing it byte-for-byte against the exact expected
+// SQL is what actually pins down precedence: full_name can only win over
+// display_name if it is truly COALESCE's *first* argument, and the trailing
+// empty-string fallback can only be reached once both NULLIFs have collapsed
+// to NULL. The PostgreSQL integration test in media-service
+// (authorizer_postgres_integration_test.go) is the real-database evidence
+// that this SQL, executed for real, produces those three outcomes.
+func TestDisplayNameExprIsExactlyFullNameThenDisplayNameThenEmpty(t *testing.T) {
+	want := `COALESCE(NULLIF(BTRIM(u.full_name), ''), NULLIF(BTRIM(u.display_name), ''), '')`
+	if DisplayNameExpr != want {
+		t.Fatalf("DisplayNameExpr = %q, want %q", DisplayNameExpr, want)
+	}
+}

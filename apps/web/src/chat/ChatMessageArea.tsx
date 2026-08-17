@@ -260,13 +260,13 @@ const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function
   );
 });
 
-interface CallActionButtonsProps {
+interface DirectCallActionsProps {
   onAudio: () => void;
   onVideo: () => void;
 }
 
-/** Shared by a channel header, a group header and a 1:1 DM header (RF-23/RF-24). */
-function CallActionButtons({ onAudio, onVideo }: CallActionButtonsProps) {
+/** RF-23 direct 1:1 call entry: audio and video remain distinct call types. */
+function DirectCallActions({ onAudio, onVideo }: DirectCallActionsProps) {
   return (
     <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
       <button type="button" aria-label="Iniciar chamada de áudio" onClick={onAudio}>
@@ -279,11 +279,31 @@ function CallActionButtons({ onAudio, onVideo }: CallActionButtonsProps) {
   );
 }
 
+interface ResourceCallActionProps {
+  onCall: () => void;
+}
+
+/**
+ * RF-24 channel/group entry (issue #540 follow-up). A resource room is one
+ * multiparty call, never separate "audio" and "video" rooms, so there is a
+ * single action instead of RF-23's two — camera and microphone are controls
+ * within the call, chosen once inside ResourceCallPanel.
+ */
+function ResourceCallAction({ onCall }: ResourceCallActionProps) {
+  return (
+    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
+      <button type="button" aria-label="Iniciar chamada" onClick={onCall}>
+        Chamada
+      </button>
+    </div>
+  );
+}
+
 interface HeaderChannelProps {
   name: string;
   detailsToggle?: React.ReactNode;
   /** RF-24: joins the channel's shared call room; absent while unavailable. */
-  onJoinCall?: (callType: "audio" | "video") => void;
+  onJoinCall?: () => void;
 }
 
 export function HeaderChannel({ name, detailsToggle, onJoinCall }: HeaderChannelProps) {
@@ -293,12 +313,7 @@ export function HeaderChannel({ name, detailsToggle, onJoinCall }: HeaderChannel
         <IconHash />
       </span>
       <h1 className="chat-msg-area__header-title">{name}</h1>
-      {onJoinCall && (
-        <CallActionButtons
-          onAudio={() => onJoinCall("audio")}
-          onVideo={() => onJoinCall("video")}
-        />
-      )}
+      {onJoinCall && <ResourceCallAction onCall={onJoinCall} />}
       {detailsToggle}
     </header>
   );
@@ -310,7 +325,7 @@ interface HeaderDMProps {
   counterpart?: DMCounterpart;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
   /** RF-24: joins a group's shared call room. Never used for a 1:1 (counterpart set). */
-  onJoinGroupCall?: (callType: "audio" | "video") => void;
+  onJoinGroupCall?: () => void;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
   /** The conversation being read; presence is resolved within it (RF-58). */
@@ -377,17 +392,12 @@ export function HeaderDM({
         </span>
       )}
       {counterpart && onStartCall && (
-        <CallActionButtons
+        <DirectCallActions
           onAudio={() => onStartCall(counterpart.userId, "audio")}
           onVideo={() => onStartCall(counterpart.userId, "video")}
         />
       )}
-      {!counterpart && onJoinGroupCall && (
-        <CallActionButtons
-          onAudio={() => onJoinGroupCall("audio")}
-          onVideo={() => onJoinGroupCall("video")}
-        />
-      )}
+      {!counterpart && onJoinGroupCall && <ResourceCallAction onCall={onJoinGroupCall} />}
       {detailsToggle}
     </header>
   );
@@ -1319,13 +1329,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // either kind is already in progress (ChatShell owns that guard).
   const joinChannelCall =
     kind === "channel" && targetId && ctx.joinResourceCall
-      ? (callType: "audio" | "video") =>
-          ctx.joinResourceCall!({ kind: "channel", id: targetId, name: resolvedName, callType })
+      ? () => ctx.joinResourceCall!({ kind: "channel", id: targetId, name: resolvedName })
       : undefined;
   const joinGroupCall =
     kind === "dm" && detailsKind === "group" && targetId && ctx.joinResourceCall
-      ? (callType: "audio" | "video") =>
-          ctx.joinResourceCall!({ kind: "dm", id: targetId, name: resolvedName, callType })
+      ? () => ctx.joinResourceCall!({ kind: "dm", id: targetId, name: resolvedName })
       : undefined;
 
   return (

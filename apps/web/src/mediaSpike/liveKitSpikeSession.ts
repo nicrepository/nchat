@@ -47,8 +47,10 @@ export interface LiveKitSpikeSessionCallbacks {
   onMicrophoneStateChanged(enabled: boolean): void;
   // Represents a remote person even before they publish any track (RF-24
   // grid). Fired for participants already in the room when connect()
-  // completes, and for every participant joining afterwards.
-  onParticipantConnected(identity: string): void;
+  // completes, and for every participant joining afterwards. displayName is
+  // the server-issued LiveKit participant name (RF-24 follow-up); empty when
+  // the SDK reports none, never the identity UUID.
+  onParticipantConnected(identity: string, displayName: string): void;
   onParticipantDisconnected(identity: string): void;
   // A remote camera can be muted (publication kept, no unsubscribe) instead
   // of unpublished. The subscribed element is never removed for this —
@@ -117,7 +119,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     // connected — so existing occupants (RF-24: someone joining after others)
     // are replayed explicitly here.
     for (const participant of this.room.remoteParticipants.values()) {
-      this.callbacks.onParticipantConnected(participant.identity);
+      this.callbacks.onParticipantConnected(participant.identity, participant.name ?? "");
     }
     // A camera publication's own current state is authoritative on join: a
     // late joiner must never infer "camera on" from the mere existence of a
@@ -263,7 +265,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   };
 
   private readonly onParticipantConnected = (participant: RemoteParticipant): void => {
-    if (!this.disposed) this.callbacks.onParticipantConnected(participant.identity);
+    if (!this.disposed) {
+      this.callbacks.onParticipantConnected(participant.identity, participant.name ?? "");
+    }
   };
 
   private readonly onParticipantDisconnected = (participant: RemoteParticipant): void => {

@@ -25,7 +25,6 @@ const channelTarget: ResourceCallTarget = {
   kind: "channel",
   id: "00000000-0000-4000-8000-000000000701",
   name: "geral",
-  callType: "audio",
 };
 
 beforeEach(() => {
@@ -59,13 +58,26 @@ describe("useResourceCallSession", () => {
   it("joins a group DM room with resource_kind dm", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    const groupTarget: ResourceCallTarget = { ...channelTarget, kind: "dm", callType: "video" };
+    const groupTarget: ResourceCallTarget = { ...channelTarget, kind: "dm" };
 
     await act(() => view.result.current.join(groupTarget));
 
     expect(issueResourceCallToken).toHaveBeenCalledExactlyOnceWith("dm", groupTarget.id);
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
-      { call_id: `dm:${groupTarget.id}`, call_type: "video" },
+      { call_id: `dm:${groupTarget.id}`, call_type: "audio" },
+      "resource-token",
+      "wss://livekit-dev.nic-labs.com",
+    );
+  });
+
+  it("never lets the camera auto-enable: call_type stays 'audio' regardless of target (RF-24 follow-up)", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+
+    await act(() => view.result.current.join(channelTarget));
+
+    expect(media.connect).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ call_type: "audio" }),
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
     );
@@ -228,7 +240,7 @@ describe("useResourceCallSession", () => {
     });
 
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
-      { call_id: `channel:${otherTarget.id}`, call_type: otherTarget.callType },
+      { call_id: `channel:${otherTarget.id}`, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
     );

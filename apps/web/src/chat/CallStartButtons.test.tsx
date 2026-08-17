@@ -31,15 +31,19 @@ it("does not offer call buttons for a 1:1 DM when onStartCall is unavailable (RF
   expect(screen.queryByRole("button", { name: /Iniciar chamada/ })).not.toBeInTheDocument();
 });
 
-it("RF-24: joins the group's resource room, never the RF-23 1:1 call actions", () => {
+it("RF-24 follow-up: joins the group's resource room via a single Chamada action, never the RF-23 1:1 call actions", () => {
   const joinGroupCall = vi.fn();
   render(<HeaderDM name="Equipe" onJoinGroupCall={joinGroupCall} />);
 
-  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de áudio" }));
-  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de vídeo" }));
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada" }));
 
-  expect(joinGroupCall).toHaveBeenNthCalledWith(1, "audio");
-  expect(joinGroupCall).toHaveBeenNthCalledWith(2, "video");
+  expect(joinGroupCall).toHaveBeenCalledOnce();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de áudio" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de vídeo" }),
+  ).not.toBeInTheDocument();
 });
 
 it("RF-24: a group with a resolved counterpart never happens, but onJoinGroupCall is ignored when counterpart is set", () => {
@@ -60,15 +64,19 @@ it("RF-24: a group with a resolved counterpart never happens, but onJoinGroupCal
   expect(joinGroupCall).not.toHaveBeenCalled();
 });
 
-it("RF-24: joins the channel's resource room from the channel header", () => {
+it("RF-24 follow-up: joins the channel's resource room via a single Chamada action", () => {
   const joinCall = vi.fn();
   render(<HeaderChannel name="geral" onJoinCall={joinCall} />);
 
-  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de áudio" }));
-  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de vídeo" }));
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada" }));
 
-  expect(joinCall).toHaveBeenNthCalledWith(1, "audio");
-  expect(joinCall).toHaveBeenNthCalledWith(2, "video");
+  expect(joinCall).toHaveBeenCalledOnce();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de áudio" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de vídeo" }),
+  ).not.toBeInTheDocument();
 });
 
 it("hides the channel call buttons while a call is already in progress (onJoinCall undefined)", () => {

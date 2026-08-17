@@ -376,9 +376,7 @@ function JoinChannelButton() {
     <button
       type="button"
       disabled={!ctx.joinResourceCall}
-      onClick={() =>
-        ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral", callType: "audio" })
-      }
+      onClick={() => ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral" })}
     >
       Entrar no canal
     </button>

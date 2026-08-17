@@ -611,7 +611,6 @@ function ResourceCallPanel({
 
   if (!target) return null;
 
-  const video = target.callType === "video";
   const participants = media?.participants ?? [];
   // +1 counts the local participant, who is never in media.participants.
   const participantCount = participants.length + 1;
@@ -622,7 +621,7 @@ function ResourceCallPanel({
     <dialog
       ref={dialogRef}
       className="call-panel call-panel--grid"
-      aria-label={`Chamada de ${video ? "vídeo" : "áudio"} em ${target.name}`}
+      aria-label={`Chamada em ${target.name}`}
       onCancel={(event) => event.preventDefault()}
       data-testid="resource-call-panel"
     >
@@ -630,7 +629,7 @@ function ResourceCallPanel({
         <div>
           <strong>{target.name}</strong>
           <span>
-            {video ? "Chamada de vídeo" : "Chamada de áudio"} ·{" "}
+            Chamada ·{" "}
             {connecting
               ? "Entrando…"
               : `${participantCount} participante${participantCount === 1 ? "" : "s"}`}
@@ -669,14 +668,14 @@ function ResourceCallPanel({
           <ParticipantTile
             identity={currentUserId}
             label="Você"
-            hasVideo={video && (media?.hasLocalVideo ?? false)}
+            hasVideo={media?.hasLocalVideo ?? false}
             bindVideo={media?.bindLocalMedia}
           />
           {participants.map((participant) => (
             <ParticipantTile
               key={participant.identity}
               identity={participant.identity}
-              label="Participante"
+              label={participant.displayName}
               hasVideo={participant.hasVideo}
               bindVideo={participant.bindVideo}
             />
@@ -752,17 +751,15 @@ function ResourceCallPanel({
           // rejection. Re-clicking retries the very same failed attempt.
           onClick={() => void resource.leave().catch(() => undefined)}
         />
-        {video && (
-          <CallAction
-            label={media?.cameraEnabled ? "Desativar câmera" : "Ativar câmera"}
-            shortLabel={media?.cameraEnabled ? "Câmera" : "Câmera desligada"}
-            icon={media?.cameraEnabled ? "videocam" : "videocam_off"}
-            pressed={media?.cameraEnabled ?? false}
-            muted={!media?.cameraEnabled}
-            disabled={connecting || media?.pendingControl === "camera"}
-            onClick={() => void media?.toggleCamera()}
-          />
-        )}
+        <CallAction
+          label={media?.cameraEnabled ? "Desativar câmera" : "Ativar câmera"}
+          shortLabel={media?.cameraEnabled ? "Câmera" : "Câmera desligada"}
+          icon={media?.cameraEnabled ? "videocam" : "videocam_off"}
+          pressed={media?.cameraEnabled ?? false}
+          muted={!media?.cameraEnabled}
+          disabled={connecting || media?.pendingControl === "camera"}
+          onClick={() => void media?.toggleCamera()}
+        />
       </footer>
     </dialog>
   );

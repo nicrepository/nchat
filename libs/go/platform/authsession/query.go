@@ -23,3 +23,11 @@ const ActiveSessionCTE = `
 		  AND u.deleted_at IS NULL
 		LIMIT 1
 	)`
+
+// DisplayNameExpr resolves the canonical NChat display name for the user row
+// aliased `u` in the surrounding query: full_name when set, else
+// display_name, else empty. Mirrors chat-service's counterpart/member name
+// resolution (dm_store.go) so every service that must present a person's
+// name — never used to authorize one — agrees on the same rule instead of
+// re-deriving it.
+const DisplayNameExpr = `COALESCE(NULLIF(BTRIM(u.full_name), ''), NULLIF(BTRIM(u.display_name), ''), '')`
