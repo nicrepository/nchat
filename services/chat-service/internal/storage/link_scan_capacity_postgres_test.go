@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
@@ -167,6 +168,76 @@ func TestLinkScanAdmissionPostgreSQL(t *testing.T) {
 		if used != 0 {
 			t.Fatalf("budget used = %d for a cached answer", used)
 		}
+	})
+
+	t.Run("an inconclusive scan is never charged or reopened by admission", func(t *testing.T) {
+		reset(t)
+		const (
+			url      = "https://inconclusive.example/a"
+			scanUUID = "scan-inconclusive"
+			attempts = 7
+		)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.link_scans
+			    (canonical_url, status, scan_uuid, decided_at, attempts)
+			VALUES ($1, 'inconclusive', $2, now(), $3)`, url, scanUUID, attempts); err != nil {
+			t.Fatalf("seed inconclusive scan: %v", err)
+		}
+
+		capacity := storage.LinkScanCapacity{
+			WorkspaceNewURLBudget: 1, BudgetWindow: time.Hour, MaxPendingJobs: 1,
+		}
+		assertUnchanged := func(t *testing.T) {
+			t.Helper()
+			admission, err := store.AdmitLinkScans(ctx, workspace, []string{url}, capacity)
+			if err != nil {
+				t.Fatalf("AdmitLinkScans: %v", err)
+			}
+			if !admission.Allowed() || admission.NewScanCost != 0 {
+				t.Fatalf("admission = %+v, want a free terminal reuse", admission)
+			}
+
+			var status, gotUUID string
+			var gotAttempts int
+			if err := pool.QueryRow(ctx, `
+				SELECT status, scan_uuid, attempts
+				FROM chat.link_scans WHERE canonical_url = $1`, url,
+			).Scan(&status, &gotUUID, &gotAttempts); err != nil {
+				t.Fatalf("read inconclusive scan: %v", err)
+			}
+			if status != "inconclusive" || gotUUID != scanUUID || gotAttempts != attempts {
+				t.Fatalf("scan changed to status=%q uuid=%q attempts=%d", status, gotUUID, gotAttempts)
+			}
+
+			jobs, err := store.ClaimDueLinkScans(ctx, 10)
+			if err != nil {
+				t.Fatalf("ClaimDueLinkScans: %v", err)
+			}
+			for _, job := range jobs {
+				if job.CanonicalURL == url {
+					t.Fatalf("inconclusive scan became claimable: %+v", job)
+				}
+			}
+
+			var used int
+			if err := pool.QueryRow(ctx, `
+				SELECT COALESCE(sum(used), 0) FROM chat.link_scan_budget_usage`,
+			).Scan(&used); err != nil {
+				t.Fatalf("read usage: %v", err)
+			}
+			if used != 0 {
+				t.Fatalf("budget used = %d for an inconclusive scan", used)
+			}
+		}
+
+		assertUnchanged(t)
+		if _, err := pool.Exec(ctx, `
+			UPDATE chat.link_scans
+			   SET decided_at = now() - ($2 * interval '1 second')
+			 WHERE canonical_url = $1`, url, urlsafety.VerdictTTL.Seconds()+3600); err != nil {
+			t.Fatalf("age inconclusive scan: %v", err)
+		}
+		assertUnchanged(t)
 	})
 
 	// [§55] The deployment-wide cap. A full queue is a slow provider, and

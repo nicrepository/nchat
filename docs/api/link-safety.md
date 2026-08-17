@@ -42,13 +42,17 @@ deleted": aplicar a edicao publicaria `message.updated` com o novo corpo para
 todos os inscritos no destino, que e exatamente a entrega que a retencao existe
 para impedir. Erro: `403 edit_forbidden`, sem revelar detalhe de Link Safety.
 
-**Malicious tem evento terminal.** A promocao e o bloqueio escrevem em
-`chat.message_publish_outbox` na mesma transacao que muda o estado:
+**Malicious e inconclusive tem evento terminal.** A promocao e o bloqueio
+escrevem em `chat.message_publish_outbox` na mesma transacao que muda o
+estado:
 
 - safe → `message.created`, destinado ao canal/DM;
 - malicious → `message.blocked`, destinado **somente ao remetente**
   (`target_type = 'sender'`), com `reason = malicious_link` e nada mais — sem
-  corpo, sem URL, sem scan UUID, sem resposta do provedor.
+  corpo, sem URL, sem scan UUID, sem resposta do provedor;
+- inconclusive → o mesmo `message.blocked`, mesma audiencia, com
+  `reason = link_check_inconclusive`. Ve "Inconclusivo" abaixo para a origem
+  desse estado.
 
 Sem isso o autor ficava para sempre em "verificando", porque o backend levava a
 mensagem a estado terminal e nao contava a ninguem.
@@ -64,6 +68,65 @@ proibida, mas essa regra e uma linha que uma mudanca futura poderia relaxar.
 `decided_at + VerdictTTL > now()`. Um veredito vencido nao promove e tambem nao
 prende: `ReopenExpiredVerdicts` devolve a URL para a fila (apenas as que alguma
 mensagem retida aguarda), e a mensagem promove quando chegar veredito fresco.
+**Escopado a `safe`/`malicious` apenas** -- ve "Inconclusivo" logo abaixo para
+o porque de `inconclusive` ficar de fora dessa reabertura.
+
+### Inconclusivo
+
+O incidente que este estado corrige: a Cloudflare responde HTTP 200,
+`task.status=finished`, `task.success=false`, `hasVerdicts=false` -- o scan
+**terminou**, mas nao produziu nenhum veredito utilizavel. Antes disso ser um
+estado proprio, essa resposta caia em `ErrUnavailable`, que e retentavel por
+design: o worker fazia poll do mesmo scan ja finalizado a cada passagem, para
+sempre, e toda mensagem com aquela URL ficava presa em `pending_link_scan`
+indefinidamente.
+
+`urlsafety.ErrScanInconclusive` e o que a camada do provedor reporta para essa
+resposta especifica, distinto de `ErrUnavailable` de proposito: um e "pergunte
+de novo", o outro e "este scan especifico esta decidido, e a decisao e que ele
+nao decide nada". O worker so alcanca esse erro a partir de um poll -- nunca de
+um submit -- e so depois de confirmar que a resposta pertence ao scan que ele
+esperava.
+
+**Fail-closed e terminal, nao apenas fail-closed.** Uma mensagem cujos links
+resolvem a inconclusive (e nenhum malicious) e bloqueada exatamente como uma
+mensagem maliciosa: status `deleted`, evento `message.blocked` com
+`reason = link_check_inconclusive`, endereçado somente ao remetente. A
+diferenca para `malicious` esta inteira no motivo relatado ao autor -- o
+mecanismo de bloqueio, a auditoria e a nao-visibilidade para o resto do canal
+sao os mesmos.
+
+O que torna esse estado deliberadamente diferente de `safe`/`malicious` e a
+ausencia total de um caminho de volta:
+
+- **sem polling futuro** -- `RecordVerdict`/`RecordLinkVerdict` escreve
+  `state = 'inconclusive'` (file-service) ou `status = 'inconclusive'`
+  (chat-service), e as queries de claim (`ClaimDueScans`,
+  `ClaimDueLinkScans`) excluem esse estado explicitamente, do mesmo jeito que
+  excluem `done`;
+- **sem TTL** -- ao contrario de `safe`/`malicious`, nenhuma expiracao e
+  gravada. Nao ha data a partir da qual o estado "vence": ele nao vence;
+- **sem reabertura automatica** -- `ReopenExpiredVerdicts` e
+  `EnsureLinkScans`/`AdmitScan` sao escopados a `status IN ('safe',
+'malicious')`. Uma nova mensagem citando a mesma URL, ou o worker reabrindo
+  um veredito vencido, nunca tocam uma linha `inconclusive` -- exatamente o
+  loop de resubmissao automatica que esta correcao existe para nao introduzir;
+- **sem carona no Backlog** -- as metricas de fila (`Backlog`,
+  `LinkScanBacklog`) tambem excluem o estado, entao um scan terminado assim
+  nao aparece como fila crescendo;
+- **nunca um veredito carregavel** -- `LoadVerdict`/`LoadLinkVerdicts` so
+  devolvem `safe`/`malicious`; um `inconclusive` nunca e lido de volta como
+  liberacao, imediato ou depois de qualquer tempo decorrido.
+
+A unica forma de um `inconclusive` deixar de ser `inconclusive` e uma acao
+deliberada fora deste pipeline (por exemplo, um operador apagando a linha para
+forcar um novo scan) -- nunca o passar do tempo, nunca um restart do worker,
+nunca uma nova mensagem citando a mesma URL.
+
+Sem mencao ou notificacao: como a mensagem nunca chega a `active`, a mesma
+regra de "mencao adiada, nunca perdida" abaixo a mantem fora de
+`chat.notification_outbox` -- a CTE que libera notificacoes so dispara para
+mensagens promovidas (`published`), nunca para bloqueadas.
 
 **Mencoes de mensagem retida sao adiadas, nao perdidas.** Elas ficam em
 `chat.message_pending_mentions` e sao movidas para `chat.notification_outbox` na
@@ -88,10 +151,14 @@ URL com veredito safe valido          -> active
 URL com veredito malicious            -> bloqueada (403 malicious_url)
 URL sem veredito                      -> pending_link_scan
 
-worker: todas as URLs safe            -> active + evento na outbox
-worker: qualquer URL malicious        -> deleted, nenhum evento
-worker: provedor indisponivel/pending -> permanece pending_link_scan, retry com backoff
+worker: todas as URLs safe                -> active + evento message.created na outbox
+worker: qualquer URL malicious            -> deleted, evento message.blocked (reason=malicious_link)
+worker: qualquer URL inconclusive         -> deleted, evento message.blocked (reason=link_check_inconclusive)
+worker: provedor indisponivel/scan rodando -> permanece pending_link_scan, retry com backoff
 ```
+
+Malicious e inconclusive sao os dois motivos que **bloqueiam** uma mensagem
+retida; nenhum dos dois nunca vira `active`.
 
 `pending_link_scan` nao e visivel: toda leitura de mensagem exclui esse estado,
 com uma unica excecao escopada ao proprio remetente (`sender_id = requester`),
@@ -265,9 +332,10 @@ resubmete.
 ### Reconciliacao no reconnect
 
 O caso que o tempo real nao cobre: o autor esta offline quando o veredito sai.
-Para `malicious` isso e terminal -- a mensagem passa a `deleted`, nenhum outro
-evento sera emitido, e nao existe mensagem para buscar depois. Sem uma pergunta
-explicita, a bolha do autor fica em "verificando" para sempre.
+Para `malicious` e para `inconclusive` isso e terminal -- a mensagem passa a
+`deleted`, nenhum outro evento sera emitido, e nao existe mensagem para buscar
+depois. Sem uma pergunta explicita, a bolha do autor fica em "verificando"
+para sempre.
 
 ```
 POST /api/chat/messages/link-safety-status
@@ -278,6 +346,7 @@ POST /api/chat/messages/link-safety-status
     { "message_id": "...", "state": "pending" },
     { "message_id": "...", "state": "active"  },
     { "message_id": "...", "state": "blocked", "reason": "malicious_link" },
+    { "message_id": "...", "state": "blocked", "reason": "link_check_inconclusive" },
     { "message_id": "...", "state": "deleted" }
 ] }
 ```
@@ -292,11 +361,14 @@ Regras que a definem:
   como estava;
 - **`blocked` vem de estado duravel**, nao do outbox: a associacao
   `message_link_scans` (ligada pelo fingerprint do conteudo atual) somada ao
-  veredito `malicious` em `link_scans`. Ler o outbox faria a resposta depender de
-  o dispatcher ter rodado;
+  veredito `malicious` **ou** `inconclusive` em `link_scans`. Ler o outbox
+  faria a resposta depender de o dispatcher ter rodado. Quando os dois
+  coexistem para a mesma mensagem, `malicious` vence -- e o motivo mais forte,
+  e reportar exige a mesma evidencia que ja existe;
 - **`deleted` nao e `blocked`**: uma mensagem que sumiu sem veredito malicious
-  que a explique e reportada como indisponivel. Dizer "link malicioso" sem
-  evidencia e a inferencia que este desenho recusa;
+  ou inconclusive que a explique e reportada como indisponivel. Dizer "link
+  malicioso" ou "verificacao inconclusiva" sem evidencia e a inferencia que
+  este desenho recusa;
 - **conteudo nenhum**: sem corpo, sem URL, sem canonical URL, sem query, sem
   scan uuid, sem nada do provedor. Estado, e para a recusa um motivo fixo;
 - **falha e conservadora**: se a requisicao falhar, o cliente mantem o pending.
@@ -305,12 +377,17 @@ Regras que a definem:
   o mesmo fato. Em qualquer ordem, uma unica transicao terminal; para `active`,
   uma unica mensagem.
 
-Limite conhecido: um veredito `malicious` mais velho que o `VerdictTTL` volta
-para a fila assim que alguem envia a mesma URL de novo, e enquanto esta `pending`
-ele deixa de explicar o bloqueio -- a resposta degrada de `blocked` para
-`deleted`. A direcao e conservadora (o autor e informado de que a mensagem sumiu,
-nao de algo que nao se consegue mais evidenciar) e fora do alcance do fluxo, que
-reconcilia na mesma sessao do bloqueio.
+`inconclusive` nao tem o limite abaixo: sem TTL gravado, `blocked` com
+`reason = link_check_inconclusive` nao degrada com o tempo -- ve
+"Inconclusivo" acima.
+
+Limite conhecido, exclusivo de `malicious`: um veredito `malicious` mais velho
+que o `VerdictTTL` volta para a fila assim que alguem envia a mesma URL de
+novo, e enquanto esta `pending` ele deixa de explicar o bloqueio -- a resposta
+degrada de `blocked` para `deleted`. A direcao e conservadora (o autor e
+informado de que a mensagem sumiu, nao de algo que nao se consegue mais
+evidenciar) e fora do alcance do fluxo, que reconcilia na mesma sessao do
+bloqueio.
 
 ### Privacidade
 
@@ -374,18 +451,28 @@ lugares que nao podem discordar.
 
 ## Veredito
 
-Tres estados, nunca dois:
+Nunca um booleano. `urlsafety.Verdict` tem quatro valores:
 
-| Veredito    | Origem                                                                         | Resultado |
-| ----------- | ------------------------------------------------------------------------------ | --------- |
-| `safe`      | o provedor respondeu e nao reportou risco                                      | permite   |
-| `malicious` | o provedor reportou pelo menos uma categoria de risco                          | bloqueia  |
-| `unknown`   | timeout, status inesperado, corpo invalido, `success:false`, credencial errada | bloqueia  |
+| Veredito       | Origem                                                                         | Resultado                                       |
+| -------------- | ------------------------------------------------------------------------------ | ----------------------------------------------- |
+| `safe`         | o provedor respondeu e nao reportou risco                                      | permite                                         |
+| `malicious`    | o provedor reportou pelo menos uma categoria de risco                          | bloqueia                                        |
+| `unknown`      | timeout, status inesperado, corpo invalido, `success:false`, credencial errada | bloqueia, **retentavel**                        |
+| `inconclusive` | scan confirmado finalizado (`status=finished`) sem veredito utilizavel         | bloqueia, **terminal**, ve "Inconclusivo" acima |
 
 **Erro tecnico nunca vira `safe`.** Um booleano tornaria "o provedor nao
 respondeu" indistinguivel de "o provedor disse que esta tudo bem", e uma queda
 da Cloudflare viraria sinal verde silencioso. O tipo tem `unknown` como valor
 zero exatamente para que um veredito nunca atribuido nao leia como liberado.
+
+`unknown` e `inconclusive` bloqueiam pelo mesmo motivo fail-closed, mas nao sao
+o mesmo fato: `unknown` e "nao sabemos ainda, pergunte de novo" -- o worker
+tenta novamente com backoff. `inconclusive` e "o provedor respondeu, e a
+resposta e que este scan especifico nunca vai produzir um veredito" -- nao ha
+"de novo" para esse scan. `IsFinal()` reflete so a metade permissiva dessa
+tabela (`safe`/`malicious`); `inconclusive` deliberadamente nao e final, mas e
+persistido e tratado como terminal pelos dois stores, exatamente como descrito
+na secao "Inconclusivo".
 
 ### Fail-closed
 
@@ -472,6 +559,15 @@ Mensagem ao usuario (definida no frontend, em portugues):
 
 O composer preserva o rascunho: `sendMessage` rejeita, e o editor so limpa em um
 `sent` confirmado.
+
+**`link_check_inconclusive` nao e um codigo desta tabela.** Ele nunca aparece
+como resposta a um submit -- a mensagem ja foi aceita e retida quando o worker
+decide isso depois, entao ele chega como `reason` do evento `message.blocked`
+ou da reconciliacao de reconnect (ve "Reconciliacao no reconnect" abaixo), nao
+como status HTTP. O frontend mapeia esse motivo para "Nao foi possivel
+verificar a seguranca deste link.", deliberadamente sem sugestao de tentar de
+novo: ao contrario de `link_check_unavailable`, reenviar nao resubmete nada --
+o scan ja terminou, e terminou assim.
 
 ## Multiplas URLs
 

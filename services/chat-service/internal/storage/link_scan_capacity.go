@@ -150,7 +150,8 @@ func chargeableURLs(ctx context.Context, tx pgx.Tx, canonicalURLs []string) ([]s
 	wanted := uniqueSortedURLs(canonicalURLs)
 	rows, err := tx.Query(ctx, `
 		SELECT canonical_url, status,
-		       (status <> 'pending' AND decided_at > now() - ($2 * interval '1 second')) AS fresh
+		       (status IN ('safe', 'malicious')
+		        AND decided_at > now() - ($2 * interval '1 second')) AS fresh
 		FROM chat.link_scans
 		WHERE canonical_url = ANY($1::text[])
 		ORDER BY canonical_url
@@ -169,9 +170,9 @@ func chargeableURLs(ctx context.Context, tx pgx.Tx, canonicalURLs []string) ([]s
 		if err := rows.Scan(&url, &status, &fresh); err != nil {
 			return nil, fmt.Errorf("classify link scan cost: %w", err)
 		}
-		// Pending: a scan is already queued or running for this URL, and this
-		// message joins it. Fresh: the answer is already known.
-		if status == "pending" || fresh {
+		// Pending joins existing work; inconclusive is terminal for its scan; a
+		// fresh safe/malicious verdict is a reusable answer.
+		if status == "pending" || status == "inconclusive" || fresh {
 			free[url] = struct{}{}
 		}
 	}
@@ -239,7 +240,7 @@ func ensureLinkScanJobs(ctx context.Context, tx pgx.Tx, canonicalURLs []string) 
 		       attempts = 0, next_attempt_at = NULL,
 		       submit_attempt_started_at = NULL, updated_at = now()
 		 WHERE canonical_url = ANY($1::text[])
-		   AND status <> 'pending'`,
+		   AND status IN ('safe', 'malicious')`,
 		canonicalURLs,
 	); err != nil {
 		return fmt.Errorf("reactivate link scan jobs: %w", err)

@@ -117,11 +117,12 @@ func (s *fakeLinkStore) AdmitScan(
 	return service.LinkScanAdmission{NewScanCost: 1, Result: service.AdmissionAllowed}, nil
 }
 
-// undecided counts the rows that still owe the provider work.
+// undecided counts the rows that still owe the provider work. Inconclusive is
+// terminal, exactly like done, so it does not count either.
 func (s *fakeLinkStore) undecided() int {
 	count := 0
 	for _, row := range s.rows {
-		if row.state != "done" {
+		if row.state != "done" && row.state != "inconclusive" {
 			count++
 		}
 	}
@@ -231,7 +232,7 @@ func (s *fakeLinkStore) ClaimDueScans(_ context.Context, batchSize int) ([]servi
 		if len(jobs) >= batchSize {
 			break
 		}
-		if row.state == "done" || row.leased {
+		if row.state == "done" || row.state == "inconclusive" || row.leased {
 			continue
 		}
 		row.attempts++
@@ -279,6 +280,12 @@ func (s *fakeLinkStore) RecordVerdict(
 	}
 	for _, row := range s.rows {
 		if row.state == "polling" && row.scanUUID == scanUUID {
+			if verdict == urlsafety.VerdictInconclusive {
+				// Terminal, no TTL — mirrors the real store's RecordVerdict, which
+				// stores no expiry and no polling backlog entry for this state.
+				row.state, row.verdict = "inconclusive", urlsafety.VerdictUnknown
+				return nil
+			}
 			row.state, row.verdict = "done", verdict
 			row.expiresAt = time.Now().Add(ttl)
 			return nil
@@ -296,7 +303,7 @@ func (s *fakeLinkStore) Backlog(_ context.Context) (map[string]int, time.Duratio
 	}
 	byState := map[string]int{}
 	for _, row := range s.rows {
-		if row.state != "done" {
+		if row.state != "done" && row.state != "inconclusive" {
 			byState[row.state]++
 		}
 	}
@@ -941,5 +948,145 @@ func TestProviderSubmitAllowanceIsSharedBetweenWorkers(t *testing.T) {
 	}
 	if store.begins != 1 {
 		t.Fatalf("intents recorded = %d, want one", store.begins)
+	}
+}
+
+// The RF-21 incident this branch fixes: Cloudflare answers HTTP 200,
+// task.status=finished, task.success=false, hasVerdicts=false — the provider
+// confirms the scan is done but never produced a usable verdict. Before this
+// change that surfaced as ErrUnavailable, which is retried forever, so the
+// finished scan was polled on every pass and the URL never left the queue.
+// ErrScanInconclusive is what the provider layer now reports for that exact
+// answer, and this proves the worker settles it once and stops.
+func TestInconclusiveScanIsTerminalAndNeverPolledAgain(t *testing.T) {
+	store := newFakeLinkStore()
+	queueScan(t, store, testURL)
+	provider := &fakeLinkProvider{scanID: "scan-9", pollErr: urlsafety.ErrScanInconclusive}
+	worker := service.NewLinkScanService(store, provider, nil)
+
+	_, _ = worker.ProcessDue(context.Background()) // submit
+	store.releaseLeases()
+	_, _ = worker.ProcessDue(context.Background()) // poll -> inconclusive
+
+	row := store.row(testURL)
+	if row.state != "inconclusive" {
+		t.Fatalf("state = %q, want inconclusive", row.state)
+	}
+
+	// Further passes must not touch it again, even once its lease would
+	// otherwise be due — ClaimDueScans excludes the state outright.
+	store.releaseLeases()
+	moved, err := worker.ProcessDue(context.Background())
+	if err != nil || moved != 0 {
+		t.Fatalf("moved=%d err=%v, want an inconclusive row to never be claimed again", moved, err)
+	}
+	if _, polls := provider.counts(); polls != 1 {
+		t.Fatalf("polls = %d, want exactly 1 — an inconclusive scan must not be polled again", polls)
+	}
+}
+
+// A worker restart must not resubmit a URL that already settled inconclusive:
+// a fresh service instance over the same store, with the lease lapsed exactly
+// as it would after a crash, must find nothing to claim.
+func TestWorkerRestartAfterInconclusiveDoesNotResubmit(t *testing.T) {
+	store := newFakeLinkStore()
+	queueScan(t, store, testURL)
+	provider := &fakeLinkProvider{scanID: "scan-9", pollErr: urlsafety.ErrScanInconclusive}
+	worker := service.NewLinkScanService(store, provider, nil)
+	_, _ = worker.ProcessDue(context.Background()) // submit
+	store.releaseLeases()
+	_, _ = worker.ProcessDue(context.Background()) // poll -> inconclusive
+
+	store.releaseLeases()
+	restarted := service.NewLinkScanService(store, provider, nil)
+	moved, err := restarted.ProcessDue(context.Background())
+	if err != nil || moved != 0 {
+		t.Fatalf("moved=%d err=%v, want the restart to find nothing due", moved, err)
+	}
+	if submits, _ := provider.counts(); submits != 1 {
+		t.Fatalf("submits = %d, want 1 — a restart must not resubmit an inconclusive scan", submits)
+	}
+}
+
+// Backlog feeds the pipeline gauges. An inconclusive row is decided, not
+// stuck, and must never inflate it — including once enough time has passed
+// that the row would otherwise look overdue.
+func TestInconclusiveScanNeverReappearsInBacklog(t *testing.T) {
+	store := newFakeLinkStore()
+	queueScan(t, store, testURL)
+	provider := &fakeLinkProvider{scanID: "scan-9", pollErr: urlsafety.ErrScanInconclusive}
+	worker := service.NewLinkScanService(store, provider, nil)
+	_, _ = worker.ProcessDue(context.Background())
+	store.releaseLeases()
+	_, _ = worker.ProcessDue(context.Background())
+
+	byState, _, err := store.Backlog(context.Background())
+	if err != nil {
+		t.Fatalf("Backlog: %v", err)
+	}
+	if _, present := byState["inconclusive"]; present {
+		t.Fatalf("backlog counted an inconclusive row: %+v", byState)
+	}
+
+	// Time passing changes nothing: there is no TTL and no next_attempt_at to
+	// bring it back due.
+	store.releaseLeases()
+	byState, _, err = store.Backlog(context.Background())
+	if err != nil {
+		t.Fatalf("Backlog after time passes: %v", err)
+	}
+	if _, present := byState["inconclusive"]; present {
+		t.Fatalf("backlog counted an inconclusive row after time passed: %+v", byState)
+	}
+}
+
+// LoadVerdict is the preview's read path. An inconclusive scan must never be
+// mistaken for a usable verdict, immediately after it settles or later.
+func TestLoadVerdictNeverReturnsInconclusive(t *testing.T) {
+	store := newFakeLinkStore()
+	queueScan(t, store, testURL)
+	provider := &fakeLinkProvider{scanID: "scan-9", pollErr: urlsafety.ErrScanInconclusive}
+	worker := service.NewLinkScanService(store, provider, nil)
+	_, _ = worker.ProcessDue(context.Background())
+	store.releaseLeases()
+	_, _ = worker.ProcessDue(context.Background())
+
+	if verdict, ok, err := store.LoadVerdict(context.Background(), testURL); err != nil || ok {
+		t.Fatalf("verdict=%v ok=%v err=%v, want no usable verdict", verdict, ok, err)
+	}
+
+	// Simulate the would-be TTL horizon elapsing — there never was one, but the
+	// read path must stay closed regardless.
+	store.clock = store.clock.Add(24 * time.Hour)
+	if verdict, ok, err := store.LoadVerdict(context.Background(), testURL); err != nil || ok {
+		t.Fatalf("verdict=%v ok=%v err=%v, want no usable verdict after the horizon", verdict, ok, err)
+	}
+}
+
+// AdmitScan is the dedup point: two previews of the same URL, settled
+// inconclusive by one scan, must not reopen it or trigger a second Submit.
+func TestInconclusiveScanIsNotReopenedByAdmitScan(t *testing.T) {
+	store := newFakeLinkStore()
+	queueScan(t, store, testURL)
+	provider := &fakeLinkProvider{scanID: "scan-9", pollErr: urlsafety.ErrScanInconclusive}
+	worker := service.NewLinkScanService(store, provider, nil)
+	_, _ = worker.ProcessDue(context.Background())
+	store.releaseLeases()
+	_, _ = worker.ProcessDue(context.Background())
+
+	// A second, later preview request for the very same URL — the request path
+	// admission, not the worker.
+	admission, err := store.AdmitScan(context.Background(), testURL, service.LinkScanCapacity{})
+	if err != nil {
+		t.Fatalf("AdmitScan: %v", err)
+	}
+	if !admission.Allowed() || admission.NewScanCost != 0 {
+		t.Fatalf("admission=%+v, want a free admit that reopens nothing", admission)
+	}
+	if row := store.row(testURL); row.state != "inconclusive" {
+		t.Fatalf("state = %q, a second admit reopened the row", row.state)
+	}
+	if submits, _ := provider.counts(); submits != 1 {
+		t.Fatalf("submits = %d, want 1 — a dedup admit must never resubmit", submits)
 	}
 }

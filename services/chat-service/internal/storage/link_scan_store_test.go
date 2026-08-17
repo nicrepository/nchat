@@ -76,23 +76,35 @@ func TestOnlyFinalVerdictsAreLoadable(t *testing.T) {
 // forbids.
 func TestLinkSafetyStateOnlyClaimsBlockedWithAVerdictBehindIt(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		status    string
-		malicious bool
-		want      domain.LinkSafetyState
+		name         string
+		status       string
+		malicious    bool
+		inconclusive bool
+		want         domain.LinkSafetyState
+		wantReason   string
 	}{
-		{"withheld", "pending_link_scan", false, domain.LinkSafetyStatePending},
-		{"published", "active", false, domain.LinkSafetyStateActive},
-		{"refused", "deleted", true, domain.LinkSafetyStateBlocked},
-		{"deleted for some other reason", "deleted", false, domain.LinkSafetyStateDeleted},
+		{"withheld", "pending_link_scan", false, false, domain.LinkSafetyStatePending, ""},
+		{"published", "active", false, false, domain.LinkSafetyStateActive, ""},
+		{"refused", "deleted", true, false, domain.LinkSafetyStateBlocked, domain.LinkSafetyReasonMaliciousLink},
+		{"deleted for some other reason", "deleted", false, false, domain.LinkSafetyStateDeleted, ""},
+		{
+			"refused for an inconclusive scan", "deleted", false, true,
+			domain.LinkSafetyStateBlocked, domain.LinkSafetyReasonLinkCheckInconclusive,
+		},
+		{
+			"malicious wins over inconclusive", "deleted", true, true,
+			domain.LinkSafetyStateBlocked, domain.LinkSafetyReasonMaliciousLink,
+		},
 		// A verdict cannot promote a withheld message into a terminal answer on
 		// its own: the resolver decides that, in one transaction, and until it has
 		// the honest answer is still "pending".
-		{"withheld with a verdict landing", "pending_link_scan", true, domain.LinkSafetyStatePending},
+		{"withheld with a verdict landing", "pending_link_scan", true, false, domain.LinkSafetyStatePending, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := linkSafetyState(tc.status, tc.malicious); got != tc.want {
-				t.Fatalf("linkSafetyState(%q, %v) = %q, want %q", tc.status, tc.malicious, got, tc.want)
+			gotState, gotReason := linkSafetyState(tc.status, tc.malicious, tc.inconclusive)
+			if gotState != tc.want || gotReason != tc.wantReason {
+				t.Fatalf("linkSafetyState(%q, %v, %v) = (%q, %q), want (%q, %q)",
+					tc.status, tc.malicious, tc.inconclusive, gotState, gotReason, tc.want, tc.wantReason)
 			}
 		})
 	}

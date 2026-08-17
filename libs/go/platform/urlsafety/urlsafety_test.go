@@ -263,6 +263,28 @@ func TestPollReportsPendingWithoutCachingIt(t *testing.T) {
 	}
 }
 
+// TestPollReportsInconclusiveWithoutCachingIt: an inconclusive scan is
+// terminal for its scan id, but it is not a URL-level safety clearance, so
+// nothing here may cache it — the durable per-scan terminal state belongs to
+// the caller's own queue.
+func TestPollReportsInconclusiveWithoutCachingIt(t *testing.T) {
+	clock := &testClock{now: time.Unix(0, 0)}
+	scanner := &stubScanner{resultErr: ErrScanInconclusive}
+	service := newService(scanner, nil, clock.Now)
+
+	verdict, err := service.Poll(context.Background(), "https://example.com/", "scan-1")
+
+	if !errors.Is(err, ErrScanInconclusive) || verdict.IsFinal() {
+		t.Fatalf("verdict=%v err=%v", verdict, err)
+	}
+	if _, live := service.cache.get("https://example.com/"); live {
+		t.Fatal("an inconclusive scan must not be cached as anything")
+	}
+	if got, ok := service.Lookup("https://example.com/"); ok {
+		t.Fatalf("Lookup must still report a miss after an inconclusive poll, got %v", got)
+	}
+}
+
 func TestPollCachesAFinalVerdictForVerdictTTL(t *testing.T) {
 	for _, want := range []Verdict{VerdictSafe, VerdictMalicious} {
 		t.Run(string(want), func(t *testing.T) {
