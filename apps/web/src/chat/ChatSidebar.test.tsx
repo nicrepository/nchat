@@ -2110,6 +2110,13 @@ describe("ChatSidebar — footer", () => {
     expect(userLink().contains(settings)).toBe(false);
   });
 
+  it("links to the global search page (RF-15)", () => {
+    renderFooter();
+
+    const search = screen.getByRole("link", { name: "Buscar" });
+    expect(search).toHaveAttribute("href", "/chat/search");
+  });
+
   it("keeps the profile link reachable", async () => {
     renderFooter();
 
