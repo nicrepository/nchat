@@ -296,8 +296,8 @@ func TestChatMigration_MessageSearchVector_PostgreSQLBehavior(t *testing.T) {
 		}
 
 		// Among comparable relevance, the more recent message gets a boost.
-		tiedOld := insert("mensagem sobre orcamento anual", "60 days")
-		tiedNew := insert("mensagem sobre orcamento anual", "1 days")
+		tiedOld := insert("mensagem sobre orcamento do ano", "60 days")
+		tiedNew := insert("mensagem sobre orcamento do ano", "1 days")
 		tiedOldRank := searchRank(t, ctx, conn, tiedOld, "orcamento")
 		tiedNewRank := searchRank(t, ctx, conn, tiedNew, "orcamento")
 		if tiedNewRank <= tiedOldRank {
