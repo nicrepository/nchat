@@ -218,6 +218,7 @@ func newTestHub(auth SubscriptionAuthorizer) *Hub {
 		subs:                    make(map[string]map[string]struct{}),
 		clientSubs:              make(map[string]map[string]struct{}),
 		subscriptionGenerations: make(map[string]map[string]uint64),
+		typingActive:            make(map[string]map[string]struct{}),
 		deliveredRosters:        make(map[string]string),
 		asserted:                make(map[presenceKey]map[string]uint64),
 		assertionEpoch:          make(map[presenceKey]map[string]uint64),

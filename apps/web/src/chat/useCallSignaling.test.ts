@@ -14,13 +14,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { _resetChatSocket, MAX_CONSECUTIVE_FAILURES, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
-import { issueCallToken } from "./callApi";
+import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { requestMediaPermission } from "./mediaPermission";
+import { useCallMedia } from "./useCallMedia";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useCallSignaling } from "./useCallSignaling";
+import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCallSession";
 
 vi.mock("./callApi", () => ({
   issueCallToken: vi.fn(),
+  issueResourceCallToken: vi.fn(),
 }));
 
 vi.mock("./mediaPermission", () => ({
@@ -472,6 +475,33 @@ describe("useCallSignaling", () => {
     expect(result.current.pending).toBe(false);
     expect(media.stop).toHaveBeenCalledOnce();
     act(() => socket.simulateMessage(endedEvent(5)));
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("clearTerminal stops media and empties a terminal call, but leaves an active call untouched", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 3);
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() => {
+      result.current.clearTerminal();
+    });
+    expect(result.current.call?.status).toBe("active");
+    expect(media.stop).not.toHaveBeenCalled();
+
+    await act(async () => socket.simulateMessage(endedEvent(4)));
+    expect(result.current.call?.status).toBe("ended");
+    await waitFor(() => expect(media.stop).toHaveBeenCalledOnce());
+    vi.mocked(media.stop).mockClear();
+
+    act(() => {
+      result.current.clearTerminal();
+    });
+
+    expect(result.current.call).toBeNull();
     expect(media.stop).toHaveBeenCalledOnce();
   });
 
@@ -1493,6 +1523,23 @@ describe("useCallSignaling", () => {
     expect(issueCallToken).toHaveBeenCalledTimes(2);
   });
 
+  it("surfaces a recoverable error when retryMedia's own cleanup fails, without requesting a fresh token", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+    await waitFor(() => expect(result.current.mediaReady).toBe(true));
+    vi.mocked(media.stop).mockRejectedValueOnce(new Error("stop failed"));
+
+    await act(async () => result.current.retryMedia());
+
+    expect(result.current.error).toBe(
+      "Não foi possível liberar a mídia da chamada anterior. Tente novamente.",
+    );
+    expect(issueCallToken).toHaveBeenCalledOnce();
+  });
+
   it("completes a failed token retry and allows another retry with a fresh token", async () => {
     const media = mediaBridge();
     vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
@@ -2347,5 +2394,285 @@ describe("useCallSignaling restored call activation", () => {
     await act(async () => result.current.activateMedia());
 
     expect(media.connect).toHaveBeenCalledOnce();
+  });
+});
+
+// ── RF-23 × RF-24: ownership handoff runs before the token request ───────────
+
+describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
+  it("calls onBeforeDirectMedia once the call is confirmed active, before requesting a token", async () => {
+    const media = mediaBridge();
+    const handoff = deferredValue<void>();
+    const onBeforeDirectMedia = vi.fn(() => handoff.promise);
+    const { result } = renderHook(() => useCallSignaling(media, true, onBeforeDirectMedia));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+
+    await waitFor(() =>
+      expect(onBeforeDirectMedia).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ call_id: baseCall.call_id, status: "active" }),
+      ),
+    );
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
+
+    await act(async () => {
+      handoff.resolve();
+      await handoff.promise;
+    });
+
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(baseCall.call_id));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+  });
+
+  it("never calls onBeforeDirectMedia when accept never reaches an active call", async () => {
+    const media = mediaBridge();
+    const onBeforeDirectMedia = vi.fn(async () => undefined);
+    const { result } = renderHook(() => useCallSignaling(media, true, onBeforeDirectMedia));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(0)));
+    act(() => {
+      result.current.accept();
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    act(() =>
+      socket.simulateMessage({
+        ...endedEvent(2),
+        type: "call.cancelled",
+        call: { ...endedEvent(2).call, status: "cancelled" },
+      }),
+    );
+
+    expect(result.current.call?.status).toBe("cancelled");
+    expect(onBeforeDirectMedia).not.toHaveBeenCalled();
+    expect(issueCallToken).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an onBeforeDirectMedia rejection as the standard media error, without requesting a token", async () => {
+    const media = mediaBridge();
+    const onBeforeDirectMedia = vi.fn().mockRejectedValueOnce(new Error("cleanup failed"));
+    const { result } = renderHook(() => useCallSignaling(media, true, onBeforeDirectMedia));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+
+    await waitFor(() =>
+      expect(result.current.error).toBe(
+        "Não foi possível preparar a mídia da chamada. Tente novamente.",
+      ),
+    );
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
+  });
+
+  it("unlocks audio again after connect, independent of the accept-time gesture unlock", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media, true, async () => undefined));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    await waitFor(() => expect(media.startAudio).toHaveBeenCalledTimes(2));
+  });
+
+  // ── Real useCallMedia + real useResourceCallSession, wired exactly like
+  // ChatShell, with a fake LiveKit factory that produces distinguishable
+  // Room instances. Proves audio ownership actually transfers from Room A
+  // to a genuinely different Room B, and that a real disconnect() failure
+  // on Room A blocks the handoff instead of just satisfying a mock. ───────
+  describe("Room A / Room B audio ownership proof (RF-24 quarta correção)", () => {
+    interface FakeCallbacks {
+      onLocalElement(element: HTMLMediaElement): void;
+      onRemoteElement(element: HTMLMediaElement): void;
+      onElementRemoved(element: HTMLMediaElement): void;
+      onDisconnected(): void;
+      onReconnecting(): void;
+      onReconnected(): void;
+      onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
+      onMicrophoneStateChanged(enabled: boolean): void;
+      onParticipantConnected(identity: string): void;
+      onParticipantDisconnected(identity: string): void;
+      onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+    }
+
+    class FakeRoomSession {
+      readonly label: string;
+      readonly callbacks: FakeCallbacks;
+      readonly connect = vi.fn(async (): Promise<void> => undefined);
+      readonly enableCamera = vi.fn(async (): Promise<void> => undefined);
+      readonly enableMicrophone = vi.fn(async (): Promise<void> => undefined);
+      readonly setCameraEnabled = vi.fn(async (): Promise<void> => undefined);
+      readonly setMicrophoneEnabled = vi.fn(async (): Promise<void> => undefined);
+      readonly startAudio = vi.fn(async (): Promise<void> => undefined);
+      readonly disconnect = vi.fn(async (): Promise<void> => undefined);
+
+      constructor(label: string, callbacks: FakeCallbacks) {
+        this.label = label;
+        this.callbacks = callbacks;
+      }
+    }
+
+    const roomLabels = ["Room A", "Room B", "Room C"];
+
+    function resourceCallHarness(onRoomCreated?: (room: FakeRoomSession, index: number) => void) {
+      const rooms: FakeRoomSession[] = [];
+      const factory = vi.fn((callbacks: FakeCallbacks) => {
+        const index = rooms.length;
+        const room = new FakeRoomSession(roomLabels[index] ?? `Room ${index}`, callbacks);
+        rooms.push(room);
+        onRoomCreated?.(room, index);
+        return room;
+      });
+      const loader = vi.fn(async () => factory as unknown as Parameters<typeof useCallMedia>[0]);
+
+      const view = renderHook(() => {
+        const media = useCallMedia(loader as unknown as Parameters<typeof useCallMedia>[0]);
+        const resourceCall = useResourceCallSession(media);
+        const directCallMedia: CallMediaBridge = {
+          startAudio: media.startAudio,
+          connect: media.connect,
+          stop: async () => {
+            if (resourceCall.active) return;
+            await media.stop();
+          },
+        };
+        const onBeforeDirectMedia = async () => {
+          if (resourceCall.active) await resourceCall.leave();
+        };
+        const calls = useCallSignaling(directCallMedia, true, onBeforeDirectMedia);
+        return { media, resourceCall, calls };
+      });
+
+      return { view, rooms };
+    }
+
+    const channelTarget: ResourceCallTarget = {
+      kind: "channel",
+      id: "00000000-0000-4000-8000-000000000710",
+      name: "geral",
+    };
+
+    beforeEach(() => {
+      vi.mocked(issueResourceCallToken).mockReset();
+      vi.mocked(issueResourceCallToken).mockResolvedValue({
+        token: "resource-token",
+        expiresAt: "2026-07-30T12:05:00Z",
+        serverUrl: liveKitServerUrl,
+      });
+    });
+
+    async function driveCallToActive(
+      view: { result: { current: { calls: ReturnType<typeof useCallSignaling> } } },
+      socket: FakeWebSocket,
+    ) {
+      act(() => socket.simulateMessage(ringingEvent(0)));
+      act(() => {
+        view.result.current.calls.accept();
+      });
+      await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+      act(() => socket.simulateMessage(activeEvent(1)));
+    }
+
+    it("hands audio ownership from Room A to a genuinely distinct Room B, with Room B's startAudio only after its own connect", async () => {
+      const { view, rooms } = resourceCallHarness();
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+
+      // Primes the LiveKit factory, mirroring how a real gesture (e.g. the
+      // browser tab already loaded it for an earlier action) ensures the
+      // resource room's own startAudio() call actually reaches the Room
+      // instead of only queuing the import.
+      await act(() => view.result.current.media.prepare());
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+      expect(rooms).toHaveLength(1);
+      const roomA = rooms[0];
+      expect(roomA.connect).toHaveBeenCalledOnce();
+      expect(roomA.startAudio).toHaveBeenCalledOnce();
+
+      await driveCallToActive(view, socket);
+
+      await waitFor(() => expect(rooms).toHaveLength(2));
+      const roomB = rooms[1];
+      expect(roomB).not.toBe(roomA);
+      await waitFor(() => expect(roomB.startAudio).toHaveBeenCalled());
+
+      expect(roomA.disconnect).toHaveBeenCalledOnce();
+      expect(roomB.connect).toHaveBeenCalledOnce();
+      expect(roomB.connect.mock.invocationCallOrder[0]).toBeLessThan(
+        roomB.startAudio.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("keeps Room B's audio recovery available when its post-handoff startAudio is blocked by the browser", async () => {
+      const { view, rooms } = resourceCallHarness((room, index) => {
+        if (index === 1) {
+          room.startAudio.mockRejectedValueOnce(new DOMException("blocked", "NotAllowedError"));
+        }
+      });
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+
+      await driveCallToActive(view, socket);
+      await waitFor(() => expect(rooms).toHaveLength(2));
+
+      await waitFor(() => expect(view.result.current.media.audioActivationRequired).toBe(true));
+      expect(view.result.current.media.error).toBe(
+        "O navegador bloqueou o áudio. Ative o áudio novamente.",
+      );
+    });
+
+    it("blocks the handoff when Room A's real disconnect() rejects: issueCallToken never advances and Room B never connects", async () => {
+      const { view, rooms } = resourceCallHarness();
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+      const roomA = rooms[0];
+      roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+      await driveCallToActive(view, socket);
+
+      await waitFor(() =>
+        expect(view.result.current.calls.error).toBe(
+          "Não foi possível preparar a mídia da chamada. Tente novamente.",
+        ),
+      );
+      expect(issueCallToken).not.toHaveBeenCalled();
+      expect(rooms).toHaveLength(1);
+      expect(view.result.current.resourceCall.status).toBe("error");
+      expect(view.result.current.resourceCall.errorOperation).toBe("leave");
+      expect(view.result.current.resourceCall.active).toEqual(channelTarget);
+      // RF-23 stays visible/active in signaling regardless of RF-24's own
+      // cleanup failure — CallPanel's precedence keeps showing it.
+      expect(view.result.current.calls.call?.status).toBe("active");
+    });
+
+    it("a retried leave() that finally disconnects Room A for real clears the resource room, unblocking the shared Room for RF-23", async () => {
+      const { view, rooms } = resourceCallHarness();
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+      const roomA = rooms[0];
+      roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+      await driveCallToActive(view, socket);
+      await waitFor(() => expect(view.result.current.resourceCall.errorOperation).toBe("leave"));
+      expect(roomA.disconnect).toHaveBeenCalledOnce();
+
+      // The retry affordance (CallPanel's "Tentar sair novamente") replays
+      // leave() itself, never join(): this time Room A's disconnect resolves.
+      await act(() => view.result.current.resourceCall.leave());
+
+      expect(roomA.disconnect).toHaveBeenCalledTimes(2);
+      expect(view.result.current.resourceCall.status).toBe("idle");
+      expect(view.result.current.resourceCall.active).toBeNull();
+      expect(rooms).toHaveLength(1);
+    });
   });
 });

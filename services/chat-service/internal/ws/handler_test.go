@@ -50,6 +50,39 @@ func (f *fakeWorkspaceResolver) GetDefaultWorkspaceID(_ context.Context) (string
 	return f.id, f.err
 }
 
+// fakeUserDisplayNameResolver returns a fixed display name or error.
+type fakeUserDisplayNameResolver struct {
+	name string
+	err  error
+}
+
+func (f *fakeUserDisplayNameResolver) GetDisplayName(_ context.Context, _ string) (string, error) {
+	return f.name, f.err
+}
+
+func TestResolveDisplayName_NilResolver_ReturnsEmpty(t *testing.T) {
+	got := resolveDisplayName(context.Background(), slog.Default(), nil, "user-1")
+	if got != "" {
+		t.Fatalf("got %q, want empty string for nil resolver", got)
+	}
+}
+
+func TestResolveDisplayName_ResolverError_ReturnsEmptyNotFail(t *testing.T) {
+	resolver := &fakeUserDisplayNameResolver{err: errors.New("db down")}
+	got := resolveDisplayName(context.Background(), slog.Default(), resolver, "user-1")
+	if got != "" {
+		t.Fatalf("got %q, want empty string on resolver error (must degrade, not propagate)", got)
+	}
+}
+
+func TestResolveDisplayName_Success_ReturnsName(t *testing.T) {
+	resolver := &fakeUserDisplayNameResolver{name: "Bruno Lima"}
+	got := resolveDisplayName(context.Background(), slog.Default(), resolver, "user-1")
+	if got != "Bruno Lima" {
+		t.Fatalf("got %q, want %q", got, "Bruno Lima")
+	}
+}
+
 // userIDFromCtxFn returns a userIDFromCtx function that always returns the given userID.
 func userIDFromCtxFn(userID string) func(*http.Request) string {
 	return func(_ *http.Request) string { return userID }

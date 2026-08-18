@@ -54,6 +54,8 @@ type App struct {
 	presenceDirectory *ws.ValkeyPresenceDirectory
 	mentionCache      *storage.ValkeyMentionLabelCache
 	reactionLimiter   *ws.ValkeyReactionLimiter
+	typingLimiter     *ws.ValkeyReactionLimiter
+	typingStore       *ws.ValkeyTypingStore
 	callWorkerCancel  context.CancelFunc
 	callWorkerWG      *sync.WaitGroup
 	linkScanCancel    context.CancelFunc
@@ -95,6 +97,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 		}
 		if a.reactionLimiter != nil {
 			a.reactionLimiter.Close()
+		}
+		if a.typingLimiter != nil {
+			a.typingLimiter.Close()
+		}
+		if a.typingStore != nil {
+			a.typingStore.Close()
 		}
 		// Close the DB pool only after the hub has drained connections that
 		// may still be issuing queries.
@@ -143,6 +151,7 @@ func New(cfg config.Config) (*App, error) {
 	var messageSvc *service.MessageService
 	var mentionSvc *service.MentionService
 	var workspaceStore *storage.PGXWorkspaceStore
+	var userDisplayNameStore *storage.PGXUserDisplayNameStore
 	var sessionValidator storage.SessionValidator
 	var channelStore *storage.PGXChannelStore
 	var memberStore *storage.PGXMemberStore
@@ -179,6 +188,7 @@ func New(cfg config.Config) (*App, error) {
 		if validator != nil {
 			sessionValidator = storage.NewPGXSessionValidator(pool)
 			workspaceStore = storage.NewPGXWorkspaceStore(pool)
+			userDisplayNameStore = storage.NewPGXUserDisplayNameStore(pool)
 			channelStore = storage.NewPGXChannelStore(pool)
 			memberStore = storage.NewPGXMemberStore(pool)
 			dmStore = storage.NewPGXDMStore(pool)
@@ -233,6 +243,7 @@ func New(cfg config.Config) (*App, error) {
 	presence := ws.NewPresenceTracker(defaultPresenceAwayTimeout)
 	var authorizer ws.SubscriptionAuthorizer = ws.NopAuthorizer{}
 	var wsWorkspaces ws.WorkspaceResolver
+	var wsDisplayNames ws.UserDisplayNameResolver
 	// Held concretely as well: the same adapter is the canonical workspace
 	// resolver for the RF-19 guard, so WebSocket sessions and HTTP sends bind to
 	// the same workspace by construction rather than by two similar lookups.
@@ -241,6 +252,7 @@ func New(cfg config.Config) (*App, error) {
 		authorizer = ws.NewServiceAuthorizer(channelStore, dmStore)
 		canonicalWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 		wsWorkspaces = canonicalWorkspaces
+		wsDisplayNames = userDisplayNameStore
 	}
 	// Two identities, because they answer two different questions.
 	//
@@ -301,6 +313,30 @@ func New(cfg config.Config) (*App, error) {
 			}
 		}
 	}
+	// Typing indicator: independent of the reaction feature (reactionSvc may be
+	// nil while typing still works), so it gets its own Valkey-backed limiter
+	// and TTL backstop, each dialed from the same VALKEY_URL — the established
+	// pattern in this package, where every ws subsystem (bus, presence
+	// directory, reaction limiter) owns its own client rather than sharing one.
+	// Absent VALKEY_URL, typing.start is refused (ErrTypingFeatureDisabled,
+	// fail-closed per SECURITY.md's WS rate-limit requirement) and the TTL
+	// backstop is simply absent — delivery itself does not depend on Valkey.
+	var typingLimiter *ws.ValkeyReactionLimiter
+	if limiter, limiterErr := ws.NewValkeyReactionLimiter(
+		cfg.ValkeyURL, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds,
+	); limiterErr != nil {
+		logger.Warn("typing indicator rate limiting disabled", "reason", "invalid_valkey_config")
+	} else {
+		typingLimiter = limiter
+		options = append(options, ws.WithTypingLimiter(limiter, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds))
+	}
+	var typingStore *ws.ValkeyTypingStore
+	if store, storeErr := ws.NewValkeyTypingStore(cfg.ValkeyURL); storeErr != nil {
+		logger.Warn("typing ttl backstop disabled", "reason", "invalid_valkey_config")
+	} else {
+		typingStore = store
+		options = append(options, ws.WithTypingStore(store))
+	}
 	// RF-19 (issue #419): the configurable per-workspace send limit. It reuses
 	// the same Lua/Valkey limiter as reactions and edits — no second rate
 	// limiting mechanism — so it exists only when that limiter does. When it is
@@ -342,7 +378,7 @@ func New(cfg config.Config) (*App, error) {
 		channelCategories = httpapi.NewChannelCategoryHandler(workspaceStore, channelCategorySvc, reactionLimiter)
 	}
 	hub := ws.NewHub(authorizer, logger, bus, instanceID, options...)
-	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator))
+	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator, wsDisplayNames))
 
 	var callWorkerCancel context.CancelFunc
 	var callWorkerWG *sync.WaitGroup
@@ -431,6 +467,8 @@ func New(cfg config.Config) (*App, error) {
 		presenceDirectory: presenceDirectory,
 		mentionCache:      mentionCache,
 		reactionLimiter:   reactionLimiter,
+		typingLimiter:     typingLimiter,
+		typingStore:       typingStore,
 		callWorkerCancel:  callWorkerCancel,
 		callWorkerWG:      callWorkerWG,
 		linkScanCancel:    linkScanWorkerCancel,
@@ -553,7 +591,7 @@ func wireMentionLabelCache(valkeyURL string, ttlSeconds int, messageSvc *service
 // connection can be re-checked against it. When no session store is configured
 // the field stays nil and connections keep upgrade-time validation only, which
 // is the same degradation the HTTP routes already have.
-func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator) ws.HandlerConfig {
+func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator, displayNames ws.UserDisplayNameResolver) ws.HandlerConfig {
 	handlerCfg := ws.HandlerConfig{
 		MaxConnectionsPerUser:    cfg.WSMaxConnectionsPerUser,
 		InboundMessagesPerMinute: cfg.WSInboundMessagesPerMinute,
@@ -563,6 +601,9 @@ func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator) ws.Ha
 	}
 	if sessions != nil {
 		handlerCfg.Sessions = sessions
+	}
+	if displayNames != nil {
+		handlerCfg.DisplayNames = displayNames
 	}
 	return handlerCfg
 }

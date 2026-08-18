@@ -18,7 +18,7 @@ type LiveKitTokenSigner struct {
 	encode    liveKitTokenEncoder
 }
 
-type liveKitTokenEncoder func(apiKey, apiSecret, identity, room string, ttl time.Duration) (SignedToken, error)
+type liveKitTokenEncoder func(apiKey, apiSecret, identity, displayName, room string, ttl time.Duration) (SignedToken, error)
 
 func NewLiveKitTokenSigner(apiKey, apiSecret string, now func() time.Time) (*LiveKitTokenSigner, error) {
 	return newLiveKitTokenSigner(apiKey, apiSecret, now, encodeLiveKitToken)
@@ -66,7 +66,7 @@ func (s *LiveKitTokenSigner) Sign(ctx context.Context, input SignInput) (SignedT
 		return SignedToken{}, fmt.Errorf("invalid LiveKit token expiry")
 	}
 
-	signed, err := s.encode(s.apiKey, s.apiSecret, identity.String(), input.Room, deadline.Sub(now))
+	signed, err := s.encode(s.apiKey, s.apiSecret, identity.String(), input.DisplayName, input.Room, deadline.Sub(now))
 	if err != nil {
 		return SignedToken{}, fmt.Errorf("issue LiveKit token")
 	}
@@ -79,7 +79,7 @@ func (s *LiveKitTokenSigner) Sign(ctx context.Context, input SignInput) (SignedT
 	return SignedToken{Token: signed.Token, ExpiresAt: signed.ExpiresAt.UTC()}, nil
 }
 
-func encodeLiveKitToken(apiKey, apiSecret, identity, room string, ttl time.Duration) (SignedToken, error) {
+func encodeLiveKitToken(apiKey, apiSecret, identity, displayName, room string, ttl time.Duration) (SignedToken, error) {
 	grant := &auth.VideoGrant{
 		RoomJoin:          true,
 		Room:              room,
@@ -90,8 +90,13 @@ func encodeLiveKitToken(apiKey, apiSecret, identity, room string, ttl time.Durat
 	grant.SetCanPublishData(false)
 	grant.SetCanUpdateOwnMetadata(false)
 
+	// SetName is the SDK's own participant-name field (JWT "name" claim,
+	// distinct from identity): the LiveKit client SDK exposes it to every
+	// other participant as Participant.name. Empty is valid — the frontend
+	// falls back to a generic label rather than the identity UUID.
 	raw, err := auth.NewAccessToken(apiKey, apiSecret).
 		SetIdentity(identity).
+		SetName(displayName).
 		SetValidFor(ttl).
 		SetVideoGrant(grant).
 		ToJWT()

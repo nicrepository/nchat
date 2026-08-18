@@ -25,6 +25,11 @@ type AuthorizationInput struct {
 type AuthorizedResource struct {
 	ID               string
 	SessionExpiresAt time.Time
+	// DisplayName is the caller's own server-resolved presentation name
+	// (full_name, else display_name, else empty). Never part of the
+	// authorization decision — only carried through to the LiveKit token so
+	// other participants see a real name instead of a generic label.
+	DisplayName string
 }
 
 type ResourceAuthorizer interface {
@@ -32,9 +37,12 @@ type ResourceAuthorizer interface {
 }
 
 type SignInput struct {
-	Identity  string
-	Room      string
-	ExpiresAt time.Time
+	Identity string
+	// DisplayName is presentation only, carried into the LiveKit token's
+	// participant name; it is never identity, never room, never a grant.
+	DisplayName string
+	Room        string
+	ExpiresAt   time.Time
 }
 
 type SignedToken struct {
@@ -85,7 +93,7 @@ func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (Issued
 	if err != nil {
 		return IssuedToken{}, domain.ErrUnauthorized
 	}
-	if input.Kind != domain.ResourceKindCall {
+	if !input.Kind.Valid() {
 		return IssuedToken{}, domain.ErrInvalidInput
 	}
 
@@ -121,9 +129,10 @@ func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (Issued
 	}
 
 	signed, err := s.signer.Sign(ctx, SignInput{
-		Identity:  userID.String(),
-		Room:      room,
-		ExpiresAt: deadline,
+		Identity:    userID.String(),
+		DisplayName: authorized.DisplayName,
+		Room:        room,
+		ExpiresAt:   deadline,
 	})
 	if err != nil {
 		return IssuedToken{}, fmt.Errorf("%w: %w", ErrTokenSigning, err)

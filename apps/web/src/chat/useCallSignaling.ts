@@ -84,7 +84,19 @@ export interface CallController {
   clearTerminal: () => void;
 }
 
-export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): CallController {
+export function useCallSignaling(
+  media?: CallMediaBridge,
+  mediaEnabled = true,
+  // Called once, right when this call's own media request begins for a
+  // confirmed `active` call — before any token is requested. The intended
+  // use is transferring shared-Room ownership away from something else
+  // (RF-24's resource room) at the earliest point this call is guaranteed
+  // to actually need the Room, never earlier (accept() alone is not that
+  // guarantee: it can fail preflight or never be delivered) and never later
+  // (deep inside connect(), which only runs after a token request already
+  // succeeded).
+  onBeforeDirectMedia?: (call: Call) => void | Promise<void>,
+): CallController {
   const [state, setState] = useState<CallState>(initialCallState);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,6 +113,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   const mediaRetryPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
   const mediaCleanupPromiseRef = useRef<Promise<boolean> | null>(null);
   const mediaRef = useRef(media);
+  const onBeforeDirectMediaRef = useRef(onBeforeDirectMedia);
   const mediaEnabledRef = useRef(mediaEnabled);
   const localAuthorizationRef = useRef<LocalMediaAuthorization | null>(null);
   const activateMediaPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
@@ -109,6 +122,10 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   useEffect(() => {
     mediaRef.current = media;
   }, [media]);
+
+  useEffect(() => {
+    onBeforeDirectMediaRef.current = onBeforeDirectMedia;
+  }, [onBeforeDirectMedia]);
 
   const requestMedia = useCallback(async (call: Call) => {
     if (
@@ -130,10 +147,26 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       callRef.current.status === "active";
     try {
       if (!current()) return;
+      // Runs before any network request for this call's own media: it is
+      // where ownership of the shared Room is handed to this call, so that
+      // ownership never depends on issueCallToken()/connect() ever
+      // succeeding — a resource room the caller is leaving stays left
+      // (or its cleanup keeps being retried) regardless of what happens to
+      // this call's own token/connect below. A rejection here is handled
+      // exactly like a token/connect failure: no Room is touched, and the
+      // existing recoverable-error/retry path takes over.
+      await onBeforeDirectMediaRef.current?.(call);
+      if (!current()) return;
       const result = await issueCallToken(call.call_id);
       if (!current()) return;
       await mediaRef.current?.connect(call, result.token, result.serverUrl);
       if (!current()) return;
+      // The gesture-time startAudio() in accept() may have unlocked a
+      // session that onBeforeDirectMedia above just tore down (a resource
+      // room's Room A): the browser's autoplay-unlock is per-Room, so the
+      // session that just connected — possibly a brand new Room B — needs
+      // its own explicit unlock too. Idempotent when no handoff happened.
+      void mediaRef.current?.startAudio();
       mediaCallIdRef.current = call.call_id;
       setMediaReady(true);
       setError(null);

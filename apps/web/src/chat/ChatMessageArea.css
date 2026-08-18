@@ -1199,6 +1199,66 @@
   gap: 8px;
 }
 
+/* ── Typing indicator ─────────────────────────────────────────────────────── */
+
+.chat-msg-area__typing-indicator {
+  align-self: flex-start;
+  margin: 0 24px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-text-muted, #6b6580);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.chat-msg-area__typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.chat-msg-area__typing-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-primary, #6d28d9);
+  opacity: 0.4;
+  animation: chat-typing-bounce 1.2s ease-in-out infinite;
+}
+
+.chat-msg-area__typing-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.chat-msg-area__typing-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes chat-typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__typing-dots span {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
 /* ── Load-more indicator (infinite scroll) ───────────────────────────────────── */
 
 .chat-msg-area__load-more {

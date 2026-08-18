@@ -20,10 +20,10 @@ const (
 func TestPGXResourceAuthorizerAllowsVisibleChannel(t *testing.T) {
 	mock := newStorageMock(t)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
-	mock.ExpectQuery(`(?s)WITH active_session AS.*auth\.user_sessions.*authorized_resource AS.*chat\.channels.*chat\.workspaces.*w\.status = 'active'.*chat\.workspace_members.*wm\.status = 'active'.*c\.status = 'active'.*chat\.channel_visible_to_user\(c\.id, active\.user_id\).*SELECT.*session_expires_at.*resource_id`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*auth\.user_sessions.*authorized_resource AS.*chat\.channels.*chat\.workspaces.*w\.status = 'active'.*chat\.workspace_members.*wm\.status = 'active'.*c\.status = 'active'.*chat\.channel_visible_to_user\(c\.id, active\.user_id\).*SELECT.*session_expires_at.*resource_id.*display_name`).
 		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
-		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
-			AddRow(expiresAt, storageTestResource))
+		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
+			AddRow(expiresAt, storageTestResource, "Ana Lima"))
 
 	result, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 		Kind: domain.ResourceKindChannel, ResourceID: storageTestResource,
@@ -35,16 +35,19 @@ func TestPGXResourceAuthorizerAllowsVisibleChannel(t *testing.T) {
 	if result.ID != storageTestResource || !result.SessionExpiresAt.Equal(expiresAt) {
 		t.Fatalf("unexpected authorization: %+v", result)
 	}
+	if result.DisplayName != "Ana Lima" {
+		t.Fatalf("expected server-resolved display name, got %+v", result)
+	}
 	assertStorageExpectations(t, mock)
 }
 
 func TestPGXResourceAuthorizerAllowsVisibleDM(t *testing.T) {
 	mock := newStorageMock(t)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
-	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.dm_conversations.*chat\.workspaces.*w\.status = 'active'.*chat\.workspace_members.*wm\.status = 'active'.*chat\.dm_members.*dm\.status = 'active'.*dc\.status = 'active'.*SELECT.*session_expires_at.*resource_id`).
+	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.dm_conversations.*chat\.workspaces.*w\.status = 'active'.*chat\.workspace_members.*wm\.status = 'active'.*chat\.dm_members.*dm\.status = 'active'.*dc\.status = 'active'.*dc\.type = 'group'.*SELECT.*session_expires_at.*resource_id.*display_name`).
 		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
-		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
-			AddRow(expiresAt, storageTestResource))
+		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
+			AddRow(expiresAt, storageTestResource, "Ana Lima"))
 
 	result, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 		Kind: domain.ResourceKindDM, ResourceID: storageTestResource,
@@ -67,8 +70,8 @@ func TestPGXResourceAuthorizerMapsEveryInvalidSessionToUnauthorized(t *testing.T
 			mock := newStorageMock(t)
 			mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS`).
 				WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
-				WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
-					AddRow(nil, nil))
+				WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
+					AddRow(nil, nil, nil))
 			_, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 				Kind: domain.ResourceKindChannel, ResourceID: storageTestResource,
 				UserID: storageTestUserID, SessionID: storageTestSessionID,
@@ -88,8 +91,8 @@ func TestPGXResourceAuthorizerDoesNotEnumerateInaccessibleResources(t *testing.T
 			expiresAt := time.Now().UTC().Add(time.Minute)
 			mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS`).
 				WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
-				WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
-					AddRow(expiresAt, nil))
+				WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
+					AddRow(expiresAt, nil, "Ana Lima"))
 			_, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 				Kind: domain.ResourceKindDM, ResourceID: storageTestResource,
 				UserID: storageTestUserID, SessionID: storageTestSessionID,
