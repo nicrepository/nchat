@@ -290,7 +290,7 @@ function MessageReactions({
               onClick={() => onActionsOpenChange((open) => !open)}
             >
               <span className="material-symbols-outlined" aria-hidden="true">
-                more_horiz
+                more_vert
               </span>
             </button>
             {actionsOpen && (
