@@ -615,6 +615,11 @@ function ResourceCallPanel({
   // +1 counts the local participant, who is never in media.participants.
   const participantCount = participants.length + 1;
   const connecting = resource.status === "connecting";
+  // RF-25: a transient LiveKit reconnect never changes resource.status (the
+  // Room lifecycle itself is untouched), so this must read media.status
+  // directly — otherwise the grid silently keeps showing the participant
+  // count with no indication that media is currently reconnecting.
+  const reconnectingMedia = resource.status === "active" && media?.status === "reconnecting";
   const error = resource.error ?? (resource.status === "active" ? media?.error : null);
 
   return (
@@ -689,6 +694,11 @@ function ResourceCallPanel({
           <p className="call-panel__status" role="status" aria-live="polite">
             <span aria-hidden="true" />
             Entrando na chamada…
+          </p>
+        ) : reconnectingMedia ? (
+          <p className="call-panel__status" role="status" aria-live="polite">
+            <span aria-hidden="true" />
+            {mediaStatusLabels.reconnecting}
           </p>
         ) : (
           error && (

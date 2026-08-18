@@ -1212,6 +1212,46 @@ describe("useCallMedia participants (RF-24)", () => {
     ]);
   });
 
+  // RF-25 "ponto crítico": on a LiveKit full reconnect, the SDK itself
+  // unwinds every remote participant (firing ParticipantDisconnected for
+  // each) before repopulating from the server's fresh join response (firing
+  // ParticipantConnected for whoever is actually still there) — see
+  // livekit-client Room.handleRestarting/handleSignalRestarted. A participant
+  // who left during the outage and one who joined during it are exactly what
+  // that unwind-then-repopulate models; this asserts our identity-keyed map
+  // reflects the post-reconnect roster with no stale entry and no duplicate,
+  // without any additional client-side snapshot/polling reconciliation.
+  it("reconciles the roster via ParticipantConnected/Disconnected alone when membership changes during a reconnect", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-b", "Maria Silva");
+    });
+
+    act(() => session.callbacks.onReconnecting());
+    // The SDK's own full-reconnect unwind: every remote participant known
+    // before the outage is disconnected first...
+    act(() => {
+      session.callbacks.onParticipantDisconnected("identity-a");
+      session.callbacks.onParticipantDisconnected("identity-b");
+    });
+    // ...then repopulated from the server's fresh, authoritative list: B left
+    // for real during the outage, C joined during it, A is still there.
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-c", "Ana Lima");
+    });
+    act(() => session.callbacks.onReconnected());
+
+    expect(view.result.current.participants.map((p) => p.identity)).toEqual([
+      "identity-a",
+      "identity-c",
+    ]);
+    expect(view.result.current.status).toBe("connected");
+  });
+
   it("removes a participant on disconnect and keeps the others", async () => {
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
