@@ -843,6 +843,54 @@ describe("CallPanel resource room (RF-24)", () => {
   });
 });
 
+// ── RF-25: transient LiveKit reconnect must stay visible in the grid too ────
+
+describe("CallPanel resource room reconnect indicator (RF-25)", () => {
+  it("shows a reconnecting status while media reconnects without leaving the room", () => {
+    renderResourcePanel(
+      resourceController({ status: "active" }),
+      media({ status: "reconnecting" }),
+    );
+
+    expect(screen.getByText("Reconectando mídia…")).toBeInTheDocument();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+    // Never an error/retry affordance while merely reconnecting.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("clears the reconnecting status once media reports connected again", () => {
+    const { rerender } = renderResourcePanel(
+      resourceController({ status: "active" }),
+      media({ status: "reconnecting" }),
+    );
+    expect(screen.getByText("Reconectando mídia…")).toBeInTheDocument();
+
+    rerender(
+      <CallPanel
+        calls={idleCalls}
+        currentUserId={currentUserId}
+        identityStatus="ready"
+        retryIdentity={retryIdentity}
+        participantName="Ana Lima"
+        media={media({ status: "connected" })}
+        resource={resourceController({ status: "active" })}
+      />,
+    );
+
+    expect(screen.queryByText("Reconectando mídia…")).not.toBeInTheDocument();
+  });
+
+  it("never shows the reconnecting status while still joining for the first time", () => {
+    renderResourcePanel(
+      resourceController({ status: "connecting" }),
+      media({ status: "reconnecting" }),
+    );
+
+    expect(screen.getByText("Entrando na chamada…")).toBeInTheDocument();
+    expect(screen.queryByText("Reconectando mídia…")).not.toBeInTheDocument();
+  });
+});
+
 // ── RF-24 code review achado 2: audio activation recovery ──────────────────
 
 describe("CallPanel resource room audio activation (RF-24 code review achado 2)", () => {
