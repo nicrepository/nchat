@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,26 +24,28 @@ const (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if err := run(logger); err != nil {
+		logger.Error("service stopped", "service", serviceName, "error", err)
+		os.Exit(1)
+	}
+}
 
+func run(logger *slog.Logger) error {
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {
-		logger.Error("invalid configuration", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 	obsCfg := observability.LoadConfig(serviceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
+	defer func() { _ = shutdown(context.Background()) }()
 	pool, err := storage.OpenDB(context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
 	if err != nil {
-		logger.Error("database unavailable", "error", err)
-		_ = shutdown(context.Background())
-		os.Exit(1)
+		return fmt.Errorf("database unavailable: %w", err)
 	}
 	defer pool.Close()
 	tokens, err := server.NewTokenValidator(cfg.AuthJWTHMACSecret, cfg.AuthJWTIssuer, cfg.AuthJWTAudience)
 	if err != nil {
-		logger.Error("auth configuration invalid", "error", err)
-		_ = shutdown(context.Background())
-		os.Exit(1)
+		return fmt.Errorf("auth configuration invalid: %w", err)
 	}
 	searcher := service.New(storage.NewPGXSearchStore(pool))
 	handler := server.NewHandlerWithDependencies(serviceName, server.Dependencies{Search: searcher, Tokens: tokens, Sessions: storage.NewPGXSessionValidator(pool), ReadinessPinger: pool})
@@ -62,15 +65,14 @@ func main() {
 	select {
 	case serveErr := <-errCh:
 		if serveErr != nil && serveErr != http.ErrServerClosed {
-			logger.Error("service failed", "service", serviceName, "error", serveErr)
-			os.Exit(1)
+			return fmt.Errorf("serve: %w", serveErr)
 		}
 	case <-sigCtx.Done():
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := httpServer.Shutdown(ctx); err != nil {
-			logger.Error("shutdown failed", "error", err)
+			return fmt.Errorf("shutdown: %w", err)
 		}
 	}
-	_ = shutdown(context.Background())
+	return nil
 }

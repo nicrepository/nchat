@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +81,31 @@ func TestSearchHandlerRejectsInvalidInputsAndMissingPrincipal(t *testing.T) {
 			h.Users(res, req)
 			if res.Code != tt.want {
 				t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+			}
+		})
+	}
+}
+
+func TestSearchHandlersMapProviderErrorsWithoutLeakingDetails(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{{"invalid input", domain.ErrInvalidInput, http.StatusBadRequest}, {"invalid cursor", domain.ErrInvalidCursor, http.StatusBadRequest}, {"unauthorized", domain.ErrUnauthorized, http.StatusUnauthorized}, {"internal", errors.New("secret database detail"), http.StatusInternalServerError}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewSearchHandler(fakeSearchProvider{err: tt.err})
+			for _, call := range []func(http.ResponseWriter, *http.Request){h.Messages, h.Users, h.Channels} {
+				req := httptest.NewRequest(http.MethodGet, "/?q=x", nil)
+				req = req.WithContext(context.WithValue(req.Context(), principalKey{}, Principal{UserID: "user"}))
+				res := httptest.NewRecorder()
+				call(res, req)
+				if res.Code != tt.want {
+					t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+				}
+				if strings.Contains(res.Body.String(), "secret database detail") {
+					t.Fatal("internal detail leaked")
+				}
 			}
 		})
 	}

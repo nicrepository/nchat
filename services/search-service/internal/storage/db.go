@@ -14,13 +14,17 @@ type Pool interface {
 	Close()
 }
 
+var newPool = func(ctx context.Context, cfg *pgxpool.Config) (Pool, error) {
+	return pgxpool.NewWithConfig(ctx, cfg)
+}
+
 func OpenDB(ctx context.Context, dsn string, timeoutSeconds int) (Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse db config: %w", err)
 	}
 	cfg.ConnConfig.ConnectTimeout = time.Duration(timeoutSeconds) * time.Second
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	pool, err := newPool(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
 	}
