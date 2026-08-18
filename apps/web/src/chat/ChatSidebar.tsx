@@ -119,6 +119,24 @@ function IconStar() {
   );
 }
 
+function IconSearch() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__icon"
+      aria-hidden="true"
+    >
+      <circle cx="11" cy="11" r="8" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  );
+}
+
 function IconChevronDown() {
   return (
     <svg
@@ -837,6 +855,10 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
 
       {/* ── Footer ── */}
       <div className="chat-sidebar__footer">
+        <Link to="/chat/search" className="chat-sidebar__footer-item" aria-label="Buscar">
+          <IconSearch />
+          <span>Buscar</span>
+        </Link>
         <Link
           to="/chat/favorites"
           className="chat-sidebar__footer-item"
