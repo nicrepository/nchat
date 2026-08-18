@@ -9,6 +9,7 @@ import {
   makeMessage,
   messageBubble,
   messagesFor,
+  openMoreActions,
   revealActions,
   uniqueId,
 } from "../helpers/messagingApi";
@@ -32,6 +33,7 @@ test.describe("RF-09 — citação entre canais", () => {
     await page.goto(`/chat/channel/${sourceChannelId}`);
 
     const sourceBubble = await revealActions(page, source.id);
+    await openMoreActions(sourceBubble);
     await sourceBubble.getByRole("button", { name: "Citar em outra conversa" }).click();
     await page.getByRole("button", { name: "Canal E2E", exact: true }).click();
     await expect(page.getByTestId("chat-composer-reference")).toContainText(

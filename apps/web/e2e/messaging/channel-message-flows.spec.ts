@@ -11,6 +11,7 @@ import {
   makeMessage,
   messageBubble,
   messagesFor,
+  openMoreActions,
   replaceEditorText,
   revealActions,
   uniqueId,
@@ -39,6 +40,7 @@ test.describe("mensagens em canal", () => {
     await page.goto(`/chat/channel/${targetId}`);
 
     const sourceBubble = await revealActions(page, original.id);
+    await openMoreActions(sourceBubble);
     await sourceBubble.getByRole("button", { name: "Encaminhar" }).click();
     const dialog = page.getByRole("dialog", { name: "Encaminhar mensagem" });
     await expect(dialog).toBeVisible();
@@ -167,6 +169,7 @@ test.describe("mensagens em canal", () => {
     await page.goto(`/chat/channel/${targetId}`);
 
     const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
     await bubble.getByRole("button", { name: "Editar mensagem" }).click();
     await replaceEditorText(page, page.getByTestId(`chat-edit-input-${original.id}`), editedText);
 
@@ -238,6 +241,7 @@ test.describe("mensagens em canal", () => {
     await page.goto(`/chat/channel/${targetId}`);
 
     const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
     await bubble.getByRole("button", { name: "Editar mensagem" }).click();
     await replaceEditorText(page, page.getByTestId(`chat-edit-input-${original.id}`), editedText);
 
@@ -281,6 +285,7 @@ test.describe("mensagens em canal", () => {
     await page.goto(`/chat/channel/${targetId}`);
 
     const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
     page.once("dialog", (dialog) => dialog.accept());
     const deleteResponse = page.waitForResponse(
       (response) =>
