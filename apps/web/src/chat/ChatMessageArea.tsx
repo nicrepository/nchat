@@ -426,7 +426,7 @@ interface MessageListProps {
   onLoadMore: () => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onReplyMessage: (message: Message) => void;
-  onReferenceMessage: (message: Message) => void;
+  onReferenceMessage: MessageBubbleProps["onReferenceMessage"];
   onForwardMessage?: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
@@ -725,17 +725,19 @@ function ReferenceDestinationDialog({
   dms,
   onClose,
   onSelect,
+  returnFocus,
 }: {
   current: { kind: "channel" | "dm"; id: string };
   channels: ChatOutletContext["channels"];
   dms: ChatOutletContext["dms"];
   onClose: () => void;
   onSelect: (target: { kind: "channel" | "dm"; id: string }) => void;
+  returnFocus: HTMLElement | null;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    const previouslyFocused = document.activeElement as HTMLElement;
+    const previouslyFocused = returnFocus ?? (document.activeElement as HTMLElement);
     closeButtonRef.current!.focus();
     const handleDialogKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -760,7 +762,7 @@ function ReferenceDestinationDialog({
       document.removeEventListener("keydown", handleDialogKey);
       previouslyFocused.focus();
     };
-  }, [onClose]);
+  }, [onClose, returnFocus]);
   const targets = [
     ...channels.map((channel) => ({
       kind: "channel" as const,
@@ -865,6 +867,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const navigate = useNavigate();
   const focusMessageId = new URLSearchParams(location.search).get("message") ?? "";
   const [referenceSource, setReferenceSource] = useState<Message | null>(null);
+  const [referenceTrigger, setReferenceTrigger] = useState<HTMLElement | null>(null);
   const [forwardSource, setForwardSource] = useState<ForwardSourceContext | null>(null);
   const pendingReference = useMemo(() => readPendingReference(location.state), [location.state]);
   const pendingReferenceId = pendingReference?.messageId ?? "";
@@ -1121,6 +1124,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [kind, navigate, referenceSource, targetId],
   );
 
+  const openReferenceDestination = useCallback((message: Message, trigger: HTMLElement) => {
+    setReferenceTrigger(trigger);
+    setReferenceSource(message);
+  }, []);
+
   const jumpToReference = useCallback(
     (reference: NonNullable<Message["reference"]>) => {
       if (!reference.available) return;
@@ -1262,7 +1270,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             onLoadMore={loadMore}
             onToggleReaction={handleToggleReaction}
             onReplyMessage={selectReply}
-            onReferenceMessage={setReferenceSource}
+            onReferenceMessage={openReferenceDestination}
             onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
             onReferenceJump={jumpToReference}
             onToggleFavorite={toggleFavorite}
@@ -1350,6 +1358,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             dms={ctx.dms}
             onClose={() => setReferenceSource(null)}
             onSelect={selectReferenceDestination}
+            returnFocus={referenceTrigger}
           />
         )}
         {/* Both dialogs render through a portal, so their position here costs the

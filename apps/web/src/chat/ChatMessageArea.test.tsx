@@ -330,6 +330,10 @@ function renderChannelArea(channelId = "geral") {
   );
 }
 
+async function openMessageActions() {
+  await userEvent.click(screen.getByRole("button", { name: "Mais ações" }));
+}
+
 function renderDMArea(dmId = "dm-juliane") {
   return render(
     <MemoryRouter initialEntries={[`/chat/dm/${encodeURIComponent(dmId)}`]}>
@@ -534,6 +538,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
     renderForwardingArea([makeMessage({ id: "source-1", senderId: "other" })]);
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
 
     const dialog = screen.getByRole("dialog", { name: "Encaminhar mensagem" });
@@ -573,6 +578,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
   it("cancels without calling the API and reports an empty search", async () => {
     renderForwardingArea([makeMessage({ id: "source-1" })]);
     fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
     const dialog = screen.getByRole("dialog", { name: "Encaminhar mensagem" });
     const dialogQueries = within(dialog);
@@ -592,6 +598,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
       .mockResolvedValueOnce(makeMessage({ id: "forwarded", isForwarded: true }));
     renderForwardingArea([makeMessage({ id: "source-1" })]);
     fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
     const dialogQueries = within(screen.getByRole("dialog", { name: "Encaminhar mensagem" }));
     await userEvent.click(dialogQueries.getByRole("button", { name: "Destino Alfa" }));
@@ -617,6 +624,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
     ]);
     const bubbles = await screen.findAllByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubbles[0]);
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
     await userEvent.click(
       within(screen.getByRole("dialog", { name: "Encaminhar mensagem" })).getByRole("button", {
@@ -624,6 +632,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
       }),
     );
     fireEvent.mouseEnter(bubbles[1]);
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
     const dialogQueries = within(screen.getByRole("dialog", { name: "Encaminhar mensagem" }));
     await userEvent.click(dialogQueries.getByRole("button", { name: "Destino Alfa" }));
@@ -637,7 +646,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
       ),
     );
     fireEvent.mouseEnter(bubbles[2]);
-    expect(screen.queryByRole("button", { name: "Encaminhar" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Mais ações" })).not.toBeInTheDocument();
   });
 
   it("keeps the captured source channel excluded while navigation changes the active route", async () => {
@@ -674,6 +683,7 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
       </MemoryRouter>,
     );
     fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Encaminhar" }));
     expect(
       within(screen.getByRole("dialog", { name: "Encaminhar mensagem" })).queryByRole("button", {
@@ -2655,8 +2665,8 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     );
 
     fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
-    const referenceAction = screen.getByRole("button", { name: "Citar em outra conversa" });
-    await userEvent.click(referenceAction);
+    await openMessageActions();
+    await userEvent.click(screen.getByRole("button", { name: "Citar em outra conversa" }));
     const closeDialog = screen.getByRole("button", { name: "Fechar" });
     const destinationButton = screen.getByRole("button", { name: /Destino/ });
     expect(closeDialog).toHaveFocus();
@@ -2667,9 +2677,10 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     expect(destinationButton).toHaveFocus();
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(referenceAction).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Mais ações" })).toHaveFocus();
 
-    await userEvent.click(referenceAction);
+    await openMessageActions();
+    await userEvent.click(screen.getByRole("button", { name: "Citar em outra conversa" }));
     await userEvent.click(screen.getByRole("button", { name: /Destino/ }));
     const preview = await screen.findByTestId("chat-composer-reference");
     expect(preview).toHaveTextContent("Ana · #Origem");
@@ -3761,6 +3772,7 @@ describe("ChatMessageArea — favoritar mensagem", () => {
     renderChannelAreaForUser();
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
 
     const star = screen.getByRole("button", { name: "Favoritar mensagem" });
     expect(star).toHaveAttribute("aria-pressed", "false");
@@ -3768,6 +3780,7 @@ describe("ChatMessageArea — favoritar mensagem", () => {
 
     expect(mockFavoriteMessage).toHaveBeenCalledWith("m1");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Remover dos favoritos" })).toHaveAttribute(
         "aria-pressed",
@@ -3784,11 +3797,13 @@ describe("ChatMessageArea — favoritar mensagem", () => {
     renderChannelAreaForUser();
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
 
     await userEvent.click(screen.getByRole("button", { name: "Remover dos favoritos" }));
 
     expect(mockUnfavoriteMessage).toHaveBeenCalledWith("m1");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Favoritar mensagem" })).toHaveAttribute(
         "aria-pressed",
@@ -3805,11 +3820,13 @@ describe("ChatMessageArea — favoritar mensagem", () => {
     renderChannelAreaForUser();
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
 
     await userEvent.click(screen.getByRole("button", { name: "Favoritar mensagem" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/favorito/i);
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     expect(screen.getByRole("button", { name: "Favoritar mensagem" })).toHaveAttribute(
       "aria-pressed",
       "false",
@@ -3818,7 +3835,7 @@ describe("ChatMessageArea — favoritar mensagem", () => {
 });
 
 describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
-  it("pins a channel message via REST and reloads pins", async () => {
+  it("keeps pinning in the compact actions menu and reloads pins", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
     mockFetchPins.mockResolvedValueOnce([]).mockResolvedValue([
       {
@@ -3831,6 +3848,8 @@ describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
 
+    expect(screen.queryByRole("button", { name: "Fixar mensagem" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Mais ações" }));
     const pinBtn = screen.getByRole("button", { name: "Fixar mensagem" });
     await userEvent.click(pinBtn);
 
@@ -3874,6 +3893,7 @@ describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
 
+    await userEvent.click(screen.getByRole("button", { name: "Mais ações" }));
     await userEvent.click(screen.getByRole("button", { name: "Fixar mensagem" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/fixar/i);
@@ -3892,6 +3912,7 @@ describe("ChatMessageArea — fixar mensagem (RF-05)", () => {
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
 
+    await userEvent.click(screen.getByRole("button", { name: "Mais ações" }));
     await userEvent.click(screen.getByRole("button", { name: "Fixar mensagem" }));
 
     expect(mockPinMessage).toHaveBeenCalledWith({ kind: "dm", id: "dm-juliane" }, "m1");
@@ -3911,6 +3932,7 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
   async function openEditor() {
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     await userEvent.click(screen.getByRole("button", { name: "Editar mensagem" }));
     return screen.findByTestId("chat-edit-input-msg-edit");
   }
@@ -4045,6 +4067,7 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
     const bubble = await screen.findByTestId("chat-msg-bubble");
     expect(bubble).toHaveTextContent("Texto original");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     expect(screen.queryByRole("button", { name: "Editar mensagem" })).not.toBeInTheDocument();
   });
 
@@ -4123,6 +4146,7 @@ describe("ChatMessageArea — exclusão com placeholder (RF-14)", () => {
   async function revealDeleteAction() {
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
+    await openMessageActions();
     return screen.findByRole("button", { name: "Excluir mensagem" });
   }
 
