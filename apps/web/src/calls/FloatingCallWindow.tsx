@@ -13,6 +13,11 @@ import "./CallPresentation.css";
 const MARGIN = 16;
 const POSITION_KEY = "nchat.call.floating-corner.v1";
 const corners: FloatingCorner[] = ["top-left", "top-right", "bottom-left", "bottom-right"];
+// A pointerdown that starts on a control inside the handle (the expand
+// button, its icon span, ...) must never be treated as a drag gesture: the
+// event still bubbles to the handle's own onPointerDown, so the boundary has
+// to reject it there rather than relying on the button to stop propagation.
+const INTERACTIVE_SELECTOR = "button, a, input, select, textarea, [contenteditable='true']";
 
 interface FloatingCallWindowProps {
   title: string;
@@ -104,13 +109,23 @@ export default function FloatingCallWindow({
   );
 
   useEffect(() => {
-    const onResize = () =>
+    const reclamp = () =>
       setPosition((current) => clampPosition(current, size(), viewport(), MARGIN));
     const frame = window.requestAnimationFrame(() => placeAt(corner));
-    window.addEventListener("resize", onResize);
+    window.addEventListener("resize", reclamp);
+    // The window's own height changes after mount (a denied getUserMedia
+    // prompt adds a recovery banner above the activation button, for
+    // example), and that must reclamp position too, not just viewport
+    // resizes — otherwise a bottom-anchored corner keeps the stale, smaller
+    // height baked into its y offset and pushes trailing controls off-screen.
+    const node = rootRef.current;
+    const observer =
+      node && typeof ResizeObserver !== "undefined" ? new ResizeObserver(reclamp) : null;
+    if (node && observer) observer.observe(node);
     return () => {
       window.cancelAnimationFrame(frame);
-      window.removeEventListener("resize", onResize);
+      window.removeEventListener("resize", reclamp);
+      observer?.disconnect();
     };
     // The initial corner is intentionally read only once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -131,6 +146,9 @@ export default function FloatingCallWindow({
         data-testid="floating-call-handle"
         onPointerDown={(event) => {
           if (!desktopDrag() || event.button !== 0) return;
+          if (event.target instanceof Element && event.target.closest(INTERACTIVE_SELECTOR)) {
+            return;
+          }
           const rect = rootRef.current?.getBoundingClientRect();
           dragRef.current = {
             pointerId: event.pointerId,
@@ -219,19 +237,6 @@ export default function FloatingCallWindow({
           {activationLabel}
         </button>
       )}
-      <label className="floating-call__position">
-        <span>Posição</span>
-        <select
-          aria-label="Posição da chamada"
-          value={corner}
-          onChange={(event) => placeAt(event.target.value as FloatingCorner)}
-        >
-          <option value="top-left">Superior esquerda</option>
-          <option value="top-right">Superior direita</option>
-          <option value="bottom-left">Inferior esquerda</option>
-          <option value="bottom-right">Inferior direita</option>
-        </select>
-      </label>
     </aside>
   );
 }
