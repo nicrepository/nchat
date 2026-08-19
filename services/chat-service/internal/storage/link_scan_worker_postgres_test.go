@@ -8,8 +8,22 @@ import (
 
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
+
+type ordinaryVerdictProvider struct {
+	scanUUID string
+	verdict  urlsafety.Verdict
+}
+
+func (p *ordinaryVerdictProvider) Submit(context.Context, string) (string, error) {
+	return p.scanUUID, nil
+}
+
+func (p *ordinaryVerdictProvider) Poll(context.Context, string, string) (urlsafety.Verdict, error) {
+	return p.verdict, nil
+}
 
 // The RF-21 worker lifecycle, against a real database.
 //
@@ -208,6 +222,71 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		}
 	})
 
+	t.Run("an ordinary malicious poll converges an older active clearance", func(t *testing.T) {
+		const (
+			activeID  = "e3000000-0000-4000-8000-00000000001a"
+			pendingID = "e3000000-0000-4000-8000-00000000001b"
+		)
+		resetQueue(t)
+		if err := store.EnsureLinkScans(ctx, []string{badURL}); err != nil {
+			t.Fatalf("EnsureLinkScans: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE chat.link_scans
+			SET status = 'safe', scan_uuid = 'expired-safe',
+			    decided_at = now() - interval '1 hour', next_attempt_at = NULL
+			WHERE canonical_url = $1`, badURL); err != nil {
+			t.Fatalf("seed expired clearance: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.messages
+				(id, workspace_id, channel_id, sender_id, kind, body_text, body_format,
+				 status, link_safety_state, link_safety_fingerprint,
+				 link_safety_projection_version)
+			VALUES
+				($1, $3, $4, $5, 'user', $6, 'v2', 'active', 'safe', $7, 1),
+				($2, $3, $4, $5, 'user', $6, 'v2', 'pending_link_scan', '', $7, 1)`,
+			activeID, pendingID, workspace, channel, author, "veja "+badURL, fingerprint); err != nil {
+			t.Fatalf("seed messages: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			VALUES ($1, $3, $4), ($2, $3, $4)`,
+			activeID, pendingID, badURL, fingerprint); err != nil {
+			t.Fatalf("seed associations: %v", err)
+		}
+
+		provider := &ordinaryVerdictProvider{
+			scanUUID: "ordinary-malicious", verdict: urlsafety.VerdictMalicious,
+		}
+		worker := service.NewLinkScanService(store, provider, nil, nil)
+		if moved, err := worker.ProcessDue(ctx); err != nil || moved != 1 {
+			t.Fatalf("submit pass: moved=%d err=%v", moved, err)
+		}
+		due(t, badURL)
+		if moved, err := worker.ProcessDue(ctx); err != nil || moved != 1 {
+			t.Fatalf("poll pass: moved=%d err=%v", moved, err)
+		}
+
+		active, err := store.GetMessageByIDInWorkspace(ctx, workspace, activeID, author)
+		if err != nil {
+			t.Fatalf("read active message: %v", err)
+		}
+		if active.LinkSafety != domain.MessageLinkSafetyMalicious || active.BodyText != "" {
+			t.Fatalf("active message=%q body=%q, want malicious body withheld",
+				active.LinkSafety, active.BodyText)
+		}
+		var pendingStatus string
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.messages WHERE id = $1`, pendingID,
+		).Scan(&pendingStatus); err != nil {
+			t.Fatalf("read pending message: %v", err)
+		}
+		if pendingStatus != "deleted" {
+			t.Fatalf("pending message status=%q, want deleted", pendingStatus)
+		}
+	})
+
 	// The RF-21 incident this branch fixes: Cloudflare answers HTTP 200,
 	// task.status=finished, task.success=false, hasVerdicts=false. That is
 	// VerdictInconclusive from the provider layer, and this proves the row it
@@ -323,44 +402,52 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 			t.Fatalf("status = %q, the reopen sweep touched an inconclusive row", status)
 		}
 
-		// The message waiting on it still resolves — to blocked, not stranded.
+		// The message waiting on it resolves, and since issue #135 it resolves by
+		// being *published* rather than refused.
+		//
+		// That is the policy change this whole issue is about. The provider's real
+		// answer for this case was an operational refusal — the hostname had been
+		// scanned too recently — which is evidence of nothing about the link, so
+		// blocking a legitimate message on it was a product bug. The message goes
+		// out; what stays revoked is this server's permission to fetch the URL,
+		// which is carried by link_safety_state and by nothing else.
 		summary, err := store.ResolveDecidedMessages(ctx)
 		if err != nil {
 			t.Fatalf("ResolveDecidedMessages: %v", err)
 		}
-		if summary.Blocked != 1 || summary.Published != 0 {
-			t.Fatalf("summary = %+v, want the withheld message blocked by the inconclusive verdict", summary)
+		if summary.Published != 1 || summary.Blocked != 0 || summary.PublishedInconclusive != 1 {
+			t.Fatalf("summary = %+v, want the withheld message published with an inconclusive marker", summary)
 		}
-		var msgStatus string
+		var msgStatus, linkSafety string
 		if err := pool.QueryRow(ctx,
-			`SELECT status FROM chat.messages WHERE id = $1`, refused).Scan(&msgStatus); err != nil {
+			`SELECT status, link_safety_state FROM chat.messages WHERE id = $1`, refused,
+		).Scan(&msgStatus, &linkSafety); err != nil {
 			t.Fatalf("read message status: %v", err)
 		}
-		if msgStatus != "deleted" {
-			t.Fatalf("message status = %q, want deleted", msgStatus)
+		if msgStatus != "active" {
+			t.Fatalf("message status = %q, want active", msgStatus)
 		}
-		var eventType, targetType, blockReason string
+		if linkSafety != "inconclusive" {
+			t.Fatalf("link_safety_state = %q, want inconclusive", linkSafety)
+		}
+		// The event reaches the conversation, exactly as any other message's does.
+		// A sender-only message.blocked here would be the old behaviour, and would
+		// leave every other member without a message that was in fact published.
+		var eventType, targetType, blockReason, targetID string
 		if err := pool.QueryRow(ctx, `
-			SELECT event_type, target_type, COALESCE(block_reason, '')
+			SELECT event_type, target_type, target_id::text, COALESCE(block_reason, '')
 			FROM chat.message_publish_outbox WHERE message_id = $1`, refused,
-		).Scan(&eventType, &targetType, &blockReason); err != nil {
-			t.Fatalf("read blocked event: %v", err)
+		).Scan(&eventType, &targetType, &targetID, &blockReason); err != nil {
+			t.Fatalf("read publish event: %v", err)
 		}
-		if eventType != storage.EventMessageBlocked || targetType != storage.TargetSender {
-			t.Fatalf("event = %s/%s, want a refusal addressed to its author", eventType, targetType)
+		if eventType != storage.EventMessageCreated || targetType != storage.TargetChannel {
+			t.Fatalf("event = %s/%s, want a creation addressed to the channel", eventType, targetType)
 		}
-		if blockReason != "link_check_inconclusive" {
-			t.Fatalf("block_reason = %q, want link_check_inconclusive", blockReason)
+		if targetID != channel {
+			t.Fatalf("target_id = %q, want the channel the message was sent to", targetID)
 		}
-		// No mention/notification for a message that was never shown to anyone.
-		var notified int
-		if err := pool.QueryRow(ctx, `
-			SELECT count(*) FROM chat.notification_outbox WHERE message_id = $1`, refused,
-		).Scan(&notified); err != nil {
-			t.Fatalf("count notifications: %v", err)
-		}
-		if notified != 0 {
-			t.Fatalf("notified = %d, want no notification for a blocked message", notified)
+		if blockReason != "" {
+			t.Fatalf("block_reason = %q, want none on a publication", blockReason)
 		}
 
 		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, refused); err != nil {
@@ -440,26 +527,31 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ResolveDecidedMessages: %v", err)
 		}
-		if summary.Blocked != 2 || summary.Published != 0 {
-			t.Fatalf("summary = %+v, want both messages blocked by the one inconclusive scan", summary)
+		if summary.Published != 2 || summary.Blocked != 0 || summary.PublishedInconclusive != 2 {
+			t.Fatalf("summary = %+v, want both messages published from the one inconclusive scan", summary)
 		}
 		for _, id := range []string{first, second} {
-			var status string
+			var status, linkSafety string
 			if err := pool.QueryRow(ctx,
-				`SELECT status FROM chat.messages WHERE id = $1`, id).Scan(&status); err != nil {
+				`SELECT status, link_safety_state FROM chat.messages WHERE id = $1`, id,
+			).Scan(&status, &linkSafety); err != nil {
 				t.Fatalf("read status for %s: %v", id, err)
 			}
-			if status != "deleted" {
-				t.Fatalf("message %s status = %q, want deleted", id, status)
+			if status != "active" || linkSafety != "inconclusive" {
+				t.Fatalf("message %s = %q/%q, want active/inconclusive", id, status, linkSafety)
 			}
-			var blockReason string
+			var eventType, blockReason string
 			if err := pool.QueryRow(ctx, `
-				SELECT COALESCE(block_reason, '') FROM chat.message_publish_outbox WHERE message_id = $1`,
-				id).Scan(&blockReason); err != nil {
-				t.Fatalf("read block reason for %s: %v", id, err)
+				SELECT event_type, COALESCE(block_reason, '')
+				FROM chat.message_publish_outbox WHERE message_id = $1`,
+				id).Scan(&eventType, &blockReason); err != nil {
+				t.Fatalf("read publish event for %s: %v", id, err)
 			}
-			if blockReason != "link_check_inconclusive" {
-				t.Fatalf("message %s block_reason = %q, want link_check_inconclusive", id, blockReason)
+			if eventType != storage.EventMessageCreated {
+				t.Fatalf("message %s event = %q, want message.created", id, eventType)
+			}
+			if blockReason != "" {
+				t.Fatalf("message %s block_reason = %q, want none on a publication", id, blockReason)
 			}
 		}
 

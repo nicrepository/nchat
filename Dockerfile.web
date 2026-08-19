@@ -6,6 +6,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/web/package.json apps/web/package.json
 RUN pnpm install --frozen-lockfile
 COPY apps/web apps/web
+COPY libs/testdata/link-safety/autolink-corpus.json libs/testdata/link-safety/autolink-corpus.json
 RUN pnpm --filter @nchat/web build
 
 FROM nginxinc/nginx-unprivileged:1.29.3-alpine

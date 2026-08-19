@@ -164,6 +164,95 @@ export type MessageKind = "user" | "system";
  * infers it, and it cannot clear it.
  */
 export type MessageStatus = "active" | "deleted" | "pending_link_scan";
+
+/**
+ * RF-21 link-safety axis, independent of MessageStatus (issue #135).
+ *
+ * `status` answers "does this message exist for readers". This answers "what is
+ * known about the links it carries", and the two are deliberately separate: a
+ * published message may carry links the provider could not produce a verdict for,
+ * and refusing the message on that was the bug this replaced.
+ *
+ * - `""` — nothing to say. The message carries no links, or predates the axis.
+ * - `"safe"` — every link holds a current clearance.
+ * - `"inconclusive"` — at least one scan finished without a usable verdict, and
+ *   none was malicious. The message is published normally and its content is
+ *   rendered exactly as any other; a notice above it says the automatic preview
+ *   could not be loaded. It does **not** mean the link is dangerous, and the copy
+ *   must never say so.
+ * - `"malicious"` — at least one link was condemned. Reachable on a message that
+ *   is already on screen, because a later reconciliation may prove a link
+ *   malicious after it was delivered.
+ *
+ * Nothing in the client decides this value; it is rendered, never inferred. In
+ * particular the client never fetches a link to find out — see MessageBubble.
+ */
+export type MessageLinkSafety = "" | "safe" | "inconclusive" | "malicious" | "unknown";
+
+/**
+ * The states the server actually persists. `unknown` is not one of them — it is a
+ * local reading, produced by the decoder when the server said something this
+ * build does not understand.
+ */
+const persistedLinkSafetyStates = ["", "safe", "inconclusive", "malicious"] as const;
+
+/**
+ * Narrows an unknown server value to a MessageLinkSafety.
+ *
+ * An unrecognised value becomes `"unknown"`, which authorises nothing — **not**
+ * `"inconclusive"`, which would authorise an anchor.
+ *
+ * That distinction is the whole of CQ-004. "The provider ran a scan and produced
+ * no usable verdict" and "this build does not recognise what the server said" are
+ * different facts with different safe answers. Collapsing the second into the
+ * first meant a future server state — a rollout of a build that knows more than
+ * this one — would silently grant clickable links on a state nobody here has
+ * reasoned about.
+ *
+ * The fail-closed direction is a distinct value that no rendering rule admits.
+ */
+export function normalizeLinkSafety(raw?: unknown): MessageLinkSafety {
+  if (raw === undefined || raw === null || raw === "") return "";
+  return (persistedLinkSafetyStates as readonly string[]).includes(raw as string)
+    ? (raw as MessageLinkSafety)
+    : "unknown";
+}
+
+/**
+ * The one place that decides whether a message's links may be drawn as anchors.
+ *
+ * An allowlist of exactly two states, and it is exported so the bubble, the tests
+ * and any future surface all ask the same question rather than each re-deriving
+ * it:
+ *
+ *	safe          checked, cleared            -> anchor
+ *	inconclusive  checked, no usable verdict  -> anchor, with the notice
+ *	malicious     checked, condemned          -> no anchor
+ *	"" (legacy)   never checked               -> no anchor
+ *	unknown       not understood by this build -> no anchor
+ *
+ * Nothing derived from `status` belongs here: a published message is not a
+ * verified one.
+ */
+export function linkSafetyAllowsAnchors(state: MessageLinkSafety | undefined): boolean {
+  return state === "safe" || state === "inconclusive";
+}
+
+/**
+ * What a "Verificar novamente" attempt reports back to the UI (issue #135).
+ *
+ * `state` is the message's authoritative link-safety state afterwards, and
+ * `retryAfterSeconds` is how long the server's own cooldown runs — the UI
+ * disables the button for that long rather than offering an action it knows will
+ * be refused. A failed attempt rejects rather than resolving to this, so both
+ * fields are always present.
+ */
+export interface LinkSafetyRecheck {
+  state: MessageLinkSafety;
+  updatedAt: string;
+  retryAfterSeconds: number;
+}
+
 export type MessageBodyFormat = "v1" | "v2" | "v3";
 
 export function normalizeBodyFormat(raw?: string): MessageBodyFormat {
@@ -187,6 +276,17 @@ export interface Message {
   bodyFormat: MessageBodyFormat;
   isRemoved: boolean;
   status: MessageStatus;
+  /**
+   * RF-21 link-safety state (issue #135). Independent of `status`: an
+   * `active` message may be `"inconclusive"`, which is what draws the notice.
+   *
+   * Optional, and absent means exactly what `""` means — nothing to say about
+   * links. That is safe in the only direction that matters: no state, and no
+   * state this client does not understand, ever authorises anything. See
+   * normalizeLinkSafety, which resolves an unrecognised server value to
+   * `"unknown"` — a state that authorises nothing.
+   */
+  linkSafetyState?: MessageLinkSafety;
   deletedAt?: string | null;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
@@ -234,6 +334,13 @@ export interface QuotedMessage {
   isRemoved: boolean;
   deletedAt: string | null;
   createdAt: string;
+  updatedAt?: string;
+  /**
+   * The quoted message's own link-safety marker (issue #135, CQ-002). The
+   * server already withholds `bodyText` when this is "malicious"; this is what
+   * lets the quote say why instead of rendering an empty block.
+   */
+  linkSafetyState: MessageLinkSafety;
 }
 
 export type MessageReference =
@@ -248,6 +355,8 @@ export type MessageReference =
       bodyText: string;
       bodyFormat: MessageBodyFormat;
       createdAt: string;
+      updatedAt?: string;
+      linkSafetyState: MessageLinkSafety;
     };
 
 export interface MessagePage {
@@ -255,6 +364,22 @@ export interface MessagePage {
   /** Opaque cursor; non-empty when an older page is available. */
   nextCursor: string;
 }
+
+export type MessageSecuritySnapshot =
+  | { messageId: string; available: false }
+  | {
+      messageId: string;
+      available: true;
+      status: MessageStatus;
+      linkSafetyState: MessageLinkSafety;
+      updatedAt: string;
+      quoted?: {
+        messageId: string;
+        status: MessageStatus;
+        linkSafetyState: MessageLinkSafety;
+        updatedAt: string;
+      };
+    };
 
 // ── Favorites (RF-06) ────────────────────────────────────────────────────────
 

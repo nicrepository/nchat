@@ -218,6 +218,7 @@ func TestPGXFavoriteStore_ListFavorites_WithEditedAt_ScansTimestamps(t *testing.
 		"", "", "",
 		&editedAt, 1, &deletedAt,
 		now, now,
+		"",
 		"Test User", "test@example.com", true,
 		now.Add(-time.Hour),
 	}

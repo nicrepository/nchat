@@ -105,16 +105,45 @@ job duravel e responde `202 link_check_pending`. Um worker proprio submete o sca
 a Cloudflare, guarda o UUID e faz o polling, entao repetir o preview da mesma URL
 nao gera scan novo -- e um restart nao perde o que ja estava em andamento.
 
-**Um scan `inconclusive` fica `202 link_check_pending` para sempre.** Ao
-contrario do fluxo de mensagem em [link-safety.md](./link-safety.md), o
-preview nao tem um terceiro codigo para "o scan terminou e nao decidiu nada" --
-`checkSafety` trata qualquer veredito nao carregavel (nenhum veredito ainda, ou
-`inconclusive`) da mesma forma: nunca busca a pagina, sempre responde pending.
-O card nunca aparece, que e o resultado fail-closed correto, mas o cliente nao
-tem como distinguir "ainda escaneando" de "nunca vai decidir" so pelo codigo de
-erro. `inconclusive` e terminal no store (ve "Inconclusivo" em
-[link-safety.md](./link-safety.md#inconclusivo)) -- nenhum polling novo
-acontece -- mas essa distincao nao atravessa para o contrato HTTP do preview.
+**Politica de entrega da mensagem != politica de execucao da URL.** Desde a
+issue #135 uma mensagem cujos links nao puderam ser verificados **e publicada**:
+todo destinatario a recebe, ela e `active`, suas mencoes disparam. Isso **nao**
+muda nada aqui. O preview continua exigindo uma liberacao explicita e nao
+vencida:
+
+| Estado do link | Mensagem no chat | Preview server-side            |
+| -------------- | ---------------- | ------------------------------ |
+| `pending`      | retida           | **NAO** (`link_check_pending`) |
+| `safe`         | publicada        | **SIM**                        |
+| `malicious`    | bloqueada        | **NAO** (`malicious_url`)      |
+| `inconclusive` | publicada        | **NAO** (`link_check_pending`) |
+
+A inferencia "a mensagem foi publicada, logo a URL e confiavel" e **proibida**, e
+nao apenas ausente: nenhuma funcao deste pacote recebe status de mensagem, entao
+nao existe parametro por onde ele entraria. `checkSafety` consulta o store de
+vereditos e mais nada, e so `safe` abre a porta.
+
+**Uma condenação de qualquer componente vence imediatamente.** Desde a issue #135
+o gate consulta `files.link_fetch_denylist` junto com o próprio row, na mesma
+consulta. Se chat-service prova uma URL maliciosa, a próxima requisição de
+preview aqui é recusada — sem esperar TTL, sem passe de worker, sem
+sincronização. O detalhe está em ["Autoridade global de
+fetch"](./link-safety.md). A negação é permanente: um scan posterior que volte
+SAFE não a levanta.
+
+**Um scan `inconclusive` responde `202 link_check_pending`.** O preview nao tem
+um terceiro codigo para "o scan terminou e nao decidiu nada" -- `checkSafety`
+trata qualquer veredito nao carregavel (nenhum veredito ainda, ou
+`inconclusive`) da mesma forma: nunca busca a pagina, sempre responde pending. O
+card nunca aparece, que e o resultado fail-closed correto, mas o cliente nao tem
+como distinguir "ainda escaneando" de "sem veredito" so pelo codigo de erro.
+
+Ao contrario da versao anterior, isso **nao** e mais permanente. O worker do
+file-service roda uma reconciliacao limitada -- busca nos scans da propria conta
+e le o relatorio completo, nunca submete -- e uma linha `inconclusive` pode virar
+`done` com veredito, a partir do qual o preview volta a funcionar. O detalhe
+completo, incluindo por que a busca nao e autoridade de veredito, esta em
+["Reconciliacao de veredito"](./link-safety.md).
 
 E um controle **distinto** da politica abaixo e nao substitui nenhuma parte
 dela: o Safe Browsing responde se _aquela URL_ e maliciosa, a politica de destino

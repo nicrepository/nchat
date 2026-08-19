@@ -30,7 +30,56 @@ const (
 	// conversation. Everyone else was never shown the message and must not learn
 	// that it existed.
 	EventTypeMessageBlocked EventType = "message.blocked"
+	// EventTypeMessageLinkSafetyChanged tells the subscribers of a conversation
+	// that what is known about a published message's links has changed (issue
+	// #135).
+	//
+	// It exists because a message may now be published while its links are only
+	// *inconclusive* — the provider confirmed a scan finished without producing a
+	// verdict, which is not evidence of anything and must not block a legitimate
+	// send. Reconciliation may later obtain the real answer, in either direction,
+	// and this is how every client that already holds the message converges:
+	//
+	//   inconclusive -> safe       the "could not verify" notice is removed
+	//   inconclusive -> malicious  the links stop being usable
+	//
+	// It is addressed to the conversation and not to the author, unlike
+	// message.blocked, and that is the whole difference: the message *was*
+	// delivered, so everyone holding it has to be corrected. Emitting a second
+	// message.created instead would duplicate the message and re-fire its
+	// mentions; this event mutates one field of a message the client already has.
+	//
+	// The payload is a message id and a state from a closed set. No URL, no scan
+	// uuid, no provider text — see MessageLinkSafetyPayload.
+	EventTypeMessageLinkSafetyChanged EventType = "message.link_safety_changed"
 )
+
+// MessageLinkSafetyPayload carries the new link-safety state of one published
+// message (issue #135).
+//
+// Three fields, and the omissions are the contract. There is no URL, because a
+// subscriber does not need to be told which of a message's links changed and a
+// broadcast is the worst possible place to enumerate them. There is no scan uuid,
+// because that is an account-internal provider identifier. There is no provider
+// message: Cloudflare's own text is an English sentence that can name the
+// hostname, and it is never shown to a user or carried in an event.
+//
+// State is one of the domain.MessageLinkSafety values, as a string. It is
+// re-validated against that closed set when the event arrives over the bus, so a
+// remote instance cannot inject a state this version does not understand — and in
+// particular cannot invent one that a client might treat as a clearance.
+//
+// UpdatedAt orders this correction against message.updated/message.created.
+// It is safe to relay across the bus, unlike MessagePayload, precisely because it
+// carries no user content. There is nothing here to re-fetch by id.
+type MessageLinkSafetyPayload struct {
+	MessageID string `json:"message_id"`
+	// State is a domain.MessageLinkSafety value: "safe", "inconclusive" or
+	// "malicious". The empty state is never announced — a message with nothing to
+	// say about links has nothing to correct.
+	State     string    `json:"state"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
 
 // MessageBlockedReasonMaliciousLink and MessageBlockedReasonLinkCheckInconclusive
 // are the only reasons message.blocked carries — a closed set.
@@ -169,23 +218,29 @@ const (
 //   - All fields are server-populated from the authoritative DB record.
 //   - No tokens, secrets, credentials, or sender email may appear in any field.
 type MessagePayload struct {
-	ID                string        `json:"id"`
-	WorkspaceID       string        `json:"workspace_id"`
-	ChannelID         string        `json:"channel_id,omitempty"`
-	DMConversationID  string        `json:"dm_conversation_id,omitempty"`
-	SenderID          string        `json:"sender_id"`
-	SenderDisplayName string        `json:"sender_display_name"`
-	Kind              string        `json:"kind"`
-	BodyText          string        `json:"body_text"`
-	BodyFormat        string        `json:"body_format"`
-	Status            string        `json:"status"`
-	IsRemoved         bool          `json:"is_removed"`
-	CreatedAt         time.Time     `json:"created_at"`
-	UpdatedAt         time.Time     `json:"updated_at"`
-	EditedAt          *time.Time    `json:"edited_at,omitempty"`
-	DeletedAt         *time.Time    `json:"deleted_at,omitempty"`
-	Quoted            *QuotePayload `json:"quoted,omitempty"`
-	IsForwarded       bool          `json:"is_forwarded"`
+	ID                string `json:"id"`
+	WorkspaceID       string `json:"workspace_id"`
+	ChannelID         string `json:"channel_id,omitempty"`
+	DMConversationID  string `json:"dm_conversation_id,omitempty"`
+	SenderID          string `json:"sender_id"`
+	SenderDisplayName string `json:"sender_display_name"`
+	Kind              string `json:"kind"`
+	BodyText          string `json:"body_text"`
+	BodyFormat        string `json:"body_format"`
+	Status            string `json:"status"`
+	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
+	// A subscriber uses it to decide whether to draw the "could not verify this
+	// link" notice on a message it is inserting. It authorises nothing — see
+	// domain.MessageLinkSafety — and is omitted for the overwhelming majority of
+	// messages, which carry no links at all.
+	LinkSafetyState string        `json:"link_safety_state,omitempty"`
+	IsRemoved       bool          `json:"is_removed"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+	EditedAt        *time.Time    `json:"edited_at,omitempty"`
+	DeletedAt       *time.Time    `json:"deleted_at,omitempty"`
+	Quoted          *QuotePayload `json:"quoted,omitempty"`
+	IsForwarded     bool          `json:"is_forwarded"`
 	// Attachments lets a subscriber render a message that carries a file without
 	// a follow-up GET, exactly like BodyText and Quoted (RF-32). It is the same
 	// metadata the list endpoints publish and grants nothing: content and preview
@@ -200,18 +255,19 @@ type MessagePayload struct {
 
 // MessageUpdatedPayload carries authoritative edit or deletion fields.
 type MessageUpdatedPayload struct {
-	MessageID  string     `json:"message_id"`
-	ChannelID  string     `json:"channel_id,omitempty"`
-	DMID       string     `json:"dm_id,omitempty"`
-	Body       string     `json:"body"`
-	BodyFormat string     `json:"body_format"`
-	EditedAt   time.Time  `json:"edited_at"`
-	EditCount  int        `json:"edit_count"`
-	IsEdited   bool       `json:"is_edited"`
-	Status     string     `json:"status"`
-	IsRemoved  bool       `json:"is_removed"`
-	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	MessageID       string     `json:"message_id"`
+	ChannelID       string     `json:"channel_id,omitempty"`
+	DMID            string     `json:"dm_id,omitempty"`
+	Body            string     `json:"body"`
+	BodyFormat      string     `json:"body_format"`
+	LinkSafetyState string     `json:"link_safety_state"`
+	EditedAt        time.Time  `json:"edited_at"`
+	EditCount       int        `json:"edit_count"`
+	IsEdited        bool       `json:"is_edited"`
+	Status          string     `json:"status"`
+	IsRemoved       bool       `json:"is_removed"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // MessageAttachmentPayload mirrors the attachment metadata the HTTP message
@@ -227,13 +283,15 @@ type MessageAttachmentPayload struct {
 }
 
 type QuotePayload struct {
-	ID         string     `json:"id"`
-	AuthorID   string     `json:"author_id"`
-	Body       string     `json:"body,omitempty"`
-	BodyFormat string     `json:"body_format"`
-	IsRemoved  bool       `json:"is_removed,omitempty"`
-	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID              string     `json:"id"`
+	AuthorID        string     `json:"author_id"`
+	Body            string     `json:"body,omitempty"`
+	BodyFormat      string     `json:"body_format"`
+	LinkSafetyState string     `json:"link_safety_state,omitempty"`
+	IsRemoved       bool       `json:"is_removed,omitempty"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type ReactionPayload struct {
@@ -445,6 +503,11 @@ type Event struct {
 	Attachment *AttachmentStatusPayload `json:"attachment,omitempty"`
 	// Presence carries one user's online/away/offline state (RF-58).
 	Presence *PresencePayload `json:"presence,omitempty"`
+	// LinkSafety carries a change to what is known about a published message's
+	// links (issue #135). Set only for message.link_safety_changed, and stripped
+	// from every other event type on arrival — an event carrying one alongside an
+	// unrelated type is relaying a state nobody asked it about.
+	LinkSafety *MessageLinkSafetyPayload `json:"link_safety,omitempty"`
 	// Typing carries one user's typing state in a channel or DM.
 	Typing *TypingEventPayload `json:"typing,omitempty"`
 	// RecipientUserID routes a user-scoped event to exactly one user.

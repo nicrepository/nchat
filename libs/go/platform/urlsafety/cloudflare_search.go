@@ -33,7 +33,11 @@ import (
 //
 // answering, unenveloped,
 //
-//	{"tasks":[{"uuid":"...","url":"...","time":"...","visibility":"unlisted","success":true}]}
+//	{"results":[{"task":{"uuid":"...","url":"...","time":"...","visibility":"unlisted","success":true}}]}
+//
+// Each result carries more than `task` — `page`, `result`, `stats`, `verdicts`
+// — and none of it is read here: identity is decided from the task fields, and
+// the verdict is never taken from a search.
 //
 // The path is account-scoped, which is what confines the answer to scans this
 // deployment's own credentials created — there is no cross-account result to
@@ -81,12 +85,14 @@ type ScanRecord struct {
 
 // searchResponse is the part of the search answer this client reads.
 type searchResponse struct {
-	Tasks []struct {
-		UUID       string `json:"uuid"`
-		URL        string `json:"url"`
-		Time       string `json:"time"`
-		Visibility string `json:"visibility"`
-	} `json:"tasks"`
+	Results []struct {
+		Task struct {
+			UUID       string `json:"uuid"`
+			URL        string `json:"url"`
+			Time       string `json:"time"`
+			Visibility string `json:"visibility"`
+		} `json:"task"`
+	} `json:"results"`
 }
 
 // FindRecentScan returns the scan this deployment most plausibly created for
@@ -155,7 +161,8 @@ func selectReconcilableScan(
 	earliest := since.Add(-searchClockTolerance)
 	var best ScanRecord
 	matches := 0
-	for _, task := range response.Tasks {
+	for _, result := range response.Results {
+		task := result.Task
 		record, ok := eligibleScan(task.UUID, task.URL, task.Time, task.Visibility, canonicalURL, earliest)
 		if !ok {
 			continue

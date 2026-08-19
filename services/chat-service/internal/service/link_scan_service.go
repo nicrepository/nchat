@@ -58,6 +58,7 @@ type LinkScanQueue interface {
 	ReserveProviderSubmit(ctx context.Context, limit int, window time.Duration) (bool, error)
 	PruneLinkScanBudget(ctx context.Context, olderThan time.Duration) error
 	RecordLinkVerdict(ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error
+	RefreshMessageLinkSafety(ctx context.Context, canonicalURL string) ([]storage.MessageLinkSafetyChange, error)
 	ResolveDecidedMessages(ctx context.Context) (storage.ResolveSummary, error)
 	ReopenExpiredVerdicts(ctx context.Context) (int, error)
 	LinkScanBacklog(ctx context.Context) (map[string]int, time.Duration, error)
@@ -652,6 +653,11 @@ func (s *LinkScanService) recordVerdict(ctx context.Context, job storage.LinkSca
 	switch err := s.queue.RecordLinkVerdict(ctx, job.CanonicalURL, job.ScanUUID, verdict); {
 	case err == nil:
 		s.observeAttempt(operationPoll, result)
+		publisher, _ := s.publisher.(LinkSafetyChangePublisher)
+		if err := drainMessageLinkSafety(ctx, s.queue, job.CanonicalURL, publisher); err != nil && ctx.Err() == nil {
+			s.logger.WarnContext(ctx, "converge ordinary link verdict",
+				slog.String("error", err.Error()))
+		}
 	case errors.Is(err, storage.ErrLinkScanConflict):
 		// This worker's lease had already been lost and the row now carries a
 		// different scan. Its answer describes a scan nobody is waiting on.
