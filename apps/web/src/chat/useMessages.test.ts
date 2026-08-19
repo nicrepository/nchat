@@ -28,6 +28,7 @@ import type {
   WSPinUpdatedEvent,
   WSReactionUpdatedEvent,
   WSSubscribedEvent,
+  WSMessageLinkSafetyChangedEvent,
 } from "./useChatWebSocket";
 import { useMessages } from "./useMessages";
 import type { Message, MessagePage } from "./chatTypes";
@@ -37,6 +38,7 @@ import type { Message, MessagePage } from "./chatTypes";
 // Captures the latest onMessageCreated callback so tests can fire WS events.
 let capturedOnMessageCreated: ((evt: WSMessageCreatedEvent) => void) | null = null;
 let capturedOnMessageBlocked: ((evt: WSMessageBlockedEvent) => void) | null = null;
+let capturedOnLinkSafetyChanged: ((evt: WSMessageLinkSafetyChangedEvent) => void) | null = null;
 let capturedOnMessageUpdated: ((evt: WSMessageUpdatedEvent) => void) | null = null;
 let capturedOnReactionUpdated: ((evt: WSReactionUpdatedEvent) => void) | null = null;
 let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
@@ -49,6 +51,7 @@ vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
     onMessageBlocked,
+    onMessageLinkSafetyChanged,
     onMessageUpdated,
     onReactionUpdated,
     onPinUpdated,
@@ -60,6 +63,7 @@ vi.mock("./useChatWebSocket", () => ({
     targetId: string;
     onMessageCreated: (evt: WSMessageCreatedEvent) => void;
     onMessageBlocked?: (evt: WSMessageBlockedEvent) => void;
+    onMessageLinkSafetyChanged?: (evt: WSMessageLinkSafetyChangedEvent) => void;
     onMessageUpdated?: (evt: WSMessageUpdatedEvent) => void;
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
     onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
@@ -69,6 +73,7 @@ vi.mock("./useChatWebSocket", () => ({
   }) => {
     capturedOnMessageCreated = onMessageCreated;
     capturedOnMessageBlocked = onMessageBlocked ?? null;
+    capturedOnLinkSafetyChanged = onMessageLinkSafetyChanged ?? null;
     capturedOnMessageUpdated = onMessageUpdated ?? null;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
     capturedOnPinUpdated = onPinUpdated ?? null;
@@ -83,10 +88,13 @@ vi.mock("./useChatWebSocket", () => ({
 
 const {
   mockFetchLinkSafetyStatuses,
+  mockReconcileMessageLinkSafety,
   mockFetchChannelMessages,
   mockFetchChannelMessage,
   mockFetchDMMessages,
   mockFetchDMMessage,
+  mockFetchChannelMessageSecuritySnapshots,
+  mockFetchDMMessageSecuritySnapshots,
   mockResolveChannelMessageReferences,
   mockResolveDMMessageReferences,
   mockFavoriteMessage,
@@ -101,6 +109,16 @@ const {
     vi.fn<(id: string, body: string, parentMessageId?: string) => Promise<Message>>(),
   mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockDeleteMessage: vi.fn<(id: string) => Promise<Message>>(),
+  mockReconcileMessageLinkSafety: vi.fn<
+    (
+      messageId: string,
+      signal?: AbortSignal,
+    ) => Promise<{
+      state: Message["linkSafetyState"];
+      updatedAt: string;
+      retryAfterSeconds: number;
+    }>
+  >(),
   mockFetchLinkSafetyStatuses:
     vi.fn<
       (
@@ -116,6 +134,8 @@ const {
     vi.fn<(id: string, cursor?: string, signal?: AbortSignal) => Promise<MessagePage>>(),
   mockFetchDMMessage:
     vi.fn<(id: string, msgId: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchChannelMessageSecuritySnapshots: vi.fn(),
+  mockFetchDMMessageSecuritySnapshots: vi.fn(),
   mockResolveChannelMessageReferences:
     vi.fn<
       (
@@ -143,6 +163,10 @@ vi.mock("./chatApi", () => ({
     mockFetchDMMessages(id, cursor, signal),
   fetchDMMessage: (id: string, msgId: string, signal?: AbortSignal) =>
     mockFetchDMMessage(id, msgId, signal),
+  fetchChannelMessageSecuritySnapshots: (id: string, messageIds: string[], signal?: AbortSignal) =>
+    mockFetchChannelMessageSecuritySnapshots(id, messageIds, signal),
+  fetchDMMessageSecuritySnapshots: (id: string, messageIds: string[], signal?: AbortSignal) =>
+    mockFetchDMMessageSecuritySnapshots(id, messageIds, signal),
   resolveChannelMessageReferences: (id: string, messageIds: string[], signal?: AbortSignal) =>
     mockResolveChannelMessageReferences(id, messageIds, signal),
   resolveDMMessageReferences: (id: string, messageIds: string[], signal?: AbortSignal) =>
@@ -157,6 +181,8 @@ vi.mock("./chatApi", () => ({
   deleteMessage: (id: string) => mockDeleteMessage(id),
   fetchLinkSafetyStatuses: (messageIds: string[], signal?: AbortSignal) =>
     mockFetchLinkSafetyStatuses(messageIds, signal),
+  reconcileMessageLinkSafety: (messageId: string, signal?: AbortSignal) =>
+    mockReconcileMessageLinkSafety(messageId, signal),
 }));
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -223,6 +249,25 @@ function fireWsBlockedEvent(messageId: string, reason?: string): void {
     type: "message.blocked",
     message_id: messageId,
     ...(reason === undefined ? {} : { reason }),
+  });
+}
+
+/**
+ * Fire the issue #135 correction: what is known about a *published* message's
+ * links changed. Unlike message.blocked it is addressed to the conversation,
+ * because the message was delivered and everyone holding it has to converge.
+ */
+function fireWsLinkSafetyChanged(
+  messageId: string,
+  state: string,
+  updatedAt = "2099-08-18T12:00:00Z",
+): void {
+  capturedOnLinkSafetyChanged?.({
+    type: "message.link_safety_changed",
+    target_type: "channel",
+    target_id: "chan-1",
+    message_id: messageId,
+    link_safety: { message_id: messageId, state, updated_at: updatedAt },
   });
 }
 
@@ -355,6 +400,7 @@ describe("useMessages — WS message.created integration", () => {
         bodyText: "segredo",
         bodyFormat: "v3",
         createdAt: "2026-07-21T12:00:00Z",
+        linkSafetyState: "",
       },
     });
     mockFetchChannelMessages.mockResolvedValue({ messages: [destination], nextCursor: "" });
@@ -450,6 +496,7 @@ describe("useMessages — WS message.created integration", () => {
       bodyText: "segredo",
       bodyFormat: "v3",
       createdAt: "2026-07-21T12:00:00Z",
+      linkSafetyState: "",
     };
     const messages = Array.from({ length: 101 }, (_, index) =>
       makeMessage({
@@ -506,11 +553,60 @@ describe("useMessages — WS message.created integration", () => {
           bodyText: "segredo",
           bodyFormat: "v3",
           createdAt: "2026-07-21T12:00:00Z",
+          linkSafetyState: "",
         },
       }),
     );
     await act(async () => Promise.resolve());
     expect(result.current.state.messages[0].reference).toEqual({ available: false });
+  });
+
+  it("does not let a stale reference response undo a realtime condemnation", async () => {
+    const reference: NonNullable<Message["reference"]> = {
+      available: true,
+      messageId: "protected-source",
+      targetType: "channel",
+      targetId: "private-source",
+      targetLabel: "Privado",
+      authorDisplayName: "Ana",
+      bodyText: "https://bad.example",
+      bodyFormat: "v3",
+      createdAt: "2026-08-18T10:00:00Z",
+      updatedAt: "2026-08-18T10:00:00Z",
+      linkSafetyState: "inconclusive",
+    };
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "destination-message", reference })],
+      nextCursor: "",
+    });
+    let resolveReference!: (value: Record<string, NonNullable<Message["reference"]>>) => void;
+    mockResolveChannelMessageReferences.mockReturnValueOnce(
+      new Promise((resolve) => (resolveReference = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "destination", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(mockResolveChannelMessageReferences).toHaveBeenCalledOnce());
+
+    act(() => fireWsLinkSafetyChanged("protected-source", "malicious", "2026-08-18T12:00:00Z"));
+    act(() =>
+      resolveReference({
+        "destination-message": {
+          ...reference,
+          updatedAt: "2026-08-18T11:00:00Z",
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0].reference).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+        updatedAt: "2026-08-18T12:00:00Z",
+      }),
+    );
   });
 
   it("refreshes only the reference and preserves the destination snapshot", async () => {
@@ -1031,6 +1127,8 @@ describe("useMessages — WS message.created integration", () => {
       isRemoved: false,
       deletedAt: null,
       createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
     });
   });
 
@@ -1471,6 +1569,7 @@ describe("useMessages — message editing", () => {
       id: "msg-edit",
       reactions: [{ emoji: "👍", count: 2, reactedByMe: true }],
       isFavorited: true,
+      linkSafetyState: "safe",
     });
     mockFetchChannelMessages.mockResolvedValue({ messages: [initial], nextCursor: "" });
     mockEditMessage.mockResolvedValue(
@@ -1483,6 +1582,7 @@ describe("useMessages — message editing", () => {
         editedAt: "2026-07-13T12:00:00Z",
         reactions: [],
         isFavorited: false,
+        linkSafetyState: "inconclusive",
       }),
     );
     const { result } = renderHook(() =>
@@ -1496,11 +1596,87 @@ describe("useMessages — message editing", () => {
       bodyText: "persistida",
       reactions: initial.reactions,
       isFavorited: true,
+      linkSafetyState: "inconclusive",
+    });
+  });
+
+  it.each([
+    ["", "safe"],
+    ["", "inconclusive"],
+    ["safe", "inconclusive"],
+    ["inconclusive", "safe"],
+    ["safe", ""],
+  ] as const)("applies message.updated link safety %s -> %s", async (before, after) => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-edit", linkSafetyState: before })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "ch-1",
+          body: after === "" ? "sem URL" : "https://example.test",
+          body_format: "v3",
+          edited_at: "2026-08-18T12:00:00Z",
+          edit_count: 1,
+          is_edited: true,
+          link_safety_state: after,
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0].linkSafetyState).toBe(after);
+  });
+
+  it("preserves link safety when a rolling-deploy message.updated omits the field", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-edit", linkSafetyState: "malicious", bodyText: "" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_update: {
+          message_id: "msg-edit",
+          channel_id: "ch-1",
+          body: "legacy body",
+          body_format: "v3",
+          edited_at: "2026-08-18T12:00:00Z",
+          edit_count: 1,
+          is_edited: true,
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
     });
   });
 
   it("applies an optimistic edit and restores the exact message when PATCH fails", async () => {
-    const original = makeMessage({ id: "msg-edit", bodyText: "original", bodyFormat: "v2" });
+    const original = makeMessage({
+      id: "msg-edit",
+      bodyText: "https://safe.example/old",
+      bodyFormat: "v2",
+      linkSafetyState: "safe",
+    });
     mockFetchChannelMessages.mockResolvedValue({ messages: [original], nextCursor: "" });
     let rejectEdit!: (error: Error) => void;
     mockEditMessage.mockImplementation(
@@ -1521,6 +1697,7 @@ describe("useMessages — message editing", () => {
       bodyFormat: "v3",
       isEdited: true,
       editCount: 1,
+      linkSafetyState: "unknown",
     });
     const settled = request.catch((error: unknown) => error);
     act(() => rejectEdit(new Error("PATCH failed")));
@@ -1777,6 +1954,7 @@ describe("useMessages — message deletion", () => {
         isRemoved: false,
         deletedAt: null,
         createdAt,
+        linkSafetyState: "",
       },
     });
     mockFetchChannelMessages.mockResolvedValue({ messages: [original, reply], nextCursor: "" });
@@ -2173,6 +2351,7 @@ describe("useMessages — message deletion", () => {
               isRemoved: false,
               deletedAt: null,
               createdAt: "2026-07-14T11:00:00Z",
+              linkSafetyState: "",
             },
           }),
         ],
@@ -3133,5 +3312,855 @@ describe("useMessages — reconnect reconciliation of withheld messages", () => 
 
     await waitFor(() => expect(mockFetchLinkSafetyStatuses).toHaveBeenCalled());
     expect(mockFetchLinkSafetyStatuses.mock.calls[0][0]).toEqual(["msg-pending"]);
+  });
+});
+
+// ── RF-21 link-safety corrections on a published message (issue #135) ─────────
+//
+// The state a message carries about its links can change *after* it has been
+// delivered, in either direction: a verdict finally arrives and the notice goes
+// away, or the link turns out to be malicious and its content is withdrawn.
+//
+// The event that carries that is deliberately not a second message.created. It
+// mutates one field of a message the client already holds, which is what makes it
+// idempotent under at-least-once delivery and what stops the message being
+// duplicated or its mentions being fired twice.
+describe("useMessages link-safety corrections", () => {
+  beforeEach(() => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([]);
+  });
+
+  /** Renders the hook holding one published message with an unverified link. */
+  async function hookWithUnverifiedMessage() {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-unverified", linkSafetyState: "inconclusive" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    return result;
+  }
+
+  it("carries the link-safety state from the initial load", async () => {
+    const result = await hookWithUnverifiedMessage();
+
+    expect(result.current.state.messages[0].linkSafetyState).toBe("inconclusive");
+  });
+
+  // A message published while its links were unverified arrives over the socket
+  // carrying that marker, so the notice appears without a follow-up fetch.
+  it("carries the link-safety state from a realtime creation", async () => {
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventWithPayload(
+        "channel",
+        "chan-1",
+        makePayload({
+          id: "msg-new",
+          link_safety_state: "inconclusive",
+        }),
+      );
+    });
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].linkSafetyState).toBe("inconclusive");
+  });
+
+  // A later clearance removes the notice, in place: same message, same position,
+  // no duplicate.
+  it("clears the notice when a verdict finally arrives", async () => {
+    const result = await hookWithUnverifiedMessage();
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "safe"));
+
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("safe"));
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0].status).toBe("active");
+  });
+
+  // The direction that costs a reader something. The message stays where it is —
+  // it was delivered — and the marker is what withdraws its links.
+  it("withdraws the links when a published message is later condemned", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-unverified",
+          linkSafetyState: "inconclusive",
+          bodyText: "https://bad.example",
+          updatedAt: "2026-08-18T10:00:00Z",
+        }),
+      ],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.selectReply(result.current.state.messages[0]));
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "malicious"));
+
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("malicious"));
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0].bodyText).toBe("");
+    expect(result.current.state.replyTo).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
+    });
+  });
+
+  it("does not let a delayed edit event restore a condemned body", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: "https://bad.example",
+          linkSafetyState: "inconclusive",
+          updatedAt: "2026-08-18T10:00:00Z",
+        }),
+      ],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "malicious", "2026-08-18T13:00:00Z"));
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "chan-1",
+        message_update: {
+          message_id: "msg-unverified",
+          body: "https://bad.example",
+          body_format: "v3",
+          link_safety_state: "inconclusive",
+          edited_at: "2026-08-18T12:00:00Z",
+          updated_at: "2026-08-18T12:00:00Z",
+          edit_count: 1,
+          is_edited: true,
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
+      updatedAt: "2026-08-18T13:00:00Z",
+    });
+  });
+
+  it("does not let a delayed PATCH success restore a condemned body", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: "https://bad.example",
+          linkSafetyState: "inconclusive",
+          updatedAt: "2026-08-18T10:00:00Z",
+        }),
+      ],
+      nextCursor: "",
+    });
+    let resolveEdit!: (message: Message) => void;
+    mockEditMessage.mockImplementation(() => new Promise((resolve) => (resolveEdit = resolve)));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    let request!: Promise<Message>;
+    act(() => {
+      request = result.current.editMessageLocal("msg-unverified", "https://bad.example", "v3");
+    });
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "malicious", "2026-08-18T13:00:00Z"));
+    act(() =>
+      resolveEdit(
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: "https://bad.example",
+          bodyFormat: "v3",
+          linkSafetyState: "inconclusive",
+          updatedAt: "2026-08-18T12:00:00Z",
+          editedAt: "2026-08-18T12:00:00Z",
+          editCount: 1,
+          isEdited: true,
+        }),
+      ),
+    );
+    await request;
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
+      updatedAt: "2026-08-18T13:00:00Z",
+    });
+  });
+
+  it("does not let a delayed message snapshot restore a condemned body", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: "https://bad.example",
+          linkSafetyState: "inconclusive",
+          updatedAt: "2026-08-18T10:00:00Z",
+        }),
+      ],
+      nextCursor: "",
+    });
+    let resolveSnapshot!: (message: Message) => void;
+    mockFetchChannelMessage.mockImplementation(
+      () => new Promise((resolve) => (resolveSnapshot = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "chan-1",
+        message_id: "msg-unverified",
+      }),
+    );
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledOnce());
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "malicious", "2026-08-18T13:00:00Z"));
+    act(() =>
+      resolveSnapshot(
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: "https://bad.example",
+          linkSafetyState: "inconclusive",
+          updatedAt: "2026-08-18T12:00:00Z",
+        }),
+      ),
+    );
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0]).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+        updatedAt: "2026-08-18T13:00:00Z",
+      }),
+    );
+  });
+
+  it("ignores an old condemnation after a newer link-free edit", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-unverified", updatedAt: "2026-08-18T10:00:00Z" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "chan-1",
+        message_update: {
+          message_id: "msg-unverified",
+          body: "sem URL",
+          body_format: "v3",
+          link_safety_state: "",
+          edited_at: "2026-08-18T14:00:00Z",
+          updated_at: "2026-08-18T14:00:00Z",
+          edit_count: 1,
+          is_edited: true,
+        },
+      }),
+    );
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "malicious", "2026-08-18T13:00:00Z"));
+
+    expect(result.current.state.messages[0]).toMatchObject({
+      linkSafetyState: "",
+      bodyText: "sem URL",
+      updatedAt: "2026-08-18T14:00:00Z",
+    });
+  });
+
+  it("applies a correction that arrives before message.created", async () => {
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsLinkSafetyChanged("msg-late", "malicious", "2026-08-18T13:00:00Z"));
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "chan-1",
+        makePayload({
+          id: "msg-late",
+          body_text: "https://bad.example",
+          link_safety_state: "inconclusive",
+          updated_at: "2026-08-18T12:00:00Z",
+        }),
+      ),
+    );
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0]).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
+      updatedAt: "2026-08-18T13:00:00Z",
+    });
+  });
+
+  it("applies an early correction to quotes and references in a delayed page", async () => {
+    let resolvePage!: (page: MessagePage) => void;
+    mockFetchChannelMessages.mockImplementation(
+      () => new Promise((resolve) => (resolvePage = resolve)),
+    );
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+
+    act(() => fireWsLinkSafetyChanged("source", "malicious", "2026-08-18T13:00:00Z"));
+    act(() =>
+      resolvePage({
+        messages: [
+          makeMessage({
+            id: "quote-destination",
+            quoted: {
+              id: "source",
+              authorId: "author",
+              bodyText: "https://bad.example",
+              bodyFormat: "v2",
+              isRemoved: false,
+              deletedAt: null,
+              createdAt: "2026-08-18T10:00:00Z",
+              updatedAt: "2026-08-18T12:00:00Z",
+              linkSafetyState: "inconclusive",
+            },
+          }),
+          makeMessage({
+            id: "reference-destination",
+            reference: {
+              available: true,
+              messageId: "source",
+              targetType: "channel",
+              targetId: "other-channel",
+              targetLabel: "origem",
+              authorDisplayName: "Alice",
+              bodyText: "https://bad.example",
+              bodyFormat: "v2",
+              createdAt: "2026-08-18T10:00:00Z",
+              updatedAt: "2026-08-18T12:00:00Z",
+              linkSafetyState: "inconclusive",
+            },
+          }),
+        ],
+        nextCursor: "",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.state.messages[0].quoted).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
+      updatedAt: "2026-08-18T13:00:00Z",
+    });
+    expect(result.current.state.messages[1].reference).toMatchObject({
+      linkSafetyState: "malicious",
+      bodyText: "",
+      updatedAt: "2026-08-18T13:00:00Z",
+    });
+  });
+
+  it("converges a visible source and quote on a realtime condemnation", async () => {
+    const source = makeMessage({
+      id: "source",
+      bodyText: "https://bad.example",
+      linkSafetyState: "inconclusive",
+    });
+    const quote = makeMessage({
+      id: "quote-destination",
+      quoted: {
+        id: "source",
+        authorId: "author",
+        bodyText: "https://bad.example",
+        bodyFormat: "v2",
+        isRemoved: false,
+        deletedAt: null,
+        createdAt: "2026-08-18T10:00:00Z",
+        linkSafetyState: "inconclusive",
+      },
+    });
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [source, quote],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsLinkSafetyChanged("source", "malicious"));
+
+    await waitFor(() => {
+      expect(result.current.state.messages[0]).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+      });
+      expect(result.current.state.messages[1].quoted).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+      });
+    });
+  });
+
+  it("does not sanitize dependent text when the source becomes safe", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "quote-destination",
+          quoted: {
+            id: "source",
+            authorId: "author",
+            bodyText: "texto preservado",
+            bodyFormat: "v2",
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: "2026-08-18T10:00:00Z",
+            linkSafetyState: "inconclusive",
+          },
+        }),
+      ],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsLinkSafetyChanged("source", "safe"));
+
+    expect(result.current.state.messages[0].quoted).toMatchObject({
+      linkSafetyState: "safe",
+      bodyText: "texto preservado",
+    });
+  });
+
+  it("ignores a delayed condemnation older than visible quote and reference snapshots", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "quote-destination",
+          quoted: {
+            id: "source",
+            authorId: "author",
+            bodyText: "texto seguro",
+            bodyFormat: "v2",
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: "2026-08-18T10:00:00Z",
+            updatedAt: "2026-08-18T14:00:00Z",
+            linkSafetyState: "safe",
+          },
+        }),
+        makeMessage({
+          id: "reference-destination",
+          reference: {
+            available: true,
+            messageId: "source",
+            targetType: "channel",
+            targetId: "other-channel",
+            targetLabel: "origem",
+            authorDisplayName: "Alice",
+            bodyText: "texto seguro",
+            bodyFormat: "v2",
+            createdAt: "2026-08-18T10:00:00Z",
+            updatedAt: "2026-08-18T14:00:00Z",
+            linkSafetyState: "safe",
+          },
+        }),
+      ],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsLinkSafetyChanged("source", "malicious", "2026-08-18T13:00:00Z"));
+
+    expect(result.current.state.messages[0].quoted).toMatchObject({
+      linkSafetyState: "safe",
+      bodyText: "texto seguro",
+      updatedAt: "2026-08-18T14:00:00Z",
+    });
+    expect(result.current.state.messages[1].reference).toMatchObject({
+      linkSafetyState: "safe",
+      bodyText: "texto seguro",
+      updatedAt: "2026-08-18T14:00:00Z",
+    });
+  });
+
+  // Delivery is at-least-once, so the same correction may arrive twice. Applying
+  // it again must be a no-op rather than a duplicate message or a second render
+  // that scrolls the conversation.
+  it("is idempotent under repeated delivery", async () => {
+    const result = await hookWithUnverifiedMessage();
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "safe"));
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("safe"));
+    const afterFirst = result.current.state.messages;
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "safe"));
+
+    expect(result.current.state.messages).toBe(afterFirst);
+    expect(result.current.state.messages).toHaveLength(1);
+  });
+
+  // A correction for something this view never held does not insert a husk; it
+  // is retained only to order a later message.created for the same id.
+  it("does not insert a correction for a message it does not hold", async () => {
+    const result = await hookWithUnverifiedMessage();
+
+    act(() => fireWsLinkSafetyChanged("msg-elsewhere", "malicious"));
+
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0].id).toBe("msg-unverified");
+  });
+
+  // An unrecognised state resolves to `unknown`, which authorises nothing —
+  // deliberately not `inconclusive`, which would authorise an anchor (CQ-004).
+  // "The provider produced no usable verdict" and "this build does not recognise
+  // what the server said" are different facts with different safe answers.
+  it("treats an unknown state as unknown, not as inconclusive", async () => {
+    const result = await hookWithUnverifiedMessage();
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "probably_fine"));
+
+    expect(result.current.state.messages[0].linkSafetyState).toBe("unknown");
+  });
+
+  // "Verificar novamente" asks the backend and applies the authoritative answer
+  // locally, so the button works even when realtime is down — which is exactly
+  // when a reader is most likely to press it.
+  it("applies the reconcile reply locally", async () => {
+    mockReconcileMessageLinkSafety.mockResolvedValue({
+      state: "safe",
+      updatedAt: "2099-08-18T12:00:00Z",
+      retryAfterSeconds: 60,
+    });
+    const result = await hookWithUnverifiedMessage();
+
+    await act(async () => {
+      await result.current.reconcileLinkSafety("msg-unverified");
+    });
+
+    expect(mockReconcileMessageLinkSafety).toHaveBeenCalledWith("msg-unverified", undefined);
+    expect(result.current.state.messages[0].linkSafetyState).toBe("safe");
+    // No duplicate: a correction is not a creation.
+    expect(result.current.state.messages).toHaveLength(1);
+  });
+
+  // A failed request is not turned into a banner over somebody's message. The
+  // outcome the reader sees is "still not verified", which is the truth.
+  it("leaves the message alone when the reconcile request fails", async () => {
+    mockReconcileMessageLinkSafety.mockRejectedValue(new Error("429"));
+    const result = await hookWithUnverifiedMessage();
+
+    await act(async () => {
+      await result.current.reconcileLinkSafety("msg-unverified");
+    });
+
+    expect(result.current.state.messages[0].linkSafetyState).toBe("inconclusive");
+    expect(result.current.state.actionError).toBeNull();
+  });
+});
+
+describe("useMessages — reconnect authoritative security refresh", () => {
+  beforeEach(() => {
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValue([]);
+    mockFetchDMMessageSecuritySnapshots.mockResolvedValue([]);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([]);
+  });
+
+  async function reconnect() {
+    await act(async () => {
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "chan-1",
+      });
+      await Promise.resolve();
+    });
+  }
+
+  it("recovers a missed malicious event for source, quote, and cross-channel reference", async () => {
+    const reference = {
+      available: true as const,
+      messageId: "source",
+      targetType: "channel" as const,
+      targetId: "other-channel",
+      targetLabel: "origem",
+      authorDisplayName: "Alice",
+      bodyText: "https://bad.example",
+      bodyFormat: "v2" as const,
+      createdAt: "2026-08-18T10:00:00Z",
+      linkSafetyState: "inconclusive" as const,
+    };
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "source",
+          bodyText: "https://bad.example",
+          linkSafetyState: "inconclusive",
+        }),
+        makeMessage({
+          id: "quote-destination",
+          quoted: {
+            id: "source",
+            authorId: "author",
+            bodyText: "https://bad.example",
+            bodyFormat: "v2",
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: "2026-08-18T10:00:00Z",
+            linkSafetyState: "inconclusive",
+          },
+        }),
+        makeMessage({ id: "reference-destination", reference }),
+      ],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValue([
+      {
+        messageId: "source",
+        available: true,
+        status: "active",
+        linkSafetyState: "malicious",
+        updatedAt: "2099-08-18T12:00:00Z",
+      },
+      {
+        messageId: "quote-destination",
+        available: true,
+        status: "active",
+        linkSafetyState: "",
+        updatedAt: "2099-08-18T12:00:00Z",
+        quoted: {
+          messageId: "source",
+          status: "active",
+          linkSafetyState: "malicious",
+          updatedAt: "2099-08-18T12:00:00Z",
+        },
+      },
+    ]);
+    mockResolveChannelMessageReferences.mockResolvedValue({
+      "reference-destination": { ...reference, bodyText: "", linkSafetyState: "malicious" },
+    });
+
+    await reconnect();
+
+    await waitFor(() => {
+      expect(mockFetchChannelMessageSecuritySnapshots).toHaveBeenCalledWith(
+        "chan-1",
+        ["source", "quote-destination"],
+        expect.any(AbortSignal),
+      );
+      expect(mockResolveChannelMessageReferences).toHaveBeenCalledTimes(1);
+      expect(result.current.state.messages[0]).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+      });
+      expect(result.current.state.messages[1].quoted).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+      });
+      expect(result.current.state.messages[2].reference).toMatchObject({
+        linkSafetyState: "malicious",
+        bodyText: "",
+      });
+    });
+  });
+
+  it("removes the warning when an inconclusive source became safe offline", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "source", linkSafetyState: "inconclusive" })],
+      nextCursor: "",
+    });
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValue([
+      {
+        messageId: "source",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2099-08-18T12:00:00Z",
+      },
+    ]);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await reconnect();
+
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("safe"));
+  });
+
+  it("does not let an older reconnect snapshot overwrite a newer quote", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "quote-destination",
+          quoted: {
+            id: "source",
+            authorId: "author",
+            bodyText: "https://unverified.example",
+            bodyFormat: "v2",
+            isRemoved: false,
+            deletedAt: null,
+            createdAt: "2026-08-18T10:00:00Z",
+            updatedAt: "2026-08-18T14:00:00Z",
+            linkSafetyState: "inconclusive",
+          },
+        }),
+      ],
+      nextCursor: "",
+    });
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValue([
+      {
+        messageId: "quote-destination",
+        available: true,
+        status: "active",
+        linkSafetyState: "",
+        updatedAt: "2026-08-18T14:00:00Z",
+        quoted: {
+          messageId: "source",
+          status: "active",
+          linkSafetyState: "malicious",
+          updatedAt: "2026-08-18T13:00:00Z",
+        },
+      },
+    ]);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await reconnect();
+
+    await waitFor(() => expect(mockFetchChannelMessageSecuritySnapshots).toHaveBeenCalledOnce());
+    expect(result.current.state.messages[0].quoted).toMatchObject({
+      linkSafetyState: "inconclusive",
+      bodyText: "https://unverified.example",
+      updatedAt: "2026-08-18T14:00:00Z",
+    });
+  });
+
+  it("removes stale content when a reconnect snapshot is no longer available", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "source",
+          bodyText: "https://private.example",
+          linkSafetyState: "inconclusive",
+          reference: {
+            available: true,
+            messageId: "cross-channel-source",
+            targetType: "channel",
+            targetId: "other-channel",
+            targetLabel: "Other channel",
+            authorDisplayName: "Other",
+            bodyText: "https://private.example",
+            bodyFormat: "v2",
+            createdAt: "2026-08-18T10:00:00Z",
+            linkSafetyState: "inconclusive",
+          },
+        }),
+      ],
+      nextCursor: "",
+    });
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValue([
+      { messageId: "source", available: false },
+    ]);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await reconnect();
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0]).toMatchObject({
+        status: "deleted",
+        isRemoved: true,
+        bodyText: "",
+        reference: undefined,
+      }),
+    );
+  });
+});
+
+// CQ-004: an unrecognised link-safety state, over the websocket, must withdraw
+// the anchor rather than granting one.
+describe("useMessages unknown link-safety states", () => {
+  beforeEach(() => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    mockFetchLinkSafetyStatuses.mockResolvedValue([]);
+  });
+
+  it("decodes an unknown realtime state as unknown, not as inconclusive", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-unverified", linkSafetyState: "inconclusive" })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsLinkSafetyChanged("msg-unverified", "future_state_v2"));
+
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("unknown"));
+    // The message itself is untouched — it was published and stays published.
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0].status).toBe("active");
+  });
+
+  it("decodes an unknown state on a realtime creation as unknown", async () => {
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "chan-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventWithPayload(
+        "channel",
+        "chan-1",
+        makePayload({
+          id: "msg-new",
+          link_safety_state: "future_state_v2",
+        }),
+      );
+    });
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].linkSafetyState).toBe("unknown");
   });
 });

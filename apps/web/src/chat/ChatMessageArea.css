@@ -379,6 +379,109 @@
   opacity: 0.72;
 }
 
+/*
+ * RF-21 link-safety notices (issue #135).
+ *
+ * Two states, two deliberately different weights. The "could not verify" notice
+ * is informational and reuses the muted palette the pending-scan line already
+ * uses, because it is not an allegation about the link — the provider simply
+ * declined to produce a verdict. The blocked notice is the only one that reads as
+ * a warning, and it is the only one that withholds content.
+ */
+.chat-msg-area__link-notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  line-height: 1.45;
+  font-weight: 600;
+}
+
+.chat-msg-area__link-notice .material-symbols-outlined {
+  font-size: 15px;
+}
+
+.chat-msg-area__link-notice-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Discreet by design: a text button, not a call to action. Pressing it asks the
+   server to re-read a verdict it may already have — it never starts a scan, and
+   nothing about its prominence should suggest otherwise. */
+.chat-msg-area__link-notice-action {
+  flex: 0 0 auto;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--color-primary, #6b3fa0);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.chat-msg-area__link-notice-action:disabled {
+  color: var(--color-muted, #7c7390);
+  text-decoration: none;
+  cursor: default;
+}
+
+.chat-msg-area__link-notice-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6b3fa0);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.chat-msg-area__link-blocked {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--color-danger, #b3261e);
+  font-size: 11px;
+  line-height: 1.45;
+  font-weight: 700;
+}
+
+.chat-msg-area__link-blocked .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* The same treatment the removed-message placeholder gets: this is a tombstone
+   for content, not content. */
+.chat-msg-area__link-blocked-body {
+  color: var(--color-muted, #7c7390);
+  font-style: italic;
+}
+
+/*
+ * Autolinked URLs in a message body (issue #135).
+ *
+ * Underlined and coloured so a link is distinguishable from text without relying
+ * on colour alone — the underline is what carries the affordance for a reader who
+ * cannot tell the two hues apart. `overflow-wrap` keeps a long URL from widening
+ * the bubble past the column.
+ */
+.rtr-link {
+  color: var(--color-primary, #6b3fa0);
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
+.rtr-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.rtr-link:focus-visible {
+  outline: 2px solid var(--color-primary, #6b3fa0);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
 .chat-msg-area__quote--clickable {
   cursor: pointer;
 }

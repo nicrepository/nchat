@@ -60,14 +60,42 @@ type messageProvider interface {
 	CreateDMMessage(ctx context.Context, in service.CreateDMMessageInput) (domain.Message, error)
 	GetDMMessage(ctx context.Context, in service.GetDMMessageInput) (domain.Message, error)
 	ResolveMessageReferenceBatch(ctx context.Context, in service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error)
+	MessageSecuritySnapshots(ctx context.Context, in service.MessageSecuritySnapshotsInput) ([]service.MessageSecuritySnapshot, error)
 	EditMessage(ctx context.Context, in service.EditMessageInput) (domain.Message, error)
 	DeleteMessage(ctx context.Context, in service.DeleteMessageInput) (domain.Message, error)
 	GetMessageEditHistory(ctx context.Context, in service.GetMessageEditHistoryInput) ([]domain.MessageEditHistory, error)
 	MessageLinkSafetyStates(ctx context.Context, in service.LinkSafetyStatusInput) ([]domain.MessageLinkSafetyState, error)
 }
 
+// linkReconcileProvider is the LinkReconcileService interface used by the
+// "Verificar novamente" endpoint (issue #135).
+//
+// One method, taking a workspace, a viewer and a message id — and nothing else.
+// There is deliberately no parameter here that could carry a URL or a scan uuid:
+// the endpoint reads both from the database, which is what keeps it from becoming
+// a Cloudflare search proxy billed to this deployment's account.
+type linkReconcileProvider interface {
+	ReconcileMessage(ctx context.Context, in service.ReconcileMessageInput) (service.ReconcileMessageResult, error)
+	Ready() bool
+}
+
 type editRateLimiter interface {
 	AllowAction(ctx context.Context, userID, action string) (bool, error)
+}
+
+// actionRateLimiter is the shared, Valkey-backed fixed-window limiter with a
+// per-operation budget (issue #135, CQ-005).
+//
+// It is the same limiter the edit and reaction paths already use, asked for a
+// different allowance. An in-process limiter was wrong here for a reason that
+// scales with the deployment: it gives every replica its own full budget, so N
+// pods admit N × the intended rate at the only user-triggered route that reaches
+// a paid third party. The counter has to live where all the pods can see it.
+//
+// The key is derived inside the limiter and hashes the user id, so no PII
+// reaches Valkey, a log or a metric.
+type actionRateLimiter interface {
+	AllowActionWithLimit(ctx context.Context, userID, action string, maxActions, windowSeconds int) (bool, error)
 }
 
 type workspaceSettingsAuthorizer interface {
@@ -89,6 +117,13 @@ type MessageHandler struct {
 	settings       storage.WorkspaceSettingsStore
 	settingsAuth   workspaceSettingsAuthorizer
 	editLimiter    editRateLimiter
+	// linkReconcile answers "Verificar novamente" (issue #135). Nil is a working
+	// deployment: the route then answers 503 rather than pretending it looked.
+	linkReconcile linkReconcileProvider
+	// reconcileLimiter is the deployment-wide budget for that route. Nil means the
+	// route answers 503 rather than running unlimited: a limiter that cannot be
+	// consulted is not permission to spend the provider's quota.
+	reconcileLimiter actionRateLimiter
 	// antiSpam is the RF-19 guard, held only so a policy update can invalidate
 	// its cache. Nil is safe: Invalidate is a no-op and the guard's TTL still
 	// picks the new value up.
@@ -105,6 +140,20 @@ func (h *MessageHandler) WithEditing(settings storage.WorkspaceSettingsStore, au
 // of the guard enforcing the limit in this process (issue #419).
 func (h *MessageHandler) WithAntiSpam(guard *AntiSpamGuard) *MessageHandler {
 	h.antiSpam = guard
+	return h
+}
+
+// WithLinkReconcile enables the RF-21 "check again" endpoint (issue #135).
+//
+// Both dependencies are required for the route to serve: the use case, and the
+// shared limiter that bounds it across every replica. Returns the handler for
+// chaining; when never called, or called with either half missing, the route
+// answers 503.
+func (h *MessageHandler) WithLinkReconcile(
+	reconcile linkReconcileProvider, limiter actionRateLimiter,
+) *MessageHandler {
+	h.linkReconcile = reconcile
+	h.reconcileLimiter = limiter
 	return h
 }
 
@@ -142,26 +191,33 @@ func (h *MessageHandler) Ready() bool {
 // messageJSON is the outbound representation of a single message.
 // body_text is suppressed for deleted messages; is_removed is set instead.
 type messageJSON struct {
-	ID                string         `json:"id"`
-	SenderID          string         `json:"sender_id"`
-	SenderDisplayName string         `json:"sender_display_name,omitempty"`
-	SenderEmail       string         `json:"sender_email,omitempty"`
-	Kind              string         `json:"kind"`
-	BodyText          string         `json:"body_text,omitempty"`
-	BodyFormat        string         `json:"body_format"`
-	IsRemoved         bool           `json:"is_removed,omitempty"`
-	Status            string         `json:"status"`
-	DeletedAt         *time.Time     `json:"deleted_at,omitempty"`
-	CreatedAt         time.Time      `json:"created_at"`
-	UpdatedAt         time.Time      `json:"updated_at"`
-	EditedAt          *time.Time     `json:"edited_at,omitempty"`
-	EditCount         int            `json:"edit_count"`
-	IsEdited          bool           `json:"is_edited"`
-	Reactions         []reactionJSON `json:"reactions"`
-	IsFavorited       bool           `json:"is_favorited,omitempty"`
-	IsForwarded       bool           `json:"is_forwarded"`
-	Quoted            *quoteJSON     `json:"quoted,omitempty"`
-	Reference         *referenceJSON `json:"reference,omitempty"`
+	ID                string `json:"id"`
+	SenderID          string `json:"sender_id"`
+	SenderDisplayName string `json:"sender_display_name,omitempty"`
+	SenderEmail       string `json:"sender_email,omitempty"`
+	Kind              string `json:"kind"`
+	BodyText          string `json:"body_text,omitempty"`
+	BodyFormat        string `json:"body_format"`
+	IsRemoved         bool   `json:"is_removed,omitempty"`
+	Status            string `json:"status"`
+	// LinkSafetyState is the link-safety axis and is independent of Status
+	// (issue #135): a published message whose links could not all be verified is
+	// `active` and carries "inconclusive" here. It is what the client draws the
+	// notice from, and it authorises nothing — file-service re-derives its own
+	// verdict from its own store on every preview request. Omitted for a message
+	// with no link-safety opinion, which is almost all of them.
+	LinkSafetyState string         `json:"link_safety_state,omitempty"`
+	DeletedAt       *time.Time     `json:"deleted_at,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	EditedAt        *time.Time     `json:"edited_at,omitempty"`
+	EditCount       int            `json:"edit_count"`
+	IsEdited        bool           `json:"is_edited"`
+	Reactions       []reactionJSON `json:"reactions"`
+	IsFavorited     bool           `json:"is_favorited,omitempty"`
+	IsForwarded     bool           `json:"is_forwarded"`
+	Quoted          *quoteJSON     `json:"quoted,omitempty"`
+	Reference       *referenceJSON `json:"reference,omitempty"`
 	// Attachments is omitted entirely for a message that carries none, so every
 	// existing text-only response is byte-for-byte what it was.
 	Attachments []messageAttachmentJSON `json:"attachments,omitempty"`
@@ -193,6 +249,11 @@ type quoteJSON struct {
 	IsRemoved  bool       `json:"is_removed,omitempty"`
 	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	// Empty unless the quoted message's own links were condemned, in which case
+	// Body above is already empty and this is what tells the client to say so
+	// rather than draw a blank quote (issue #135, CQ-002).
+	LinkSafetyState string `json:"link_safety_state,omitempty"`
 }
 
 type referenceJSON struct {
@@ -205,6 +266,8 @@ type referenceJSON struct {
 	Body              string     `json:"body,omitempty"`
 	BodyFormat        string     `json:"body_format,omitempty"`
 	CreatedAt         *time.Time `json:"created_at,omitempty"`
+	UpdatedAt         *time.Time `json:"updated_at,omitempty"`
+	LinkSafetyState   string     `json:"link_safety_state,omitempty"`
 }
 
 type reactionJSON struct {
@@ -251,6 +314,30 @@ type messageReferenceResolutionJSON struct {
 
 type messageReferenceResolutionsData struct {
 	References []messageReferenceResolutionJSON `json:"references"`
+}
+
+type messageSecuritySnapshotsRequest struct {
+	MessageIDs []string `json:"message_ids"`
+}
+
+type quotedMessageSecuritySnapshotJSON struct {
+	MessageID       string `json:"message_id"`
+	Status          string `json:"status"`
+	LinkSafetyState string `json:"link_safety_state"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+type messageSecuritySnapshotJSON struct {
+	MessageID       string                             `json:"message_id"`
+	Available       bool                               `json:"available"`
+	Status          string                             `json:"status,omitempty"`
+	LinkSafetyState string                             `json:"link_safety_state,omitempty"`
+	UpdatedAt       string                             `json:"updated_at,omitempty"`
+	Quoted          *quotedMessageSecuritySnapshotJSON `json:"quoted,omitempty"`
+}
+
+type messageSecuritySnapshotsData struct {
+	Snapshots []messageSecuritySnapshotJSON `json:"snapshots"`
 }
 
 type mentionJSON struct {
@@ -425,6 +512,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		Kind:              string(m.Kind),
 		BodyFormat:        string(m.BodyFormat),
 		Status:            string(m.Status),
+		LinkSafetyState:   string(m.LinkSafety),
 		CreatedAt:         m.CreatedAt,
 		UpdatedAt:         m.UpdatedAt,
 		EditedAt:          editedAt,
@@ -487,12 +575,13 @@ func mapDomainReferenceJSON(ref domain.MessageReference) referenceJSON {
 	if !ref.Available {
 		return referenceJSON{Available: false}
 	}
-	createdAt := ref.CreatedAt
+	createdAt, updatedAt := ref.CreatedAt, ref.UpdatedAt
 	return referenceJSON{
 		Available: true, MessageID: ref.MessageID,
 		TargetType: ref.TargetType, TargetID: ref.TargetID,
 		TargetLabel: ref.TargetLabel, AuthorDisplayName: ref.AuthorDisplayName,
-		Body: ref.BodyText, BodyFormat: string(ref.BodyFormat), CreatedAt: &createdAt,
+		Body: ref.BodyText, BodyFormat: string(ref.BodyFormat), CreatedAt: &createdAt, UpdatedAt: &updatedAt,
+		LinkSafetyState: string(ref.LinkSafety),
 	}
 }
 
@@ -512,6 +601,9 @@ func mapQuoteJSON(q *domain.QuotedMessage) *quoteJSON {
 		IsRemoved:  q.Status == domain.MessageStatusDeleted || deletedAt != nil,
 		DeletedAt:  deletedAt,
 		CreatedAt:  q.CreatedAt,
+		UpdatedAt:  q.UpdatedAt,
+
+		LinkSafetyState: string(q.LinkSafety),
 	}
 	if !j.IsRemoved {
 		j.Body = q.BodyText
@@ -1370,6 +1462,68 @@ func (h *MessageHandler) resolveMessageReferences(w http.ResponseWriter, r *http
 	httputil.WriteJSON(w, http.StatusOK, response)
 }
 
+func (h *MessageHandler) GetChannelMessageSecuritySnapshots(w http.ResponseWriter, r *http.Request) {
+	h.getMessageSecuritySnapshots(w, r, r.PathValue("channelID"), "")
+}
+
+func (h *MessageHandler) GetDMMessageSecuritySnapshots(w http.ResponseWriter, r *http.Request) {
+	h.getMessageSecuritySnapshots(w, r, "", r.PathValue("conversationID"))
+}
+
+func (h *MessageHandler) getMessageSecuritySnapshots(w http.ResponseWriter, r *http.Request, channelID, conversationID string) {
+	if !h.checkDeps(w) {
+		return
+	}
+	targetID, targetParam := channelID, "channel_id"
+	if targetID == "" {
+		targetID, targetParam = conversationID, "conversation_id"
+	}
+	if !validateTargetID(w, targetID, targetParam) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var req messageSecuritySnapshotsRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	snapshots, err := h.messages.MessageSecuritySnapshots(r.Context(), service.MessageSecuritySnapshotsInput{
+		WorkspaceID: workspaceID, ChannelID: channelID, DMConversationID: conversationID,
+		CallerID: userID, MessageIDs: req.MessageIDs,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	response := messageSecuritySnapshotsData{Snapshots: make([]messageSecuritySnapshotJSON, 0, len(snapshots))}
+	for _, snapshot := range snapshots {
+		item := messageSecuritySnapshotJSON{
+			MessageID: snapshot.MessageID, Available: snapshot.Available,
+			Status:          string(snapshot.Status),
+			LinkSafetyState: string(snapshot.LinkSafetyState),
+		}
+		if snapshot.Available {
+			item.UpdatedAt = snapshot.UpdatedAt.UTC().Format(time.RFC3339Nano)
+		}
+		if snapshot.Quoted != nil {
+			item.Quoted = &quotedMessageSecuritySnapshotJSON{
+				MessageID: snapshot.Quoted.MessageID, Status: string(snapshot.Quoted.Status),
+				LinkSafetyState: string(snapshot.Quoted.LinkSafetyState),
+				UpdatedAt:       snapshot.Quoted.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			}
+		}
+		response.Snapshots = append(response.Snapshots, item)
+	}
+	httputil.WriteJSON(w, http.StatusOK, response)
+}
+
 // GetMessageLinkSafetyStatus answers what became of the caller's own withheld
 // messages (RF-21).
 //
@@ -1412,6 +1566,109 @@ func (h *MessageHandler) GetMessageLinkSafetyStatus(w http.ResponseWriter, r *ht
 		response.Statuses = append(response.Statuses, status)
 	}
 	httputil.WriteJSON(w, http.StatusOK, response)
+}
+
+// linkSafetyReconcileResponse is what "Verificar novamente" answers with.
+//
+// Three fields, and the omissions are the contract. There is no URL, no scan uuid,
+// no provider status, no error text and no count of links examined: a reader
+// asking whether a warning can go away needs the answer, and every one of those
+// would be either an account-internal identifier or a probe. In particular
+// nothing here reports whether a *new scan* was started, because none ever is.
+type linkSafetyReconcileResponse struct {
+	// LinkSafetyState is the message's authoritative state after the attempt —
+	// the same closed set the message payload carries. Answered even when nothing
+	// changed, so a client never has to infer.
+	LinkSafetyState string `json:"link_safety_state"`
+	// UpdatedAt orders this readback against websocket create/edit/correction
+	// events without trusting the client's clock.
+	UpdatedAt time.Time `json:"updated_at"`
+	// RetryAfterSeconds is how long to wait before asking again. It is a hint for
+	// disabling the button, never a promise that waiting produces an answer.
+	RetryAfterSeconds int `json:"retry_after_seconds"`
+}
+
+// ReconcileMessageLinkSafety takes a second look at one message's unverified
+// links (issue #135).
+//
+// # What it does not do
+//
+// It does not submit a scan. Cloudflare has no idempotency token, so a second POST
+// is a second billed scan, and the production case this endpoint exists for is a
+// provider refusal that says the hostname was scanned too recently — the one
+// situation where another POST cannot help. What it does is search this account's
+// own scan history for exactly this URL and, if it finds one, read that scan's
+// full report. There is no "force scan" variant of this route and no parameter
+// that could become one.
+//
+// # Why the body is empty
+//
+// The client sends a message id in the path and nothing else. It does not send a
+// URL and it does not send a scan uuid: both are read server-side, from the
+// associations recorded when the message was created. A client that could name a
+// URL would have turned this into a Cloudflare proxy anyone with an account could
+// use, paid for by this deployment.
+//
+// # Authorization and rate limiting
+//
+// Authentication and session validity are the router's; the workspace is resolved
+// from the session. The service then applies the ordinary message-read
+// authorization — active membership plus channel visibility or DM participation —
+// and answers 404 for anything this caller may not read, so the endpoint cannot be
+// used to discover message ids. Two rate limits stack: a per-user budget in the
+// router, and a deployment-wide once-a-minute-per-URL cooldown in the database, so
+// a channel full of people clicking one warning costs one provider search.
+func (h *MessageHandler) ReconcileMessageLinkSafety(w http.ResponseWriter, r *http.Request) {
+	if h.linkReconcile == nil || !h.linkReconcile.Ready() || h.reconcileLimiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
+			"link verification is not available")
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	// The deployment-wide per-user budget, applied before anything else costs
+	// work. It is deliberately the shared Valkey counter rather than an in-process
+	// one: this is the only user-triggered route that reaches a paid third party,
+	// and a per-replica budget would multiply by the pod count.
+	//
+	// A limiter that cannot answer is a refusal, not a pass. Not knowing whether
+	// there is allowance left is not permission to spend it.
+	allowed, err := h.reconcileLimiter.AllowActionWithLimit(
+		r.Context(), userID, linkReconcileAction,
+		linkReconcileRateLimit, int(linkReconcileRateWindow.Seconds()))
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
+			"link verification is not available")
+		return
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(linkReconcileRateWindow.Seconds())))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return
+	}
+	messageID := r.PathValue("messageID")
+	if !validateTargetID(w, messageID, "messageID") {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+	result, err := h.linkReconcile.ReconcileMessage(r.Context(), service.ReconcileMessageInput{
+		WorkspaceID: workspaceID, ViewerID: userID, MessageID: messageID,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, linkSafetyReconcileResponse{
+		LinkSafetyState:   string(result.State),
+		UpdatedAt:         result.UpdatedAt,
+		RetryAfterSeconds: int(result.RetryAfter.Seconds()),
+	})
 }
 
 func mapMessages(msgs []domain.Message) []messageJSON {

@@ -1004,6 +1004,70 @@ describe("useChatWebSocket", () => {
     expect(onAttachmentStatus).toHaveBeenCalledOnce();
   });
 
+  it("routes a versioned link-safety correction for a subscribed target", () => {
+    const onLinkSafetyChanged = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageLinkSafetyChanged: onLinkSafetyChanged,
+      }),
+    );
+    const event = {
+      type: "message.link_safety_changed",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      link_safety: {
+        message_id: "msg-1",
+        state: "malicious",
+        updated_at: "2026-08-18T12:00:00Z",
+      },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage(event);
+    });
+
+    expect(onLinkSafetyChanged).toHaveBeenCalledWith(event);
+  });
+
+  it("rejects an unversioned or mismatched link-safety correction", () => {
+    const onLinkSafetyChanged = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageLinkSafetyChanged: onLinkSafetyChanged,
+      }),
+    );
+    const event = {
+      type: "message.link_safety_changed",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      link_safety: { message_id: "msg-1", state: "malicious" },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage(event);
+      FakeWebSocket.instances[0].simulateMessage({
+        ...event,
+        link_safety: {
+          ...event.link_safety,
+          message_id: "msg-2",
+          updated_at: "2026-08-18T12:00:00Z",
+        },
+      });
+    });
+
+    expect(onLinkSafetyChanged).not.toHaveBeenCalled();
+  });
+
   it("routes every supported message.updated body format only for the active target", () => {
     const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
     renderHook(() =>
@@ -1026,6 +1090,7 @@ describe("useChatWebSocket", () => {
         edited_at: "2026-07-13T12:00:00Z",
         edit_count: 2,
         is_edited: true,
+        link_safety_state: "inconclusive",
       },
     };
 
@@ -1518,5 +1583,191 @@ describe("useChatWebSocket", () => {
       .map((message) => JSON.parse(message) as Record<string, unknown>)
       .find((message) => message["type"] === "unsubscribe");
     expect(unsubscribe).toMatchObject({ target_type: "channel", target_id: canonical });
+  });
+
+  // ── RF-21 sender-scoped refusal ─────────────────────────────────────────────
+
+  // message.blocked is addressed to a user rather than to a conversation, so it
+  // carries no target to match against and is routed ahead of the subscription
+  // guard. Without a message id there is nothing for the author's composer to
+  // stop waiting on, so the event is dropped rather than forwarded half-formed.
+  it.each([
+    { name: "no message id at all", body: { reason: "malicious_link" } },
+    { name: "a numeric message id", body: { message_id: 42, reason: "malicious_link" } },
+    { name: "a null message id", body: { message_id: null, reason: "malicious_link" } },
+    {
+      name: "an object message id",
+      body: { message_id: { id: "msg-1" }, reason: "malicious_link" },
+    },
+  ])("ignores a message.blocked event with $name", ({ body }) => {
+    const onMessageBlocked = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageBlocked,
+      }),
+    );
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage({ type: "message.blocked", ...body });
+    });
+
+    expect(onMessageBlocked).not.toHaveBeenCalled();
+  });
+
+  it("routes message.blocked to its author before the subscription guard", () => {
+    const onMessageBlocked = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageBlocked,
+      }),
+    );
+    const event = { type: "message.blocked", message_id: "msg-1", reason: "malicious_link" };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      // Deliberately no acknowledgement first: the author must be told even
+      // though this client has confirmed no target, which is exactly why the
+      // event is routed before the subscription guard.
+      FakeWebSocket.instances[0].simulateMessage(event);
+    });
+
+    expect(onMessageBlocked).toHaveBeenCalledOnce();
+    expect(onMessageBlocked).toHaveBeenCalledWith(event);
+  });
+
+  // A reaction is a mutating action on the conversation the user has open. A
+  // subscribed-but-background target still receives corrections (link safety,
+  // attachment status), but not this.
+  it("keeps mutating events scoped to the primary target", () => {
+    const onReactionUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+        onReactionUpdated,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => {
+      socket.simulateOpen();
+      socket.simulateMessage(subscribed("channel", "ch-a"));
+      socket.simulateMessage(subscribed("dm", "dm-b"));
+    });
+
+    act(() =>
+      socket.simulateMessage({
+        type: "reaction.updated",
+        target_type: "dm",
+        target_id: "dm-b",
+        message_id: "msg-1",
+      }),
+    );
+    expect(onReactionUpdated).not.toHaveBeenCalled();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-a",
+        message_id: "msg-1",
+      }),
+    );
+    expect(onReactionUpdated).toHaveBeenCalledOnce();
+  });
+
+  it("routes pin.updated for the primary target", () => {
+    const onPinUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onPinUpdated,
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    const event = {
+      type: "pin.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      pinned: true,
+    };
+
+    act(() => {
+      socket.simulateOpen();
+      socket.simulateMessage(subscribed("channel", "ch-1"));
+      socket.simulateMessage(event);
+    });
+
+    expect(onPinUpdated).toHaveBeenCalledOnce();
+    expect(onPinUpdated).toHaveBeenCalledWith(event);
+  });
+
+  // A second consumer joining a socket that already holds the subscriptions it
+  // wants is acknowledged from what the connection knows, without re-asking the
+  // server. Re-subscribing would be both a wasted round trip and a way for a
+  // background panel to reset the recovery state of the conversation on screen.
+  it("adopts subscriptions the shared socket already holds for a second consumer", async () => {
+    const first = renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+      }),
+    );
+    const socket = FakeWebSocket.instances[0];
+    act(() => {
+      socket.simulateOpen();
+      socket.simulateMessage(subscribed("channel", "ch-a"));
+      socket.simulateMessage(subscribed("dm", "dm-b"));
+    });
+    const framesBefore = subscriptionCount(socket);
+
+    const onSubscribed = vi.fn();
+    const second = renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-a",
+        additionalTargets: [{ kind: "dm", targetId: "dm-b" }],
+        onMessageCreated: vi.fn(),
+        onSubscribed,
+      }),
+    );
+    // Joining an open socket defers the open callback by one microtask, so the
+    // consumer has its handle before it is asked to subscribe.
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(subscriptionCount(socket)).toBe(framesBefore);
+    // Both the join callback and the subscription-declaration effect resolve the
+    // same already-live targets, so the consumer can be notified more than once.
+    // What must hold is that every notification is the primary acknowledgement:
+    // a consumer told it is subscribed to the wrong conversation would render
+    // that conversation's history under the one the user actually opened.
+    expect(onSubscribed).toHaveBeenCalled();
+    for (const [acknowledgement] of onSubscribed.mock.calls) {
+      expect(acknowledgement).toMatchObject({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "ch-a",
+      });
+    }
+
+    second.unmount();
+    first.unmount();
   });
 });

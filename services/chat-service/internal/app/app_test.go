@@ -550,6 +550,17 @@ func TestDomainMessageToWSUpdatedPayloadWithholdsDeletedBody(t *testing.T) {
 	}
 }
 
+func TestDomainMessageToWSUpdatedPayloadCarriesLinkSafetyState(t *testing.T) {
+	got := domainMessageToWSUpdatedPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		BodyText: "https://example.test", BodyFormat: domain.MessageBodyFormatV3,
+		Status: domain.MessageStatusActive, LinkSafety: domain.MessageLinkSafetyInconclusive,
+	})
+	if got.LinkSafetyState != "inconclusive" {
+		t.Fatalf("link safety state = %q, want inconclusive", got.LinkSafetyState)
+	}
+}
+
 func TestDomainMessageToWSPayloadMapsDeletedQuotePlaceholder(t *testing.T) {
 	now := time.Now().UTC()
 	got := domainMessageToWSPayload(domain.Message{
@@ -565,6 +576,20 @@ func TestDomainMessageToWSPayloadMapsDeletedQuotePlaceholder(t *testing.T) {
 	}
 	if !got.Quoted.IsRemoved || got.Quoted.DeletedAt == nil || got.Quoted.Body != "" {
 		t.Fatalf("deleted quoted body must be withheld: %+v", got.Quoted)
+	}
+}
+
+func TestDomainMessageToWSPayloadCarriesMaliciousQuoteState(t *testing.T) {
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		Quoted: &domain.QuotedMessage{
+			ID: "parent-1", AuthorID: "user-2", BodyText: "",
+			BodyFormat: domain.MessageBodyFormatV2, Status: domain.MessageStatusActive,
+			LinkSafety: domain.MessageLinkSafetyMalicious, CreatedAt: time.Now().UTC(),
+		},
+	})
+	if got.Quoted == nil || got.Quoted.LinkSafetyState != "malicious" || got.Quoted.Body != "" {
+		t.Fatalf("malicious quoted payload = %+v", got.Quoted)
 	}
 }
 
@@ -623,6 +648,31 @@ func TestHubBroadcasterPublishesUpdatedMessage(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("message.updated was not published")
+	}
+}
+
+func TestHubBroadcasterPublishesLinkSafetyEvents(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 2)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-link-safety-broadcaster")
+	t.Cleanup(hub.Shutdown)
+	broadcaster := &hubBroadcaster{hub: hub}
+	updatedAt := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	broadcaster.PublishMessageLinkSafetyChanged(
+		t.Context(), "workspace-1", "channel", "channel-1", "message-1", "safe", updatedAt,
+	)
+	broadcaster.PublishMessageBlocked(
+		t.Context(), "workspace-1", "author-1", "message-2", ws.MessageBlockedReasonMaliciousLink,
+	)
+
+	events := publishedEvents(t, bus, 2)
+	if events[0].TargetType != ws.TargetTypeChannel || events[0].LinkSafety == nil ||
+		events[0].LinkSafety.State != "safe" || !events[0].LinkSafety.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("unexpected link-safety correction: %+v", events[0])
+	}
+	if events[1].Type != ws.EventTypeMessageBlocked || events[1].RecipientUserID != "author-1" ||
+		events[1].Reason != ws.MessageBlockedReasonMaliciousLink {
+		t.Fatalf("unexpected blocked event: %+v", events[1])
 	}
 }
 
@@ -898,12 +948,15 @@ func TestNewRefusesInvalidLinkSafetyFlag(t *testing.T) {
 func TestWireLinkSafetySkipsWhenDisabled(t *testing.T) {
 	svc := &service.MessageService{}
 
-	worker, err := wireLinkSafety(config.Config{LinkSafetyEnabled: false}, svc, stubLinkStore{}, nil, nil, nil)
+	wiring, err := wireLinkSafety(config.Config{LinkSafetyEnabled: false}, svc, stubLinkStore{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("a disabled check must need no credentials: %v", err)
 	}
-	if worker != nil {
+	if wiring.Scan != nil {
 		t.Fatal("no scan worker may be built when the flag is off")
+	}
+	if wiring.Reconcile != nil {
+		t.Fatal("no reconcile worker may be built when the flag is off")
 	}
 	if svc.HasLinkSafety() {
 		t.Fatal("no gate may be installed when the flag is off")
@@ -918,15 +971,21 @@ func TestWireLinkSafetyInstallsGateWhenEnabled(t *testing.T) {
 		LinkSafetyCloudflareToken:   "token-abc",
 	}
 
-	worker, err := wireLinkSafety(cfg, svc, stubLinkStore{}, nil, nil, nil)
+	wiring, err := wireLinkSafety(cfg, svc, stubLinkStore{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("a valid configuration must wire: %v", err)
 	}
 	if !svc.HasLinkSafety() {
 		t.Fatal("the flag was on and no gate was installed")
 	}
-	if worker == nil {
+	if wiring.Scan == nil {
 		t.Fatal("the flag was on and no scan worker was built")
+	}
+	// The recovery half (issue #135). Without it an inconclusive link would be
+	// permanent: the message stays published and the server's permission to fetch
+	// the URL could never be restored, in either direction.
+	if wiring.Reconcile == nil || !wiring.Reconcile.Ready() {
+		t.Fatal("the flag was on and no reconcile worker was built")
 	}
 }
 
@@ -1029,4 +1088,44 @@ func (stubLinkStore) PublishOutboxBacklog(context.Context) (int, time.Duration, 
 
 func (stubLinkStore) LinkScanBacklog(context.Context) (map[string]int, time.Duration, error) {
 	return map[string]int{}, 0, nil
+}
+
+// The issue #135 reconciliation half. Note what the interface does not require
+// and therefore what this stub cannot provide: there is no submit, no attempt
+// reset and no way to write status='pending'.
+
+func (stubLinkStore) MessageInconclusiveURLs(
+	context.Context, string, string, string,
+) ([]string, error) {
+	return nil, domain.ErrNotFound
+}
+
+func (stubLinkStore) MessageLinkSafety(
+	context.Context, string, string, string,
+) (domain.MessageLinkSafety, time.Time, error) {
+	return domain.MessageLinkSafetyNone, time.Time{}, domain.ErrNotFound
+}
+
+func (stubLinkStore) ClaimManualReconcile(
+	context.Context, []string,
+) ([]storage.InconclusiveScan, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) ClaimDueInconclusiveScans(
+	context.Context, int,
+) ([]storage.InconclusiveScan, error) {
+	return nil, nil
+}
+
+func (stubLinkStore) ReconcileLinkVerdict(
+	context.Context, string, string, urlsafety.ScanEvidence,
+) error {
+	return nil
+}
+
+func (stubLinkStore) RefreshMessageLinkSafety(
+	context.Context, string,
+) ([]storage.MessageLinkSafetyChange, error) {
+	return nil, nil
 }

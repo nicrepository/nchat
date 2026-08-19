@@ -33,6 +33,7 @@ func TestLinkScanCreateReplayPostgreSQL(t *testing.T) {
 		conversation = "e4000000-0000-4000-8000-000000000003"
 		author       = "e4000000-0000-4000-8000-000000000004"
 		other        = "e4000000-0000-4000-8000-000000000005"
+		destination  = "e4000000-0000-4000-8000-000000000006"
 
 		scannedURL  = "https://replay.example/article"
 		fingerprint = "fp-replay"
@@ -56,8 +57,9 @@ func TestLinkScanCreateReplayPostgreSQL(t *testing.T) {
 		  VALUES ($1, $2, 'active'), ($1, $3, 'active') ON CONFLICT DO NOTHING`,
 			[]any{workspace, author, other}},
 		{`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status)
-		  VALUES ($2, $1, 'rf21-replay', 'RF21 replay', 'public', 'active')
-		  ON CONFLICT (id) DO NOTHING`, []any{workspace, channel}},
+		  VALUES ($2, $1, 'rf21-replay', 'RF21 replay', 'public', 'active'),
+		         ($3, $1, 'rf21-replay-destination', 'RF21 replay destination', 'public', 'active')
+		  ON CONFLICT (id) DO NOTHING`, []any{workspace, channel, destination}},
 		// A mention is only valid for somebody who is in the channel, so the
 		// membership is part of the fixture rather than an assumption.
 		{`INSERT INTO chat.channel_members (channel_id, user_id)
@@ -244,6 +246,40 @@ func TestLinkScanCreateReplayPostgreSQL(t *testing.T) {
 		}
 		if notified != 1 || parked != 0 {
 			t.Fatalf("notified=%d parked=%d, want the mention delivered at once", notified, parked)
+		}
+	})
+
+	t.Run("a cached-safe message stores its authoritative marker", func(t *testing.T) {
+		published, err := store.CreateMessage(ctx, storage.CreateMessageInput{
+			WorkspaceID: workspace, ChannelID: channel, SenderID: author,
+			BodyText: "veja " + scannedURL, BodyFormat: domain.MessageBodyFormatV2,
+			LinkScanURLs: []string{scannedURL}, LinkSafetyFingerprint: fingerprint,
+			LinkSafetyState: domain.MessageLinkSafetySafe,
+			IdempotencyKey:  "key-cached-safe",
+		})
+		if err != nil {
+			t.Fatalf("CreateMessage: %v", err)
+		}
+		if published.Status != domain.MessageStatusActive ||
+			published.LinkSafety != domain.MessageLinkSafetySafe {
+			t.Fatalf("message=%q/%q, want active/safe",
+				published.Status, published.LinkSafety)
+		}
+
+		forwarded, err := store.ForwardChannelMessage(ctx, storage.ForwardChannelMessageInput{
+			WorkspaceID: workspace, DestinationChannelID: destination, ActorID: author,
+			SourceMessageID: published.ID, IdempotencyKey: "forward-cached-safe",
+			BodyText: published.BodyText, BodyFormat: published.BodyFormat,
+			LinkScanURLs: []string{scannedURL}, LinkSafetyFingerprint: fingerprint,
+			LinkSafetyState: domain.MessageLinkSafetySafe,
+		})
+		if err != nil {
+			t.Fatalf("ForwardChannelMessage: %v", err)
+		}
+		if forwarded.Message.Status != domain.MessageStatusActive ||
+			forwarded.Message.LinkSafety != domain.MessageLinkSafetySafe {
+			t.Fatalf("forward=%q/%q, want active/safe",
+				forwarded.Message.Status, forwarded.Message.LinkSafety)
 		}
 	})
 
