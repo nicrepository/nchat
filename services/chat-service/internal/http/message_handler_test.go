@@ -2290,3 +2290,53 @@ func TestMessageHandler_LinkSafetyStatus_RejectsAnUnboundedBatch(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+// The batch body is decoded strictly, so an unknown field is refused rather than
+// ignored. A tolerant decoder here would let a client attach a field the handler
+// does not read today and a later version might — and the request would already
+// have been accepted under the old rules.
+func TestMessageHandler_LinkSafetyStatus_RefusesAnUnrecognisedBody(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown field": `{"message_ids":["` + testMessageID + `"],"canonical_url":"https://example.test/x"}`,
+		"malformed":     `{"message_ids":`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			messages := &fakeMessageProvider{}
+			handler := makeHandlerWithUser(
+				&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+			request := requestWithUser(
+				http.MethodPost, httpapi.RouteMessageLinkSafetyStatus, strings.NewReader(body))
+			recorder := httptest.NewRecorder()
+
+			handler.GetMessageLinkSafetyStatus(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if messages.lastLinkSafetyInput.SenderID != "" {
+				t.Fatal("an undecodable body reached the service")
+			}
+		})
+	}
+}
+
+// A workspace that cannot be resolved is not an empty workspace. Falling through
+// with a blank id would ask the service for states scoped to nothing, and the
+// scoping is what keeps one workspace's message ids out of another's answer.
+func TestMessageHandler_LinkSafetyStatus_RefusesWhenTheWorkspaceIsUnresolved(t *testing.T) {
+	messages := &fakeMessageProvider{}
+	handler := makeHandlerWithUser(
+		&fakeWorkspaceResolver{err: errors.New("workspace lookup failed")}, messages)
+	request := requestWithUser(http.MethodPost, httpapi.RouteMessageLinkSafetyStatus,
+		strings.NewReader(`{"message_ids":["`+testMessageID+`"]}`))
+	recorder := httptest.NewRecorder()
+
+	handler.GetMessageLinkSafetyStatus(recorder, request)
+
+	if recorder.Code < 500 {
+		t.Fatalf("expected a server error, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if messages.lastLinkSafetyInput.SenderID != "" {
+		t.Fatal("an unresolved workspace still reached the service")
+	}
+}

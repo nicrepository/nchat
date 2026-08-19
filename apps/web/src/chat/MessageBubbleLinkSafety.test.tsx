@@ -27,7 +27,8 @@ import type { LinkSafetyRecheck, Message } from "./chatTypes";
 
 const linkURL = "https://example.test/some/page";
 
-const noticeText = "Não foi possível verificar este link agora. A prévia automática não foi carregada.";
+const noticeText =
+  "Não foi possível verificar este link agora. A prévia automática não foi carregada.";
 const blockedText = "Este link foi bloqueado após a verificação de segurança.";
 
 function messageWith(overrides: Partial<Message> = {}): Message {
@@ -193,7 +194,9 @@ describe("a condemned link", () => {
     expect(screen.getByTestId("chat-message-link-blocked")).toHaveTextContent(blockedText);
     // The body is withheld: the body *is* the link as far as the risk goes, and a
     // URL a reader can select and paste is a URL the block did not stop.
-    expect(screen.queryByText(new RegExp(linkURL.replace(/[/.?]/g, "\\$&")))).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(new RegExp(linkURL.replace(/[/.?]/g, "\\$&"))),
+    ).not.toBeInTheDocument();
     // The author and timestamp stay, so the conversation still makes sense.
     expect(screen.getByText("Alex")).toBeInTheDocument();
     expectNoClientSideFetch(container);

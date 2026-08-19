@@ -368,6 +368,39 @@ func TestRecordLinkVerdictMaliciousInvalidationPostgreSQL(t *testing.T) {
 	}
 }
 
+func TestLookupInconclusiveScansPostgreSQL(t *testing.T) {
+	ctx := t.Context()
+	pool := newLinkScanTestPool(t)
+	store := storage.NewPGXMessageStore(pool)
+	urls := []string{
+		"https://lookup-inconclusive.example/eligible",
+		"https://lookup-inconclusive.example/safe",
+		"https://lookup-inconclusive.example/unsubmitted",
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM chat.link_scans WHERE canonical_url = ANY($1::text[])`, urls)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chat.link_scans (canonical_url, status, scan_uuid, decided_at)
+		VALUES ($1, 'inconclusive', 'scan-eligible', now()),
+		       ($2, 'safe', 'scan-safe', now()),
+		       ($3, 'inconclusive', NULL, now())`, urls[0], urls[1], urls[2]); err != nil {
+		t.Fatalf("seed scans: %v", err)
+	}
+
+	scans, err := store.LookupInconclusiveScans(ctx, urls)
+	if err != nil {
+		t.Fatalf("LookupInconclusiveScans: %v", err)
+	}
+	if len(scans) != 1 || scans[0].CanonicalURL != urls[0] || scans[0].ScanUUID != "scan-eligible" {
+		t.Fatalf("scans = %+v, want only the submitted inconclusive scan", scans)
+	}
+	empty, err := store.LookupInconclusiveScans(ctx, nil)
+	if err != nil || empty != nil {
+		t.Fatalf("empty lookup = %+v, %v; want nil, nil", empty, err)
+	}
+}
+
 // TestLinkReconcileConcurrencyPostgreSQL runs two connections at the same URL.
 //
 // The properties under test are all properties of predicates and of SKIP LOCKED,

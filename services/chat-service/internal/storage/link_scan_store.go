@@ -644,13 +644,9 @@ func (s *PGXMessageStore) RecordLinkVerdict(
 // Publishing the global denial and expiring a file-service SAFE row are CTEs of
 // the same statement, so success can never expose chat=malicious while either
 // current or rolling-deploy file readers still have fetch authority.
-func (s *PGXMessageStore) recordMaliciousLinkVerdict(
-	ctx context.Context, canonicalURL, scanUUID, expectedStatus string,
-) error {
-	var updated bool
-	err := s.pool.QueryRow(ctx, `
-		WITH updated AS (
-			UPDATE chat.link_scans
+const recordMaliciousLinkVerdictQuery = `
+	WITH updated AS (
+		UPDATE chat.link_scans
 		   SET status = 'malicious', decided_at = now(), next_attempt_at = NULL,
 		       next_reconcile_at = NULL, updated_at = now()
 		 WHERE canonical_url = $1
@@ -658,10 +654,35 @@ func (s *PGXMessageStore) recordMaliciousLinkVerdict(
 		   AND scan_uuid IS NOT NULL
 		   AND scan_uuid = $3
 		 RETURNING canonical_url
-		),
-		`+urlsafety.InvalidateFetchAuthoritySQL(
-		"$4", "updated.canonical_url", "'"+urlsafety.DenylistSourceChat+"'", "updated")+`
-		SELECT EXISTS (SELECT 1 FROM updated)`,
+	),
+	denied AS (
+		INSERT INTO files.link_fetch_denylist (url_digest, canonical_url, source)
+		SELECT $4, updated.canonical_url, 'chat'
+		FROM updated
+		ON CONFLICT (url_digest) DO NOTHING
+		RETURNING url_digest
+	),
+	-- Expiring the per-service row is what reaches an *old* pod during a rolling
+	-- update: its gate is "done and not expired", so an expired row is absent, and
+	-- absent is refusal. Scoped to 'done' because that is the only state that can
+	-- currently authorise a fetch, and because inconclusive rows are protected by
+	-- the 000009 trigger, which this must not fight.
+	expired AS (
+		UPDATE files.link_scans
+		   SET verdict_expires_at = now(), updated_at = now()
+		 WHERE url_digest = $4
+		   AND state = 'done'
+		   AND verdict_expires_at > now()
+		   AND EXISTS (SELECT 1 FROM updated)
+		 RETURNING url_digest
+	)
+	SELECT EXISTS (SELECT 1 FROM updated)`
+
+func (s *PGXMessageStore) recordMaliciousLinkVerdict(
+	ctx context.Context, canonicalURL, scanUUID, expectedStatus string,
+) error {
+	var updated bool
+	err := s.pool.QueryRow(ctx, recordMaliciousLinkVerdictQuery,
 		canonicalURL, expectedStatus, scanUUID, urlsafety.URLDigest(canonicalURL),
 	).Scan(&updated)
 	if err != nil {

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -128,5 +129,32 @@ func TestLinkSafetyStatesQueryIsSenderScoped(t *testing.T) {
 	// promotion uses.
 	if !strings.Contains(linkSafetyStatesQuery, "mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')") {
 		t.Fatalf("the verdict is not bound to this content: %s", linkSafetyStatesQuery)
+	}
+}
+
+// The admission locks the rows it charges for in this exact order. Two sends
+// naming the same URLs in different orders must therefore produce the same
+// sequence, and a URL repeated in one body must be locked once — a second lock
+// attempt on a row this transaction already holds is the deadlock the ordering
+// exists to prevent.
+func TestUniqueSortedURLsIsAStableLockOrder(t *testing.T) {
+	first := uniqueSortedURLs([]string{
+		"https://example.test/b",
+		"https://example.test/a",
+		"https://example.test/b",
+	})
+	want := []string{"https://example.test/a", "https://example.test/b"}
+	if !slices.Equal(first, want) {
+		t.Fatalf("uniqueSortedURLs = %q, want %q", first, want)
+	}
+
+	// The reverse order is the other half of the invariant: the lock sequence is
+	// a property of the set, not of how the body happened to spell it.
+	second := uniqueSortedURLs([]string{
+		"https://example.test/b",
+		"https://example.test/a",
+	})
+	if !slices.Equal(first, second) {
+		t.Fatalf("lock order depended on input order: %q vs %q", first, second)
 	}
 }

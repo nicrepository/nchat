@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -247,5 +248,49 @@ func TestReconcileLinkSafety_RouteIsMessageScoped(t *testing.T) {
 	}
 	if strings.Contains(httpapi.RouteMessageLinkSafetyReconcile, "url") {
 		t.Fatalf("route %q names a url", httpapi.RouteMessageLinkSafetyReconcile)
+	}
+}
+
+// The per-user budget is spent before anything reaches the paid third party, so
+// exhausting it must refuse the call outright — and say when to come back, since
+// a client with no hint retries immediately and spends the next window too.
+func TestReconcileLinkSafety_RefusesWhenTheBudgetIsSpent(t *testing.T) {
+	reconciler := &fakeLinkReconciler{ready: true}
+	limiter := &fakeActionLimiter{allow: false}
+	handler := reconcileHandlerWithLimiter(t, reconciler, limiter)
+	recorder := httptest.NewRecorder()
+
+	handler.ReconcileMessageLinkSafety(recorder, reconcileRequest(testMessageID, true))
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Retry-After") == "" {
+		t.Fatal("a refused call carried no Retry-After")
+	}
+	if reconciler.calls != 0 {
+		t.Fatal("a rate-limited request still reached the provider")
+	}
+}
+
+// A limiter that cannot answer is a refusal, not a pass. Not knowing whether
+// there is allowance left is not permission to spend it — otherwise a Valkey
+// outage turns the deployment-wide budget off entirely, which is exactly when
+// an attacker would want it off.
+func TestReconcileLinkSafety_TreatsAnUnreachableLimiterAsARefusal(t *testing.T) {
+	reconciler := &fakeLinkReconciler{ready: true}
+	limiter := &fakeActionLimiter{allow: true, err: errors.New("valkey unavailable")}
+	handler := reconcileHandlerWithLimiter(t, reconciler, limiter)
+	recorder := httptest.NewRecorder()
+
+	handler.ReconcileMessageLinkSafety(recorder, reconcileRequest(testMessageID, true))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	// The staged limiter would have said "allow" if its error were ignored, so
+	// this also proves the error is what refused the call.
+	if reconciler.calls != 0 {
+		t.Fatal("an unanswerable limiter let the request through to the provider")
 	}
 }

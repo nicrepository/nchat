@@ -36,6 +36,7 @@ case "$MODULE" in
       TestLinkReconcileConcurrencyPostgreSQL
       TestCrossServiceMaliciousInvalidationPostgreSQL
       TestRecordLinkVerdictMaliciousInvalidationPostgreSQL
+      TestLookupInconclusiveScansPostgreSQL
       TestLinkReconcileConvergenceScalePostgreSQL
       TestLinkReconcileEvidenceAgePostgreSQL
       TestLinkSafetyCheckValidationDoesNotBlockWritersPostgreSQL

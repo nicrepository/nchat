@@ -651,6 +651,31 @@ func TestHubBroadcasterPublishesUpdatedMessage(t *testing.T) {
 	}
 }
 
+func TestHubBroadcasterPublishesLinkSafetyEvents(t *testing.T) {
+	bus := &captureBroadcastBus{published: make(chan ws.Event, 2)}
+	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), bus, "test-link-safety-broadcaster")
+	t.Cleanup(hub.Shutdown)
+	broadcaster := &hubBroadcaster{hub: hub}
+	updatedAt := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	broadcaster.PublishMessageLinkSafetyChanged(
+		t.Context(), "workspace-1", "channel", "channel-1", "message-1", "safe", updatedAt,
+	)
+	broadcaster.PublishMessageBlocked(
+		t.Context(), "workspace-1", "author-1", "message-2", ws.MessageBlockedReasonMaliciousLink,
+	)
+
+	events := publishedEvents(t, bus, 2)
+	if events[0].TargetType != ws.TargetTypeChannel || events[0].LinkSafety == nil ||
+		events[0].LinkSafety.State != "safe" || !events[0].LinkSafety.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("unexpected link-safety correction: %+v", events[0])
+	}
+	if events[1].Type != ws.EventTypeMessageBlocked || events[1].RecipientUserID != "author-1" ||
+		events[1].Reason != ws.MessageBlockedReasonMaliciousLink {
+		t.Fatalf("unexpected blocked event: %+v", events[1])
+	}
+}
+
 func TestHubBroadcasterPublishesPinUpdated(t *testing.T) {
 	hub := ws.NewHub(ws.NopAuthorizer{}, slog.Default(), ws.NopBus{}, "test-pin-broadcaster")
 	t.Cleanup(hub.Shutdown)

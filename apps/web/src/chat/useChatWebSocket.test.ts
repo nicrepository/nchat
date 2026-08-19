@@ -1090,7 +1090,7 @@ describe("useChatWebSocket", () => {
         edited_at: "2026-07-13T12:00:00Z",
         edit_count: 2,
         is_edited: true,
-		link_safety_state: "inconclusive",
+        link_safety_state: "inconclusive",
       },
     };
 

@@ -67,6 +67,9 @@ type fakeReconcileQueue struct {
 	changes       []storage.MessageLinkSafetyChange
 
 	conflictOnWrite bool
+	reconciled      chan struct{}
+	claimErr        error
+	claimed         chan struct{}
 }
 
 func newFakeReconcileQueue() *fakeReconcileQueue {
@@ -131,6 +134,15 @@ func (q *fakeReconcileQueue) ClaimDueInconclusiveScans(
 ) ([]storage.InconclusiveScan, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.claimed != nil {
+		select {
+		case q.claimed <- struct{}{}:
+		default:
+		}
+	}
+	if q.claimErr != nil {
+		return nil, q.claimErr
+	}
 	if q.backgroundLeft <= 0 || batchSize <= 0 {
 		return nil, nil
 	}
@@ -159,6 +171,12 @@ func (q *fakeReconcileQueue) ReconcileLinkVerdict(
 	verdict := evidence.Verdict
 	q.verdicts = append(q.verdicts, verdict)
 	q.evidenceTimes = append(q.evidenceTimes, evidence.ObservedAt)
+	if q.reconciled != nil {
+		select {
+		case q.reconciled <- struct{}{}:
+		default:
+		}
+	}
 	switch verdict {
 	case urlsafety.VerdictSafe:
 		q.state = domain.MessageLinkSafetySafe
@@ -802,5 +820,111 @@ func TestCandidateFoundIsObservedOnlyForAMatch(t *testing.T) {
 				t.Fatalf("CandidateFound = %v, want %v", evidence.CandidateFound, tc.want)
 			}
 		})
+	}
+}
+
+func TestRunLinkReconcileWorkerProcessesDueScanAndStops(t *testing.T) {
+	service.RunLinkReconcileWorker(t.Context(), nil, time.Millisecond, nil)
+	service.RunLinkReconcileWorker(
+		t.Context(), service.NewLinkReconcileService(nil, nil, nil), time.Millisecond, nil,
+	)
+
+	queue := newFakeReconcileQueue()
+	queue.backgroundLeft = 1
+	queue.reconciled = make(chan struct{}, 1)
+	processor := service.NewLinkReconcileService(
+		queue, &fakeReconciler{verdict: urlsafety.VerdictSafe}, nil,
+	)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.RunLinkReconcileWorker(ctx, processor, time.Millisecond, nil)
+	}()
+
+	select {
+	case <-queue.reconciled:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("worker did not reconcile the due scan")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after cancellation")
+	}
+	if got := queue.writtenVerdicts(); len(got) != 1 || got[0] != urlsafety.VerdictSafe {
+		t.Fatalf("written verdicts = %v, want [safe]", got)
+	}
+}
+
+// A pass that fails is logged and the worker keeps its schedule. The alternative
+// — returning — would mean one transient database error silently stops
+// reconciliation for the life of the pod, and the messages this exists to correct
+// would stay wrong until someone restarted it.
+func TestRunLinkReconcileWorkerSurvivesAFailingPass(t *testing.T) {
+	queue := newFakeReconcileQueue()
+	queue.claimErr = errors.New("database unavailable")
+	queue.claimed = make(chan struct{}, 1)
+	processor := service.NewLinkReconcileService(
+		queue, &fakeReconciler{verdict: urlsafety.VerdictSafe}, nil,
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.RunLinkReconcileWorker(ctx, processor, time.Millisecond, nil)
+	}()
+
+	// Two passes: the second only happens if the first failure did not stop the
+	// loop, which is the whole assertion.
+	for pass := 0; pass < 2; pass++ {
+		select {
+		case <-queue.claimed:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatalf("the worker stopped after %d failing pass(es)", pass)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after cancellation")
+	}
+}
+
+// A non-positive interval is a misconfiguration, not a request to spin. It falls
+// back to the package default rather than creating a ticker that fires
+// continuously and turns a config typo into a busy loop against the database.
+func TestRunLinkReconcileWorkerRejectsANonPositiveInterval(t *testing.T) {
+	queue := newFakeReconcileQueue()
+	queue.claimed = make(chan struct{}, 1)
+	processor := service.NewLinkReconcileService(
+		queue, &fakeReconciler{verdict: urlsafety.VerdictSafe}, nil,
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.RunLinkReconcileWorker(ctx, processor, 0, nil)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop on an already-cancelled context")
+	}
+	// The default interval is far longer than this test runs, so a ticker built
+	// from it cannot have fired. A zero interval that was taken literally would
+	// have fired immediately instead.
+	select {
+	case <-queue.claimed:
+		t.Fatal("a zero interval was used literally and fired a pass")
+	default:
 	}
 }
