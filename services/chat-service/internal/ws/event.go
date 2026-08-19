@@ -203,10 +203,15 @@ const (
 	ClientMessageTypeCallDecline    ClientMessageType = "call.decline"
 	ClientMessageTypeCallCancel     ClientMessageType = "call.cancel"
 	ClientMessageTypeCallEnd        ClientMessageType = "call.end"
-	ClientMessageTypeCallSync       ClientMessageType = "call.sync"
-	ClientMessageTypeCallPresence   ClientMessageType = "call.presence"
-	ClientMessageTypeTypingStart    ClientMessageType = "typing.start"
-	ClientMessageTypeTypingStop     ClientMessageType = "typing.stop"
+	// ClientMessageTypeCallLeave releases one participant's own presence in a
+	// resource (channel/group-DM) call without ending it for anyone else —
+	// see CallHandler.LeaveCall (issue #569). It has no direct-call meaning:
+	// a 1:1 call's participants use call.decline/call.cancel/call.end.
+	ClientMessageTypeCallLeave    ClientMessageType = "call.leave"
+	ClientMessageTypeCallSync     ClientMessageType = "call.sync"
+	ClientMessageTypeCallPresence ClientMessageType = "call.presence"
+	ClientMessageTypeTypingStart  ClientMessageType = "typing.start"
+	ClientMessageTypeTypingStop   ClientMessageType = "typing.stop"
 )
 
 // MessagePayload carries the full message DTO for message.created events.

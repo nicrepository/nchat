@@ -89,6 +89,61 @@ export function startResourceCall(
   });
 }
 
+// leaveResourceCall releases this participant's own presence in a resource
+// (channel/group-DM) call immediately, without ending it for anyone else
+// (issue #569). It resolves with the authoritative post-leave call — still
+// "active" if other participants remain, "ended" if this was the last one —
+// so a caller can safely start a new call the instant this promise settles,
+// with no lease-expiry timeout to wait out.
+export function leaveResourceCall(
+  callID: string,
+  options: Omit<ResourceCallSignalingOptions, "requestId"> = {},
+): Promise<Call> {
+  const acquire = options.acquire ?? acquireChatSocket;
+  const schedule =
+    options.setTimeout ?? ((callback, delay) => globalThis.setTimeout(callback, delay));
+  const cancel = options.clearTimeout ?? ((handle) => globalThis.clearTimeout(handle as number));
+
+  return new Promise<Call>((resolve, reject) => {
+    let handle: ChatSocketHandle | null = null;
+    // Assigned after acquire() because test/socket adapters may fail synchronously.
+    // eslint-disable-next-line prefer-const
+    let timer: unknown;
+    let settled = false;
+    const finish = (result: Call | Error) => {
+      if (settled) return;
+      settled = true;
+      cancel(timer);
+      handle?.release();
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    };
+    handle = acquire({
+      onOpen() {
+        if (!handle?.send({ type: "call.leave", call_id: callID })) {
+          finish(new Error("call leave failed"));
+        }
+      },
+      onMessage(data) {
+        if (data["type"] === "call.error" && data["operation"] === "call.leave") {
+          finish(new Error("call leave failed"));
+          return;
+        }
+        const event = parseCallEvent(data);
+        if (event?.call.call_id === callID) finish(event.call);
+      },
+      onStatus(status) {
+        if (status === "failed") finish(new Error("call leave failed"));
+      },
+    });
+    if (settled) {
+      handle.release();
+      return;
+    }
+    timer = schedule(() => finish(new Error("call leave timed out")), options.timeoutMs ?? 10_000);
+  });
+}
+
 export function resolveCall(
   callID: string,
   options: Omit<ResourceCallSignalingOptions, "requestId"> = {},

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ChatSocketHandle, ChatSocketListener } from "./chatSocket";
-import { resolveCall, startResourceCall } from "./resourceCallSignaling";
+import { leaveResourceCall, resolveCall, startResourceCall } from "./resourceCallSignaling";
 
 const call = {
   call_id: "00000000-0000-4000-8000-000000000546",
@@ -121,6 +121,79 @@ describe("resource call signaling", () => {
 
     await expect(starting).resolves.toEqual(call);
     expect(socket.handle.release).toHaveBeenCalledOnce();
+  });
+
+  it("releases this participant's presence through authenticated call.leave and resolves the authoritative call (issue #569)", async () => {
+    const socket = setup();
+    const leaving = leaveResourceCall(call.call_id, {
+      acquire: socket.acquire,
+      setTimeout: vi.fn(() => 1),
+      clearTimeout: vi.fn(),
+    });
+
+    socket.listener.onOpen?.(1);
+    expect(socket.handle.send).toHaveBeenCalledWith({ type: "call.leave", call_id: call.call_id });
+    socket.listener.onMessage?.(
+      {
+        type: "call.ended",
+        event_id: "event",
+        target_type: "channel",
+        target_id: call.target_id,
+        call: { ...call, status: "ended" },
+      },
+      1,
+    );
+
+    await expect(leaving).resolves.toEqual({ ...call, status: "ended" });
+    expect(socket.handle.release).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when call.leave is refused by the server", async () => {
+    const socket = setup();
+    const leaving = leaveResourceCall(call.call_id, {
+      acquire: socket.acquire,
+      setTimeout: vi.fn(() => 1),
+      clearTimeout: vi.fn(),
+    });
+
+    socket.listener.onMessage?.({ type: "call.error", operation: "call.leave" }, 1);
+
+    await expect(leaving).rejects.toThrow("call leave failed");
+    expect(socket.handle.release).toHaveBeenCalledOnce();
+  });
+
+  it("fails deterministically when call.leave cannot send, the socket fails, or its deadline fires", async () => {
+    const cannotSend = setup();
+    cannotSend.handle.send = vi.fn(() => false);
+    const sendFailure = leaveResourceCall(call.call_id, {
+      acquire: cannotSend.acquire,
+      setTimeout: vi.fn(() => 1),
+      clearTimeout: vi.fn(),
+    });
+    cannotSend.listener.onOpen?.(1);
+    await expect(sendFailure).rejects.toThrow("call leave failed");
+
+    const failed = setup();
+    const socketFailure = leaveResourceCall(call.call_id, {
+      acquire: failed.acquire,
+      setTimeout: vi.fn(() => 1),
+      clearTimeout: vi.fn(),
+    });
+    failed.listener.onStatus?.("failed");
+    await expect(socketFailure).rejects.toThrow("call leave failed");
+
+    const timed = setup();
+    let expire: () => void = () => undefined;
+    const timeout = leaveResourceCall(call.call_id, {
+      acquire: timed.acquire,
+      setTimeout: (callback) => {
+        expire = callback;
+        return 1;
+      },
+      clearTimeout: vi.fn(),
+    });
+    expire();
+    await expect(timeout).rejects.toThrow("call leave timed out");
   });
 
   it("fails closed on a correlated server error", async () => {

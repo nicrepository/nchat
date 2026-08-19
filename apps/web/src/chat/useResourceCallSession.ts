@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { issueCallToken, type ResourceCallKind } from "./callApi";
 import { acquireChatSocket } from "./chatSocket";
-import { startResourceCall } from "./resourceCallSignaling";
+import { leaveResourceCall, startResourceCall } from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
@@ -33,13 +33,17 @@ export interface ResourceCallController {
   /** Reacquires a token and Room after this tab regains ownership. */
   reconnect: () => Promise<void>;
   /**
-   * Disconnects this participant only; never notifies anyone else. Resolves
-   * once the local Room cleanup has actually finished. Rejects, without
-   * pretending the room was left, if that cleanup itself fails — `active`
-   * and `status` stay in place so both the "Sair da chamada" button and a
-   * handoff caller (RF-23's direct-call media bridge) can tell cleanup
-   * never completed and try again; only a call that actually resolves may
-   * treat the Room as gone.
+   * Disconnects this participant only — releases their own server-side
+   * participation (issue #569) alongside the local Room cleanup, but never
+   * ends the resource call for anyone else and never notifies anyone else
+   * directly. Resolves once both have actually finished. Rejects, without
+   * pretending the room was left, if either the local cleanup or the
+   * server-side release fails — `active` and `status` stay in place so both
+   * the "Sair da chamada" button and a handoff caller (RF-23's direct-call
+   * media bridge) can tell cleanup never completed and try again; only a
+   * call that actually resolves may treat the Room as gone. Safe to call
+   * more than once for the same leave: the server-side release is
+   * idempotent, so a duplicate/retried leave never corrupts state.
    */
   leave: () => Promise<void>;
 }
@@ -75,6 +79,15 @@ export function useResourceCallSession(
   // promise pre-resolved to "done" regardless of outcome. join() awaits it
   // before requesting a new Room; a rejection here must reach every awaiter.
   const cleanupPromiseRef = useRef<Promise<void> | null>(null);
+  // Set by the presence effect below whenever its heartbeat is running;
+  // leave() calls this synchronously, before any await, so a heartbeat tick
+  // already queued cannot slip a call.presence out after call.leave has been
+  // sent (issue #569 follow-up: a late presence must never resurrect a lease
+  // this same leave() is releasing). React's own effect cleanup calls the
+  // same function on the next render, so whichever runs first does the work
+  // and the other is a no-op — see the effect for why that's safe to call
+  // twice.
+  const stopHeartbeatRef = useRef<(() => void) | null>(null);
   const mediaRef = useRef(media);
   useEffect(() => {
     mediaRef.current = media;
@@ -98,9 +111,25 @@ export function useResourceCallSession(
 
   const leave = useCallback((): Promise<void> => {
     const generation = ++attemptGenerationRef.current;
+    // Stops the presence heartbeat before anything else — synchronously,
+    // not via setStatus()/setCallId() and a future render. Those only take
+    // effect once this leave() resolves, and the heartbeat interval keeps
+    // firing for that entire round trip otherwise: a tick landing after
+    // call.leave is sent but before the server processes it would resend
+    // call.presence and resurrect the lease call.leave just released.
+    stopHeartbeatRef.current?.();
+    // Only a call that actually reached the server (a callId is known) has
+    // anything server-side to release; an abandoned in-flight join never
+    // created a lease, so there is nothing to send — the generation bump
+    // above already invalidates that attempt's continuation.
+    const leavingCallId = callId;
     setError(null);
     setErrorOperation(null);
-    return stopMedia().then(
+    const mediaCleanup = stopMedia();
+    const serverRelease = leavingCallId
+      ? leaveResourceCall(leavingCallId).then(() => undefined)
+      : Promise.resolve();
+    return Promise.all([mediaCleanup, serverRelease]).then(
       () => {
         // A newer join()/leave() may already have moved past this attempt;
         // only the leave() that is still current gets to clear the room.
@@ -112,16 +141,16 @@ export function useResourceCallSession(
         setStatus("idle");
         setErrorOperation(null);
       },
-      (cleanupError: unknown) => {
+      (leaveError: unknown) => {
         if (attemptGenerationRef.current === generation) {
           setStatus("error");
           setErrorOperation("leave");
           setError("Não foi possível sair da chamada. Tente novamente.");
         }
-        throw cleanupError;
+        throw leaveError;
       },
     );
-  }, [stopMedia]);
+  }, [callId, stopMedia]);
 
   const join = useCallback((target: ResourceCallTarget): Promise<void> => {
     const pending = joinPromiseRef.current;
@@ -226,10 +255,16 @@ export function useResourceCallSession(
     const handle = acquireChatSocket({ onOpen: sendPresence });
     sendPresence();
     const heartbeat = window.setInterval(sendPresence, 10_000);
-    return () => {
+    // Idempotent and reusable as both leave()'s synchronous stop and React's
+    // own cleanup: whichever runs first tears the heartbeat down, the other
+    // finds stopHeartbeatRef already cleared and no-ops.
+    const stop = () => {
       window.clearInterval(heartbeat);
       handle.release();
+      if (stopHeartbeatRef.current === stop) stopHeartbeatRef.current = null;
     };
+    stopHeartbeatRef.current = stop;
+    return stop;
   }, [callId, presenceEnabled, status]);
 
   return { active, callId, status, error, errorOperation, join, reconnect, leave };

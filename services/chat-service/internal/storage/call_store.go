@@ -39,6 +39,14 @@ type RenewCallPresenceInput struct {
 	ExpiresAt   time.Time
 }
 
+// LeaveResourceCallInput identifies one participant's own departure from a
+// resource (channel/group-DM) call — see PGXCallStore.LeaveResourceCall.
+type LeaveResourceCallInput struct {
+	WorkspaceID string
+	CallID      string
+	ActorID     string
+}
+
 const callSelectColumns = `id, workspace_id, request_id, caller_id, callee_id, target_type, target_id, call_type, status, version, created_at, updated_at, expires_at, accepted_at, ended_at`
 
 type CallAction string
@@ -120,9 +128,24 @@ func (s *PGXCallStore) CreateCall(ctx context.Context, input CreateCallInput) (d
 		return domain.Call{}, false, domain.ErrForbidden
 	}
 
+	// Busy means an active/ringing direct call, or a resource call this
+	// user currently holds a live participant lease on — never merely
+	// having once been a resource call's caller_id, which stays on that row
+	// forever and would otherwise block this user's own 1:1 calls long after
+	// they left it (issue #569).
 	var busy bool
 	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM chat.calls WHERE workspace_id = $1 AND status IN ('ringing', 'active') AND (caller_id IN ($2, $3) OR callee_id IN ($2, $3)))`,
+		`SELECT EXISTS (
+			SELECT 1 FROM chat.calls
+			WHERE workspace_id = $1 AND target_type = 'user' AND status IN ('ringing', 'active')
+			  AND (caller_id IN ($2, $3) OR callee_id IN ($2, $3))
+			UNION ALL
+			SELECT 1 FROM chat.call_participant_leases leases
+			JOIN chat.calls resource_calls ON resource_calls.id = leases.call_id
+			WHERE resource_calls.workspace_id = $1 AND resource_calls.status = 'active'
+			  AND resource_calls.target_type IN ('channel', 'dm')
+			  AND leases.user_id IN ($2, $3) AND leases.expires_at > clock_timestamp()
+		)`,
 		input.WorkspaceID, input.CallerID, input.CalleeID,
 	).Scan(&busy); err != nil {
 		return domain.Call{}, false, fmt.Errorf("check active calls: %w", err)
@@ -183,8 +206,20 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 		return domain.Call{}, false, domain.ErrForbidden
 	}
 
+	// FOR UPDATE: without it, this SELECT can return an "active" row an
+	// instant before a concurrent LeaveResourceCall (or call.end) commits
+	// that same row to 'ended' — the snapshot below would then be stale by
+	// the time this transaction commits, and upsertCallPresence's INSERT
+	// (which only waits on the row's FK-implied lock, not on this SELECT)
+	// would attach a fresh lease to a call that is already over (issue
+	// #569 follow-up). Taking the lock here forces this query to block
+	// until any such concurrent transition finishes, then re-evaluate
+	// against the committed row: WHERE status = 'active' then correctly
+	// finds no match if the call just ended, and this function falls
+	// through to inserting a brand-new active call instead — the joiner
+	// gets a live call either way, never a dead one.
 	active, err := scanCall(tx.QueryRow(ctx,
-		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND target_type = $2 AND target_id = $3 AND status = 'active'`,
+		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND target_type = $2 AND target_id = $3 AND status = 'active' FOR UPDATE`,
 		input.WorkspaceID, string(input.TargetType), input.TargetID,
 	))
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -277,6 +312,111 @@ func upsertCallPresence(ctx context.Context, tx pgx.Tx, callID, actorID string, 
 		return fmt.Errorf("renew call presence: %w", err)
 	}
 	return nil
+}
+
+// LeaveResourceCall releases actorID's own participant lease on a resource
+// (channel/group-DM) call immediately — the counterpart to
+// upsertCallPresence, and deliberately not call.end: a resource call's
+// lifecycle for its other participants must never depend on any single
+// participant's leave (issue #569).
+//
+// Idempotent: leaving twice, or leaving after never holding an active lease
+// (already left, or the call is no longer active), changes nothing and is
+// not an error — a duplicated or retried leave must be safe.
+//
+// The call itself transitions to ended here, deterministically, only when
+// actorID's lease was the last one live — never left to ExpireDueCalls'
+// periodic sweep, which stays in place purely as a safety net for a
+// participant who disconnects without ever sending call.leave (a crashed
+// tab, a lost socket).
+func (s *PGXCallStore) LeaveResourceCall(ctx context.Context, input LeaveResourceCallInput) (TransitionCallResult, error) {
+	if s == nil || s.pool == nil {
+		return TransitionCallResult{}, errors.New("call store unavailable")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TransitionCallResult{}, fmt.Errorf("begin call leave: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	call, err := scanCall(tx.QueryRow(ctx,
+		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND id = $2 FOR UPDATE`,
+		input.WorkspaceID, input.CallID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TransitionCallResult{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return TransitionCallResult{}, fmt.Errorf("lock call for leave: %w", err)
+	}
+	if !call.IsResource() {
+		// call.leave has no meaning for a direct call: RF-23's own
+		// call.decline/call.cancel/call.end already own that lifecycle.
+		return TransitionCallResult{}, domain.ErrNotFound
+	}
+
+	var hadLease bool
+	if err := tx.QueryRow(ctx,
+		`DELETE FROM chat.call_participant_leases WHERE call_id = $1 AND user_id = $2 RETURNING TRUE`,
+		call.ID, input.ActorID,
+	).Scan(&hadLease); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return TransitionCallResult{}, fmt.Errorf("release call participant lease: %w", err)
+	}
+
+	if !hadLease {
+		// No active lease to release: either a legitimate retry (actorID
+		// already left, or never got as far as holding one) or an arbitrary
+		// caller who merely knows/guessed this call_id. Only someone
+		// currently authorized for the call's own target may learn its
+		// state here — same authorization RenewCallPresence already
+		// requires before it will touch this call at all — so an
+		// unauthorized guess fails exactly like a call.leave for a call_id
+		// that does not exist, carrying no call metadata.
+		authorized, err := authorizeResourceTarget(ctx, tx, input.WorkspaceID, input.ActorID, call.TargetType, call.TargetID)
+		if err != nil {
+			return TransitionCallResult{}, err
+		}
+		if !authorized {
+			return TransitionCallResult{}, domain.ErrNotFound
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
+		}
+		return TransitionCallResult{Call: call}, nil
+	}
+
+	if call.Status != domain.CallStatusActive {
+		// A real lease existed, so actorID was a genuine participant at
+		// some point — no further authorization check needed to hand back
+		// this already-terminal call's state.
+		if err := tx.Commit(ctx); err != nil {
+			return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
+		}
+		return TransitionCallResult{Call: call}, nil
+	}
+
+	var remaining bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM chat.call_participant_leases WHERE call_id = $1 AND expires_at > clock_timestamp())`,
+		call.ID,
+	).Scan(&remaining); err != nil {
+		return TransitionCallResult{}, fmt.Errorf("check remaining call participants: %w", err)
+	}
+	if remaining {
+		if err := tx.Commit(ctx); err != nil {
+			return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
+		}
+		return TransitionCallResult{Call: call}, nil
+	}
+
+	ended, err := updateCallStatus(ctx, tx, call.ID, domain.CallStatusEnded)
+	if err != nil {
+		return TransitionCallResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TransitionCallResult{}, fmt.Errorf("commit call leave: %w", err)
+	}
+	return TransitionCallResult{Call: ended, Changed: true}, nil
 }
 
 func (s *PGXCallStore) TransitionCall(ctx context.Context, input TransitionCallInput) (TransitionCallResult, error) {

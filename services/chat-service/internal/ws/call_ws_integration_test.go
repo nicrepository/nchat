@@ -64,6 +64,15 @@ func (h *lifecycleCallHandler) RenewCallPresence(context.Context, string, string
 	return nil
 }
 
+func (h *lifecycleCallHandler) LeaveCall(_ context.Context, _, actorID, _ string) (domain.Call, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.call.ID == "" || (!h.call.IsParticipant(actorID) && h.call.CallerID != actorID) {
+		return domain.Call{}, domain.ErrNotFound
+	}
+	return h.call, nil
+}
+
 func TestCallWebSocketLifecycleNotifiesTwoAuthenticatedClients(t *testing.T) {
 	handler := &lifecycleCallHandler{}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-ws-integration",
