@@ -93,9 +93,7 @@ test.describe("chamada 1:1", () => {
     } satisfies CallFixture;
     await emitCallEvent(page, callEvent(call, "ringing", 1));
 
-    const unresolvedDialog = page.getByRole("dialog", {
-      name: "Chamada de vídeo com Participante",
-    });
+    const unresolvedDialog = page.getByRole("dialog", { name: "Chamada recebida" });
     await expect(unresolvedDialog).toBeVisible();
     await expect(unresolvedDialog.getByRole("status")).toHaveText("Preparando chamada…");
     await expect(unresolvedDialog.getByRole("button", { name: "Atender" })).toHaveCount(0);
@@ -104,15 +102,13 @@ test.describe("chamada 1:1", () => {
 
     sidebar.resolve();
 
-    const dialog = page.getByRole("dialog", {
-      name: "Chamada de vídeo com " + participantName,
-    });
-    const accept = dialog.getByRole("button", { name: "Atender" });
-    await expect(accept).toBeFocused();
+    const dialog = page.getByRole("dialog", { name: "Chamada recebida" });
+    await expect(dialog.getByText(participantName, { exact: true })).toBeVisible();
+    const accept = dialog.getByRole("button", { name: "Atender com câmera" });
     await expect(dialog.getByRole("button", { name: "Recusar" })).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Cancelar chamada" })).toHaveCount(0);
     expect(await commandCount(page, "call.sync")).toBe(1);
-    await page.keyboard.press("Enter");
+    await accept.click();
     await expectCommandCount(page, "call.accept", 1);
   });
 
@@ -156,31 +152,25 @@ test.describe("chamada 1:1", () => {
     await emitCallEvent(page, callEvent(call, "ringing", 1));
     initialSidebar.resolve();
 
-    const unresolvedDialog = page.getByRole("dialog", {
-      name: "Chamada de vídeo com Participante",
-    });
+    const unresolvedDialog = page.getByRole("dialog", { name: "Chamada recebida" });
     await expect(unresolvedDialog.getByRole("alert")).toContainText(
       "Não foi possível preparar a chamada",
     );
     const retry = unresolvedDialog.getByRole("button", { name: "Tentar novamente" });
-    await expect(retry).toBeFocused();
-    await page.keyboard.press("Enter");
+    await retry.click();
     await expect.poll(() => sidebarRequests).toBe(2);
-    await expect(retry).toBeDisabled();
-    await page.keyboard.press("Enter");
+    await expect(retry).toHaveCount(0);
     expect(sidebarRequests).toBe(2);
 
     retrySidebar.resolve();
 
-    const dialog = page.getByRole("dialog", {
-      name: `Chamada de vídeo com ${participantName}`,
-    });
-    const accept = dialog.getByRole("button", { name: "Atender" });
-    await expect(accept).toBeFocused();
+    const dialog = page.getByRole("dialog", { name: "Chamada recebida" });
+    await expect(dialog.getByText(participantName, { exact: true })).toBeVisible();
+    const accept = dialog.getByRole("button", { name: "Atender com câmera" });
     await expect(dialog.getByRole("button", { name: "Recusar" })).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Cancelar chamada" })).toHaveCount(0);
     expect(await commandCount(page, "call.sync")).toBe(1);
-    await page.keyboard.press("Enter");
+    await accept.click();
     await expectCommandCount(page, "call.accept", 1);
   });
 
@@ -232,31 +222,25 @@ test.describe("chamada 1:1", () => {
     } satisfies CallFixture;
     await emitCallEvent(page, callEvent(call, "active", 1));
 
-    const unresolvedDialog = page.getByRole("dialog", {
-      name: "Chamada de vídeo com Participante",
-    });
-    await expect(unresolvedDialog.getByRole("status")).toHaveText("Preparando chamada…");
-    await expect(unresolvedDialog.getByRole("button", { name: "Ativar microfone" })).toHaveCount(0);
-    await expect(unresolvedDialog.getByRole("button", { name: "Ativar câmera" })).toHaveCount(0);
-    await expect(unresolvedDialog.getByRole("button", { name: "Encerrar chamada" })).toHaveCount(0);
+    const unresolvedDialog = page.getByLabel("Chamada com Participante");
+    await expect(unresolvedDialog.getByText("Preparando chamada…")).toBeVisible();
+    await expect(unresolvedDialog.getByRole("button", { name: "Ativar microfone" })).toBeVisible();
+    await expect(unresolvedDialog.getByRole("button", { name: "Ativar câmera" })).toBeVisible();
+    await expect(unresolvedDialog.getByRole("button", { name: "Encerrar chamada" })).toBeVisible();
     expect(tokenRequests).toBe(0);
 
     initialSidebar.resolve();
     const retry = unresolvedDialog.getByRole("button", { name: "Tentar novamente" });
-    await expect(retry).toBeFocused();
-    await page.keyboard.press("Enter");
+    await retry.click();
     await expect.poll(() => sidebarRequests).toBe(2);
-    await expect(retry).toBeDisabled();
-    await page.keyboard.press("Enter");
+    await expect(retry).toHaveCount(0);
     expect(sidebarRequests).toBe(2);
     expect(tokenRequests).toBe(0);
 
     retrySidebar.resolve();
 
-    const dialog = page.getByRole("dialog", {
-      name: `Chamada de vídeo com ${participantName}`,
-    });
-    await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeFocused();
+    const dialog = page.getByLabel(`Chamada com ${participantName}`);
+    await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeVisible();
     // RF-23: an active call restored this way (never locally started or
     // accepted by this tab) must not request media on its own, however long
     // identity took to resolve — only the explicit activation click may.
@@ -278,49 +262,59 @@ test.describe("chamada 1:1", () => {
 
     await emitCallEvent(page, callEvent(call, "ringing", 1));
 
-    const dialog = page.getByRole("dialog", {
-      name: `Chamada de vídeo com ${participantName}`,
-    });
+    const dialog = page.getByRole("dialog", { name: "Chamada recebida" });
     await expect(dialog).toBeVisible();
-    await expect(dialog).toHaveAttribute("open", "");
-    expect(
-      await dialog.evaluate(
-        (element) => (element as HTMLDialogElement).open && element.matches(":modal"),
-      ),
-    ).toBe(true);
+    await expect(dialog).toHaveAttribute("aria-modal", "false");
 
-    const accept = dialog.getByRole("button", { name: "Atender" });
-    await expect(accept).toBeFocused();
+    const accept = dialog.getByRole("button", { name: "Atender com câmera" });
+    await expect(accept).not.toBeFocused();
     await page.keyboard.press("Escape");
     await expect(dialog).toBeVisible();
-    expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
 
-    await page.keyboard.press("Enter");
+    await accept.click();
     await expectCommandCount(page, "call.accept", 1);
     expect(await commandCount(page, "call.accept")).toBe(1);
 
     await emitCallEvent(page, callEvent(call, "active", 2));
-    await expect(dialog.getByText(`A câmera de ${participantName} está desligada`)).toBeVisible();
-    await expect(dialog.getByText("Sua câmera está desligada")).toBeVisible();
-    await expect(dialog.locator("video")).toHaveCount(0);
+    const floating = page.getByTestId("floating-call-window");
+    await expect(floating).toBeVisible();
+    await expect(floating.getByText(participantName, { exact: true })).toBeVisible();
 
-    const microphone = dialog.getByRole("button", { name: "Ativar microfone" });
-    const camera = dialog.getByRole("button", { name: "Ativar câmera" });
-    const end = dialog.getByRole("button", { name: "Encerrar chamada" });
+    const handle = floating.getByTestId("floating-call-handle");
+    const beforeDrag = await floating.boundingBox();
+    expect(beforeDrag).not.toBeNull();
+    await handle.hover();
+    await page.mouse.down();
+    await page.mouse.move(beforeDrag!.x - 80, beforeDrag!.y - 60, { steps: 4 });
+    await page.mouse.up();
+    const afterDrag = await floating.boundingBox();
+    expect(afterDrag).not.toBeNull();
+    expect({ x: afterDrag!.x, y: afterDrag!.y }).not.toEqual({
+      x: beforeDrag!.x,
+      y: beforeDrag!.y,
+    });
+
+    await page.getByRole("link", { name: /^Meu perfil/ }).click();
+    await expect(page).toHaveURL(/\/profile$/);
+    await expect(floating).toBeVisible();
+    await page.goBack();
+    await expect(page).toHaveURL(/\/chat\/dm\//);
+    await expect(floating).toBeVisible();
+
+    const microphone = floating.getByRole("button", { name: "Ativar microfone" });
+    const camera = floating.getByRole("button", { name: "Ativar câmera" });
+    const end = floating.getByRole("button", { name: "Encerrar chamada" });
     await expect(microphone).toBeVisible();
     await expect(camera).toBeVisible();
     await expect(end).toBeVisible();
 
-    await focusByTab(page, end);
+    await end.focus();
+    await expect(end).toBeFocused();
     await page.keyboard.press("Enter");
     await expectCommandCount(page, "call.end", 1);
 
     await emitCallEvent(page, callEvent(call, "ended", 3));
-    await expect(dialog.getByText("Chamada encerrada")).toBeVisible();
-    const close = dialog.getByRole("button", { name: "Fechar" });
-    await expect(close).toBeFocused();
-    await page.keyboard.press("Enter");
-    await expect(dialog).toHaveCount(0);
+    await expect(floating).toHaveCount(0);
   });
 
   test("mantém fallback e controles utilizáveis em 320 px", async ({ page }, testInfo) => {
@@ -330,43 +324,23 @@ test.describe("chamada 1:1", () => {
 
     await emitCallEvent(page, callEvent(call, "active", 1));
 
-    const dialog = page.getByRole("dialog", {
-      name: `Chamada de vídeo com ${participantName}`,
-    });
+    const dialog = page.getByTestId("floating-call-window");
     await expect(dialog).toBeVisible();
-    await expectFillsViewport(dialog, page);
     await expectNoHorizontalScroll(page);
 
     const participant = dialog.getByText(participantName, { exact: true }).first();
     await expect(participant).toBeVisible();
     await expectInsideViewport(participant, page);
-    expect(
-      await participant.evaluate((element) => {
-        const style = getComputedStyle(element);
-        return (
-          element.scrollWidth > element.clientWidth &&
-          style.overflow === "hidden" &&
-          style.textOverflow === "ellipsis" &&
-          style.whiteSpace === "nowrap"
-        );
-      }),
-    ).toBe(true);
-    await expect(dialog.getByText("Sua câmera está desligada")).toBeAttached();
-
-    const controls = dialog.getByRole("contentinfo", { name: "Controles da chamada" });
-    const preview = dialog.getByRole("complementary", { name: "Sua pré-visualização" });
     const microphone = dialog.getByRole("button", { name: "Ativar microfone" });
     const camera = dialog.getByRole("button", { name: "Ativar câmera" });
     const end = dialog.getByRole("button", { name: "Encerrar chamada" });
-    await expect(controls).toBeVisible();
-    await expect(preview).toBeVisible();
     for (const control of [microphone, camera, end]) {
       await expect(control).toBeVisible();
       await expectInsideViewport(control, page);
     }
-    await expectNoOverlap(preview, controls);
 
-    await focusByTab(page, end);
+    await end.focus();
+    await expect(end).toBeFocused();
     await page.keyboard.press("Enter");
     await expectCommandCount(page, "call.end", 1);
   });
@@ -378,13 +352,9 @@ test.describe("chamada 1:1", () => {
 
     await emitCallEvent(page, callEvent(call, "active", 1));
 
-    const dialog = page.getByRole("dialog", {
-      name: `Chamada de vídeo com ${participantName}`,
-    });
+    const dialog = page.getByTestId("floating-call-window");
     const header = dialog.locator("header");
-    const stage = dialog.locator("main");
-    const controls = dialog.getByRole("contentinfo", { name: "Controles da chamada" });
-    const preview = dialog.getByRole("complementary", { name: "Sua pré-visualização" });
+    const stage = dialog.locator(".floating-call__stage");
     const microphone = dialog.getByRole("button", { name: "Ativar microfone" });
     const camera = dialog.getByRole("button", { name: "Ativar câmera" });
     const end = dialog.getByRole("button", { name: "Encerrar chamada" });
@@ -393,16 +363,12 @@ test.describe("chamada 1:1", () => {
     await expectNoHorizontalScroll(page);
     await expectInsideViewport(header, page);
     await expectInsideViewport(stage, page);
-    await expectInsideViewport(controls, page);
     for (const control of [microphone, camera, end]) {
       await expect(control).toBeVisible();
       await expectInsideViewport(control, page);
     }
-    await expectNoOverlap(preview, end);
-    expect(await end.evaluate((element) => getComputedStyle(element).flexDirection)).toBe("row");
 
-    await focusByTab(page, end);
-    await page.keyboard.press("Enter");
+    await end.press("Enter");
     await expectCommandCount(page, "call.end", 1);
   });
 });
@@ -514,7 +480,7 @@ test.describe("permissões de mídia (RF-23)", () => {
     // shape of a call restored by reload, reconnect, or call.sync.
     await emitCallEvent(page, callEvent(call, "active", 1, "audio"));
 
-    const dialog = page.getByRole("dialog", { name: `Chamada de áudio com ${participantName}` });
+    const dialog = page.getByLabel(`Chamada com ${participantName}`);
     await expect(dialog).toBeVisible();
     const activate = dialog.getByRole("button", { name: "Permitir microfone" });
     await expect(activate).toBeVisible();
@@ -549,7 +515,7 @@ test.describe("permissões de mídia (RF-23)", () => {
     } satisfies CallFixture;
     await emitCallEvent(page, callEvent(call, "active", 1));
 
-    const dialog = page.getByRole("dialog", { name: `Chamada de vídeo com ${participantName}` });
+    const dialog = page.getByLabel(`Chamada com ${participantName}`);
     const activate = dialog.getByRole("button", { name: "Permitir câmera e microfone" });
     await activate.click();
 
@@ -592,16 +558,13 @@ test.describe("permissões de mídia (RF-23)", () => {
     } satisfies CallFixture;
     await emitCallEvent(page, callEvent(call, "ringing", 1));
 
-    const dialog = page.getByRole("dialog", { name: `Chamada de vídeo com ${participantName}` });
-    const accept = dialog.getByRole("button", { name: "Atender" });
+    const dialog = page.getByRole("dialog", { name: "Chamada recebida" });
+    const accept = dialog.getByRole("button", { name: "Atender com câmera" });
     const decline = dialog.getByRole("button", { name: "Recusar" });
-    await expect(accept).toBeFocused();
-
     await accept.click();
     // Wait for accept()'s own getUserMedia preflight to actually be in
     // flight (held open, simulating the native prompt) before asserting.
     await expect.poll(() => getUserMediaCalls(page)).toEqual([{ audio: true, video: true }]);
-    await expect(accept).toBeDisabled();
     await expect(decline).toBeEnabled();
 
     await decline.click();
@@ -790,25 +753,6 @@ async function expectCommandCount(page: Page, type: string, count: number) {
   await expect.poll(() => commandCount(page, type)).toBe(count);
 }
 
-async function focusByTab(page: Page, target: Locator) {
-  for (let stop = 0; stop < 12; stop += 1) {
-    if (await target.evaluate((element) => element === document.activeElement)) return;
-    await page.keyboard.press("Tab");
-  }
-  await expect(target).toBeFocused();
-}
-
-async function expectFillsViewport(locator: Locator, page: Page) {
-  const box = await locator.boundingBox();
-  const viewport = page.viewportSize();
-  expect(box).not.toBeNull();
-  expect(viewport).not.toBeNull();
-  expect(box!.x).toBeCloseTo(0, 0);
-  expect(box!.y).toBeCloseTo(0, 0);
-  expect(box!.width).toBeCloseTo(viewport!.width, 0);
-  expect(box!.height).toBeCloseTo(viewport!.height, 0);
-}
-
 async function expectInsideViewport(locator: Locator, page: Page) {
   const box = await locator.boundingBox();
   const viewport = page.viewportSize();
@@ -824,22 +768,4 @@ async function expectNoHorizontalScroll(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
-}
-
-async function expectNoOverlap(first: Locator, second: Locator) {
-  const firstBox = await first.boundingBox();
-  const secondBox = await second.boundingBox();
-  expect(firstBox).not.toBeNull();
-  expect(secondBox).not.toBeNull();
-  const overlapWidth = Math.max(
-    0,
-    Math.min(firstBox!.x + firstBox!.width, secondBox!.x + secondBox!.width) -
-      Math.max(firstBox!.x, secondBox!.x),
-  );
-  const overlapHeight = Math.max(
-    0,
-    Math.min(firstBox!.y + firstBox!.height, secondBox!.y + secondBox!.height) -
-      Math.max(firstBox!.y, secondBox!.y),
-  );
-  expect(overlapWidth * overlapHeight).toBe(0);
 }

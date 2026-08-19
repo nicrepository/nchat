@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { _resetChatSocket, MAX_CONSECUTIVE_FAILURES, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
-import { issueCallToken, issueResourceCallToken } from "./callApi";
+import { issueCallToken } from "./callApi";
 import { requestMediaPermission } from "./mediaPermission";
 import { useCallMedia } from "./useCallMedia";
 import type { CallMediaBridge } from "./useCallSignaling";
@@ -23,7 +23,6 @@ import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCa
 
 vi.mock("./callApi", () => ({
   issueCallToken: vi.fn(),
-  issueResourceCallToken: vi.fn(),
 }));
 
 vi.mock("./mediaPermission", () => ({
@@ -2554,16 +2553,8 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       kind: "channel",
       id: "00000000-0000-4000-8000-000000000710",
       name: "geral",
+      callId: "00000000-0000-4000-8000-000000000711",
     };
-
-    beforeEach(() => {
-      vi.mocked(issueResourceCallToken).mockReset();
-      vi.mocked(issueResourceCallToken).mockResolvedValue({
-        token: "resource-token",
-        expiresAt: "2026-07-30T12:05:00Z",
-        serverUrl: liveKitServerUrl,
-      });
-    });
 
     async function driveCallToActive(
       view: { result: { current: { calls: ReturnType<typeof useCallSignaling> } } },
@@ -2573,7 +2564,11 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       act(() => {
         view.result.current.calls.accept();
       });
-      await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+      await waitFor(() =>
+        expect(
+          sentMessages(socket).filter((message) => message.type === "call.accept"),
+        ).toHaveLength(1),
+      );
       act(() => socket.simulateMessage(activeEvent(1)));
     }
 
@@ -2633,6 +2628,7 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
 
       await act(() => view.result.current.resourceCall.join(channelTarget));
       const roomA = rooms[0];
+      vi.mocked(issueCallToken).mockClear();
       roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
 
       await driveCallToActive(view, socket);

@@ -730,7 +730,19 @@ export async function dropWebSocket(page: Page) {
 export async function installMessagingMocks(
   page: Page,
   scenario: MessagingScenario,
-  options: { editWindowExpiredIds?: string[]; forbiddenTargetIds?: string[] } = {},
+  options: {
+    editWindowExpiredIds?: string[];
+    forbiddenTargetIds?: string[];
+    /**
+     * Resource (channel/dm) calls a dedicated tab can resolve via call.sync
+     * on load, keyed by call id (CALLS-546). Baked into the mock's
+     * addInitScript args so it is already known on the very first
+     * call.sync — including after a reload, which re-runs the init script
+     * with these same args. Unregistered ids keep answering
+     * call_not_found.
+     */
+    knownCalls?: Array<{ callId: string; event: Record<string, unknown> }>;
+  } = {},
 ) {
   const expired = new Set(options.editWindowExpiredIds ?? []);
   const forbidden = new Set(options.forbiddenTargetIds ?? []);
@@ -748,7 +760,7 @@ export async function installMessagingMocks(
   await page.context().grantPermissions(["camera", "microphone"], {
     origin: "http://localhost:5173",
   });
-  await installWebSocketMock(page, scenario, assertConversationAccess);
+  await installWebSocketMock(page, scenario, assertConversationAccess, options.knownCalls ?? []);
   await installSidebarMocks(page, scenario);
   await installInteractionMocks(page, scenario, assertConversationAccess);
   await installConversationMocks(page, scenario);
@@ -1017,6 +1029,7 @@ async function installWebSocketMock(
   page: Page,
   scenario: MessagingScenario,
   assertConversationAccess: ConversationAccessGuard,
+  knownCalls: Array<{ callId: string; event: Record<string, unknown> }>,
 ) {
   // Reaction toggles travel over the WebSocket, not REST (RF-08). The fake
   // socket below calls back into this exposed function so a toggle mutates
@@ -1061,7 +1074,15 @@ async function installWebSocketMock(
 
   await page.addInitScript(
     (args) => {
-      const { accessToken, targetKind, targetId, currentUserId, allowedTargets, presence } = args;
+      const {
+        accessToken,
+        targetKind,
+        targetId,
+        currentUserId,
+        allowedTargets,
+        presence,
+        knownCalls: knownCallList,
+      } = args;
       sessionStorage.setItem("nchat_at", accessToken);
       const allowed = new Set(allowedTargets);
       const sockets = new Set<StableWebSocket>();
@@ -1074,6 +1095,15 @@ async function installWebSocketMock(
       // Every roster this mock answered with, so a spec can assert what each
       // conversation was actually told rather than waiting a fixed time.
       const deliveredSnapshots: Array<Record<string, unknown>> = [];
+      // Resource (channel/dm) calls a dedicated tab resolves via call.sync
+      // (RF-23/CALLS-546). Baked in via addInitScript args (not a runtime
+      // exposeFunction) so it survives — and is already there for — the
+      // very first call.sync a reload sends, matching achado #1's
+      // reload/direct-open recovery scenarios. Unregistered ids keep
+      // answering call_not_found.
+      const knownCalls = new Map<string, Record<string, unknown>>(
+        knownCallList.map((entry) => [entry.callId, entry.event]),
+      );
 
       class StableWebSocket {
         static readonly CONNECTING = 0;
@@ -1101,14 +1131,17 @@ async function installWebSocketMock(
           }
           sentMessages.push(parsed);
           if (parsed["type"] === "call.sync") {
+            const known = knownCalls.get(parsed["call_id"] as string);
             queueMicrotask(() =>
               this.onmessage?.(
                 new MessageEvent("message", {
-                  data: JSON.stringify({
-                    type: "call.error",
-                    operation: "call.sync",
-                    code: "call_not_found",
-                  }),
+                  data: JSON.stringify(
+                    known ?? {
+                      type: "call.error",
+                      operation: "call.sync",
+                      code: "call_not_found",
+                    },
+                  ),
                 }),
               ),
             );
@@ -1288,6 +1321,7 @@ async function installWebSocketMock(
         string,
         Array<Record<string, unknown>>
       >,
+      knownCalls,
     },
   );
 }
