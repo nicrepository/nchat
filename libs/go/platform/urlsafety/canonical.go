@@ -1,6 +1,7 @@
 package urlsafety
 
 import (
+	"crypto/sha256"
 	"net/url"
 	"strings"
 )
@@ -130,4 +131,22 @@ func canonicalPathAndQuery(parsed *url.URL) string {
 // isDefaultPort reports the port that carries no information for a scheme.
 func isDefaultPort(scheme, port string) bool {
 	return (scheme == "http" && port == "80") || (scheme == "https" && port == "443")
+}
+
+// URLDigest is the storage key for a canonical URL: SHA-256 over its exact bytes.
+//
+// It lives here, next to CanonicalizeURL, because it is the second half of the
+// same contract. chat-service and file-service both key durable rows by it — and
+// since issue #135 they share one table, files.link_fetch_denylist, whose whole
+// job is to let one service veto the other's clearance. Two definitions of "the
+// key for this URL" would be a veto that silently never matches: the row would be
+// written under one digest and looked up under another, and the failure would
+// look exactly like "no such URL" rather than like a bug.
+//
+// It hashes the canonical form and nothing else. Feeding it a raw user URL would
+// key two spellings of one resource differently, which is the same failure by
+// another route.
+func URLDigest(canonicalURL string) []byte {
+	sum := sha256.Sum256([]byte(canonicalURL))
+	return sum[:]
 }

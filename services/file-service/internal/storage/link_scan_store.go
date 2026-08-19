@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -62,9 +61,14 @@ const (
 // row a fixed-width key regardless of how long the URL is. The URL itself is
 // still stored — the worker has to submit it after a restart, and a digest
 // cannot be reversed — but nothing else has to carry it around.
+// digestOf is urlsafety.URLDigest under this package's older name.
+//
+// It delegates rather than re-implementing: since issue #135 the same digest keys
+// files.link_fetch_denylist, which chat-service also writes, and two definitions
+// of "the key for this URL" would be a cross-service veto that silently never
+// matches.
 func digestOf(canonicalURL string) []byte {
-	sum := sha256.Sum256([]byte(canonicalURL))
-	return sum[:]
+	return urlsafety.URLDigest(canonicalURL)
 }
 
 // LoadVerdict returns a live verdict for a canonical URL.
@@ -76,22 +80,35 @@ func digestOf(canonicalURL string) []byte {
 func (s *PGXLinkScanStore) LoadVerdict(
 	ctx context.Context, canonicalURL string,
 ) (urlsafety.Verdict, bool, error) {
-	var stored string
+	// One round trip, two facts. The denylist is asked alongside the row because it
+	// *overrides*: a URL any component proved malicious is refused whatever this
+	// service's own row says, and however fresh that row is. This is the CQ-002
+	// invariant, enforced on the read that authorises the fetch rather than left to
+	// two independent stores converging.
+	var denied bool
+	var stored *string
 	err := s.pool.QueryRow(ctx, `
-		SELECT verdict
-		FROM files.link_scans
-		WHERE url_digest = $1 AND state = 'done' AND verdict_expires_at > now()`,
-		digestOf(canonicalURL),
-	).Scan(&stored)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return urlsafety.VerdictUnknown, false, nil
-	}
+		SELECT
+			EXISTS (SELECT 1 FROM files.link_fetch_denylist WHERE url_digest = $1),
+			(SELECT verdict FROM files.link_scans
+			  WHERE url_digest = $1 AND state = 'done' AND verdict_expires_at > now())`,
+		urlsafety.URLDigest(canonicalURL),
+	).Scan(&denied, &stored)
 	if err != nil {
 		return urlsafety.VerdictUnknown, false, fmt.Errorf("load link verdict: %w", err)
 	}
+	if denied {
+		// Reported as a verdict rather than as an absence, so the caller refuses
+		// permanently instead of queueing another scan for a URL already known to be
+		// malicious.
+		return urlsafety.VerdictMalicious, true, nil
+	}
+	if stored == nil {
+		return urlsafety.VerdictUnknown, false, nil
+	}
 	// Only a value this package recognises becomes a verdict. A corrupted or
 	// future status is treated as absent rather than as a clearance.
-	verdict := urlsafety.Verdict(stored)
+	verdict := urlsafety.Verdict(*stored)
 	if !verdict.IsFinal() {
 		return urlsafety.VerdictUnknown, false, nil
 	}
@@ -511,7 +528,8 @@ func (s *PGXLinkScanStore) RecordVerdict(
 
 	var tag pgconn.CommandTag
 	var err error
-	if verdict == urlsafety.VerdictInconclusive {
+	switch verdict {
+	case urlsafety.VerdictInconclusive:
 		// Terminal, and deliberately without a TTL: unlike a safe/malicious
 		// clearance this never expires back into the claim query on a timer — see
 		// ClaimDueScans and Backlog, which exclude this state outright — so there
@@ -524,7 +542,32 @@ func (s *PGXLinkScanStore) RecordVerdict(
 			 WHERE url_digest = $1 AND state = 'polling' AND scan_uuid = $2`,
 			urlDigest, scanUUID,
 		)
-	} else {
+	case urlsafety.VerdictMalicious:
+		// A condemnation is published to the shared authority in the *same*
+		// statement that records it (issue #135, CQ-002), so there is no ordering in
+		// which this service knows a URL is malicious and the deployment as a whole
+		// does not. The canonical URL is read back out of the row being updated
+		// rather than taken from a parameter, so the denylist entry can only ever
+		// describe the URL this row is actually about.
+		tag, err = s.pool.Exec(ctx, `
+			WITH updated AS (
+				UPDATE files.link_scans
+				   SET state = 'done', verdict = $3,
+				       verdict_expires_at = now() + ($4 * interval '1 second'),
+				       lease_until = NULL, next_attempt_at = NULL, updated_at = now()
+				 WHERE url_digest = $1 AND state = 'polling' AND scan_uuid = $2
+				RETURNING url_digest, canonical_url
+			),
+			`+urlsafety.InvalidateFetchAuthoritySQL(
+			"$1",
+			"updated.canonical_url",
+			"'"+urlsafety.DenylistSourceFiles+"'",
+			"updated",
+		)+`
+			SELECT url_digest FROM updated`,
+			urlDigest, scanUUID, string(verdict), ttl.Seconds(),
+		)
+	default:
 		tag, err = s.pool.Exec(ctx, `
 			UPDATE files.link_scans
 			   SET state = 'done', verdict = $3,
