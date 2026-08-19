@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 
 import "./ProfilePage.css";
+import { validateDisplayName } from "./profileForm";
 import {
   getSoundNotificationMode,
   setSoundNotificationMode,
@@ -13,22 +14,31 @@ import {
   AvatarUploadError,
   fetchMyProfile,
   removeAvatar,
+  updateDisplayName,
+  UpdateDisplayNameError,
   uploadAvatar,
 } from "./profileApi";
 import { refreshSelfProfile } from "./selfProfile";
 
 /**
- * ProfilePage — lets the signed-in user set, replace or remove their avatar.
+ * ProfilePage — lets the signed-in user edit their display name and set,
+ * replace or remove their avatar.
  *
- * The persisted avatar is loaded from GET /api/auth/me on mount, so it survives a
- * page reload and can be removed later (never derived from the last local upload
- * alone). A newly chosen file is previewed locally and uploaded only on an
- * explicit action; the preview object URL is always revoked exactly once.
+ * The persisted profile is loaded from GET /api/auth/me on mount, so it
+ * survives a page reload. A newly chosen avatar file is previewed locally and
+ * uploaded only on an explicit action; the preview object URL is always
+ * revoked exactly once.
  *
  * Two distinct removal semantics are surfaced as two buttons so a single control
  * never carries an ambiguous meaning:
  *   - "Cancelar nova imagem" discards the local selection (no server call);
  *   - "Remover avatar" deletes the persisted avatar (server DELETE).
+ *
+ * Saving the display name (ID 7, cronograma 19/08) updates only this screen's
+ * local state from the server's response. Propagating the new name to the
+ * sidebar and elsewhere (refreshSelfProfile) is explicitly out of scope here —
+ * that synchronization is ID 13 (20/08) — so the screen must reflect the
+ * persisted value on its own rather than relying on that propagation.
  */
 export default function ProfilePage() {
   // persistedAvatarUrl: undefined = still loading / unknown, "" = confirmed none.
@@ -50,6 +60,17 @@ export default function ProfilePage() {
     getSoundNotificationMode(),
   );
 
+  // persistedDisplayName: undefined = still loading / unknown.
+  const [persistedDisplayName, setPersistedDisplayName] = useState<string | undefined>(undefined);
+  const [nameDraft, setNameDraft] = useState("");
+  const [savingName, setSavingName] = useState(false);
+  const [nameNetworkError, setNameNetworkError] = useState<string | null>(null);
+  const [nameNotice, setNameNotice] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  // State updates are asynchronous, so `savingName` cannot stop a second submit
+  // fired in the same tick; this ref is what actually makes the save single.
+  const savingNameRef = useRef(false);
+
   // loadProfile performs the fetch and settles state asynchronously (in the
   // promise callbacks), so it never calls setState synchronously — safe to run
   // from the mount effect without triggering a cascading render.
@@ -57,6 +78,8 @@ export default function ProfilePage() {
     fetchMyProfile(signal)
       .then((profile) => {
         setPersistedAvatarUrl(profile.avatarUrl ?? "");
+        setPersistedDisplayName(profile.displayName);
+        setNameDraft(profile.displayName);
         setLoadingProfile(false);
       })
       .catch((error: unknown) => {
@@ -198,6 +221,77 @@ export default function ProfilePage() {
   const hasPersistedAvatar = persistedAvatarUrl !== undefined && persistedAvatarUrl !== "";
   const shownImage = previewUrl ?? (hasPersistedAvatar ? persistedAvatarUrl : null);
 
+  const trimmedNameDraft = nameDraft.trim();
+  // Reported while the user types rather than only on submit, so shortening a
+  // too-long name shows the fix immediately. The empty case is guarded here
+  // (an untouched or just-cleared field should not shout "required" before
+  // any attempt to save) and is instead caught by validateDisplayName itself
+  // inside onSaveName.
+  const nameError = trimmedNameDraft === "" ? null : validateDisplayName(trimmedNameDraft);
+  const nameDirty = persistedDisplayName !== undefined && nameDraft !== persistedDisplayName;
+
+  const onNameChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    setNameDraft(event.target.value);
+    setNameNetworkError(null);
+    setNameNotice(false);
+  }, []);
+
+  const onCancelName = useCallback(() => {
+    setNameDraft(persistedDisplayName ?? "");
+    setNameNetworkError(null);
+    setNameNotice(false);
+  }, [persistedDisplayName]);
+
+  /**
+   * Saves the display name, at most once per submission (savingNameRef makes
+   * the guard synchronous; savingName only drives the disabled UI). On
+   * success, the field is set to exactly what the server persisted rather
+   * than what was typed — the two coincide in the normal case, but the
+   * response is what is actually true. Only this screen's own state is
+   * updated: no sidebar/session propagation here, that is ID 13's job.
+   */
+  const onSaveName = useCallback(async () => {
+    if (savingNameRef.current) return;
+    const trimmed = nameDraft.trim();
+    const message = validateDisplayName(trimmed);
+    if (message) {
+      nameInputRef.current?.focus();
+      return; // nameError is already shown live; nothing else to do.
+    }
+    savingNameRef.current = true;
+    setSavingName(true);
+    setNameNetworkError(null);
+    setNameNotice(false);
+    try {
+      const profile = await updateDisplayName(trimmed);
+      setPersistedDisplayName(profile.displayName);
+      setNameDraft(profile.displayName);
+      setNameNotice(true);
+    } catch (error) {
+      const errMessage =
+        error instanceof UpdateDisplayNameError
+          ? error.message
+          : "Não foi possível atualizar o nome.";
+      setNameNetworkError(errMessage); // draft is preserved so the user can retry.
+    } finally {
+      savingNameRef.current = false;
+      setSavingName(false);
+    }
+  }, [nameDraft]);
+
+  /**
+   * The form's only entry point, for both Enter and the Save button — Enter
+   * submits from the input via the native <form>, and the guards in
+   * onSaveName apply the same way either path is taken.
+   */
+  const onNameFormSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      void onSaveName();
+    },
+    [onSaveName],
+  );
+
   return (
     <main className="profile-page" aria-labelledby="profile-title">
       <header className="profile-page__header">
@@ -208,6 +302,57 @@ export default function ProfilePage() {
           Voltar ao chat
         </Link>
       </header>
+
+      <section className="profile-page__name-card" aria-label="Nome de exibição">
+        <form className="profile-page__name-form" onSubmit={onNameFormSubmit}>
+          <label className="profile-page__field-label" htmlFor="profile-display-name">
+            Nome de exibição
+          </label>
+          <input
+            ref={nameInputRef}
+            id="profile-display-name"
+            type="text"
+            className="profile-page__input"
+            autoComplete="name"
+            value={nameDraft}
+            disabled={savingName || loadingProfile}
+            aria-invalid={nameError !== null}
+            aria-describedby={nameError ? "profile-display-name-error" : undefined}
+            onChange={onNameChange}
+          />
+          {nameError && (
+            <p id="profile-display-name-error" className="profile-page__error" role="alert">
+              {nameError}
+            </p>
+          )}
+
+          <div className="profile-page__buttons">
+            <button
+              type="submit"
+              className="profile-page__btn profile-page__btn--primary"
+              disabled={!nameDirty || nameError !== null || savingName || loadingProfile}
+              aria-busy={savingName}
+            >
+              {savingName ? "Salvando…" : "Salvar nome"}
+            </button>
+            {nameDirty && (
+              <button
+                type="button"
+                className="profile-page__btn"
+                onClick={onCancelName}
+                disabled={savingName}
+              >
+                Cancelar
+              </button>
+            )}
+          </div>
+
+          <div className="profile-page__status" role="status" aria-live="polite">
+            {nameNetworkError && <span className="profile-page__error">{nameNetworkError}</span>}
+            {nameNotice && <span className="profile-page__ok">Nome atualizado.</span>}
+          </div>
+        </form>
+      </section>
 
       <section className="profile-page__avatar-card" aria-label="Avatar">
         <div className="profile-page__avatar-preview">

@@ -516,6 +516,7 @@ Auth-service implements RF-44 with Keycloak as the first OIDC provider. The flow
 - Frontend exchange: `POST /auth/oidc/keycloak/exchange`
 - Web route: `/oidc-callback`
 - User linking: existing `(external_provider, external_subject)` users log in; new verified emails are auto-provisioned when enabled; manual same-email accounts are not silently linked.
+- Provisioning is just-in-time: the NChat account is created on the user's first successful SSO login. Creating a user in Keycloak does not by itself create an NChat account, and it does not grant workspace membership — see the runbook.
 - Required provider values use secret refs in Kubernetes. `OIDC_ENABLED=false` by default.
 - Runbook: [docs/runbooks/task-auth-oidc-keycloak.md](docs/runbooks/task-auth-oidc-keycloak.md)
 - Migration: `migrations/auth/000007_oidc_keycloak_provider.{up,down}.sql`

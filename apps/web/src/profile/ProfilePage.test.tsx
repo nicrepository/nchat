@@ -4,14 +4,15 @@ import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ProfilePage from "./ProfilePage";
-import { AvatarUploadError } from "./profileApi";
+import { AvatarUploadError, UpdateDisplayNameError } from "./profileApi";
 import { _resetSelfProfile, useSelfProfile } from "./selfProfile";
 import { getSoundNotificationMode } from "../chat/soundPreference";
 
-const { mockUpload, mockRemove, mockFetchProfile } = vi.hoisted(() => ({
+const { mockUpload, mockRemove, mockFetchProfile, mockUpdateDisplayName } = vi.hoisted(() => ({
   mockUpload: vi.fn(),
   mockRemove: vi.fn(),
   mockFetchProfile: vi.fn(),
+  mockUpdateDisplayName: vi.fn(),
 }));
 
 vi.mock("./profileApi", async (importOriginal) => {
@@ -21,6 +22,8 @@ vi.mock("./profileApi", async (importOriginal) => {
     uploadAvatar: (file: File) => mockUpload(file),
     removeAvatar: () => mockRemove(),
     fetchMyProfile: (signal?: AbortSignal) => mockFetchProfile(signal),
+    updateDisplayName: (displayName: string, signal?: AbortSignal) =>
+      mockUpdateDisplayName(displayName, signal),
   };
 });
 
@@ -63,6 +66,11 @@ function gifFile(name = "x.gif") {
 const fileInput = () => screen.getByLabelText(/escolher imagem/i) as HTMLInputElement;
 const uploadBtn = () => screen.getByRole("button", { name: /enviar avatar/i });
 const removeBtn = () => screen.getByRole("button", { name: /remover avatar/i });
+
+const nameInput = () =>
+  screen.getByRole("textbox", { name: /nome de exibição/i }) as HTMLInputElement;
+const saveNameBtn = () => screen.getByRole("button", { name: /salvar nome/i });
+const cancelNameBtn = () => screen.queryByRole("button", { name: /^cancelar$/i });
 
 // Wait for the initial profile load to settle so the input is enabled.
 async function settled() {
@@ -391,6 +399,224 @@ describe("ProfilePage — removal", () => {
       "src",
       "/api/auth/avatars/saved.png",
     );
+  });
+});
+
+// ── Display name (ID 7 — cronograma 19/08) ─────────────────────────────────────
+
+describe("ProfilePage — display name: initial state and disabled controls", () => {
+  it("shows the persisted display name once loaded", async () => {
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana Lima", avatarUrl: undefined });
+    renderPage();
+    await settled();
+    expect(nameInput().value).toBe("Ana Lima");
+  });
+
+  it("disables the name input and Save while the profile is still loading", async () => {
+    mockFetchProfile.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    expect(nameInput()).toBeDisabled();
+    expect(saveNameBtn()).toBeDisabled();
+  });
+
+  it("hides Cancel and disables Save when the draft has not changed", async () => {
+    renderPage();
+    await settled();
+    expect(cancelNameBtn()).not.toBeInTheDocument();
+    expect(saveNameBtn()).toBeDisabled();
+  });
+});
+
+describe("ProfilePage — display name: editing", () => {
+  it("typing enables Save and reveals Cancel", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Nova Ana");
+
+    expect(saveNameBtn()).toBeEnabled();
+    expect(cancelNameBtn()).toBeInTheDocument();
+  });
+
+  it("shows a validation error past the limit and blocks Save, without calling the server", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "a".repeat(81));
+
+    expect(await screen.findByText(/no máximo 80 caracteres/i)).toBeInTheDocument();
+    expect(nameInput()).toHaveAttribute("aria-invalid", "true");
+    expect(saveNameBtn()).toBeDisabled();
+
+    // A disabled button cannot be clicked via userEvent; fireEvent on the form's
+    // submit still must not reach the service, proving onSaveName re-validates
+    // rather than trusting the disabled attribute alone.
+    fireEvent.submit(nameInput().closest("form")!);
+    expect(mockUpdateDisplayName).not.toHaveBeenCalled();
+  });
+
+  it("Cancel resets the draft to the persisted value with no server call", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana", avatarUrl: undefined });
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Outro Nome");
+    await user.click(cancelNameBtn()!);
+
+    expect(nameInput().value).toBe("Ana");
+    expect(cancelNameBtn()).not.toBeInTheDocument();
+    expect(mockUpdateDisplayName).not.toHaveBeenCalled();
+  });
+});
+
+describe("ProfilePage — display name: save", () => {
+  it("saves the trimmed value and reflects exactly what the server returned", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana", avatarUrl: undefined });
+    mockUpdateDisplayName.mockResolvedValue({ id: "u1", displayName: "Ana Lima Souza" });
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "  Ana Lima Souza  ");
+    await user.click(saveNameBtn());
+
+    await waitFor(() => expect(mockUpdateDisplayName).toHaveBeenCalledTimes(1));
+    expect(mockUpdateDisplayName.mock.calls[0][0]).toBe("Ana Lima Souza");
+    await waitFor(() => expect(screen.getByText(/nome atualizado/i)).toBeInTheDocument());
+    expect(nameInput().value).toBe("Ana Lima Souza");
+    // The value now matches what was persisted, so there is nothing left to save.
+    expect(cancelNameBtn()).not.toBeInTheDocument();
+  });
+
+  it("shows aria-busy and disables the input while saving", async () => {
+    const user = userEvent.setup();
+    let resolveSave!: (value: { id: string; displayName: string }) => void;
+    mockUpdateDisplayName.mockReturnValue(new Promise((resolve) => (resolveSave = resolve)));
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Ana Lima");
+    const btn = saveNameBtn(); // the label changes to "Salvando…" once pending
+    await user.click(btn);
+
+    expect(btn).toHaveAttribute("aria-busy", "true");
+    expect(nameInput()).toBeDisabled();
+
+    resolveSave({ id: "u1", displayName: "Ana Lima" });
+    await waitFor(() => expect(screen.getByText(/nome atualizado/i)).toBeInTheDocument());
+  });
+
+  it("a duplicate submit in the same tick reaches the service exactly once", async () => {
+    mockUpdateDisplayName.mockResolvedValue({ id: "u1", displayName: "Ana Lima" });
+    renderPage();
+    await settled();
+
+    fireEvent.change(nameInput(), { target: { value: "Ana Lima" } });
+    const form = nameInput().closest("form")!;
+    // Two submits fired before either promise settles: the synchronous
+    // savingNameRef guard, not just the (async) disabled attribute, is what
+    // keeps this to one call.
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+
+    await waitFor(() => expect(mockUpdateDisplayName).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps the draft and shows a message on failure, allowing retry", async () => {
+    const user = userEvent.setup();
+    mockUpdateDisplayName
+      .mockRejectedValueOnce(new UpdateDisplayNameError("unknown", "Falhou."))
+      .mockResolvedValueOnce({ id: "u1", displayName: "Ana Lima" });
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Ana Lima");
+    await user.click(saveNameBtn());
+
+    expect(await screen.findByText(/falhou/i)).toBeInTheDocument();
+    expect(nameInput().value).toBe("Ana Lima"); // draft preserved for retry
+    expect(saveNameBtn()).toBeEnabled();
+
+    await user.click(saveNameBtn());
+    await waitFor(() => expect(screen.getByText(/nome atualizado/i)).toBeInTheDocument());
+  });
+
+  it("a generic (non-typed) failure still shows a message instead of leaving the screen blank", async () => {
+    const user = userEvent.setup();
+    mockUpdateDisplayName.mockRejectedValue(new Error("boom"));
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Ana Lima");
+    await user.click(saveNameBtn());
+
+    expect(await screen.findByText(/não foi possível atualizar o nome/i)).toBeInTheDocument();
+  });
+});
+
+// ID 13 (20/08) owns propagating a saved name to the sidebar and elsewhere via
+// refreshSelfProfile; ID 7 must NOT do that itself. This guards the boundary:
+// the shared self-profile cache (what the sidebar reads) must stay exactly
+// what it was before the save.
+describe("ProfilePage — display name: does not sync globally (reserved for ID 13)", () => {
+  function SelfNameProbe() {
+    const state = useSelfProfile();
+    return (
+      <span data-testid="self-name">
+        {state.status === "ready" ? state.profile.displayName : state.status}
+      </span>
+    );
+  }
+  function renderPageWithNameProbe() {
+    return render(
+      <MemoryRouter>
+        <ProfilePage />
+        <SelfNameProbe />
+      </MemoryRouter>,
+    );
+  }
+  const selfName = () => screen.getByTestId("self-name").textContent;
+
+  it("does not refresh the shared self-profile after a successful save", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana", avatarUrl: undefined });
+    mockUpdateDisplayName.mockResolvedValue({ id: "u1", displayName: "Ana Lima Souza" });
+    renderPageWithNameProbe();
+    await settled();
+    await waitFor(() => expect(selfName()).toBe("Ana"));
+    // ProfilePage's own load and the shared self-profile cache's load are two
+    // independent GETs at mount; what matters below is that this count does
+    // not grow after the save.
+    const callsAtMount = mockFetchProfile.mock.calls.length;
+
+    // If the server were asked again after save, it would answer with the new
+    // name — which is exactly what must NOT happen here.
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana Lima Souza",
+      avatarUrl: undefined,
+    });
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Ana Lima Souza");
+    await user.click(saveNameBtn());
+    await waitFor(() => expect(screen.getByText(/nome atualizado/i)).toBeInTheDocument());
+
+    // The page itself shows the new name...
+    expect(nameInput().value).toBe("Ana Lima Souza");
+    // ...but the shared cache other screens read from is untouched.
+    expect(selfName()).toBe("Ana");
+    expect(mockFetchProfile).toHaveBeenCalledTimes(callsAtMount);
   });
 });
 

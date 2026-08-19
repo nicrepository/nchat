@@ -118,11 +118,16 @@ func NewRouter(cfg config.Config, logger *slog.Logger, users service.UserAdmin, 
 	mux.Handle(RouteAuthAdminUsers, httputil.MethodNotAllowed(http.MethodGet, adminUsersHandler))
 	mux.Handle(RouteAuthAdminInvites, httputil.MethodNotAllowed(http.MethodPost, adminInvitesHandler))
 	profileHandler := GetMyProfile(users)
+	patchProfileHandler := PatchMyProfile(users)
 	if tokens != nil && users != nil {
 		requireActive := RequireActiveSession(sessions)
 		profileHandler = BearerAuth(tokens)(requireActive(profileHandler))
+		patchProfileHandler = BearerAuth(tokens)(requireActive(patchProfileHandler))
 	}
-	mux.Handle(RouteAuthMe, httputil.MethodNotAllowed(http.MethodGet, profileHandler))
+	mux.Handle(RouteAuthMe, methodRouter(map[string]http.Handler{
+		http.MethodGet:   profileHandler,
+		http.MethodPatch: patchProfileHandler,
+	}))
 
 	loginAttemptsHandler := GetMyLoginAttempts(loginAttempts)
 	if tokens != nil && loginAttempts != nil {
