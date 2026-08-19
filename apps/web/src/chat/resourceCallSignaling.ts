@@ -1,6 +1,7 @@
 import { acquireChatSocket, type ChatSocketHandle, type ChatSocketListener } from "./chatSocket";
 import { parseCallEvent, type Call } from "./callState";
 import type { ResourceCallKind } from "./callApi";
+import { randomId } from "../lib/randomId";
 
 interface ResourceCallStartTarget {
   kind: ResourceCallKind;
@@ -20,7 +21,7 @@ export function startResourceCall(
   options: ResourceCallSignalingOptions = {},
 ): Promise<Call> {
   const acquire = options.acquire ?? acquireChatSocket;
-  const requestID = (options.requestId ?? (() => crypto.randomUUID()))();
+  const requestID = (options.requestId ?? (() => randomId()))();
   const schedule =
     options.setTimeout ??
     ((callback: () => void, delay: number) => globalThis.setTimeout(callback, delay));
