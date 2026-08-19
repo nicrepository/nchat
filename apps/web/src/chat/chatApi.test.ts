@@ -1842,7 +1842,7 @@ describe("forwardChannelMessage", () => {
 });
 
 describe("fetchMentionCandidates", () => {
-  it("scopes the query to the current channel and maps both candidate types", async () => {
+  it("scopes the query to the current channel and maps user candidates", async () => {
     mockAuthFetch.mockResolvedValue({
       data: {
         users: [{ type: "user", id: "user-1", label: "Ana" }],
@@ -1856,10 +1856,22 @@ describe("fetchMentionCandidates", () => {
       expect.stringContaining("/channels/channel-1/mentions?q=an"),
       expect.objectContaining({ method: "GET" }),
     );
-    expect(candidates).toEqual([
-      { mentionType: "user", id: "user-1", label: "Ana" },
-      { mentionType: "channel", id: "channel-2", label: "anuncios" },
-    ]);
+    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+  });
+
+  it("drops channel candidates even when the backend still returns them — mentions are for people only", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        users: [{ type: "user", id: "user-1", label: "Ana" }],
+        channels: [{ type: "channel", id: "channel-2", label: "anuncios" }],
+      },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    // MentionCandidate no longer has a "channel" variant at all — this
+    // exhaustively proves nothing from res.data.channels leaked through.
+    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
   });
 
   it("fails safe to an empty list when the response shape is malformed", async () => {

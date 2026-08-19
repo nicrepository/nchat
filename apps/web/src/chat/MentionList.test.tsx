@@ -6,7 +6,7 @@ import type { MentionListRef } from "./MentionList";
 
 const items = [
   { mentionType: "user" as const, id: "user-1", label: "Ana" },
-  { mentionType: "channel" as const, id: "channel-1", label: "anuncios" },
+  { mentionType: "all" as const, id: "00000000-0000-0000-0000-000000000000", label: "all" },
 ];
 
 describe("MentionList", () => {
@@ -16,10 +16,7 @@ describe("MentionList", () => {
     render(<MentionList ref={ref} items={items} command={command} />);
 
     act(() => expect(ref.current?.onKeyDown({ key: "ArrowDown" } as KeyboardEvent)).toBe(true));
-    expect(screen.getByRole("option", { name: /anuncios/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("option", { name: /all/ })).toHaveAttribute("aria-selected", "true");
     act(() => expect(ref.current?.onKeyDown({ key: "ArrowUp" } as KeyboardEvent)).toBe(true));
     act(() => expect(ref.current?.onKeyDown({ key: "Enter" } as KeyboardEvent)).toBe(true));
 
@@ -31,7 +28,7 @@ describe("MentionList", () => {
   it("selects an item with the pointer", () => {
     const command = vi.fn();
     render(<MentionList items={items} command={command} />);
-    fireEvent.mouseDown(screen.getByRole("option", { name: /anuncios/ }));
+    fireEvent.mouseDown(screen.getByRole("option", { name: /all/ }));
     expect(command).toHaveBeenCalledWith(items[1]);
   });
 

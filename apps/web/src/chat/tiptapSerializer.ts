@@ -73,7 +73,11 @@ function serializeMention(node: TTNode): string {
   const mentionType = node.attrs?.mentionType;
   const id = node.attrs?.id;
   const label = node.attrs?.label;
-  if ((mentionType !== "user" && mentionType !== "channel") || !id || !label) {
+  if (
+    (mentionType !== "user" && mentionType !== "channel" && mentionType !== "all") ||
+    !id ||
+    !label
+  ) {
     throw new Error("invalid mention node: mentionType, id, and label are required");
   }
   return buildMentionToken(mentionType, String(id), String(label));

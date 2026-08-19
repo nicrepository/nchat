@@ -3,6 +3,11 @@ import { Link } from "react-router";
 
 import "./ProfilePage.css";
 import {
+  getSoundNotificationMode,
+  setSoundNotificationMode,
+  type SoundNotificationMode,
+} from "../chat/soundPreference";
+import {
   AVATAR_ACCEPTED_TYPES,
   AVATAR_MAX_BYTES,
   AvatarUploadError,
@@ -38,6 +43,12 @@ export default function ProfilePage() {
   const [networkError, setNetworkError] = useState<string | null>(null);
   const [notice, setNotice] = useState<"saved" | "removed" | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Local-only preference (no backend endpoint for it yet), read once at
+  // mount — every write goes through setSoundNotificationMode immediately
+  // below, so this state never drifts from what's persisted.
+  const [soundMode, setSoundModeState] = useState<SoundNotificationMode>(() =>
+    getSoundNotificationMode(),
+  );
 
   // loadProfile performs the fetch and settles state asynchronously (in the
   // promise callbacks), so it never calls setState synchronously — safe to run
@@ -177,6 +188,12 @@ export default function ProfilePage() {
     }
   }, [discardSelection]);
 
+  const onChangeSoundMode = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const next = event.currentTarget.value as SoundNotificationMode;
+    setSoundNotificationMode(next);
+    setSoundModeState(next);
+  }, []);
+
   const busy = uploading || removing;
   const hasPersistedAvatar = persistedAvatarUrl !== undefined && persistedAvatarUrl !== "";
   const shownImage = previewUrl ?? (hasPersistedAvatar ? persistedAvatarUrl : null);
@@ -265,6 +282,56 @@ export default function ProfilePage() {
             {notice === "removed" && <span className="profile-page__ok">Avatar removido.</span>}
           </div>
         </div>
+      </section>
+
+      <section className="profile-page__notifications-card" aria-label="Notificações">
+        <fieldset className="profile-page__sound-modes">
+          <legend className="profile-page__sound-modes-legend">Som de notificações</legend>
+          <label className="profile-page__checkbox-row" htmlFor="sound-mode-off">
+            <input
+              id="sound-mode-off"
+              type="radio"
+              name="sound-mode"
+              value="off"
+              checked={soundMode === "off"}
+              onChange={onChangeSoundMode}
+            />
+            Desativado
+          </label>
+          <label className="profile-page__checkbox-row" htmlFor="sound-mode-all">
+            <input
+              id="sound-mode-all"
+              type="radio"
+              name="sound-mode"
+              value="all"
+              checked={soundMode === "all"}
+              onChange={onChangeSoundMode}
+            />
+            Todas as mensagens
+          </label>
+          <label className="profile-page__checkbox-row" htmlFor="sound-mode-mentions">
+            <input
+              id="sound-mode-mentions"
+              type="radio"
+              name="sound-mode"
+              value="mentions"
+              checked={soundMode === "mentions"}
+              onChange={onChangeSoundMode}
+            />
+            Somente menções
+          </label>
+          <label className="profile-page__checkbox-row" htmlFor="sound-mode-mentions-and-dms">
+            <input
+              id="sound-mode-mentions-and-dms"
+              type="radio"
+              name="sound-mode"
+              value="mentions_and_dms"
+              checked={soundMode === "mentions_and_dms"}
+              onChange={onChangeSoundMode}
+            />
+            Menções e mensagens diretas
+          </label>
+        </fieldset>
       </section>
     </main>
   );

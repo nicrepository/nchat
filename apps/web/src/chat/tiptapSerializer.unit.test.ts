@@ -37,7 +37,7 @@ function text(t: string, ...marks: string[]): TTNode {
 function hardBreak(): TTNode {
   return { type: "hardBreak" };
 }
-function mention(type: "user" | "channel", id: string, label: string): TTNode {
+function mention(type: "user" | "channel" | "all", id: string, label: string): TTNode {
   return { type: "mention", attrs: { mentionType: type, id, label } };
 }
 function codeBlock(code: string): TTNode {
@@ -114,6 +114,15 @@ describe("tiptapDocToMarkdown — inline marks", () => {
         "v3",
       ),
     ).toBe(String.raw`Oi @[Ana \[Dev\]](mention:user:11111111-1111-1111-1111-111111111111)`);
+  });
+
+  it("serializes an 'all' broadcast mention like any other mention type", () => {
+    expect(
+      tiptapDocToMarkdown(
+        doc(para(text("Oi "), mention("all", "00000000-0000-0000-0000-000000000000", "all"))),
+        "v3",
+      ),
+    ).toBe(String.raw`Oi @[all](mention:all:00000000-0000-0000-0000-000000000000)`);
   });
 
   it("escapes literal mention delimiters in v3 plain text", () => {
@@ -455,6 +464,21 @@ describe("richTextToTiptapDoc — edit initialization", () => {
         label: "Ana",
         mentionType: "user",
         id: "123e4567-e89b-12d3-a456-426614174000",
+      },
+    });
+    expect(serializeDoc(decoded, "v3")).toBe(stored);
+  });
+
+  it("round-trips an 'all' broadcast mention node", () => {
+    const stored = "@[all](mention:all:00000000-0000-0000-0000-000000000000)";
+    const decoded = richTextToTiptapDoc(stored, "v3");
+
+    expect(decoded.content?.[0].content?.[0]).toMatchObject({
+      type: "mention",
+      attrs: {
+        label: "all",
+        mentionType: "all",
+        id: "00000000-0000-0000-0000-000000000000",
       },
     });
     expect(serializeDoc(decoded, "v3")).toBe(stored);
