@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
 
+	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
@@ -67,6 +68,7 @@ func messageCols() []string {
 		"parent_message_id", "forwarded_from_message_id", "referenced_message_id",
 		"edited_at", "edit_count", "deleted_at",
 		"created_at", "updated_at",
+		"link_safety_state",
 	}
 }
 
@@ -79,6 +81,9 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		"", "", "",
 		(*time.Time)(nil), 0, (*time.Time)(nil),
 		now, now,
+		// link_safety_state: the empty state, which is what the overwhelming
+		// majority of messages carry — they contain no links at all (issue #135).
+		"",
 	}
 }
 
@@ -91,7 +96,8 @@ func listMessageCols() []string {
 func listMessageWithQuoteCols() []string {
 	return append(listMessageCols(),
 		"quote_id", "quote_author_id", "quote_body_text", "quote_body_format",
-		"quote_status", "quote_deleted_at", "quote_created_at",
+		"quote_status", "quote_deleted_at", "quote_created_at", "quote_updated_at",
+		"quote_link_safety_state",
 	)
 }
 
@@ -108,11 +114,11 @@ func listMessageWithQuoteRow(id, workspaceID, channelID, dmID string, now time.T
 }
 
 func emptyQuoteRow() []any {
-	return []any{"", "", "", "", "", (*time.Time)(nil), (*time.Time)(nil)}
+	return []any{"", "", "", "", "", (*time.Time)(nil), (*time.Time)(nil), (*time.Time)(nil), ""}
 }
 
 func quoteRow(id, authorID, body, format, status string, deletedAt *time.Time, createdAt time.Time) []any {
-	return []any{id, authorID, body, format, status, deletedAt, &createdAt}
+	return []any{id, authorID, body, format, status, deletedAt, &createdAt, &createdAt, ""}
 }
 
 func listMessageRowWithQuote(id, workspaceID, channelID, dmID string, now time.Time, quote []any) []any {
@@ -153,6 +159,7 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // create idempotency key
 			pgxmock.AnyArg(), // link safety fingerprint
 			pgxmock.AnyArg(), // create request fingerprint
+			pgxmock.AnyArg(), // initial link safety state
 		).
 		WillReturnRows(rows)
 }
@@ -206,6 +213,7 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(),
 				).
 				WillReturnError(dbErr)
 
@@ -235,7 +243,7 @@ func TestPGXMessageStore_ForwardChannelMessage_SnapshotsAndPersistsProvenance(t 
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -258,7 +266,7 @@ func TestPGXMessageStore_ForwardChannelMessage_DeniedIsNonEnumerating(t *testing
 	mock := newMock(t)
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()))
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
 		WorkspaceID: "ws-1", DestinationChannelID: "destination", ActorID: "actor", SourceMessageID: "source",
@@ -277,7 +285,7 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotentReplay(t *testing.T) {
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -299,7 +307,7 @@ func TestPGXMessageStore_ForwardChannelMessage_IdempotencyFingerprintConflict(t 
 	row[10] = "different-source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, true)...))
 
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -407,7 +415,7 @@ func TestPGXMessageStore_ForwardChannelMessage_PreservesInfrastructureError(t *t
 	databaseErr := errors.New("database unavailable")
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "", "copied snapshot", "v3",
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(databaseErr)
 
 	_, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(t.Context(), storage.ForwardChannelMessageInput{
@@ -552,7 +560,7 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -575,7 +583,7 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			[]string{"11111111-1111-1111-1111-111111111111"},
 			[]string{"22222222-2222-2222-2222-222222222222"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-			pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -605,7 +613,7 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"99999999-9999-9999-9999-999999999999"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -789,6 +797,7 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"", "", "",
 		&editedAt, 1, &deletedAt,
 		now, now,
+		"",
 		"Test User", "test@example.com", false,
 	}
 	row = append(row, emptyQuoteRow()...)
@@ -857,7 +866,8 @@ func TestPGXMessageStore_ResolveMessageReferences_FiltersWithCanonicalReadAccess
 		WithArgs("ws-1", "user-1", []string{"msg-visible", "msg-hidden"}).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"message_id", "target_type", "target_id", "target_label", "author", "body", "body_format", "created_at",
-		}).AddRow("msg-visible", "channel", "ch-private", "privado", "Ana", "conteúdo", "v3", now))
+			"updated_at", "link_safety_state",
+		}).AddRow("msg-visible", "channel", "ch-private", "privado", "Ana", "conteúdo", "v3", now, now, ""))
 
 	refs, err := storage.NewPGXMessageStore(mock).ResolveMessageReferences(
 		t.Context(), "ws-1", "user-1", []string{"msg-visible", "msg-hidden"},
@@ -924,20 +934,37 @@ func TestPGXMessageStore_EditMessage_SnapshotsAndUpdatesInOneTransaction(t *test
 		WithArgs("ws-1", "msg-1", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
 			AddRow("user-1", "active", nil, now.Add(-time.Minute), &window, now))
-	mock.ExpectExec(`INSERT INTO chat\.message_edit_history`).
+	mock.ExpectQuery(`INSERT INTO chat\.message_edit_history`).
 		WithArgs("msg-1", "user-1", now).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("history-1"))
+	// The link-safety half of the edit, in the same transaction (issue #135):
+	// the states of the new body's URLs are re-checked under the row lock and its
+	// version-bound associations are written.
+	mock.ExpectQuery(`(?s)SELECT canonical_url, status.*FROM chat\.link_scans`).
+		WithArgs([]string{"https://edited.example/b"}, urlsafety.VerdictTTL.Seconds()).
+		WillReturnRows(pgxmock.NewRows([]string{"canonical_url", "status"}).
+			AddRow("https://edited.example/b", "safe"))
+	mock.ExpectExec(`DELETE FROM chat\.message_link_scans`).
+		WithArgs("msg-1").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`INSERT INTO chat\.message_link_scans`).
+		WithArgs("msg-1", "fp-edit", []string{"https://edited.example/b"}).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	updatedRow := listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)
 	updatedRow[6], updatedRow[7], updatedRow[13] = "new body", "v2", 1
 	updatedRow[12], updatedRow[16] = &now, now
+	updatedRow[17] = "safe"
 	mock.ExpectQuery(`(?s)UPDATE chat\.messages.*edit_count = edit_count \+ 1`).
-		WithArgs("msg-1", "new body", "v2", "user-1", now).
+		WithArgs("msg-1", "new body", "v2", "user-1", now, "safe", "fp-edit").
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(updatedRow...))
 	mock.ExpectCommit()
 
 	message, err := storage.NewPGXMessageStore(mock).EditMessage(context.Background(), storage.EditMessageInput{
 		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: "user-1",
 		Body: "new body", BodyFormat: domain.MessageBodyFormatV2,
+		LinkSafetyState:       domain.MessageLinkSafetySafe,
+		LinkSafetyFingerprint: "fp-edit",
+		LinkScanURLs:          []string{"https://edited.example/b"},
 	})
 	if err != nil {
 		t.Fatalf("EditMessage: %v", err)
@@ -978,14 +1005,19 @@ func TestPGXMessageStore_EditMessage_AtWindowLimitSucceeds(t *testing.T) {
 		WithArgs("ws-1", "msg-1", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
 			AddRow("user-1", "active", nil, now.Add(-900*time.Second), &window, now))
-	mock.ExpectExec(`INSERT INTO chat\.message_edit_history`).
+	mock.ExpectQuery(`INSERT INTO chat\.message_edit_history`).
 		WithArgs("msg-1", "user-1", now).
-		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("history-1"))
+	// No state re-check and no insert: the new body has no links. Historical
+	// associations remain bound to the old fingerprint and cannot decide it.
+	mock.ExpectExec(`DELETE FROM chat\.message_link_scans`).
+		WithArgs("msg-1").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	updatedRow := listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)
 	updatedRow[6], updatedRow[7], updatedRow[13] = "at limit", "v1", 1
 	updatedRow[12], updatedRow[16] = &now, now
 	mock.ExpectQuery(`(?s)UPDATE chat\.messages.*edit_count = edit_count \+ 1`).
-		WithArgs("msg-1", "at limit", "v1", "user-1", now).
+		WithArgs("msg-1", "at limit", "v1", "user-1", now, "", "").
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(updatedRow...))
 	mock.ExpectCommit()
 
@@ -1008,9 +1040,9 @@ func TestPGXMessageStore_EditMessage_MissingSnapshotRowRollsBack(t *testing.T) {
 		WithArgs("ws-1", "msg-1", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
 			AddRow("user-1", "active", nil, now.Add(-time.Minute), &window, now))
-	mock.ExpectExec(`INSERT INTO chat\.message_edit_history`).
+	mock.ExpectQuery(`INSERT INTO chat\.message_edit_history`).
 		WithArgs("msg-1", "user-1", now).
-		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		WillReturnRows(pgxmock.NewRows([]string{"id"}))
 	mock.ExpectRollback()
 
 	_, err := storage.NewPGXMessageStore(mock).EditMessage(context.Background(), storage.EditMessageInput{
@@ -1290,6 +1322,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		"", "", "",
 		&editedAt, 1, &deletedAt,
 		now, now,
+		"",
 		"Test User", "test@example.com", false,
 	}
 	row = append(row, emptyQuoteRow()...)
@@ -1689,7 +1722,7 @@ func TestPGXMessageStore_ForwardChannelMessage_WritesTheSuppliedSnapshot(t *test
 	row[10] = "source"
 	mock.ExpectQuery(forwardMsgSQL).
 		WithArgs("ws-1", "destination", "actor", "source", "action-1", "checked body", "v2",
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows(forwardMessageCols()).AddRow(append(row, false)...))
 
 	result, err := storage.NewPGXMessageStore(mock).ForwardChannelMessage(

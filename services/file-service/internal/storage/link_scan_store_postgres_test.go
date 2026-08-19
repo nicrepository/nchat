@@ -71,6 +71,11 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 	reset := func(t *testing.T) {
 		t.Helper()
 		for _, statement := range []string{
+			// The denylist is deliberately monotonic — nothing in the application
+			// ever removes a row — so a condemnation recorded by one subtest would
+			// otherwise dominate every later one that reuses the same URL. That is
+			// the intended production behaviour; here it is fixture state.
+			`DELETE FROM files.link_fetch_denylist`,
 			`DELETE FROM files.link_scans`,
 			`DELETE FROM files.link_scan_budget_usage`,
 		} {
@@ -81,6 +86,7 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		background := context.Background()
+		_, _ = pool.Exec(background, `DELETE FROM files.link_fetch_denylist`)
 		_, _ = pool.Exec(background, `DELETE FROM files.link_scans`)
 		_, _ = pool.Exec(background, `DELETE FROM files.link_scan_budget_usage`)
 	})
@@ -196,6 +202,16 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 		if err := store.RecordVerdict(ctx, job.URLDigest, "scan-stale",
 			urlsafety.VerdictMalicious, time.Hour); !errors.Is(err, service.ErrLinkScanConflict) {
 			t.Fatalf("RecordVerdict for a superseded scan: %v, want ErrLinkScanConflict", err)
+		}
+		var denied bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM files.link_fetch_denylist WHERE url_digest = $1
+			)`, job.URLDigest).Scan(&denied); err != nil {
+			t.Fatalf("read denylist after failed verdict CAS: %v", err)
+		}
+		if denied {
+			t.Fatal("a failed malicious verdict CAS published a global denial")
 		}
 		// And a second submission finds the row already polling.
 		if err := store.RecordSubmission(ctx, job.URLDigest, "scan-second", generation); !errors.Is(err, service.ErrLinkScanConflict) {
@@ -352,16 +368,52 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 			t.Fatalf("the condemnation was disturbed: %q, %v, %v", verdict, found, err)
 		}
 
-		// Once the verdict lapses it is neither served nor trusted: the row is
-		// re-opened and charged again, which is the only direction this moves.
+		// Expiring a *condemnation* does not make the URL unknown again. Since
+		// issue #135 a malicious verdict is also published to the shared fetch
+		// denylist, which is permanent by design: the per-service row's TTL governs
+		// when this service would re-scan, not whether the deployment still refuses
+		// to fetch. That the denial survives the lapse is the CQ-002 invariant, so
+		// it is asserted rather than worked around.
 		if _, err := pool.Exec(ctx,
 			`UPDATE files.link_scans SET verdict_expires_at = now() - interval '1 hour'`); err != nil {
 			t.Fatalf("expire verdict: %v", err)
 		}
-		if _, found, err := store.LoadVerdict(ctx, firstURL); err != nil || found {
-			t.Fatalf("a lapsed verdict was served: found %v (%v)", found, err)
+		if verdict, found, err := store.LoadVerdict(ctx, firstURL); err != nil ||
+			!found || verdict != urlsafety.VerdictMalicious {
+			t.Fatalf("a lapsed condemnation stopped refusing: %q, %v, %v", verdict, found, err)
 		}
-		reopened, err := store.AdmitScan(ctx, firstURL, unlimited)
+
+		// The lapse rule itself — a stale clearance is neither served nor trusted —
+		// is a property of a *safe* verdict, which is the one that grants something.
+		// Asserted on its own URL so the permanent denial above cannot mask it.
+		const lapsingURL = "https://lapsing.example/a"
+		if _, err := store.AdmitScan(ctx, lapsingURL, unlimited); err != nil {
+			t.Fatalf("AdmitScan(lapsing): %v", err)
+		}
+		lapsingJob := claimOne(t, lapsingURL)
+		lapsingGeneration, err := store.BeginSubmit(ctx, lapsingJob.URLDigest, lapsingJob.SubmitGeneration)
+		if err != nil {
+			t.Fatalf("BeginSubmit(lapsing): %v", err)
+		}
+		if err := store.RecordSubmission(ctx, lapsingJob.URLDigest, "scan-lapsing", lapsingGeneration); err != nil {
+			t.Fatalf("RecordSubmission(lapsing): %v", err)
+		}
+		if err := store.RecordVerdict(ctx, lapsingJob.URLDigest, "scan-lapsing",
+			urlsafety.VerdictSafe, time.Hour); err != nil {
+			t.Fatalf("RecordVerdict(lapsing): %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE files.link_scans SET verdict_expires_at = now() - interval '1 hour'
+			  WHERE url_digest = $1`, lapsingJob.URLDigest); err != nil {
+			t.Fatalf("expire lapsing verdict: %v", err)
+		}
+		if _, found, err := store.LoadVerdict(ctx, lapsingURL); err != nil || found {
+			t.Fatalf("a lapsed clearance was served: found %v (%v)", found, err)
+		}
+		// A lapsed clearance goes back into the queue and is charged again. Asserted
+		// on the lapsing URL rather than the condemned one, and scoped by digest,
+		// because the table now holds both.
+		reopened, err := store.AdmitScan(ctx, lapsingURL, unlimited)
 		if err != nil {
 			t.Fatalf("AdmitScan: %v", err)
 		}
@@ -370,7 +422,8 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 		}
 		var state string
 		if err := pool.QueryRow(ctx,
-			`SELECT state FROM files.link_scans`).Scan(&state); err != nil {
+			`SELECT state FROM files.link_scans WHERE url_digest = $1`,
+			lapsingJob.URLDigest).Scan(&state); err != nil {
 			t.Fatalf("read state: %v", err)
 		}
 		if state != "submit_pending" {

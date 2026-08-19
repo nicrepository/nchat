@@ -107,6 +107,10 @@ func TestCachedSafeURLPublishesImmediately(t *testing.T) {
 	if store.lastCreateInput.Status != "" {
 		t.Fatalf("a cleared message was withheld: %q", store.lastCreateInput.Status)
 	}
+	if store.lastCreateInput.LinkSafetyState != domain.MessageLinkSafetySafe {
+		t.Fatalf("link_safety_state=%q, want safe on the published fast path",
+			store.lastCreateInput.LinkSafetyState)
+	}
 	if len(store.ensuredURLs) != 0 {
 		t.Fatalf("a scan was queued for an already-decided URL: %v", store.ensuredURLs)
 	}
@@ -528,6 +532,7 @@ func TestForwardIsGated(t *testing.T) {
 		verdicts   map[string]urlsafety.Verdict
 		wantErr    error
 		wantStatus domain.MessageStatus
+		wantState  domain.MessageLinkSafety
 		wantPub    int
 	}{
 		"malicious": {
@@ -535,7 +540,11 @@ func TestForwardIsGated(t *testing.T) {
 			wantErr:  domain.ErrMaliciousURL,
 		},
 		"unscanned": {wantStatus: domain.MessageStatusPendingLinkScan},
-		"safe":      {verdicts: safe("https://evil.example/x"), wantPub: 1},
+		"safe": {
+			verdicts:  safe("https://evil.example/x"),
+			wantState: domain.MessageLinkSafetySafe,
+			wantPub:   1,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := safetyStore(testCase.verdicts)
@@ -561,6 +570,10 @@ func TestForwardIsGated(t *testing.T) {
 			}
 			if store.lastForwardInput.Status != testCase.wantStatus {
 				t.Fatalf("status=%q want %q", store.lastForwardInput.Status, testCase.wantStatus)
+			}
+			if store.lastForwardInput.LinkSafetyState != testCase.wantState {
+				t.Fatalf("link_safety_state=%q want %q",
+					store.lastForwardInput.LinkSafetyState, testCase.wantState)
 			}
 			if testCase.wantPub > 0 {
 				waitForPublishCalls(t, publisher, testCase.wantPub)

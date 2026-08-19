@@ -56,6 +56,8 @@ type fakeQueue struct {
 	pruneErr        error
 	backlogErr      error
 	outboxErr       error
+	refreshBatches  [][]storage.MessageLinkSafetyChange
+	refreshCalls    int
 
 	begun            []string
 	beginConflict    bool
@@ -192,6 +194,20 @@ func (q *fakeQueue) ResolveDecidedMessages(_ context.Context) (storage.ResolveSu
 	return summary, nil
 }
 
+func (q *fakeQueue) RefreshMessageLinkSafety(
+	_ context.Context, _ string,
+) ([]storage.MessageLinkSafetyChange, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.refreshCalls++
+	if len(q.refreshBatches) == 0 {
+		return nil, nil
+	}
+	changes := q.refreshBatches[0]
+	q.refreshBatches = q.refreshBatches[1:]
+	return changes, nil
+}
+
 // ClaimPublishEvents hands out the outbox rows once. A second pass finds
 // nothing, which is what "delivered" looks like from the worker's side.
 func (q *fakeQueue) ClaimPublishEvents(_ context.Context, _ int) ([]storage.PublishEvent, error) {
@@ -321,6 +337,29 @@ func worker(queue service.LinkScanQueue, provider service.LinkScanProvider, publ
 	return service.NewLinkScanService(queue, provider, publisher, nil)
 }
 
+type linkAwarePublisher struct {
+	fakePublisher
+	mu          sync.Mutex
+	linkChanges []storage.MessageLinkSafetyChange
+}
+
+func (p *linkAwarePublisher) PublishMessageLinkSafetyChanged(
+	_ context.Context, workspaceID, targetType, targetID, messageID, state string, updatedAt time.Time,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.linkChanges = append(p.linkChanges, storage.MessageLinkSafetyChange{
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID: messageID, State: domain.MessageLinkSafety(state), UpdatedAt: updatedAt,
+	})
+}
+
+func (p *linkAwarePublisher) linkChangeSnapshot() []storage.MessageLinkSafetyChange {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]storage.MessageLinkSafetyChange(nil), p.linkChanges...)
+}
+
 // A URL that has never been submitted is submitted, and its id stored — losing
 // the id would mean the scan still runs but nobody ever reads it.
 func TestUnsubmittedURLIsSubmittedAndItsIDStored(t *testing.T) {
@@ -361,6 +400,34 @@ func TestSubmittedURLIsPolled(t *testing.T) {
 	_, verdicts := queue.snapshot()
 	if verdicts["https://example.com/x"] != urlsafety.VerdictSafe {
 		t.Fatalf("verdicts: %v", verdicts)
+	}
+}
+
+func TestOrdinaryFinalVerdictConvergesAlreadyActiveMessages(t *testing.T) {
+	updatedAt := time.Unix(1_700_000_000, 0)
+	want := storage.MessageLinkSafetyChange{
+		WorkspaceID: "ws-1", TargetType: "channel", TargetID: "ch-1",
+		MessageID: "active-1", State: domain.MessageLinkSafetyMalicious, UpdatedAt: updatedAt,
+	}
+	queue := newFakeQueue(storage.LinkScanJob{
+		CanonicalURL: "https://example.com/x", ScanUUID: "scan-9",
+	})
+	queue.refreshBatches = [][]storage.MessageLinkSafetyChange{{want}, nil}
+	publisher := &linkAwarePublisher{}
+
+	if _, err := worker(queue,
+		&fakeProvider{verdict: urlsafety.VerdictMalicious}, publisher,
+	).ProcessDue(context.Background()); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	queue.mu.Lock()
+	refreshCalls := queue.refreshCalls
+	queue.mu.Unlock()
+	if refreshCalls != 2 {
+		t.Fatalf("refresh calls=%d, want the active-message drain to reach empty", refreshCalls)
+	}
+	if got := publisher.linkChangeSnapshot(); len(got) != 1 || got[0] != want {
+		t.Fatalf("link-safety changes=%+v, want %+v", got, want)
 	}
 }
 

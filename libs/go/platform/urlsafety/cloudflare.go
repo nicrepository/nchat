@@ -170,6 +170,19 @@ type resultResponse struct {
 		// value: "finished"). It is what distinguishes a terminal report with no
 		// verdict from one that simply cannot be trusted yet.
 		Status string `json:"status"`
+		// Time and TimeEnd are when the provider says the scan happened, RFC3339.
+		//
+		// They exist here for one reason: a verdict is evidence with an age, and
+		// reconciliation may adopt a scan that ran hours ago. Dating such a
+		// clearance from the moment it was *adopted* would hand a full fresh
+		// lifetime to stale evidence — see EvidenceTime and Service.Reconcile.
+		//
+		// Both are optional. Cloudflare documents `time` on the task; `timeEnd` is
+		// read when present because a scan's conclusion is a better statement of
+		// when the verdict was formed than its submission. Neither is trusted to
+		// exist, and the caller has a conservative fallback when both are absent.
+		Time    string `json:"time"`
+		TimeEnd string `json:"timeEnd"`
 	} `json:"task"`
 	Verdicts struct {
 		Overall *struct {
@@ -234,36 +247,77 @@ func (c *CloudflareScanner) SubmitScan(ctx context.Context, canonicalURL string)
 // untrusted or malformed answer, a transport failure — yields ErrUnavailable. A
 // pending scan is not a verdict, an inconclusive scan is not a verdict, and a
 // failure is not a verdict, so none of the three can be stored as one.
+//
+// It is GetScanReport with the evidence time discarded, which is right for the
+// polling path: a scan submitted a moment ago has an age indistinguishable from
+// now. Reconciliation, which adopts scans that may be hours old, uses
+// GetScanReport instead.
 func (c *CloudflareScanner) GetScanResult(ctx context.Context, scanID string) (Verdict, error) {
+	verdict, _, err := c.GetScanReport(ctx, scanID)
+	return verdict, err
+}
+
+// GetScanReport reads a submitted scan and also reports when the provider says
+// it concluded.
+//
+// The second return is the evidence time, and it is zero whenever the provider
+// did not supply a usable one. It is never a local clock reading: a caller that
+// substituted its own "now" for a missing provider timestamp would be inventing
+// freshness, which is precisely the finding this exists to close. A zero time is
+// an honest "the provider did not say", and the caller decides what to do with
+// that — see Service.Reconcile, which falls back to the scan's submission time
+// and refuses to clear anything when even that is unavailable.
+func (c *CloudflareScanner) GetScanReport(
+	ctx context.Context, scanID string,
+) (Verdict, time.Time, error) {
 	if strings.TrimSpace(scanID) == "" {
-		return VerdictUnknown, ErrUnavailable
+		return VerdictUnknown, time.Time{}, ErrUnavailable
 	}
 	endpoint := c.accountPath("/urlscanner/v2/result/" + url.PathEscape(scanID))
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return VerdictUnknown, ErrUnavailable
+		return VerdictUnknown, time.Time{}, ErrUnavailable
 	}
 	c.authorize(request)
 
 	response, err := c.do(ctx, request)
 	if err != nil {
-		return VerdictUnknown, err
+		return VerdictUnknown, time.Time{}, err
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	// The documented progress signal is the status code: 404 while the scan is
 	// in progress, 200 once it is finished.
 	if response.StatusCode == http.StatusNotFound {
-		return VerdictUnknown, ErrScanPending
+		return VerdictUnknown, time.Time{}, ErrScanPending
 	}
 	if response.StatusCode != http.StatusOK {
-		return VerdictUnknown, ErrUnavailable
+		return VerdictUnknown, time.Time{}, ErrUnavailable
 	}
 	var decoded resultResponse
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
-		return VerdictUnknown, ErrUnavailable
+		return VerdictUnknown, time.Time{}, ErrUnavailable
 	}
-	return verdictFromReport(decoded, scanID)
+	verdict, err := verdictFromReport(decoded, scanID)
+	return verdict, reportEvidenceTime(decoded), err
+}
+
+// reportEvidenceTime reads when the provider says the scan concluded.
+//
+// `timeEnd` is preferred over `time` because a verdict is formed when the scan
+// finishes, not when it was queued; `time` is the fallback because Cloudflare
+// documents it and `timeEnd` is not guaranteed. An unparseable or absent value
+// yields the zero time rather than a guess.
+//
+// Nothing here consults a clock. Deriving a missing provider timestamp from the
+// local time is exactly how stale evidence acquires a fresh lifetime.
+func reportEvidenceTime(report resultResponse) time.Time {
+	for _, raw := range []string{report.Task.TimeEnd, report.Task.Time} {
+		if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
 }
 
 // verdictFromReport turns a decoded report into a verdict, refuses it as

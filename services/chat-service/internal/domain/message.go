@@ -94,6 +94,75 @@ type MessageLinkSafetyState struct {
 	Reason string
 }
 
+// MessageLinkSafety is the link-safety axis of a published message (RF-21,
+// issue #135).
+//
+// It is deliberately not part of MessageStatus. Status answers "does this message
+// exist for readers" — pending_link_scan, active, deleted — and this answers "what
+// is known about the URLs it carries". Folding the two into one enum is what
+// produced the bug this exists to fix: a scan that finished without a usable
+// verdict had to be expressed as `deleted`, so an operational refusal by the
+// provider silently became "your message was rejected".
+//
+// The three non-empty values and what each one authorises:
+//
+//	safe          published, links usable, server-side preview ALLOWED
+//	inconclusive  published, links usable, server-side preview FORBIDDEN
+//	malicious     published body, links NOT usable, preview FORBIDDEN
+//
+// Inconclusive is the asymmetric one and that asymmetry is the feature. It means
+// "this deployment has no clearance to fetch that URL on its own behalf", which is
+// a statement about our own authority, not about the link. A reader may still
+// click it; their browser is not our server.
+type MessageLinkSafety string
+
+const (
+	// MessageLinkSafetyNone is a message with nothing to say about links: it
+	// carries none, or it predates this axis. It is the zero value, and that is
+	// safe in the only direction that matters — see AllowsServerFetch, which says
+	// no to it.
+	MessageLinkSafetyNone MessageLinkSafety = ""
+	// MessageLinkSafetySafe means every URL in the message holds a fresh explicit
+	// clearance. It is the only value that authorises anything.
+	MessageLinkSafetySafe MessageLinkSafety = "safe"
+	// MessageLinkSafetyInconclusive means at least one URL's scan reached a
+	// terminal state without a usable verdict, and none was malicious.
+	MessageLinkSafetyInconclusive MessageLinkSafety = "inconclusive"
+	// MessageLinkSafetyMalicious means at least one URL was condemned. Reachable
+	// on a published message only through reconciliation, which may prove a link
+	// malicious after the message was already delivered on inconclusive.
+	MessageLinkSafetyMalicious MessageLinkSafety = "malicious"
+)
+
+// AllowsServerFetch reports whether this deployment may open a connection to the
+// URLs this message carries — an Open Graph GET, a HEAD, a thumbnail, an unfurl,
+// anything at all.
+//
+// An allowlist of exactly one value, and phrased as a question about clearance
+// rather than as "is it not blocked". That is the point: `active` is not a
+// clearance, `inconclusive` is not a clearance, the zero value is not a
+// clearance, and a value added to this type in a later version will not be one
+// either. Nothing in this codebase may infer permission to fetch from the fact
+// that a message was published.
+//
+// It is not the authorisation itself — file-service re-derives the verdict from
+// its own store on every preview request, against the row rather than against
+// anything a chat payload said. This is the in-process expression of the same
+// rule, so a caller here cannot reach for the weaker one.
+func (s MessageLinkSafety) AllowsServerFetch() bool {
+	return s == MessageLinkSafetySafe
+}
+
+// RestrictsLinks reports whether a reader's client must refuse to make the URLs
+// in this message usable.
+//
+// Only a condemned link. An inconclusive one is deliberately not restricted:
+// there is no evidence against it, and dressing an operational refusal up as a
+// security warning teaches readers the wrong thing about both.
+func (s MessageLinkSafety) RestrictsLinks() bool {
+	return s == MessageLinkSafetyMalicious
+}
+
 // MessageBodyFormat selects the grammar used to render BodyText.
 type MessageBodyFormat string
 
@@ -112,15 +181,20 @@ const (
 // string when NULL (no reference). EditedAt and DeletedAt are zero time.Time
 // when NULL.
 type Message struct {
-	ID                     string
-	WorkspaceID            string
-	ChannelID              string
-	DMConversationID       string
-	SenderID               string
-	Kind                   MessageKind
-	BodyText               string
-	BodyFormat             MessageBodyFormat
-	Status                 MessageStatus
+	ID               string
+	WorkspaceID      string
+	ChannelID        string
+	DMConversationID string
+	SenderID         string
+	Kind             MessageKind
+	BodyText         string
+	BodyFormat       MessageBodyFormat
+	Status           MessageStatus
+	// LinkSafety is the link-safety axis, independent of Status. See
+	// MessageLinkSafety: it is what a client needs to decide whether to draw the
+	// "could not verify" notice, and what nothing in this service may read as
+	// permission to fetch a URL.
+	LinkSafety             MessageLinkSafety
 	ParentMessageID        string
 	ForwardedFromMessageID string
 	ReferencedMessageID    string
@@ -239,6 +313,12 @@ type QuotedMessage struct {
 	Status     MessageStatus
 	DeletedAt  time.Time
 	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	// LinkSafety is the quoted message's own marker, read live from its row.
+	// A quote is a copy of a body, so it has to answer the same question the
+	// body does — and a message condemned after being quoted has to stop
+	// showing through the quote (issue #135, CQ-002).
+	LinkSafety MessageLinkSafety
 }
 
 // MessageReference is the one-level, read-time preview of a cross-target
@@ -254,6 +334,9 @@ type MessageReference struct {
 	BodyText          string
 	BodyFormat        MessageBodyFormat
 	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	// LinkSafety of the referenced message, for the same reason as on a quote.
+	LinkSafety MessageLinkSafety
 }
 
 // FavoriteMessage is one entry in a user's private favorites list.

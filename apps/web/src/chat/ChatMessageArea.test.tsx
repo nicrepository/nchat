@@ -22,6 +22,7 @@ import type {
   WSMessageCreatedEvent,
   WSMessageUpdatedEvent,
   WSReactionUpdatedEvent,
+  WSSubscribedEvent,
   WSTypingUpdatedEvent,
 } from "./useChatWebSocket";
 import { useChatWebSocket } from "./useChatWebSocket";
@@ -51,10 +52,12 @@ async function replaceEditorText(element: HTMLElement, text: string) {
 const {
   mockFetchChannelMessages,
   mockFetchChannelMessage,
+  mockFetchChannelMessageSecuritySnapshots,
   mockPostChannelMessage,
   mockForwardChannelMessage,
   mockFetchDMMessages,
   mockFetchDMMessage,
+  mockFetchDMMessageSecuritySnapshots,
   mockPostDMMessage,
   mockFetchAllowedReactionEmojis,
   mockFavoriteMessage,
@@ -77,6 +80,7 @@ const {
     >(),
   mockFetchChannelMessage:
     vi.fn<(channelId: string, messageId: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchChannelMessageSecuritySnapshots: vi.fn(),
   mockPostChannelMessage:
     vi.fn<
       (
@@ -102,6 +106,7 @@ const {
     >(),
   mockFetchDMMessage:
     vi.fn<(conversationId: string, messageId: string, signal?: AbortSignal) => Promise<Message>>(),
+  mockFetchDMMessageSecuritySnapshots: vi.fn(),
   mockPostDMMessage:
     vi.fn<
       (
@@ -135,6 +140,7 @@ const {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: WSReactionUpdatedEvent) => void) | null,
+    capturedSubscribed: null as ((event: WSSubscribedEvent) => void) | null,
     capturedOnTypingUpdated: null as ((event: WSTypingUpdatedEvent) => void) | null,
     toggleReaction: vi.fn(() => true),
     sendTyping: vi.fn(() => true),
@@ -159,6 +165,7 @@ vi.mock("./chatApi", () => ({
   fetchChannelMessages: (channelId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchChannelMessages(channelId, beforeCursor, signal),
   fetchChannelMessage: mockFetchChannelMessage,
+  fetchChannelMessageSecuritySnapshots: mockFetchChannelMessageSecuritySnapshots,
   postChannelMessage: (
     channelId: string,
     bodyText: string,
@@ -182,6 +189,7 @@ vi.mock("./chatApi", () => ({
     signal?: AbortSignal,
   ) => mockPostDMMessage(conversationId, bodyText, parentMessageId, referencedMessageId, signal),
   fetchDMMessage: mockFetchDMMessage,
+  fetchDMMessageSecuritySnapshots: mockFetchDMMessageSecuritySnapshots,
   fetchAllowedReactionEmojis: mockFetchAllowedReactionEmojis,
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
   unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
@@ -226,16 +234,19 @@ vi.mock("./useChatWebSocket", () => ({
       onMessageCreated,
       onMessageUpdated,
       onReactionUpdated,
+      onSubscribed,
       onTypingUpdated,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
       onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+      onSubscribed?: (event: WSSubscribedEvent) => void;
       onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      wsMockState.capturedSubscribed = onSubscribed ?? null;
       wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
       return {
         toggleReaction: wsMockState.toggleReaction,
@@ -443,13 +454,15 @@ beforeEach(() => {
   wsMockState.capturedWSMessageCreated = null;
   wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
+  wsMockState.capturedSubscribed = null;
   wsMockState.capturedOnTypingUpdated = null;
   vi.clearAllMocks();
   vi.mocked(useChatWebSocket).mockImplementation(
-    ({ onMessageCreated, onMessageUpdated, onReactionUpdated, onTypingUpdated }) => {
+    ({ onMessageCreated, onMessageUpdated, onReactionUpdated, onSubscribed, onTypingUpdated }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      wsMockState.capturedSubscribed = onSubscribed ?? null;
       wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
       return {
         toggleReaction: wsMockState.toggleReaction,
@@ -477,6 +490,8 @@ beforeEach(() => {
     "🤔",
   ]);
   mockFetchPins.mockResolvedValue([]);
+  mockFetchChannelMessageSecuritySnapshots.mockResolvedValue([]);
+  mockFetchDMMessageSecuritySnapshots.mockResolvedValue([]);
   mockPinMessage.mockResolvedValue(undefined);
   mockUnpinMessage.mockResolvedValue(undefined);
   mockGetMessageHistory.mockResolvedValue({ entries: [], nextCursor: undefined });
@@ -2245,6 +2260,7 @@ describe("ChatMessageArea — send message", () => {
           isRemoved: false,
           deletedAt: null,
           createdAt: parent.createdAt,
+          linkSafetyState: "",
         },
       }),
     );
@@ -2278,6 +2294,7 @@ describe("ChatMessageArea — send message", () => {
             isRemoved: true,
             deletedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2308,6 +2325,7 @@ describe("ChatMessageArea — send message", () => {
             isRemoved: false,
             deletedAt: null,
             createdAt: new Date().toISOString(),
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2335,6 +2353,7 @@ describe("ChatMessageArea — send message", () => {
             isRemoved: false,
             deletedAt: null,
             createdAt: parent.createdAt,
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2372,6 +2391,7 @@ describe("ChatMessageArea — send message", () => {
             isRemoved: false,
             deletedAt: null,
             createdAt: parent.createdAt,
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2429,6 +2449,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
             bodyText: "<img src=x onerror=alert(1)>",
             bodyFormat: "v3",
             createdAt: new Date().toISOString(),
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2468,6 +2489,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
             bodyText: "origem",
             bodyFormat: "v3",
             createdAt: new Date().toISOString(),
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2506,6 +2528,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
             bodyText: "- um\n- dois",
             bodyFormat: "v3",
             createdAt: new Date().toISOString(),
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -2664,6 +2687,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
           bodyText: "segredo aninhado",
           bodyFormat: "v3",
           createdAt: new Date().toISOString(),
+          linkSafetyState: "",
         },
       }),
     );
@@ -4202,6 +4226,33 @@ describe("ChatMessageArea — edição e histórico (RF-13)", () => {
     expect(screen.getByRole("button", { name: "Ver histórico de edições" })).toBeInTheDocument();
   });
 
+  it("applies link safety from the editor response without a reload", async () => {
+    const url = "https://example.test/editada";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ ...ownMessage(), linkSafetyState: "safe" })]),
+    );
+    mockEditMessage.mockResolvedValue(
+      makeMessage({
+        ...ownMessage(),
+        bodyText: url,
+        bodyFormat: "v2",
+        isEdited: true,
+        editCount: 1,
+        editedAt: "2026-08-18T12:00:00Z",
+        linkSafetyState: "inconclusive",
+      }),
+    );
+    renderChannelAreaForUser();
+
+    const editor = await openEditor();
+    await replaceEditorText(editor, url);
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByTestId("chat-message-link-unverified")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: url })).toHaveAttribute("href", url);
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
   it("cancels an inline edit without calling the API or changing the message", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([ownMessage()]));
     renderChannelAreaForUser();
@@ -4488,6 +4539,7 @@ describe("ChatMessageArea — exclusão com placeholder (RF-14)", () => {
             isRemoved: false,
             deletedAt: null,
             createdAt: original.createdAt,
+            linkSafetyState: "",
           },
         }),
       ]),
@@ -5302,5 +5354,222 @@ describe("ChatMessageArea — ação indisponível do perfil por teclado (#443)"
     await userEvent.click(screen.getByRole("button", { name: "Fechar perfil" }));
     expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
     expect(profileToggle()).toHaveFocus();
+  });
+});
+
+// ── RF-21 link safety, end to end through the real message area (issue #135) ──
+//
+// The unit tests around MessageBubble prove the rendering rules; these prove the
+// rules survive the whole stack a reader actually goes through — the API mapper,
+// useMessages, the list, the bubble. That is what "reload keeps the warning and
+// the link" means in practice: nothing here fires a realtime event, it is simply
+// a fresh load of the conversation.
+describe("ChatMessageArea — RF-21 link safety", () => {
+  const linkURL = "https://example.test/artigo";
+
+  beforeEach(() => {
+    mockFetchAllowedReactionEmojis.mockResolvedValue([]);
+    mockFetchPins.mockResolvedValue([]);
+    mockFetchChannelAttachments.mockResolvedValue([]);
+  });
+
+  it("keeps the notice and a clickable link across a reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: `veja ${linkURL} depois`,
+          bodyFormat: "v2",
+          linkSafetyState: "inconclusive",
+        }),
+      ]),
+    );
+
+    renderChannelArea();
+
+    // The notice, verbatim.
+    const notice = await screen.findByTestId("chat-message-link-unverified");
+    expect(notice).toHaveTextContent(
+      "Não foi possível verificar este link agora. A prévia automática não foi carregada.",
+    );
+
+    // And the link is genuinely clickable: a real anchor, with the address the
+    // sender wrote, opening in a new tab without leaking this workspace's URL.
+    const anchor = await screen.findByRole("link", { name: linkURL });
+    expect(anchor).toHaveAttribute("href", linkURL);
+    expect(anchor).toHaveAttribute("target", "_blank");
+    expect(anchor.getAttribute("rel")).toContain("noopener");
+    expect(anchor.getAttribute("rel")).toContain("noreferrer");
+  });
+
+  it("withdraws a malicious link after reconnect recovers a missed event", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: "inconclusive",
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-unverified",
+        available: true,
+        status: "active",
+        linkSafetyState: "malicious",
+        updatedAt: "2099-08-18T12:00:00Z",
+      },
+    ]);
+    renderChannelArea();
+    expect(await screen.findByRole("link", { name: linkURL })).toBeInTheDocument();
+
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole("link", { name: linkURL })).toBeNull());
+    expect(screen.queryByText(linkURL)).toBeNull();
+    expect(screen.getByTestId("chat-message-link-blocked")).toBeInTheDocument();
+    expect(mockFetchChannelMessageSecuritySnapshots).toHaveBeenCalledWith(
+      "geral",
+      ["msg-unverified"],
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("removes the warning but keeps the anchor after an offline clearance", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-unverified",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: "inconclusive",
+        }),
+      ]),
+    );
+    mockFetchChannelMessageSecuritySnapshots.mockResolvedValueOnce([
+      {
+        messageId: "msg-unverified",
+        available: true,
+        status: "active",
+        linkSafetyState: "safe",
+        updatedAt: "2099-08-18T12:00:00Z",
+      },
+    ]);
+    renderChannelArea();
+    expect(await screen.findByTestId("chat-message-link-unverified")).toBeInTheDocument();
+
+    act(() =>
+      wsMockState.capturedSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "geral",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+  });
+
+  it.each([
+    ["", "safe"],
+    ["", "inconclusive"],
+    ["safe", "inconclusive"],
+    ["inconclusive", "safe"],
+    ["safe", ""],
+  ] as const)("renders message.updated link safety %s -> %s", async (before, after) => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-updated",
+          bodyText: linkURL,
+          bodyFormat: "v2",
+          linkSafetyState: before,
+        }),
+      ]),
+    );
+    renderChannelArea();
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedWSMessageUpdated?.({
+        type: "message.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_update: {
+          message_id: "msg-updated",
+          channel_id: "geral",
+          body: after === "" ? "sem URL" : linkURL,
+          body_format: "v2",
+          edited_at: "2026-08-18T12:00:00Z",
+          edit_count: 1,
+          is_edited: true,
+          link_safety_state: after,
+        },
+      }),
+    );
+
+    if (after === "safe" || after === "inconclusive") {
+      expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+    } else {
+      await waitFor(() => expect(screen.queryByRole("link", { name: linkURL })).toBeNull());
+    }
+    if (after === "inconclusive") {
+      expect(screen.getByTestId("chat-message-link-unverified")).toBeInTheDocument();
+    } else {
+      expect(screen.queryByTestId("chat-message-link-unverified")).toBeNull();
+    }
+  });
+
+  it("renders a safe message's link as an anchor with no notice", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-safe",
+          bodyText: `veja ${linkURL}`,
+          bodyFormat: "v2",
+          linkSafetyState: "safe",
+        }),
+      ]),
+    );
+
+    renderChannelArea();
+
+    expect(await screen.findByRole("link", { name: linkURL })).toHaveAttribute("href", linkURL);
+    expect(screen.queryByTestId("chat-message-link-unverified")).not.toBeInTheDocument();
+  });
+
+  it("renders no link at all for a message whose link was condemned", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "msg-blocked",
+          bodyText: `veja ${linkURL}`,
+          bodyFormat: "v2",
+          linkSafetyState: "malicious",
+        }),
+      ]),
+    );
+
+    renderChannelArea();
+
+    expect(await screen.findByTestId("chat-message-link-blocked")).toHaveTextContent(
+      "Este link foi bloqueado após a verificação de segurança.",
+    );
+    expect(screen.queryByRole("link", { name: linkURL })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(new RegExp(linkURL.replace(/[/.?]/g, "\\$&"))),
+    ).not.toBeInTheDocument();
   });
 });

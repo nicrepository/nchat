@@ -1,0 +1,282 @@
+{
+  "$comment": [
+    "RF-21 / issue #135: the shared boundary corpus for URL extraction.",
+    "",
+    "chat-service decides which URLs get scanned (scanURLCandidates); the web client",
+    "decides which get a clickable anchor (findAutolinks). If the two disagree about",
+    "where a URL ends, the client can render a link to an address the safety check",
+    "never saw. This file is the single source of expectations that holds them",
+    "together: both test suites read it, and both assert the invariant below.",
+    "",
+    "INVARIANT: every href the client produces must appear verbatim among the",
+    "candidates the backend extracted from the same input. Under-linking is fine —",
+    "the client may produce fewer — but a client href that is not a backend",
+    "candidate is a link to something unchecked.",
+    "",
+    "Fields per case:",
+    "  name              what the case is about",
+    "  input             the message body, exactly as stored",
+    "  backendCandidates scanURLCandidates(input), in order",
+    "  frontendHrefs     findAutolinks(input) hrefs, in order",
+    "  note              why the two differ, when they do",
+    "",
+    "Escapes: invisible and direction-altering characters are written as \\uXXXX so",
+    "the file stays reviewable and greppable. Every host is under .test or .example,",
+    "which are reserved and unroutable — no real address appears here."
+  ],
+  "cases": [
+    {
+      "name": "plain https",
+      "input": "veja https://example.test/ agora",
+      "backendCandidates": ["https://example.test/"],
+      "frontendHrefs": ["https://example.test/"]
+    },
+    {
+      "name": "mixed-case scheme",
+      "input": "HTTPS://Example.test/A e HtTp://other.test/b",
+      "backendCandidates": ["HTTPS://Example.test/A", "HtTp://other.test/b"],
+      "frontendHrefs": ["HTTPS://Example.test/A", "HtTp://other.test/b"],
+      "note": "Both sides match the scheme case-insensitively and keep the text verbatim."
+    },
+    {
+      "name": "trailing full stop",
+      "input": "veja https://example.test/a.",
+      "backendCandidates": ["https://example.test/a"],
+      "frontendHrefs": ["https://example.test/a"]
+    },
+    {
+      "name": "trailing comma",
+      "input": "https://example.test/a, e mais",
+      "backendCandidates": ["https://example.test/a"],
+      "frontendHrefs": ["https://example.test/a"]
+    },
+    {
+      "name": "balanced parentheses",
+      "input": "veja https://example.test/wiki/Function_(mathematics) agora",
+      "backendCandidates": ["https://example.test/wiki/Function_(mathematics)"],
+      "frontendHrefs": ["https://example.test/wiki/Function_(mathematics)"],
+      "note": "The regression this corpus exists for: the backend used to trim the closing paren and scan a different URL from the one the client linked."
+    },
+    {
+      "name": "external parentheses",
+      "input": "(https://example.test/foo)",
+      "backendCandidates": ["https://example.test/foo"],
+      "frontendHrefs": ["https://example.test/foo"]
+    },
+    {
+      "name": "balanced square brackets",
+      "input": "https://example.test/a_[b]",
+      "backendCandidates": ["https://example.test/a_[b]"],
+      "frontendHrefs": ["https://example.test/a_[b]"]
+    },
+    {
+      "name": "external square brackets",
+      "input": "[https://example.test/foo]",
+      "backendCandidates": ["https://example.test/foo"],
+      "frontendHrefs": ["https://example.test/foo"]
+    },
+    {
+      "name": "balanced braces",
+      "input": "https://example.test/a_{b}",
+      "backendCandidates": ["https://example.test/a_{b}"],
+      "frontendHrefs": ["https://example.test/a_{b}"]
+    },
+    {
+      "name": "external braces",
+      "input": "{https://example.test/foo}",
+      "backendCandidates": ["https://example.test/foo"],
+      "frontendHrefs": ["https://example.test/foo"]
+    },
+    {
+      "name": "balanced paren then sentence stop",
+      "input": "https://example.test/a_(b).",
+      "backendCandidates": ["https://example.test/a_(b)"],
+      "frontendHrefs": ["https://example.test/a_(b)"]
+    },
+    {
+      "name": "external bracket then sentence stop",
+      "input": "https://example.test/foo].",
+      "backendCandidates": ["https://example.test/foo"],
+      "frontendHrefs": ["https://example.test/foo"]
+    },
+    {
+      "name": "nested url in query",
+      "input": "https://a.test/r?u=https://b.test/x",
+      "backendCandidates": ["https://a.test/r?u=https://b.test/x"],
+      "frontendHrefs": ["https://a.test/r?u=https://b.test/x"],
+      "note": "One candidate, not two: the scan consumes the whole run, so the embedded address is never offered as a separate destination."
+    },
+    {
+      "name": "credentials in authority",
+      "input": "https://user:pass@evil.test/a",
+      "backendCandidates": ["https://user:pass@evil.test/a"],
+      "frontendHrefs": [],
+      "note": "The backend extracts it and its canonicaliser then refuses it as having no consultable reputation. The client refuses to anchor it: an authority section that reads like a hostname is a classic disguise."
+    },
+    {
+      "name": "backslash in authority",
+      "input": "https://good.test\\@evil.test/a",
+      "backendCandidates": ["https://good.test\\@evil.test/a"],
+      "frontendHrefs": [],
+      "note": "The parser divergence that matters most. WHATWG normalises the backslash to a slash, making the host evil.test; Go's net/url keeps it in the path, making the host good.test. The client refuses any candidate containing a literal backslash."
+    },
+    {
+      "name": "invalid percent escape",
+      "input": "https://example.test/a%zz",
+      "backendCandidates": ["https://example.test/a%zz"],
+      "frontendHrefs": [],
+      "note": "Go's url.Parse rejects the escape, so the backend never canonicalises or scans it; WHATWG keeps it verbatim. The client fails closed."
+    },
+    {
+      "name": "valid percent escape",
+      "input": "https://example.test/a%20b",
+      "backendCandidates": ["https://example.test/a%20b"],
+      "frontendHrefs": ["https://example.test/a%20b"]
+    },
+    {
+      "name": "percent-encoded parentheses",
+      "input": "(https://example.test/a%28b%29)",
+      "backendCandidates": ["https://example.test/a%28b%29"],
+      "frontendHrefs": ["https://example.test/a%28b%29"],
+      "note": "%28/%29 are not brackets to a reader and take no part in the balance, so only the literal wrapping paren is given back."
+    },
+    {
+      "name": "internationalised domain",
+      "input": "veja https://münchen.example/straße agora",
+      "backendCandidates": ["https://münchen.example/straße"],
+      "frontendHrefs": ["https://münchen.example/straße"],
+      "note": "The candidate is the text as written on both sides; punycode conversion happens later, in each side's own resolver."
+    },
+    {
+      "name": "punycode host",
+      "input": "https://xn--mnchen-3ya.example/a",
+      "backendCandidates": ["https://xn--mnchen-3ya.example/a"],
+      "frontendHrefs": ["https://xn--mnchen-3ya.example/a"]
+    },
+    {
+      "name": "ipv4 literal",
+      "input": "http://192.0.2.10:8080/a",
+      "backendCandidates": ["http://192.0.2.10:8080/a"],
+      "frontendHrefs": [],
+      "note": "The backend extracts then refuses IP literals. The client under-links them so WHATWG-normalized legacy spellings cannot navigate to an address different from the scanned string."
+    },
+    {
+      "name": "ipv6 literal",
+      "input": "https://[2001:db8::1]:8443/a",
+      "backendCandidates": ["https://[2001:db8::1]:8443/a"],
+      "frontendHrefs": [],
+      "note": "The delimiter still keeps the balanced authority, but IP literals are deliberately not anchored."
+    },
+    {
+      "name": "short ipv4 literal",
+      "input": "http://127.1/a",
+      "backendCandidates": ["http://127.1/a"],
+      "frontendHrefs": [],
+      "note": "WHATWG resolves this historical spelling as 127.0.0.1; Go must refuse it and the client must not anchor it."
+    },
+    {
+      "name": "octal ipv4 literal",
+      "input": "http://0177.0.0.1/a",
+      "backendCandidates": ["http://0177.0.0.1/a"],
+      "frontendHrefs": [],
+      "note": "WHATWG resolves the octal spelling as 127.0.0.1."
+    },
+    {
+      "name": "hex ipv4 literal",
+      "input": "http://0x7f.0.0.1/a",
+      "backendCandidates": ["http://0x7f.0.0.1/a"],
+      "frontendHrefs": [],
+      "note": "WHATWG resolves the hexadecimal spelling as 127.0.0.1."
+    },
+    {
+      "name": "protocol relative",
+      "input": "//example.test/a",
+      "backendCandidates": [],
+      "frontendHrefs": [],
+      "note": "No scheme, so neither side sees a URL at all."
+    },
+    {
+      "name": "javascript scheme",
+      "input": "javascript:alert(1)",
+      "backendCandidates": [],
+      "frontendHrefs": []
+    },
+    {
+      "name": "data scheme",
+      "input": "data:text/html,<script>alert(1)</script>",
+      "backendCandidates": [],
+      "frontendHrefs": []
+    },
+    {
+      "name": "blob wrapping https",
+      "input": "blob:https://example.test/uuid",
+      "backendCandidates": ["https://example.test/uuid"],
+      "frontendHrefs": [],
+      "note": "The backend scans the embedded address, which is the conservative direction for a security check. The client refuses it: a scheme starting inside another token is not a URL the sender wrote."
+    },
+    {
+      "name": "bidi override around a url",
+      "input": "\u202Ehttps://example.test/a\u202C",
+      "backendCandidates": ["https://example.test/a\u202C"],
+      "frontendHrefs": [],
+      "note": "The scan begins at the scheme, so a leading control is outside the candidate while a trailing one is inside it — the two ends are not symmetric. The client refuses any candidate carrying a direction-altering character at all: the rendered label would not be the resolved address."
+    },
+    {
+      "name": "bidi isolate around a url",
+      "input": "veja \u2066https://example.test/a\u2069 agora",
+      "backendCandidates": ["https://example.test/a\u2069"],
+      "frontendHrefs": []
+    },
+    {
+      "name": "zero width space inside a url",
+      "input": "https://exa\u200Bmple.test/a",
+      "backendCandidates": ["https://exa\u200Bmple.test/a"],
+      "frontendHrefs": []
+    },
+    {
+      "name": "control character ends the run",
+      "input": "https://example.test/a\u0007b",
+      "backendCandidates": ["https://example.test/a"],
+      "frontendHrefs": ["https://example.test/a"],
+      "note": "A C0 control is a terminator on both sides, so the candidate ends before it."
+    },
+    {
+      "name": "scheme inside another token",
+      "input": "shttp://example.test",
+      "backendCandidates": ["http://example.test"],
+      "frontendHrefs": [],
+      "note": "The backend extracts the embedded address and scans it; the client refuses to offer an address the sender did not write."
+    },
+    {
+      "name": "scheme after a colon",
+      "input": "foo:https://example.test/a",
+      "backendCandidates": ["https://example.test/a"],
+      "frontendHrefs": []
+    },
+    {
+      "name": "bare mention is not a url",
+      "input": "user@example.test",
+      "backendCandidates": [],
+      "frontendHrefs": []
+    },
+    {
+      "name": "url followed by a quote",
+      "input": "\"https://example.test/a\"",
+      "backendCandidates": ["https://example.test/a"],
+      "frontendHrefs": ["https://example.test/a"]
+    },
+    {
+      "name": "two urls on one line",
+      "input": "https://one.test/a e https://two.test/b",
+      "backendCandidates": ["https://one.test/a", "https://two.test/b"],
+      "frontendHrefs": ["https://one.test/a", "https://two.test/b"]
+    },
+    {
+      "name": "scheme with no host",
+      "input": "https:// example.test",
+      "backendCandidates": ["https://"],
+      "frontendHrefs": [],
+      "note": "The backend extracts the fragment and its hasHost check then treats it as not-a-link rather than refusing the message. The client will not anchor a URL with no host."
+    }
+  ]
+}

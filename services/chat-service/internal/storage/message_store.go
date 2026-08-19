@@ -98,6 +98,10 @@ type CreateMessageInput struct {
 	// path already excludes, so it is withheld from everyone until the worker
 	// promotes it. The service decides this; a client cannot ask for a status.
 	Status domain.MessageStatus
+	// LinkSafetyState is derived by the service from the same verdict snapshot as
+	// Status. Empty is correct for linkless and withheld messages; a cached-safe
+	// active message must carry safe immediately.
+	LinkSafetyState domain.MessageLinkSafety
 
 	// RequestFingerprint is the identity of the operation this key stands for.
 	// Persisted beside the key so a replay can be told from a reuse.
@@ -258,6 +262,7 @@ type ForwardChannelMessageInput struct {
 	// written withheld, the URLs it waits on are recorded in the same statement,
 	// and the fingerprint binds the eventual promotion to this exact snapshot.
 	Status                domain.MessageStatus
+	LinkSafetyState       domain.MessageLinkSafety
 	LinkScanURLs          []string
 	LinkSafetyFingerprint string
 }
@@ -289,6 +294,18 @@ type EditMessageInput struct {
 	EditorID    string
 	Body        string
 	BodyFormat  domain.MessageBodyFormat
+	// LinkSafetyState, LinkSafetyFingerprint and LinkScanURLs describe the link
+	// safety of the *new* body, and they are applied in the same transaction as the
+	// body itself (issue #135, CQ-001).
+	//
+	// Before they existed the edit replaced the body and left chat.message_link_scans
+	// untouched, so the message went on being decided by the URLs of a version
+	// nobody could read any more: editing a link out of a message left its
+	// association behind, and a later condemnation of that URL blanked a message
+	// that no longer contained it.
+	LinkSafetyState       domain.MessageLinkSafety
+	LinkSafetyFingerprint string
+	LinkScanURLs          []string
 }
 
 // DeleteMessageInput contains only server-derived identity and scope fields.
@@ -305,6 +322,24 @@ type ListMessageEditHistoryInput struct {
 	UserID      string
 	Limit       int
 	Offset      int
+}
+
+// MessageSecuritySnapshot is the narrow, body-free projection used to repair a
+// visible timeline after missed realtime link-safety events.
+type MessageSecuritySnapshot struct {
+	MessageID       string
+	Available       bool
+	Status          domain.MessageStatus
+	LinkSafetyState domain.MessageLinkSafety
+	UpdatedAt       time.Time
+	Quoted          *QuotedMessageSecuritySnapshot
+}
+
+type QuotedMessageSecuritySnapshot struct {
+	MessageID       string
+	Status          domain.MessageStatus
+	LinkSafetyState domain.MessageLinkSafety
+	UpdatedAt       time.Time
 }
 
 // ListChannelMessagesInput identifies the paged message list for a channel.
@@ -416,6 +451,7 @@ type MessageStore interface {
 	// Returns ErrNotFound when the message does not exist or belongs to a different
 	// workspace, preventing cross-workspace enumeration via message IDs.
 	GetMessageByIDInWorkspace(ctx context.Context, workspaceID, messageID, userID string) (domain.Message, error)
+	ListMessageSecuritySnapshots(ctx context.Context, workspaceID, userID, channelID, dmConversationID string, messageIDs []string) ([]MessageSecuritySnapshot, error)
 
 	// ValidateRefMessageInTarget checks that messageID belongs to the given workspace
 	// and target (channelID or dmConversationID). Returns nil when valid.
@@ -469,6 +505,34 @@ func NewPGXMessageStore(pool Pool) *PGXMessageStore {
 
 // When alias is non-empty (e.g. "m"), columns are prefixed to avoid ambiguity
 // in JOIN queries.
+// withheldIfMalicious wraps a body-text expression so that a message whose links
+// this deployment has condemned projects an empty body instead of its text
+// (issue #135, CQ-002).
+//
+// # Why in SQL and not in the client
+//
+// The client already refuses to render a malicious body, but that is a decision
+// taken over data it was nonetheless sent. Anything holding the response holds
+// the URL: the network tab, a cached payload, a second client, a reload against
+// a build that predates the check. "The reader does not see it" and "the reader
+// cannot get it" are different guarantees, and only the second one is a block.
+//
+// # Why every projection, not just the main body
+//
+// A message is not shown in one place. It is quoted, referenced from another
+// channel, and kept in edit history, and each of those is a separate query that
+// reads body_text from the same row. Suppressing only the main body leaves the
+// same string reachable through three other reads — which is the finding. This
+// is the one expression all four go through, so a new projection that forgets it
+// is a projection that does not compile against this helper.
+//
+// The state is read live from the source row rather than snapshotted, so a
+// message condemned by background reconciliation *after* it was quoted is
+// withheld from that quote on the next read, with no backfill of its own.
+func withheldIfMalicious(bodyExpr, stateExpr string) string {
+	return `CASE WHEN ` + stateExpr + ` = 'malicious' THEN '' ELSE ` + bodyExpr + ` END`
+}
+
 func messageColumns(alias string) string {
 	p := ""
 	if alias != "" {
@@ -478,12 +542,15 @@ func messageColumns(alias string) string {
 	COALESCE(` + p + `channel_id::text, ''),
 	COALESCE(` + p + `dm_conversation_id::text, ''),
 	` + p + `sender_id::text,
-	` + p + `kind, ` + p + `body_text, ` + p + `body_format, ` + p + `status,
+	` + p + `kind,
+	` + withheldIfMalicious(p+`body_text`, p+`link_safety_state`) + `,
+	` + p + `body_format, ` + p + `status,
 	COALESCE(` + p + `parent_message_id::text, ''),
 	COALESCE(` + p + `forwarded_from_message_id::text, ''),
 	COALESCE(` + p + `referenced_message_id::text, ''),
 	` + p + `edited_at, ` + p + `edit_count, ` + p + `deleted_at,
-	` + p + `created_at, ` + p + `updated_at`
+	` + p + `created_at, ` + p + `updated_at,
+	` + p + `link_safety_state`
 }
 
 // listMessageColumns returns messageColumns plus sender display info from
@@ -506,11 +573,13 @@ func quotedMessageColumns(alias string) string {
 	return `
 	COALESCE(` + alias + `.id::text, ''),
 	COALESCE(` + alias + `.sender_id::text, ''),
-	COALESCE(` + alias + `.body_text, ''),
+	COALESCE(` + withheldIfMalicious(alias+`.body_text`, alias+`.link_safety_state`) + `, ''),
 	COALESCE(` + alias + `.body_format::text, ''),
 	COALESCE(` + alias + `.status::text, ''),
 	` + alias + `.deleted_at,
-	` + alias + `.created_at`
+	` + alias + `.created_at,
+	` + alias + `.updated_at,
+	COALESCE(` + alias + `.link_safety_state, '')`
 }
 
 func listMessageWithQuoteColumns(alias, userParam, quoteAlias string) string {
@@ -537,7 +606,7 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 	var msg domain.Message
 	var editedAt, deletedAt *time.Time
 	var quote domain.QuotedMessage
-	var quoteDeletedAt, quoteCreatedAt *time.Time
+	var quoteDeletedAt, quoteCreatedAt, quoteUpdatedAt *time.Time
 	destinations := []any{
 		&msg.ID, &msg.WorkspaceID,
 		&msg.ChannelID, &msg.DMConversationID,
@@ -546,10 +615,11 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 		&editedAt, &msg.EditCount, &deletedAt,
 		&msg.CreatedAt, &msg.UpdatedAt,
+		(*string)(&msg.LinkSafety),
 		&msg.SenderDisplayName, &msg.SenderEmail,
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
-		&quoteDeletedAt, &quoteCreatedAt,
+		&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
 	}
 	destinations = append(destinations, extra...)
 	err := row.Scan(destinations...)
@@ -568,6 +638,9 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		}
 		if quoteCreatedAt != nil {
 			quote.CreatedAt = *quoteCreatedAt
+		}
+		if quoteUpdatedAt != nil {
+			quote.UpdatedAt = *quoteUpdatedAt
 		}
 		msg.Quoted = &quote
 	}
@@ -746,9 +819,12 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				(workspace_id, channel_id, dm_conversation_id, sender_id,
 				 kind, body_text, body_format, status,
 				 parent_message_id, forwarded_from_message_id, referenced_message_id,
-				 create_idempotency_key, create_request_fingerprint, link_safety_fingerprint)
+				 create_idempotency_key, create_request_fingerprint, link_safety_state,
+				 link_safety_fingerprint,
+				 link_safety_projection_version)
 			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $14::text,
-			       $8::uuid, $9::uuid, $10::uuid, NULLIF($16, ''), NULLIF($18, ''), NULLIF($17, '')
+			       $8::uuid, $9::uuid, $10::uuid, NULLIF($16, ''), NULLIF($18, ''), $19::text,
+			       NULLIF($17, ''), 1
 			FROM (
 				-- Channel message authorization branch.
 				SELECT 1
@@ -779,7 +855,8 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
-			          edited_at, edit_count, deleted_at, created_at, updated_at
+			          edited_at, edit_count, deleted_at, created_at, updated_at,
+			          link_safety_state
 		),
 		-- A published message notifies its mentions immediately, exactly as it
 		-- always has. A withheld one must not: a notification is a side effect
@@ -855,6 +932,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.IdempotencyKey,
 		input.LinkSafetyFingerprint,
 		input.RequestFingerprint,
+		string(input.LinkSafetyState),
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
@@ -1016,9 +1094,9 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, sender_id, kind, body_text, body_format,
 				 status, forwarded_from_message_id, forward_idempotency_key,
-				 link_safety_fingerprint)
+				 link_safety_state, link_safety_fingerprint, link_safety_projection_version)
 			SELECT $1::uuid, $2::uuid, $3::uuid, 'user', $6::text,
-			       $7::text, $8::text, source.id, NULLIF($5, ''), NULLIF($10, '')
+			       $7::text, $8::text, source.id, NULLIF($5, ''), $11::text, NULLIF($10, ''), 1
 			FROM source
 			JOIN chat.workspaces destination_workspace
 			  ON destination_workspace.id = $1::uuid AND destination_workspace.status = 'active'
@@ -1038,6 +1116,7 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, edit_count, deleted_at, created_at, updated_at,
+			          link_safety_state,
 			          (xmax <> 0) AS replayed
 		),
 		-- RF-21, same atomicity argument as CreateMessage's: the withheld
@@ -1058,7 +1137,7 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 		input.WorkspaceID, input.DestinationChannelID, input.ActorID, input.SourceMessageID,
 		input.IdempotencyKey, input.BodyText, string(input.BodyFormat),
 		string(messageStatusOrActive(input.Status)), input.LinkScanURLs,
-		input.LinkSafetyFingerprint,
+		input.LinkSafetyFingerprint, string(input.LinkSafetyState),
 	)
 	var replayed bool
 	msg, err := scanMessageWithSenderAndQuoteExtra(row, &replayed)
@@ -1109,23 +1188,86 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 		return domain.Message{}, err
 	}
 
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO chat.message_edit_history (message_id, body, body_format, editor_user_id, versioned_at)
-		SELECT id, body_text, body_format, $2, $3
-		FROM chat.messages
-		WHERE id = $1`, input.MessageID, input.EditorID, databaseNow)
+	var historyID string
+	err = tx.QueryRow(ctx, `
+		WITH snapshot AS (
+			INSERT INTO chat.message_edit_history
+				(message_id, body, body_format, editor_user_id, versioned_at, link_safety_fingerprint)
+			SELECT id, body_text, body_format, $2, $3,
+			       CASE WHEN link_safety_projection_version > 0
+			            THEN COALESCE(link_safety_fingerprint, '') END
+			FROM chat.messages
+			WHERE id = $1
+			RETURNING id, message_id, link_safety_fingerprint
+		), linked AS (
+			INSERT INTO chat.message_edit_history_link_scans (history_id, canonical_url)
+			SELECT snapshot.id, mls.canonical_url
+			FROM snapshot
+			JOIN chat.message_link_scans mls
+			  ON mls.message_id = snapshot.message_id
+			 AND mls.fingerprint = snapshot.link_safety_fingerprint
+		)
+		SELECT id::text FROM snapshot`, input.MessageID, input.EditorID, databaseNow).Scan(&historyID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, domain.ErrNotFound
+		}
 		return domain.Message{}, fmt.Errorf("snapshot message edit: %w", err)
 	}
-	if tag.RowsAffected() != 1 {
-		return domain.Message{}, domain.ErrNotFound
+
+	// The link-safety half of the edit, in the same transaction as the body
+	// (issue #135, CQ-001).
+	//
+	// The invariant this establishes: once this transaction commits, the state and
+	// associations selected by the message's current fingerprint describe the new
+	// body and nothing else. Prior fingerprints remain only as edit-history
+	// redaction evidence and cannot decide the current row.
+	//
+	// Re-checked here rather than trusted from the caller. The service classified
+	// the new body before this transaction opened, and a reconciliation could have
+	// landed in between; the row is held FOR UPDATE, so checking now closes that
+	// window. A URL that has become malicious, or that has lost its terminal state,
+	// refuses the edit exactly as it would have refused it a moment earlier.
+	if err := assertEditableLinkStates(ctx, tx, input.LinkScanURLs); err != nil {
+		return domain.Message{}, err
+	}
+	// Prior URLs were copied to the edit-history association table above. The
+	// current table now describes only the new body.
+	// Every current-body reader joins on messages.link_safety_fingerprint, so an
+	// old association can redact its old version but cannot decide the new body.
+	// The fingerprint exists only to bind associations to the body version they
+	// were extracted from, so a body with no URLs must not keep one. Derived here
+	// rather than trusted from the caller: a leftover fingerprint with no rows to
+	// match is precisely the stale link fact this transaction exists to prevent,
+	// and the store is the last place that can still refuse it.
+	fingerprint := input.LinkSafetyFingerprint
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM chat.message_link_scans WHERE message_id = $1`, input.MessageID,
+	); err != nil {
+		return domain.Message{}, fmt.Errorf("replace message link scans: %w", err)
+	}
+	if len(input.LinkScanURLs) == 0 {
+		fingerprint = ""
+	} else {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			SELECT $1::uuid, url, $2
+			FROM unnest($3::text[]) AS urls(url)
+			ON CONFLICT DO NOTHING`,
+			input.MessageID, fingerprint, input.LinkScanURLs,
+		); err != nil {
+			return domain.Message{}, fmt.Errorf("record message link scans: %w", err)
+		}
 	}
 
 	row := tx.QueryRow(ctx, `
 		WITH updated AS (
 			UPDATE chat.messages
 			SET body_text = $2, body_format = $3, edited_at = $5,
-			    edit_count = edit_count + 1, updated_at = $5
+			    edit_count = edit_count + 1, updated_at = $5,
+			    link_safety_state = $6,
+			    link_safety_fingerprint = NULLIF($7, ''),
+			    link_safety_projection_version = link_safety_projection_version + 1
 			WHERE id = $1
 			RETURNING *
 		)
@@ -1133,6 +1275,7 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 		FROM updated m
 		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
 		input.MessageID, input.Body, string(input.BodyFormat), input.EditorID, databaseNow,
+		string(input.LinkSafetyState), fingerprint,
 	)
 	updated, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
@@ -1142,6 +1285,72 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 		return domain.Message{}, fmt.Errorf("commit message edit: %w", err)
 	}
 	return updated, nil
+}
+
+// assertEditableLinkStates re-checks, inside the edit's transaction, that every
+// URL in the new body is still in a state an edit may publish.
+//
+// It exists to close a time-of-check window. The service classifies the new body
+// before opening this transaction, and a reconciliation running concurrently can
+// change a verdict in between — most importantly from inconclusive to malicious.
+// Without this the edit would publish a body carrying a URL that had just been
+// condemned.
+//
+// The rule is the same one the classification applied, restated against the rows
+// as they are now:
+//
+//   - a fresh malicious verdict refuses the edit outright;
+//   - a URL with no terminal state means the edit must wait, because an edit
+//     cannot be withheld the way a new message can;
+//   - a fresh clearance and a terminal inconclusive both pass.
+//
+// The errors are the ones the caller already maps, so a race produces exactly the
+// answer the non-racing path would have produced a moment earlier.
+//
+// Lock order is message first, then scan rows by canonical_url. Reconciliation
+// commits its scan-row CAS before opening the message convergence transaction,
+// so it never holds a scan lock while waiting for a message lock and cannot form
+// the inverse scan -> message edge.
+func assertEditableLinkStates(ctx context.Context, tx pgx.Tx, canonicalURLs []string) error {
+	if len(canonicalURLs) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT canonical_url, status
+		FROM chat.link_scans
+		WHERE canonical_url = ANY($1::text[])
+		  AND ((status IN ('safe', 'malicious')
+		        AND decided_at > now() - ($2 * interval '1 second'))
+		       OR status = 'inconclusive')
+		ORDER BY canonical_url
+		FOR UPDATE`,
+		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
+	)
+	if err != nil {
+		return fmt.Errorf("read link states for edit: %w", err)
+	}
+	defer rows.Close()
+
+	decided := make(map[string]struct{}, len(canonicalURLs))
+	for rows.Next() {
+		var url, status string
+		if err := rows.Scan(&url, &status); err != nil {
+			return fmt.Errorf("scan link state for edit: %w", err)
+		}
+		if urlsafety.Verdict(status) == urlsafety.VerdictMalicious {
+			return domain.ErrMaliciousURL
+		}
+		decided[url] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read link states for edit: %w", err)
+	}
+	for _, url := range canonicalURLs {
+		if _, ok := decided[url]; !ok {
+			return domain.ErrURLCheckPending
+		}
+	}
+	return nil
 }
 
 // DeleteMessage atomically re-checks read access and authorship, then marks the
@@ -1215,18 +1424,41 @@ func (s *PGXMessageStore) ListMessageEditHistory(ctx context.Context, input List
 	offset := max(input.Offset, 0)
 	rows, err := s.pool.Query(ctx, `
 		WITH authorized AS (
-			SELECT m.id
+			SELECT m.id, m.link_safety_state
 			FROM chat.messages m`+messageAccessJoins("$3")+`
 			WHERE m.workspace_id = $1 AND m.id = $2
 			  AND m.status = 'active' AND m.deleted_at IS NULL
 			  AND `+messageAccessPredicate("$3")+`
 		)
 		SELECT COALESCE(h.id::text, ''), COALESCE(h.message_id::text, ''),
-		       COALESCE(h.body, ''), COALESCE(h.body_format, ''),
+		       -- Every stored version, not only the one that was condemned. A
+		       -- verdict is about a URL, and an edit that changed the wording
+		       -- around it kept the URL — so the previous versions of a message
+		       -- whose links are malicious are exactly where that URL is most
+		       -- likely to still be written down. Withholding only the current
+		       -- version would turn the history into the way to read it.
+		       -- The version list itself is preserved: the reader still sees
+		       -- that the message was edited and when, only not the text.
+		       COALESCE(CASE
+		         -- Pre-migration versions have no provable URL identity. Withhold
+		         -- them instead of borrowing the current body's fingerprint.
+		         WHEN h.link_safety_fingerprint IS NULL
+		           OR a.link_safety_state = 'malicious' OR EXISTS (
+		           SELECT 1
+		           FROM chat.message_edit_history_link_scans hmls
+		           LEFT JOIN chat.link_scans hls
+		             ON hls.canonical_url = hmls.canonical_url
+		           LEFT JOIN files.link_fetch_denylist deny
+		             ON deny.url_digest = sha256(hmls.canonical_url::bytea)
+		           WHERE hmls.history_id = h.id
+		             AND (hls.status = 'malicious' OR deny.url_digest IS NOT NULL)
+		         ) THEN '' ELSE h.body END, ''),
+		       COALESCE(h.body_format, ''),
 		       COALESCE(h.editor_user_id::text, ''), h.versioned_at
 		FROM authorized a
 		LEFT JOIN LATERAL (
-			SELECT id, message_id, body, body_format, editor_user_id, versioned_at
+			SELECT id, message_id, body, body_format, editor_user_id, versioned_at,
+			       link_safety_fingerprint
 			FROM chat.message_edit_history
 			WHERE message_id = a.id
 			ORDER BY versioned_at DESC, id DESC
@@ -1383,7 +1615,9 @@ func (s *PGXMessageStore) ResolveMessageReferences(ctx context.Context, workspac
 		       COALESCE(m.channel_id::text, m.dm_conversation_id::text),
 		       COALESCE(c.display_name, dc.title, ''),
 		       COALESCE(author.display_name, ''),
-		       m.body_text, m.body_format, m.created_at
+		       `+withheldIfMalicious("m.body_text", "m.link_safety_state")+`, m.body_format, m.created_at,
+		       m.updated_at,
+		       COALESCE(m.link_safety_state, '')
 		FROM unnest($3::text[]) AS ids(id)
 		JOIN chat.messages m ON m.id = ids.id::uuid`+messageAccessJoins("$2")+`
 		LEFT JOIN auth.users author ON author.id = m.sender_id
@@ -1403,7 +1637,8 @@ func (s *PGXMessageStore) ResolveMessageReferences(ctx context.Context, workspac
 		ref.Available = true
 		if err := rows.Scan(
 			&ref.MessageID, &ref.TargetType, &ref.TargetID, &ref.TargetLabel,
-			&ref.AuthorDisplayName, &ref.BodyText, (*string)(&ref.BodyFormat), &ref.CreatedAt,
+			&ref.AuthorDisplayName, &ref.BodyText, (*string)(&ref.BodyFormat), &ref.CreatedAt, &ref.UpdatedAt,
+			(*string)(&ref.LinkSafety),
 		); err != nil {
 			return nil, fmt.Errorf("scan message reference: %w", err)
 		}
@@ -1479,6 +1714,69 @@ func (s *PGXMessageStore) GetMessageByIDInWorkspace(ctx context.Context, workspa
 		return domain.Message{}, err
 	}
 	return messages[0], nil
+}
+
+func (s *PGXMessageStore) ListMessageSecuritySnapshots(
+	ctx context.Context, workspaceID, userID, channelID, dmConversationID string, messageIDs []string,
+) ([]MessageSecuritySnapshot, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH requested AS (
+			SELECT id::uuid, ordinality
+			FROM unnest($5::text[]) WITH ORDINALITY AS ids(id, ordinality)
+		), visible AS (
+			SELECT m.id, m.status, m.link_safety_state, m.updated_at, m.parent_message_id
+			FROM chat.messages m`+messageAccessJoins("$2")+`
+			WHERE m.workspace_id = $1::uuid
+			  AND m.channel_id IS NOT DISTINCT FROM $3::uuid
+			  AND m.dm_conversation_id IS NOT DISTINCT FROM $4::uuid
+			  AND `+messageAccessPredicate("$2")+`
+			  AND `+messageVisibilityPredicate("m", "$2")+`
+		)
+		SELECT requested.id::text, visible.id IS NOT NULL,
+		       COALESCE(visible.status, ''), COALESCE(visible.link_safety_state, ''),
+		       COALESCE(visible.updated_at, to_timestamp(0)),
+		       COALESCE(q.id::text, ''), COALESCE(q.status, ''),
+		       COALESCE(q.link_safety_state, ''), COALESCE(q.updated_at, to_timestamp(0))
+		FROM requested
+		LEFT JOIN visible ON visible.id = requested.id
+		LEFT JOIN chat.messages q
+		  ON q.id = visible.parent_message_id
+		 AND q.workspace_id = $1::uuid
+		 AND q.channel_id IS NOT DISTINCT FROM $3::uuid
+		 AND q.dm_conversation_id IS NOT DISTINCT FROM $4::uuid
+		ORDER BY requested.ordinality`,
+		workspaceID, userID, nullableUUID(channelID), nullableUUID(dmConversationID), messageIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list message security snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	snapshots := make([]MessageSecuritySnapshot, 0, len(messageIDs))
+	for rows.Next() {
+		var snapshot MessageSecuritySnapshot
+		var status, linkSafety, quoteID, quoteStatus, quoteLinkSafety string
+		var quoteUpdatedAt time.Time
+		if err := rows.Scan(&snapshot.MessageID, &snapshot.Available, &status, &linkSafety,
+			&snapshot.UpdatedAt, &quoteID, &quoteStatus, &quoteLinkSafety, &quoteUpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan message security snapshot: %w", err)
+		}
+		if snapshot.Available {
+			snapshot.Status = domain.MessageStatus(status)
+			snapshot.LinkSafetyState = domain.MessageLinkSafety(linkSafety)
+			if quoteID != "" {
+				snapshot.Quoted = &QuotedMessageSecuritySnapshot{
+					MessageID: quoteID, Status: domain.MessageStatus(quoteStatus),
+					LinkSafetyState: domain.MessageLinkSafety(quoteLinkSafety), UpdatedAt: quoteUpdatedAt,
+				}
+			}
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate message security snapshots: %w", err)
+	}
+	return snapshots, nil
 }
 
 func (s *PGXMessageStore) ListChannelMessages(ctx context.Context, input ListChannelMessagesInput) (ListMessagesResult, error) {
@@ -1771,7 +2069,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 		var msg domain.Message
 		var editedAt, deletedAt *time.Time
 		var quote domain.QuotedMessage
-		var quoteDeletedAt, quoteCreatedAt *time.Time
+		var quoteDeletedAt, quoteCreatedAt, quoteUpdatedAt *time.Time
 		dest := []any{
 			&msg.ID, &msg.WorkspaceID,
 			&msg.ChannelID, &msg.DMConversationID,
@@ -1780,12 +2078,13 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 			&editedAt, &msg.EditCount, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
+			(*string)(&msg.LinkSafety),
 		}
 		if withSender {
 			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.IsFavorited)
 			dest = append(dest,
 				&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
-				&quoteDeletedAt, &quoteCreatedAt,
+				&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
 			)
 		}
 		err := rows.Scan(dest...)
@@ -1804,6 +2103,9 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			}
 			if quoteCreatedAt != nil {
 				quote.CreatedAt = *quoteCreatedAt
+			}
+			if quoteUpdatedAt != nil {
+				quote.UpdatedAt = *quoteUpdatedAt
 			}
 			msg.Quoted = &quote
 		}
