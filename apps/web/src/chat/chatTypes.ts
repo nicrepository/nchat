@@ -34,6 +34,8 @@ export interface Channel extends ConversationActivity {
   /** Server-derived permission. The forwarding endpoint remains authoritative. */
   canWrite: boolean;
   unreadCount?: number;
+  /** True once the unread count includes a message that mentions the current user. */
+  hasMentionUnread?: boolean;
   categoryId?: string;
   categoryName?: string;
 }
@@ -100,6 +102,8 @@ export interface DMConversation extends ConversationActivity {
   participants: DMParticipant[];
   counterpart?: DMCounterpart;
   unreadCount?: number;
+  /** True once the unread count includes a message that mentions the current user. */
+  hasMentionUnread?: boolean;
 }
 
 /**
@@ -260,7 +264,8 @@ export function normalizeBodyFormat(raw?: string): MessageBodyFormat {
 }
 
 export interface MentionCandidate {
-  mentionType: "user" | "channel";
+  /** "all" is synthesized client-side (see mentionExtension.tsx) — never fetched from the server. */
+  mentionType: "user" | "all";
   id: string;
   label: string;
 }

@@ -19,14 +19,14 @@ import {
   unescapeRichText,
   unescapeRichTextV3,
 } from "./richTextMarkers";
-import type { InlineMarkerType, ListType } from "./richTextMarkers";
+import type { InlineMarkerType, ListType, MentionType } from "./richTextMarkers";
 import { findAutolinks } from "./autolink";
 import type { MessageBodyFormat } from "./chatTypes";
 
 type InlineToken =
   | string
   | { type: InlineMarkerType; text: string }
-  | { type: "mention"; text: string; mentionType: "user" | "channel"; id: string };
+  | { type: "mention"; text: string; mentionType: MentionType; id: string };
 
 function tokenizeV1Inline(text: string): InlineToken[] {
   return text.split(LEGACY_INLINE_RE).flatMap((chunk): InlineToken[] => {
@@ -104,7 +104,7 @@ function tokenizeV3Inline(text: string): InlineToken[] {
       tokens.push({
         type: "mention",
         text: unescapeRichTextV3(mention[1]),
-        mentionType: mention[2] as "user" | "channel",
+        mentionType: mention[2] as MentionType,
         id: mention[3].toLowerCase(),
       });
       i += mention[0].length;

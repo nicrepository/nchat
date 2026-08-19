@@ -309,6 +309,15 @@ function Section({ labelId, title, spaced, children }: SectionProps) {
   );
 }
 
+/**
+ * The unread badge never depends on color alone to signal a mention: the
+ * accessible name says so explicitly, and the visible "@" prefix carries the
+ * same information for sighted users who don't rely on the badge's color.
+ */
+function unreadBadgeLabel(count: number, hasMentionUnread?: boolean): string {
+  return hasMentionUnread ? `${count} não lidas, incluindo menção` : `${count} não lidas`;
+}
+
 // ── Channel list ──────────────────────────────────────────────────────────────
 
 interface ChannelListProps {
@@ -351,9 +360,14 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, onPin }: Ch
               )}
               {ch.unreadCount != null && ch.unreadCount > 0 && (
                 <span
-                  className="chat-sidebar__unread-badge"
-                  aria-label={`${ch.unreadCount} não lidas`}
+                  className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+                  aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
                 >
+                  {ch.hasMentionUnread && (
+                    <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
+                      @
+                    </span>
+                  )}
                   {ch.unreadCount}
                 </span>
               )}
@@ -451,7 +465,15 @@ function DMRow({
           <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
         )}
         {dm.unreadCount != null && dm.unreadCount > 0 && (
-          <span className="chat-sidebar__unread-badge" aria-label={`${dm.unreadCount} não lidas`}>
+          <span
+            className={`chat-sidebar__unread-badge${dm.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+            aria-label={unreadBadgeLabel(dm.unreadCount, dm.hasMentionUnread)}
+          >
+            {dm.hasMentionUnread && (
+              <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
+                @
+              </span>
+            )}
             {dm.unreadCount}
           </span>
         )}

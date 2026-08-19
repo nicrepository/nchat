@@ -1289,6 +1289,56 @@ describe("ChatSidebar — section classification", () => {
     expect(badgeOf("Canal privado projetos")).toBeUndefined();
   });
 
+  it("marks a mentioned conversation's badge distinctly, not by color alone", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [{ ...PUBLIC_CHANNEL, unreadCount: 3, hasMentionUnread: true }, PRIVATE_CHANNEL],
+      dms: [{ ...DIRECT, unreadCount: 2 }],
+    });
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    const badge = () =>
+      within(screen.getByRole("option", { name: "Canal geral" })).getByLabelText(/não lidas/i);
+
+    // A visible "@" mark (not aria-hidden text alone) plus the accessible
+    // name spelling it out — two independent signals, neither is color.
+    expect(badge().textContent).toBe("@3");
+    expect(badge()).toHaveAccessibleName("3 não lidas, incluindo menção");
+    expect(badge()).toHaveClass("chat-sidebar__unread-badge--mention");
+  });
+
+  it("does not mark a plain unread badge as a mention", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [{ ...PUBLIC_CHANNEL, unreadCount: 3 }, PRIVATE_CHANNEL],
+      dms: [],
+    });
+    renderChat();
+
+    await screen.findByRole("heading", { name: "Canais" });
+    const badge = within(screen.getByRole("option", { name: "Canal geral" })).getByLabelText(
+      /não lidas/i,
+    );
+
+    expect(badge.textContent).toBe("3");
+    expect(badge).toHaveAccessibleName("3 não lidas");
+    expect(badge).not.toHaveClass("chat-sidebar__unread-badge--mention");
+  });
+
+  it("marks a mentioned DM's badge the same way as a mentioned channel", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: "user-a",
+      channels: [],
+      dms: [{ ...DIRECT, unreadCount: 5, hasMentionUnread: true }],
+    });
+    renderChat();
+
+    const badge = await screen.findByLabelText(/não lidas/i);
+    expect(badge.textContent).toBe("@5");
+    expect(badge).toHaveAccessibleName("5 não lidas, incluindo menção");
+  });
+
   it("reaches items of all three sections by keyboard, with focus never trapped", async () => {
     const user = userEvent.setup();
     mockFetchSidebarData.mockResolvedValue(mixedSidebar());

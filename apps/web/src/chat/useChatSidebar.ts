@@ -6,6 +6,8 @@ import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
 import { playMessageSound } from "./messageSound";
 import { laterActivity } from "./sidebarOrder";
+import { getSoundNotificationMode } from "./soundPreference";
+import { classifySoundEvent, shouldPlayMessageSound } from "./soundRules";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -42,6 +44,8 @@ type Action =
       /** The message's own persisted creation instant, as the server stated it. */
       messageCreatedAt: string;
       activeTarget?: WSSubscriptionTarget;
+      /** Whether this message names the current user (specific @mention or @all). */
+      isMentioned: boolean;
     }
   | { type: "target_opened"; target: WSSubscriptionTarget }
   | { type: "pin_changed"; target: WSSubscriptionTarget; pinnedAt: string | null };
@@ -128,11 +132,19 @@ function reducer(state: SidebarState, action: Action): SidebarState {
           action.activeTarget?.kind === action.target.kind &&
           action.activeTarget.targetId === action.target.targetId
         );
-      const withUnread = <T extends { id: string; unreadCount?: number }>(items: T[]): T[] =>
+      const withUnread = <
+        T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean },
+      >(
+        items: T[],
+      ): T[] =>
         counts
           ? items.map((item) =>
               item.id === action.target.targetId
-                ? { ...item, unreadCount: (item.unreadCount ?? 0) + 1 }
+                ? {
+                    ...item,
+                    unreadCount: (item.unreadCount ?? 0) + 1,
+                    hasMentionUnread: item.hasMentionUnread || action.isMentioned,
+                  }
                 : item,
             )
           : items;
@@ -159,7 +171,7 @@ function reducer(state: SidebarState, action: Action): SidebarState {
           ...state,
           channels: state.channels.map((channel) =>
             channel.id === action.target.targetId && channel.unreadCount
-              ? { ...channel, unreadCount: 0 }
+              ? { ...channel, unreadCount: 0, hasMentionUnread: false }
               : channel,
           ),
         };
@@ -167,7 +179,9 @@ function reducer(state: SidebarState, action: Action): SidebarState {
       return {
         ...state,
         dms: state.dms.map((dm) =>
-          dm.id === action.target.targetId && dm.unreadCount ? { ...dm, unreadCount: 0 } : dm,
+          dm.id === action.target.targetId && dm.unreadCount
+            ? { ...dm, unreadCount: 0, hasMentionUnread: false }
+            : dm,
         ),
       };
     }
@@ -325,12 +339,28 @@ export function useChatSidebar() {
       // here rather than threaded out of the reducer: a reducer performs
       // state transitions, not side effects like audio playback, and this
       // callback already has senderId, currentUserId and the active target
-      // in scope for the very same event.
-      if (state.status === "ready") {
-        const isOwnMessage = (event.payload?.sender_id ?? "") === state.currentUserId;
+      // in scope for the very same event. The classification is also reused
+      // for the reducer's `isMentioned` flag below, so it only runs once.
+      let isMentioned = false;
+      if (state.status === "ready" && event.payload) {
+        const payload = event.payload;
+        const isOwnMessage = (payload.sender_id ?? "") === state.currentUserId;
         const isActiveConversation =
           openedTarget?.kind === event.target_type && openedTarget.targetId === event.target_id;
-        if (!isOwnMessage && !isActiveConversation) {
+        const classified = classifySoundEvent(payload, event.target_type, state.currentUserId);
+        isMentioned = classified.isMentioned;
+        const play = shouldPlayMessageSound({
+          mode: getSoundNotificationMode(),
+          // Already past the seenRealtimeMessageIds check above — this event
+          // is guaranteed fresh by the time it reaches this decision.
+          isDuplicate: false,
+          isOwnMessage,
+          category: classified.category,
+          isMentioned: classified.isMentioned,
+          isActiveConversation,
+          isWindowFocused: document.visibilityState === "visible",
+        });
+        if (play) {
           // playMessageSound() already never throws, but the unread badge
           // must update even if that guarantee is ever violated — a failed
           // chime is never allowed to break message receipt.
@@ -347,6 +377,7 @@ export function useChatSidebar() {
         senderId: event.payload?.sender_id ?? "",
         messageCreatedAt,
         activeTarget: openedTarget,
+        isMentioned,
       });
     },
   });
