@@ -193,7 +193,10 @@ describe("DedicatedCallPage", () => {
     renderPage();
 
     expect(await screen.findByText("Tela de Ana")).toBeInTheDocument();
-    expect(session.calls.activateMedia).toHaveBeenCalledOnce();
+    // activateMedia() runs in a passive effect that commits after the DOM
+    // update above, not synchronously with it — same reasoning as the
+    // join() wait a few tests up for the channel/dm activation branch.
+    await waitFor(() => expect(session.calls.activateMedia).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
     expect(session.calls.end).toHaveBeenCalledOnce();
   });
