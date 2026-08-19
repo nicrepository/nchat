@@ -33,6 +33,14 @@ type SelfProfileReader interface {
 	GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error)
 }
 
+// SelfProfileWriter edits the authenticated user's own minimal profile.
+type SelfProfileWriter interface {
+	// UpdateDisplayName validates and persists a new display_name for userID,
+	// then returns the resulting profile — the same shape GetProfile returns,
+	// so a caller can render the confirmed value without a second round trip.
+	UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error)
+}
+
 // WorkspaceAdminResolver answers "which workspace does this caller
 // administer?" — the question that turns a session into authority.
 //
@@ -59,6 +67,7 @@ type UserAdmin interface {
 	UserCreator
 	UserStatusManager
 	SelfProfileReader
+	SelfProfileWriter
 	WorkspaceAdminResolver
 	WorkspaceUserLister
 }
@@ -77,6 +86,33 @@ func NewUserService(store storage.UserStore) *UserService {
 // comes from the session; there is no lookup by any client-supplied identifier.
 func (s *UserService) GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error) {
 	return s.store.GetSelfProfile(ctx, userID)
+}
+
+// selfDisplayNameMinLen and selfDisplayNameMaxLen bound a user's own
+// display_name. There is no requirement document specifying this field's
+// length, so the bound is not invented: it reuses the value already chosen
+// for the same kind of field in this package — a short, human-chosen label —
+// by UpdateDeviceDisplayName below (deviceDisplayNameMaxLen).
+const (
+	selfDisplayNameMinLen = 1
+	selfDisplayNameMaxLen = 80
+)
+
+// UpdateDisplayName validates and persists a new display_name for userID, then
+// returns the resulting profile so the caller can render the confirmed value.
+// The userID comes from the session, exactly like GetProfile; there is no
+// lookup or update by any client-supplied identifier. Only an active,
+// non-deleted user can be updated — the same scope GetSelfProfile reads and
+// SetAvatarURL writes under, enforced by the store.
+func (s *UserService) UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error) {
+	displayName = sanitizeDisplayName(displayName)
+	if len([]rune(displayName)) < selfDisplayNameMinLen {
+		return domain.SelfProfile{}, fmt.Errorf("%w: display_name must be at least 1 character", domain.ErrInvalidInput)
+	}
+	if len([]rune(displayName)) > selfDisplayNameMaxLen {
+		return domain.SelfProfile{}, fmt.Errorf("%w: display_name must be at most 80 characters", domain.ErrInvalidInput)
+	}
+	return s.store.UpdateDisplayName(ctx, userID, displayName)
 }
 
 func (s *UserService) CreateUser(ctx context.Context, input domain.CreateUserInput) (domain.User, error) {

@@ -163,3 +163,79 @@ func TestPGXUserStore_GetSelfProfile_NotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+func TestPGXUserStore_UpdateDisplayName_ReturnsPersistedProfile(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE auth\.users\s+SET display_name = \$2, updated_at = now\(\)\s+WHERE id = \$1\s+AND status = 'active'\s+AND deleted_at IS NULL\s+RETURNING id, display_name, avatar_url`).
+		WithArgs("user-1", "Ana Lima").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name", "avatar_url"}).
+			AddRow("user-1", "Ana Lima", strptrAvatar("/api/auth/avatars/x.png")))
+
+	got, err := storage.NewPGXUserStore(mock).UpdateDisplayName(context.Background(), "user-1", "Ana Lima")
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.ID != "user-1" || got.DisplayName != "Ana Lima" || got.AvatarURL != "/api/auth/avatars/x.png" {
+		t.Fatalf("unexpected profile: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet: %v", err)
+	}
+}
+
+func TestPGXUserStore_UpdateDisplayName_NullAvatarIsEmpty(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("user-1", "Ana").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name", "avatar_url"}).
+			AddRow("user-1", "Ana", nil))
+
+	got, err := storage.NewPGXUserStore(mock).UpdateDisplayName(context.Background(), "user-1", "Ana")
+	if err != nil || got.AvatarURL != "" {
+		t.Fatalf("expected empty avatar, got %q err=%v", got.AvatarURL, err)
+	}
+}
+
+// Inactive, deleted, or nonexistent users match no row: the WHERE clause
+// excludes them, so the UPDATE affects nothing and RETURNING yields ErrNoRows.
+func TestPGXUserStore_UpdateDisplayName_InactiveOrMissingReturnsNotFound(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("user-1", "Ana").
+		WillReturnError(pgx.ErrNoRows)
+
+	if _, err := storage.NewPGXUserStore(mock).UpdateDisplayName(context.Background(), "user-1", "Ana"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestPGXUserStore_UpdateDisplayName_PropagatesDBError(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery(`UPDATE auth\.users`).
+		WithArgs("user-1", "Ana").
+		WillReturnError(errors.New("connection reset"))
+
+	if _, err := storage.NewPGXUserStore(mock).UpdateDisplayName(context.Background(), "user-1", "Ana"); err == nil || errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected a wrapped db error, got %v", err)
+	}
+}
