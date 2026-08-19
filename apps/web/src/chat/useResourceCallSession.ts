@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { issueResourceCallToken, type ResourceCallKind } from "./callApi";
+import { issueCallToken, type ResourceCallKind } from "./callApi";
+import { acquireChatSocket } from "./chatSocket";
+import { startResourceCall } from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
@@ -11,10 +13,13 @@ export interface ResourceCallTarget {
   id: string;
   /** Channel or group display name, for the panel header — never sent to the server. */
   name: string;
+  /** Authoritative id resolved by authenticated call.sync during tab handoff. */
+  callId?: string;
 }
 
 export interface ResourceCallController {
   active: ResourceCallTarget | null;
+  callId: string | null;
   status: ResourceCallStatus;
   error: string | null;
   /**
@@ -25,6 +30,8 @@ export interface ResourceCallController {
   errorOperation: ResourceCallErrorOperation;
   /** Explicit user gesture only — never called on mount/reconnect. */
   join: (target: ResourceCallTarget) => Promise<void>;
+  /** Reacquires a token and Room after this tab regains ownership. */
+  reconnect: () => Promise<void>;
   /**
    * Disconnects this participant only; never notifies anyone else. Resolves
    * once the local Room cleanup has actually finished. Rejects, without
@@ -37,9 +44,13 @@ export interface ResourceCallController {
   leave: () => Promise<void>;
 }
 
-export function useResourceCallSession(media: CallMediaBridge): ResourceCallController {
+export function useResourceCallSession(
+  media: CallMediaBridge,
+  presenceEnabled = true,
+): ResourceCallController {
   const [active, setActive] = useState<ResourceCallTarget | null>(null);
   const [status, setStatus] = useState<ResourceCallStatus>("idle");
+  const [callId, setCallId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [errorOperation, setErrorOperation] = useState<ResourceCallErrorOperation>(null);
   const activeRef = useRef<ResourceCallTarget | null>(null);
@@ -97,6 +108,7 @@ export function useResourceCallSession(media: CallMediaBridge): ResourceCallCont
         activeRef.current = null;
         joinPromiseRef.current = null;
         setActive(null);
+        setCallId(null);
         setStatus("idle");
         setErrorOperation(null);
       },
@@ -136,7 +148,10 @@ export function useResourceCallSession(media: CallMediaBridge): ResourceCallCont
       if (attemptGenerationRef.current !== generation) return;
       await mediaRef.current.startAudio();
       if (attemptGenerationRef.current !== generation) return;
-      const result = await issueResourceCallToken(target.kind, target.id);
+      const call = target.callId ? { call_id: target.callId } : await startResourceCall(target);
+      if (attemptGenerationRef.current !== generation) return;
+      setCallId(call.call_id);
+      const result = await issueCallToken(call.call_id);
       if (attemptGenerationRef.current !== generation) return;
       // RF-24 follow-up: a resource room is one call, camera and microphone
       // are just controls within it — "audio"/"video" is not a concept of
@@ -146,7 +161,7 @@ export function useResourceCallSession(media: CallMediaBridge): ResourceCallCont
       // by itself here, so this stays "audio" unconditionally and the user
       // enables the camera explicitly via toggleCamera().
       await mediaRef.current.connect(
-        { call_id: `${target.kind}:${target.id}`, call_type: "audio" },
+        { call_id: call.call_id, call_type: "audio" },
         result.token,
         result.serverUrl,
       );
@@ -165,6 +180,34 @@ export function useResourceCallSession(media: CallMediaBridge): ResourceCallCont
     return attempt;
   }, []);
 
+  const reconnect = useCallback(async (): Promise<void> => {
+    const target = activeRef.current;
+    if (!target || !callId) return;
+    const generation = ++attemptGenerationRef.current;
+    setStatus("connecting");
+    setError(null);
+    setErrorOperation(null);
+    try {
+      await stopMedia();
+      if (attemptGenerationRef.current !== generation) return;
+      await mediaRef.current.startAudio();
+      const result = await issueCallToken(callId);
+      if (attemptGenerationRef.current !== generation) return;
+      await mediaRef.current.connect(
+        { call_id: callId, call_type: "audio" },
+        result.token,
+        result.serverUrl,
+      );
+      if (attemptGenerationRef.current === generation) setStatus("active");
+    } catch (reconnectError) {
+      if (attemptGenerationRef.current !== generation) return;
+      setStatus("error");
+      setErrorOperation("join");
+      setError("Não foi possível recuperar a chamada.");
+      throw reconnectError;
+    }
+  }, [callId, stopMedia]);
+
   useEffect(
     () => () => {
       // Invalidates any in-flight join()/leave() attempt so its continuation
@@ -177,5 +220,17 @@ export function useResourceCallSession(media: CallMediaBridge): ResourceCallCont
     [stopMedia],
   );
 
-  return { active, status, error, errorOperation, join, leave };
+  useEffect(() => {
+    if (!presenceEnabled || status !== "active" || !callId) return;
+    const sendPresence = () => handle.send({ type: "call.presence", call_id: callId });
+    const handle = acquireChatSocket({ onOpen: sendPresence });
+    sendPresence();
+    const heartbeat = window.setInterval(sendPresence, 10_000);
+    return () => {
+      window.clearInterval(heartbeat);
+      handle.release();
+    };
+  }, [callId, presenceEnabled, status]);
+
+  return { active, callId, status, error, errorOperation, join, reconnect, leave };
 }
