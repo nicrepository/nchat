@@ -27,10 +27,13 @@ type fakeCallStore struct {
 	resourceInput    storage.CreateResourceCallInput
 	presenceInput    storage.RenewCallPresenceInput
 	transitionInputs []storage.TransitionCallInput
+	leaveInputs      []storage.LeaveResourceCallInput
 	createCreated    bool
 	createErr        error
 	transitionResult storage.TransitionCallResult
 	transitionErr    error
+	leaveResult      storage.TransitionCallResult
+	leaveErr         error
 	currentErr       error
 	currentCallID    string
 	expired          []domain.Call
@@ -61,6 +64,13 @@ func (f *fakeCallStore) TransitionCall(_ context.Context, input storage.Transiti
 	defer f.mu.Unlock()
 	f.transitionInputs = append(f.transitionInputs, input)
 	return f.transitionResult, f.transitionErr
+}
+
+func (f *fakeCallStore) LeaveResourceCall(_ context.Context, input storage.LeaveResourceCallInput) (storage.TransitionCallResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leaveInputs = append(f.leaveInputs, input)
+	return f.leaveResult, f.leaveErr
 }
 
 func (f *fakeCallStore) CurrentCallForUser(_ context.Context, _, _, callID string) (domain.Call, error) {
@@ -254,6 +264,80 @@ func TestCallServiceTransitionsUseAuthenticatedActorAndPublishOnlyChanges(t *tes
 		}
 		if len(publisher.calls) != 0 {
 			t.Fatal("duplicate transition published another event")
+		}
+	})
+}
+
+func TestCallServiceLeavePublishesOnlyWhenTheCallActuallyEnds(t *testing.T) {
+	t.Run("other participants remain: not published", func(t *testing.T) {
+		call := serviceCall(domain.CallStatusActive, 2)
+		store := &fakeCallStore{leaveResult: storage.TransitionCallResult{Call: call}}
+		publisher := &fakeCallPublisher{}
+		svc := NewCallService(store, 30*time.Second, nil, publisher)
+
+		got, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID)
+		if err != nil {
+			t.Fatalf("Leave: %v", err)
+		}
+		if got.Status != domain.CallStatusActive || len(publisher.calls) != 0 {
+			t.Fatalf("unexpected leave result: call=%+v published=%+v", got, publisher.calls)
+		}
+		if len(store.leaveInputs) != 1 ||
+			store.leaveInputs[0].WorkspaceID != serviceCallWorkspace ||
+			store.leaveInputs[0].ActorID != serviceCallCaller ||
+			store.leaveInputs[0].CallID != serviceCallID {
+			t.Fatalf("unexpected store input: %+v", store.leaveInputs)
+		}
+	})
+
+	t.Run("last participant: call ends and is published", func(t *testing.T) {
+		ended := serviceCall(domain.CallStatusEnded, 3)
+		store := &fakeCallStore{leaveResult: storage.TransitionCallResult{Call: ended, Changed: true}}
+		publisher := &fakeCallPublisher{}
+		svc := NewCallService(store, 30*time.Second, nil, publisher)
+
+		got, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID)
+		if err != nil {
+			t.Fatalf("Leave: %v", err)
+		}
+		if got.Status != domain.CallStatusEnded || len(publisher.calls) != 1 {
+			t.Fatalf("unexpected leave result: call=%+v published=%+v", got, publisher.calls)
+		}
+	})
+
+	t.Run("propagates storage failure", func(t *testing.T) {
+		sentinel := errors.New("call store failure")
+		store := &fakeCallStore{leaveErr: sentinel}
+		svc := NewCallService(store, 30*time.Second, nil, nil)
+
+		if _, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID); !errors.Is(err, sentinel) {
+			t.Fatalf("error = %v, want storage failure", err)
+		}
+	})
+
+	t.Run("validates every identity", func(t *testing.T) {
+		store := &fakeCallStore{}
+		svc := NewCallService(store, 30*time.Second, nil, nil)
+
+		tests := []struct {
+			name        string
+			workspaceID string
+			actorID     string
+			callID      string
+		}{
+			{"workspace", "bad", serviceCallCaller, serviceCallID},
+			{"actor", serviceCallWorkspace, "bad", serviceCallID},
+			{"call", serviceCallWorkspace, serviceCallCaller, "bad"},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				if _, err := svc.Leave(context.Background(), test.workspaceID, test.actorID, test.callID); !errors.Is(err, domain.ErrInvalidInput) {
+					t.Fatalf("error = %v, want invalid input", err)
+				}
+				if len(store.leaveInputs) != 0 {
+					t.Fatal("storage called for invalid input")
+				}
+			})
 		}
 	})
 }

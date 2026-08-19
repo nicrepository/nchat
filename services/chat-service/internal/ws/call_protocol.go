@@ -35,6 +35,11 @@ type CallHandler interface {
 	TransitionCall(context.Context, string, string, string, ClientMessageType) (domain.Call, error)
 	CurrentCall(context.Context, string, string, string) (domain.Call, error)
 	RenewCallPresence(context.Context, string, string, string) error
+	// LeaveCall releases one participant's own presence in a resource call —
+	// distinct from TransitionCall's call.end, which only the resource
+	// call's original caller may use to end it for everyone (issue #569).
+	// workspaceID, actorID, callID, in that order.
+	LeaveCall(context.Context, string, string, string) (domain.Call, error)
 }
 
 type CallLimiter interface {
@@ -128,6 +133,26 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 		}
 		_, err = h.callHandler.TransitionCall(ctx, c.workspaceID, c.userID, callID, msg.Type)
 		return err
+
+	case ClientMessageTypeCallLeave:
+		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" || msg.TargetType != "" ||
+			msg.TargetID != "" || msg.MessageID != "" || msg.Emoji != "" {
+			return domain.ErrInvalidInput
+		}
+		callID, err := canonicalCallUUID(msg.CallID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		call, err := h.callHandler.LeaveCall(ctx, c.workspaceID, c.userID, callID)
+		if err != nil {
+			return err
+		}
+		// Addressed to the requesting client only, exactly like call.sync's
+		// reply — every other participant learns about a departure that
+		// changes nothing for them only if the call itself transitions,
+		// which PublishCall (inside the handler) already broadcasts.
+		h.sendCallToClient(c, call)
+		return nil
 
 	case ClientMessageTypeCallSync:
 		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" ||

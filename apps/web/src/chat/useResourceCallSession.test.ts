@@ -2,14 +2,19 @@ import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { issueCallToken } from "./callApi";
-import { startResourceCall } from "./resourceCallSignaling";
+import type { Call } from "./callState";
+import { acquireChatSocket } from "./chatSocket";
+import { leaveResourceCall, startResourceCall } from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCallSession";
 
 vi.mock("./callApi", () => ({
   issueCallToken: vi.fn(),
 }));
-vi.mock("./resourceCallSignaling", () => ({ startResourceCall: vi.fn() }));
+vi.mock("./resourceCallSignaling", () => ({
+  startResourceCall: vi.fn(),
+  leaveResourceCall: vi.fn(),
+}));
 vi.mock("./chatSocket", () => ({
   acquireChatSocket: vi.fn(() => ({
     send: vi.fn(() => true),
@@ -60,6 +65,8 @@ beforeEach(() => {
     expiresAt: "2026-01-01T00:00:00Z",
     serverUrl: "wss://livekit-dev.nic-labs.com",
   });
+  vi.mocked(leaveResourceCall).mockReset();
+  vi.mocked(leaveResourceCall).mockResolvedValue({ ...resourceCall, status: "ended" });
 });
 
 describe("useResourceCallSession", () => {
@@ -147,7 +154,11 @@ describe("useResourceCallSession", () => {
     expect(issueCallToken).toHaveBeenCalledOnce();
   });
 
-  it("leave() disconnects only locally, never sends any signaling event", async () => {
+  // ── issue #569: leave() must release this participant's server-side
+  // participation (a call.leave signal), never just clean up locally and
+  // never end the resource call for anyone else. ─────────────────────────
+
+  it("leave() stops media locally and releases this participant's own server-side presence", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
     await act(() => view.result.current.join(channelTarget));
@@ -155,9 +166,190 @@ describe("useResourceCallSession", () => {
     await act(() => view.result.current.leave());
 
     expect(media.stop).toHaveBeenCalledOnce();
+    expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
     expect(view.result.current.active).toBeNull();
     expect(view.result.current.status).toBe("idle");
     expect(view.result.current.error).toBeNull();
+  });
+
+  it("leave() never sends any signal before a call_id is known: an abandoned in-flight join has nothing to release", async () => {
+    const media = fakeMedia();
+    let resolveStartAudio!: () => void;
+    media.startAudio.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveStartAudio = resolve;
+      }),
+    );
+    const view = renderHook(() => useResourceCallSession(media));
+
+    let joining!: Promise<void>;
+    act(() => {
+      joining = view.result.current.join(channelTarget);
+    });
+    await act(() => view.result.current.leave());
+
+    expect(leaveResourceCall).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveStartAudio();
+      await joining;
+    });
+  });
+
+  it("a leave() whose server-side release fails surfaces a recoverable 'leave' error distinct from a media-cleanup failure", async () => {
+    const media = fakeMedia();
+    vi.mocked(leaveResourceCall).mockRejectedValueOnce(new Error("release failed"));
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+
+    let caught: unknown;
+    await act(async () => {
+      try {
+        await view.result.current.leave();
+      } catch (error) {
+        caught = error;
+      }
+    });
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe("release failed");
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(view.result.current.active).toEqual(channelTarget);
+    expect(view.result.current.status).toBe("error");
+    expect(view.result.current.errorOperation).toBe("leave");
+
+    // Retrying succeeds once the server-side release stops failing — the
+    // same affordance, not a fresh join.
+    await act(() => view.result.current.leave());
+    expect(view.result.current.active).toBeNull();
+    expect(view.result.current.status).toBe("idle");
+    expect(leaveResourceCall).toHaveBeenCalledTimes(2);
+  });
+
+  it("never turns leave() into ending the call: nothing beyond call.leave's own signaling is ever sent", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+
+    await act(() => view.result.current.leave());
+
+    // The hook's only server-facing calls are startResourceCall (join) and
+    // leaveResourceCall (leave) — there is no call.end/global-end affordance
+    // in this hook's surface at all, so a passing join+leave already proves
+    // leave() never reached for one.
+    expect(startResourceCall).toHaveBeenCalledOnce();
+    expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
+  });
+
+  it("a duplicated/retried leave() is safe: both settle and never leave a stuck pending state", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    await act(async () => {
+      first = view.result.current.leave();
+      second = view.result.current.leave();
+      await Promise.all([first, second]);
+    });
+
+    expect(view.result.current.active).toBeNull();
+    expect(view.result.current.status).toBe("idle");
+    expect(view.result.current.error).toBeNull();
+  });
+
+  // ── issue #569 follow-up: a heartbeat tick that lands during leave()'s own
+  // round trip must never resend call.presence and resurrect the lease
+  // call.leave is releasing. The heartbeat has to stop the instant leave()
+  // is called, not once it resolves. ──────────────────────────────────────
+
+  it("stops the presence heartbeat synchronously when leave() starts, before call.leave's ack ever arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      expect(view.result.current.status).toBe("active");
+
+      const acquireCallsBeforeLeave = vi.mocked(acquireChatSocket).mock.results.length;
+      const presenceHandle = vi.mocked(acquireChatSocket).mock.results.at(-1)!.value as {
+        send: ReturnType<typeof vi.fn>;
+      };
+      presenceHandle.send.mockClear();
+
+      let resolveAck!: (value: Call) => void;
+      vi.mocked(leaveResourceCall).mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveAck = resolve;
+        }),
+      );
+
+      let leaving!: Promise<void>;
+      act(() => {
+        leaving = view.result.current.leave();
+      });
+
+      // Well past two whole presence intervals while call.leave's ack is
+      // still pending: every tick that would have fired must have been
+      // silenced by leave(), not merely deferred.
+      act(() => {
+        vi.advanceTimersByTime(25_000);
+      });
+      expect(presenceHandle.send).not.toHaveBeenCalled();
+      // No replacement heartbeat was started either.
+      expect(vi.mocked(acquireChatSocket).mock.results.length).toBe(acquireCallsBeforeLeave);
+
+      await act(async () => {
+        resolveAck({ ...resourceCall, status: "ended" });
+        await leaving;
+      });
+
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.error).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resumes the presence heartbeat normally for a new session after a completed leave() — the timer is never left permanently disabled", async () => {
+    vi.useFakeTimers();
+    try {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.leave());
+      expect(view.result.current.status).toBe("idle");
+
+      const otherTarget: ResourceCallTarget = {
+        ...channelTarget,
+        id: "00000000-0000-4000-8000-000000000702",
+      };
+      const otherCall = {
+        ...resourceCall,
+        call_id: "00000000-0000-4000-8000-000000000799",
+        target_id: otherTarget.id,
+      };
+      vi.mocked(startResourceCall).mockResolvedValueOnce(otherCall);
+      await act(() => view.result.current.join(otherTarget));
+      expect(view.result.current.status).toBe("active");
+
+      const presenceHandle = vi.mocked(acquireChatSocket).mock.results.at(-1)!.value as {
+        send: ReturnType<typeof vi.fn>;
+      };
+      presenceHandle.send.mockClear();
+
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(presenceHandle.send).toHaveBeenCalledWith({
+        type: "call.presence",
+        call_id: otherCall.call_id,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("unmount stops media without requiring an explicit leave()", async () => {
