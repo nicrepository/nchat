@@ -1,0 +1,272 @@
+/* ── Busca global (RF-15) ──────────────────────────────────────────────── */
+
+.global-search {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  height: 100%;
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+
+.global-search__header {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.global-search__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-ink);
+}
+
+.global-search__field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 480px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  background: var(--color-surface);
+}
+
+.global-search__field:focus-within {
+  border-color: var(--color-primary);
+}
+
+.global-search__field input {
+  flex: 1;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 14px;
+  color: var(--color-ink);
+}
+
+.global-search__sr-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.global-search__tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.global-search__tab {
+  padding: 8px 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-muted);
+  cursor: pointer;
+}
+
+.global-search__tab:hover {
+  color: var(--color-ink);
+}
+
+.global-search__tab--active {
+  color: var(--color-primary-strong);
+  border-bottom-color: var(--color-primary);
+}
+
+.global-search__status {
+  padding: 12px 0;
+  font-size: 13px;
+  color: var(--color-muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.global-search__link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 13px;
+  color: var(--color-primary);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.global-search__link-btn:hover {
+  text-decoration: underline;
+}
+
+.global-search__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.global-search__item {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+.global-search__result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-lg);
+}
+
+.global-search__result:hover {
+  background: var(--color-surface-2);
+}
+
+.global-search__result--message {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.global-search__result-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.global-search__result-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.global-search__result-sub {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.global-search__result-snippet {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--color-ink-2);
+}
+
+.global-search__badge {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--color-primary-tint);
+  color: var(--color-primary-strong);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.global-search__result--user {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 4px;
+}
+
+.global-search__result-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-lg);
+}
+
+.global-search__result-trigger:hover {
+  background: var(--color-surface-2);
+}
+
+.global-search__result-trigger:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.global-search__result-error {
+  padding: 0 8px 6px;
+  font-size: 12px;
+  color: var(--color-danger-ink);
+}
+
+.global-search__avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  flex-shrink: 0;
+  overflow: hidden;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+
+.global-search__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.global-search__avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.global-search__avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.global-search__avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.global-search__avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.global-search__avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.global-search__avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
+}
+
+.global-search__load-more {
+  align-self: center;
+  padding: 6px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* Matched query text — adapted from the busca.html prototype's .hl class to
+   this app's real tokens instead of a hardcoded purple. */
+.search-hl {
+  background: rgba(109, 40, 217, 0.16);
+  color: var(--color-primary-strong);
+  padding: 0 2px;
+  border-radius: 3px;
+  font-weight: 600;
+}

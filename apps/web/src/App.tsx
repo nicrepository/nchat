@@ -19,6 +19,7 @@ const AdminAntiSpamPage = lazy(() => import("./admin/AdminAntiSpamPage"));
 const AdminUploadLimitPage = lazy(() => import("./admin/AdminUploadLimitPage"));
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
+const GlobalSearchPage = lazy(() => import("./search/GlobalSearchPage"));
 const LiveKitSpikePage = import.meta.env.DEV
   ? lazy(() => import("./mediaSpike/LiveKitSpikePage"))
   : null;
@@ -107,6 +108,14 @@ export default function App() {
             element={
               <Suspense fallback={null}>
                 <AdminUploadLimitPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="search"
+            element={
+              <Suspense fallback={null}>
+                <GlobalSearchPage />
               </Suspense>
             }
           />

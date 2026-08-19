@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +12,10 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/health"
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 )
+
+type readinessPinger struct{ err error }
+
+func (p readinessPinger) Ping(context.Context) error { return p.err }
 
 func TestHealthzContract(t *testing.T) {
 	handler := NewHandler("search-service")
@@ -59,6 +65,30 @@ func TestReadyzContract(t *testing.T) {
 	}
 	assertReadinessCheck(t, body.Data.Checks, "service-bootstrap")
 	assertReadinessCheck(t, body.Data.Checks, "config-loaded")
+}
+
+func TestDatabaseReadinessReportsHealthyAndUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		want    health.CheckStatus
+		message string
+	}{{"healthy", nil, health.CheckPass, ""}, {"unavailable", errors.New("down"), health.CheckFail, "database unavailable"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			checks := readinessChecks(readinessPinger{err: tc.err})
+			if len(checks) != 3 {
+				t.Fatalf("checks=%d", len(checks))
+			}
+			db := checks[2]
+			if db.Name() != "postgres" || !db.Critical() {
+				t.Fatalf("metadata name=%s critical=%v", db.Name(), db.Critical())
+			}
+			got := db.Check(context.Background())
+			if got.Status != tc.want || got.Message != tc.message {
+				t.Fatalf("result=%+v", got)
+			}
+		})
+	}
 }
 
 func TestVersionRouteStillWorks(t *testing.T) {
