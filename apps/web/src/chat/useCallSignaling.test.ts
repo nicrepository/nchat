@@ -250,17 +250,61 @@ describe("useCallSignaling", () => {
     expect(callCommands(socket)).toHaveLength(1);
   });
 
-  it.each([
-    ["call.accept", "call_not_found"],
-    ["call.sync", "call_unavailable"],
-  ])("keeps %s/%s as an actionable error", (operation, code) => {
+  it("keeps a correlated call.accept rejection as an actionable error", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      expect(result.current.accept()).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.accept",
+        call_id: baseCall.call_id,
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.error).toBe("Não foi possível concluir a ação da chamada.");
+  });
+
+  it("ignores an uncorrelated call.accept rejection when nothing is pending", () => {
     const { result } = renderHook(() => useCallSignaling());
     const socket = FakeWebSocket.instances[0];
     act(() => socket.simulateOpen());
 
-    act(() => socket.simulateMessage({ type: "call.error", operation, code }));
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.accept",
+        call_id: baseCall.call_id,
+        code: "call_not_found",
+      }),
+    );
 
-    expect(result.current.error).toBe("Não foi possível concluir a ação da chamada.");
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("ignores a call.sync error with no reconciliation in flight", () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_unavailable",
+      }),
+    );
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
   });
 
   it("does not alter an active call for an empty call.sync response", async () => {
@@ -504,7 +548,7 @@ describe("useCallSignaling", () => {
     expect(media.stop).toHaveBeenCalledOnce();
   });
 
-  it("releases pending for a correlated call.error", async () => {
+  it("defers pending release for a correlated call_invalid_state until call.sync reconciles it", async () => {
     const { result } = renderHook(() => useCallSignaling());
     const socket = FakeWebSocket.instances[0];
     act(() => socket.simulateOpen());
@@ -523,8 +567,166 @@ describe("useCallSignaling", () => {
       }),
     );
 
+    // The server disputes the local end(): the client no longer finalizes a
+    // generic error immediately, it waits on the call.sync it just sent.
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(callCommands(socket)).toEqual([{ type: "call.end", call_id: baseCall.call_id }]);
+  });
+
+  it("ignores a stale call.error that does not match the pending direct-call command", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: "00000000-0000-4000-8000-000000000999",
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("ignores a stale direct-call error when no command is pending", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+
     expect(result.current.pending).toBe(false);
-    expect(result.current.error).toBe("A chamada já mudou de estado.");
+    expect(result.current.error).toBeNull();
+
+    const syncCountBefore = sentMessages(socket).filter(
+      (message) => message.type === "call.sync",
+    ).length;
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    // No local command was ever sent for this call_id/operation, so a
+    // call_invalid_state stale reply has nothing to reconcile against —
+    // it must not start a call.sync of its own either.
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(result.current.call?.status).toBe("active");
+    expect(
+      sentMessages(socket).filter((message) => message.type === "call.sync"),
+    ).toHaveLength(syncCountBefore);
+  });
+
+  it("reconciles a correlated call_invalid_state through call.sync", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+
+    const syncCountBefore = sentMessages(socket).filter(
+      (message) => message.type === "call.sync",
+    ).length;
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(
+      sentMessages(socket).filter((message) => message.type === "call.sync"),
+    ).toHaveLength(syncCountBefore + 1);
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.call).toBeNull();
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("reconciles a correlated call.accept rejection through call.sync without granting media authorization", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      expect(result.current.accept()).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    const syncCountBefore = sentMessages(socket).filter(
+      (message) => message.type === "call.sync",
+    ).length;
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.accept",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(
+      sentMessages(socket).filter((message) => message.type === "call.sync"),
+    ).toHaveLength(syncCountBefore + 1);
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() => socket.simulateMessage(activeEvent(2)));
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(result.current.call?.status).toBe("active");
+
+    // Reconciled through call.sync, not this hook's own call.accept
+    // completing: per RF-23 only accept()/start() completing their own
+    // pending command grants local media authorization, never a snapshot
+    // arriving through reconciliation — so this active call still requires
+    // an explicit activateMedia() and never auto-connects.
+    expect(result.current.mediaActivationRequired).toBe(true);
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
   });
 
   it("does not let a delayed event from a stale connection overwrite newer state", () => {
@@ -1437,8 +1639,16 @@ describe("useCallSignaling", () => {
       }),
     );
 
+    // The rejected end() defers to call.sync reconciliation instead of
+    // finalizing an error immediately.
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(media.connect).not.toHaveBeenCalled();
+
+    act(() => socket.simulateMessage(activeEvent(2)));
+
     expect(result.current.pending).toBe(false);
-    expect(result.current.error).toBe("A chamada já mudou de estado.");
+    expect(result.current.call?.status).toBe("active");
     expect(media.connect).not.toHaveBeenCalled();
 
     await act(async () => result.current.retryMedia());

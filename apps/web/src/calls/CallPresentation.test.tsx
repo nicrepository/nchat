@@ -125,7 +125,7 @@ describe("FloatingCallWindow", () => {
     expect(screen.getByRole("button", { name: "Expandir em nova aba" })).toBeInTheDocument();
   });
 
-  it("drags only from its handle and supports preset keyboard positioning", () => {
+  it("drags only from its handle and has no preset position selector", () => {
     render(
       <FloatingCallWindow
         title="Ana"
@@ -150,10 +150,71 @@ describe("FloatingCallWindow", () => {
     fireEvent.pointerUp(handle, { pointerId: 7, clientX: 720, clientY: 520 });
     expect(windowElement.style.transform).toContain("translate3d");
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Posição da chamada" }), {
-      target: { value: "top-left" },
+    expect(
+      screen.queryByRole("combobox", { name: "Posição da chamada" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not start dragging when the expand control receives the pointer gesture", () => {
+    const onExpand = vi.fn();
+
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={onExpand}
+      />,
+    );
+
+    const windowElement = screen.getByTestId("floating-call-window");
+    const handle = screen.getByTestId("floating-call-handle");
+    const expand = screen.getByRole("button", { name: "Expandir em nova aba" });
+
+    Object.defineProperty(windowElement, "getBoundingClientRect", {
+      value: () => ({ width: 320, height: 240, left: 0, top: 0 }),
     });
-    expect(windowElement.style.transform).toBe("translate3d(16px, 16px, 0)");
+
+    const capture = vi.fn();
+    Object.defineProperty(handle, "setPointerCapture", { value: capture });
+    Object.defineProperty(handle, "releasePointerCapture", { value: vi.fn() });
+
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 1024,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 768,
+    });
+
+    const before = windowElement.style.transform;
+
+    fireEvent.pointerDown(expand, {
+      button: 0,
+      pointerId: 77,
+      clientX: 900,
+      clientY: 40,
+    });
+
+    fireEvent.pointerMove(handle, {
+      pointerId: 77,
+      clientX: 500,
+      clientY: 400,
+    });
+
+    fireEvent.pointerUp(handle, {
+      pointerId: 77,
+      clientX: 500,
+      clientY: 400,
+    });
+
+    expect(capture).not.toHaveBeenCalled();
+    expect(windowElement.style.transform).toBe(before);
+
+    fireEvent.click(expand);
+    expect(onExpand).toHaveBeenCalledOnce();
   });
 
   it("cleans up drag state on pointercancel just like pointerup (achado #6)", () => {
