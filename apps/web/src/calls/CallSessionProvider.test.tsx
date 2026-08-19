@@ -484,6 +484,26 @@ describe("CallSessionProvider", () => {
     await waitFor(() => expect(screen.getByTestId("presentation")).toHaveTextContent("ended"));
   });
 
+  it("does not treat a popup-blocked window.open as a loss of ownership", async () => {
+    const opened = vi.spyOn(window, "open").mockReturnValue(null);
+    const view = renderProvider();
+    calls.call = activeDirect();
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await screen.findByTestId("floating-call-window");
+    expect(screen.getByTestId("owner")).toHaveTextContent("local");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expandir em nova aba" }));
+
+    expect(opened).toHaveBeenCalledWith(`/call/${callId}`, "_blank", "noopener");
+    // A blocked/opaque popup must never look like ownership was lost: no
+    // release, no owner-state change — only the ready/handoff/ack protocol
+    // (exercised in the recovery tests below) ever does that.
+    expect(ownership.release).not.toHaveBeenCalled();
+    expect(screen.getByTestId("owner")).toHaveTextContent("local");
+  });
+
   it("recovers resource ownership, including activation and failed-claim paths", async () => {
     vi.useFakeTimers();
     resource.active = { kind: "channel", id: channelId, name: "Produto" };

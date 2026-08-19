@@ -1,11 +1,26 @@
 .incoming-call,
-.floating-call,
 .global-call-indicator {
   position: fixed;
   z-index: 80;
   color: var(--color-text, #f8fafc);
   background: color-mix(in srgb, var(--color-surface, #111827) 94%, transparent);
   border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
+  backdrop-filter: blur(18px);
+}
+
+/*
+ * Own opaque dark surface, independent of --color-surface/--color-text:
+ * the floating call renders as a sibling of ChatShell's light-theme surface
+ * tokens, but :root also defines --color-surface (#fff) for the auth pages,
+ * so the shared rule above silently resolved to a near-white background here.
+ */
+.floating-call {
+  position: fixed;
+  z-index: 80;
+  color: #f8fafc;
+  background: rgb(15 23 42 / 96%);
+  border: 1px solid rgb(255 255 255 / 16%);
   box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
   backdrop-filter: blur(18px);
 }
@@ -102,10 +117,24 @@
 }
 .floating-call__handle button,
 .dedicated-call__header button {
-  border: 0;
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
   color: inherit;
-  background: transparent;
+  background: rgb(255 255 255 / 14%);
   cursor: pointer;
+}
+.floating-call__handle button:hover,
+.dedicated-call__header button:hover {
+  background: rgb(255 255 255 / 24%);
+}
+.floating-call__handle button:focus-visible,
+.dedicated-call__header button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 .floating-call__stage {
   position: relative;
@@ -159,27 +188,41 @@
   width: 2.65rem;
   height: 2.65rem;
   place-items: center;
-  border: 1px solid rgb(255 255 255 / 16%);
+  border: 1px solid rgb(255 255 255 / 26%);
   border-radius: 50%;
-  color: inherit;
-  background: rgb(255 255 255 / 9%);
+  color: #f8fafc;
+  background: rgb(255 255 255 / 16%);
   cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+}
+.call-presentation__control:hover:not(:disabled) {
+  background: rgb(255 255 255 / 26%);
+}
+.call-presentation__control:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 .call-presentation__control[aria-pressed="false"] {
-  outline: 2px solid transparent;
+  border-color: rgb(254 205 213 / 45%);
   color: #fecdd3;
+  background: rgb(190 18 60 / 24%);
+}
+.call-presentation__control[aria-pressed="false"]:hover:not(:disabled) {
+  background: rgb(190 18 60 / 34%);
+}
+.call-presentation__control:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
 }
 .call-presentation__control--danger {
   color: #fff;
+  border-color: #be123c;
   background: #be123c;
 }
-.floating-call__position {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0 0.75rem 0.75rem;
-  font-size: 0.75rem;
+.call-presentation__control--danger:hover:not(:disabled) {
+  background: #9f1239;
 }
 .floating-call__activate {
   display: block;
@@ -214,11 +257,6 @@
   color: var(--color-text, #111827);
   box-shadow: 0 0.75rem 2rem rgb(15 23 42 / 18%);
 }
-.floating-call__position select {
-  max-width: 11rem;
-  min-height: 2rem;
-}
-
 .global-call-indicator {
   top: 0.75rem;
   left: 50%;
@@ -309,9 +347,6 @@
   }
   .floating-call__handle {
     cursor: default;
-  }
-  .floating-call__position {
-    display: none;
   }
   .floating-call__stage {
     min-height: 7rem;
