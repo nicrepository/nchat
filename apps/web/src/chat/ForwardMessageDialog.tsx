@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 
 import { forwardChannelMessage } from "./chatApi";
 import type { Channel } from "./chatTypes";
+import { randomId } from "../lib/randomId";
 
 export interface ForwardSourceContext {
   messageID: string;
@@ -107,7 +108,7 @@ export default function ForwardMessageDialog({
 
   const submit = async () => {
     if (!selectedChannel || submittingRef.current) return;
-    if (!idempotencyKeyRef.current) idempotencyKeyRef.current = crypto.randomUUID();
+    if (!idempotencyKeyRef.current) idempotencyKeyRef.current = randomId();
     submittingRef.current = true;
     setSubmitting(true);
     setError("");
