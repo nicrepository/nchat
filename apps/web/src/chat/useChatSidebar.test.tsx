@@ -1,22 +1,30 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { MemoryRouter } from "react-router";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { parseInstant } from "./sidebarOrder";
 import type { WSMessageCreatedEvent } from "./useChatWebSocket";
 import { useChatSidebar } from "./useChatSidebar";
 
-const { mockFetchSidebarData, mockSetSidebarConversationPinned, mockPlayMessageSound, websocket } =
-  vi.hoisted(() => ({
-    mockFetchSidebarData: vi.fn(),
-    mockSetSidebarConversationPinned: vi.fn(),
-    mockPlayMessageSound: vi.fn(),
-    websocket: {
-      onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
-      onConversationAvailable: null as (() => void) | null,
-    },
-  }));
+const {
+  mockFetchSidebarData,
+  mockSetSidebarConversationPinned,
+  mockPlayMessageSound,
+  mockGetSoundNotificationMode,
+  websocket,
+} = vi.hoisted(() => ({
+  mockFetchSidebarData: vi.fn(),
+  mockSetSidebarConversationPinned: vi.fn(),
+  mockPlayMessageSound: vi.fn(),
+  mockGetSoundNotificationMode: vi.fn(
+    () => "all" as "off" | "all" | "mentions" | "mentions_and_dms",
+  ),
+  websocket: {
+    onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
+    onConversationAvailable: null as (() => void) | null,
+  },
+}));
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: mockFetchSidebarData,
@@ -24,6 +32,9 @@ vi.mock("./chatApi", () => ({
 }));
 vi.mock("./messageSound", () => ({
   playMessageSound: mockPlayMessageSound,
+}));
+vi.mock("./soundPreference", () => ({
+  getSoundNotificationMode: mockGetSoundNotificationMode,
 }));
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: vi.fn(
@@ -45,7 +56,8 @@ const channelA = "11111111-1111-4111-8111-111111111111";
 const channelB = "22222222-2222-4222-8222-222222222222";
 const dmC = "33333333-3333-4333-8333-333333333333";
 const groupD = "44444444-4444-4444-8444-444444444444";
-const currentUserId = "me-1";
+const currentUserId = "00000000-0000-4000-8000-0000000000f1";
+const otherUserId = "00000000-0000-4000-8000-0000000000f2";
 
 function deferredValue<T>() {
   let resolve!: (value: T) => void;
@@ -70,6 +82,8 @@ function messageCreated(
   targetType: "channel" | "dm" = "channel",
   /** The message's persisted creation instant — the sidebar's ordering key. */
   messageCreatedAt = "2026-07-28T12:00:00Z",
+  bodyText = "Nova mensagem",
+  kind = "user",
 ): WSMessageCreatedEvent {
   return {
     type: "message.created",
@@ -86,14 +100,19 @@ function messageCreated(
       dm_conversation_id: targetType === "dm" ? targetId : undefined,
       sender_id: senderId,
       sender_display_name: "Other",
-      kind: "user",
-      body_text: "Nova mensagem",
+      kind,
+      body_text: bodyText,
       status: "active",
       is_removed: false,
       created_at: messageCreatedAt,
       updated_at: messageCreatedAt,
     },
   };
+}
+
+/** The same official mention token format RichTextRenderer parses (see richTextMarkers.ts). */
+function mentionToken(userId: string, label = "Você") {
+  return `@[${label}](mention:user:${userId})`;
 }
 
 /**
@@ -469,6 +488,422 @@ describe("useChatSidebar notification sound", () => {
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
     if (result.current.state.status === "ready") {
       expect(result.current.state.dms.find((d) => d.id === groupD)?.unreadCount).toBe(1);
+    }
+  });
+});
+
+describe("useChatSidebar sound preference and DM/mention rules", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [
+        { id: dmC, type: "1:1", name: "C", participants: [] },
+        { id: groupD, type: "group", name: "D", participants: [] },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does not play any sound when the sound mode is 'off'", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("off");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("message-1", channelA)));
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("still updates the unread badge when the sound mode is 'off'", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("off");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("message-1", channelA)));
+
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  it("plays a sound for a real @mention of the current user in a background channel", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "mention-1",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `oi ${mentionToken(currentUserId)} bora?`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not give mention priority to a mention of a different user", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    // Active conversation, window unfocused: a real MENTION/DM would still
+    // play here, but a mention of someone else is just STANDARD, which never
+    // plays while its conversation is open (focused or not).
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "mention-other",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `oi ${mentionToken(otherUserId)} bora?`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("does not play a sound for a mention inside the current user's own message", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "mention-own",
+          channelA,
+          currentUserId,
+          "channel",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("does not classify a system message as a mention even when it names the current user", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "system-1",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `${mentionToken(currentUserId)} entrou no canal`,
+          "system",
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("plays a sound for a DM in the active conversation once the window loses focus", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("visible");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/dm/${dmC}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    // Focused + active: no sound (unchanged from the existing DM-active test).
+    act(() => websocket.onMessageCreated?.(messageCreated("dm-focused", dmC, "other-1", "dm")));
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+
+    // Same active DM, window now in the background: DM priority still plays.
+    visibility.mockReturnValue("hidden");
+    act(() => websocket.onMessageCreated?.(messageCreated("dm-unfocused", dmC, "other-1", "dm")));
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not play a standard channel message in the active conversation even when the window is unfocused", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-unfocused", channelA)));
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("plays only once for a DM message that also contains a mention of the current user", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "dm-mention-1",
+          dmC,
+          "other-1",
+          "dm",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  // ── 'mentions' mode ──────────────────────────────────────────────────────
+
+  it("in 'mentions' mode, does not play for a background standard channel message", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelA)));
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("in 'mentions' mode, does not play for a background DM without a mention", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("dm-plain", dmC, "other-1", "dm")));
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("in 'mentions_and_dms' mode, plays for a background DM without a mention", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions_and_dms");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("dm-mode4", dmC, "other-1", "dm")));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("in 'mentions_and_dms' mode, does not play for a plain channel message", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions_and_dms");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-mode4", channelA)));
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("in 'mentions_and_dms' mode, plays for a real @mention in a channel", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions_and_dms");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "mention-mode4",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("in 'mentions' mode, plays once for a DM that also contains a mention of the current user", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "dm-mention-2",
+          dmC,
+          "other-1",
+          "dm",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("in 'mentions' mode, plays for a real @mention of the current user in a background channel", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "mention-in-mentions-mode",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("in 'mentions' mode, plays for an @all broadcast in a background channel", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("mentions");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated("all-1", channelA, "other-1", "channel", undefined, "heads up @all"),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("in 'all' mode, an @all broadcast also plays (background channel)", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated("all-2", channelA, "other-1", "channel", undefined, "heads up @all"),
+      ),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Mention badge (visual indicator, independent of sound mode) ─────────
+
+  it("sets hasMentionUnread on the mentioned channel", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "badge-mention-1",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    if (result.current.state.status === "ready") {
+      const channel = result.current.state.channels.find((c) => c.id === channelA);
+      expect(channel?.hasMentionUnread).toBe(true);
+      expect(channel?.unreadCount).toBe(1);
+    }
+  });
+
+  it("does not set hasMentionUnread for a plain unread message", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("badge-plain-1", channelA)));
+
+    if (result.current.state.status === "ready") {
+      const channel = result.current.state.channels.find((c) => c.id === channelA);
+      expect(channel?.hasMentionUnread).toBeFalsy();
+      expect(channel?.unreadCount).toBe(1);
+    }
+  });
+
+  it("keeps updating hasMentionUnread even when the sound mode is 'off'", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("off");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageCreated(
+          "badge-mention-off",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `oi ${mentionToken(currentUserId)}`,
+        ),
+      ),
+    );
+
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    if (result.current.state.status === "ready") {
+      expect(result.current.state.channels.find((c) => c.id === channelA)?.hasMentionUnread).toBe(
+        true,
+      );
     }
   });
 });

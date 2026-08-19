@@ -1105,11 +1105,17 @@ export async function fetchMentionCandidates(
   const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/mentions?q=${encodeURIComponent(query)}`;
   const res = await authenticatedFetch<MentionEnvelope>(url, { method: "GET", signal });
   if (!isMentionEnvelope(res)) return [];
-  return [...res.data.users, ...res.data.channels].map((candidate) => ({
-    mentionType: candidate.type,
-    id: candidate.id,
-    label: candidate.label,
-  }));
+  // Channel-reference mentions (backend still returns them; the composer no
+  // longer offers them) are intentionally dropped here — @-mentions are for
+  // people only. The .type === "user" filter also guards against a malformed
+  // backend response placing a "channel" entry in the users array.
+  return res.data.users
+    .filter((candidate) => candidate.type === "user")
+    .map((candidate) => ({
+      mentionType: "user" as const,
+      id: candidate.id,
+      label: candidate.label,
+    }));
 }
 
 export async function postDMMessage(

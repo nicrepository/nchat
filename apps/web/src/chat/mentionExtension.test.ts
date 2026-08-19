@@ -226,6 +226,77 @@ describe("mentionExtension", () => {
     }
   });
 
+  it("prepends a synthetic @all candidate when the query matches", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+      const suggestion = options().suggestion;
+      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+
+      const pending = suggestion.items({ query: "al", editor });
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(pending).resolves.toEqual([
+        { mentionType: "all", id: "00000000-0000-0000-0000-000000000000", label: "all" },
+        { mentionType: "user", id: "user-1", label: "Ana" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not offer @all once the query no longer matches it", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+      const suggestion = options().suggestion;
+      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+
+      const pending = suggestion.items({ query: "ana", editor });
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(pending).resolves.toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("offers @all with an empty query, matching normal candidate-list behavior", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.fetch.mockResolvedValue([]);
+      const suggestion = options().suggestion;
+      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+
+      const pending = suggestion.items({ query: "", editor });
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(pending).resolves.toEqual([
+        { mentionType: "all", id: "00000000-0000-0000-0000-000000000000", label: "all" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("matches @all case-insensitively", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.fetch.mockResolvedValue([]);
+      const suggestion = options().suggestion;
+      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+
+      const pending = suggestion.items({ query: "AL", editor });
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(pending).resolves.toEqual([
+        { mentionType: "all", id: "00000000-0000-0000-0000-000000000000", label: "all" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("cancels a pending debounced fetch when the popup exits", async () => {
     vi.useFakeTimers();
     try {
