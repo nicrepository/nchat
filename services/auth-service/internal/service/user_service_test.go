@@ -56,6 +56,10 @@ func (f *fakeStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProf
 	return domain.SelfProfile{}, nil
 }
 
+func (f *fakeStore) UpdateDisplayName(_ context.Context, _, _ string) (domain.SelfProfile, error) {
+	return domain.SelfProfile{}, nil
+}
+
 func (f *fakeStore) ListWorkspaceUsers(_ context.Context, workspaceID string, limit int, afterUserID string) ([]domain.WorkspaceUser, error) {
 	f.gotWorkspaceID = workspaceID
 	f.gotLimit = limit
@@ -314,6 +318,108 @@ func TestUserService_GetProfile_PropagatesError(t *testing.T) {
 	store := &profileStore{err: domain.ErrNotFound}
 	svc := service.NewUserService(store)
 	if _, err := svc.GetProfile(context.Background(), "u1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// ── UpdateDisplayName (ID 7 — cronograma 19/08) ─────────────────────────────
+
+// updateDisplayNameStore records what the service passed to the store, so
+// tests can assert validation happens before storage is ever reached, and
+// that the value forwarded is the sanitized one, not the raw input.
+type updateDisplayNameStore struct {
+	fakeStore
+	gotUserID      string
+	gotDisplayName string
+	calls          int
+	profile        domain.SelfProfile
+	err            error
+}
+
+func (s *updateDisplayNameStore) UpdateDisplayName(_ context.Context, userID, displayName string) (domain.SelfProfile, error) {
+	s.gotUserID = userID
+	s.gotDisplayName = displayName
+	s.calls++
+	return s.profile, s.err
+}
+
+func TestUserService_UpdateDisplayName_TrimsAndDelegates(t *testing.T) {
+	store := &updateDisplayNameStore{profile: domain.SelfProfile{ID: "u1", DisplayName: "Ana Lima"}}
+	svc := service.NewUserService(store)
+
+	got, err := svc.UpdateDisplayName(context.Background(), "u1", "  Ana Lima  ")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotUserID != "u1" {
+		t.Fatalf("expected userID u1 to reach the store, got %q", store.gotUserID)
+	}
+	if store.gotDisplayName != "Ana Lima" {
+		t.Fatalf("expected trimmed display_name to reach the store, got %q", store.gotDisplayName)
+	}
+	if got.DisplayName != "Ana Lima" {
+		t.Fatalf("expected the store's persisted value to be returned, got %+v", got)
+	}
+}
+
+func TestUserService_UpdateDisplayName_StripsControlCharacters(t *testing.T) {
+	store := &updateDisplayNameStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateDisplayName(context.Background(), "u1", "Ana\x00\nLima"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotDisplayName != "AnaLima" {
+		t.Fatalf("expected control characters stripped, got %q", store.gotDisplayName)
+	}
+}
+
+func TestUserService_UpdateDisplayName_RejectsEmptyAfterTrim(t *testing.T) {
+	store := &updateDisplayNameStore{}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateDisplayName(context.Background(), "u1", "   ")
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatal("store must not be called when validation fails")
+	}
+}
+
+func TestUserService_UpdateDisplayName_RejectsTooLong(t *testing.T) {
+	store := &updateDisplayNameStore{}
+	svc := service.NewUserService(store)
+
+	tooLong := strings.Repeat("a", 81)
+	_, err := svc.UpdateDisplayName(context.Background(), "u1", tooLong)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatal("store must not be called when validation fails")
+	}
+}
+
+func TestUserService_UpdateDisplayName_AcceptsMaxLength(t *testing.T) {
+	store := &updateDisplayNameStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	exactly80 := strings.Repeat("a", 80)
+	if _, err := svc.UpdateDisplayName(context.Background(), "u1", exactly80); err != nil {
+		t.Fatalf("unexpected error at the boundary: %v", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("expected exactly one store call, got %d", store.calls)
+	}
+}
+
+func TestUserService_UpdateDisplayName_PropagatesStoreError(t *testing.T) {
+	store := &updateDisplayNameStore{err: domain.ErrNotFound}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateDisplayName(context.Background(), "u1", "Ana")
+	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

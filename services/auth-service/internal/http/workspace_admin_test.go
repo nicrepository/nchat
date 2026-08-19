@@ -33,6 +33,7 @@ const (
 type workspaceAdminStub struct {
 	routerUsersUnused
 	stubProfileReader
+	stubProfileWriter
 
 	workspaceID  string
 	workspaceErr error

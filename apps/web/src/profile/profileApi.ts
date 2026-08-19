@@ -137,3 +137,53 @@ function mapAvatarError(error: unknown): AvatarUploadError {
   }
   return new AvatarUploadError("unknown", "Não foi possível atualizar o avatar.");
 }
+
+export type UpdateDisplayNameErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateDisplayNameError extends Error {
+  readonly reason: UpdateDisplayNameErrorReason;
+  constructor(reason: UpdateDisplayNameErrorReason, message: string) {
+    super(message);
+    this.name = "UpdateDisplayNameError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Updates the authenticated user's display name and returns the profile as
+ * persisted by the server — never the optimistic input. The body carries only
+ * display_name; identity comes from the session via authenticatedFetch, never
+ * from a client-supplied id.
+ */
+export async function updateDisplayName(
+  displayName: string,
+  signal?: AbortSignal,
+): Promise<SelfProfile> {
+  try {
+    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: displayName }),
+      signal,
+    });
+    return {
+      id: res.data.id,
+      displayName: normalizeDisplayName(res.data.display_name),
+      avatarUrl: sameOriginAvatarUrl(res.data.avatar_url),
+    };
+  } catch (error) {
+    throw mapUpdateDisplayNameError(error);
+  }
+}
+
+function mapUpdateDisplayNameError(error: unknown): UpdateDisplayNameError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 400:
+        return new UpdateDisplayNameError("invalid", "Nome inválido.");
+      case 403:
+        return new UpdateDisplayNameError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new UpdateDisplayNameError("unknown", "Não foi possível atualizar o nome.");
+}
