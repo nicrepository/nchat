@@ -449,12 +449,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     },
     [],
   );
+  // window.open's return value is not trustworthy evidence that a tab
+  // actually opened: with "noopener" some browsers omit the WindowProxy even
+  // on success, and that is indistinguishable here from a blocked popup. So
+  // this boolean means only "the main tab asked the browser to open the
+  // dedicated tab" (the guard above passed) — never "the dedicated tab is
+  // confirmed open". Real handoff confirmation is exclusively the
+  // ready -> handoff -> ack/failure/timeout protocol elsewhere in this file;
+  // a blocked/opaque popup must never change ownerState or release the lease.
   const expand = useCallback(() => {
     if (!activeCallId || ownerStateRef.current !== "local") return false;
-    const opened =
-      window.open(`/call/${encodeURIComponent(activeCallId)}`, "_blank", "noopener") !== null;
-    if (opened) emitCallTechnicalEvent("dedicated-opened");
-    return opened;
+    window.open(`/call/${encodeURIComponent(activeCallId)}`, "_blank", "noopener");
+    emitCallTechnicalEvent("dedicated-opened");
+    return true;
   }, [activeCallId]);
   const takeOver = useCallback(async () => {
     if (!activeCallId) return false;

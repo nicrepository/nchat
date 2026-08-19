@@ -365,37 +365,76 @@ export function useCallSignaling(
         if (value["type"] === "call.error") {
           const operation = value["operation"];
           const code = value["code"];
-          if (operation === "call.sync" && code === "call_not_found") {
+          if (operation === "call.sync") {
+            // call.sync never has a PendingCallCommand of its own (it isn't
+            // sent through send()/sendGated()): its correlation is entirely
+            // syncReconciliationRef, scoped to this connection's generation.
+            // No match means this reply belongs to an abandoned/older
+            // reconciliation attempt, so it is ignored rather than shown.
             const reconciliation =
               syncReconciliationRef.current?.generation === generation
                 ? syncReconciliationRef.current
                 : null;
             if (!reconciliation) return;
+            if (code === "call_not_found") {
+              syncReconciliationRef.current = null;
+              pendingRef.current = null;
+              const staleCall = callRef.current;
+              callRef.current = null;
+              setState(initialCallState);
+              setPending(false);
+              setError(null);
+              invalidateMediaRequest();
+              if (staleCall && !isTerminalCall(staleCall.status) && !reconciliation.mediaCleanup) {
+                void stopMedia();
+              }
+              return;
+            }
             syncReconciliationRef.current = null;
             pendingRef.current = null;
-            const staleCall = callRef.current;
-            callRef.current = null;
-            setState(initialCallState);
             setPending(false);
+            setError(
+              code === "call_rate_limited"
+                ? "Muitas tentativas de chamada. Aguarde um minuto."
+                : "Não foi possível concluir a ação da chamada.",
+            );
+            return;
+          }
+          // Every remaining call.error answers a normal command (call.start,
+          // call.accept, call.decline, call.cancel or call.end): it is only
+          // processed if it matches the PendingCallCommand this hook actually
+          // has in flight. A stale reply for a command that was already
+          // superseded (or one for a different call_id) must not touch
+          // pending/error/call/media state at all — including when nothing
+          // is pending, since there is nothing here for it to correlate to.
+          const pendingCommand = pendingRef.current;
+          if (!pendingCommand || !errorMatchesPending(pendingCommand, value)) {
+            return;
+          }
+          if (code === "call_invalid_state" && pendingCommand.operation !== "call.start") {
+            // The backend disagrees with the local transition: the call_id we
+            // acted on is correlated, but its authoritative state has moved
+            // on. call.start has no established call_id to reconcile against
+            // (and its own errors never echo request_id, see
+            // errorMatchesPending), so it keeps the generic release below;
+            // every other transition reconciles through the same call.sync
+            // path a reconnect uses, instead of guessing at the new state.
+            // The in-flight media cleanup this command already started (see
+            // decline/cancel/end below) carries over into the reconciliation
+            // so it is never started a second time.
+            const mediaCleanup = mediaCleanupPromiseRef.current;
+            pendingRef.current = null;
             setError(null);
-            invalidateMediaRequest();
-            if (staleCall && !isTerminalCall(staleCall.status) && !reconciliation.mediaCleanup) {
-              void stopMedia();
+            syncReconciliationRef.current = { generation, mediaCleanup };
+            if (!handle.send({ type: "call.sync" })) {
+              syncReconciliationRef.current = null;
+              setPending(false);
+              setError("Conexão em tempo real indisponível.");
             }
             return;
           }
-          if (
-            operation === "call.sync" &&
-            syncReconciliationRef.current?.generation === generation
-          ) {
-            syncReconciliationRef.current = null;
-            pendingRef.current = null;
-            setPending(false);
-          }
-          if (errorMatchesPending(pendingRef.current, value)) {
-            pendingRef.current = null;
-            setPending(false);
-          }
+          pendingRef.current = null;
+          setPending(false);
           setError(
             code === "call_rate_limited"
               ? "Muitas tentativas de chamada. Aguarde um minuto."
