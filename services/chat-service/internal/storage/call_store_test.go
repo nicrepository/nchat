@@ -24,6 +24,7 @@ const (
 func callColumns() []string {
 	return []string{
 		"id", "workspace_id", "request_id", "caller_id", "callee_id",
+		"target_type", "target_id",
 		"call_type", "status", "version", "created_at", "updated_at",
 		"expires_at", "accepted_at", "ended_at",
 	}
@@ -39,8 +40,18 @@ func callRow(now time.Time, status domain.CallStatus, version int64) *pgxmock.Ro
 	}
 	return pgxmock.NewRows(callColumns()).AddRow(
 		callID, callWorkspaceID, callRequestID, callCallerID, callCalleeID,
+		string(domain.CallTargetUser), callCalleeID,
 		string(domain.CallTypeVideo), string(status), version, now, now,
 		now.Add(30*time.Second), acceptedAt, endedAt,
+	)
+}
+
+func resourceCallRow(now time.Time, status domain.CallStatus, version int64) *pgxmock.Rows {
+	return pgxmock.NewRows(callColumns()).AddRow(
+		callID, callWorkspaceID, callRequestID, callCallerID, nil,
+		string(domain.CallTargetChannel), callCalleeID,
+		string(domain.CallTypeVideo), string(status), version, now, now,
+		now.Add(30*time.Second), now, nil,
 	)
 }
 
@@ -123,6 +134,79 @@ func TestPGXCallStoreCreateIsIdempotentAndDetectsRequestConflict(t *testing.T) {
 	}
 }
 
+func TestPGXCallStoreCreatesAuthorizedResourceAndInitialLease(t *testing.T) {
+	mock := newCategoryMock(t)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Second)
+	lockKey := callWorkspaceID + ":channel:" + callCalleeID
+	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callCallerID, callRequestID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+		WithArgs(callWorkspaceID, callCallerID, callCalleeID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(`FROM chat.calls.*target_type.*status = 'active'`).
+		WithArgs(callWorkspaceID, string(domain.CallTargetChannel), callCalleeID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO chat.calls.*'active'`).
+		WithArgs(callWorkspaceID, callRequestID, callCallerID, string(domain.CallTargetChannel), callCalleeID, string(domain.CallTypeVideo), expiresAt).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
+		WithArgs(callID, callCallerID, expiresAt).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	call, created, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
+		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
+		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
+	})
+	if err != nil || !created || call.TargetType != domain.CallTargetChannel || call.Status != domain.CallStatusActive {
+		t.Fatalf("resource call=%+v created=%v err=%v", call, created, err)
+	}
+	requireMetExpectations(t, mock)
+}
+
+func TestPGXCallStoreRenewsPresenceOnlyAfterResourceAuthorization(t *testing.T) {
+	now := time.Now().UTC()
+	for _, test := range []struct {
+		name       string
+		authorized bool
+		wantErr    error
+	}{
+		{name: "member", authorized: true},
+		{name: "outsider", wantErr: domain.ErrNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock := newCategoryMock(t)
+			mock.ExpectBegin()
+			mock.ExpectQuery(`FROM chat.calls.*FOR SHARE`).WithArgs(callWorkspaceID, callID).
+				WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+			mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+				WithArgs(callWorkspaceID, callCallerID, callCalleeID).
+				WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(test.authorized))
+			if test.authorized {
+				mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
+					WithArgs(callID, callCallerID, now.Add(30*time.Second)).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				mock.ExpectCommit()
+			} else {
+				mock.ExpectRollback()
+			}
+			err := storage.NewPGXCallStore(mock).RenewCallPresence(context.Background(), storage.RenewCallPresenceInput{
+				WorkspaceID: callWorkspaceID, CallID: callID, ActorID: callCallerID,
+				ExpiresAt: now.Add(30 * time.Second),
+			})
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error=%v want=%v", err, test.wantErr)
+			}
+			requireMetExpectations(t, mock)
+		})
+	}
+}
+
 func TestPGXCallStoreTransitionAcceptAndDuplicate(t *testing.T) {
 	now := time.Now().UTC()
 	for _, test := range []struct {
@@ -168,7 +252,7 @@ func TestPGXCallStoreTransitionAcceptAndDuplicate(t *testing.T) {
 func TestPGXCallStoreExpireDueUsesSkipLockedAndReturnsOnlyWinners(t *testing.T) {
 	mock := newCategoryMock(t)
 	now := time.Now().UTC()
-	mock.ExpectQuery(`FOR UPDATE SKIP LOCKED.*UPDATE chat.calls`).
+	mock.ExpectQuery(`call_participant_leases.*expires_at > clock_timestamp\(\).*FOR UPDATE SKIP LOCKED.*UPDATE chat.calls`).
 		WithArgs(100).
 		WillReturnRows(callRow(now, domain.CallStatusTimedOut, 2))
 

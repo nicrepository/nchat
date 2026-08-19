@@ -20,12 +20,14 @@ const (
 )
 
 type fakeCallHandler struct {
-	call    domain.Call
-	started StartCallCommand
-	action  ClientMessageType
-	actorID string
-	callID  string
-	err     error
+	call           domain.Call
+	started        StartCallCommand
+	action         ClientMessageType
+	actorID        string
+	callID         string
+	presenceCallID string
+	syncCallID     string
+	err            error
 }
 
 func (h *fakeCallHandler) StartCall(_ context.Context, command StartCallCommand) (domain.Call, error) {
@@ -38,8 +40,14 @@ func (h *fakeCallHandler) TransitionCall(_ context.Context, workspaceID, actorID
 	return h.call, h.err
 }
 
-func (h *fakeCallHandler) CurrentCall(context.Context, string, string) (domain.Call, error) {
+func (h *fakeCallHandler) CurrentCall(_ context.Context, _, _, callID string) (domain.Call, error) {
+	h.syncCallID = callID
 	return h.call, h.err
+}
+
+func (h *fakeCallHandler) RenewCallPresence(_ context.Context, _ string, actorID, callID string) error {
+	h.actorID, h.presenceCallID = actorID, callID
+	return h.err
 }
 
 type allowCallLimiter struct{ allowed bool }
@@ -80,6 +88,64 @@ func TestCallStartUsesAuthenticatedClientIdentity(t *testing.T) {
 	}
 }
 
+func TestCallSyncByIDUsesAuthenticatedIdentityAndRepliesOnlyToRequester(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 2)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-sync-test", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("sync-client", callTestCallee, callTestWorkspace, &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallSync, CallID: callTestID,
+	})
+	if err != nil {
+		t.Fatalf("sync call: %v", err)
+	}
+	if handler.syncCallID != callTestID || handler.actorID != "" {
+		t.Fatalf("unexpected sync input: call=%q actor side effect=%q", handler.syncCallID, handler.actorID)
+	}
+	select {
+	case payload := <-client.outbox:
+		var event Event
+		if err := json.Unmarshal(payload, &event); err != nil || event.Call == nil || event.Call.ID != callTestID {
+			t.Fatalf("unexpected sync response: %s (%v)", payload, err)
+		}
+	default:
+		t.Fatal("expected direct sync response")
+	}
+}
+
+func TestResourceCallStartAndPresenceUseAuthenticatedClientIdentity(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-call-test",
+		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("caller-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register caller")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
+		TargetType: TargetTypeChannel, TargetID: callTestCallee, CallType: domain.CallTypeVideo,
+	})
+	if err != nil {
+		t.Fatalf("start resource call: %v", err)
+	}
+	if handler.started.CallerID != callTestCaller || handler.started.TargetType != TargetTypeChannel ||
+		handler.started.TargetID != callTestCallee {
+		t.Fatalf("resource command=%+v", handler.started)
+	}
+
+	if err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallPresence, CallID: callTestID,
+	}); err != nil {
+		t.Fatalf("presence: %v", err)
+	}
+	if handler.actorID != callTestCaller || handler.presenceCallID != callTestID {
+		t.Fatalf("presence actor=%q call=%q", handler.actorID, handler.presenceCallID)
+	}
+}
+
 func TestCallCommandValidationRejectsClientControlledIdentity(t *testing.T) {
 	_, err := decodeClientMessage([]byte(`{"type":"call.start","request_id":"` + callTestRequest +
 		`","target_user_id":"` + callTestCallee + `","call_type":"audio","actor_user_id":"` + callTestOutsider + `"}`))
@@ -114,6 +180,35 @@ func TestPublishCallDeliversOnlyToParticipants(t *testing.T) {
 		if event.Type != EventTypeCallAccepted || event.Call == nil || event.Call.Version != 2 {
 			t.Fatalf("unexpected event: %+v", event)
 		}
+	}
+}
+
+func TestPublishResourceCallUsesAuthorizedTargetSubscription(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess(callTestCaller, callTestWorkspace, TargetTypeChannel, callTestCallee, true)
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "resource-call-publisher")
+	t.Cleanup(hub.Shutdown)
+	member := newClient("member", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(member) {
+		t.Fatal("register member")
+	}
+	if err := hub.Subscribe(context.Background(), member, TargetTypeChannel, callTestCallee); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	call := callProtocolCall(domain.CallStatusActive, 1)
+	call.CalleeID = ""
+	call.TargetType = domain.CallTargetChannel
+	call.TargetID = callTestCallee
+	hub.PublishCall(context.Background(), call)
+	waitForOutbox(member, 1)
+	var event Event
+	if err := json.Unmarshal(<-member.outbox, &event); err != nil {
+		t.Fatalf("decode event: %v", err)
+	}
+	if event.TargetType != TargetTypeChannel || event.TargetID != callTestCallee ||
+		event.Call == nil || event.Call.TargetType != domain.CallTargetChannel {
+		t.Fatalf("resource event=%+v", event)
 	}
 }
 

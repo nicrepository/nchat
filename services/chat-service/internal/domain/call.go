@@ -13,6 +13,18 @@ func (t CallType) Valid() bool {
 	return t == CallTypeAudio || t == CallTypeVideo
 }
 
+type CallTargetType string
+
+const (
+	CallTargetUser    CallTargetType = "user"
+	CallTargetChannel CallTargetType = "channel"
+	CallTargetDM      CallTargetType = "dm"
+)
+
+func (t CallTargetType) Valid() bool {
+	return t == CallTargetUser || t == CallTargetChannel || t == CallTargetDM
+}
+
 type CallStatus string
 
 const (
@@ -45,6 +57,8 @@ type Call struct {
 	RequestID   string
 	CallerID    string
 	CalleeID    string
+	TargetType  CallTargetType
+	TargetID    string
 	Type        CallType
 	Status      CallStatus
 	Version     int64
@@ -56,5 +70,13 @@ type Call struct {
 }
 
 func (c Call) IsParticipant(userID string) bool {
-	return userID == c.CallerID || userID == c.CalleeID
+	return c.IsDirect() && (userID == c.CallerID || userID == c.CalleeID)
+}
+
+func (c Call) IsDirect() bool {
+	return c.TargetType == CallTargetUser || (c.TargetType == "" && c.CalleeID != "")
+}
+
+func (c Call) IsResource() bool {
+	return c.TargetType == CallTargetChannel || c.TargetType == CallTargetDM
 }

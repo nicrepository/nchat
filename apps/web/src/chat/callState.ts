@@ -6,6 +6,8 @@ export interface Call {
   request_id: string;
   caller_id: string;
   callee_id: string;
+  target_type?: "user" | "channel" | "dm";
+  target_id?: string;
   call_type: CallType;
   status: CallStatus;
   version: number;
@@ -25,7 +27,7 @@ export interface CallEvent {
     | "call.timed_out"
     | "call.ended";
   event_id: string;
-  target_type: "user";
+  target_type: "user" | "channel" | "dm";
   target_id: string;
   call: Call;
 }
@@ -64,7 +66,7 @@ export function parseCallEvent(value: unknown): CallEvent | null {
       "call.timed_out",
       "call.ended",
     ].includes(String(event.type)) ||
-    event.target_type !== "user" ||
+    !["user", "channel", "dm"].includes(String(event.target_type)) ||
     typeof event.event_id !== "string" ||
     !event.call ||
     typeof event.call !== "object"
@@ -76,7 +78,7 @@ export function parseCallEvent(value: unknown): CallEvent | null {
     typeof call.call_id !== "string" ||
     typeof call.request_id !== "string" ||
     typeof call.caller_id !== "string" ||
-    typeof call.callee_id !== "string" ||
+    (event.target_type === "user" && typeof call.callee_id !== "string") ||
     (call.call_type !== "audio" && call.call_type !== "video") ||
     !["ringing", "active", "declined", "cancelled", "timed_out", "ended"].includes(
       String(call.status),
@@ -88,5 +90,17 @@ export function parseCallEvent(value: unknown): CallEvent | null {
   ) {
     return null;
   }
-  return value as CallEvent;
+  if (
+    event.target_type !== "user" &&
+    (call.target_type !== event.target_type || call.target_id !== event.target_id)
+  ) {
+    return null;
+  }
+  return {
+    ...(value as CallEvent),
+    call: {
+      ...(call as unknown as Call),
+      callee_id: typeof call.callee_id === "string" ? call.callee_id : "",
+    },
+  };
 }

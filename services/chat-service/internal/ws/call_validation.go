@@ -8,7 +8,8 @@ import (
 func isCallClientMessage(messageType ClientMessageType) bool {
 	switch messageType {
 	case ClientMessageTypeCallStart, ClientMessageTypeCallAccept, ClientMessageTypeCallDecline,
-		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallSync:
+		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallSync,
+		ClientMessageTypeCallPresence:
 		return true
 	default:
 		return false
