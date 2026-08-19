@@ -80,6 +80,14 @@ export default function App() {
                 </Suspense>
               }
             />
+            <Route
+              path="search"
+              element={
+                <Suspense fallback={null}>
+                  <GlobalSearchPage />
+                </Suspense>
+              }
+            />
           </Route>
 
           {/* ── Profile (authenticated) ───────────────────────────────── */}
@@ -108,14 +116,6 @@ export default function App() {
             element={
               <Suspense fallback={null}>
                 <AdminUploadLimitPage />
-              </Suspense>
-            }
-          />
-          <Route
-            path="search"
-            element={
-              <Suspense fallback={null}>
-                <GlobalSearchPage />
               </Suspense>
             }
           />
