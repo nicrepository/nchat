@@ -632,9 +632,9 @@ describe("useCallSignaling", () => {
     expect(result.current.pending).toBe(false);
     expect(result.current.error).toBeNull();
     expect(result.current.call?.status).toBe("active");
-    expect(
-      sentMessages(socket).filter((message) => message.type === "call.sync"),
-    ).toHaveLength(syncCountBefore);
+    expect(sentMessages(socket).filter((message) => message.type === "call.sync")).toHaveLength(
+      syncCountBefore,
+    );
   });
 
   it("reconciles a correlated call_invalid_state through call.sync", async () => {
@@ -662,9 +662,9 @@ describe("useCallSignaling", () => {
       }),
     );
 
-    expect(
-      sentMessages(socket).filter((message) => message.type === "call.sync"),
-    ).toHaveLength(syncCountBefore + 1);
+    expect(sentMessages(socket).filter((message) => message.type === "call.sync")).toHaveLength(
+      syncCountBefore + 1,
+    );
 
     expect(result.current.pending).toBe(true);
     expect(result.current.error).toBeNull();
@@ -707,9 +707,9 @@ describe("useCallSignaling", () => {
       }),
     );
 
-    expect(
-      sentMessages(socket).filter((message) => message.type === "call.sync"),
-    ).toHaveLength(syncCountBefore + 1);
+    expect(sentMessages(socket).filter((message) => message.type === "call.sync")).toHaveLength(
+      syncCountBefore + 1,
+    );
     expect(result.current.pending).toBe(true);
     expect(result.current.error).toBeNull();
 

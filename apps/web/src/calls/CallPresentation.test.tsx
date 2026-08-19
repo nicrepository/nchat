@@ -150,9 +150,7 @@ describe("FloatingCallWindow", () => {
     fireEvent.pointerUp(handle, { pointerId: 7, clientX: 720, clientY: 520 });
     expect(windowElement.style.transform).toContain("translate3d");
 
-    expect(
-      screen.queryByRole("combobox", { name: "Posição da chamada" }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Posição da chamada" })).not.toBeInTheDocument();
   });
 
   it("does not start dragging when the expand control receives the pointer gesture", () => {
