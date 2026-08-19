@@ -20,9 +20,12 @@ interface SessionCallbacks {
   onReconnected(): void;
   onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
   onMicrophoneStateChanged(enabled: boolean): void;
-  onParticipantConnected(identity: string): void;
+  onParticipantConnected(identity: string, displayName: string): void;
   onParticipantDisconnected(identity: string): void;
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+  onActiveSpeakersChanged(identities: string[]): void;
+  onScreenShareChanged(enabled: boolean): void;
+  onRemoteScreenShareChanged(identity: string, element: HTMLMediaElement | null): void;
 }
 
 function remoteVideoFor(identity: string): HTMLVideoElement {
@@ -51,6 +54,9 @@ class FakeSession {
   readonly setCameraEnabled = vi.fn(async (): Promise<void> => undefined);
   readonly setMicrophoneEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
     this.callbacks.onMicrophoneStateChanged(enabled);
+  });
+  readonly setScreenShareEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
+    this.callbacks.onScreenShareChanged(enabled);
   });
   readonly disconnect = vi.fn(async (): Promise<void> => undefined);
 
@@ -155,6 +161,53 @@ describe("useCallMedia", () => {
     expect(view.getSession().enableCamera).not.toHaveBeenCalled();
     expect(view.getSession().enableMicrophone).toHaveBeenCalledOnce();
     expect(view.result.current.cameraEnabled).toBe(false);
+  });
+
+  it("never starts screen share on connect and toggles only from explicit intent", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    expect(session.setScreenShareEnabled).not.toHaveBeenCalled();
+    await act(() => view.result.current.toggleScreenShare());
+    expect(view.result.current.screenShareEnabled).toBe(true);
+    await act(() => view.result.current.toggleScreenShare());
+    expect(view.result.current.screenShareEnabled).toBe(false);
+    expect(session.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("stabilizes the active speaker before updating the presentation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onActiveSpeakersChanged(["identity-a"]));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+    act(() => vi.advanceTimersByTime(399));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(view.result.current.activeSpeakerId).toBe("identity-a");
+
+    view.unmount();
+    vi.useRealTimers();
+  });
+
+  it("binds remote screen share separately from participant camera media", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const element = remoteVideoFor("identity-a");
+
+    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", element));
+    expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+    render(
+      <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+    );
+    expect(screen.getByTestId("screen-share")).toContainElement(element);
+
+    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", null));
+    expect(view.result.current.remoteScreenShare).toBeNull();
   });
 
   it("attaches and removes local and remote media without storing SDK objects in React state", async () => {
@@ -1061,11 +1114,30 @@ describe("useCallMedia participants (RF-24)", () => {
     await act(() => view.result.current.connect(videoCall, "participant-token"));
     const session = view.getSession();
 
-    act(() => session.callbacks.onParticipantConnected("identity-a"));
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
 
     expect(view.result.current.participants).toEqual([
-      { identity: "identity-a", hasVideo: false, hasAudio: false, bindVideo: expect.any(Function) },
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: false,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
     ]);
+  });
+
+  it("falls back to a generic label when the SDK reports no participant name", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", ""));
+
+    expect(view.result.current.participants[0]).toMatchObject({
+      identity: "identity-a",
+      displayName: "Participante",
+    });
   });
 
   it("adds video and audio for a participant already known and removes them independently", async () => {
@@ -1076,24 +1148,36 @@ describe("useCallMedia participants (RF-24)", () => {
     const audio = remoteAudioFor("identity-a");
 
     act(() => {
-      session.callbacks.onParticipantConnected("identity-a");
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
       session.callbacks.onRemoteElement(video);
       session.callbacks.onRemoteElement(audio);
     });
     expect(view.result.current.participants).toEqual([
-      { identity: "identity-a", hasVideo: true, hasAudio: true, bindVideo: expect.any(Function) },
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: true,
+        hasAudio: true,
+        bindVideo: expect.any(Function),
+      },
     ]);
 
     act(() => session.callbacks.onElementRemoved(video));
     expect(view.result.current.participants).toEqual([
-      { identity: "identity-a", hasVideo: false, hasAudio: true, bindVideo: expect.any(Function) },
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: false,
+        hasAudio: true,
+        bindVideo: expect.any(Function),
+      },
     ]);
 
     act(() => session.callbacks.onElementRemoved(audio));
     expect(view.result.current.participants[0]).toMatchObject({ hasVideo: false, hasAudio: false });
   });
 
-  it("upserts the participant from a track arriving before ParticipantConnected (race with pre-existing occupants)", async () => {
+  it("upserts the participant from a track arriving before ParticipantConnected, then fills in the real name once it arrives (HIGH: late displayName)", async () => {
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
     const session = view.getSession();
@@ -1102,8 +1186,123 @@ describe("useCallMedia participants (RF-24)", () => {
     act(() => session.callbacks.onRemoteElement(video));
 
     expect(view.result.current.participants).toEqual([
-      { identity: "identity-a", hasVideo: true, hasAudio: false, bindVideo: expect.any(Function) },
+      {
+        identity: "identity-a",
+        displayName: "Participante",
+        hasVideo: true,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
     ]);
+    const bindVideoBeforeName = view.result.current.participants[0].bindVideo;
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+
+    // Same identity, same media state, same bindVideo reference — only the
+    // name changed. Never a second entry, never a reset of hasVideo.
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: true,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+    expect(view.result.current.participants[0].bindVideo).toBe(bindVideoBeforeName);
+
+    render(
+      <div ref={view.result.current.participants[0].bindVideo} data-testid="tile-late-name" />,
+    );
+    expect(screen.getByTestId("tile-late-name")).toContainElement(video);
+  });
+
+  it("never lets an empty or blank name regress an already-known real name (HIGH fix)", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", ""));
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "   "));
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+
+    expect(view.result.current.participants).toHaveLength(1);
+  });
+
+  it("trims whitespace around a real name instead of treating it as a different name", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "  Pedro Almeida  "));
+
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+    expect(view.result.current.participants).toHaveLength(1);
+  });
+
+  it("preserves participant identity and display name across a reconnect, without duplicating the entry", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+
+    act(() => session.callbacks.onReconnecting());
+    act(() => session.callbacks.onReconnected());
+
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: false,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+  });
+
+  // RF-25 "ponto crítico": on a LiveKit full reconnect, the SDK itself
+  // unwinds every remote participant (firing ParticipantDisconnected for
+  // each) before repopulating from the server's fresh join response (firing
+  // ParticipantConnected for whoever is actually still there) — see
+  // livekit-client Room.handleRestarting/handleSignalRestarted. A participant
+  // who left during the outage and one who joined during it are exactly what
+  // that unwind-then-repopulate models; this asserts our identity-keyed map
+  // reflects the post-reconnect roster with no stale entry and no duplicate,
+  // without any additional client-side snapshot/polling reconciliation.
+  it("reconciles the roster via ParticipantConnected/Disconnected alone when membership changes during a reconnect", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-b", "Maria Silva");
+    });
+
+    act(() => session.callbacks.onReconnecting());
+    // The SDK's own full-reconnect unwind: every remote participant known
+    // before the outage is disconnected first...
+    act(() => {
+      session.callbacks.onParticipantDisconnected("identity-a");
+      session.callbacks.onParticipantDisconnected("identity-b");
+    });
+    // ...then repopulated from the server's fresh, authoritative list: B left
+    // for real during the outage, C joined during it, A is still there.
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-c", "Ana Lima");
+    });
+    act(() => session.callbacks.onReconnected());
+
+    expect(view.result.current.participants.map((p) => p.identity)).toEqual([
+      "identity-a",
+      "identity-c",
+    ]);
+    expect(view.result.current.status).toBe("connected");
   });
 
   it("removes a participant on disconnect and keeps the others", async () => {
@@ -1112,8 +1311,8 @@ describe("useCallMedia participants (RF-24)", () => {
     const session = view.getSession();
 
     act(() => {
-      session.callbacks.onParticipantConnected("identity-a");
-      session.callbacks.onParticipantConnected("identity-b");
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-b", "Maria Silva");
       session.callbacks.onParticipantDisconnected("identity-a");
     });
 
@@ -1126,7 +1325,7 @@ describe("useCallMedia participants (RF-24)", () => {
     const session = view.getSession();
     const video = remoteVideoFor("identity-a");
     act(() => {
-      session.callbacks.onParticipantConnected("identity-a");
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
       session.callbacks.onRemoteElement(video);
     });
 
@@ -1151,7 +1350,7 @@ describe("useCallMedia participants (RF-24)", () => {
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
     const session = view.getSession();
-    act(() => session.callbacks.onParticipantConnected("identity-a"));
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
     expect(view.result.current.participants).toHaveLength(1);
 
     await act(() => view.result.current.stop());
@@ -1167,11 +1366,17 @@ describe("useCallMedia remote camera mute/unmute (RF-24 code review achado 1)", 
     const session = view.getSession();
     const video = remoteVideoFor("identity-a");
     act(() => {
-      session.callbacks.onParticipantConnected("identity-a");
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
       session.callbacks.onRemoteElement(video);
     });
     expect(view.result.current.participants).toEqual([
-      { identity: "identity-a", hasVideo: true, hasAudio: false, bindVideo: expect.any(Function) },
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: true,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
     ]);
 
     act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", false));
@@ -1196,7 +1401,7 @@ describe("useCallMedia remote camera mute/unmute (RF-24 code review achado 1)", 
     const session = view.getSession();
     const video = remoteVideoFor("identity-a");
     act(() => {
-      session.callbacks.onParticipantConnected("identity-a");
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
       session.callbacks.onRemoteElement(video);
     });
     render(<div ref={view.result.current.participants[0].bindVideo} data-testid="tile-a" />);
@@ -1213,7 +1418,7 @@ describe("useCallMedia remote camera mute/unmute (RF-24 code review achado 1)", 
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
     const session = view.getSession();
-    act(() => session.callbacks.onParticipantConnected("identity-a"));
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
 
     act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", true));
 
@@ -1227,7 +1432,7 @@ describe("useCallMedia remote camera mute/unmute (RF-24 code review achado 1)", 
     const video = remoteVideoFor("identity-a");
     const audio = remoteAudioFor("identity-a");
     act(() => {
-      session.callbacks.onParticipantConnected("identity-a");
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
       session.callbacks.onRemoteElement(video);
       session.callbacks.onRemoteElement(audio);
     });
@@ -1273,7 +1478,7 @@ describe("useCallMedia session serialization (RF-24 code review achado 4)", () =
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
     const firstSession = view.getSession();
-    act(() => firstSession.callbacks.onParticipantConnected("identity-a"));
+    act(() => firstSession.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
     expect(view.result.current.participants).toHaveLength(1);
 
     act(() => firstSession.callbacks.onDisconnected());
@@ -1286,7 +1491,7 @@ describe("useCallMedia session serialization (RF-24 code review achado 4)", () =
       ),
     );
     const secondSession = view.getSession();
-    act(() => secondSession.callbacks.onParticipantConnected("identity-b"));
+    act(() => secondSession.callbacks.onParticipantConnected("identity-b", "Maria Silva"));
 
     expect(view.result.current.participants.map((p) => p.identity)).toEqual(["identity-b"]);
   });
@@ -1312,7 +1517,7 @@ describe("useCallMedia session serialization (RF-24 code review achado 4)", () =
     // opposite value from the stale session must not flip the new session's
     // confirmed state, and a stale participant must not reappear.
     act(() => firstSession.callbacks.onMicrophoneStateChanged(false));
-    act(() => firstSession.callbacks.onParticipantConnected("ghost-from-old-room"));
+    act(() => firstSession.callbacks.onParticipantConnected("ghost-from-old-room", "Ghost"));
 
     expect(view.result.current.microphoneEnabled).toBe(true);
     expect(view.result.current.participants).toEqual([]);

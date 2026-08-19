@@ -1,4 +1,4 @@
--- 000028_validate_message_link_safety_check.down.sql
+-- 000030_validate_message_link_safety_check.down.sql
 -- Returns messages_link_safety_state_check to the NOT VALID state 000027 leaves
 -- it in.
 --

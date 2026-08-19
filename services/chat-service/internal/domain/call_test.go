@@ -51,3 +51,23 @@ func TestCallTerminalAndParticipant(t *testing.T) {
 		}
 	}
 }
+
+func TestCallTargetsKeepDirectAndResourceSemanticsSeparate(t *testing.T) {
+	for _, target := range []CallTargetType{CallTargetUser, CallTargetChannel, CallTargetDM} {
+		if !target.Valid() {
+			t.Fatalf("expected valid call target %q", target)
+		}
+	}
+	if CallTargetType("workspace").Valid() {
+		t.Fatal("unexpected valid call target")
+	}
+
+	direct := Call{CallerID: "caller", CalleeID: "callee", TargetType: CallTargetUser}
+	resource := Call{CallerID: "caller", TargetType: CallTargetChannel, TargetID: "channel"}
+	if !direct.IsDirect() || direct.IsResource() || !direct.IsParticipant("callee") {
+		t.Fatal("direct call semantics changed")
+	}
+	if resource.IsDirect() || !resource.IsResource() || resource.IsParticipant("channel") {
+		t.Fatal("resource identifiers must never become user participants")
+	}
+}

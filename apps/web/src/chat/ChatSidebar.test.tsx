@@ -8,6 +8,7 @@ import { clearTokens, setTokens } from "../lib/authSession";
 import { _resetSelfProfile, refreshSelfProfile } from "../profile/selfProfile";
 import type { SelfProfile } from "../profile/profileApi";
 import RequireAuth from "../auth/RequireAuth";
+import CallSessionProvider from "../calls/CallSessionProvider";
 import ChatShell from "./ChatShell";
 import ChatSidebar from "./ChatSidebar";
 import type {
@@ -159,7 +160,9 @@ function renderChat(initialPath = "/chat", authenticated = true) {
           path="/chat"
           element={
             <RequireAuth>
-              <ChatShell />
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
             </RequireAuth>
           }
         >
@@ -1920,7 +1923,9 @@ describe("ChatSidebar — storage safety", () => {
             path="/chat"
             element={
               <RequireAuth>
-                <ChatShell />
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
               </RequireAuth>
             }
           >
@@ -2108,6 +2113,13 @@ describe("ChatSidebar — footer", () => {
     // Interactive elements must not nest: settings is a sibling of the profile
     // link, never inside it.
     expect(userLink().contains(settings)).toBe(false);
+  });
+
+  it("links to the global search page (RF-15)", () => {
+    renderFooter();
+
+    const search = screen.getByRole("link", { name: "Buscar" });
+    expect(search).toHaveAttribute("href", "/chat/search");
   });
 
   it("keeps the profile link reachable", async () => {

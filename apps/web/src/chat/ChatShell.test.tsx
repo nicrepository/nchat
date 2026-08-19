@@ -7,6 +7,7 @@ import { clearTokens, setTokens } from "../lib/authSession";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData } from "./chatApi";
 import ChatShell, { type ChatOutletContext } from "./ChatShell";
+import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
 import { useCallMedia } from "./useCallMedia";
@@ -117,12 +118,16 @@ beforeEach(() => {
     audioActivationRequired: false,
     error: null,
     pendingControl: null,
+    activeSpeakerId: null,
+    screenShareEnabled: false,
+    remoteScreenShare: null,
     bindLocalMedia: vi.fn(),
     bindRemoteMedia: vi.fn(),
     participants: [],
     bindRemoteAudio: vi.fn(),
     toggleMicrophone: vi.fn(async () => undefined),
     toggleCamera: vi.fn(async () => undefined),
+    toggleScreenShare: vi.fn(async () => undefined),
     activateAudio: vi.fn(async () => undefined),
     prepare: prepareMedia,
     startAudio: vi.fn(async () => undefined),
@@ -145,7 +150,9 @@ describe("ChatShell call identity bootstrap", () => {
 
     render(
       <MemoryRouter initialEntries={["/chat"]}>
-        <ChatShell />
+        <CallSessionProvider>
+          <ChatShell />
+        </CallSessionProvider>
       </MemoryRouter>,
     );
 
@@ -161,9 +168,9 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
+    const dialog = screen.getByRole("dialog", { name: "Chamada recebida" });
     expect(within(dialog).getByRole("status")).toHaveTextContent("Preparando chamada…");
-    expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Atender com câmera" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(prepareMedia).not.toHaveBeenCalled();
@@ -186,7 +193,7 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Atender" })).toHaveFocus();
+    expect(await screen.findByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
     expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(FakeWebSocket.instances).toHaveLength(1);
@@ -206,7 +213,9 @@ describe("ChatShell call identity bootstrap", () => {
 
     render(
       <MemoryRouter initialEntries={["/chat"]}>
-        <ChatShell />
+        <CallSessionProvider>
+          <ChatShell />
+        </CallSessionProvider>
       </MemoryRouter>,
     );
 
@@ -223,22 +232,23 @@ describe("ChatShell call identity bootstrap", () => {
     );
     await act(async () => initialSidebar.reject(new Error("offline")));
 
-    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
+    const dialog = screen.getByRole("dialog", { name: "Chamada recebida" });
     expect(within(dialog).getByRole("alert")).toHaveTextContent(
       "Não foi possível preparar a chamada",
     );
     const retry = within(dialog).getByRole("button", { name: "Tentar novamente" });
-    expect(retry).toHaveFocus();
-    await user.keyboard("{Enter}");
+    expect(retry).not.toHaveFocus();
+    await user.click(retry);
     expect(fetchSidebarData).toHaveBeenCalledTimes(2);
     expect(retry).toBeDisabled();
-    await user.keyboard("{Enter}");
+    await user.click(retry);
     expect(fetchSidebarData).toHaveBeenCalledTimes(2);
     expect(prepareMedia).not.toHaveBeenCalled();
 
     await act(async () => failedRetry.reject(new Error("still offline")));
-    expect(retry).toBeEnabled();
-    await user.keyboard("{Enter}");
+    const retryAgain = within(dialog).getByRole("button", { name: "Tentar novamente" });
+    expect(retryAgain).toBeEnabled();
+    await user.click(retryAgain);
     expect(fetchSidebarData).toHaveBeenCalledTimes(3);
     expect(retry).toBeDisabled();
 
@@ -259,7 +269,7 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Atender" })).toHaveFocus();
+    expect(await screen.findByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
     expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(FakeWebSocket.instances).toHaveLength(1);
@@ -279,7 +289,9 @@ describe("ChatShell call identity bootstrap", () => {
 
     render(
       <MemoryRouter initialEntries={["/chat"]}>
-        <ChatShell />
+        <CallSessionProvider>
+          <ChatShell />
+        </CallSessionProvider>
       </MemoryRouter>,
     );
 
@@ -295,25 +307,23 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
-    expect(within(dialog).getByRole("status")).toHaveTextContent("Preparando chamada…");
-    expect(
-      within(dialog).queryByRole("button", { name: "Encerrar chamada" }),
-    ).not.toBeInTheDocument();
+    const dialog = screen.getByTestId("floating-call-window");
+    expect(within(dialog).getByText("Preparando chamada…")).toBeInTheDocument();
     expect(issueCallToken).not.toHaveBeenCalled();
     expect(connectMedia).not.toHaveBeenCalled();
 
     await act(async () => initialSidebar.reject(new Error("offline")));
     const retry = within(dialog).getByRole("button", { name: "Tentar novamente" });
-    expect(retry).toHaveFocus();
-    await user.keyboard("{Enter}");
-    await user.keyboard("{Enter}");
+    expect(retry).not.toHaveFocus();
+    await user.click(retry);
+    await user.click(retry);
     expect(fetchSidebarData).toHaveBeenCalledTimes(2);
     expect(issueCallToken).not.toHaveBeenCalled();
 
     await act(async () => failedRetry.reject(new Error("still offline")));
-    expect(retry).toBeEnabled();
-    await user.keyboard("{Enter}");
+    const retryAgain = within(dialog).getByRole("button", { name: "Tentar novamente" });
+    expect(retryAgain).toBeEnabled();
+    await user.click(retryAgain);
     expect(fetchSidebarData).toHaveBeenCalledTimes(3);
 
     await act(async () =>
@@ -333,11 +343,9 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    const dialogAfterRecovery = await screen.findByRole("dialog", {
-      name: "Chamada de vídeo com Ana Lima",
-    });
+    const dialogAfterRecovery = await screen.findByLabelText("Chamada com Ana Lima");
     expect(dialogAfterRecovery).toBeVisible();
-    expect(screen.getByRole("button", { name: "Encerrar chamada" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Encerrar chamada" })).not.toHaveFocus();
 
     // This call reached "active" via a raw push, never through this hook's
     // own start()/accept() preflight, so RF-23 requires an explicit gesture
@@ -376,9 +384,7 @@ function JoinChannelButton() {
     <button
       type="button"
       disabled={!ctx.joinResourceCall}
-      onClick={() =>
-        ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral", callType: "audio" })
-      }
+      onClick={() => ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral" })}
     >
       Entrar no canal
     </button>
@@ -403,7 +409,14 @@ async function renderWithJoinButtonReady() {
   render(
     <MemoryRouter initialEntries={["/chat"]}>
       <Routes>
-        <Route path="/chat" element={<ChatShell />}>
+        <Route
+          path="/chat"
+          element={
+            <CallSessionProvider>
+              <ChatShell />
+            </CallSessionProvider>
+          }
+        >
           <Route index element={<JoinChannelButton />} />
         </Route>
       </Routes>
@@ -415,12 +428,43 @@ async function renderWithJoinButtonReady() {
   return socket;
 }
 
+async function joinResource(user: ReturnType<typeof userEvent.setup>, socket: FakeWebSocket) {
+  await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+  let requestID = "";
+  await waitFor(() => {
+    const command = socket.sentMessages
+      .map((message) => JSON.parse(message) as { type: string; request_id?: string })
+      .find((message) => message.type === "call.start" && message.request_id);
+    expect(command).toBeDefined();
+    requestID = command!.request_id!;
+  });
+  act(() =>
+    socket.simulateMessage({
+      type: "call.accepted",
+      event_id: crypto.randomUUID(),
+      target_type: "channel",
+      target_id: "chan-1",
+      call: {
+        ...call,
+        call_id: "00000000-0000-4000-8000-000000000550",
+        request_id: requestID,
+        caller_id: currentUserId,
+        callee_id: "",
+        target_type: "channel",
+        target_id: "chan-1",
+        call_type: "audio",
+        status: "active",
+      },
+    }),
+  );
+}
+
 describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("Caso A: an incoming RF-23 call stays visible and can be declined while a resource room is active", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
 
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
 
@@ -434,9 +478,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
       }),
     );
 
-    expect(
-      await screen.findByRole("alert", { name: "Chamada de vídeo de Ana Lima" }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
     expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Recusar" }));
@@ -456,7 +498,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("achado A: accept() that never manages to send (preflight stuck open) leaves RF-24 completely untouched", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     connectMedia.mockClear();
 
@@ -469,7 +511,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
+    await screen.findByRole("button", { name: "Atender com câmera" });
 
     // The permission prompt never resolves: call.accept is never sent, so
     // RF-23 never reaches "active" and never asks for the Room.
@@ -479,7 +521,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         resolvePermission = resolve;
       }),
     );
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
 
     expect(syncCommands(socket)).toHaveLength(1); // only the initial call.sync
     expect(stopMedia).not.toHaveBeenCalled();
@@ -494,7 +536,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("achado B: a denied permission preflight leaves RF-24 active and never calls stop", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     connectMedia.mockClear();
 
@@ -507,14 +549,14 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
+    await screen.findByRole("button", { name: "Atender com câmera" });
     vi.mocked(requestMediaPermission).mockResolvedValueOnce({
       ok: false,
       kind: "permission_denied",
       message: "Permissão negada.",
     });
 
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
 
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalled());
     expect(syncCommands(socket)).toHaveLength(1);
@@ -526,7 +568,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("achado C: accepting only hands the Room to RF-23 once the server confirms active, never on the local accept() call alone", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
     connectMedia.mockClear();
@@ -540,9 +582,9 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
+    await screen.findByRole("button", { name: "Atender com câmera" });
 
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
 
     // The command was accepted locally (preflight granted, call.accept sent)
     // but the server has not confirmed "active" yet: RF-24 must still be
@@ -571,7 +613,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("achado D: resource cleanup resolves before the direct call's media.connect() runs, never after", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     connectMedia.mockClear();
 
@@ -584,8 +626,8 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
 
     let resolveStop!: () => void;
@@ -623,7 +665,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("achado 3 (round 2): Recusar stays enabled and sends call.decline with the right call_id while Atender's preflight is still pending", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
 
@@ -636,7 +678,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
+    await screen.findByRole("button", { name: "Atender com câmera" });
 
     let resolvePermission!: (value: MediaPermissionResult) => void;
     vi.mocked(requestMediaPermission).mockReturnValueOnce(
@@ -644,7 +686,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         resolvePermission = resolve;
       }),
     );
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalled());
 
     const recusar = screen.getByRole("button", { name: "Recusar" });
@@ -665,7 +707,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("shows the RF-23 dialog immediately once the call is confirmed active, even while its own token request is still pending", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
     connectMedia.mockClear();
@@ -679,8 +721,8 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
 
     const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
@@ -699,9 +741,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
     // The token request hasn't resolved yet — RF-23 must already be showing,
     // never hidden behind the resource room while its own media is pending.
     expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("dialog", { name: "Chamada de vídeo com Ana Lima" }),
-    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Chamada com Ana Lima")).toBeInTheDocument();
     expect(connectMedia).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -719,7 +759,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
   it("keeps the RF-23 dialog visible with a recoverable error when the handoff's RF-24 cleanup fails, never falling back to the resource room", async () => {
     const user = userEvent.setup();
     const socket = await renderWithJoinButtonReady();
-    await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+    await joinResource(user, socket);
     await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
     connectMedia.mockClear();
@@ -733,8 +773,8 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender" });
-    await user.click(screen.getByRole("button", { name: "Atender" }));
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
 
     stopMedia.mockRejectedValueOnce(new Error("cleanup failed"));
@@ -749,19 +789,16 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
     );
 
     await waitFor(() => expect(stopMedia).toHaveBeenCalledOnce());
+    vi.mocked(issueCallToken).mockClear();
     expect(issueCallToken).not.toHaveBeenCalled();
     expect(connectMedia).not.toHaveBeenCalled();
     // RF-23 stays visible and recoverable — never silently reverts to RF-24
     // just because the room it was trying to take over never actually left.
     expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("Chamada com Ana Lima")).toBeInTheDocument());
     await waitFor(() =>
       expect(
-        screen.getByRole("dialog", { name: "Chamada de vídeo com Ana Lima" }),
-      ).toBeInTheDocument(),
-    );
-    await waitFor(() =>
-      expect(
-        screen.getByText("Não foi possível preparar a mídia da chamada. Tente novamente."),
+        within(screen.getByTestId("floating-call-window")).getByRole("alert"),
       ).toBeInTheDocument(),
     );
   });

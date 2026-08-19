@@ -16,6 +16,7 @@ func TestLiveKitTokenEncoderUsesOfficialSDKWithRoomBoundMinimalGrant(t *testing.
 		"livekit-test-key",
 		liveKitSignerTestSecret,
 		serviceTestUserID,
+		"",
 		"channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		5*time.Minute,
 	)
@@ -57,6 +58,57 @@ func TestLiveKitTokenEncoderUsesOfficialSDKWithRoomBoundMinimalGrant(t *testing.
 	}
 }
 
+func TestLiveKitTokenEncoderSetsParticipantNameFromDisplayNameNeverIdentity(t *testing.T) {
+	result, err := encodeLiveKitToken(
+		"livekit-test-key",
+		liveKitSignerTestSecret,
+		serviceTestUserID,
+		"Ana Lima",
+		"channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	verifier, err := auth.ParseAPIToken(result.Token)
+	if err != nil {
+		t.Fatalf("parse official LiveKit token: %v", err)
+	}
+	_, grants, err := verifier.Verify(liveKitSignerTestSecret)
+	if err != nil {
+		t.Fatalf("verify official LiveKit token: %v", err)
+	}
+	if grants.Identity != serviceTestUserID {
+		t.Fatalf("identity must stay the canonical UUID, got %q", grants.Identity)
+	}
+	if grants.Name != "Ana Lima" {
+		t.Fatalf("expected participant name %q, got %q", "Ana Lima", grants.Name)
+	}
+}
+
+func TestLiveKitTokenSignerPassesDisplayNameThroughToTheEncoder(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	var gotDisplayName string
+	encoder := func(_ string, _ string, _ string, displayName string, _ string, _ time.Duration) (SignedToken, error) {
+		gotDisplayName = displayName
+		return SignedToken{Token: "token", ExpiresAt: now.Add(time.Minute)}, nil
+	}
+	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, encoder)
+
+	if _, err := signer.Sign(context.Background(), SignInput{
+		Identity:    serviceTestUserID,
+		DisplayName: "Pedro Almeida",
+		Room:        "dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		ExpiresAt:   now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if gotDisplayName != "Pedro Almeida" {
+		t.Fatalf("expected display name to reach the encoder, got %q", gotDisplayName)
+	}
+}
+
 func TestLiveKitTokenSignerUsesDeterministicAbsoluteDeadlineAcrossSecondBoundary(t *testing.T) {
 	deadline := time.Date(2026, 7, 21, 12, 1, 0, 0, time.UTC)
 	tests := []struct {
@@ -70,7 +122,7 @@ func TestLiveKitTokenSignerUsesDeterministicAbsoluteDeadlineAcrossSecondBoundary
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var gotTTL time.Duration
-			encoder := func(_ string, _ string, _ string, _ string, ttl time.Duration) (SignedToken, error) {
+			encoder := func(_ string, _ string, _ string, _ string, _ string, ttl time.Duration) (SignedToken, error) {
 				gotTTL = ttl
 				return SignedToken{
 					Token:     "deterministic-token",
@@ -100,7 +152,7 @@ func TestLiveKitTokenSignerUsesDeterministicAbsoluteDeadlineAcrossSecondBoundary
 func TestLiveKitTokenSignerRejectsExpiryBeyondAbsoluteDeadline(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 500_000_000, time.UTC)
 	deadline := now.Add(time.Minute).Truncate(time.Second)
-	encoder := func(_ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
+	encoder := func(_ string, _ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
 		return SignedToken{Token: "overlong", ExpiresAt: deadline.Add(time.Second)}, nil
 	}
 	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, encoder)
@@ -125,7 +177,7 @@ func TestLiveKitTokenSignerRejectsInvalidConfigurationAndInput(t *testing.T) {
 	if _, err := NewLiveKitTokenSigner("key", "", fixedNow); err == nil {
 		t.Fatal("expected missing API secret to fail")
 	}
-	signer := mustTestLiveKitSigner(t, fixedNow, func(_ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
+	signer := mustTestLiveKitSigner(t, fixedNow, func(_ string, _ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
 		return SignedToken{Token: "unused"}, nil
 	})
 	for _, input := range []SignInput{
@@ -141,7 +193,7 @@ func TestLiveKitTokenSignerRejectsInvalidConfigurationAndInput(t *testing.T) {
 
 func TestLiveKitTokenSignerPropagatesCanceledContextWithoutToken(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
-	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, func(_ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
+	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, func(_ string, _ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
 		t.Fatal("encoder must not be called for a canceled context")
 		return SignedToken{}, nil
 	})

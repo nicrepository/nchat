@@ -43,7 +43,7 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 750_000_000, time.UTC)
 	wantDeadline := now.Add(5 * time.Minute).Truncate(time.Second)
 	authorizer := &tokenAuthorizerStub{result: AuthorizedResource{
-		ID: serviceTestResource, SessionExpiresAt: now.Add(20 * time.Minute),
+		ID: serviceTestResource, SessionExpiresAt: now.Add(20 * time.Minute), DisplayName: "Ana Lima",
 	}}
 	signer := &tokenSignerStub{result: SignedToken{
 		Token: "livekit-token", ExpiresAt: wantDeadline,
@@ -63,6 +63,9 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	}
 	if signer.input.Identity != serviceTestUserID {
 		t.Fatalf("identity must come from authenticated user, got %q", signer.input.Identity)
+	}
+	if signer.input.DisplayName != "Ana Lima" {
+		t.Fatalf("display name must come from the authorizer, got %q", signer.input.DisplayName)
 	}
 	if signer.input.Room != "call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
 		t.Fatalf("room must be server-derived, got %q", signer.input.Room)

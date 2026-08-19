@@ -205,7 +205,7 @@ func TestWSHandlerConfig_MapsWebSocketResourceControls(t *testing.T) {
 		WSMaxInvalidMessages:       3,
 	}
 
-	got := wsHandlerConfig(cfg, nil)
+	got := wsHandlerConfig(cfg, nil, nil)
 	want := ws.HandlerConfig{
 		MaxConnectionsPerUser:    7,
 		InboundMessagesPerMinute: 120,
@@ -235,7 +235,7 @@ func TestWSHandlerConfig_MapsWebSocketResourceControls(t *testing.T) {
 func TestWSHandlerConfig_PassesTheSessionAuthorityToTheSocket(t *testing.T) {
 	sessions := stubSessionValidator{}
 
-	got := wsHandlerConfig(config.Config{}, sessions)
+	got := wsHandlerConfig(config.Config{}, sessions, nil)
 
 	if got.Sessions == nil {
 		t.Fatal("expected the configured session validator to reach the WebSocket handler")

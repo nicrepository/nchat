@@ -23,6 +23,7 @@ import type {
   WSMessageUpdatedEvent,
   WSReactionUpdatedEvent,
   WSSubscribedEvent,
+  WSTypingUpdatedEvent,
 } from "./useChatWebSocket";
 import { useChatWebSocket } from "./useChatWebSocket";
 import * as chatApi from "./chatApi";
@@ -140,7 +141,9 @@ const {
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: WSReactionUpdatedEvent) => void) | null,
     capturedSubscribed: null as ((event: WSSubscribedEvent) => void) | null,
+    capturedOnTypingUpdated: null as ((event: WSTypingUpdatedEvent) => void) | null,
     toggleReaction: vi.fn(() => true),
+    sendTyping: vi.fn(() => true),
   },
 }));
 
@@ -232,17 +235,24 @@ vi.mock("./useChatWebSocket", () => ({
       onMessageUpdated,
       onReactionUpdated,
       onSubscribed,
+      onTypingUpdated,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
       onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
       onSubscribed?: (event: WSSubscribedEvent) => void;
+      onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
-      return { toggleReaction: wsMockState.toggleReaction, connectionStatus: "connected" };
+      wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
+      return {
+        toggleReaction: wsMockState.toggleReaction,
+        sendTyping: wsMockState.sendTyping,
+        connectionStatus: "connected",
+      };
     },
   ),
 }));
@@ -445,14 +455,20 @@ beforeEach(() => {
   wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
   wsMockState.capturedSubscribed = null;
+  wsMockState.capturedOnTypingUpdated = null;
   vi.clearAllMocks();
   vi.mocked(useChatWebSocket).mockImplementation(
-    ({ onMessageCreated, onMessageUpdated, onReactionUpdated, onSubscribed }) => {
+    ({ onMessageCreated, onMessageUpdated, onReactionUpdated, onSubscribed, onTypingUpdated }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
-      return { toggleReaction: wsMockState.toggleReaction, connectionStatus: "connected" };
+      wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
+      return {
+        toggleReaction: wsMockState.toggleReaction,
+        sendTyping: wsMockState.sendTyping,
+        connectionStatus: "connected",
+      };
     },
   );
   mockFetchAllowedReactionEmojis.mockResolvedValue([
@@ -873,14 +889,46 @@ describe("ChatMessageArea — channel header", () => {
       </MemoryRouter>,
     );
 
-    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de vídeo" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada" }));
 
     expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith({
       kind: "channel",
       id: "geral",
       name: "geral",
-      callType: "video",
     });
+  });
+
+  it("RF-24 follow-up: the channel header offers a single Chamada action, never separate Áudio/Vídeo", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat/channel"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  joinResourceCall: vi.fn(),
+                }}
+              />
+            }
+          >
+            <Route path=":id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("button", { name: "Iniciar chamada" });
+    expect(
+      screen.queryByRole("button", { name: "Iniciar chamada de áudio" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Iniciar chamada de vídeo" }),
+    ).not.toBeInTheDocument();
   });
 
   it("RF-24: wires the group header call buttons to joinResourceCall with resource_kind dm, never for a 1:1", async () => {
@@ -908,13 +956,12 @@ describe("ChatMessageArea — channel header", () => {
       </MemoryRouter>,
     );
 
-    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada de áudio" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Iniciar chamada" }));
 
     expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith({
       kind: "dm",
       id: "dm-grp",
       name: "Equipe Infra",
-      callType: "audio",
     });
   });
 
@@ -1743,6 +1790,133 @@ describe("ChatMessageArea — message list", () => {
     await waitFor(() => {
       expect(screen.queryByText(secretBody)).not.toBeInTheDocument();
     });
+  });
+});
+
+// ── RF-12 typing indicator display name ───────────────────────────────────────
+
+describe("ChatMessageArea — RF-12 typing indicator display name", () => {
+  it("shows the server-provided display name even when the local heuristic has no name for that user", async () => {
+    // Channel conversation, no messages loaded from "user-elias" and no DM
+    // roster at all (this is a channel) — the old client-side heuristic
+    // (typingNameByUserId) has no way to resolve this user, and would have
+    // fallen back to "Alguém".
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: {
+          user_id: "user-elias",
+          user_display_name: "Elias Rocha",
+          is_typing: true,
+        },
+      }),
+    );
+
+    const indicator = await screen.findByTestId("chat-typing-indicator");
+    expect(indicator).toHaveTextContent("Elias Rocha está digitando");
+    expect(indicator).not.toHaveTextContent("Alguém");
+  });
+
+  it("shows an aggregate label for two, then three or more, simultaneous typists", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: { user_id: "user-a", user_display_name: "Ana", is_typing: true },
+      }),
+    );
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: { user_id: "user-b", user_display_name: "Bruno", is_typing: true },
+      }),
+    );
+    expect(await screen.findByTestId("chat-typing-indicator")).toHaveTextContent(
+      "Ana e Bruno estão digitando",
+    );
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "geral",
+        typing: { user_id: "user-c", user_display_name: "Carla", is_typing: true },
+      }),
+    );
+    expect(await screen.findByTestId("chat-typing-indicator")).toHaveTextContent(
+      "3 pessoas estão digitando",
+    );
+  });
+
+  it("in a DM, falls back to the roster's display name when the server sends none", async () => {
+    mockFetchDMMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "me-123", senderDisplayName: "Me" })]),
+    );
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-juliane"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-juliane",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [
+                        {
+                          id: "user-elias",
+                          displayName: "Elias Rocha",
+                          initials: "ER",
+                          color: "purple",
+                          status: "online",
+                        },
+                      ],
+                    },
+                  ],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-bubble");
+
+    act(() =>
+      wsMockState.capturedOnTypingUpdated?.({
+        type: "typing.updated",
+        target_type: "dm",
+        target_id: "dm-juliane",
+        typing: { user_id: "user-elias", is_typing: true },
+      }),
+    );
+
+    const indicator = await screen.findByTestId("chat-typing-indicator");
+    expect(indicator).toHaveTextContent("Elias Rocha está digitando");
   });
 });
 
@@ -3755,7 +3929,11 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
         onMessageCreated: (evt: WSMessageCreatedEvent) => void;
       }) => {
         capturedOnMessageCreated = onMessageCreated;
-        return { toggleReaction: wsMockState.toggleReaction, connectionStatus: "connected" };
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
       },
     );
   });
@@ -3764,6 +3942,7 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
     // Restore to the default no-op so other test suites are not affected.
     vi.mocked(useChatWebSocket).mockImplementation(() => ({
       toggleReaction: wsMockState.toggleReaction,
+      sendTyping: wsMockState.sendTyping,
       connectionStatus: "connected",
     }));
   });

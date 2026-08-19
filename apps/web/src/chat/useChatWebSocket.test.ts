@@ -186,6 +186,41 @@ describe("useChatWebSocket", () => {
     expect(result.current.toggleReaction("msg-1", "👍")).toBe(false);
   });
 
+  it("sends a strict typing.start/typing.stop command on the active socket", () => {
+    const { result } = renderHook(() =>
+      useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
+    );
+    let sent = false;
+    act(() => {
+      sent = result.current.sendTyping(true);
+    });
+    expect(sent).toBe(true);
+    expect(JSON.parse(FakeWebSocket.instances[0].sentMessages.at(-1)!)).toEqual({
+      type: "typing.start",
+      target_type: "channel",
+      target_id: "ch-1",
+    });
+
+    act(() => {
+      sent = result.current.sendTyping(false);
+    });
+    expect(sent).toBe(true);
+    expect(JSON.parse(FakeWebSocket.instances[0].sentMessages.at(-1)!)).toEqual({
+      type: "typing.stop",
+      target_type: "channel",
+      target_id: "ch-1",
+    });
+  });
+
+  it("reports when typing cannot be sent on a closed socket", () => {
+    const { result } = renderHook(() =>
+      useChatWebSocket({ kind: "channel", targetId: "ch-1", onMessageCreated: vi.fn() }),
+    );
+    FakeWebSocket.instances[0].readyState = FakeWebSocket.CLOSED;
+
+    expect(result.current.sendTyping(true)).toBe(false);
+  });
+
   it("routes structured reaction errors before target filtering", () => {
     const onReactionError = vi.fn();
     renderHook(() =>
@@ -732,6 +767,30 @@ describe("useChatWebSocket", () => {
     expect(onReactionUpdated).toHaveBeenCalledWith(
       expect.objectContaining({ message_id: "msg-1" }),
     );
+  });
+
+  it("routes matching typing.updated events", () => {
+    const onTypingUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onTypingUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "typing.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        typing: {
+          user_id: "user-1",
+          is_typing: true,
+        },
+      }),
+    );
+    expect(onTypingUpdated).toHaveBeenCalledWith(expect.objectContaining({ target_id: "ch-1" }));
   });
 
   // The decisive property: it arrives for a target this client never subscribed

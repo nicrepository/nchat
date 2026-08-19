@@ -117,6 +117,32 @@ export interface WSReactionUpdatedEvent {
 }
 
 /**
+ * Someone's typing state in a channel or DM changed.
+ *
+ * IsTyping is exactly what the server accepted from the typing user's own
+ * typing.start/typing.stop — never inferred, never the local user's own
+ * keystrokes echoed back with a different meaning. No draft, no character
+ * count, no body: this answers "is this person typing right now" and nothing
+ * about what they wrote.
+ */
+export interface WSTypingUpdatedEvent {
+  type: "typing.updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  typing?: {
+    user_id: string;
+    /**
+     * The typing user's display name, resolved server-side once per
+     * WebSocket connection. Absent when the server couldn't resolve one
+     * (rare) — the caller falls back to its own heuristic in that case.
+     */
+    user_display_name?: string;
+    is_typing: boolean;
+    updated_at?: string;
+  };
+}
+
+/**
  * RF-21: the author's message was refused by the link-safety check.
  *
  * Recipient-scoped rather than target-scoped — the server addresses it to one
@@ -311,6 +337,7 @@ interface UseChatWebSocketOptions {
   onMessageLinkSafetyChanged?: (event: WSMessageLinkSafetyChangedEvent) => void;
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+  onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
@@ -322,6 +349,13 @@ interface UseChatWebSocketOptions {
 
 export interface ChatWebSocketActions {
   toggleReaction: (messageId: string, emoji: string) => boolean;
+  /**
+   * Declares this user's typing intent for the primary target. Returns false
+   * when the shared socket is not open, the same "nothing sent, caller may
+   * retry" contract toggleReaction uses. Never sends the composer's content —
+   * only the boolean state.
+   */
+  sendTyping: (isTyping: boolean) => boolean;
   /** Shared connection state, for discreet feedback and diagnosis. */
   connectionStatus: ChatSocketStatus;
 }
@@ -349,6 +383,7 @@ export function useChatWebSocket({
   onMessageLinkSafetyChanged,
   onMessageUpdated,
   onReactionUpdated,
+  onTypingUpdated,
   onPinUpdated,
   onMembersAdded,
   onAttachmentStatus,
@@ -379,6 +414,7 @@ export function useChatWebSocket({
   const onLinkSafetyRef = useRef(onMessageLinkSafetyChanged);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
+  const onTypingRef = useRef(onTypingUpdated);
   const onPinRef = useRef(onPinUpdated);
   const onMembersRef = useRef(onMembersAdded);
   const onAttachmentStatusRef = useRef(onAttachmentStatus);
@@ -402,6 +438,7 @@ export function useChatWebSocket({
     onLinkSafetyRef.current = onMessageLinkSafetyChanged;
     onMessageUpdatedRef.current = onMessageUpdated;
     onReactionRef.current = onReactionUpdated;
+    onTypingRef.current = onTypingUpdated;
     onPinRef.current = onPinUpdated;
     onMembersRef.current = onMembersAdded;
     onAttachmentStatusRef.current = onAttachmentStatus;
@@ -419,6 +456,22 @@ export function useChatWebSocket({
     if (!handle) return false;
     return handle.send({ type: "reaction.toggle", message_id: messageId, emoji });
   }, []);
+
+  // Scoped to the primary target only — the one conversation actually open —
+  // same as toggleReaction reading socketRef at call time rather than closing
+  // over a stale handle.
+  const sendTyping = useCallback(
+    (isTyping: boolean) => {
+      const handle = socketRef.current;
+      if (!handle) return false;
+      return handle.send({
+        type: isTyping ? "typing.start" : "typing.stop",
+        target_type: kind,
+        target_id: normalizedTargetId,
+      });
+    },
+    [kind, normalizedTargetId],
+  );
 
   useEffect(() => {
     const primaryTarget = JSON.parse(primaryTargetSignature) as WSSubscriptionTarget | null;
@@ -637,6 +690,8 @@ export function useChatWebSocket({
           onMessageUpdatedRef.current?.(normalizedData);
         } else if (d["type"] === "reaction.updated") {
           onReactionRef.current?.(normalizedData as unknown as WSReactionUpdatedEvent);
+        } else if (d["type"] === "typing.updated") {
+          onTypingRef.current?.(normalizedData as unknown as WSTypingUpdatedEvent);
         } else if (d["type"] === "pin.updated") {
           onPinRef.current?.(normalizedData as unknown as WSPinUpdatedEvent);
         } else if (d["type"] === "members.added") {
@@ -737,5 +792,5 @@ export function useChatWebSocket({
     }
   }, [subscriptionSignature, primaryTargetSignature]);
 
-  return { toggleReaction, connectionStatus };
+  return { toggleReaction, sendTyping, connectionStatus };
 }

@@ -18,9 +18,15 @@ const liveKitMock = vi.hoisted(() => {
     AudioPlaybackStatusChanged: "audioPlaybackChanged",
     TrackMuted: "trackMuted",
     TrackUnmuted: "trackUnmuted",
+    ActiveSpeakersChanged: "activeSpeakersChanged",
+    LocalTrackUnpublished: "localTrackUnpublished",
   } as const;
   const kinds = { Audio: "audio", Video: "video" } as const;
-  const sources = { Camera: "camera", Microphone: "microphone" } as const;
+  const sources = {
+    Camera: "camera",
+    Microphone: "microphone",
+    ScreenShare: "screen_share",
+  } as const;
   const permissionDenied = "permission-denied";
   const rooms: MockRoom[] = [];
 
@@ -32,6 +38,7 @@ const liveKitMock = vi.hoisted(() => {
 
   interface MockRemoteParticipant {
     identity: string;
+    name?: string;
     getTrackPublication: (source: string) => MockPublication | undefined;
   }
 
@@ -48,6 +55,7 @@ const liveKitMock = vi.hoisted(() => {
     readonly localParticipant = {
       setCameraEnabled: vi.fn(async (): Promise<unknown> => undefined),
       setMicrophoneEnabled: vi.fn(async (): Promise<unknown> => undefined),
+      setScreenShareEnabled: vi.fn(async (): Promise<unknown> => undefined),
       getTrackPublication: vi.fn((): unknown => undefined),
     };
     readonly connect = vi.fn(async (): Promise<unknown> => undefined);
@@ -138,6 +146,9 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onParticipantConnected: vi.fn(),
     onParticipantDisconnected: vi.fn(),
     onRemoteVideoAvailabilityChanged: vi.fn(),
+    onActiveSpeakersChanged: vi.fn(),
+    onScreenShareChanged: vi.fn(),
+    onRemoteScreenShareChanged: vi.fn(),
   };
 }
 
@@ -153,9 +164,11 @@ function cameraPublication(isMuted: boolean, isSubscribed = true) {
 function fakeRemoteParticipant(
   identity: string,
   camera?: { isMuted: boolean; isSubscribed?: boolean },
+  name?: string,
 ) {
   return {
     identity,
+    name,
     getTrackPublication: (source: string) =>
       source === liveKitMock.sources.Camera && camera
         ? {
@@ -246,6 +259,49 @@ describe("createLiveKitSpikeSession", () => {
     expect(handlers.onElementRemoved).toHaveBeenCalledWith(localVideo);
   });
 
+  it("forwards active speakers and controls screen share explicitly", async () => {
+    const { handlers, room, session } = setup();
+
+    room.emit(liveKitMock.events.ActiveSpeakersChanged, [
+      { identity: "identity-a" },
+      { identity: "identity-b" },
+    ]);
+    await session.setScreenShareEnabled(true);
+    await session.setScreenShareEnabled(false);
+
+    expect(handlers.onActiveSpeakersChanged).toHaveBeenCalledWith(["identity-a", "identity-b"]);
+    expect(room.localParticipant.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+    expect(handlers.onScreenShareChanged).toHaveBeenNthCalledWith(1, true);
+    expect(handlers.onScreenShareChanged).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it("reports native screen-share termination", () => {
+    const { handlers, room } = setup();
+
+    room.emit(
+      liveKitMock.events.LocalTrackUnpublished,
+      { source: liveKitMock.sources.ScreenShare },
+      room.localParticipant,
+    );
+
+    expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps remote screen share separate from participant camera video", () => {
+    const { handlers, room } = setup();
+    const participant = { sid: "participant-a", identity: "identity-a" };
+    const element = document.createElement("video");
+    const track = createTrack("video", element);
+    const publication = { source: liveKitMock.sources.ScreenShare };
+
+    room.emit(liveKitMock.events.TrackSubscribed, track, publication, participant);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenCalledWith("identity-a", element);
+    expect(handlers.onRemoteElement).not.toHaveBeenCalled();
+
+    room.emit(liveKitMock.events.TrackUnsubscribed, track, publication, participant);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenLastCalledWith("identity-a", null);
+  });
+
   it("attaches remote video and audio once per track", async () => {
     const { handlers, room } = setup();
     const participant = { sid: "participant-a" };
@@ -282,23 +338,42 @@ describe("createLiveKitSpikeSession", () => {
     expect(video.dataset.participantIdentity).toBe(participant.identity);
   });
 
-  it("reports participants already in the room once connect() completes", async () => {
+  it("reports participants already in the room once connect() completes, with their display name", async () => {
     const { handlers, room, session } = setup();
-    room.remoteParticipants.set("a", fakeRemoteParticipant("identity-a"));
-    room.remoteParticipants.set("b", fakeRemoteParticipant("identity-b"));
+    room.remoteParticipants.set(
+      "a",
+      fakeRemoteParticipant("identity-a", undefined, "Pedro Almeida"),
+    );
+    room.remoteParticipants.set("b", fakeRemoteParticipant("identity-b", undefined, "Maria Silva"));
 
     await session.connect("ws://127.0.0.1:7880", "participant-token");
 
-    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-a");
-    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-b");
+    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-a", "Pedro Almeida");
+    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-b", "Maria Silva");
     expect(handlers.onParticipantConnected).toHaveBeenCalledTimes(2);
   });
 
-  it("reports a participant joining after connect and one leaving", () => {
+  it("reports an existing participant with no name as an empty display name, never the identity", async () => {
+    const { handlers, room, session } = setup();
+    room.remoteParticipants.set("a", fakeRemoteParticipant("identity-a"));
+
+    await session.connect("ws://127.0.0.1:7880", "participant-token");
+
+    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith("identity-a", "");
+  });
+
+  it("reports a participant joining after connect (with display name) and one leaving", () => {
     const { handlers, room } = setup();
 
-    room.emit(liveKitMock.events.ParticipantConnected, { sid: "c-sid", identity: "identity-c" });
-    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith("identity-c");
+    room.emit(liveKitMock.events.ParticipantConnected, {
+      sid: "c-sid",
+      identity: "identity-c",
+      name: "Ana Lima",
+    });
+    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith(
+      "identity-c",
+      "Ana Lima",
+    );
 
     room.emit(liveKitMock.events.ParticipantDisconnected, { sid: "c-sid", identity: "identity-c" });
     expect(handlers.onParticipantDisconnected).toHaveBeenCalledExactlyOnceWith("identity-c");

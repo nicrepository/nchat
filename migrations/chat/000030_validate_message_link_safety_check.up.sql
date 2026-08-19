@@ -1,4 +1,4 @@
--- 000028_validate_message_link_safety_check.up.sql
+-- 000030_validate_message_link_safety_check.up.sql
 -- RF-21 (issue #135, CQ-005): the scanning half of 000027's CHECK constraint.
 --
 -- 000027 added messages_link_safety_state_check as NOT VALID, which is a

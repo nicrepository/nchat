@@ -43,6 +43,12 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: /^usuários$/i })).not.toBeInTheDocument();
   });
 
+  it("redirects unauthenticated users from a dedicated call URL to login", async () => {
+    window.history.pushState({}, "", "/call/00000000-0000-4000-8000-000000000546");
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: /entrar no nic chat/i })).toBeInTheDocument();
+  });
+
   it("renders the isolated LiveKit development spike route", async () => {
     window.history.pushState({}, "", "/spike/livekit-1to1");
     render(<App />);

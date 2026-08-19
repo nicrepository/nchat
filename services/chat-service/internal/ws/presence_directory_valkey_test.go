@@ -141,6 +141,20 @@ func (s *fakeValkeyServer) applyLocked(command []string) string {
 			s.expires[command[1]] = seconds
 		}
 		return "+OK\r\n"
+	case "DEL":
+		deleted := int64(0)
+		for _, key := range command[1:] {
+			if _, ok := s.strings[key]; ok {
+				delete(s.strings, key)
+				deleted++
+			}
+			if _, ok := s.hashes[key]; ok {
+				delete(s.hashes, key)
+				deleted++
+			}
+			delete(s.expires, key)
+		}
+		return fmt.Sprintf(":%d\r\n", deleted)
 	case "MGET":
 		var reply strings.Builder
 		fmt.Fprintf(&reply, "*%d\r\n", len(command)-1)
@@ -174,6 +188,13 @@ func (s *fakeValkeyServer) hashExists(key string) bool {
 	defer s.mu.Unlock()
 	_, ok := s.hashes[key]
 	return ok
+}
+
+func (s *fakeValkeyServer) stringValue(key string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.strings[key]
+	return value, ok
 }
 
 func (s *fakeValkeyServer) ttlOf(key string) int64 {

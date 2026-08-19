@@ -7,6 +7,7 @@ import {
   type LiveKitSessionFactory,
   type LiveKitSessionLoader,
 } from "../media/liveKitSession";
+import { nextStableSpeaker, type StableSpeakerState } from "../calls/activeSpeaker";
 import type { CallType } from "./callState";
 
 export type CallMediaStatus =
@@ -24,9 +25,23 @@ export type CallMediaStatus =
 // grid tile can render an avatar fallback instead of disappearing.
 export interface ParticipantMedia {
   identity: string;
+  /** Server-issued LiveKit participant name; falls back to "Participante" when absent. */
+  displayName: string;
   hasVideo: boolean;
   hasAudio: boolean;
   bindVideo: RefCallback<HTMLDivElement>;
+}
+
+export interface RemoteScreenShare {
+  identity: string;
+  bindMedia: RefCallback<HTMLDivElement>;
+}
+
+const fallbackParticipantDisplayName = "Participante";
+
+/** Trims a raw participant name; "" (including whitespace-only) means "no name known". */
+function normalizeParticipantDisplayName(name: string): string {
+  return name.trim();
 }
 
 export interface CallMediaController {
@@ -40,7 +55,10 @@ export interface CallMediaController {
   audioStarting: boolean;
   audioActivationRequired: boolean;
   error: string | null;
-  pendingControl: "microphone" | "camera" | null;
+  pendingControl: "microphone" | "camera" | "screen-share" | null;
+  activeSpeakerId: string | null;
+  screenShareEnabled: boolean;
+  remoteScreenShare: RemoteScreenShare | null;
   bindLocalMedia: RefCallback<HTMLDivElement>;
   bindRemoteMedia: RefCallback<HTMLDivElement>;
   // RF-24 grid API. Populated from the same event stream as the legacy
@@ -50,6 +68,7 @@ export interface CallMediaController {
   bindRemoteAudio: RefCallback<HTMLDivElement>;
   toggleMicrophone: () => Promise<void>;
   toggleCamera: () => Promise<void>;
+  toggleScreenShare: () => Promise<void>;
   activateAudio: () => Promise<void>;
 }
 
@@ -75,7 +94,10 @@ interface MediaState {
   audioStarting: boolean;
   audioActivationRequired: boolean;
   error: string | null;
-  pendingControl: "microphone" | "camera" | null;
+  pendingControl: "microphone" | "camera" | "screen-share" | null;
+  activeSpeakerId: string | null;
+  screenShareEnabled: boolean;
+  remoteScreenShare: RemoteScreenShare | null;
   participants: ParticipantMedia[];
 }
 
@@ -91,10 +113,14 @@ const initialState: MediaState = {
   audioActivationRequired: false,
   error: null,
   pendingControl: null,
+  activeSpeakerId: null,
+  screenShareEnabled: false,
+  remoteScreenShare: null,
   participants: [],
 };
 
 interface ParticipantMediaEntry {
+  displayName: string;
   hasVideo: boolean;
   hasAudio: boolean;
   videoElement: HTMLMediaElement | null;
@@ -105,7 +131,7 @@ interface ParticipantMediaEntry {
 // never by its "control" field alone, so a toggle from a superseded session
 // or generation can never be mistaken for the currently pending one.
 interface PendingMediaOperation {
-  readonly control: "microphone" | "camera";
+  readonly control: "microphone" | "camera" | "screen-share";
   readonly session: LiveKitSession;
   readonly generation: number;
 }
@@ -144,6 +170,9 @@ export function useCallMedia(
   // toggle intent. toggleMicrophone reads this ref (not React state) to
   // avoid acting on a stale closure.
   const microphoneEnabledRef = useRef(false);
+  const screenShareEnabledRef = useRef(false);
+  const speakerStateRef = useRef<StableSpeakerState | null>(null);
+  const speakerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const localContainerRef = useRef<HTMLDivElement | null>(null);
   const remoteContainerRef = useRef<HTMLDivElement | null>(null);
   const localElementRef = useRef<HTMLMediaElement | null>(null);
@@ -154,6 +183,9 @@ export function useCallMedia(
   const participantsMapRef = useRef(new Map<string, ParticipantMediaEntry>());
   const participantOrderRef = useRef<string[]>([]);
   const participantBindRef = useRef(new Map<string, RefCallback<HTMLDivElement>>());
+  const remoteScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
+  const remoteScreenShareContainerRef = useRef<HTMLDivElement | null>(null);
+  const remoteScreenShareIdentityRef = useRef<string | null>(null);
 
   const update = useCallback((patch: Partial<MediaState>) => {
     if (mountedRef.current) setState((current) => ({ ...current, ...patch }));
@@ -173,6 +205,20 @@ export function useCallMedia(
     participantsMapRef.current.clear();
     participantOrderRef.current = [];
     participantBindRef.current.clear();
+    remoteScreenShareElementRef.current?.remove();
+    remoteScreenShareElementRef.current = null;
+    remoteScreenShareContainerRef.current?.replaceChildren();
+    remoteScreenShareIdentityRef.current = null;
+    if (speakerTimerRef.current !== null) clearTimeout(speakerTimerRef.current);
+    speakerTimerRef.current = null;
+    speakerStateRef.current = null;
+  }, []);
+
+  const bindRemoteScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
+    remoteScreenShareContainerRef.current = element;
+    if (element && remoteScreenShareElementRef.current) {
+      element.replaceChildren(remoteScreenShareElementRef.current);
+    }
   }, []);
 
   const bindVideoFor = useCallback((identity: string): RefCallback<HTMLDivElement> => {
@@ -194,6 +240,7 @@ export function useCallMedia(
       const entry = participantsMapRef.current.get(identity);
       return {
         identity,
+        displayName: entry?.displayName ?? fallbackParticipantDisplayName,
         hasVideo: entry?.hasVideo ?? false,
         hasAudio: entry?.hasAudio ?? false,
         bindVideo: bindVideoFor(identity),
@@ -202,9 +249,29 @@ export function useCallMedia(
     update({ participants });
   }, [bindVideoFor, update]);
 
-  const ensureParticipant = useCallback((identity: string) => {
-    if (participantsMapRef.current.has(identity)) return;
+  // displayName defaults to "" (never seen it yet — e.g. a track arriving
+  // before the SDK's own participant-connected callback) and is normalized to
+  // the visible fallback here, once, so every other reader of the map can
+  // trust displayName is always non-empty.
+  //
+  // identity is, and stays, the only key: a track event and a
+  // ParticipantConnected event can arrive in either order for the same
+  // participant, so this must upsert rather than create-or-ignore. An
+  // already-known entry only ever has its name *improved* — a normalized,
+  // non-empty name overwrites a fallback or an older name, but an empty/
+  // blank one (e.g. the nameless call from onRemoteElement, or a later event
+  // that genuinely carries none) never regresses an already-known real name
+  // back to the fallback. hasVideo/hasAudio/videoElement/container are
+  // untouched here; only displayName is ever revised in place.
+  const ensureParticipant = useCallback((identity: string, displayName = "") => {
+    const normalized = normalizeParticipantDisplayName(displayName);
+    const entry = participantsMapRef.current.get(identity);
+    if (entry) {
+      if (normalized !== "" && normalized !== entry.displayName) entry.displayName = normalized;
+      return;
+    }
     participantsMapRef.current.set(identity, {
+      displayName: normalized !== "" ? normalized : fallbackParticipantDisplayName,
       hasVideo: false,
       hasAudio: false,
       videoElement: null,
@@ -238,6 +305,7 @@ export function useCallMedia(
       pendingControlRef.current = null;
       audioActivationRequiredRef.current = false;
       microphoneEnabledRef.current = false;
+      screenShareEnabledRef.current = false;
       generationRef.current += 1;
       clearElements();
       if (session && !disconnectPromiseRef.current) {
@@ -305,6 +373,11 @@ export function useCallMedia(
           }
           remoteElementsRef.current.delete(element);
           remoteAudioElementsRef.current.delete(element);
+          if (remoteScreenShareElementRef.current === element) {
+            remoteScreenShareElementRef.current = null;
+            remoteScreenShareIdentityRef.current = null;
+            update({ remoteScreenShare: null });
+          }
           element.remove();
           syncRemoteState();
 
@@ -320,14 +393,23 @@ export function useCallMedia(
           }
           syncParticipants();
         },
-        onParticipantConnected(identity) {
+        onParticipantConnected(identity, displayName) {
           if (!current()) return;
-          ensureParticipant(identity);
+          ensureParticipant(identity, displayName);
           syncParticipants();
         },
         onParticipantDisconnected(identity) {
           if (!current()) return;
           removeParticipant(identity);
+          if (
+            speakerStateRef.current?.candidate === identity ||
+            speakerStateRef.current?.visible === identity
+          ) {
+            if (speakerTimerRef.current !== null) clearTimeout(speakerTimerRef.current);
+            speakerTimerRef.current = null;
+            speakerStateRef.current = null;
+            update({ activeSpeakerId: null });
+          }
           syncParticipants();
         },
         // Camera mute keeps the publication (and the attached element) alive
@@ -382,9 +464,65 @@ export function useCallMedia(
           microphoneEnabledRef.current = enabled;
           update({ microphoneEnabled: enabled });
         },
+        onActiveSpeakersChanged(identities) {
+          if (!current()) return;
+          const previous = speakerStateRef.current;
+          const candidate = identities[0] ?? null;
+          const next = nextStableSpeaker(previous, candidate, Date.now(), 400);
+          speakerStateRef.current = next;
+          if (next.visible !== (previous?.visible ?? null)) {
+            update({ activeSpeakerId: next.visible });
+          }
+          if (speakerTimerRef.current !== null) clearTimeout(speakerTimerRef.current);
+          speakerTimerRef.current = null;
+          if (next.visible === candidate) return;
+          speakerTimerRef.current = setTimeout(
+            () => {
+              speakerTimerRef.current = null;
+              if (!current() || !speakerStateRef.current) return;
+              const settled = nextStableSpeaker(
+                speakerStateRef.current,
+                speakerStateRef.current.candidate,
+                Date.now(),
+                400,
+              );
+              const changed = settled.visible !== speakerStateRef.current.visible;
+              speakerStateRef.current = settled;
+              if (changed) update({ activeSpeakerId: settled.visible });
+            },
+            Math.max(0, 400 - (Date.now() - next.since)),
+          );
+        },
+        onScreenShareChanged(enabled) {
+          if (!current()) return;
+          screenShareEnabledRef.current = enabled;
+          update({ screenShareEnabled: enabled });
+        },
+        onRemoteScreenShareChanged(identity, element) {
+          if (!current()) return;
+          if (!element) {
+            if (remoteScreenShareIdentityRef.current !== identity) return;
+            remoteScreenShareElementRef.current = null;
+            remoteScreenShareIdentityRef.current = null;
+            remoteScreenShareContainerRef.current?.replaceChildren();
+            update({ remoteScreenShare: null });
+            return;
+          }
+          remoteScreenShareElementRef.current = element;
+          remoteScreenShareIdentityRef.current = identity;
+          remoteScreenShareContainerRef.current?.replaceChildren(element);
+          update({ remoteScreenShare: { identity, bindMedia: bindRemoteScreenShare } });
+        },
       };
     },
-    [ensureParticipant, invalidateDeadSession, removeParticipant, syncParticipants, update],
+    [
+      bindRemoteScreenShare,
+      ensureParticipant,
+      invalidateDeadSession,
+      removeParticipant,
+      syncParticipants,
+      update,
+    ],
   );
 
   const loadFactory = useCallback((): Promise<LiveKitSessionFactory> => {
@@ -516,6 +654,7 @@ export function useCallMedia(
     pendingControlRef.current = null;
     audioActivationRequiredRef.current = false;
     microphoneEnabledRef.current = false;
+    screenShareEnabledRef.current = false;
     generationRef.current += 1;
     clearElements();
     update(initialState);
@@ -721,6 +860,30 @@ export function useCallMedia(
     }
   }, [state.cameraEnabled, update]);
 
+  const toggleScreenShare = useCallback(async () => {
+    const session = sessionRef.current;
+    if (!session || pendingControlRef.current) return;
+    const operation: PendingMediaOperation = {
+      control: "screen-share",
+      session,
+      generation: generationRef.current,
+    };
+    pendingControlRef.current = operation;
+    update({ pendingControl: "screen-share", error: null });
+    try {
+      await session.setScreenShareEnabled(!screenShareEnabledRef.current);
+    } catch {
+      if (pendingControlRef.current === operation) {
+        update({ error: "Não foi possível alterar o compartilhamento de tela." });
+      }
+    } finally {
+      if (pendingControlRef.current === operation) {
+        pendingControlRef.current = null;
+        update({ pendingControl: null });
+      }
+    }
+  }, [update]);
+
   const bindLocalMedia = useCallback<RefCallback<HTMLDivElement>>((element) => {
     localContainerRef.current = element;
     if (element && localElementRef.current) element.replaceChildren(localElementRef.current);
@@ -738,6 +901,7 @@ export function useCallMedia(
     bindRemoteAudio,
     toggleMicrophone,
     toggleCamera,
+    toggleScreenShare,
     activateAudio: startAudio,
     prepare,
     startAudio,

@@ -1,4 +1,4 @@
--- 000027_message_link_safety_state.up.sql
+-- 000029_message_link_safety_state.up.sql
 -- RF-21 (issue #135): separate "may this message be delivered" from "may this
 -- server fetch the URL it carries".
 --

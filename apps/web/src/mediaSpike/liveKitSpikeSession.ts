@@ -47,8 +47,10 @@ export interface LiveKitSpikeSessionCallbacks {
   onMicrophoneStateChanged(enabled: boolean): void;
   // Represents a remote person even before they publish any track (RF-24
   // grid). Fired for participants already in the room when connect()
-  // completes, and for every participant joining afterwards.
-  onParticipantConnected(identity: string): void;
+  // completes, and for every participant joining afterwards. displayName is
+  // the server-issued LiveKit participant name (RF-24 follow-up); empty when
+  // the SDK reports none, never the identity UUID.
+  onParticipantConnected(identity: string, displayName: string): void;
   onParticipantDisconnected(identity: string): void;
   // A remote camera can be muted (publication kept, no unsubscribe) instead
   // of unpublished. The subscribed element is never removed for this —
@@ -57,6 +59,9 @@ export interface LiveKitSpikeSessionCallbacks {
   // losing the element, and restore it on unmute. Never fired for a
   // microphone (local or remote): see onMicrophoneStateChanged for that.
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+  onActiveSpeakersChanged(identities: string[]): void;
+  onScreenShareChanged(enabled: boolean): void;
+  onRemoteScreenShareChanged(identity: string, element: HTMLMediaElement | null): void;
 }
 
 export interface LiveKitSpikeSession {
@@ -66,6 +71,7 @@ export interface LiveKitSpikeSession {
   enableMicrophone(): Promise<void>;
   setCameraEnabled(enabled: boolean): Promise<void>;
   setMicrophoneEnabled(enabled: boolean): Promise<void>;
+  setScreenShareEnabled(enabled: boolean): Promise<void>;
   disconnect(): Promise<void>;
 }
 
@@ -77,7 +83,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   private readonly room = new Room({ adaptiveStream: true, dynacast: true });
   private readonly remoteTracks = new Map<
     RemoteTrack,
-    { participantSid: string; elements: Set<HTMLMediaElement> }
+    { participantSid: string; elements: Set<HTMLMediaElement>; screenShareIdentity?: string }
   >();
   private readonly callbacks: LiveKitSpikeSessionCallbacks;
   private localVideoElement: HTMLMediaElement | null = null;
@@ -102,7 +108,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .on(RoomEvent.Reconnected, this.onReconnected)
       .on(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged)
       .on(RoomEvent.TrackMuted, this.onTrackMuted)
-      .on(RoomEvent.TrackUnmuted, this.onTrackUnmuted);
+      .on(RoomEvent.TrackUnmuted, this.onTrackUnmuted)
+      .on(RoomEvent.ActiveSpeakersChanged, this.onActiveSpeakersChanged)
+      .on(RoomEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished);
   }
 
   async connect(serverUrl: string, token: string): Promise<void> {
@@ -117,7 +125,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     // connected — so existing occupants (RF-24: someone joining after others)
     // are replayed explicitly here.
     for (const participant of this.room.remoteParticipants.values()) {
-      this.callbacks.onParticipantConnected(participant.identity);
+      this.callbacks.onParticipantConnected(participant.identity, participant.name ?? "");
     }
     // A camera publication's own current state is authoritative on join: a
     // late joiner must never infer "camera on" from the mere existence of a
@@ -203,6 +211,16 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     this.notifyMicrophoneState();
   }
 
+  async setScreenShareEnabled(enabled: boolean): Promise<void> {
+    if (this.disposed) return;
+    await this.room.localParticipant.setScreenShareEnabled(enabled);
+    if (this.disposed) {
+      if (enabled) await this.disableScreenShareAfterInterruptedEnable();
+      return;
+    }
+    this.callbacks.onScreenShareChanged(enabled);
+  }
+
   disconnect(): Promise<void> {
     if (this.disconnected) return Promise.resolve();
     if (this.disconnectPromise) return this.disconnectPromise;
@@ -241,8 +259,17 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     element.autoplay = true;
     element.dataset.participantIdentity = participant.identity;
     const elements = new Set([element]);
-    this.remoteTracks.set(track, { participantSid: participant.sid, elements });
-    this.callbacks.onRemoteElement(element);
+    const screenShare = publication.source === Track.Source.ScreenShare;
+    this.remoteTracks.set(track, {
+      participantSid: participant.sid,
+      elements,
+      ...(screenShare ? { screenShareIdentity: participant.identity } : {}),
+    });
+    if (screenShare) {
+      this.callbacks.onRemoteScreenShareChanged(participant.identity, element);
+    } else {
+      this.callbacks.onRemoteElement(element);
+    }
     if (track.kind === Track.Kind.Audio) {
       void element.play().catch(() => {
         if (!this.disposed) this.callbacks.onAudioPlaybackChanged(false);
@@ -263,7 +290,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   };
 
   private readonly onParticipantConnected = (participant: RemoteParticipant): void => {
-    if (!this.disposed) this.callbacks.onParticipantConnected(participant.identity);
+    if (!this.disposed) {
+      this.callbacks.onParticipantConnected(participant.identity, participant.name ?? "");
+    }
   };
 
   private readonly onParticipantDisconnected = (participant: RemoteParticipant): void => {
@@ -296,6 +325,18 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     if (!this.disposed) this.callbacks.onAudioPlaybackChanged(canPlaybackAudio);
   };
 
+  private readonly onActiveSpeakersChanged = (participants: Participant[]): void => {
+    if (!this.disposed) {
+      this.callbacks.onActiveSpeakersChanged(participants.map(({ identity }) => identity));
+    }
+  };
+
+  private readonly onLocalTrackUnpublished = (publication: LocalTrackPublication): void => {
+    if (!this.disposed && publication.source === Track.Source.ScreenShare) {
+      this.callbacks.onScreenShareChanged(false);
+    }
+  };
+
   private readonly onTrackMuted = (
     publication: TrackPublication,
     participant: Participant,
@@ -303,6 +344,10 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     if (this.disposed) return;
     if (this.isLocalMicrophone(publication, participant)) {
       this.callbacks.onMicrophoneStateChanged(false);
+      return;
+    }
+    if (this.isLocalScreenShare(publication, participant)) {
+      this.callbacks.onScreenShareChanged(false);
       return;
     }
     if (this.isRemoteCamera(publication, participant)) {
@@ -319,6 +364,10 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       this.callbacks.onMicrophoneStateChanged(true);
       return;
     }
+    if (this.isLocalScreenShare(publication, participant)) {
+      this.callbacks.onScreenShareChanged(true);
+      return;
+    }
     if (this.isRemoteCamera(publication, participant)) {
       this.callbacks.onRemoteVideoAvailabilityChanged(participant.identity, true);
     }
@@ -327,6 +376,12 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   private isLocalMicrophone(publication: TrackPublication, participant: Participant): boolean {
     return (
       participant === this.room.localParticipant && publication.source === Track.Source.Microphone
+    );
+  }
+
+  private isLocalScreenShare(publication: TrackPublication, participant: Participant): boolean {
+    return (
+      participant === this.room.localParticipant && publication.source === Track.Source.ScreenShare
     );
   }
 
@@ -391,13 +446,18 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .off(RoomEvent.Reconnected, this.onReconnected)
       .off(RoomEvent.AudioPlaybackStatusChanged, this.onAudioPlaybackChanged)
       .off(RoomEvent.TrackMuted, this.onTrackMuted)
-      .off(RoomEvent.TrackUnmuted, this.onTrackUnmuted);
+      .off(RoomEvent.TrackUnmuted, this.onTrackUnmuted)
+      .off(RoomEvent.ActiveSpeakersChanged, this.onActiveSpeakersChanged)
+      .off(RoomEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished);
   }
 
   private removeRemoteTrack(track: RemoteTrack): void {
     const remoteTrack = this.remoteTracks.get(track);
     if (!remoteTrack) return;
     this.remoteTracks.delete(track);
+    if (remoteTrack.screenShareIdentity) {
+      this.callbacks.onRemoteScreenShareChanged(remoteTrack.screenShareIdentity, null);
+    }
     const elements = new Set([...remoteTrack.elements, ...track.detach()]);
     for (const element of elements) this.callbacks.onElementRemoved(element);
   }
@@ -413,6 +473,14 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   private async disableMicrophoneAfterInterruptedEnable(): Promise<void> {
     try {
       await this.room.localParticipant.setMicrophoneEnabled(false);
+    } catch {
+      // Best effort only during teardown.
+    }
+  }
+
+  private async disableScreenShareAfterInterruptedEnable(): Promise<void> {
+    try {
+      await this.room.localParticipant.setScreenShareEnabled(false);
     } catch {
       // Best effort only during teardown.
     }

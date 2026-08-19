@@ -1,4 +1,4 @@
--- 000027_message_link_safety_state.down.sql
+-- 000029_message_link_safety_state.down.sql
 -- Reverses 000027.
 --
 -- Rolling back drops the per-message link-safety axis, which means a message

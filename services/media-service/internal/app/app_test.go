@@ -64,8 +64,8 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 	sessionExpiry := time.Now().UTC().Add(10 * time.Minute)
 	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.calls`).
 		WithArgs(appTestSessionID, appTestUserID, appTestResource).
-		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id"}).
-			AddRow(sessionExpiry, appTestResource))
+		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
+			AddRow(sessionExpiry, appTestResource, "App Test User"))
 
 	application, err := newApp(cfg, appDependencies{
 		openDB:          func(context.Context, string, int) (storage.Pool, error) { return mock, nil },
@@ -104,6 +104,9 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 	if grants.Identity != appTestUserID || grants.Video == nil ||
 		!grants.Video.RoomJoin || grants.Video.Room != "call:"+appTestResource {
 		t.Fatalf("unexpected LiveKit grants: %+v", grants)
+	}
+	if grants.Name != "App Test User" {
+		t.Fatalf("expected server-resolved display name in token, got %q", grants.Name)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("storage expectations: %v", err)

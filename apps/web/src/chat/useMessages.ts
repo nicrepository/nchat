@@ -64,6 +64,7 @@ import {
   type WSAttachmentStatusEvent,
   type WSPinUpdatedEvent,
   type WSReactionUpdatedEvent,
+  type WSTypingUpdatedEvent,
 } from "./useChatWebSocket";
 
 // ── State shape ───────────────────────────────────────────────────────────────
@@ -1112,6 +1113,13 @@ interface UseMessagesOptions {
    * refetch.
    */
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
+  /**
+   * Typing indicator: called on a typing.updated event for the active target,
+   * including the local user's own echo — self-filtering is left to the
+   * caller (useTypingIndicator), the same way actorIsMe is computed per
+   * caller for reactions rather than dropped here.
+   */
+  onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
   onMessageRemoved?: () => void;
 }
 
@@ -1132,6 +1140,12 @@ export interface UseMessagesResult {
   selectReply: (message: Message) => void;
   cancelReply: () => void;
   toggleReaction: (messageId: string, emoji: string) => void;
+  /**
+   * Declares this user's typing intent for the active target. See
+   * ChatWebSocketActions.sendTyping — returns false when the shared socket is
+   * not open.
+   */
+  sendTyping: (isTyping: boolean) => boolean;
   toggleFavorite: (messageId: string, isFavorited: boolean) => void;
   /**
    * RF-21 "Verificar novamente" (issue #135): asks the server to re-read what it
@@ -1158,6 +1172,7 @@ export function useMessages({
   onPinUpdated,
   onMembersAdded,
   onAttachmentStatus,
+  onTypingUpdated,
   onMessageRemoved,
 }: UseMessagesOptions): UseMessagesResult {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -2035,7 +2050,20 @@ export function useMessages({
     [],
   );
 
-  const { toggleReaction: sendReactionToggle } = useChatWebSocket({
+  // Same ref treatment again, same reason.
+  const onTypingUpdatedRef = useRef(onTypingUpdated);
+  useLayoutEffect(() => {
+    onTypingUpdatedRef.current = onTypingUpdated;
+  });
+  const handleTypingUpdated = useCallback(
+    (event: WSTypingUpdatedEvent) => {
+      if (event.target_type !== kind || event.target_id !== targetId) return;
+      onTypingUpdatedRef.current?.(event);
+    },
+    [kind, targetId],
+  );
+
+  const { toggleReaction: sendReactionToggle, sendTyping } = useChatWebSocket({
     kind,
     targetId,
     onMessageCreated: handleWsMessageCreated,
@@ -2043,6 +2071,7 @@ export function useMessages({
     onMessageLinkSafetyChanged: handleWsLinkSafetyChanged,
     onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: handleReactionUpdated,
+    onTypingUpdated: handleTypingUpdated,
     onPinUpdated: handlePinUpdated,
     onMembersAdded: handleMembersAdded,
     onAttachmentStatus: handleAttachmentStatus,
@@ -2166,6 +2195,7 @@ export function useMessages({
     selectReply,
     cancelReply,
     toggleReaction,
+    sendTyping,
     toggleFavorite,
     reconcileLinkSafety,
     editMessageLocal,
