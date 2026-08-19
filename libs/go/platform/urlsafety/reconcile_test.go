@@ -154,9 +154,9 @@ func TestReconcileAdoptsAMaliciousVerdictFromTheFullReport(t *testing.T) {
 func TestReconcileNeverTreatsTheSearchAnswerAsAVerdict(t *testing.T) {
 	// A search payload carrying every verdict-shaped field the provider might
 	// ever add. None of them is read: ScanRecord has nowhere to put them.
-	searchBody := `{"tasks":[{"uuid":"scan-c","url":"https://example.com/c",` +
-		`"time":"` + recentRFC3339() + `","visibility":"unlisted","success":true,` +
-		`"verdict":{"malicious":false,"hasVerdicts":true}}]}`
+	searchBody := `{"results":[{"task":{"uuid":"scan-c","url":"https://example.com/c",` +
+		`"time":"` + recentRFC3339() + `","visibility":"unlisted","success":true},` +
+		`"verdicts":{"overall":{"malicious":false,"hasVerdicts":true}}}]}`
 	server := &reconcileServer{
 		searchBody: searchBody,
 		// The authoritative report: finished, but with nothing to act on. This is
@@ -223,7 +223,7 @@ func TestReconcileReportsStillInconclusive(t *testing.T) {
 // account scanned recently looks like — and it must be distinguishable from a
 // failure, because only one of the two is worth logging.
 func TestReconcileReportsNoCandidate(t *testing.T) {
-	server := &reconcileServer{searchBody: `{"tasks":[]}`}
+	server := &reconcileServer{searchBody: `{"results":[]}`}
 	service := server.start(t)
 
 	evidence, err := service.Reconcile(context.Background(), "https://example.com/f")
@@ -301,7 +301,7 @@ func TestReconcileIsFailClosedOnProviderErrors(t *testing.T) {
 	for name, server := range map[string]*reconcileServer{
 		"search throttled":   {searchStatus: http.StatusTooManyRequests},
 		"search unavailable": {searchStatus: http.StatusBadGateway},
-		"search unparseable": {searchBody: `{"tasks":[}`},
+		"search unparseable": {searchBody: `{"results":[}`},
 		"result unavailable": {searchBody: scanTasksJSON(scanTaskJSON("s", "https://example.com/h", recentRFC3339(), "unlisted")), resultStatus: http.StatusInternalServerError},
 		"result unparseable": {searchBody: scanTasksJSON(scanTaskJSON("s", "https://example.com/h", recentRFC3339(), "unlisted")), resultBody: `{`},
 		"result trailing data": {searchBody: scanTasksJSON(scanTaskJSON("s", "https://example.com/h", recentRFC3339(), "unlisted")),
@@ -634,8 +634,8 @@ func TestReconcileFallsBackToTheSubmissionTime(t *testing.T) {
 // has no honest freshness to assign — so it clears nothing.
 func TestReconcileRefusesCompletelyUndatedEvidence(t *testing.T) {
 	server := &reconcileServer{
-		searchBody: `{"tasks":[{"uuid":"scan-nodate","url":"https://example.test/nodate",` +
-			`"time":"` + recentRFC3339() + `","visibility":"unlisted"}]}`,
+		searchBody: `{"results":[{"task":{"uuid":"scan-nodate","url":"https://example.test/nodate",` +
+			`"time":"` + recentRFC3339() + `","visibility":"unlisted"}}]}`,
 		resultBody: `{"task":{"uuid":"scan-nodate","status":"finished","success":true},` +
 			`"verdicts":{"overall":{"hasVerdicts":true,"malicious":false}}}`,
 	}
@@ -676,7 +676,7 @@ func TestCandidateFoundIsReportedForAnExactMatch(t *testing.T) {
 
 func TestCandidateFoundIsNotReportedWithoutAMatch(t *testing.T) {
 	for name, server := range map[string]*reconcileServer{
-		"empty search":   {searchBody: `{"tasks":[]}`},
+		"empty search":   {searchBody: `{"results":[]}`},
 		"different url":  {searchBody: scanTasksJSON(scanTaskJSON("s", "https://other.test/x", recentRFC3339(), "unlisted"))},
 		"search failure": {searchStatus: http.StatusTooManyRequests},
 	} {

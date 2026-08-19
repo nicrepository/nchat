@@ -50,12 +50,15 @@ func (s *searchServer) start(t *testing.T) *CloudflareScanner {
 	return scanner
 }
 
+// scanTasksJSON builds the envelope the provider actually answers with: a
+// top-level `results`, each entry wrapping its task under `task`.
 func scanTasksJSON(tasks ...string) string {
-	return `{"tasks":[` + strings.Join(tasks, ",") + `]}`
+	return `{"results":[` + strings.Join(tasks, ",") + `]}`
 }
 
 func scanTaskJSON(uuid, url, when, visibility string) string {
-	return `{"uuid":"` + uuid + `","url":"` + url + `","time":"` + when + `","visibility":"` + visibility + `"}`
+	return `{"task":{"uuid":"` + uuid + `","url":"` + url + `","time":"` + when +
+		`","visibility":"` + visibility + `","success":true}}`
 }
 
 func TestFindRecentScanUsesTheDocumentedRequest(t *testing.T) {
@@ -85,6 +88,44 @@ func TestFindRecentScanUsesTheDocumentedRequest(t *testing.T) {
 	}
 	if server.query != `task.url:"https://example.com/a"` {
 		t.Fatalf("query = %q", server.query)
+	}
+}
+
+// The production regression. The search answers `{"results":[{...,"task":{...}}]}`,
+// and a client modelling it as `{"tasks":[...]}` decodes that without error into
+// an empty slice: every reconciliation then reports "no such scan", the caller
+// stays uncertain with no scan_uuid, and the search repeats forever.
+//
+// So the payload here is the observed one, siblings and all — `_id`, `page`,
+// `result`, `stats`, `verdicts` around the `task` — because the fields this
+// client ignores are exactly the ones a fabricated fixture leaves out.
+func TestFindRecentScanReadsTheProviderResultEnvelope(t *testing.T) {
+	const wanted = "https://example.com/a"
+	when := time.Now().UTC().Format(time.RFC3339)
+	body := `{"results":[{` +
+		`"_id":"019bc0de-0000-7000-8000-000000000001",` +
+		`"page":{"url":"` + wanted + `","country":"US","asn":"AS13335"},` +
+		`"result":"https://api.example/urlscanner/v2/result/scan-live",` +
+		`"stats":{"dataLength":1234,"requests":7,"uniqIPs":3},` +
+		`"task":{"success":true,"time":"` + when + `","url":"` + wanted + `",` +
+		`"uuid":"scan-live","visibility":"unlisted"},` +
+		`"verdicts":{"overall":{"malicious":false,"hasVerdicts":true}}` +
+		`}]}`
+	scanner := (&searchServer{body: body}).start(t)
+
+	record, matches, err := scanner.FindRecentScan(
+		context.Background(), wanted, time.Now().Add(-time.Minute))
+
+	if err != nil {
+		t.Fatalf("the real provider envelope was not understood: %v", err)
+	}
+	if record.UUID != "scan-live" || matches != 1 {
+		t.Fatalf("record=%+v matches=%d", record, matches)
+	}
+	// The siblings are read past, not read from: the search never becomes a
+	// verdict, whatever `verdicts` says.
+	if record.URL != wanted || record.Visibility != "unlisted" {
+		t.Fatalf("record = %+v", record)
 	}
 }
 
@@ -239,12 +280,12 @@ func TestFindRecentScanToleratesClockSkew(t *testing.T) {
 // eventually, a failure must not.
 func TestFindRecentScanReportsFailureRatherThanAbsence(t *testing.T) {
 	for name, server := range map[string]*searchServer{
-		"429":            {status: http.StatusTooManyRequests, body: `{"tasks":[]}`},
+		"429":            {status: http.StatusTooManyRequests, body: `{"results":[]}`},
 		"500":            {status: http.StatusInternalServerError, body: `{}`},
 		"403":            {status: http.StatusForbidden, body: `{}`},
 		"404":            {status: http.StatusNotFound, body: `{}`},
-		"malformed json": {body: `{"tasks":`},
-		"trailing data":  {body: `{"tasks":[]}{"tasks":[]}`},
+		"malformed json": {body: `{"results":`},
+		"trailing data":  {body: `{"results":[]}{"results":[]}`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			scanner := server.start(t)
@@ -260,7 +301,7 @@ func TestFindRecentScanReportsFailureRatherThanAbsence(t *testing.T) {
 // An empty result set is absence, not failure — and it must be distinguishable,
 // because the two lead to different decisions upstream.
 func TestFindRecentScanReportsAbsenceForAnEmptyResult(t *testing.T) {
-	scanner := (&searchServer{body: `{"tasks":[]}`}).start(t)
+	scanner := (&searchServer{body: `{"results":[]}`}).start(t)
 
 	_, _, err := scanner.FindRecentScan(
 		context.Background(), "https://example.com/a", time.Now().Add(-time.Minute))
@@ -272,7 +313,7 @@ func TestFindRecentScanReportsAbsenceForAnEmptyResult(t *testing.T) {
 
 // The caller going away is reported as itself rather than as a provider fact.
 func TestFindRecentScanReportsCancellation(t *testing.T) {
-	scanner := (&searchServer{body: `{"tasks":[]}`}).start(t)
+	scanner := (&searchServer{body: `{"results":[]}`}).start(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
