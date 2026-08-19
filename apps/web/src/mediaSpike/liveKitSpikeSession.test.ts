@@ -18,9 +18,15 @@ const liveKitMock = vi.hoisted(() => {
     AudioPlaybackStatusChanged: "audioPlaybackChanged",
     TrackMuted: "trackMuted",
     TrackUnmuted: "trackUnmuted",
+    ActiveSpeakersChanged: "activeSpeakersChanged",
+    LocalTrackUnpublished: "localTrackUnpublished",
   } as const;
   const kinds = { Audio: "audio", Video: "video" } as const;
-  const sources = { Camera: "camera", Microphone: "microphone" } as const;
+  const sources = {
+    Camera: "camera",
+    Microphone: "microphone",
+    ScreenShare: "screen_share",
+  } as const;
   const permissionDenied = "permission-denied";
   const rooms: MockRoom[] = [];
 
@@ -49,6 +55,7 @@ const liveKitMock = vi.hoisted(() => {
     readonly localParticipant = {
       setCameraEnabled: vi.fn(async (): Promise<unknown> => undefined),
       setMicrophoneEnabled: vi.fn(async (): Promise<unknown> => undefined),
+      setScreenShareEnabled: vi.fn(async (): Promise<unknown> => undefined),
       getTrackPublication: vi.fn((): unknown => undefined),
     };
     readonly connect = vi.fn(async (): Promise<unknown> => undefined);
@@ -139,6 +146,9 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onParticipantConnected: vi.fn(),
     onParticipantDisconnected: vi.fn(),
     onRemoteVideoAvailabilityChanged: vi.fn(),
+    onActiveSpeakersChanged: vi.fn(),
+    onScreenShareChanged: vi.fn(),
+    onRemoteScreenShareChanged: vi.fn(),
   };
 }
 
@@ -247,6 +257,49 @@ describe("createLiveKitSpikeSession", () => {
       [true],
     ]);
     expect(handlers.onElementRemoved).toHaveBeenCalledWith(localVideo);
+  });
+
+  it("forwards active speakers and controls screen share explicitly", async () => {
+    const { handlers, room, session } = setup();
+
+    room.emit(liveKitMock.events.ActiveSpeakersChanged, [
+      { identity: "identity-a" },
+      { identity: "identity-b" },
+    ]);
+    await session.setScreenShareEnabled(true);
+    await session.setScreenShareEnabled(false);
+
+    expect(handlers.onActiveSpeakersChanged).toHaveBeenCalledWith(["identity-a", "identity-b"]);
+    expect(room.localParticipant.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+    expect(handlers.onScreenShareChanged).toHaveBeenNthCalledWith(1, true);
+    expect(handlers.onScreenShareChanged).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it("reports native screen-share termination", () => {
+    const { handlers, room } = setup();
+
+    room.emit(
+      liveKitMock.events.LocalTrackUnpublished,
+      { source: liveKitMock.sources.ScreenShare },
+      room.localParticipant,
+    );
+
+    expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps remote screen share separate from participant camera video", () => {
+    const { handlers, room } = setup();
+    const participant = { sid: "participant-a", identity: "identity-a" };
+    const element = document.createElement("video");
+    const track = createTrack("video", element);
+    const publication = { source: liveKitMock.sources.ScreenShare };
+
+    room.emit(liveKitMock.events.TrackSubscribed, track, publication, participant);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenCalledWith("identity-a", element);
+    expect(handlers.onRemoteElement).not.toHaveBeenCalled();
+
+    room.emit(liveKitMock.events.TrackUnsubscribed, track, publication, participant);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenLastCalledWith("identity-a", null);
   });
 
   it("attaches remote video and audio once per track", async () => {
