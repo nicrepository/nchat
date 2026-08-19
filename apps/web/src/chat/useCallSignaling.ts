@@ -14,6 +14,7 @@ import {
 } from "./callState";
 import { requestMediaPermission } from "./mediaPermission";
 import type { CallMediaSessionController } from "./useCallMedia";
+import { randomId } from "../lib/randomId";
 
 export type CallMediaBridge = Pick<CallMediaSessionController, "startAudio" | "connect" | "stop">;
 
@@ -610,7 +611,7 @@ export function useCallSignaling(
     mediaActivationRequired,
     start: (targetUserId, callType) => {
       const started = sendGated("call.start", callType, {
-        request_id: crypto.randomUUID(),
+        request_id: randomId(),
         target_user_id: targetUserId,
         call_type: callType,
       });

@@ -1,3 +1,5 @@
+import { randomId } from "../lib/randomId";
+
 const CHANNEL_NAME = "nchat-call-ownership-v1";
 const LEASE_KEY = "nchat.call.owner.v1";
 const MESSAGE_TYPES = new Set([
@@ -145,7 +147,7 @@ export function resolveLeaseConflict(a: OwnerLease, b: OwnerLease): OwnerLease {
 export function createOwnershipCoordinator(
   options: OwnershipCoordinatorOptions = {},
 ): OwnershipCoordinator {
-  const tabId = options.tabId ?? crypto.randomUUID();
+  const tabId = options.tabId ?? randomId();
   const storage = options.storage ?? localStorage;
   const channel = options.channel ?? new BroadcastChannel(CHANNEL_NAME);
   const now = options.now ?? Date.now;
