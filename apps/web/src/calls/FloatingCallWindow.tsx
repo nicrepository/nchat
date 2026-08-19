@@ -109,13 +109,23 @@ export default function FloatingCallWindow({
   );
 
   useEffect(() => {
-    const onResize = () =>
+    const reclamp = () =>
       setPosition((current) => clampPosition(current, size(), viewport(), MARGIN));
     const frame = window.requestAnimationFrame(() => placeAt(corner));
-    window.addEventListener("resize", onResize);
+    window.addEventListener("resize", reclamp);
+    // The window's own height changes after mount (a denied getUserMedia
+    // prompt adds a recovery banner above the activation button, for
+    // example), and that must reclamp position too, not just viewport
+    // resizes — otherwise a bottom-anchored corner keeps the stale, smaller
+    // height baked into its y offset and pushes trailing controls off-screen.
+    const node = rootRef.current;
+    const observer =
+      node && typeof ResizeObserver !== "undefined" ? new ResizeObserver(reclamp) : null;
+    if (node && observer) observer.observe(node);
     return () => {
       window.cancelAnimationFrame(frame);
-      window.removeEventListener("resize", onResize);
+      window.removeEventListener("resize", reclamp);
+      observer?.disconnect();
     };
     // The initial corner is intentionally read only once.
     // eslint-disable-next-line react-hooks/exhaustive-deps

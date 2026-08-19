@@ -314,6 +314,64 @@ describe("FloatingCallWindow", () => {
     expect(screen.getByText("Falha sem nova tentativa")).toBeInTheDocument();
     vi.unstubAllGlobals();
   });
+
+  it("reclamps a bottom-anchored window when its own height grows after mount (regression: denied activation could push the retry button off-screen)", () => {
+    class ResizeObserverStub {
+      static instances: ResizeObserverStub[] = [];
+      callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+        ResizeObserverStub.instances.push(this);
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+    localStorage.setItem("nchat.call.floating-corner.v1", "bottom-right");
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 768 });
+
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={1}
+        controls={controls}
+        onExpand={noop}
+        activationRequired
+        onActivate={noop}
+      />,
+    );
+
+    const windowElement = screen.getByTestId("floating-call-window");
+    const observer = ResizeObserverStub.instances.at(-1)!;
+    expect(observer.observe).toHaveBeenCalledWith(windowElement);
+
+    Object.defineProperty(windowElement, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ width: 320, height: 240, left: 688, top: 512 }),
+    });
+    act(() => observer.callback([], observer as unknown as ResizeObserver));
+    expect(windowElement.style.transform).toBe("translate3d(688px, 512px, 0)");
+
+    // A denied getUserMedia prompt adds a recovery banner above the
+    // activation button without moving the window: simulate the resulting
+    // layout growth that a ResizeObserver would report.
+    Object.defineProperty(windowElement, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ width: 320, height: 340, left: 688, top: 512 }),
+    });
+    act(() => observer.callback([], observer as unknown as ResizeObserver));
+
+    // Bottom-right anchored: y must shrink so the taller window's bottom
+    // edge stays inside the viewport margin instead of pushing the trailing
+    // activation button below the visible viewport.
+    expect(windowElement.style.transform).toBe("translate3d(688px, 412px, 0)");
+
+    localStorage.removeItem("nchat.call.floating-corner.v1");
+    vi.unstubAllGlobals();
+  });
 });
 
 describe("global and dedicated presentation", () => {
