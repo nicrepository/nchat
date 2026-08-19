@@ -1,12 +1,22 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { issueResourceCallToken } from "./callApi";
+import { issueCallToken } from "./callApi";
+import { startResourceCall } from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCallSession";
 
 vi.mock("./callApi", () => ({
-  issueResourceCallToken: vi.fn(),
+  issueCallToken: vi.fn(),
+}));
+vi.mock("./resourceCallSignaling", () => ({ startResourceCall: vi.fn() }));
+vi.mock("./chatSocket", () => ({
+  acquireChatSocket: vi.fn(() => ({
+    send: vi.fn(() => true),
+    isOpen: vi.fn(() => true),
+    generation: vi.fn(() => 1),
+    release: vi.fn(),
+  })),
 }));
 
 function fakeMedia(): CallMediaBridge & {
@@ -26,10 +36,26 @@ const channelTarget: ResourceCallTarget = {
   id: "00000000-0000-4000-8000-000000000701",
   name: "geral",
 };
+const resourceCall = {
+  call_id: "00000000-0000-4000-8000-000000000705",
+  request_id: "00000000-0000-4000-8000-000000000706",
+  caller_id: "00000000-0000-4000-8000-000000000707",
+  callee_id: "",
+  target_type: "channel" as const,
+  target_id: channelTarget.id,
+  call_type: "audio" as const,
+  status: "active" as const,
+  version: 1,
+  created_at: "2026-08-18T12:00:00Z",
+  occurred_at: "2026-08-18T12:00:00Z",
+  expires_at: "2026-08-18T12:00:30Z",
+};
 
 beforeEach(() => {
-  vi.mocked(issueResourceCallToken).mockReset();
-  vi.mocked(issueResourceCallToken).mockResolvedValue({
+  vi.mocked(startResourceCall).mockReset();
+  vi.mocked(startResourceCall).mockResolvedValue(resourceCall);
+  vi.mocked(issueCallToken).mockReset();
+  vi.mocked(issueCallToken).mockResolvedValue({
     token: "resource-token",
     expiresAt: "2026-01-01T00:00:00Z",
     serverUrl: "wss://livekit-dev.nic-labs.com",
@@ -44,9 +70,10 @@ describe("useResourceCallSession", () => {
     await act(() => view.result.current.join(channelTarget));
 
     expect(media.startAudio).toHaveBeenCalledOnce();
-    expect(issueResourceCallToken).toHaveBeenCalledExactlyOnceWith("channel", channelTarget.id);
+    expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(channelTarget);
+    expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
-      { call_id: `channel:${channelTarget.id}`, call_type: "audio" },
+      { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
     );
@@ -62,9 +89,10 @@ describe("useResourceCallSession", () => {
 
     await act(() => view.result.current.join(groupTarget));
 
-    expect(issueResourceCallToken).toHaveBeenCalledExactlyOnceWith("dm", groupTarget.id);
+    expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(groupTarget);
+    expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
-      { call_id: `dm:${groupTarget.id}`, call_type: "audio" },
+      { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
     );
@@ -85,7 +113,7 @@ describe("useResourceCallSession", () => {
 
   it("reports an error and leaves status idle-adjacent when the token request fails", async () => {
     const media = fakeMedia();
-    vi.mocked(issueResourceCallToken).mockRejectedValueOnce(new Error("unauthorized"));
+    vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("unauthorized"));
     const view = renderHook(() => useResourceCallSession(media));
 
     await act(() => view.result.current.join(channelTarget));
@@ -98,7 +126,7 @@ describe("useResourceCallSession", () => {
   it("dedups a second join for the same target while one is already in flight", async () => {
     const media = fakeMedia();
     let resolveToken!: (value: { token: string; expiresAt: string; serverUrl: string }) => void;
-    vi.mocked(issueResourceCallToken).mockReturnValueOnce(
+    vi.mocked(issueCallToken).mockReturnValueOnce(
       new Promise((resolve) => {
         resolveToken = resolve;
       }),
@@ -116,7 +144,7 @@ describe("useResourceCallSession", () => {
       await Promise.all([first, second]);
     });
 
-    expect(issueResourceCallToken).toHaveBeenCalledOnce();
+    expect(issueCallToken).toHaveBeenCalledOnce();
   });
 
   it("leave() disconnects only locally, never sends any signaling event", async () => {
@@ -146,7 +174,7 @@ describe("useResourceCallSession", () => {
   it("ignores a stale token/connect resolution after leave() switched targets", async () => {
     const media = fakeMedia();
     let resolveToken!: (value: { token: string; expiresAt: string; serverUrl: string }) => void;
-    vi.mocked(issueResourceCallToken).mockReturnValueOnce(
+    vi.mocked(issueCallToken).mockReturnValueOnce(
       new Promise((resolve) => {
         resolveToken = resolve;
       }),
@@ -240,7 +268,7 @@ describe("useResourceCallSession", () => {
     });
 
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
-      { call_id: `channel:${otherTarget.id}`, call_type: "audio" },
+      { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
     );
@@ -261,7 +289,7 @@ describe("useResourceCallSession", () => {
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
-    // Let startAudio() and issueResourceCallToken() (both already-resolved
+    // Let startAudio(), startResourceCall(), and issueCallToken() (all already-resolved
     // mocks) actually settle, so the attempt is genuinely stalled awaiting
     // connect() — not still behind an earlier step — before leave() runs.
     await act(async () => {
@@ -292,7 +320,7 @@ describe("useResourceCallSession", () => {
       }),
     );
     let resolveToken!: (value: { token: string; expiresAt: string; serverUrl: string }) => void;
-    vi.mocked(issueResourceCallToken).mockReturnValueOnce(
+    vi.mocked(issueCallToken).mockReturnValueOnce(
       new Promise((resolve) => {
         resolveToken = resolve;
       }),
@@ -361,16 +389,60 @@ describe("useResourceCallSession", () => {
 
   it("retry after an error performs a real reconnect, not a no-op", async () => {
     const media = fakeMedia();
-    vi.mocked(issueResourceCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+    vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
     const view = renderHook(() => useResourceCallSession(media));
     await act(() => view.result.current.join(channelTarget));
     expect(view.result.current.status).toBe("error");
 
     await act(() => view.result.current.join(channelTarget));
 
-    expect(issueResourceCallToken).toHaveBeenCalledTimes(2);
+    expect(issueCallToken).toHaveBeenCalledTimes(2);
     expect(media.connect).toHaveBeenCalledOnce();
     expect(view.result.current.status).toBe("active");
+  });
+
+  it("reconnects only an established resource call and surfaces recovery failure", async () => {
+    const media = fakeMedia();
+    let resolveAudio!: () => void;
+    media.startAudio.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveAudio = resolve;
+      }),
+    );
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.reconnect());
+
+    let joining!: Promise<void>;
+    act(() => {
+      joining = view.result.current.join(channelTarget);
+    });
+    await act(() => view.result.current.reconnect());
+    await act(async () => {
+      resolveAudio();
+      await joining;
+    });
+
+    media.stop.mockClear();
+    media.startAudio.mockClear();
+    media.connect.mockClear();
+    await act(() => view.result.current.reconnect());
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(media.startAudio).toHaveBeenCalledOnce();
+    expect(media.connect).toHaveBeenCalledOnce();
+    expect(view.result.current.status).toBe("active");
+
+    media.stop.mockRejectedValueOnce(new Error("reconnect failed"));
+    let reconnectError: unknown;
+    await act(async () => {
+      try {
+        await view.result.current.reconnect();
+      } catch (error) {
+        reconnectError = error;
+      }
+    });
+    expect(reconnectError).toBeInstanceOf(Error);
+    expect(view.result.current.status).toBe("error");
+    expect(view.result.current.error).toContain("recuperar");
   });
 
   // ── RF-24 × RF-23: a cleanup failure is never mistaken for a completed
@@ -565,7 +637,7 @@ describe("useResourceCallSession", () => {
   describe("errorOperation", () => {
     it("is 'join' after a join failure and clears on the next successful join", async () => {
       const media = fakeMedia();
-      vi.mocked(issueResourceCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+      vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
       const view = renderHook(() => useResourceCallSession(media));
 
       await act(() => view.result.current.join(channelTarget));

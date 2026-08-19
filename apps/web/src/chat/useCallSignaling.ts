@@ -266,6 +266,10 @@ export function useCallSignaling(
       onMessage: (value, generation) => {
         if (closed || generation !== socketGenerationRef.current) return;
         const event = parseCallEvent(value);
+        // Resource-room events share the socket but have their own lifecycle
+        // controller. Treating one as a direct call would create a second media
+        // owner for the same call_id.
+        if (event && event.target_type !== "user") return;
         if (event) {
           const currentCall = callRef.current;
           const reconciliation =

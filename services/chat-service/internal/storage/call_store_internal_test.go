@@ -45,3 +45,17 @@ func TestAuthorizeCallTransitionCoversActorsStatesAndIdempotency(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthorizeResourceCallEndIsOriginatorOnly(t *testing.T) {
+	call := domain.Call{
+		CallerID: "caller", TargetType: domain.CallTargetChannel,
+		TargetID: "channel", Status: domain.CallStatusActive,
+	}
+	got, _, err := authorizeCallTransition(call, "caller", CallActionEnd)
+	if err != nil || got != domain.CallStatusEnded {
+		t.Fatalf("originator end: status=%q err=%v", got, err)
+	}
+	if _, _, err := authorizeCallTransition(call, "member", CallActionEnd); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("member error=%v, want not found", err)
+	}
+}

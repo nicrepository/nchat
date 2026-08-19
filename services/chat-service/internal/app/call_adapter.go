@@ -16,7 +16,12 @@ func (a *callHandlerAdapter) StartCall(ctx context.Context, command ws.StartCall
 	return a.service.Start(ctx, service.StartCallInput{
 		WorkspaceID: command.WorkspaceID, RequestID: command.RequestID,
 		CallerID: command.CallerID, CalleeID: command.CalleeID, Type: command.Type,
+		TargetType: domain.CallTargetType(command.TargetType), TargetID: command.TargetID,
 	})
+}
+
+func (a *callHandlerAdapter) RenewCallPresence(ctx context.Context, workspaceID, actorID, callID string) error {
+	return a.service.Presence(ctx, workspaceID, actorID, callID)
 }
 
 func (a *callHandlerAdapter) TransitionCall(ctx context.Context, workspaceID, actorID, callID string, action ws.ClientMessageType) (domain.Call, error) {
@@ -34,8 +39,8 @@ func (a *callHandlerAdapter) TransitionCall(ctx context.Context, workspaceID, ac
 	}
 }
 
-func (a *callHandlerAdapter) CurrentCall(ctx context.Context, workspaceID, actorID string) (domain.Call, error) {
-	return a.service.Current(ctx, workspaceID, actorID)
+func (a *callHandlerAdapter) CurrentCall(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
+	return a.service.Current(ctx, workspaceID, actorID, callID)
 }
 
 func runCallExpiryWorker(ctx context.Context, calls *service.CallService, logger *slog.Logger) {

@@ -23,6 +23,9 @@ interface SessionCallbacks {
   onParticipantConnected(identity: string, displayName: string): void;
   onParticipantDisconnected(identity: string): void;
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+  onActiveSpeakersChanged(identities: string[]): void;
+  onScreenShareChanged(enabled: boolean): void;
+  onRemoteScreenShareChanged(identity: string, element: HTMLMediaElement | null): void;
 }
 
 function remoteVideoFor(identity: string): HTMLVideoElement {
@@ -51,6 +54,9 @@ class FakeSession {
   readonly setCameraEnabled = vi.fn(async (): Promise<void> => undefined);
   readonly setMicrophoneEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
     this.callbacks.onMicrophoneStateChanged(enabled);
+  });
+  readonly setScreenShareEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
+    this.callbacks.onScreenShareChanged(enabled);
   });
   readonly disconnect = vi.fn(async (): Promise<void> => undefined);
 
@@ -155,6 +161,53 @@ describe("useCallMedia", () => {
     expect(view.getSession().enableCamera).not.toHaveBeenCalled();
     expect(view.getSession().enableMicrophone).toHaveBeenCalledOnce();
     expect(view.result.current.cameraEnabled).toBe(false);
+  });
+
+  it("never starts screen share on connect and toggles only from explicit intent", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    expect(session.setScreenShareEnabled).not.toHaveBeenCalled();
+    await act(() => view.result.current.toggleScreenShare());
+    expect(view.result.current.screenShareEnabled).toBe(true);
+    await act(() => view.result.current.toggleScreenShare());
+    expect(view.result.current.screenShareEnabled).toBe(false);
+    expect(session.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("stabilizes the active speaker before updating the presentation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onActiveSpeakersChanged(["identity-a"]));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+    act(() => vi.advanceTimersByTime(399));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(view.result.current.activeSpeakerId).toBe("identity-a");
+
+    view.unmount();
+    vi.useRealTimers();
+  });
+
+  it("binds remote screen share separately from participant camera media", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const element = remoteVideoFor("identity-a");
+
+    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", element));
+    expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+    render(
+      <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+    );
+    expect(screen.getByTestId("screen-share")).toContainElement(element);
+
+    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", null));
+    expect(view.result.current.remoteScreenShare).toBeNull();
   });
 
   it("attaches and removes local and remote media without storing SDK objects in React state", async () => {
