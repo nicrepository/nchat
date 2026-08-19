@@ -53,6 +53,12 @@ export interface WSMessagePayload {
   /** Missing means legacy v1 during rolling deploys. */
   body_format?: "v1" | "v2" | "v3";
   status: string;
+  /**
+   * RF-21 link safety (issue #135), a separate axis from `status`. Absent on a
+   * message with no links and on any pre-#135 server; the value is narrowed by
+   * the client that reads it.
+   */
+  link_safety_state?: unknown;
   is_removed: boolean;
   created_at: string;
   updated_at: string;
@@ -77,6 +83,9 @@ export interface WSQuotePayload {
   is_removed?: boolean;
   deleted_at?: string | null;
   created_at: string;
+  updated_at?: string;
+  /** Absent on a pre-#135 server; treated as "unknown" by the reader. */
+  link_safety_state?: string;
 }
 
 export interface WSMessageCreatedEvent {
@@ -121,6 +130,34 @@ export interface WSMessageBlockedEvent {
   reason?: string;
 }
 
+/**
+ * RF-21: what is known about a published message's links changed (issue #135).
+ *
+ * Target-scoped, unlike message.blocked, and that difference is the whole point:
+ * the message *was* delivered, so everyone holding it has to converge. It arrives
+ * when a reconciliation obtains a verdict for a link whose scan had finished
+ * without one — in either direction:
+ *
+ *   inconclusive -> safe       the "could not verify" notice goes away
+ *   inconclusive -> malicious  the links stop being usable
+ *
+ * It carries a message id, state, and update time. No URL, scan id, or provider
+ * text. The timestamp orders it against delayed create/edit events; the reducer
+ * can retain it until the corresponding message arrives without inventing a
+ * partial message.
+ */
+export interface WSMessageLinkSafetyChangedEvent {
+  type: "message.link_safety_changed";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+  link_safety: {
+    message_id: string;
+    state: string;
+    updated_at: string;
+  };
+}
+
 export interface WSMessageUpdatedEvent {
   type: "message.updated";
   target_type: "channel" | "dm";
@@ -133,6 +170,7 @@ export interface WSMessageUpdatedEvent {
     dm_id?: string;
     body: string;
     body_format: "v1" | "v2" | "v3";
+    link_safety_state?: unknown;
     edited_at: string;
     edit_count: number;
     is_edited: boolean;
@@ -159,6 +197,8 @@ function isMessageUpdatedEvent(
     typeof payload["edited_at"] === "string" &&
     typeof payload["edit_count"] === "number" &&
     typeof payload["is_edited"] === "boolean" &&
+    (payload["link_safety_state"] === undefined ||
+      typeof payload["link_safety_state"] === "string") &&
     (payload["status"] === undefined ||
       payload["status"] === "active" ||
       payload["status"] === "deleted") &&
@@ -268,6 +308,7 @@ interface UseChatWebSocketOptions {
   additionalTargets?: readonly WSSubscriptionTarget[];
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
   onMessageBlocked?: (event: WSMessageBlockedEvent) => void;
+  onMessageLinkSafetyChanged?: (event: WSMessageLinkSafetyChangedEvent) => void;
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
@@ -305,6 +346,7 @@ export function useChatWebSocket({
   additionalTargets,
   onMessageCreated,
   onMessageBlocked,
+  onMessageLinkSafetyChanged,
   onMessageUpdated,
   onReactionUpdated,
   onPinUpdated,
@@ -334,6 +376,7 @@ export function useChatWebSocket({
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
   const onMessageBlockedRef = useRef(onMessageBlocked);
+  const onLinkSafetyRef = useRef(onMessageLinkSafetyChanged);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
   const onPinRef = useRef(onPinUpdated);
@@ -356,6 +399,7 @@ export function useChatWebSocket({
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
     onMessageBlockedRef.current = onMessageBlocked;
+    onLinkSafetyRef.current = onMessageLinkSafetyChanged;
     onMessageUpdatedRef.current = onMessageUpdated;
     onReactionRef.current = onReactionUpdated;
     onPinRef.current = onPinUpdated;
@@ -553,6 +597,27 @@ export function useChatWebSocket({
           return;
         }
         if (!control.expected.has(incomingTargetKey)) return;
+        // Routed for any subscribed target rather than only the primary one, for
+        // the same reason attachment.status is: a reconciliation lands minutes
+        // after the message and quite possibly while the reader is looking at a
+        // different conversation. The correction still has to be applied — a
+        // message that stopped being safe must not stay drawn as safe just
+        // because its tab is in the background.
+        if (d["type"] === "message.link_safety_changed" && typeof d["message_id"] === "string") {
+          const linkSafety = d["link_safety"];
+          if (
+            !linkSafety ||
+            typeof linkSafety !== "object" ||
+            typeof (linkSafety as Record<string, unknown>)["message_id"] !== "string" ||
+            (linkSafety as Record<string, unknown>)["message_id"] !== d["message_id"] ||
+            typeof (linkSafety as Record<string, unknown>)["state"] !== "string" ||
+            typeof (linkSafety as Record<string, unknown>)["updated_at"] !== "string"
+          ) {
+            return;
+          }
+          onLinkSafetyRef.current?.(normalizedData as unknown as WSMessageLinkSafetyChangedEvent);
+          return;
+        }
         if (d["type"] === "message.created") {
           onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
           return;

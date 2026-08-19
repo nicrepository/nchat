@@ -53,6 +53,8 @@ type fakeMessageProvider struct {
 	historyErr          error
 	referenceOut        []service.MessageReferenceResolution
 	referenceErr        error
+	securitySnapshots   []service.MessageSecuritySnapshot
+	securitySnapshotErr error
 	forwardedMsg        domain.Message
 	forwardReplay       bool
 	forwardErr          error
@@ -67,6 +69,7 @@ type fakeMessageProvider struct {
 	lastDeleteInput        service.DeleteMessageInput
 	lastHistoryInput       service.GetMessageEditHistoryInput
 	lastReferenceInput     service.ResolveMessageReferencesInput
+	lastSecurityInput      service.MessageSecuritySnapshotsInput
 	lastForwardInput       service.ForwardChannelMessageInput
 }
 
@@ -217,6 +220,11 @@ func (f *fakeMessageProvider) GetDMMessage(_ context.Context, in service.GetDMMe
 func (f *fakeMessageProvider) ResolveMessageReferenceBatch(_ context.Context, in service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error) {
 	f.lastReferenceInput = in
 	return f.referenceOut, f.referenceErr
+}
+
+func (f *fakeMessageProvider) MessageSecuritySnapshots(_ context.Context, in service.MessageSecuritySnapshotsInput) ([]service.MessageSecuritySnapshot, error) {
+	f.lastSecurityInput = in
+	return f.securitySnapshots, f.securitySnapshotErr
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -895,6 +903,76 @@ func TestMessageHandler_ResolveDMMessageReferences_RejectsUnknownFields(t *testi
 	h.ResolveDMMessageReferences(rec, r)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMessageHandler_GetChannelMessageSecuritySnapshots_ReturnsOnlySecurityProjection(t *testing.T) {
+	updatedAt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	provider := &fakeMessageProvider{securitySnapshots: []service.MessageSecuritySnapshot{{
+		MessageID: testMessageID, Available: true, Status: domain.MessageStatusActive,
+		LinkSafetyState: domain.MessageLinkSafetyInconclusive, UpdatedAt: updatedAt,
+		Quoted: &service.QuotedMessageSecuritySnapshot{
+			MessageID: otherMessageID, Status: domain.MessageStatusActive,
+			LinkSafetyState: domain.MessageLinkSafetyMalicious, UpdatedAt: updatedAt,
+		},
+	}}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/message-security-snapshots", strings.NewReader(
+		`{"message_ids":["`+testMessageID+`"]}`,
+	))
+	r.SetPathValue("channelID", testChannelID)
+	rec := httptest.NewRecorder()
+
+	h.GetChannelMessageSecuritySnapshots(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, forbidden := range []string{"body", "url", "scan_uuid", "canonical_url"} {
+		if strings.Contains(body, `"`+forbidden+`"`) {
+			t.Fatalf("security snapshot exposed %q: %s", forbidden, body)
+		}
+	}
+	if !strings.Contains(body, `"link_safety_state":"inconclusive"`) || !strings.Contains(body, `"link_safety_state":"malicious"`) {
+		t.Fatalf("security states missing: %s", body)
+	}
+	if provider.lastSecurityInput.ChannelID != testChannelID || provider.lastSecurityInput.CallerID != msgTestUserID {
+		t.Fatalf("unexpected service input: %+v", provider.lastSecurityInput)
+	}
+}
+
+func TestMessageHandler_GetDMMessageSecuritySnapshots_RejectsURLAndScanIdentity(t *testing.T) {
+	provider := &fakeMessageProvider{}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	r := requestWithUser(http.MethodPost, "/api/chat/dm/"+testConversationID+"/message-security-snapshots", strings.NewReader(
+		`{"message_ids":["`+testMessageID+`"],"url":"https://example.test","scan_uuid":"`+otherMessageID+`"}`,
+	))
+	r.SetPathValue("conversationID", testConversationID)
+	rec := httptest.NewRecorder()
+
+	h.GetDMMessageSecuritySnapshots(rec, r)
+
+	if rec.Code != http.StatusBadRequest || len(provider.lastSecurityInput.MessageIDs) != 0 {
+		t.Fatalf("status/input = %d/%+v body=%s", rec.Code, provider.lastSecurityInput, rec.Body.String())
+	}
+}
+
+func TestMessageHandler_GetChannelMessageSecuritySnapshots_HidesUnavailableMetadata(t *testing.T) {
+	provider := &fakeMessageProvider{securitySnapshots: []service.MessageSecuritySnapshot{{
+		MessageID: testMessageID,
+	}}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/message-security-snapshots", strings.NewReader(
+		`{"message_ids":["`+testMessageID+`"]}`,
+	))
+	r.SetPathValue("channelID", testChannelID)
+	rec := httptest.NewRecorder()
+
+	h.GetChannelMessageSecuritySnapshots(rec, r)
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"available":false`) || strings.Contains(rec.Body.String(), `"status"`) || strings.Contains(rec.Body.String(), `"link_safety_state"`) {
+		t.Fatalf("unavailable snapshot leaked metadata: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -1429,6 +1429,9 @@ func (p *countingEditProvider) GetDMMessage(context.Context, service.GetDMMessag
 func (p *countingEditProvider) ResolveMessageReferenceBatch(context.Context, service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error) {
 	panic("unexpected call")
 }
+func (p *countingEditProvider) MessageSecuritySnapshots(context.Context, service.MessageSecuritySnapshotsInput) ([]service.MessageSecuritySnapshot, error) {
+	panic("unexpected call")
+}
 func (p *countingEditProvider) DeleteMessage(context.Context, service.DeleteMessageInput) (domain.Message, error) {
 	panic("unexpected call")
 }

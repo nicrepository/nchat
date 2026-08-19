@@ -28,11 +28,14 @@ import {
   editMessage as editMessageRequest,
   favoriteMessage,
   fetchChannelMessage,
+  fetchChannelMessageSecuritySnapshots,
   fetchChannelMessages,
   fetchDMMessage,
+  fetchDMMessageSecuritySnapshots,
   fetchDMMessages,
   fetchLinkSafetyStatuses,
   postChannelMessage,
+  reconcileMessageLinkSafety,
   postDMMessage,
   resolveChannelMessageReferences,
   resolveDMMessageReferences,
@@ -42,15 +45,19 @@ import { markPresenceActivity } from "./chatSocket";
 import { ApiRequestError } from "../lib/api";
 import {
   normalizeBodyFormat,
+  normalizeLinkSafety,
   parseMessageAttachments,
+  type LinkSafetyRecheck,
   type ChannelAttachment,
   type Message,
   type MessagePage,
+  type MessageSecuritySnapshot,
 } from "./chatTypes";
 import {
   useChatWebSocket,
   type WSMessageBlockedEvent,
   type WSMessageCreatedEvent,
+  type WSMessageLinkSafetyChangedEvent,
   type WSMessageUpdatedEvent,
   type WSClientErrorEvent,
   type WSMembersAddedEvent,
@@ -105,6 +112,8 @@ export interface MessagesState {
   pendingReactions: Map<string, Message["reactions"]>;
   /** RF-07: message currently selected as the parent quote for the composer. */
   replyTo: Message | null;
+  /** Versioned corrections that arrived before their message.created payload. */
+  linkSafetyCorrections: Map<string, { state: Message["linkSafetyState"]; updatedAt: string }>;
 }
 
 // ── Send result ───────────────────────────────────────────────────────────────
@@ -141,6 +150,18 @@ type Action =
       messageId: string;
       reason?: "malicious_link" | "link_check_inconclusive" | "unavailable";
     }
+  /**
+   * RF-21: what is known about a *published* message's links changed (issue
+   * #135). Applied to a message this view already holds, never inserting one, so
+   * a repeated delivery is idempotent.
+   */
+  | {
+      type: "link_safety_changed";
+      messageId: string;
+      state: Message["linkSafetyState"];
+      updatedAt: string;
+    }
+  | { type: "security_snapshots_refreshed"; snapshots: MessageSecuritySnapshot[] }
   | { type: "prepending" }
   | { type: "prepended"; page: MessagePage }
   | { type: "prepend_error" }
@@ -231,6 +252,7 @@ const initialState: MessagesState = {
   actionError: null,
   pendingReactions: new Map(),
   replyTo: null,
+  linkSafetyCorrections: new Map(),
 };
 
 const realtimeFallbackErrorMessage = "Não foi possível atualizar mensagens em tempo real.";
@@ -291,6 +313,77 @@ function sendErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Não foi possível enviar a mensagem.";
 }
 
+function isOlderSecurityVersion(candidate: string, current: string): boolean {
+  const candidateMs = Date.parse(candidate);
+  const currentMs = Date.parse(current);
+  return Number.isFinite(candidateMs) && Number.isFinite(currentMs) && candidateMs < currentMs;
+}
+
+function isNotNewerSecurityVersion(candidate: string, current: string): boolean {
+  const candidateMs = Date.parse(candidate);
+  const currentMs = Date.parse(current);
+  return Number.isFinite(candidateMs) && Number.isFinite(currentMs) && candidateMs <= currentMs;
+}
+
+function applyLinkSafetyCorrection(
+  message: Message,
+  correction: { state: Message["linkSafetyState"]; updatedAt: string } | undefined,
+): Message {
+  if (!correction || isOlderSecurityVersion(correction.updatedAt, message.updatedAt))
+    return message;
+  return {
+    ...message,
+    linkSafetyState: correction.state,
+    bodyText: correction.state === "malicious" ? "" : message.bodyText,
+    updatedAt: correction.updatedAt,
+  };
+}
+
+function applyLinkSafetyCorrections(
+  message: Message,
+  corrections: MessagesState["linkSafetyCorrections"],
+): Message {
+  let next = applyLinkSafetyCorrection(message, corrections.get(message.id));
+  const quoted = next.quoted;
+  const quoteCorrection = quoted && corrections.get(quoted.id);
+  if (
+    quoted &&
+    quoteCorrection &&
+    !isOlderSecurityVersion(quoteCorrection.updatedAt, quoted.updatedAt ?? quoted.createdAt)
+  ) {
+    next = {
+      ...next,
+      quoted: {
+        ...quoted,
+        linkSafetyState: quoteCorrection.state ?? "unknown",
+        bodyText: quoteCorrection.state === "malicious" ? "" : quoted.bodyText,
+        updatedAt: quoteCorrection.updatedAt,
+      },
+    };
+  }
+  const reference = next.reference;
+  const referenceCorrection = reference?.available && corrections.get(reference.messageId);
+  if (
+    reference?.available &&
+    referenceCorrection &&
+    !isOlderSecurityVersion(
+      referenceCorrection.updatedAt,
+      reference.updatedAt ?? reference.createdAt,
+    )
+  ) {
+    next = {
+      ...next,
+      reference: {
+        ...reference,
+        linkSafetyState: referenceCorrection.state ?? "unknown",
+        bodyText: referenceCorrection.state === "malicious" ? "" : reference.bodyText,
+        updatedAt: referenceCorrection.updatedAt,
+      },
+    };
+  }
+  return next;
+}
+
 function reducer(state: MessagesState, action: Action): MessagesState {
   switch (action.type) {
     case "loading":
@@ -311,7 +404,9 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     case "loaded":
       return {
         status: "ready",
-        messages: action.page.messages,
+        messages: action.page.messages.map((message) =>
+          applyLinkSafetyCorrections(message, state.linkSafetyCorrections),
+        ),
         nextCursor: action.page.nextCursor,
         sendError: null,
         sending: false,
@@ -321,6 +416,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         actionError: null,
         pendingReactions: new Map(),
         replyTo: null,
+        linkSafetyCorrections: state.linkSafetyCorrections,
       };
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
@@ -329,14 +425,18 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     case "sent": {
       // Deduplicate: a realtime event or a prior send might have already added this message.
       const alreadyPresent = state.messages.some((m) => m.id === action.message.id);
+      const message = applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections);
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      linkSafetyCorrections.delete(action.message.id);
       return {
         ...state,
-        messages: alreadyPresent ? state.messages : [...state.messages, action.message],
+        messages: alreadyPresent ? state.messages : [...state.messages, message],
         sending: false,
         sendError: null,
         lastMutation: alreadyPresent ? "none" : "append",
         realtimeError: null,
         replyTo: null,
+        linkSafetyCorrections,
       };
     }
     case "message_blocked": {
@@ -366,6 +466,230 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         lastMutation: "none",
       };
     }
+    case "link_safety_changed": {
+      // Only a message already on screen, and only a real change. A correction
+      // for something this view never held is a no-op, and so is one that agrees
+      // with what is already drawn — which is what makes at-least-once delivery
+      // of this event free.
+      //
+      // Nothing here inserts a message and nothing changes `status`: if the
+      // message has not arrived yet, only a versioned correction is retained for
+      // its eventual create event. Nothing here fetches a URL either — see
+      // MessageBubble, where this state is rendered and never acted on.
+      const previousCorrection = state.linkSafetyCorrections.get(action.messageId);
+      if (
+        previousCorrection?.state === action.state &&
+        previousCorrection?.updatedAt === action.updatedAt
+      ) {
+        return state;
+      }
+      if (
+        previousCorrection &&
+        isOlderSecurityVersion(action.updatedAt, previousCorrection.updatedAt)
+      ) {
+        return state;
+      }
+      // A quote/reference can be the only visible copy of the source. Its
+      // version is still authoritative: retaining an older correction here
+      // would let a later stale snapshot re-apply it.
+      const hasNewerVisibleVersion = state.messages.some(
+        (message) =>
+          (message.id === action.messageId &&
+            isOlderSecurityVersion(action.updatedAt, message.updatedAt)) ||
+          (message.quoted?.id === action.messageId &&
+            isOlderSecurityVersion(
+              action.updatedAt,
+              message.quoted.updatedAt ?? message.quoted.createdAt,
+            )) ||
+          (message.reference?.available &&
+            message.reference.messageId === action.messageId &&
+            isOlderSecurityVersion(
+              action.updatedAt,
+              message.reference.updatedAt ?? message.reference.createdAt,
+            )),
+      );
+      if (
+        hasNewerVisibleVersion ||
+        (state.replyTo?.id === action.messageId &&
+          isOlderSecurityVersion(action.updatedAt, state.replyTo.updatedAt))
+      ) {
+        return state;
+      }
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      linkSafetyCorrections.set(action.messageId, {
+        state: action.state,
+        updatedAt: action.updatedAt,
+      });
+      const malicious = action.state === "malicious";
+      const messages = state.messages.map((message) => {
+        let next = message;
+        if (
+          message.id === action.messageId &&
+          !isOlderSecurityVersion(action.updatedAt, message.updatedAt) &&
+          ((message.linkSafetyState ?? "") !== (action.state ?? "") ||
+            (malicious && message.bodyText !== ""))
+        ) {
+          next = {
+            ...next,
+            linkSafetyState: action.state,
+            bodyText: malicious ? "" : next.bodyText,
+            updatedAt: action.updatedAt,
+          };
+        }
+        if (
+          message.quoted?.id === action.messageId &&
+          !isOlderSecurityVersion(
+            action.updatedAt,
+            message.quoted.updatedAt ?? message.quoted.createdAt,
+          ) &&
+          (message.quoted.linkSafetyState !== action.state ||
+            (malicious && message.quoted.bodyText !== ""))
+        ) {
+          next = {
+            ...next,
+            quoted: {
+              ...message.quoted,
+              linkSafetyState: action.state ?? "",
+              bodyText: malicious ? "" : message.quoted.bodyText,
+              updatedAt: action.updatedAt,
+            },
+          };
+        }
+        if (
+          message.reference?.available &&
+          message.reference.messageId === action.messageId &&
+          !isOlderSecurityVersion(
+            action.updatedAt,
+            message.reference.updatedAt ?? message.reference.createdAt,
+          ) &&
+          (message.reference.linkSafetyState !== action.state ||
+            (malicious && message.reference.bodyText !== ""))
+        ) {
+          next = {
+            ...next,
+            reference: {
+              ...message.reference,
+              linkSafetyState: action.state ?? "",
+              bodyText: malicious ? "" : message.reference.bodyText,
+              updatedAt: action.updatedAt,
+            },
+          };
+        }
+        return next;
+      });
+      const replyTo =
+        state.replyTo?.id === action.messageId &&
+        !isOlderSecurityVersion(action.updatedAt, state.replyTo.updatedAt)
+          ? applyLinkSafetyCorrection(state.replyTo, {
+              state: action.state,
+              updatedAt: action.updatedAt,
+            })
+          : state.replyTo;
+      // lastMutation stays "none": nothing was added or removed, so the list must
+      // not scroll. A notice appearing above a message the reader is looking at
+      // should not move the conversation under them.
+      return {
+        ...state,
+        messages,
+        replyTo,
+        linkSafetyCorrections,
+        lastMutation: "none",
+      };
+    }
+    case "security_snapshots_refreshed": {
+      const snapshots = new Map(action.snapshots.map((snapshot) => [snapshot.messageId, snapshot]));
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      let changed = false;
+      const messages = state.messages.map((message) => {
+        const snapshot = snapshots.get(message.id);
+        if (!snapshot) return message;
+        if (!snapshot.available) {
+          linkSafetyCorrections.delete(message.id);
+          changed = true;
+          return {
+            ...message,
+            bodyText: "",
+            quoted: undefined,
+            reference: undefined,
+            reactions: [],
+            status: "deleted" as const,
+            isRemoved: true,
+          };
+        }
+        const correction = linkSafetyCorrections.get(message.id);
+        const correctionWins =
+          correction && isNotNewerSecurityVersion(snapshot.updatedAt, correction.updatedAt);
+        if (!correctionWins) linkSafetyCorrections.delete(message.id);
+        const snapshotWins = !isOlderSecurityVersion(snapshot.updatedAt, message.updatedAt);
+        const effectiveState = correctionWins
+          ? correction.state
+          : snapshotWins
+            ? snapshot.linkSafetyState
+            : message.linkSafetyState;
+        const effectiveUpdatedAt = correctionWins
+          ? correction.updatedAt
+          : snapshotWins
+            ? snapshot.updatedAt
+            : message.updatedAt;
+        const effectiveStatus = snapshotWins ? snapshot.status : message.status;
+        const removed = effectiveStatus === "deleted";
+        const malicious = effectiveState === "malicious";
+        let next: Message = {
+          ...message,
+          status: effectiveStatus,
+          linkSafetyState: effectiveState,
+          bodyText: removed || malicious ? "" : message.bodyText,
+          isRemoved: removed,
+          updatedAt: effectiveUpdatedAt,
+          ...(removed ? { quoted: undefined, reactions: [] } : {}),
+        };
+        if (!removed && message.quoted && snapshot.quoted?.messageId === message.quoted.id) {
+          const quoteCurrentVersion = message.quoted.updatedAt ?? message.quoted.createdAt;
+          const quoteCorrection = linkSafetyCorrections.get(message.quoted.id);
+          const quoteCorrectionWins =
+            quoteCorrection &&
+            isNotNewerSecurityVersion(snapshot.quoted.updatedAt, quoteCorrection.updatedAt) &&
+            !isOlderSecurityVersion(quoteCorrection.updatedAt, quoteCurrentVersion);
+          if (!quoteCorrectionWins) linkSafetyCorrections.delete(message.quoted.id);
+          const quoteSnapshotWins = !isOlderSecurityVersion(
+            snapshot.quoted.updatedAt,
+            quoteCurrentVersion,
+          );
+          const quoteState = quoteCorrectionWins
+            ? (quoteCorrection.state ?? "unknown")
+            : quoteSnapshotWins
+              ? snapshot.quoted.linkSafetyState
+              : message.quoted.linkSafetyState;
+          const quoteUpdatedAt = quoteCorrectionWins
+            ? quoteCorrection.updatedAt
+            : quoteSnapshotWins
+              ? snapshot.quoted.updatedAt
+              : quoteCurrentVersion;
+          const quoteRemoved = quoteSnapshotWins
+            ? snapshot.quoted.status === "deleted"
+            : message.quoted.isRemoved;
+          next = {
+            ...next,
+            quoted: {
+              ...message.quoted,
+              linkSafetyState: quoteState,
+              updatedAt: quoteUpdatedAt,
+              isRemoved: quoteRemoved,
+              bodyText: quoteRemoved || quoteState === "malicious" ? "" : message.quoted.bodyText,
+            },
+          };
+        }
+        changed = true;
+        return next;
+      });
+      if (!changed) return state;
+      const replySnapshot = state.replyTo ? snapshots.get(state.replyTo.id) : undefined;
+      const replyTo =
+        replySnapshot && (!replySnapshot.available || replySnapshot.status === "deleted")
+          ? null
+          : state.replyTo;
+      return { ...state, messages, replyTo, linkSafetyCorrections, lastMutation: "none" };
+    }
     case "send_error":
       return { ...state, sending: false, sendError: action.error };
     case "prepending":
@@ -373,7 +697,9 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     case "prepended": {
       // Prepend older messages; deduplicate by ID to guard against cursor overlaps.
       const existingIds = new Set(state.messages.map((m) => m.id));
-      const fresh = action.page.messages.filter((m) => !existingIds.has(m.id));
+      const fresh = action.page.messages
+        .filter((m) => !existingIds.has(m.id))
+        .map((message) => applyLinkSafetyCorrections(message, state.linkSafetyCorrections));
       // If every message in this page was already present, no DOM change occurs:
       // skip the scroll delta calculation by keeping lastMutation as "none".
       return {
@@ -387,9 +713,12 @@ function reducer(state: MessagesState, action: Action): MessagesState {
     case "prepend_error":
       return { ...state, loadingMore: false, lastMutation: "none" };
     case "ws_received": {
+      const received = applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections);
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      linkSafetyCorrections.delete(action.message.id);
       // Dedup: if the message is already present (e.g. our own POST response
       // arrived before the WS event), this is normally a pure no-op.
-      const existingIndex = state.messages.findIndex((m) => m.id === action.message.id);
+      const existingIndex = state.messages.findIndex((m) => m.id === received.id);
       if (existingIndex >= 0) {
         const existing = state.messages[existingIndex];
         // RF-21: the one case where "already present" is not a no-op.
@@ -405,21 +734,18 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         // local one in place: same position, no duplicate, no re-sort. Only this
         // transition is special-cased; every other repeat delivery stays the
         // no-op it was, which is what keeps at-least-once outbox delivery safe.
-        if (
-          existing.status === "pending_link_scan" &&
-          action.message.status !== "pending_link_scan"
-        ) {
+        if (existing.status === "pending_link_scan" && received.status !== "pending_link_scan") {
           const messages = [...state.messages];
-          messages[existingIndex] = action.message;
-          return { ...state, messages, realtimeError: null };
+          messages[existingIndex] = received;
+          return { ...state, messages, linkSafetyCorrections, realtimeError: null };
         }
-        return { ...state, realtimeError: null };
+        return { ...state, linkSafetyCorrections, realtimeError: null };
       }
 
       // Insert in stable (createdAt, id) order to handle out-of-order delivery.
       // Most WS messages are newer than all existing ones, so a quick tail-check
       // avoids a full sort in the common case.
-      const insertion = insertMessageChronologically(state.messages, action.message);
+      const insertion = insertMessageChronologically(state.messages, received);
 
       return {
         ...state,
@@ -429,6 +755,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         // If the message was inserted mid-list (out-of-order), no auto-scroll.
         lastMutation: insertion.isNewer ? "ws_append" : "none",
         realtimeError: null,
+        linkSafetyCorrections,
       };
     }
     case "edit_optimistic": {
@@ -441,32 +768,44 @@ function reducer(state: MessagesState, action: Action): MessagesState {
               isEdited: true,
               editCount: message.editCount + 1,
               editedAt: action.editedAt,
-              updatedAt: action.editedAt,
+              // The new body has not yet received the server's verdict. Keeping the
+              // old body's clearance here would briefly authorize different links.
+              linkSafetyState: "unknown" as const,
             }
           : message,
       );
       return { ...state, messages, lastMutation: "none" };
     }
-    case "edit_confirmed":
+    case "edit_confirmed": {
+      const correction = state.linkSafetyCorrections.get(action.message.id);
+      const correctionWins =
+        correction && isNotNewerSecurityVersion(action.message.updatedAt, correction.updatedAt);
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      if (!correctionWins) linkSafetyCorrections.delete(action.message.id);
       return {
         ...state,
         messages: state.messages.map((message) =>
           message.id === action.message.id &&
           !message.isRemoved &&
           action.message.editCount >= message.editCount
-            ? {
-                ...message,
-                bodyText: action.message.bodyText,
-                bodyFormat: action.message.bodyFormat,
-                editedAt: action.message.editedAt,
-                updatedAt: action.message.updatedAt,
-                editCount: action.message.editCount,
-                isEdited: action.message.isEdited,
-              }
+            ? correctionWins
+              ? applyLinkSafetyCorrection(message, correction)
+              : {
+                  ...message,
+                  bodyText: action.message.bodyText,
+                  bodyFormat: action.message.bodyFormat,
+                  editedAt: action.message.editedAt,
+                  updatedAt: action.message.updatedAt,
+                  editCount: action.message.editCount,
+                  isEdited: action.message.isEdited,
+                  linkSafetyState: action.message.linkSafetyState,
+                }
             : message,
         ),
+        linkSafetyCorrections,
         lastMutation: "none",
       };
+    }
     case "edit_revert":
       return {
         ...state,
@@ -474,7 +813,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
           message.id === action.message.id &&
           !message.isRemoved &&
           message.editedAt === action.optimisticEditedAt
-            ? action.message
+            ? applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections)
             : message,
         ),
         lastMutation: "none",
@@ -484,10 +823,19 @@ function reducer(state: MessagesState, action: Action): MessagesState {
       if (!update) return state;
       const removed = update.is_removed === true || update.status === "deleted";
       const deletedAt = update.deleted_at ?? update.updated_at ?? null;
+      const updateVersion = update.updated_at ?? update.edited_at;
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      const correction = linkSafetyCorrections.get(update.message_id);
+      if (!correction || !isNotNewerSecurityVersion(updateVersion, correction.updatedAt)) {
+        linkSafetyCorrections.delete(update.message_id);
+      }
       return {
         ...state,
         messages: state.messages.map((message) => {
           if (message.id === update.message_id) {
+            if (correction && isNotNewerSecurityVersion(updateVersion, correction.updatedAt)) {
+              return message;
+            }
             if (message.isRemoved || removed) {
               return removed
                 ? {
@@ -502,16 +850,21 @@ function reducer(state: MessagesState, action: Action): MessagesState {
                   }
                 : message;
             }
+            const linkSafetyState =
+              update.link_safety_state === undefined
+                ? message.linkSafetyState
+                : normalizeLinkSafety(update.link_safety_state);
             return update.edit_count < message.editCount
               ? message
               : {
                   ...message,
-                  bodyText: update.body,
+                  bodyText: linkSafetyState === "malicious" ? "" : update.body,
                   bodyFormat: normalizeBodyFormat(update.body_format),
                   editedAt: update.edited_at,
                   updatedAt: update.updated_at ?? update.edited_at,
                   editCount: update.edit_count,
                   isEdited: update.is_edited,
+                  linkSafetyState,
                 };
           }
           if (removed && message.quoted?.id === update.message_id) {
@@ -525,13 +878,20 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         replyTo: removed && state.replyTo?.id === update.message_id ? null : state.replyTo,
         lastMutation: "none",
         realtimeError: null,
+        linkSafetyCorrections,
       };
     }
     case "message_snapshot": {
       const removed = action.message.isRemoved || action.message.status === "deleted";
-      const snapshot = removed
+      const rawSnapshot = removed
         ? { ...action.message, bodyText: "", quoted: undefined, reactions: [] }
         : action.message;
+      const correction = state.linkSafetyCorrections.get(rawSnapshot.id);
+      const snapshot = applyLinkSafetyCorrections(rawSnapshot, state.linkSafetyCorrections);
+      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+      if (!correction || !isNotNewerSecurityVersion(rawSnapshot.updatedAt, correction.updatedAt)) {
+        linkSafetyCorrections.delete(rawSnapshot.id);
+      }
       const alreadyPresent = state.messages.some((message) => message.id === snapshot.id);
       let insertedAsNewer = false;
       let messages = state.messages.map((message) => {
@@ -560,6 +920,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         replyTo: removed && state.replyTo?.id === snapshot.id ? null : state.replyTo,
         lastMutation: insertedAsNewer ? "ws_append" : "none",
         realtimeError: null,
+        linkSafetyCorrections,
       };
     }
     case "references_refreshed":
@@ -567,7 +928,20 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         ...state,
         messages: state.messages.map((message) => {
           const reference = action.references[message.id];
-          return reference && message.reference ? { ...message, reference } : message;
+          if (!reference || !message.reference) return message;
+          if (
+            message.reference.available &&
+            reference.available &&
+            ((message.reference.updatedAt &&
+              reference.updatedAt &&
+              isOlderSecurityVersion(reference.updatedAt, message.reference.updatedAt)) ||
+              (message.reference.linkSafetyState === "malicious" &&
+                !reference.updatedAt &&
+                reference.linkSafetyState !== "malicious"))
+          ) {
+            return message;
+          }
+          return { ...message, reference };
         }),
       };
     case "delete_error":
@@ -759,6 +1133,14 @@ export interface UseMessagesResult {
   cancelReply: () => void;
   toggleReaction: (messageId: string, emoji: string) => void;
   toggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  /**
+   * RF-21 "Verificar novamente" (issue #135): asks the server to re-read what it
+   * already knows about one message's unverified links. It never starts a new
+   * scan. Resolves to the message's state afterwards, or `undefined` when the
+   * request itself failed — in both cases the caller simply re-enables its
+   * button.
+   */
+  reconcileLinkSafety: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
   editMessageLocal: (
     messageId: string,
     body: string,
@@ -1153,6 +1535,26 @@ export function useMessages({
     });
   }, []);
 
+  // RF-21: a published message's link-safety state changed (issue #135).
+  //
+  // This is the convergence path for a reconciliation that landed after the
+  // message was delivered — the notice disappearing when a verdict finally
+  // arrives, or the links being withdrawn when one turns out to be malicious.
+  // Unlike message.blocked it never removes the message: it was published, and it
+  // stays published.
+  //
+  // The event's own `link_safety.state` is preferred and the envelope's is not
+  // consulted for the value, so a payload the server stripped simply carries the
+  // conservative fallback normalizeLinkSafety produces for an unknown value.
+  const handleWsLinkSafetyChanged = useCallback((evt: WSMessageLinkSafetyChangedEvent) => {
+    dispatch({
+      type: "link_safety_changed",
+      messageId: evt.message_id,
+      state: normalizeLinkSafety(evt.link_safety?.state),
+      updatedAt: evt.link_safety.updated_at,
+    });
+  }, []);
+
   const handleWsMessageCreated = useCallback(
     (evt: WSMessageCreatedEvent) => {
       const loadKey = `${kind}:${targetId}`;
@@ -1175,6 +1577,10 @@ export function useMessages({
           bodyFormat: normalizeBodyFormat(p.body_format),
           isRemoved: removed,
           status: removed ? "deleted" : "active",
+          // RF-21 (issue #135). A published message may carry links the provider
+          // could not produce a verdict for; this is what draws the notice. It is
+          // rendered, never acted on — nothing in this client fetches a URL.
+          linkSafetyState: removed ? "" : normalizeLinkSafety(p.link_safety_state),
           deletedAt: p.deleted_at ?? null,
           createdAt: p.created_at,
           updatedAt: p.updated_at,
@@ -1196,6 +1602,8 @@ export function useMessages({
                   isRemoved: p.quoted.is_removed ?? false,
                   deletedAt: p.quoted.deleted_at ?? null,
                   createdAt: p.quoted.created_at ?? "",
+                  updatedAt: p.quoted.updated_at ?? p.quoted.created_at ?? "",
+                  linkSafetyState: normalizeLinkSafety(p.quoted.link_safety_state),
                 }
               : undefined,
           // Same parser as the HTTP path, so an event and a refetch describe the
@@ -1463,10 +1871,71 @@ export function useMessages({
     targetId,
   ]);
 
+  const refreshAuthoritativeMessageSecurity = useCallback(() => {
+    const visible = stateRef.current.messages;
+    const snapshotIDs = visible
+      .filter(
+        (message) =>
+          message.status === "active" &&
+          (message.linkSafetyState === "inconclusive" ||
+            message.quoted?.linkSafetyState === "inconclusive"),
+      )
+      .map((message) => message.id);
+    const referenceIDs = visible
+      .filter((message) => message.reference?.available)
+      .map((message) => message.id);
+    if (snapshotIDs.length === 0 && referenceIDs.length === 0) return;
+
+    const batches = (ids: string[]) =>
+      Array.from({ length: Math.ceil(ids.length / referenceRevalidationBatchSize) }, (_, index) =>
+        ids.slice(
+          index * referenceRevalidationBatchSize,
+          (index + 1) * referenceRevalidationBatchSize,
+        ),
+      );
+    const fallbackKey = "message-security-refresh";
+    const ctrl = startWsFallback(fallbackKey);
+    const loadKey = `${kind}:${targetId}`;
+    const snapshotRequests = batches(snapshotIDs).map((messageIDs) =>
+      kind === "channel"
+        ? fetchChannelMessageSecuritySnapshots(targetId, messageIDs, ctrl.signal)
+        : fetchDMMessageSecuritySnapshots(targetId, messageIDs, ctrl.signal),
+    );
+    const referenceRequests = batches(referenceIDs).map((messageIDs) =>
+      kind === "channel"
+        ? resolveChannelMessageReferences(targetId, messageIDs, ctrl.signal)
+        : resolveDMMessageReferences(targetId, messageIDs, ctrl.signal),
+    );
+
+    void Promise.allSettled([
+      Promise.all(snapshotRequests).then((parts) => parts.flat()),
+      Promise.all(referenceRequests).then((parts) => Object.assign({}, ...parts)),
+    ]).then(([snapshotResult, referenceResult]) => {
+      finishWsFallback(fallbackKey, ctrl);
+      if (ctrl.signal.aborted || !isCurrentTarget(loadKey)) return;
+      if (snapshotResult.status === "fulfilled") {
+        dispatch({ type: "security_snapshots_refreshed", snapshots: snapshotResult.value });
+      }
+      if (referenceIDs.length > 0) {
+        const references = referenceResult.status === "fulfilled" ? referenceResult.value : {};
+        dispatch({
+          type: "references_refreshed",
+          references: Object.fromEntries(
+            referenceIDs.map((messageID) => [
+              messageID,
+              references[messageID] ?? { available: false },
+            ]),
+          ),
+        });
+      }
+    });
+  }, [finishWsFallback, isCurrentTarget, kind, startWsFallback, targetId]);
+
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });
     reconcilePendingLinkScans();
-  }, [reconcilePendingLinkScans]);
+    refreshAuthoritativeMessageSecurity();
+  }, [reconcilePendingLinkScans, refreshAuthoritativeMessageSecurity]);
 
   // RF-05: keep the pin callback in a ref so it never restarts the socket.
   const onPinUpdatedRef = useRef(onPinUpdated);
@@ -1519,11 +1988,59 @@ export function useMessages({
     [kind, targetId],
   );
 
+  /**
+   * "Verificar novamente": ask the server to take a second look at one message's
+   * unverified links (issue #135).
+   *
+   * # What it is not
+   *
+   * It does not start a new scan and must never be presented as doing so. The
+   * server searches its own scan history for the URLs it recorded for this
+   * message; a new submission is impossible by construction, not merely absent
+   * from this call.
+   *
+   * # Why the reply is applied locally as well as over the websocket
+   *
+   * A verdict that actually changed something is broadcast, so every reader
+   * converges. But the reply is authoritative for *this* reader and costs
+   * nothing to apply, which is what makes the button work when realtime is down —
+   * the one situation in which a user is most likely to press it. The reducer
+   * ignores a state that matches what is already drawn, so the two paths cannot
+   * fight.
+   *
+   * A failure is swallowed on purpose. The outcome the user sees either way is
+   * "still not verified", and turning a rate-limit or an outage into a red banner
+   * over somebody's message would be alarming about a link nothing is alleging
+   * anything against. The state is returned so the caller can re-enable its
+   * button.
+   */
+  const reconcileLinkSafety = useCallback(
+    async (messageId: string): Promise<LinkSafetyRecheck | undefined> => {
+      try {
+        const result = await reconcileMessageLinkSafety(messageId);
+        dispatch({
+          type: "link_safety_changed",
+          messageId,
+          state: result.state,
+          updatedAt: result.updatedAt,
+        });
+        // The whole reply is handed back, not just the state: the caller disables
+        // its button for the cooldown the server reported, which is what keeps the
+        // control from offering an action that would be refused.
+        return result;
+      } catch {
+        return undefined;
+      }
+    },
+    [],
+  );
+
   const { toggleReaction: sendReactionToggle } = useChatWebSocket({
     kind,
     targetId,
     onMessageCreated: handleWsMessageCreated,
     onMessageBlocked: handleWsMessageBlocked,
+    onMessageLinkSafetyChanged: handleWsLinkSafetyChanged,
     onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: handleReactionUpdated,
     onPinUpdated: handlePinUpdated,
@@ -1650,6 +2167,7 @@ export function useMessages({
     cancelReply,
     toggleReaction,
     toggleFavorite,
+    reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,
   };

@@ -945,6 +945,70 @@ describe("useChatWebSocket", () => {
     expect(onAttachmentStatus).toHaveBeenCalledOnce();
   });
 
+  it("routes a versioned link-safety correction for a subscribed target", () => {
+    const onLinkSafetyChanged = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageLinkSafetyChanged: onLinkSafetyChanged,
+      }),
+    );
+    const event = {
+      type: "message.link_safety_changed",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      link_safety: {
+        message_id: "msg-1",
+        state: "malicious",
+        updated_at: "2026-08-18T12:00:00Z",
+      },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage(event);
+    });
+
+    expect(onLinkSafetyChanged).toHaveBeenCalledWith(event);
+  });
+
+  it("rejects an unversioned or mismatched link-safety correction", () => {
+    const onLinkSafetyChanged = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageLinkSafetyChanged: onLinkSafetyChanged,
+      }),
+    );
+    const event = {
+      type: "message.link_safety_changed",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      link_safety: { message_id: "msg-1", state: "malicious" },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage(event);
+      FakeWebSocket.instances[0].simulateMessage({
+        ...event,
+        link_safety: {
+          ...event.link_safety,
+          message_id: "msg-2",
+          updated_at: "2026-08-18T12:00:00Z",
+        },
+      });
+    });
+
+    expect(onLinkSafetyChanged).not.toHaveBeenCalled();
+  });
+
   it("routes every supported message.updated body format only for the active target", () => {
     const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
     renderHook(() =>
@@ -967,6 +1031,7 @@ describe("useChatWebSocket", () => {
         edited_at: "2026-07-13T12:00:00Z",
         edit_count: 2,
         is_edited: true,
+		link_safety_state: "inconclusive",
       },
     };
 

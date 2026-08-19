@@ -454,6 +454,8 @@ interface MessageListProps {
   onForwardMessage?: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  /** RF-21 "Verificar novamente" (issue #135); see MessageBubbleProps. */
+  onReconcileLinkSafety?: MessageBubbleProps["onReconcileLinkSafety"];
   onEditMessage: MessageBubbleProps["onEditMessage"];
   onEditForbidden: MessageBubbleProps["onEditForbidden"];
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
@@ -483,6 +485,7 @@ function MessageList({
   onForwardMessage,
   onReferenceJump,
   onToggleFavorite,
+  onReconcileLinkSafety,
   onEditMessage,
   onEditForbidden,
   onDeleteMessage,
@@ -713,6 +716,7 @@ function MessageList({
             onReferenceMessage={onReferenceMessage}
             onForwardMessage={onForwardMessage}
             onToggleFavorite={onToggleFavorite}
+            onReconcileLinkSafety={onReconcileLinkSafety}
             onEditMessage={onEditMessage}
             onEditForbidden={onEditForbidden}
             onDeleteMessage={onDeleteMessage}
@@ -1038,6 +1042,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     cancelReply,
     toggleReaction,
     toggleFavorite,
+    reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,
   } = useMessages({
@@ -1307,6 +1312,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
             onReferenceJump={jumpToReference}
             onToggleFavorite={toggleFavorite}
+            onReconcileLinkSafety={reconcileLinkSafety}
             onEditMessage={editMessageLocal}
             onEditForbidden={handleEditForbidden}
             onDeleteMessage={deleteMessageLocal}

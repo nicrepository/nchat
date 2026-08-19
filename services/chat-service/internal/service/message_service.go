@@ -56,6 +56,7 @@ type messageUpdatedPublisher interface {
 const maxMessageBodyRunes = 40_000
 const maxEditHistoryOffset = 10_000
 const MaxMessageReferenceBatchSize = 100
+const MaxMessageSecuritySnapshotBatchSize = 100
 
 // MaxLinkSafetyStatusBatchSize bounds one reconnect reconciliation.
 //
@@ -97,6 +98,78 @@ type LinkSafetyStatusInput struct {
 	WorkspaceID string
 	SenderID    string
 	MessageIDs  []string
+}
+
+// MessageSecuritySnapshot is the minimum authoritative projection needed to
+// repair a visible timeline after a missed link-safety event. Bodies, URLs and
+// scan identifiers never leave this endpoint.
+type MessageSecuritySnapshot struct {
+	MessageID       string
+	Available       bool
+	Status          domain.MessageStatus
+	LinkSafetyState domain.MessageLinkSafety
+	UpdatedAt       time.Time
+	Quoted          *QuotedMessageSecuritySnapshot
+}
+
+type QuotedMessageSecuritySnapshot struct {
+	MessageID       string
+	Status          domain.MessageStatus
+	LinkSafetyState domain.MessageLinkSafety
+	UpdatedAt       time.Time
+}
+
+type MessageSecuritySnapshotsInput struct {
+	WorkspaceID      string
+	ChannelID        string
+	DMConversationID string
+	CallerID         string
+	MessageIDs       []string
+}
+
+// MessageSecuritySnapshots re-authorizes one visible target and returns only
+// the security axes for requested messages. Invisible, missing and wrong-target
+// ids all return the same Available=false sentinel, so the client can withdraw
+// stale content without the batch becoming an existence oracle.
+func (s *MessageService) MessageSecuritySnapshots(
+	ctx context.Context, input MessageSecuritySnapshotsInput,
+) ([]MessageSecuritySnapshot, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	callerID := strings.TrimSpace(input.CallerID)
+	channelID := strings.TrimSpace(input.ChannelID)
+	dmConversationID := strings.TrimSpace(input.DMConversationID)
+	if workspaceID == "" || callerID == "" || (channelID == "") == (dmConversationID == "") {
+		return nil, fmt.Errorf("%w: workspace_id, caller_id, and exactly one target are required", domain.ErrInvalidInput)
+	}
+	messageIDs, err := normalizeMessageIDBatch(input.MessageIDs, MaxMessageSecuritySnapshotBatchSize)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authorizeTarget(ctx, workspaceID, channelID, dmConversationID, callerID); err != nil {
+		return nil, err
+	}
+
+	stored, err := s.messages.ListMessageSecuritySnapshots(
+		ctx, workspaceID, callerID, channelID, dmConversationID, messageIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list message security snapshots: %w", err)
+	}
+	result := make([]MessageSecuritySnapshot, 0, len(stored))
+	for _, message := range stored {
+		snapshot := MessageSecuritySnapshot{
+			MessageID: message.MessageID, Available: message.Available,
+			Status: message.Status, LinkSafetyState: message.LinkSafetyState, UpdatedAt: message.UpdatedAt,
+		}
+		if message.Available && message.Quoted != nil {
+			snapshot.Quoted = &QuotedMessageSecuritySnapshot{
+				MessageID: message.Quoted.MessageID, Status: message.Quoted.Status,
+				LinkSafetyState: message.Quoted.LinkSafetyState, UpdatedAt: message.Quoted.UpdatedAt,
+			}
+		}
+		result = append(result, snapshot)
+	}
+	return result, nil
 }
 
 // MessageLinkSafetyStates reports the authoritative state of the caller's own
@@ -685,6 +758,7 @@ func (s *MessageService) persistMessage(
 	body string, replayInput storage.CreateReplayInput, operation string,
 ) (domain.Message, error) {
 	input.Status = links.messageStatus()
+	input.LinkSafetyState = links.initialState()
 	input.LinkScanURLs = links.URLs
 	input.LinkSafetyFingerprint = links.fingerprint(body)
 	input.IdempotencyKey = replayInput.IdempotencyKey
@@ -903,6 +977,7 @@ func (s *MessageService) ForwardChannelMessage(ctx context.Context, input Forwar
 		BodyText:              snapshot.BodyText,
 		BodyFormat:            snapshot.BodyFormat,
 		Status:                links.messageStatus(),
+		LinkSafetyState:       links.initialState(),
 		LinkScanURLs:          links.URLs,
 		LinkSafetyFingerprint: links.fingerprint(snapshot.BodyText),
 	})
@@ -1081,7 +1156,18 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	if err != nil {
 		return domain.Message{}, err
 	}
-	if editLinks.pending() {
+	// An edit publishes immediately or not at all, so the two halves of "pending"
+	// part company here — the one place they do.
+	//
+	// A URL nothing has decided means waiting: there is no answer and this path
+	// will not produce one. A URL whose scan is terminal-without-verdict is
+	// decided, and the edit lands carrying the same `inconclusive` marker a created
+	// message ends up with, with the same consequences — the reader may click, this
+	// server may not fetch. Refusing that case would make a message permanently
+	// uneditable whenever one of its links happened to be one Cloudflare declined
+	// to scan.
+	editState, editable := editLinks.editState()
+	if !editable {
 		return domain.Message{}, domain.ErrURLCheckPending
 	}
 	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, editorID, body, bodyFormat)
@@ -1089,9 +1175,16 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 		return domain.Message{}, err
 	}
 
+	// The fingerprint is computed over the *rewritten* body, which is the text the
+	// URLs were extracted from after mention resolution — the same binding
+	// creation uses, so a verdict obtained for one content can never decide
+	// another.
 	updated, err := s.messages.EditMessage(ctx, storage.EditMessageInput{
 		WorkspaceID: workspaceID, MessageID: messageID, EditorID: editorID,
 		Body: body, BodyFormat: bodyFormat,
+		LinkSafetyState:       editState,
+		LinkSafetyFingerprint: editLinks.fingerprint(body),
+		LinkScanURLs:          editLinks.URLs,
 	})
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("edit message: %w", err)

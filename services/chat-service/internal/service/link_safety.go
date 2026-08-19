@@ -101,17 +101,65 @@ const maxCheckedURLs = 10
 // record what a withheld message is waiting on, in the same statement that
 // creates it.
 type linkDecision struct {
-	// PendingURLs are the canonical URLs with no usable verdict yet, in the
-	// order they first appear. Non-empty means the message must be withheld.
-	PendingURLs []string
+	// UndecidedURLs are the canonical URLs with no terminal state at all: never
+	// scanned, or scanned and expired. Non-empty means new provider work.
+	UndecidedURLs []string
+	// InconclusiveURLs are the ones whose scan reached a terminal state without a
+	// usable verdict. They are *decided* — asking again produces nothing — but they
+	// are not a clearance, so they are tracked apart from both other groups.
+	InconclusiveURLs []string
 	// URLs is every distinct canonical URL in the body. It is what gets recorded
-	// against a withheld message, including the ones already safe, so a verdict
-	// that expires and flips later still has an edge to be found by.
+	// against a message, including the ones already safe, so a verdict that expires
+	// and flips later still has an edge to be found by.
 	URLs []string
 }
 
-// pending reports whether the message must be withheld.
-func (d linkDecision) pending() bool { return len(d.PendingURLs) > 0 }
+// pending reports whether the message must be withheld at creation.
+//
+// Both groups withhold, for different reasons: an undecided URL has no answer
+// yet, and an inconclusive one is published by the resolver rather than by the
+// send, so that the aggregation over *all* of a message's links happens in one
+// place. See resolvePendingMessagesQuery.
+func (d linkDecision) pending() bool {
+	return len(d.UndecidedURLs) > 0 || len(d.InconclusiveURLs) > 0
+}
+
+// admissionURLs are the URLs that need new provider work.
+//
+// Deliberately only the undecided ones. An inconclusive scan is terminal — there
+// is nothing to admit, and passing it here would ask the capacity gate to
+// consider work that will never be done.
+func (d linkDecision) admissionURLs() []string { return d.UndecidedURLs }
+
+// editState reports the link-safety state an *edit* would publish with, and
+// whether the edit may proceed at all.
+//
+// Editing cannot go pending — see EditMessage — so the two groups are not
+// equivalent here, and this is the one place that distinction is visible:
+//
+//   - an undecided URL means the edit must wait, because nothing has decided it
+//     and nothing about this path will;
+//   - an inconclusive URL is decided. The edit publishes, carrying the same
+//     marker a created message would end up with, and the same rules follow from
+//     it: the reader may click, this server may not fetch.
+//
+// It is derived from the same classification the send path uses rather than from
+// a second one. A divergent copy is how the two doors start answering
+// differently.
+func (d linkDecision) editState() (domain.MessageLinkSafety, bool) {
+	if len(d.UndecidedURLs) > 0 {
+		return domain.MessageLinkSafetyNone, false
+	}
+	switch {
+	case len(d.InconclusiveURLs) > 0:
+		return domain.MessageLinkSafetyInconclusive, true
+	case len(d.URLs) > 0:
+		return domain.MessageLinkSafetySafe, true
+	default:
+		// A body with no links has no link-safety opinion at all.
+		return domain.MessageLinkSafetyNone, true
+	}
+}
 
 // fingerprint identifies the content this decision was made about, so the
 // promotion can refuse to publish anything else. Empty for a body with no links
@@ -133,6 +181,15 @@ func (d linkDecision) messageStatus() domain.MessageStatus {
 		return domain.MessageStatusPendingLinkScan
 	}
 	return ""
+}
+
+// initialState is the marker stored with a message published directly from the
+// verdict cache. Pending messages get their aggregate marker from the resolver.
+func (d linkDecision) initialState() domain.MessageLinkSafety {
+	if !d.pending() && len(d.URLs) > 0 {
+		return domain.MessageLinkSafetySafe
+	}
+	return domain.MessageLinkSafetyNone
 }
 
 // classifyBodyLinks decides what happens to a body carrying links.
@@ -212,8 +269,15 @@ func aggregateLinkDecision(urls []string, verdicts map[string]urlsafety.Verdict)
 			return linkDecision{}, domain.ErrMaliciousURL
 		case urlsafety.VerdictSafe:
 			// Cleared and still fresh — this URL holds nothing up.
+		case urlsafety.VerdictInconclusive:
+			// Decided, and decided to say nothing. It withholds a *new* message, so
+			// the aggregation over all of its links happens in one place, but it does
+			// not block an edit — see linkDecision.editState.
+			decision.InconclusiveURLs = append(decision.InconclusiveURLs, canonical)
 		default:
-			decision.PendingURLs = append(decision.PendingURLs, canonical)
+			// Absent, expired, or any value that is not one this package recognises.
+			// All of them mean the same thing: nothing has decided this URL.
+			decision.UndecidedURLs = append(decision.UndecidedURLs, canonical)
 		}
 	}
 	return decision, nil
@@ -239,10 +303,10 @@ func aggregateLinkDecision(urls []string, verdicts map[string]urlsafety.Verdict)
 func (s *MessageService) admitScans(
 	ctx context.Context, workspaceID string, decision linkDecision,
 ) error {
-	if !decision.pending() {
+	if len(decision.admissionURLs()) == 0 {
 		return nil
 	}
-	admission, err := s.linkSafety.AdmitLinkScans(ctx, workspaceID, decision.PendingURLs, s.linkScanCapacity)
+	admission, err := s.linkSafety.AdmitLinkScans(ctx, workspaceID, decision.admissionURLs(), s.linkScanCapacity)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -332,6 +396,25 @@ func hasHost(candidate string) bool {
 // an offset found in the copy does not address the same position in the
 // original. Any such rune before a link was enough to make the slice start in
 // the wrong place, or in the middle of a rune, and the link then went unchecked.
+//
+// # The boundary rules are shared with the client, deliberately
+//
+// apps/web/src/chat/autolink.ts implements the same two rules — the terminator
+// set and trimTrailingDelimiters — because the client draws an anchor from this
+// text and this function decides what gets scanned. If the two disagree about
+// where a URL ends, the client can render a link to a URL nobody checked. That
+// is not a hypothetical: trimming every trailing bracket here while the client
+// kept balanced ones made
+//
+//	https://example.test/wiki/Function_(mathematics)
+//
+// scan as ".../Function_(mathematics" and render as ".../Function_(mathematics)"
+// — a clickable address the safety check never saw.
+//
+// The shared corpus in libs/testdata/link-safety/autolink-corpus.json is what
+// holds the two implementations together: both sides assert against it, and it
+// asserts that every href the client produces is a candidate this function
+// extracted from the same text.
 func scanURLCandidates(text string) []string {
 	var candidates []string
 	for index := 0; index < len(text); {
@@ -344,7 +427,7 @@ func scanURLCandidates(text string) []string {
 		for end < len(text) && !isURLTerminator(text[end]) {
 			end++
 		}
-		candidate := strings.TrimRight(text[start:end], ".,;:!?)]}'\"<>")
+		candidate := text[start:trimTrailingDelimiters(text, start, end)]
 		if candidate != "" {
 			candidates = append(candidates, candidate)
 		}
@@ -354,6 +437,73 @@ func scanURLCandidates(text string) []string {
 		}
 	}
 	return candidates
+}
+
+// sentenceTrailers are the characters that always belong to the sentence rather
+// than to the URL when they end a candidate.
+//
+// The closing brackets are deliberately absent — they are handled by balance, in
+// trimTrailingDelimiters, because stripping them unconditionally corrupts
+// perfectly ordinary addresses.
+const sentenceTrailers = ".,;:!?'\"<>"
+
+// closingDelimiters pairs each closer with the opener that makes it part of a
+// URL rather than part of the sentence around it.
+var closingDelimiters = map[byte]byte{')': '(', ']': '[', '}': '{'}
+
+// trimTrailingDelimiters returns the end offset of the candidate once the
+// characters belonging to the surrounding sentence have been given back.
+//
+// Ordinary punctuation always goes back. A closing bracket goes back only when it
+// is *unbalanced* within the candidate — that is, when the candidate holds no
+// unmatched opener for it, which means the bracket was wrapping the URL rather
+// than living inside it:
+//
+//	https://example.test/a_(b)     the ) is balanced, kept
+//	(https://example.test/foo)     the ) is unbalanced, given back
+//	https://example.test/a_[b]     the ] is balanced, kept
+//	https://example.test/foo].     both given back, right to left
+//
+// Counting is textual and deliberately shallow: a percent-encoded %28 is not a
+// bracket to a reader and does not participate, which falls out of counting
+// literal bytes only. This is a boundary heuristic, not a URL parser.
+//
+// Byte-wise rather than rune-wise, and that is safe: every character it compares
+// is ASCII, and a UTF-8 continuation byte is never in the ASCII range, so it can
+// neither match one nor stop inside a multi-byte rune.
+func trimTrailingDelimiters(text string, start, end int) int {
+	stop := end
+	for stop > start {
+		last := text[stop-1]
+		if strings.IndexByte(sentenceTrailers, last) >= 0 {
+			stop--
+			continue
+		}
+		opener, isCloser := closingDelimiters[last]
+		if isCloser && !hasUnmatchedOpener(text, start, stop-1, opener, last) {
+			stop--
+			continue
+		}
+		return stop
+	}
+	return stop
+}
+
+// hasUnmatchedOpener reports whether text[start:end] holds an opener still
+// waiting to be closed, which is what makes a trailing closer part of the URL.
+func hasUnmatchedOpener(text string, start, end int, opener, closer byte) bool {
+	depth := 0
+	for i := start; i < end; i++ {
+		switch text[i] {
+		case opener:
+			depth++
+		case closer:
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return depth > 0
 }
 
 // indexOfScheme returns the byte offset of the next http:// or https:// in

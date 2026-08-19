@@ -51,6 +51,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -345,6 +346,33 @@ func NormalizeHost(host string) (string, error) {
 		return "", ErrNotCheckable
 	}
 	if _, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		return "", ErrNotCheckable
+	}
+	// WHATWG accepts historical IPv4 spellings such as 127.1, 0177.0.0.1 and
+	// 0x7f.0.0.1 and resolves them as 127.0.0.1. net/url leaves those spellings
+	// untouched, so treating them as DNS names would scan a different string from
+	// the address a browser opens. Numeric/0x-only label sets are therefore IP
+	// literals for this policy too.
+	legacyIPv4 := true
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			legacyIPv4 = false
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(label), "0x") {
+			_, err := strconv.ParseUint(label[2:], 16, 64)
+			if err != nil {
+				legacyIPv4 = false
+				break
+			}
+			continue
+		}
+		if _, err := strconv.ParseUint(label, 10, 64); err != nil {
+			legacyIPv4 = false
+			break
+		}
+	}
+	if legacyIPv4 {
 		return "", ErrNotCheckable
 	}
 	// idna.Lookup is the strict profile: it is the one meant for turning a name

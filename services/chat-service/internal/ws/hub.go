@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
 // broadcastAuthTimeout caps the per-client authorization re-check during
@@ -830,6 +832,105 @@ func (h *Hub) PublishConversationAvailable(
 				"target_type", string(targetType), "error", err)
 		}
 	}
+}
+
+// PublishMessageLinkSafetyChanged corrects a published message's link-safety
+// state for everyone who received it (issue #135).
+//
+// Routed by (workspace, target) on the ordinary broadcast path — the same routing
+// message.created used — because the audience is the same: the message was
+// delivered, so every subscriber holding it has to converge. That is the
+// difference from PublishMessageBlocked, which is addressed to one author because
+// its message was shown to nobody.
+//
+// Unlike message.created, the payload survives the bus. It can: a message id and
+// a closed-set enum are not user content, there is nothing here for a remote node
+// to have to re-fetch, and the receiving side re-validates the state against the
+// same closed set before delivering it — see canonicalizeLinkSafetyEvent. A
+// remote instance therefore cannot inject a state this version does not
+// understand, and in particular cannot invent one a client might read as a
+// clearance.
+//
+// The empty state is refused rather than published: "this message has nothing to
+// say about links" is not a correction, and announcing it would let a client
+// clear a warning on no evidence.
+func (h *Hub) PublishMessageLinkSafetyChanged(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID, state string, updatedAt time.Time,
+) {
+	if workspaceID == "" || targetID == "" || messageID == "" || !isKnownLinkSafetyState(state) || updatedAt.IsZero() {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageLinkSafetyChanged,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID:        messageID,
+		LinkSafety:       &MessageLinkSafetyPayload{MessageID: messageID, State: state, UpdatedAt: updatedAt},
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal message.link_safety_changed event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		// Deliberately no message id and no state in the log line: the state is a
+		// security fact about a specific message, and an operational log is not
+		// where it belongs.
+		h.logger.WarnContext(ctx, "ws: message.link_safety_changed bus publish failed",
+			"target_type", string(targetType), "error", err)
+	}
+}
+
+// isKnownLinkSafetyState reports whether a state is one of the three this version
+// announces.
+//
+// An allowlist, and the empty state is deliberately outside it. Adding a value to
+// domain.MessageLinkSafety must not make it publishable — or relayable — until
+// somebody has decided what a client should do with it.
+func isKnownLinkSafetyState(state string) bool {
+	switch domain.MessageLinkSafety(state) {
+	case domain.MessageLinkSafetySafe,
+		domain.MessageLinkSafetyInconclusive,
+		domain.MessageLinkSafetyMalicious:
+		return true
+	default:
+		return false
+	}
+}
+
+// canonicalizeLinkSafetyEvent validates a link-safety change arriving over the
+// bus.
+//
+// Three things are checked, and each one closes a way a remote node could say
+// something this instance would otherwise relay unexamined: the block has to be
+// present, its message id has to be the envelope's own (so the routing key and the
+// payload cannot disagree about which message is being corrected), and the state
+// has to be one of the three known values.
+//
+// A failure drops the whole event rather than sanitising it. There is no safe
+// partial version of "this message's links changed status".
+func canonicalizeLinkSafetyEvent(evt Event) (Event, bool) {
+	if evt.LinkSafety == nil || evt.MessageID == "" {
+		return Event{}, false
+	}
+	if evt.LinkSafety.MessageID != evt.MessageID {
+		return Event{}, false
+	}
+	if !isKnownLinkSafetyState(evt.LinkSafety.State) {
+		return Event{}, false
+	}
+	if evt.LinkSafety.UpdatedAt.IsZero() {
+		return Event{}, false
+	}
+	return evt, true
 }
 
 // PublishMessageBlocked tells one author their message was refused (RF-21).
@@ -2333,6 +2434,12 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if evt.Type == EventTypeMessageLinkSafetyChanged {
+		evt, ok = canonicalizeLinkSafetyEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 	if isCallEventType(evt.Type) {
 		evt, ok = canonicalizeCallEvent(evt)
 		if !ok {
@@ -2349,6 +2456,12 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 	// than forwarded alongside an unrelated event.
 	if evt.Type != EventTypePresenceUpdated {
 		evt.Presence = nil
+	}
+	// Same rule as the presence block: a link-safety correction belongs to exactly
+	// one event type, and anything else carrying one is relaying a security state
+	// nobody asked it about.
+	if evt.Type != EventTypeMessageLinkSafetyChanged {
+		evt.LinkSafety = nil
 	}
 
 	return evt, true
@@ -2368,7 +2481,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageBlocked,
+	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged,
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
 		EventTypePresenceUpdated,

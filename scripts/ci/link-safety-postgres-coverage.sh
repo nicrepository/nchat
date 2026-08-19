@@ -32,13 +32,39 @@ case "$MODULE" in
       TestLinkSafetyStatesPostgreSQL
       TestLinkScanWorkerLifecyclePostgreSQL
       TestLinkScanCreateReplayPostgreSQL
+      TestLinkReconcilePostgreSQL
+      TestLinkReconcileConcurrencyPostgreSQL
+      TestCrossServiceMaliciousInvalidationPostgreSQL
+      TestRecordLinkVerdictMaliciousInvalidationPostgreSQL
+      TestLinkReconcileConvergenceScalePostgreSQL
+      TestLinkReconcileEvidenceAgePostgreSQL
+      TestLinkSafetyCheckValidationDoesNotBlockWritersPostgreSQL
+      TestCrossServiceReconcileLeasePostgreSQL
+      TestCrossServiceTwoURLLeaseOrderPostgreSQL
+      TestEditMessageIsAtomicWithLinkSafetyPostgreSQL
+      TestEditMessageRechecksLockedLinkRowsPostgreSQL
+      TestEditWinsThenReconcileConvergesPostgreSQL
+      TestEditRemovingURLRejectsStaleRefreshPostgreSQL
+      TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
+      TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
+      TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
     )
     ;;
   services/file-service)
     dsn_var="FILE_TEST_DATABASE_URL"
-    package="./internal/storage"
+    # The CQ-002 end-to-end proof lives with the preview service, because what it
+    # asserts is that no outbound request leaves it. Both packages are named so one
+    # profile still covers the whole RF-21 surface in this module.
+    package="./internal/storage ./internal/linkpreview"
     tests=(
       TestLinkScanStorePostgreSQL
+      TestLinkScanReconcilePostgreSQL
+      TestLinkFetchDenylistPostgreSQL
+      TestLinkScanReconcileEvidenceAgePostgreSQL
+      TestLinkScanReconcileColumnAllowlistPostgreSQL
+      TestPreviewRefusesADeniedURLPostgreSQL
+      TestLinkFetchDenylistBackfillPostgreSQL
+      TestLegacySafeWriterLosesToAConcurrentCondemnationPostgreSQL
     )
     ;;
   *)
@@ -46,6 +72,19 @@ case "$MODULE" in
     exit 1
     ;;
 esac
+
+# `go test -run` succeeds when a named test was renamed or removed. Refuse that
+# silent coverage hole by checking every exact name before running the suite.
+listed_tests="$({
+  cd "$ROOT_DIR/$MODULE"
+  go test $package -list '^Test'
+})"
+for test_name in "${tests[@]}"; do
+  if ! grep -Fxq -- "$test_name" <<<"$listed_tests"; then
+    echo "Required PostgreSQL test is missing from $MODULE: $test_name" >&2
+    exit 1
+  fi
+done
 
 run="^($(
   IFS='|'
@@ -58,8 +97,9 @@ echo "==> go test coverage RF-21 PostgreSQL $MODULE"
 (
   cd "$ROOT_DIR/$MODULE"
   env "$dsn_var=$LINK_SAFETY_TEST_DATABASE_URL" \
-    go test "$package" \
+    go test $package \
     -run "$run" \
+    -v \
     -count=1 \
     -covermode=atomic \
     -coverprofile="$PROFILE"

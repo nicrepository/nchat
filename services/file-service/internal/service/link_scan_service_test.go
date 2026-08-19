@@ -48,6 +48,9 @@ type fakeLinkStore struct {
 	providerReserved int
 	reserveErr       error
 	prunes           int
+	// The issue #135 recovery half.
+	reconcileClaimErr error
+	reconciled        []string
 	// clock stands in for now() so a test can place a submission attempt in the
 	// past and cross the uncertainty horizon without sleeping.
 	clock time.Time
@@ -70,6 +73,10 @@ type scanRow struct {
 	// attempt was handed to the provider, and the compare-and-set token it owns.
 	submitStartedAt  time.Time
 	submitGeneration int
+
+	// reconcileAttempts is the automatic-recovery budget (issue #135). It is
+	// consumed by the claim and never reset — which is the whole loop protection.
+	reconcileAttempts int
 }
 
 func newFakeLinkStore() *fakeLinkStore {
@@ -79,6 +86,11 @@ func newFakeLinkStore() *fakeLinkStore {
 // digest stands in for the store's SHA-256 key. The identity is what matters
 // here, not the hash function.
 func digest(url string) []byte { return []byte("d:" + url) }
+
+// fakeReconcileAttemptCap mirrors len(storage.ReconcileSchedule) without
+// importing the storage package. The number is not what is under test — that a
+// finite cap exists and is never reset is.
+const fakeReconcileAttemptCap = 4
 
 func (s *fakeLinkStore) LoadVerdict(_ context.Context, canonicalURL string) (urlsafety.Verdict, bool, error) {
 	s.mu.Lock()
@@ -191,6 +203,71 @@ func (s *fakeLinkStore) ReserveProviderSubmit(_ context.Context, limit int, _ ti
 	}
 	s.providerReserved++
 	return true, nil
+}
+
+// ClaimDueReconciliations mirrors the real claim's two bounds (issue #135): only
+// an inconclusive row that still carries its scan uuid is eligible, and only
+// while it has automatic attempts left. The claim consumes one whether or not the
+// provider then answers, which is what makes the recovery terminate.
+func (s *fakeLinkStore) ClaimDueReconciliations(
+	_ context.Context, batchSize int,
+) ([]service.LinkScanJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reconcileClaimErr != nil {
+		return nil, s.reconcileClaimErr
+	}
+	var jobs []service.LinkScanJob
+	for _, row := range s.rows {
+		if len(jobs) >= batchSize {
+			break
+		}
+		if row.state != "inconclusive" || row.scanUUID == "" {
+			continue
+		}
+		if row.reconcileAttempts >= fakeReconcileAttemptCap {
+			continue
+		}
+		row.reconcileAttempts++
+		jobs = append(jobs, service.LinkScanJob{
+			URLDigest: digest(row.canonicalURL), CanonicalURL: row.canonicalURL,
+			State: row.state, ScanUUID: row.scanUUID, Attempts: row.attempts,
+		})
+	}
+	return jobs, nil
+}
+
+// ReconcileVerdict is the one-way door, with the same predicate the real one
+// has: inconclusive only, and only for the scan uuid the row already owns.
+func (s *fakeLinkStore) ReconcileVerdict(
+	_ context.Context, urlDigest []byte, scanUUID string, evidence urlsafety.ScanEvidence,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !evidence.Verdict.IsFinal() {
+		return errors.New("link scan: reconciliation may only record a final verdict")
+	}
+	if evidence.ObservedAt.IsZero() {
+		return errors.New("link scan: reconciliation may only record dated evidence")
+	}
+	row := s.rowByDigest(urlDigest)
+	if row == nil || row.state != "inconclusive" || row.scanUUID == "" || row.scanUUID != scanUUID {
+		return service.ErrLinkScanConflict
+	}
+	// A clearance expires from the provider's evidence time, never from adoption —
+	// the real store enforces the same rule, and a fake that dated it from now
+	// would hide the whole of CQ-001.
+	expires := evidence.ExpiresAt()
+	if evidence.Verdict == urlsafety.VerdictMalicious {
+		// A restriction is retained from adoption: it grants nothing, so keeping it
+		// longer than the evidence's own age is the conservative direction.
+		expires = time.Now().Add(urlsafety.VerdictTTL)
+	} else if !expires.After(time.Now()) {
+		return service.ErrLinkScanConflict
+	}
+	row.state, row.verdict, row.expiresAt = "done", evidence.Verdict, expires
+	s.reconciled = append(s.reconciled, row.canonicalURL)
+	return nil
 }
 
 func (s *fakeLinkStore) PruneLinkScanBudget(_ context.Context, _ time.Duration) error {
