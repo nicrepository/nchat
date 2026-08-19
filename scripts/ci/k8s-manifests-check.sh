@@ -954,11 +954,23 @@ validate_nchat_dev() {
 # previous round asserted it inside the nchat-dev-server validator only — and
 # k3s-dev and k3s-staging shipped with the control off, which is precisely the
 # regression a per-environment assertion cannot catch.
+#
+# The expected value is a parameter because nchat-dev-server has RF-21
+# deliberately off for the MVP, and every other environment does not. It is
+# still an exact match against one literal, never "any value": the point of
+# asserting a control at all is that neither a typo nor a dropped key nor an
+# unannounced flip can pass, and that has to hold for the "false" as strictly
+# as it holds for the "true". An environment changes side here, in the caller,
+# where the change is one reviewable line — and the surrounding assertions
+# below (credentials never in a ConfigMap, the Secret still wired, the provider
+# still the right one) run identically for every overlay whatever the flag says,
+# because turning the feature off is not a reason to stop checking that the
+# thing it is turned off *in* is still wired correctly.
 validate_link_safety() {
-  local name="$1" rendered="$2" flag
+  local name="$1" rendered="$2" expected="$3" flag
   for flag in CHAT_LINK_SAFETY_ENABLED FILE_LINK_SAFETY_ENABLED; do
-    if [[ "$(grep -Fxc "  $flag: \"true\"" "$rendered")" -ne 1 ]]; then
-      echo "error: $flag must be exactly \"true\" in nchat-config for $name" >&2
+    if [[ "$(grep -Fxc "  $flag: \"$expected\"" "$rendered")" -ne 1 ]]; then
+      echo "error: $flag must be exactly \"$expected\" in nchat-config for $name" >&2
       return 1
     fi
   done
@@ -1010,10 +1022,18 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
   # say otherwise.
   for overlay in \
     infra/k8s/overlays/k3s-dev \
-    infra/k8s/overlays/k3s-staging \
-    infra/k8s/overlays/nchat-dev-server; do
-    validate_link_safety "$overlay" "${rendered_by_overlay[$overlay]}"
+    infra/k8s/overlays/k3s-staging; do
+    validate_link_safety "$overlay" "${rendered_by_overlay[$overlay]}" true
   done
+  # nchat-dev-server: RF-21 is temporarily off for the MVP because the
+  # Cloudflare URL Scanner's behaviour makes it operationally unfit to gate
+  # messages there. Asserted as "false" rather than left unasserted, so the
+  # decision keeps a home in CI and going back to "true" stays a one-line,
+  # reviewed change here instead of a quiet drift in an overlay.
+  validate_link_safety \
+    infra/k8s/overlays/nchat-dev-server \
+    "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server]}" \
+    false
 fi
 
 echo "K8s manifests CI check passed."
