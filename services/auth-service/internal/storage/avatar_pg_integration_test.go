@@ -178,6 +178,94 @@ func TestPGXUserStore_AvatarRejectsInactiveUserPostgreSQL(t *testing.T) {
 	}
 }
 
+// TestPGXUserStore_UpdateDisplayNamePostgreSQL runs the real UPDATE...RETURNING
+// against the actual auth.users schema (Code Quality Review, ID 7, finding 2):
+// a pgxmock-only test can pass with a query the real column types would
+// reject, so this proves the SQL text actually executes and persists.
+func TestPGXUserStore_UpdateDisplayNamePostgreSQL(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "displayname@example.test")
+
+	_, before := readDisplayNameAndUpdatedAt(t, pool, userID)
+
+	profile, err := store.UpdateDisplayName(ctx, userID, "Ana Lima")
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if profile.ID != userID || profile.DisplayName != "Ana Lima" {
+		t.Fatalf("unexpected returned profile: %+v", profile)
+	}
+
+	gotName, after := readDisplayNameAndUpdatedAt(t, pool, userID)
+	if gotName != "Ana Lima" {
+		t.Fatalf("persisted display_name mismatch: got %q", gotName)
+	}
+	if !after.After(before) {
+		t.Fatalf("updated_at must advance: before=%v after=%v", before, after)
+	}
+
+	// A fresh read (what GET /auth/me does) surfaces the persisted value.
+	reread, err := store.GetSelfProfile(ctx, userID)
+	if err != nil || reread.DisplayName != "Ana Lima" {
+		t.Fatalf("reload after update: %+v err=%v", reread, err)
+	}
+}
+
+func TestPGXUserStore_UpdateDisplayNameRejectsSuspendedUserPostgreSQL(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "suspended-name@example.test")
+	if _, err := pool.Exec(ctx, `UPDATE auth.users SET status = 'suspended' WHERE id = $1`, userID); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+
+	if _, err := store.UpdateDisplayName(ctx, userID, "Should Not Persist"); err != domain.ErrNotFound {
+		t.Fatalf("expected ErrNotFound for suspended user, got %v", err)
+	}
+	if gotName, _ := readDisplayNameAndUpdatedAt(t, pool, userID); gotName != "Test User" {
+		t.Fatalf("suspended user's display_name must not change, got %q", gotName)
+	}
+}
+
+// TestPGXUserStore_UpdateDisplayNameRejectsDeletedUserPostgreSQL covers a
+// soft-deleted row distinctly from a merely suspended one: deleted_at can be
+// set independently of status, and the store's WHERE clause checks both.
+func TestPGXUserStore_UpdateDisplayNameRejectsDeletedUserPostgreSQL(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "deleted-name@example.test")
+	if _, err := pool.Exec(ctx, `UPDATE auth.users SET deleted_at = now() WHERE id = $1`, userID); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
+
+	if _, err := store.UpdateDisplayName(ctx, userID, "Should Not Persist"); err != domain.ErrNotFound {
+		t.Fatalf("expected ErrNotFound for deleted user, got %v", err)
+	}
+	if gotName, _ := readDisplayNameAndUpdatedAt(t, pool, userID); gotName != "Test User" {
+		t.Fatalf("deleted user's display_name must not change, got %q", gotName)
+	}
+}
+
+func readDisplayNameAndUpdatedAt(t *testing.T, pool *pgxpool.Pool, userID string) (string, time.Time) {
+	t.Helper()
+	var name string
+	var updatedAt time.Time
+	err := pool.QueryRow(context.Background(),
+		`SELECT display_name, updated_at FROM auth.users WHERE id = $1`, userID,
+	).Scan(&name, &updatedAt)
+	if err != nil {
+		t.Fatalf("read display_name/updated_at: %v", err)
+	}
+	return name, updatedAt
+}
+
 // TestPGXOIDCStore_ReloginDoesNotClobberUploadedAvatarPostgreSQL is the security
 // evidence for the OIDC precedence rule: a user uploads an avatar, then signs in
 // again through OIDC with a (same-origin) picture claim. The stored avatar must

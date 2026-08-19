@@ -4,6 +4,7 @@ import { useLocation } from "react-router";
 import { fetchSidebarData, setSidebarConversationPinned } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
+import { playMessageSound } from "./messageSound";
 import { laterActivity } from "./sidebarOrder";
 import {
   useChatWebSocket,
@@ -318,6 +319,27 @@ export function useChatSidebar() {
       if (!messageCreatedAt) {
         refreshSidebar();
         return;
+      }
+      // Same "is this relevant to the reader" question the reducer's `counts`
+      // (message_created case above) answers for unread badges, recomputed
+      // here rather than threaded out of the reducer: a reducer performs
+      // state transitions, not side effects like audio playback, and this
+      // callback already has senderId, currentUserId and the active target
+      // in scope for the very same event.
+      if (state.status === "ready") {
+        const isOwnMessage = (event.payload?.sender_id ?? "") === state.currentUserId;
+        const isActiveConversation =
+          openedTarget?.kind === event.target_type && openedTarget.targetId === event.target_id;
+        if (!isOwnMessage && !isActiveConversation) {
+          // playMessageSound() already never throws, but the unread badge
+          // must update even if that guarantee is ever violated — a failed
+          // chime is never allowed to break message receipt.
+          try {
+            playMessageSound();
+          } catch {
+            // Swallowed on purpose: see above.
+          }
+        }
       }
       dispatch({
         type: "message_created",
