@@ -11,8 +11,10 @@ import (
 
 type callStore interface {
 	CreateCall(context.Context, storage.CreateCallInput) (domain.Call, bool, error)
+	CreateResourceCall(context.Context, storage.CreateResourceCallInput) (domain.Call, bool, error)
+	RenewCallPresence(context.Context, storage.RenewCallPresenceInput) error
 	TransitionCall(context.Context, storage.TransitionCallInput) (storage.TransitionCallResult, error)
-	CurrentCallForUser(context.Context, string, string) (domain.Call, error)
+	CurrentCallForUser(context.Context, string, string, string) (domain.Call, error)
 	ExpireDueCalls(context.Context, int) ([]domain.Call, error)
 }
 
@@ -32,6 +34,8 @@ type StartCallInput struct {
 	RequestID   string
 	CallerID    string
 	CalleeID    string
+	TargetType  domain.CallTargetType
+	TargetID    string
 	Type        domain.CallType
 }
 
@@ -55,8 +59,41 @@ func (s *CallService) Start(ctx context.Context, input StartCallInput) (domain.C
 	if err != nil {
 		return domain.Call{}, domain.ErrInvalidInput
 	}
+	if !input.Type.Valid() || s == nil || s.store == nil || s.timeout <= 0 {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	if input.CalleeID == "" {
+		if input.TargetType != domain.CallTargetChannel && input.TargetType != domain.CallTargetDM {
+			return domain.Call{}, domain.ErrInvalidInput
+		}
+		targetID, targetErr := canonicalUUID(input.TargetID)
+		if targetErr != nil {
+			return domain.Call{}, domain.ErrInvalidInput
+		}
+		call, created, createErr := s.store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+			WorkspaceID: workspaceID,
+			RequestID:   requestID,
+			CallerID:    callerID,
+			TargetType:  input.TargetType,
+			TargetID:    targetID,
+			Type:        input.Type,
+			ExpiresAt:   s.now().UTC().Add(s.timeout),
+		})
+		if createErr != nil {
+			return domain.Call{}, createErr
+		}
+		// Re-publishing an existing resource call lets a late starter reconcile
+		// without manufacturing a second lifecycle row; clients discard its same version.
+		if created || call.Status == domain.CallStatusActive {
+			s.publish(ctx, call)
+		}
+		return call, nil
+	}
+	if input.TargetType != "" || input.TargetID != "" {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
 	calleeID, err := canonicalUUID(input.CalleeID)
-	if err != nil || callerID == calleeID || !input.Type.Valid() || s == nil || s.store == nil || s.timeout <= 0 {
+	if err != nil || callerID == calleeID {
 		return domain.Call{}, domain.ErrInvalidInput
 	}
 
@@ -77,6 +114,27 @@ func (s *CallService) Start(ctx context.Context, input StartCallInput) (domain.C
 	return call, nil
 }
 
+func (s *CallService) Presence(ctx context.Context, workspaceID, actorID, callID string) error {
+	workspaceID, err := canonicalUUID(workspaceID)
+	if err != nil {
+		return domain.ErrInvalidInput
+	}
+	actorID, err = canonicalUUID(actorID)
+	if err != nil {
+		return domain.ErrInvalidInput
+	}
+	callID, err = canonicalUUID(callID)
+	if err != nil || s == nil || s.store == nil || s.timeout <= 0 {
+		return domain.ErrInvalidInput
+	}
+	return s.store.RenewCallPresence(ctx, storage.RenewCallPresenceInput{
+		WorkspaceID: workspaceID,
+		CallID:      callID,
+		ActorID:     actorID,
+		ExpiresAt:   s.now().UTC().Add(s.timeout),
+	})
+}
+
 func (s *CallService) Accept(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
 	return s.transition(ctx, workspaceID, actorID, callID, storage.CallActionAccept)
 }
@@ -93,7 +151,7 @@ func (s *CallService) End(ctx context.Context, workspaceID, actorID, callID stri
 	return s.transition(ctx, workspaceID, actorID, callID, storage.CallActionEnd)
 }
 
-func (s *CallService) Current(ctx context.Context, workspaceID, actorID string) (domain.Call, error) {
+func (s *CallService) Current(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
 	workspaceID, err := canonicalUUID(workspaceID)
 	if err != nil {
 		return domain.Call{}, domain.ErrInvalidInput
@@ -102,7 +160,13 @@ func (s *CallService) Current(ctx context.Context, workspaceID, actorID string) 
 	if err != nil || s == nil || s.store == nil {
 		return domain.Call{}, domain.ErrInvalidInput
 	}
-	return s.store.CurrentCallForUser(ctx, workspaceID, actorID)
+	if callID != "" {
+		callID, err = canonicalUUID(callID)
+		if err != nil {
+			return domain.Call{}, domain.ErrInvalidInput
+		}
+	}
+	return s.store.CurrentCallForUser(ctx, workspaceID, actorID, callID)
 }
 
 func (s *CallService) ExpireDue(ctx context.Context) error {

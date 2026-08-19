@@ -25,13 +25,16 @@ type StartCallCommand struct {
 	RequestID   string
 	CallerID    string
 	CalleeID    string
+	TargetType  TargetType
+	TargetID    string
 	Type        domain.CallType
 }
 
 type CallHandler interface {
 	StartCall(context.Context, StartCallCommand) (domain.Call, error)
 	TransitionCall(context.Context, string, string, string, ClientMessageType) (domain.Call, error)
-	CurrentCall(context.Context, string, string) (domain.Call, error)
+	CurrentCall(context.Context, string, string, string) (domain.Call, error)
+	RenewCallPresence(context.Context, string, string, string) error
 }
 
 type CallLimiter interface {
@@ -56,15 +59,22 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 	}
 	switch msg.Type {
 	case ClientMessageTypeCallStart:
-		if msg.CallID != "" || msg.TargetType != "" || msg.TargetID != "" || msg.MessageID != "" || msg.Emoji != "" ||
-			msg.RequestID == "" || msg.TargetUserID == "" || !msg.CallType.Valid() {
+		direct := msg.TargetUserID != "" && msg.TargetType == "" && msg.TargetID == ""
+		resource := msg.TargetUserID == "" && (msg.TargetType == TargetTypeChannel || msg.TargetType == TargetTypeDM) && msg.TargetID != ""
+		if msg.CallID != "" || msg.MessageID != "" || msg.Emoji != "" || msg.RequestID == "" ||
+			(!direct && !resource) || !msg.CallType.Valid() {
 			return domain.ErrInvalidInput
 		}
 		requestID, err := canonicalCallUUID(msg.RequestID)
 		if err != nil {
 			return domain.ErrInvalidInput
 		}
-		calleeID, err := canonicalCallUUID(msg.TargetUserID)
+		calleeID, targetID := "", ""
+		if direct {
+			calleeID, err = canonicalCallUUID(msg.TargetUserID)
+		} else {
+			targetID, err = canonicalCallUUID(msg.TargetID)
+		}
 		if err != nil {
 			return domain.ErrInvalidInput
 		}
@@ -90,9 +100,22 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 			RequestID:   requestID,
 			CallerID:    c.userID,
 			CalleeID:    calleeID,
+			TargetType:  msg.TargetType,
+			TargetID:    targetID,
 			Type:        msg.CallType,
 		})
 		return err
+
+	case ClientMessageTypeCallPresence:
+		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" || msg.TargetType != "" ||
+			msg.TargetID != "" || msg.MessageID != "" || msg.Emoji != "" {
+			return domain.ErrInvalidInput
+		}
+		callID, err := canonicalCallUUID(msg.CallID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		return h.callHandler.RenewCallPresence(ctx, c.workspaceID, c.userID, callID)
 
 	case ClientMessageTypeCallAccept, ClientMessageTypeCallDecline, ClientMessageTypeCallCancel, ClientMessageTypeCallEnd:
 		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" || msg.TargetType != "" ||
@@ -107,15 +130,23 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 		return err
 
 	case ClientMessageTypeCallSync:
-		if msg.RequestID != "" || msg.CallID != "" || msg.TargetUserID != "" || msg.CallType != "" ||
+		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" ||
 			msg.TargetType != "" || msg.TargetID != "" || msg.MessageID != "" || msg.Emoji != "" {
 			return domain.ErrInvalidInput
 		}
-		call, err := h.callHandler.CurrentCall(ctx, c.workspaceID, c.userID)
+		callID := ""
+		if msg.CallID != "" {
+			var err error
+			callID, err = canonicalCallUUID(msg.CallID)
+			if err != nil {
+				return domain.ErrInvalidInput
+			}
+		}
+		call, err := h.callHandler.CurrentCall(ctx, c.workspaceID, c.userID, callID)
 		if err != nil {
 			return err
 		}
-		h.publishCallToUser(ctx, call, c.userID)
+		h.sendCallToClient(c, call)
 		return nil
 	default:
 		return domain.ErrInvalidInput
@@ -123,28 +154,22 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 }
 
 func (h *Hub) PublishCall(ctx context.Context, call domain.Call) {
+	if call.IsResource() {
+		h.publishCallToTarget(ctx, call, TargetType(call.TargetType), call.TargetID)
+		return
+	}
 	h.publishCallToUser(ctx, call, call.CallerID)
 	h.publishCallToUser(ctx, call, call.CalleeID)
 }
 
 func (h *Hub) publishCallToUser(ctx context.Context, call domain.Call, userID string) {
-	eventType, ok := callEventType(call.Status)
+	h.publishCallToTarget(ctx, call, TargetTypeUser, userID)
+}
+
+func (h *Hub) publishCallToTarget(ctx context.Context, call domain.Call, targetType TargetType, targetID string) {
+	event, ok := h.newCallEvent(call, targetType, targetID)
 	if !ok {
 		return
-	}
-	event := Event{
-		SchemaVersion: CurrentEventSchemaVersion,
-		Type:          eventType,
-		WorkspaceID:   call.WorkspaceID,
-		TargetType:    TargetTypeUser,
-		TargetID:      userID,
-		Call: &CallEventPayload{
-			ID: call.ID, RequestID: call.RequestID, CallerID: call.CallerID, CalleeID: call.CalleeID,
-			CallType: call.Type, Status: call.Status, Version: call.Version,
-			CreatedAt: call.CreatedAt, OccurredAt: call.UpdatedAt, ExpiresAt: call.ExpiresAt,
-			AcceptedAt: call.AcceptedAt, EndedAt: call.EndedAt,
-		},
-		EventID: uuid.NewString(), SourceInstanceID: h.presenceInstanceID, CreatedAt: call.UpdatedAt,
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -159,8 +184,45 @@ func (h *Hub) publishCallToUser(ctx context.Context, call domain.Call, userID st
 		return
 	}
 	if err := h.bus.Publish(ctx, event); err != nil {
-		h.logger.WarnContext(ctx, "ws: call bus publish failed", "call_id", call.ID, "event_type", string(eventType))
+		h.logger.WarnContext(ctx, "ws: call bus publish failed", "call_id", call.ID, "event_type", string(event.Type))
 	}
+}
+
+func (h *Hub) sendCallToClient(c *Client, call domain.Call) {
+	targetType, targetID := TargetTypeUser, c.userID
+	if call.IsResource() {
+		targetType, targetID = TargetType(call.TargetType), call.TargetID
+	}
+	event, ok := h.newCallEvent(call, targetType, targetID)
+	if !ok {
+		return
+	}
+	data, err := json.Marshal(event)
+	if err == nil {
+		_ = c.enqueue(data)
+	}
+}
+
+func (h *Hub) newCallEvent(call domain.Call, targetType TargetType, targetID string) (Event, bool) {
+	eventType, ok := callEventType(call.Status)
+	if !ok {
+		return Event{}, false
+	}
+	return Event{
+		SchemaVersion: CurrentEventSchemaVersion,
+		Type:          eventType,
+		WorkspaceID:   call.WorkspaceID,
+		TargetType:    targetType,
+		TargetID:      targetID,
+		Call: &CallEventPayload{
+			ID: call.ID, RequestID: call.RequestID, CallerID: call.CallerID, CalleeID: call.CalleeID,
+			TargetType: call.TargetType, TargetID: call.TargetID,
+			CallType: call.Type, Status: call.Status, Version: call.Version,
+			CreatedAt: call.CreatedAt, OccurredAt: call.UpdatedAt, ExpiresAt: call.ExpiresAt,
+			AcceptedAt: call.AcceptedAt, EndedAt: call.EndedAt,
+		},
+		EventID: uuid.NewString(), SourceInstanceID: h.presenceInstanceID, CreatedAt: call.UpdatedAt,
+	}, true
 }
 
 func callEventType(status domain.CallStatus) (EventType, bool) {

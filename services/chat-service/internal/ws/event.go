@@ -155,6 +155,7 @@ const (
 	ClientMessageTypeCallCancel     ClientMessageType = "call.cancel"
 	ClientMessageTypeCallEnd        ClientMessageType = "call.end"
 	ClientMessageTypeCallSync       ClientMessageType = "call.sync"
+	ClientMessageTypeCallPresence   ClientMessageType = "call.presence"
 	ClientMessageTypeTypingStart    ClientMessageType = "typing.start"
 	ClientMessageTypeTypingStop     ClientMessageType = "typing.stop"
 )
@@ -399,18 +400,20 @@ type ReactionEventPayload struct {
 }
 
 type CallEventPayload struct {
-	ID         string            `json:"call_id"`
-	RequestID  string            `json:"request_id"`
-	CallerID   string            `json:"caller_id"`
-	CalleeID   string            `json:"callee_id"`
-	CallType   domain.CallType   `json:"call_type"`
-	Status     domain.CallStatus `json:"status"`
-	Version    int64             `json:"version"`
-	CreatedAt  time.Time         `json:"created_at"`
-	OccurredAt time.Time         `json:"occurred_at"`
-	ExpiresAt  time.Time         `json:"expires_at"`
-	AcceptedAt *time.Time        `json:"accepted_at,omitempty"`
-	EndedAt    *time.Time        `json:"ended_at,omitempty"`
+	ID         string                `json:"call_id"`
+	RequestID  string                `json:"request_id"`
+	CallerID   string                `json:"caller_id"`
+	CalleeID   string                `json:"callee_id,omitempty"`
+	TargetType domain.CallTargetType `json:"target_type"`
+	TargetID   string                `json:"target_id"`
+	CallType   domain.CallType       `json:"call_type"`
+	Status     domain.CallStatus     `json:"status"`
+	Version    int64                 `json:"version"`
+	CreatedAt  time.Time             `json:"created_at"`
+	OccurredAt time.Time             `json:"occurred_at"`
+	ExpiresAt  time.Time             `json:"expires_at"`
+	AcceptedAt *time.Time            `json:"accepted_at,omitempty"`
+	EndedAt    *time.Time            `json:"ended_at,omitempty"`
 }
 
 // Event is the outbound event envelope sent to WebSocket clients and exchanged

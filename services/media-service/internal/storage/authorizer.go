@@ -116,6 +116,28 @@ const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 		 AND wm.user_id = active.user_id
 		 AND wm.status = 'active'
 		WHERE c.status = 'active'
-		  AND (c.caller_id = active.user_id OR c.callee_id = active.user_id)
+		  AND (
+			(c.target_type = 'user' AND (c.caller_id = active.user_id OR c.callee_id = active.user_id))
+			OR
+			(c.target_type = 'channel' AND EXISTS (
+				SELECT 1 FROM chat.channels AS channel
+				WHERE channel.id = c.target_id
+				  AND channel.workspace_id = c.workspace_id
+				  AND channel.status = 'active'
+				  AND chat.channel_visible_to_user(channel.id, active.user_id)
+			))
+			OR
+			(c.target_type = 'dm' AND EXISTS (
+				SELECT 1 FROM chat.dm_conversations AS conversation
+				JOIN chat.dm_members AS member
+				  ON member.conversation_id = conversation.id
+				 AND member.user_id = active.user_id
+				 AND member.status = 'active'
+				WHERE conversation.id = c.target_id
+				  AND conversation.workspace_id = c.workspace_id
+				  AND conversation.status = 'active'
+				  AND conversation.type = 'group'
+			))
+		  )
 	)
 	` + authorizedResourceSelect
