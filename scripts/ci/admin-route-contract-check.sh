@@ -19,6 +19,41 @@ OVERLAYS=(k3s-dev k3s-staging nchat-dev-server)
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+# The nchat-dev-server overlay reads topology.env through a configMapGenerator,
+# and that file is deliberately unversioned: it names one specific machine. So a
+# clean checkout cannot render the overlay at all, and standing the REPLACE_ME
+# example in for it renders `admin.REPLACE_ME_HOST` — which this check then
+# rejects, correctly, as an unresolved administrative host.
+#
+# The fix is a synthetic topology, not a weaker assertion. The fixture below is
+# the one the other manifest gates already use (documentation-range addresses,
+# a reserved .invalid host), and it is materialized through the deploy tree
+# helper so the overlay is rendered exactly the way a deployment renders it —
+# kustomize replacements included. Pinning it rather than honouring an inherited
+# NCHAT_DEV_TOPOLOGY_FILE is deliberate: this is a contract check, so it must
+# assert the same host every time and never depend on a real domain.
+#
+# prepare_deploy_tree copies infra/k8s into WORK_DIR and writes topology.env
+# there, so the working tree keeps no generated file and the trap above cleans
+# up on every exit path.
+export NCHAT_DEV_TOPOLOGY_FILE="$ROOT_DIR/scripts/ci/testdata/nchat-dev-topology.env"
+# shellcheck source=scripts/deploy/nchat-dev/lib.sh
+source "$ROOT_DIR/scripts/deploy/nchat-dev/lib.sh"
+if ! prepare_deploy_tree "$ROOT_DIR" "$WORK_DIR/tree"; then
+  echo "error: could not materialize the synthetic nchat-dev topology fixture" >&2
+  exit 1
+fi
+NCHAT_DEV_OVERLAY_PATH="$WORK_DIR/tree/infra-k8s/overlays/nchat-dev-server"
+
+# The host the fixture declares, read back from the fixture rather than repeated
+# here: the assertions below compare the rendered manifests against it, so the
+# two cannot drift apart.
+FIXTURE_HOST="$(awk -F= '/^NCHAT_DEV_HOST=/ { print $2; exit }' "$NCHAT_DEV_TOPOLOGY_FILE")"
+if [ -z "$FIXTURE_HOST" ] || [ "${FIXTURE_HOST#*REPLACE_ME}" != "$FIXTURE_HOST" ]; then
+  echo "error: the topology fixture must declare a resolved NCHAT_DEV_HOST" >&2
+  exit 1
+fi
+
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import yaml" >/dev/null 2>&1; then
   # Failing is deliberate: a contract gate that silently skips reports "passed"
   # for exactly the configuration it exists to reject.
@@ -27,9 +62,15 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import yaml" >/dev/null
 fi
 
 for overlay in "${OVERLAYS[@]}"; do
-  if ! "$RENDER" "infra/k8s/overlays/$overlay" >"$WORK_DIR/$overlay.yaml" 2>"$WORK_DIR/$overlay.err"; then
+  # Absolute throughout: the fixture overlay lives in WORK_DIR, outside the
+  # repository, so a path joined onto ROOT_DIR would not resolve.
+  overlay_path="$ROOT_DIR/infra/k8s/overlays/$overlay"
+  if [ "$overlay" = nchat-dev-server ]; then
+    overlay_path="$NCHAT_DEV_OVERLAY_PATH"
+  fi
+  if ! "$RENDER" "$overlay_path" >"$WORK_DIR/$overlay.yaml" 2>"$WORK_DIR/$overlay.err"; then
     if command -v kustomize >/dev/null 2>&1 &&
-      kustomize build "$ROOT_DIR/infra/k8s/overlays/$overlay" >"$WORK_DIR/$overlay.yaml" 2>>"$WORK_DIR/$overlay.err"; then
+      kustomize build "$overlay_path" >"$WORK_DIR/$overlay.yaml" 2>>"$WORK_DIR/$overlay.err"; then
       :
     else
       echo "error: failed to render overlay $overlay" >&2
@@ -39,13 +80,19 @@ for overlay in "${OVERLAYS[@]}"; do
   fi
 done
 
-python3 - "$ROOT_DIR" "$WORK_DIR" "${OVERLAYS[@]}" <<'PY'
+python3 - "$ROOT_DIR" "$WORK_DIR" "$FIXTURE_HOST" "${OVERLAYS[@]}" <<'PY'
 import re
 import sys
 
 import yaml
 
-root, work, *overlays = sys.argv[1:]
+root, work, fixture_host, *overlays = sys.argv[1:]
+
+# The overlay whose host is derived from the synthetic topology fixture, and the
+# host that derivation must produce. k3s-dev and k3s-staging carry static hosts
+# in their own manifests and are not driven by the fixture.
+FIXTURE_OVERLAY = "nchat-dev-server"
+FIXTURE_ADMIN_HOST = f"admin.{fixture_host}"
 
 MW_NAME = "admin-api-prefix"
 ANNOTATION = "traefik.ingress.kubernetes.io/router.middlewares"
@@ -274,6 +321,18 @@ for overlay in overlays:
     host = rule.get("host")
     if not host or "REPLACE_ME" in host:
         errors.append(f"{label}: administrative host is unresolved ({host!r})")
+    elif overlay == FIXTURE_OVERLAY and host != FIXTURE_ADMIN_HOST:
+        # The derivation itself, asserted on the rendered output: the overlay's
+        # kustomize replacement splits "admin.REPLACE_ME_ADMIN_HOST" on the
+        # first dot and substitutes NCHAT_DEV_HOST into the second segment. A
+        # broken replacement leaves the placeholder (caught above) and a
+        # mis-indexed one produces the wrong host, which is caught here.
+        # Checking the rendered manifest is the point — patching REPLACE_ME out
+        # of the YAML after the build would hide exactly this failure.
+        errors.append(
+            f"{label}: administrative host is {host!r}, expected {FIXTURE_ADMIN_HOST!r} "
+            f"derived from NCHAT_DEV_HOST={fixture_host!r}"
+        )
     elif any(
         other_rule.get("host") == host
         for d in docs
@@ -296,6 +355,33 @@ for overlay in overlays:
         tls_hosts = {h for entry in ingress["spec"].get("tls", []) for h in entry.get("hosts", [])}
         if host not in tls_hosts:
             errors.append(f"{label}: administrative host {host} is not covered by the Ingress TLS block")
+
+# ── The derived pair, on the rendered fixture overlay ──────────────────────
+#
+# Both halves of the derivation are asserted together: the chat host is the
+# fixture's NCHAT_DEV_HOST verbatim, and the administrative host is that same
+# value under the fixed "admin" label. Asserting only the admin host would pass
+# for an overlay that had quietly stopped rendering the chat host at all.
+fixture_docs = [d for d in yaml.safe_load_all(open(f"{work}/{FIXTURE_OVERLAY}.yaml")) if d]
+fixture_hosts = {
+    rule.get("host")
+    for d in fixture_docs
+    if d.get("kind") == "Ingress"
+    for rule in d["spec"].get("rules", [])
+    if rule.get("host")
+}
+for expected in (fixture_host, FIXTURE_ADMIN_HOST):
+    if expected not in fixture_hosts:
+        errors.append(
+            f"{FIXTURE_OVERLAY}: no Ingress renders the host {expected!r} "
+            f"(rendered: {sorted(fixture_hosts)})"
+        )
+# Nothing may survive the render still holding a placeholder. The other gates
+# check this for the whole manifest; here it is scoped to hosts, which is what
+# this contract is about.
+for host in fixture_hosts:
+    if "REPLACE_ME" in host:
+        errors.append(f"{FIXTURE_OVERLAY}: host {host!r} left a placeholder unresolved")
 
 # Every overlay must implement the same rule; a divergence is how one
 # environment starts answering 404 while the others work.
