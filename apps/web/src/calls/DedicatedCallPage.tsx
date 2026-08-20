@@ -18,6 +18,7 @@ export default function DedicatedCallPage() {
   const {
     acknowledgeDedicated,
     announceDedicated,
+    beginResourceParticipation,
     calls,
     dedicatedRecoveryFailed,
     media,
@@ -81,14 +82,23 @@ export default function DedicatedCallPage() {
     if (resolved.target_type === "user") {
       void calls.activateMedia();
     } else if (resolved.target_type === "channel" || resolved.target_type === "dm") {
-      void resource.join({
-        kind: resolved.target_type,
-        id: resolved.target_id!,
-        name: target.name,
-        callId: resolved.call_id,
-      });
+      // Registers the new participation only once join() itself confirms it
+      // actually succeeded (issue #570 follow-up) — never inferred from
+      // resource.callId changing, which a rejoin of the very same call_id
+      // (e.g. reopening this exact dedicated tab for a call this user
+      // already left) would never observably do.
+      void resource
+        .join({
+          kind: resolved.target_type,
+          id: resolved.target_id!,
+          name: target.name,
+          callId: resolved.call_id,
+        })
+        .then((joinedCallId) => {
+          if (joinedCallId) void beginResourceParticipation(joinedCallId);
+        });
     }
-  }, [calls, ownerState, resolved, resource, target]);
+  }, [beginResourceParticipation, calls, ownerState, resolved, resource, target]);
 
   useEffect(() => {
     if (!resolved || acknowledged.current || activationCall.current !== resolved.call_id) return;
@@ -138,8 +148,25 @@ export default function DedicatedCallPage() {
     onScreenShare: media.toggleScreenShare,
     onEnd: () => {
       emitCallTechnicalEvent("end");
-      if (resolved.target_type === "user") calls.end();
-      else void resource.leave().catch(() => undefined);
+      if (resolved.target_type === "user") {
+        calls.end();
+        return;
+      }
+      // Issue #570: leaving a resource/group call from the dedicated tab
+      // must fully converge — participant leave (#569), release dedicated
+      // ownership, then close this tab (falling back to /chat when the
+      // browser won't let it close itself) — never just the local leave
+      // that used to leave this tab stuck and the main tab still pointing
+      // at ownership nobody holds anymore. A failed leave (network, server)
+      // must not close the window: the existing error/retry state stays on
+      // screen instead.
+      void session
+        .leaveDedicated(resolved.call_id)
+        .then(() => {
+          window.close();
+          if (!window.closed) navigate("/chat");
+        })
+        .catch(() => undefined);
     },
   };
 
