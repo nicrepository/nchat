@@ -27,7 +27,8 @@
   text-decoration: underline;
 }
 
-.profile-page__name-card {
+.profile-page__name-card,
+.profile-page__details-card {
   padding: 24px;
   margin-bottom: 20px;
   border: 1px solid rgba(0, 0, 0, 0.08);
@@ -59,6 +60,19 @@
 }
 .profile-page__input[aria-invalid="true"] {
   border-color: #dc2626;
+}
+
+.profile-page__textarea {
+  min-height: 96px;
+  max-width: 100%;
+  resize: vertical;
+}
+
+.profile-page__select {
+  cursor: pointer;
+}
+.profile-page__select:disabled {
+  cursor: not-allowed;
 }
 
 .profile-page__avatar-card {
@@ -164,7 +178,7 @@
   font-size: 14px;
 }
 .profile-page__error {
-  color: #dc2626;
+  color: #b91c1c;
 }
 .profile-page__ok {
   color: #16a34a;
@@ -200,8 +214,8 @@
 
 @media (prefers-color-scheme: dark) {
   .profile-page__avatar-card,
-  .profile-page__notifications-card,
-  .profile-page__name-card {
+  .profile-page__name-card,
+  .profile-page__details-card {
     border-color: rgba(255, 255, 255, 0.12);
   }
   .profile-page__btn {
