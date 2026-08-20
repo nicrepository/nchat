@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"net/url"
 	"strings"
 
@@ -49,12 +50,27 @@ type Config struct {
 	OIDCClientID                        string
 	OIDCClientSecret                    string
 	OIDCRedirectURL                     string
-	OIDCFrontendCallbackURL             string
-	OIDCScopes                          string
-	OIDCHTTPTimeoutSeconds              int
-	OIDCStateTTLMinutes                 int
-	OIDCAutoProvisionEnabled            bool
-	OIDCAllowedEmailDomains             string
+	// OIDCAdminRedirectURL is the provider callback URI for the administrative
+	// console, which is served from its own origin (issue #578). Empty means
+	// single sign-on is simply unavailable on that host; it never falls back to
+	// the chat URI, which would land an administrator on the wrong origin.
+	OIDCAdminRedirectURL     string
+	OIDCFrontendCallbackURL  string
+	OIDCScopes               string
+	OIDCHTTPTimeoutSeconds   int
+	OIDCStateTTLMinutes      int
+	OIDCAutoProvisionEnabled bool
+	OIDCAllowedEmailDomains  string
+	// OIDCAdminACRValues is the comma-separated list of `acr` values this
+	// deployment accepts as evidence that the administrative authentication
+	// context ran — in practice, the value its Keycloak authentication flow
+	// emits for a login that required a second factor.
+	//
+	// Empty states no requirement. Non-empty makes the requirement real and
+	// fail-closed: the administrative login asks the provider for the context
+	// and the callback refuses a token that does not come back with one of
+	// these values. Local development normally leaves it empty.
+	OIDCAdminACRValues string
 	// AuthTrustedProxyCIDRs is a comma-separated list of CIDRs (e.g. "10.0.0.0/8,172.16.0.0/12")
 	// whose X-Forwarded-For header is trusted for client-IP extraction by the rate limiter.
 	// Leave empty (default) to always use RemoteAddr — safe for direct or single-instance deployments.
@@ -93,12 +109,14 @@ func Load() Config {
 		OIDCClientID:                        strings.TrimSpace(platformconfig.GetString("OIDC_CLIENT_ID", "")),
 		OIDCClientSecret:                    platformconfig.GetString("OIDC_CLIENT_SECRET", ""),
 		OIDCRedirectURL:                     strings.TrimSpace(platformconfig.GetString("OIDC_REDIRECT_URL", "")),
+		OIDCAdminRedirectURL:                strings.TrimSpace(platformconfig.GetString("OIDC_ADMIN_REDIRECT_URL", "")),
 		OIDCFrontendCallbackURL:             strings.TrimSpace(platformconfig.GetString("OIDC_FRONTEND_CALLBACK_URL", "")),
 		OIDCScopes:                          strings.TrimSpace(platformconfig.GetString("OIDC_SCOPES", defaultOIDCScopes)),
 		OIDCHTTPTimeoutSeconds:              positiveInt("OIDC_HTTP_TIMEOUT_SECONDS", defaultOIDCHTTPTimeoutSeconds),
 		OIDCStateTTLMinutes:                 positiveInt("OIDC_STATE_TTL_MINUTES", defaultOIDCStateTTLMinutes),
 		OIDCAutoProvisionEnabled:            platformconfig.GetBool("OIDC_AUTO_PROVISION_ENABLED", defaultOIDCAutoProvisionEnable),
 		OIDCAllowedEmailDomains:             strings.TrimSpace(platformconfig.GetString("OIDC_ALLOWED_EMAIL_DOMAINS", "")),
+		OIDCAdminACRValues:                  strings.TrimSpace(platformconfig.GetString("OIDC_ADMIN_ACR_VALUES", "")),
 		AuthTrustedProxyCIDRs:               platformconfig.GetString("AUTH_TRUSTED_PROXY_CIDRS", ""),
 		AuthAvatarDir:                       platformconfig.GetString("AUTH_AVATAR_DIR", ""),
 		AuthAvatarBaseURL:                   platformconfig.GetString("AUTH_AVATAR_BASE_URL", defaultAvatarBaseURL),
@@ -119,7 +137,38 @@ func (c Config) ValidateOIDC() error {
 	if !validOIDCFrontendCallbackPath(c.OIDCFrontendCallbackURL) {
 		return domain.ErrOIDCMisconfigured
 	}
+	// The administrative redirect is optional, but a value that is present must
+	// be usable: a deployment that sets a malformed one should fail at startup,
+	// not at an administrator's first sign-in attempt.
+	if c.OIDCAdminRedirectURL != "" && !validOIDCProviderRedirectURL(c.OIDCAdminRedirectURL) {
+		return domain.ErrOIDCMisconfigured
+	}
 	return nil
+}
+
+// validOIDCProviderRedirectURL accepts an absolute callback URI. HTTPS is
+// required except on loopback, so local development works over plain HTTP while
+// no deployed environment can.
+func validOIDCProviderRedirectURL(raw string) bool {
+	if strings.ContainsAny(raw, "\r\n") {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return false
+	}
+	if parsed.Scheme == "https" {
+		return true
+	}
+	return parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c Config) NormalizedOIDCProviderName() string {

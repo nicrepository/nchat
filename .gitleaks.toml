@@ -39,6 +39,25 @@ id = "generic-api-key"
   ]
 
   [[rules.allowlists]]
+  description = "Admin console test fixtures: one inert 32-byte HMAC key, declared twice under two different constant names, used only to sign and verify tokens inside the admin-service test binary (issue #578). It is a literal ascending-hex string, it is never read from the environment, it is not any deployment's AUTH_JWT_HMAC_SECRET, and it grants access to nothing outside the test process. Both the constant name and the exact value are pinned here, so a real secret assigned to either name is still reported."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['(testJWTSecret|testSecret)\s*=\s*"0123456789abcdef0123456789abcdef"']
+  paths = [
+    '^services/admin-service/internal/http/test_fixtures_test\.go$',
+    '^services/admin-service/internal/service/admin_session_service_test\.go$',
+  ]
+
+  [[rules.allowlists]]
+  description = "Admin console negative test fixture: an unsigned JWT whose header is the base64 of {alg:none,typ:JWT}. It exists so the test can assert the validator REFUSES it, which is why the assertion must not be weakened to satisfy the scanner. The token carries no signature and therefore no key material. Gitleaks classifies it as generic-api-key rather than jwt because the alg=none form has an empty signature segment. Pinned to the constant name, that exact header and the single file; real credentials remain disallowed."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['const noneToken = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0\." \+']
+  paths = [
+    '^services/admin-service/internal/http/middleware_units_test\.go$',
+  ]
+
+  [[rules.allowlists]]
   description = "Encrypted values in validated SealedSecret manifests"
   condition = "AND"
   paths = [

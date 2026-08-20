@@ -36,8 +36,13 @@ fi
 if command -v mkcert >/dev/null 2>&1; then
   echo "Generating trusted local certificate with mkcert for ${DOMAIN}."
   mkcert -install
+  # admin.nchat.local is the administrative console host (issue #578). The
+  # console runs on its own origin locally for the same reason it does in the
+  # cluster: its __Host- session cookie must be invisible to the chat origin,
+  # and a single certificate covering both is what lets that be exercised over
+  # real HTTPS in development.
   mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" \
-    "$DOMAIN" nchat.local localhost 127.0.0.1 ::1
+    "$DOMAIN" nchat.local admin.nchat.local localhost 127.0.0.1 ::1
 elif command -v openssl >/dev/null 2>&1; then
   echo "mkcert not found; generating a self-signed local certificate with openssl." >&2
   echo "Browsers will not trust this certificate automatically." >&2
@@ -61,7 +66,8 @@ elif command -v openssl >/dev/null 2>&1; then
     '[alt_names]' \
     "DNS.1 = $DOMAIN" \
     'DNS.2 = nchat.local' \
-    'DNS.3 = localhost' \
+    'DNS.3 = admin.nchat.local' \
+    'DNS.4 = localhost' \
     'IP.1 = 127.0.0.1' \
     'IP.2 = ::1' >"$config"
   openssl req -x509 -nodes -days 397 -newkey rsa:2048 \

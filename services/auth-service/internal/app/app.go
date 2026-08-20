@@ -154,6 +154,8 @@ func New(cfg config.Config) (*App, error) {
 			StateTTL:            time.Duration(cfg.OIDCStateTTLMinutes) * time.Minute,
 			AutoProvision:       cfg.OIDCAutoProvisionEnabled,
 			AllowedDomains:      allowedDomains,
+			RedirectURLs:        oidcRedirectURLs(cfg),
+			AdminACRValues:      splitOIDCACRValues(cfg.OIDCAdminACRValues),
 		}, tokens, oidcStore, provider)
 		if oidcErr != nil {
 			logger.Warn("oidc endpoints unavailable", "reason", "oidc_service_init_failed")
@@ -210,6 +212,39 @@ func splitOIDCDomains(raw string) []string {
 	return domains
 }
 
+// oidcRedirectURLs builds the closed allowlist of provider callback URIs.
+//
+// The chat entry always exists — ValidateOIDC already required it. The
+// administrative entry is added only when the deployment configured one, so a
+// cluster that has not published the console host simply has no administrative
+// single sign-on rather than an administrative sign-in that lands on the chat
+// origin.
+func oidcRedirectURLs(cfg config.Config) map[domain.OIDCAppContext]string {
+	redirects := map[domain.OIDCAppContext]string{
+		domain.OIDCAppChat: cfg.OIDCRedirectURL,
+	}
+	if cfg.OIDCAdminRedirectURL != "" {
+		redirects[domain.OIDCAppAdmin] = cfg.OIDCAdminRedirectURL
+	}
+	return redirects
+}
+
+// splitOIDCACRValues parses the configured administrative authentication
+// contexts. Empty configuration yields nil, which the service reads as "no
+// requirement" — the only way this policy is ever off.
+func splitOIDCACRValues(raw string) []string {
+	values := make([]string, 0)
+	for _, candidate := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
+}
+
 func resolveOIDCProvider(cfg config.Config) (string, service.OIDCProvider, error) {
 	providerName := cfg.NormalizedOIDCProviderName()
 	if err := cfg.ValidateOIDC(); err != nil {
@@ -221,7 +256,6 @@ func resolveOIDCProvider(cfg config.Config) (string, service.OIDCProvider, error
 		IssuerURL:    cfg.OIDCIssuerURL,
 		ClientID:     cfg.OIDCClientID,
 		ClientSecret: cfg.OIDCClientSecret,
-		RedirectURL:  cfg.OIDCRedirectURL,
 		Scopes:       cfg.OIDCScopes,
 		HTTPTimeout:  time.Duration(cfg.OIDCHTTPTimeoutSeconds) * time.Second,
 	})

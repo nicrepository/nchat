@@ -25,9 +25,13 @@ type fakeOIDCManager struct {
 	exchangeErr      error
 	gotCallback      service.OIDCCallbackInput
 	gotExchangeCode  string
+	gotLoginApp      domain.OIDCAppContext
+	loginCalls       int
 }
 
-func (f *fakeOIDCManager) Login(context.Context) (string, error) {
+func (f *fakeOIDCManager) Login(_ context.Context, app domain.OIDCAppContext) (string, error) {
+	f.gotLoginApp = app
+	f.loginCalls++
 	return f.loginLocation, f.loginErr
 }
 

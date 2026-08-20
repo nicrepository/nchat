@@ -19,6 +19,13 @@ func RequestIDFromContext(ctx context.Context) string {
 	return requestID
 }
 
+// RequestID adopts an inbound X-Request-ID when the caller sent one, so a trace
+// started upstream keeps its identity across services, and generates one
+// otherwise.
+//
+// That makes the value a *correlation hint*, not evidence: any client can
+// choose it. Never use it as the identity of a security-relevant record — see
+// GeneratedRequestID.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := r.Header.Get(requestIDHeader)
@@ -26,6 +33,28 @@ func RequestID(next http.Handler) http.Handler {
 			requestID = newRequestID()
 		}
 
+		w.Header().Set(requestIDHeader, requestID)
+		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// GeneratedRequestID always mints the identifier itself and ignores whatever
+// the caller sent.
+//
+// It exists for surfaces whose request ID ends up in a record someone will
+// later rely on — the administrative audit trail is the one this was written
+// for. If the caller could choose that value, the subject of an investigation
+// would be choosing the identifier the investigation is indexed by: they could
+// collide their own entries with an innocent request's, or flood the trail with
+// one repeated ID. Neither grants privilege, and both waste the reviewer's
+// time, which is the whole point of keeping a trail.
+//
+// The generated value is also what the response carries, so an operator holding
+// a report can find exactly the row it belongs to.
+func GeneratedRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := newRequestID()
 		w.Header().Set(requestIDHeader, requestID)
 		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
 		next.ServeHTTP(w, r.WithContext(ctx))
