@@ -2,12 +2,18 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 import { Link } from "react-router";
 
 import "./ProfilePage.css";
-import { validateDisplayName } from "./profileForm";
 import {
   getSoundNotificationMode,
   setSoundNotificationMode,
   type SoundNotificationMode,
 } from "../chat/soundPreference";
+import {
+  supportedTimezones,
+  validateBio,
+  validateDisplayName,
+  validateShortProfileField,
+  validateTimezone,
+} from "./profileForm";
 import {
   AVATAR_ACCEPTED_TYPES,
   AVATAR_MAX_BYTES,
@@ -16,13 +22,23 @@ import {
   removeAvatar,
   updateDisplayName,
   UpdateDisplayNameError,
+  updateProfileFields,
+  UpdateProfileFieldsError,
   uploadAvatar,
 } from "./profileApi";
 import { refreshSelfProfile } from "./selfProfile";
 
+// Computed once at module load, not per render: the set of IANA time zones a
+// browser supports does not change during a session, so recomputing it (and
+// rebuilding ~419 <option> elements) on every keystroke anywhere on the page
+// — which is what calling supportedTimezones() inline in JSX would do, since
+// any state change re-renders this whole component — is pure waste.
+const TIMEZONE_OPTIONS = supportedTimezones();
+
 /**
- * ProfilePage — lets the signed-in user edit their display name and set,
- * replace or remove their avatar.
+ * ProfilePage — lets the signed-in user edit their display name, cargo
+ * (job_title), bio, timezone and custom status, and set, replace or remove
+ * their avatar.
  *
  * The persisted profile is loaded from GET /api/auth/me on mount, so it
  * survives a page reload. A newly chosen avatar file is previewed locally and
@@ -34,11 +50,17 @@ import { refreshSelfProfile } from "./selfProfile";
  *   - "Cancelar nova imagem" discards the local selection (no server call);
  *   - "Remover avatar" deletes the persisted avatar (server DELETE).
  *
- * Saving the display name (ID 7, cronograma 19/08) updates only this screen's
- * local state from the server's response. Propagating the new name to the
- * sidebar and elsewhere (refreshSelfProfile) is explicitly out of scope here —
- * that synchronization is ID 13 (20/08) — so the screen must reflect the
- * persisted value on its own rather than relying on that propagation.
+ * The text fields are edited through two independent forms sharing one PATCH
+ * /auth/me endpoint: "Nome de exibição" (display_name alone) and "Detalhes do
+ * perfil" (job_title/bio/timezone/custom_status together). Each request sends
+ * only the fields its own form owns — the endpoint treats an absent field as
+ * "leave it alone" — so saving one form can never clobber the other's data.
+ *
+ * Saving updates only this screen's local state from the server's response.
+ * Propagating the change to the sidebar and elsewhere (refreshSelfProfile) is
+ * explicitly out of scope here — that synchronization is ID 13 (20/08) — so
+ * the screen must reflect the persisted value on its own rather than relying
+ * on that propagation.
  */
 export default function ProfilePage() {
   // persistedAvatarUrl: undefined = still loading / unknown, "" = confirmed none.
@@ -71,6 +93,26 @@ export default function ProfilePage() {
   // fired in the same tick; this ref is what actually makes the save single.
   const savingNameRef = useRef(false);
 
+  // persisted* fields below: undefined = still loading / unknown, "" = unset.
+  // Unlike display name, all four are optional — there is no "required" case.
+  const [persistedJobTitle, setPersistedJobTitle] = useState<string | undefined>(undefined);
+  const [persistedBio, setPersistedBio] = useState<string | undefined>(undefined);
+  const [persistedTimezone, setPersistedTimezone] = useState<string | undefined>(undefined);
+  const [persistedCustomStatus, setPersistedCustomStatus] = useState<string | undefined>(undefined);
+  const [jobTitleDraft, setJobTitleDraft] = useState("");
+  const [bioDraft, setBioDraft] = useState("");
+  const [timezoneDraft, setTimezoneDraft] = useState("");
+  const [customStatusDraft, setCustomStatusDraft] = useState("");
+  const [savingDetails, setSavingDetails] = useState(false);
+  const [detailsNetworkError, setDetailsNetworkError] = useState<string | null>(null);
+  const [detailsNotice, setDetailsNotice] = useState(false);
+  const jobTitleInputRef = useRef<HTMLInputElement>(null);
+  const timezoneSelectRef = useRef<HTMLSelectElement>(null);
+  const customStatusInputRef = useRef<HTMLInputElement>(null);
+  const bioInputRef = useRef<HTMLTextAreaElement>(null);
+  // Same single-submit guard as savingNameRef, for the same reason.
+  const savingDetailsRef = useRef(false);
+
   // loadProfile performs the fetch and settles state asynchronously (in the
   // promise callbacks), so it never calls setState synchronously — safe to run
   // from the mount effect without triggering a cascading render.
@@ -80,6 +122,14 @@ export default function ProfilePage() {
         setPersistedAvatarUrl(profile.avatarUrl ?? "");
         setPersistedDisplayName(profile.displayName);
         setNameDraft(profile.displayName);
+        setPersistedJobTitle(profile.jobTitle ?? "");
+        setJobTitleDraft(profile.jobTitle ?? "");
+        setPersistedBio(profile.bio ?? "");
+        setBioDraft(profile.bio ?? "");
+        setPersistedTimezone(profile.timezone ?? "");
+        setTimezoneDraft(profile.timezone ?? "");
+        setPersistedCustomStatus(profile.customStatus ?? "");
+        setCustomStatusDraft(profile.customStatus ?? "");
         setLoadingProfile(false);
       })
       .catch((error: unknown) => {
@@ -292,6 +342,102 @@ export default function ProfilePage() {
     [onSaveName],
   );
 
+  const jobTitleError = validateShortProfileField(jobTitleDraft, "Cargo");
+  const bioError = validateBio(bioDraft);
+  const timezoneError = validateTimezone(timezoneDraft);
+  const customStatusError = validateShortProfileField(customStatusDraft, "Status");
+  const detailsError = jobTitleError ?? timezoneError ?? customStatusError ?? bioError;
+  const detailsDirty =
+    persistedJobTitle !== undefined &&
+    (jobTitleDraft !== persistedJobTitle ||
+      bioDraft !== persistedBio ||
+      timezoneDraft !== persistedTimezone ||
+      customStatusDraft !== persistedCustomStatus);
+
+  const onDetailsChange = useCallback(
+    (setter: (value: string) => void) =>
+      (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+        setter(event.target.value);
+        setDetailsNetworkError(null);
+        setDetailsNotice(false);
+      },
+    [],
+  );
+
+  const onCancelDetails = useCallback(() => {
+    setJobTitleDraft(persistedJobTitle ?? "");
+    setBioDraft(persistedBio ?? "");
+    setTimezoneDraft(persistedTimezone ?? "");
+    setCustomStatusDraft(persistedCustomStatus ?? "");
+    setDetailsNetworkError(null);
+    setDetailsNotice(false);
+  }, [persistedJobTitle, persistedBio, persistedTimezone, persistedCustomStatus]);
+
+  /**
+   * Saves job_title, bio, timezone and custom_status together, mirroring
+   * onSaveName's single-submit guard and read-your-write behavior.
+   * display_name is never part of this request: PATCH /auth/me treats an
+   * absent field as "leave it alone" (see updateProfileFields), so this form
+   * cannot touch the name even though it never mentions it.
+   */
+  const onSaveDetails = useCallback(async () => {
+    if (savingDetailsRef.current) return;
+    if (detailsError) {
+      if (jobTitleError) jobTitleInputRef.current?.focus();
+      else if (timezoneError) timezoneSelectRef.current?.focus();
+      else if (customStatusError) customStatusInputRef.current?.focus();
+      else bioInputRef.current?.focus();
+      return;
+    }
+    savingDetailsRef.current = true;
+    setSavingDetails(true);
+    setDetailsNetworkError(null);
+    setDetailsNotice(false);
+    try {
+      const profile = await updateProfileFields({
+        jobTitle: jobTitleDraft.trim(),
+        bio: bioDraft.trim(),
+        timezone: timezoneDraft,
+        customStatus: customStatusDraft.trim(),
+      });
+      setPersistedJobTitle(profile.jobTitle ?? "");
+      setJobTitleDraft(profile.jobTitle ?? "");
+      setPersistedBio(profile.bio ?? "");
+      setBioDraft(profile.bio ?? "");
+      setPersistedTimezone(profile.timezone ?? "");
+      setTimezoneDraft(profile.timezone ?? "");
+      setPersistedCustomStatus(profile.customStatus ?? "");
+      setCustomStatusDraft(profile.customStatus ?? "");
+      setDetailsNotice(true);
+    } catch (error) {
+      const errMessage =
+        error instanceof UpdateProfileFieldsError
+          ? error.message
+          : "Não foi possível atualizar o perfil.";
+      setDetailsNetworkError(errMessage); // drafts are preserved so the user can retry.
+    } finally {
+      savingDetailsRef.current = false;
+      setSavingDetails(false);
+    }
+  }, [
+    detailsError,
+    jobTitleError,
+    timezoneError,
+    customStatusError,
+    jobTitleDraft,
+    bioDraft,
+    timezoneDraft,
+    customStatusDraft,
+  ]);
+
+  const onDetailsFormSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      void onSaveDetails();
+    },
+    [onSaveDetails],
+  );
+
   return (
     <main className="profile-page" aria-labelledby="profile-title">
       <header className="profile-page__header">
@@ -350,6 +496,131 @@ export default function ProfilePage() {
           <div className="profile-page__status" role="status" aria-live="polite">
             {nameNetworkError && <span className="profile-page__error">{nameNetworkError}</span>}
             {nameNotice && <span className="profile-page__ok">Nome atualizado.</span>}
+          </div>
+        </form>
+      </section>
+
+      <section className="profile-page__details-card" aria-label="Detalhes do perfil">
+        <form className="profile-page__details-form" onSubmit={onDetailsFormSubmit}>
+          <label className="profile-page__field-label" htmlFor="profile-job-title">
+            Cargo
+          </label>
+          <input
+            ref={jobTitleInputRef}
+            id="profile-job-title"
+            name="job_title"
+            type="text"
+            className="profile-page__input"
+            autoComplete="organization-title"
+            value={jobTitleDraft}
+            disabled={savingDetails || loadingProfile}
+            aria-invalid={jobTitleError !== null}
+            aria-describedby={jobTitleError ? "profile-job-title-error" : undefined}
+            onChange={onDetailsChange(setJobTitleDraft)}
+          />
+          {jobTitleError && (
+            <p id="profile-job-title-error" className="profile-page__error" role="alert">
+              {jobTitleError}
+            </p>
+          )}
+
+          <label className="profile-page__field-label" htmlFor="profile-timezone">
+            Fuso horário
+          </label>
+          <select
+            ref={timezoneSelectRef}
+            id="profile-timezone"
+            name="timezone"
+            className="profile-page__input profile-page__select"
+            autoComplete="off"
+            value={timezoneDraft}
+            disabled={savingDetails || loadingProfile}
+            aria-invalid={timezoneError !== null}
+            aria-describedby={timezoneError ? "profile-timezone-error" : undefined}
+            onChange={onDetailsChange(setTimezoneDraft)}
+          >
+            <option value="">Não definido</option>
+            {TIMEZONE_OPTIONS.map((tz) => (
+              <option key={tz} value={tz}>
+                {tz}
+              </option>
+            ))}
+          </select>
+          {timezoneError && (
+            <p id="profile-timezone-error" className="profile-page__error" role="alert">
+              {timezoneError}
+            </p>
+          )}
+
+          <label className="profile-page__field-label" htmlFor="profile-custom-status">
+            Status customizado
+          </label>
+          <input
+            ref={customStatusInputRef}
+            id="profile-custom-status"
+            name="custom_status"
+            type="text"
+            className="profile-page__input"
+            autoComplete="off"
+            value={customStatusDraft}
+            disabled={savingDetails || loadingProfile}
+            aria-invalid={customStatusError !== null}
+            aria-describedby={customStatusError ? "profile-custom-status-error" : undefined}
+            onChange={onDetailsChange(setCustomStatusDraft)}
+          />
+          {customStatusError && (
+            <p id="profile-custom-status-error" className="profile-page__error" role="alert">
+              {customStatusError}
+            </p>
+          )}
+
+          <label className="profile-page__field-label" htmlFor="profile-bio">
+            Biografia
+          </label>
+          <textarea
+            ref={bioInputRef}
+            id="profile-bio"
+            name="bio"
+            className="profile-page__input profile-page__textarea"
+            autoComplete="off"
+            value={bioDraft}
+            disabled={savingDetails || loadingProfile}
+            aria-invalid={bioError !== null}
+            aria-describedby={bioError ? "profile-bio-error" : undefined}
+            onChange={onDetailsChange(setBioDraft)}
+          />
+          {bioError && (
+            <p id="profile-bio-error" className="profile-page__error" role="alert">
+              {bioError}
+            </p>
+          )}
+
+          <div className="profile-page__buttons">
+            <button
+              type="submit"
+              className="profile-page__btn profile-page__btn--primary"
+              disabled={!detailsDirty || detailsError !== null || savingDetails || loadingProfile}
+              aria-busy={savingDetails}
+            >
+              {savingDetails ? "Salvando…" : "Salvar alterações"}
+            </button>
+            {detailsDirty && (
+              <button
+                type="button"
+                className="profile-page__btn"
+                onClick={onCancelDetails}
+                disabled={savingDetails}
+              >
+                Cancelar
+              </button>
+            )}
+          </div>
+
+          <div className="profile-page__status" role="status" aria-live="polite">
+            {detailsNetworkError && (
+              <span className="profile-page__error">{detailsNetworkError}</span>
+            )}
+            {detailsNotice && <span className="profile-page__ok">Perfil atualizado.</span>}
           </div>
         </form>
       </section>
