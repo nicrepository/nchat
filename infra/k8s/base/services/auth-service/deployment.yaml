@@ -86,6 +86,19 @@ spec:
                   name: nchat-secrets
                   key: OIDC_REDIRECT_URL
                   optional: true
+            # Provider callback URI for the administrative console host
+            # (issue #578). It sits beside OIDC_REDIRECT_URL rather than in the
+            # ConfigMap for one reason: the two must be registered together on
+            # the same identity-provider client, and an operator who sets one
+            # and forgets the other is the failure this co-location prevents.
+            # Optional and absent means the console simply has no single
+            # sign-on; it never falls back to the chat host's URI.
+            - name: OIDC_ADMIN_REDIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_ADMIN_REDIRECT_URL
+                  optional: true
             - name: OIDC_FRONTEND_CALLBACK_URL
               valueFrom:
                 secretKeyRef:

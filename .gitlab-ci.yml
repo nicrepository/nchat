@@ -63,8 +63,11 @@ quality:
     - pnpm tls:config-check
     - pnpm sealed-secrets:policy-check
     - pnpm typecheck:web
+    - pnpm typecheck:admin-web
     - pnpm test:web
+    - pnpm test:admin-web
     - pnpm build:web
+    - pnpm build:admin-web
 
 backend:
   stage: backend
@@ -110,9 +113,13 @@ frontend:
   script:
     - pnpm format:check:web
     - pnpm lint:web
+    - pnpm lint:admin-web
     - pnpm typecheck:web
+    - pnpm typecheck:admin-web
     - pnpm test:coverage:web
+    - pnpm test:coverage:admin-web
     - pnpm build:web
+    - pnpm build:admin-web
 
 manifests:
   stage: manifests

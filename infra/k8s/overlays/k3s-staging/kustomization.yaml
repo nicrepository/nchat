@@ -13,6 +13,8 @@ labels:
 images:
   - name: ghcr.io/nicrepository/nchat/web
     newTag: 0.0.0
+  - name: ghcr.io/nicrepository/nchat/admin-web
+    newTag: 0.0.0
   - name: ghcr.io/nicrepository/nchat/auth-service
     newTag: 0.0.0
   - name: ghcr.io/nicrepository/nchat/chat-service
@@ -35,6 +37,7 @@ patches:
   - path: configmap-patch.yaml
   - path: web-env-patch.yaml
   - path: patches/web-replicas.yaml
+  - path: patches/admin-web-replicas.yaml
   - path: patches/auth-service-replicas.yaml
   - path: patches/chat-service-replicas.yaml
   - path: patches/file-service-replicas.yaml

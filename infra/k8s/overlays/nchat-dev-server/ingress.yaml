@@ -63,13 +63,9 @@ spec:
                 name: notification-service
                 port:
                   name: http
-          - path: /api/admin
-            pathType: Prefix
-            backend:
-              service:
-                name: admin-service
-                port:
-                  name: http
+          # No /api/admin here: the Admin API is published only on the
+          # administrative host, so the chat origin cannot reach it (issue #578
+          # origin isolation).
           - path: /api/search
             pathType: Prefix
             backend:
@@ -89,6 +85,67 @@ spec:
             backend:
               service:
                 name: nchat-web
+                port:
+                  name: http
+---
+# Administrative console host (issue #578).
+#
+# A host of its own, not a path on the chat host. That separation is what makes
+# the console's CSP, its cookie scope and its access policy independent of the
+# chat app: the __Host- session cookie set here cannot be read or planted by the
+# chat origin, and a future VPN, IP allowlist or mTLS rule can be attached to
+# this router without touching the application everyone uses.
+#
+# Exactly three backends are reachable from it, and they are one origin as far
+# as the browser is concerned — which is what the __Host- cookie, SameSite,
+# the CSRF double-submit and the OIDC callback all depend on:
+#
+#   /            -> nchat-admin-web  (the console bundle)
+#   /api/admin   -> admin-service    (the Admin API)
+#   /api/auth    -> auth-service     (sign-in and the OIDC callback)
+#
+# Nothing else on the platform is routed here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-dev-admin
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    # The same two rewrites the chat host applies, for the same reason:
+    # auth-service registers /auth/*, admin-service registers /session,
+    # /bootstrap and /audit/events. Without them every route on this host
+    # answers 404 from the routers' catch-all.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-dev-auth-api-prefix@kubernetescrd,nchat-dev-admin-api-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - admin.REPLACE_ME_ADMIN_HOST
+      secretName: nchat-dev-tls
+  rules:
+    - host: admin.REPLACE_ME_ADMIN_HOST
+      http:
+        paths:
+          - path: /api/admin
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service
+                port:
+                  name: http
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web
                 port:
                   name: http
 ---
@@ -154,6 +211,16 @@ spec:
             backend:
               service:
                 name: nchat-web
+                port:
+                  name: http
+    - host: admin.REPLACE_ME_ADMIN_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web
                 port:
                   name: http
 ---
@@ -277,3 +344,26 @@ spec:
   stripPrefix:
     prefixes:
       - /api/files
+---
+# Rewrites the public /api/admin/<rest> contract onto the paths admin-service
+# actually registers (issue #578). Same class of rule as auth-api-prefix and
+# media-api-prefix above, and the same one the local Traefik gateway applies as
+# strip-admin-prefix, so the contract is one shape everywhere instead of three
+# that can drift.
+#
+# Without it every Admin API route — the session handshake, the bootstrap, the
+# audit trail — reaches the pod with the /api/admin prefix still attached and
+# answers 404 from the router's catch-all.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: admin-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/admin/(.*)"
+    replacement: "/${1}"

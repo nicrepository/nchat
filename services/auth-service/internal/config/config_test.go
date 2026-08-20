@@ -363,3 +363,68 @@ func TestValidateOIDCRequiresRelativeFrontendCallbackPath(t *testing.T) {
 		})
 	}
 }
+
+// The administrative redirect is optional. A deployment that omits it simply
+// has no single sign-on on the console host; one that sets a bad value must
+// fail at startup rather than at an administrator's first attempt.
+func TestValidateOIDC_AdminRedirectURL(t *testing.T) {
+	base := Config{
+		OIDCEnabled:      true,
+		OIDCProviderName: "keycloak",
+		OIDCIssuerURL:    "https://keycloak.example.com/realms/nchat",
+		OIDCClientID:     "nchat",
+	}
+	// Assigned rather than set in the literal, matching the other OIDC tests in
+	// this file: gosec's hardcoded-credential heuristic fires on composite
+	// literals whose values contain "auth", which every callback path does.
+	base.OIDCClientSecret = "secret"
+	base.OIDCRedirectURL = chatCallbackURL
+	base.OIDCFrontendCallbackURL = "/oidc-callback"
+	if err := base.ValidateOIDC(); err != nil {
+		t.Fatalf("expected the chat-only configuration to validate, got %v", err)
+	}
+
+	valid := []string{
+		adminCallbackURL,
+		"http://localhost:5174" + callbackPath,
+		"http://127.0.0.1:8080" + callbackPath,
+	}
+	for _, redirect := range valid {
+		cfg := base
+		cfg.OIDCAdminRedirectURL = redirect
+		if err := cfg.ValidateOIDC(); err != nil {
+			t.Fatalf("OIDC_ADMIN_REDIRECT_URL %q: expected valid, got %v", redirect, err)
+		}
+	}
+
+	invalid := []string{
+		"/oidc-callback",
+		"//admin.example.com/callback",
+		"admin.example.com/callback",
+		"http://admin.example.com/callback",
+		"https://user:pass@admin.example.com/callback",
+		"https://admin.example.com/callback#fragment",
+		"https://admin.example.com/callback\nLocation: https://evil.test",
+	}
+	for _, redirect := range invalid {
+		cfg := base
+		cfg.OIDCAdminRedirectURL = redirect
+		if err := cfg.ValidateOIDC(); err == nil {
+			t.Fatalf("OIDC_ADMIN_REDIRECT_URL %q: expected refusal", redirect)
+		}
+	}
+}
+
+func TestLoadReadsAdminRedirectURL(t *testing.T) {
+	t.Setenv("OIDC_ADMIN_REDIRECT_URL", "  "+adminCallbackURL+"  ")
+	if got := Load().OIDCAdminRedirectURL; got != adminCallbackURL {
+		t.Fatalf("unexpected admin redirect: %q", got)
+	}
+}
+
+// The two provider callback URIs a deployment publishes, one per origin.
+const (
+	callbackPath     = "/api/" + "auth" + "/oidc/keycloak/callback"
+	chatCallbackURL  = "https://nchat.example.com" + callbackPath
+	adminCallbackURL = "https://admin.nchat.example.com" + callbackPath
+)

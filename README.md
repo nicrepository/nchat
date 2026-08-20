@@ -97,6 +97,17 @@ Rodar o frontend:
 make dev-web
 ```
 
+Rodar o console administrativo (aplicacao separada, issue #578):
+
+```bash
+make dev-admin-web
+```
+
+O console e servido em `https://admin.nchat.local` pelo gateway local — host
+proprio, bundle proprio e CSP propria, para exercitar localmente a mesma
+fronteira que existe em producao. Ver
+`docs/runbooks/task-admin-console-foundation.md`.
+
 Validacao:
 
 ```bash
@@ -301,6 +312,7 @@ Adicione no `/etc/hosts`:
 
 ```text
 127.0.0.1 nchat.local
+127.0.0.1 admin.nchat.local
 ```
 
 Rotas locais:
@@ -310,9 +322,10 @@ Rotas locais:
 - `http://nchat.local:8080/api/chat/healthz`
 - `http://nchat.local:8080/api/files/healthz`
 - `http://nchat.local:8080/api/notifications/healthz`
-- `http://nchat.local:8080/api/admin/healthz`
 - `http://nchat.local:8080/api/search/healthz`
 - `http://nchat.local:8080/api/media/healthz`
+- Console administrativo: `http://admin.nchat.local:8080/`
+- Admin API: `http://admin.nchat.local:8080/api/admin/healthz`
 - Dashboard: `http://localhost:8090/dashboard/`
 
 Avisos:

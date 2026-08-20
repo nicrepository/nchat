@@ -109,6 +109,43 @@ type AcceptInviteResult struct {
 	CreatedAt   time.Time
 }
 
+// OIDCAppContext names which NChat application a single sign-on run belongs to.
+//
+// It exists because the two applications are served from different origins and
+// the identity provider must send the browser back to the one it started from.
+// It is deliberately a closed enum and never a URL: the client picks a *label*,
+// the server picks the redirect URI that label maps to. There is therefore no
+// request value that can become a redirect target, which is what keeps this
+// from being an open redirect.
+type OIDCAppContext string
+
+const (
+	// OIDCAppChat is the chat application. It is the default for a login that
+	// names no context, so every caller that predates this distinction keeps
+	// the behaviour it had.
+	OIDCAppChat OIDCAppContext = "chat"
+	// OIDCAppAdmin is the administrative console, served from its own host.
+	OIDCAppAdmin OIDCAppContext = "admin"
+)
+
+// ParseOIDCAppContext resolves a client-supplied label against the closed set.
+//
+// An empty label is the chat application. Anything else that is not exactly a
+// known label is refused rather than coerced: silently falling back would let a
+// typo — or a probe — land on a context the caller did not ask for.
+func ParseOIDCAppContext(raw string) (OIDCAppContext, bool) {
+	switch OIDCAppContext(raw) {
+	case "":
+		return OIDCAppChat, true
+	case OIDCAppChat:
+		return OIDCAppChat, true
+	case OIDCAppAdmin:
+		return OIDCAppAdmin, true
+	default:
+		return "", false
+	}
+}
+
 // OIDCLoginRequest stores generated one-time login request material.
 type OIDCLoginRequest struct {
 	ID                    string
@@ -117,7 +154,12 @@ type OIDCLoginRequest struct {
 	NonceHash             string
 	PKCEVerifierEncrypted string
 	RedirectAfter         string
-	ExpiresAt             time.Time
+	// AppContext is recorded here, server-side, alongside the state and nonce.
+	// The callback reads it back from this row rather than from the returning
+	// request, so the context a run finishes in is the one it started in even
+	// though the browser passes through an identity provider in between.
+	AppContext OIDCAppContext
+	ExpiresAt  time.Time
 }
 
 // OIDCConsumedAuthRequest is returned after a state value is atomically consumed.
@@ -127,6 +169,7 @@ type OIDCConsumedAuthRequest struct {
 	NonceHash             string
 	PKCEVerifierEncrypted string
 	RedirectAfter         string
+	AppContext            OIDCAppContext
 }
 
 // OIDCClaims carries the validated identity claims used by nchat.
@@ -137,11 +180,16 @@ type OIDCClaims struct {
 	Email             string
 	EmailVerified     bool
 	PreferredUsername string
-	Name              string
-	GivenName         string
-	FamilyName        string
-	Picture           string
-	Nonce             string
+	// AuthenticationContextClass carries the `acr` claim, which is how the
+	// identity provider states which authentication context it ran. Optional in
+	// OIDC: an empty value means the provider said nothing, which is never
+	// evidence of a strong authentication.
+	AuthenticationContextClass string
+	Name                       string
+	GivenName                  string
+	FamilyName                 string
+	Picture                    string
+	Nonce                      string
 }
 
 // OIDCSessionInput carries provider identity and internal session material for atomic persistence.

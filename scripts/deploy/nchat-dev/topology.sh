@@ -2,6 +2,9 @@
 # This file is sourced by deploy.sh.
 # The caller must enable: set -Eeuo pipefail.
 
+# The subdomain label the administrative console is served from (issue #578).
+# Derived from NCHAT_DEV_HOST rather than configured; see load_nchat_dev_topology.
+NCHAT_DEV_ADMIN_HOST_LABEL='admin'
 NCHAT_DEV_TOPOLOGY_KEYS_RE='^(NCHAT_DEV_NODE_IP|NCHAT_DEV_NODE_CIDR|NCHAT_DEV_HOST|NCHAT_DEV_PUBLIC_URL|NCHAT_DEV_TURN_EXTERNAL_IP|LIVEKIT_API_PORT|LIVEKIT_RTC_TCP_PORT|LIVEKIT_RTC_UDP_PORT|TURN_LISTEN_PORT|TURN_RELAY_MIN_PORT|TURN_RELAY_MAX_PORT)$'
 # Full RFC 1123 hostname: 1-63 char labels, alphanumeric with interior
 # hyphens only (no leading/trailing hyphen or dot, no empty label), joined by
@@ -58,6 +61,13 @@ load_nchat_dev_topology() {
   is_ipv4 "$NCHAT_DEV_TURN_EXTERNAL_IP" || return 1
   is_rfc1123_hostname "$NCHAT_DEV_HOST" || return 1
   is_rfc1123_hostname "turn.$NCHAT_DEV_HOST" || return 1
+  # The administrative console host (issue #578) is derived, not configured,
+  # for the same reason turn. is: it is always a fixed label under the
+  # deployment host, so asking an operator to restate it would only create a
+  # way for the two to disagree. The derivation itself lives in the overlay's
+  # kustomize replacement, so every renderer produces it; what belongs here is
+  # the constraint it imposes on the host an operator may choose.
+  is_rfc1123_hostname "$NCHAT_DEV_ADMIN_HOST_LABEL.$NCHAT_DEV_HOST" || return 1
   [[ "$NCHAT_DEV_PUBLIC_URL" == "https://$NCHAT_DEV_HOST" ]] || return 1
   local port
   for port in "$LIVEKIT_API_PORT" "$LIVEKIT_RTC_TCP_PORT" "$LIVEKIT_RTC_UDP_PORT" \

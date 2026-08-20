@@ -101,3 +101,68 @@ func TestMethodNotAllowedRejectsInvalidMethod(t *testing.T) {
 		t.Fatalf("expected status 405, got %d", response.Code)
 	}
 }
+
+// The administrative audit trail is indexed by this value, so the caller must
+// not be able to choose it. A client that supplies X-Request-ID gets a
+// server-minted one back instead.
+func TestGeneratedRequestIDIgnoresTheInboundHeader(t *testing.T) {
+	const forged = "attacker-controlled-value"
+	var seen string
+	handler := GeneratedRequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = RequestIDFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("X-Request-ID", forged)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if seen == forged {
+		t.Fatal("the forged identifier reached the handler")
+	}
+	if seen == "" {
+		t.Fatal("expected a generated identifier")
+	}
+	if got := response.Header().Get("X-Request-ID"); got != seen {
+		t.Fatalf("the response must carry the generated identifier, got %q want %q", got, seen)
+	}
+	if len(seen) != 32 {
+		t.Fatalf("expected a 32-character hex identifier, got %q", seen)
+	}
+}
+
+// Two requests must not share an identifier, forged header or not.
+func TestGeneratedRequestIDIsUniquePerRequest(t *testing.T) {
+	ids := make(map[string]struct{}, 64)
+	handler := GeneratedRequestID(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		ids[RequestIDFromContext(r.Context())] = struct{}{}
+	}))
+
+	for i := 0; i < 64; i++ {
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		request.Header.Set("X-Request-ID", "same-for-every-request")
+		handler.ServeHTTP(httptest.NewRecorder(), request)
+	}
+	if len(ids) != 64 {
+		t.Fatalf("expected 64 distinct identifiers, got %d", len(ids))
+	}
+}
+
+// RequestID keeps propagating an upstream trace: that is what the other
+// services use it for, and this change must not alter it.
+func TestRequestIDStillAdoptsAnInboundTrace(t *testing.T) {
+	const upstream = "trace-from-the-gateway"
+	var seen string
+	handler := RequestID(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen = RequestIDFromContext(r.Context())
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("X-Request-ID", upstream)
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	if seen != upstream {
+		t.Fatalf("expected the upstream trace to survive, got %q", seen)
+	}
+}

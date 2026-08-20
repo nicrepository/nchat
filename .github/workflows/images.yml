@@ -55,6 +55,7 @@ jobs:
           set -euo pipefail
           case "$IMAGE" in
             web) dockerfile=Dockerfile.web; build_args= ;;
+            admin-web) dockerfile=Dockerfile.admin-web; build_args= ;;
             migrations) dockerfile=Dockerfile.migrations; build_args= ;;
             *) dockerfile=Dockerfile.service; build_args="SERVICE=$IMAGE" ;;
           esac

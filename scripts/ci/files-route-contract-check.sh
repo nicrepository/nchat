@@ -72,10 +72,13 @@ UPLOAD_RULE = "PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)"
 # Paths that must survive the Ingress's whole middleware chain untouched. The
 # annotation applies to every router the shared Ingress generates, so a rewrite
 # that is broader than its own prefix would silently maul another service.
+# /api/admin is deliberately absent: since issue #578 the Admin API is published
+# only on the administrative host, so it never reaches this Ingress at all. That
+# separation has its own gate in scripts/ci/admin-route-contract-check.sh. The
+# prefixes below are the ones no middleware in this chain may touch.
 UNTOUCHED = [
     "/api/chat/channels/c1/messages",
     "/api/notifications/subscriptions",
-    "/api/admin/healthz",
     "/api/search/messages?q=x",
     "/",
     "/index.html",

@@ -135,6 +135,8 @@ poc-results/webrtc-office-network/*
 
 # Playwright local artifacts
 apps/web/playwright-report/
+apps/admin-web/playwright-report/
+apps/admin-web/test-results/
 apps/web/test-results/
 
 # Security scan artifacts

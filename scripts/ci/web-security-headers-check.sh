@@ -15,6 +15,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 NGINX_CONF="$ROOT_DIR/infra/docker/web/nginx.conf"
 INDEX_HTML="$ROOT_DIR/apps/web/index.html"
+ADMIN_NGINX_CONF="$ROOT_DIR/infra/docker/admin-web/nginx.conf"
+ADMIN_INDEX_HTML="$ROOT_DIR/apps/admin-web/index.html"
 
 fail() {
   echo "$1" >&2
@@ -115,10 +117,56 @@ if grep -o '<script[^>]*>' "$INDEX_HTML" | grep -qv 'src='; then
   fail "apps/web/index.html não pode conter script inline (remova o inline ou use nonce/hash específico)."
 fi
 
-# Nenhuma outra camada versionada (Traefik, Ingress, serviços Go) pode emitir CSP.
+# --- Console administrativo (issue #578) -------------------------------------
+#
+# O console e um bundle separado, servido em outro host, com CSP propria. Ela e
+# validada com as mesmas diretivas obrigatorias e mais algumas restricoes que o
+# chat nao pode ter: o console nao abre WebSocket, nao carrega midia e nao fala
+# com nenhum host alem do proprio.
+
+[ -f "$ADMIN_NGINX_CONF" ] || fail "Arquivo obrigatório ausente: infra/docker/admin-web/nginx.conf"
+[ -f "$ADMIN_INDEX_HTML" ] || fail "Arquivo obrigatório ausente: apps/admin-web/index.html"
+
+admin_csp_lines="$(grep -c 'add_header Content-Security-Policy ' "$ADMIN_NGINX_CONF" || true)"
+if [ "$admin_csp_lines" -ne 1 ]; then
+  fail "admin-web/nginx.conf deve declarar exatamente um add_header Content-Security-Policy (encontrado: $admin_csp_lines)."
+fi
+
+if grep -q 'Content-Security-Policy-Report-Only' "$ADMIN_NGINX_CONF"; then
+  fail "admin-web/nginx.conf não pode emitir Content-Security-Policy-Report-Only junto com a política enforced."
+fi
+
+admin_policy="$(sed -n 's/.*add_header Content-Security-Policy "\(.*\)".*/\1/p' "$ADMIN_NGINX_CONF")"
+assert_policy "admin-web/nginx.conf" "$admin_policy"
+
+case "$admin_policy" in
+  *"frame-ancestors 'none'"*) ;;
+  *) fail "admin-web/nginx.conf: o console não pode ser embutido (frame-ancestors 'none')." ;;
+esac
+
+# connect-src do console e exatamente 'self': a Admin API e same-origin e nao ha
+# nenhum terceiro para liberar. Qualquer host extra aqui e uma exfiltracao a
+# mais que a politica passaria a permitir.
+admin_connect="$(directive_value "$admin_policy" 'connect-src')"
+if [ "$admin_connect" != "'self'" ]; then
+  fail "admin-web/nginx.conf: connect-src deve ser exatamente 'self' (encontrado: $admin_connect)."
+fi
+
+for header in 'X-Frame-Options "DENY"' 'X-Content-Type-Options "nosniff"' 'Strict-Transport-Security' 'Cache-Control "no-store"'; do
+  grep -q "$header" "$ADMIN_NGINX_CONF" || fail "admin-web/nginx.conf: header obrigatório ausente ($header)."
+done
+
+if grep -o '<script[^>]*>' "$ADMIN_INDEX_HTML" | grep -qv 'src='; then
+  fail "apps/admin-web/index.html não pode conter script inline."
+fi
+
+# Nenhuma outra camada versionada (Traefik, Ingress, serviços Go) pode emitir
+# CSP. Os dois arquivos abaixo sao as unicas fontes: um por aplicacao frontend,
+# cada um servido em seu proprio host.
 extra_csp="$(
   git -C "$ROOT_DIR" grep -lI -i 'Content-Security-Policy' -- . \
     ':!infra/docker/web/nginx.conf' \
+    ':!infra/docker/admin-web/nginx.conf' \
     ':!scripts/ci/web-security-headers-check.sh' \
     ':!scripts/ci/web-livekit-integration-check.sh' \
     ':!*.md' || true

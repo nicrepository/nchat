@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-Este diretorio configura o Traefik como gateway local padrao do NChat. Ele existe apenas para desenvolvimento e roteia requisicoes HTTP e HTTPS de `nchat.local` para processos rodando no host.
+Este diretorio configura o Traefik como gateway local padrao do NChat. Ele existe apenas para desenvolvimento e roteia requisicoes HTTP e HTTPS de `nchat.local` e `admin.nchat.local` para processos rodando no host.
 
 Nginx permanece como alternativa futura porque os requisitos aceitam Traefik ou Nginx.
 
@@ -14,6 +14,8 @@ Nginx permanece como alternativa futura porque os requisitos aceitam Traefik ou 
 
 ## Rotas
 
+### Host `nchat.local`
+
 | Rota                 | Destino local                      |
 | -------------------- | ---------------------------------- |
 | `/`                  | `http://host.docker.internal:5173` |
@@ -21,15 +23,29 @@ Nginx permanece como alternativa futura porque os requisitos aceitam Traefik ou 
 | `/api/chat`          | `http://host.docker.internal:8082` |
 | `/api/files`         | `http://host.docker.internal:8083` |
 | `/api/notifications` | `http://host.docker.internal:8084` |
-| `/api/admin`         | `http://host.docker.internal:8085` |
 | `/api/search`        | `http://host.docker.internal:8086` |
 | `/api/media`         | `http://host.docker.internal:8087` |
+
+Nao ha rota `/api/admin` neste host: desde a issue #578 a Admin API e publicada
+exclusivamente em `admin.nchat.local`, para que um request forjado a partir da
+origem do chat nao alcance o `admin-service`.
+
+### Host `admin.nchat.local` (issue #578)
+
+| Rota         | Destino local                      |
+| ------------ | ---------------------------------- |
+| `/`          | `http://host.docker.internal:5174` |
+| `/api/admin` | `http://host.docker.internal:8085` |
+| `/api/auth`  | `http://host.docker.internal:8081` |
+
+O console administrativo roda em um host proprio ja em desenvolvimento. E o que faz o ambiente local exercitar a mesma fronteira de producao: o cookie `__Host-` da sessao administrativa nao e visivel para a origem do chat, a CSP e outra, e a Admin API e same-origin para o console e cross-origin para todo o resto. Somente essas tres rotas chegam a esse host.
 
 O gateway local preserva os caminhos esperados pelo frontend:
 
 - `/api/auth/*` e reescrito para `/auth/*` no `auth-service`.
 - `/api/chat/*` chega ao `chat-service` sem strip, pois o servico monta rotas em `/api/chat/*`.
 - Rotas de probe como `/api/auth/healthz` e `/api/chat/healthz` usam routers explicitos para chegar aos handlers `/healthz` dos servicos.
+- `/api/admin/*` tem o prefixo removido antes de chegar ao `admin-service`, que registra `/session`, `/bootstrap` e `/audit/events`. Os overlays Kubernetes aplicam a mesma transformacao com o middleware `admin-api-prefix`, e `scripts/ci/admin-route-contract-check.sh` falha se as camadas divergirem.
 
 WebSocket nao exige configuracao especial no Traefik para o caso basico; headers `Upgrade` e `Connection` sao encaminhados pelo proxy. Esta tarefa nao implementa WebSocket real nos servicos.
 
@@ -57,6 +73,7 @@ Para resolver `nchat.local`, adicione no host:
 
 ```text
 127.0.0.1 nchat.local
+127.0.0.1 admin.nchat.local
 ```
 
 ## Limitacoes

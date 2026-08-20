@@ -60,9 +60,8 @@ func TestProviderRegistry_AzureADDefinitionExistsButRequiresConfig(t *testing.T)
 
 func TestProviderRegistry_AzureADDefinitionReturnsOIDCProviderForConfig(t *testing.T) {
 	provider, err := NewAzureADProvider(AzureADProviderConfig{
-		TenantID:    "contoso.onmicrosoft.com",
-		ClientID:    "client",
-		RedirectURL: "https://auth.example.com/auth/oidc/keycloak/callback",
+		TenantID: "contoso.onmicrosoft.com",
+		ClientID: "client",
 	})
 	if err != nil {
 		t.Fatalf("AzureADProviderConfig: expected no error, got %v", err)
@@ -81,8 +80,7 @@ func TestProviderRegistry_GoogleWorkspaceDefinitionExistsButRequiresConfig(t *te
 
 func TestProviderRegistry_GoogleWorkspaceDefinitionReturnsOIDCProviderForConfig(t *testing.T) {
 	provider, err := NewGoogleWorkspaceProvider(GoogleWorkspaceProviderConfig{
-		ClientID:    "client",
-		RedirectURL: "https://auth.example.com/auth/oidc/keycloak/callback",
+		ClientID: "client",
 	})
 	if err != nil {
 		t.Fatalf("GoogleWorkspaceProviderConfig: expected no error, got %v", err)
@@ -102,10 +100,10 @@ func TestProviderRegistry_DisabledProviderRejected(t *testing.T) {
 
 type stubRegistryProvider struct{}
 
-func (s *stubRegistryProvider) AuthorizationURL(_, _, _ string) (string, error) {
+func (s *stubRegistryProvider) AuthorizationURL(AuthorizationRequest) (string, error) {
 	return "", nil
 }
-func (s *stubRegistryProvider) ExchangeCode(_ context.Context, _, _ string) (oidcTokenSet, error) {
+func (s *stubRegistryProvider) ExchangeCode(_ context.Context, _, _, _ string) (oidcTokenSet, error) {
 	return oidcTokenSet{}, nil
 }
 func (s *stubRegistryProvider) ValidateIDToken(_ context.Context, _ string) (domain.OIDCClaims, error) {
