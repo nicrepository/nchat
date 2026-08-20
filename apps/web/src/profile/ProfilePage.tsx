@@ -2,7 +2,6 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 import { Link } from "react-router";
 
 import "./ProfilePage.css";
-import { validateDisplayName } from "./profileForm";
 import {
   getSoundNotificationMode,
   setSoundNotificationMode,
@@ -82,17 +81,6 @@ export default function ProfilePage() {
   const [soundMode, setSoundModeState] = useState<SoundNotificationMode>(() =>
     getSoundNotificationMode(),
   );
-
-  // persistedDisplayName: undefined = still loading / unknown.
-  const [persistedDisplayName, setPersistedDisplayName] = useState<string | undefined>(undefined);
-  const [nameDraft, setNameDraft] = useState("");
-  const [savingName, setSavingName] = useState(false);
-  const [nameNetworkError, setNameNetworkError] = useState<string | null>(null);
-  const [nameNotice, setNameNotice] = useState(false);
-  const nameInputRef = useRef<HTMLInputElement>(null);
-  // State updates are asynchronous, so `savingName` cannot stop a second submit
-  // fired in the same tick; this ref is what actually makes the save single.
-  const savingNameRef = useRef(false);
 
   // persistedDisplayName: undefined = still loading / unknown.
   const [persistedDisplayName, setPersistedDisplayName] = useState<string | undefined>(undefined);
