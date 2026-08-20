@@ -25,11 +25,19 @@ type User struct {
 // SelfProfile is the minimal identity a signed-in user may read about
 // themselves, used by GET /auth/me to hydrate the profile screen. It carries no
 // e-mail, status, auth source or other PII beyond what the UI renders. AvatarURL
-// is empty when no avatar is set.
+// is empty when no avatar is set. JobTitle, Bio, Timezone and CustomStatus are
+// "" when unset — all four are optional, unlike DisplayName.
+// Timezone, when set, is always a valid IANA time zone name (validated at the
+// service layer before it is ever persisted). CustomStatus is a single textual
+// MVP field; a separate emoji is deliberately outside this contract.
 type SelfProfile struct {
-	ID          string
-	DisplayName string
-	AvatarURL   string
+	ID           string
+	DisplayName  string
+	AvatarURL    string
+	JobTitle     string
+	Bio          string
+	Timezone     string
+	CustomStatus string
 }
 
 // WorkspaceUser is one row of the workspace user administration list.
