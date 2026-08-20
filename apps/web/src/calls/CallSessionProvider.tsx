@@ -29,9 +29,12 @@ import {
   type ResourceCallController,
 } from "../chat/useResourceCallSession";
 import {
+  compareParticipationTokens,
   createOwnershipCoordinator,
   type OwnershipCoordinator,
   type OwnershipMessage,
+  type ParticipationMessageType,
+  type ParticipationToken,
 } from "./callOwnership";
 import { initialPresentation, transition, type PresentationState } from "./callPresentation";
 import { emitCallTechnicalEvent } from "./callTelemetry";
@@ -65,6 +68,30 @@ export interface CallSessionContextValue {
   announceDedicated: (callId: string) => void;
   acknowledgeDedicated: (callId: string, connected: boolean) => void;
   releaseDedicated: (callId: string) => Promise<void>;
+  /**
+   * The dedicated tab's actual exit from a resource/group call (issue
+   * #570) — never for RF-23 direct calls, which keep using calls.end().
+   * Runs the real participant leave (#569), releases the dedicated
+   * ownership lease, and tells every other tab this participation is over
+   * so none of them ever reconnect it. Distinct from releaseDedicated,
+   * which only moves ownership (minimize) and must leave participation
+   * untouched.
+   */
+  leaveDedicated: (callId: string) => Promise<void>;
+  /**
+   * Registers a fresh resource-call participation for callId — the causal
+   * counterpart to leaveDedicated/endResourceParticipation (issue #570
+   * follow-up). Must be called once, right after resource.join() itself
+   * resolves with a call_id, by every real call site of resource.join() —
+   * never inferred from resource.callId changing, since a legitimate rejoin
+   * of the very same resource call resolves to the very same callId string
+   * and produces no observable state transition to key an effect off.
+   * Resolves once the generation has actually been allocated from the
+   * shared, cross-tab ownership storage — never a locally computed one, so
+   * a brand-new or reloaded tab always outranks whatever any other tab
+   * still remembers for this callId.
+   */
+  beginResourceParticipation: (callId: string) => Promise<void>;
 }
 
 const CallSessionContext = createContext<CallSessionContextValue | null>(null);
@@ -109,7 +136,95 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const expectedAckEpoch = useRef<number | null>(null);
   const recovery = useRef<Promise<boolean> | null>(null);
   const dedicatedReadyTimer = useRef<number | null>(null);
-
+  // Per-callId participation lifecycle (issue #570 follow-up). "leaving"/
+  // "left" block reconnect the same way the old permanent
+  // endedResourceCallIds Set did — but scoped to one participation attempt,
+  // not the callId forever: a resource call's server-side row is long-lived
+  // and reused by every participant who joins it, so callId alone can't
+  // mean "never reconnectable again" — a later, legitimate rejoin of the
+  // very same callId must work.
+  //
+  // Ordered by (ParticipationToken, sequence), never wall-clock time — two
+  // tabs can legitimately produce identical Date.now() values, and delivery
+  // order is not causal order. The token's generation increments once per
+  // fresh join of a callId, so a message from an old, already-superseded
+  // participation can never outrank a newer one no matter how it collides or
+  // reorders in transit; when two tabs race to the SAME generation without a
+  // real cross-process lock (allocateParticipationGeneration is best-effort,
+  // not a true compare-and-swap — see callOwnership.ts), the token's
+  // writerId is what still makes them distinguishable and consistently
+  // orderable across every tab, via compareParticipationTokens. `sequence`
+  // orders leaving/left/leave-cancelled within one already-agreed-upon
+  // participation's own lifecycle. A handoff/minimize never touches this map
+  // at all: resource.callId staying set after a handoff is exactly what lets
+  // a legitimate later reclaim reconnect, and this map only ever gates that
+  // reclaim for a callId whose CURRENT participation attempt is actually
+  // leaving/left.
+  //
+  // The ref is the single source of truth, mutated synchronously and
+  // immediately by commitParticipation below — never through a setState
+  // updater's "current" argument. That eager-computation path only fires
+  // reliably when this hook has no other update already pending on it, and
+  // beginResourceParticipation/continueResourceParticipation must compute
+  // the next token/sequence from the true latest record even when called
+  // from a plain Promise continuation (resource.join() resolving) that is
+  // not itself inside any React-owned batch — exactly the case a stale read
+  // would silently under-count the next generation. participationVersion
+  // exists purely to force the re-render that makes render-time reads of the
+  // ref (resourceParticipationPhase below, the chat-socket gate) observe the
+  // change.
+  const participationRecordsRef = useRef<
+    Map<
+      string,
+      { phase: "participating" | "leaving" | "left"; token: ParticipationToken; sequence: number }
+    >
+  >(new Map());
+  const [, setParticipationVersion] = useState(0);
+  // Applies a participation transition — from an incoming cross-tab message
+  // (applyParticipationEvent) or a locally computed one
+  // (beginResourceParticipation/continueResourceParticipation) — but only if
+  // (token, sequence) is not behind whatever this tab already knows for that
+  // callId. That ordering guard is what a bare Set, a naive delete-on-
+  // rejoin, or a wall-clock comparison could never express deterministically.
+  //
+  // Purely local — never writes back to shared storage. Under the per-writer
+  // storage keys allocateParticipationGeneration uses (issue #570 follow-up),
+  // every writer's own token already persists durably under its own key the
+  // moment it is allocated, and getParticipationToken derives "current" as
+  // the max across all of them at read time — so there is nothing left for
+  // a receiver to converge into storage; a convergence write would in fact
+  // be unsafe here, since the only way to "record" a token this tab did not
+  // allocate itself would be writing it under another writer's key,
+  // destroying the exclusive-ownership property that makes the storage
+  // layer race-free without Web Locks.
+  const commitParticipation = useCallback(
+    (
+      callId: string,
+      phase: "participating" | "leaving" | "left",
+      token: ParticipationToken,
+      sequence: number,
+    ) => {
+      const existing = participationRecordsRef.current.get(callId);
+      if (existing) {
+        const cmp = compareParticipationTokens(token, existing.token);
+        if (cmp < 0) return;
+        if (cmp === 0 && sequence <= existing.sequence) return;
+      }
+      participationRecordsRef.current = new Map(participationRecordsRef.current);
+      participationRecordsRef.current.set(callId, { phase, token, sequence });
+      setParticipationVersion((version) => version + 1);
+    },
+    [],
+  );
+  const applyParticipationEvent = useCallback(
+    (
+      callId: string,
+      phase: "participating" | "leaving" | "left",
+      token: ParticipationToken,
+      sequence: number,
+    ) => commitParticipation(callId, phase, token, sequence),
+    [commitParticipation],
+  );
   useEffect(() => {
     mediaRef.current = media;
   }, [media]);
@@ -210,13 +325,129 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   }, [resource]);
   const calls = useCallSignaling(directMedia, mediaEnabled, releaseResource);
 
+  const postParticipation = useCallback(
+    (
+      callId: string,
+      type: ParticipationMessageType,
+      token: ParticipationToken,
+      sequence: number,
+    ) => {
+      const ownership = getOwnership();
+      ownership.post({
+        v: 1,
+        type,
+        callId,
+        tabId: ownership.tabId,
+        epoch: ownership.getLease()?.epoch ?? 0,
+        generation: token.generation,
+        writerId: token.writerId,
+        sequence,
+      });
+    },
+    [getOwnership],
+  );
+  // Registers a *causally real* new join — called only once resource.join()
+  // itself resolves with the callId it actually joined (issue #570 follow-
+  // up), never inferred from resource.callId changing: a legitimate rejoin
+  // of the very same resource call resolves to the very same callId string,
+  // and React never produces an observable state transition on an unchanged
+  // primitive, so nothing watching resource.callId can ever detect it.
+  //
+  // The token is allocated from the ownership coordinator's SHARED,
+  // persisted, per-callId storage (allocateParticipationGeneration) — never
+  // computed from this tab's own local participationRecordsRef, which
+  // starts EMPTY in a brand-new or just-reloaded tab. A local-only counter
+  // can only ever be monotonic within one CallSessionProvider instance; a
+  // fresh instance has no way to know what generation another tab (or its
+  // own earlier life, before reload) already reached for THIS callId
+  // specifically, and would restart at 1 — indistinguishable from, and
+  // rejected as older than, a real prior participation another tab still
+  // remembers. Handoff note (issue #570 problem 3): DedicatedCallPage's
+  // activation effect calls resource.join() — and therefore this — on
+  // EVERY successful activation, including a plain handoff continuation,
+  // not only a genuinely fresh join. That is intentional: it never touches
+  // "leaving"/"left" (those live exclusively in endResourceParticipation
+  // below, reachable only via an explicit user "sair" action), so a handoff
+  // can never make any tab believe a server-side leave/rejoin happened —
+  // the phase stays "participating" throughout. The resulting generation
+  // bump is a harmless, idempotent refresh of the "currently participating"
+  // token, not a second real join.
+  const beginResourceParticipation = useCallback(
+    async (callId: string) => {
+      const token = getOwnership().allocateParticipationGeneration(callId);
+      commitParticipation(callId, "participating", token, 0);
+      postParticipation(callId, "participating", token, 0);
+    },
+    [commitParticipation, getOwnership, postParticipation],
+  );
+  // Advances the CURRENT participation (same token, next sequence) — used
+  // by endResourceParticipation below for leaving/left/leave-cancelled,
+  // which all belong to the join already registered via
+  // beginResourceParticipation, never a new one. Falls back to the shared,
+  // read-only token when this tab's own local record is empty — e.g. a tab
+  // that took over an EXISTING participation via handoff/reconnect (never
+  // its own join()) never locally observed the "participating" broadcast
+  // that created it, and must still tag its own leaving/left with the token
+  // every other tab already knows, or they would reject it as an older,
+  // unrelated participation.
+  const continueResourceParticipation = useCallback(
+    (
+      callId: string,
+      phase: "participating" | "leaving" | "left",
+      type: ParticipationMessageType,
+    ) => {
+      const existing = participationRecordsRef.current.get(callId);
+      const token = existing?.token ??
+        getOwnership().getParticipationToken(callId) ?? {
+          generation: 0,
+          writerId: getOwnership().tabId,
+        };
+      const sequence = (existing?.sequence ?? 0) + 1;
+      commitParticipation(callId, phase, token, sequence);
+      postParticipation(callId, type, token, sequence);
+    },
+    [commitParticipation, getOwnership, postParticipation],
+  );
+  // The real participant leave (#569) plus the cross-tab signal that this
+  // user's participation is over — distinct from a handoff/minimize, which
+  // only ever moves ownership and must leave resource.callId alone so a
+  // legitimate reclaim can still reconnect (issue #570). Every genuine
+  // "I'm done with this resource call" action funnels through here so no
+  // other tab is ever left believing it can reconnect it.
+  //
+  // "leaving" is posted immediately, before the server round trip, so no
+  // tab (including this one) can reconnect/take over while the leave is
+  // still pending. "left" only follows once resource.leave() actually
+  // resolves; if it rejects instead, "leave-cancelled" restores this exact
+  // participation to "participating" everywhere and the rejection
+  // propagates so the caller's own retry affordance still fires.
+  const endResourceParticipation = useCallback(async (): Promise<void> => {
+    if (!resource.active) return;
+    const callId = resource.callId;
+    if (callId) continueResourceParticipation(callId, "leaving", "leaving");
+    try {
+      await resource.leave();
+    } catch (error) {
+      if (callId) continueResourceParticipation(callId, "participating", "leave-cancelled");
+      throw error;
+    }
+    if (callId) continueResourceParticipation(callId, "left", "left");
+  }, [continueResourceParticipation, resource]);
+
   const directActive = calls.call?.status === "active" ? calls.call : null;
-  const activeCallId = directActive?.call_id ?? resource.callId ?? "";
+  const resourceParticipationPhase = resource.callId
+    ? participationRecordsRef.current.get(resource.callId)?.phase
+    : undefined;
+  const resourceCallReconnectable =
+    resourceParticipationPhase !== "leaving" && resourceParticipationPhase !== "left";
+  const activeCallId =
+    directActive?.call_id ?? (resource.callId && resourceCallReconnectable ? resource.callId : "");
 
   const reconnectLocal = useCallback(async (): Promise<boolean> => {
     try {
-      if (resource.callId) await resource.reconnect();
-      else if (calls.call?.status === "active") {
+      if (resource.callId && resourceCallReconnectable) {
+        await resource.reconnect();
+      } else if (calls.call?.status === "active") {
         if (calls.mediaActivationRequired) await calls.activateMedia();
         else await calls.retryMedia();
       }
@@ -224,7 +455,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     } catch {
       return false;
     }
-  }, [calls, resource]);
+  }, [calls, resource, resourceCallReconnectable]);
 
   const restoreOwnership = useCallback(
     (callId: string, afterEpoch = 0): Promise<boolean> => {
@@ -251,6 +482,26 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   useEffect(() => {
     const ownership = getOwnership();
     return ownership.subscribe((message: OwnershipMessage) => {
+      // Participation facts (issue #570) are handled before — and
+      // independently of — the handoff correlation below: they must be
+      // applied for whatever callId they name, never only the one this tab
+      // currently considers "active" (that's circular — activeCallId
+      // itself depends on participationRecords), and never gated on
+      // handoffCall.current either.
+      if (
+        message.type === "participating" ||
+        message.type === "leaving" ||
+        message.type === "left" ||
+        message.type === "leave-cancelled"
+      ) {
+        applyParticipationEvent(
+          message.callId,
+          message.type === "leave-cancelled" ? "participating" : message.type,
+          { generation: message.generation, writerId: message.writerId },
+          message.sequence,
+        );
+        return;
+      }
       const callId = activeCallId || handoffCall.current;
       if (message.callId !== callId) return;
       if (role === "main" && message.type === "ready") {
@@ -326,7 +577,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         void restoreOwnership(callId, handoffEpoch.current);
       }
     });
-  }, [activeCallId, getOwnership, restoreOwnership, role, setOwner]);
+  }, [activeCallId, applyParticipationEvent, getOwnership, restoreOwnership, role, setOwner]);
 
   useEffect(() => {
     if (role !== "main" || ownerState !== "remote" || !activeCallId || !handoffEpoch.current)
@@ -403,7 +654,14 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           );
         } else if (
           event.call.status === "active" &&
-          event.call.call_id !== resource.callId &&
+          // Never gated on resource.callId equality (issue #570 follow-up):
+          // a stale resource.callId — left set on purpose after a handoff so
+          // a legitimate later reclaim can still reconnect — must not
+          // permanently suppress this affordance for a callId this tab's
+          // current participation has actually left. What matters is
+          // whether THIS tab is presently participating, which
+          // participationRecords, not raw callId equality, answers.
+          participationRecordsRef.current.get(event.call.call_id)?.phase !== "participating" &&
           event.call.caller_id !== directory.currentUserId &&
           !ignoredResourceCalls.current.has(event.call.call_id)
         ) {
@@ -418,7 +676,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       handle.release();
       releaseConsumerSubscriptions(consumerId);
     };
-  }, [directory, getOwnership, resource.callId]);
+  }, [directory, getOwnership]);
 
   // Timers only: the coordinator's own close() lives exclusively in the
   // lifecycle effect above.
@@ -546,6 +804,21 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     },
     [getOwnership, setOwner],
   );
+  // The dedicated tab's actual "sair" (issue #570) — distinct from
+  // releaseDedicated above, which only ever moves ownership (minimize) and
+  // must never touch participation. Runs the real participant leave (#569)
+  // and broadcasts "leaving"/"left" so every other tab converges instead of
+  // later reconnecting a call this user already left, then reuses
+  // releaseDedicated itself for the ownership half — same
+  // stop-before-release guarantee, no separate implementation of it to
+  // drift out of sync.
+  const leaveDedicated = useCallback(
+    async (callId: string) => {
+      await endResourceParticipation();
+      await releaseDedicated(callId);
+    },
+    [endResourceParticipation, releaseDedicated],
+  );
 
   const value = useMemo(
     () => ({
@@ -563,14 +836,18 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       announceDedicated,
       acknowledgeDedicated,
       releaseDedicated,
+      leaveDedicated,
+      beginResourceParticipation,
     }),
     [
       acknowledgeDedicated,
       announceDedicated,
+      beginResourceParticipation,
       calls,
       dedicatedRecoveryFailed,
       enableMedia,
       expand,
+      leaveDedicated,
       media,
       ownerState,
       presentation,
@@ -614,7 +891,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       ? calls.end
       : () => {
           emitCallTechnicalEvent("end");
-          void resource.leave().catch(() => undefined);
+          void endResourceParticipation().catch(() => undefined);
         },
   };
   const floatingStatus =
@@ -661,12 +938,20 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           onAccept={() => {
             emitCallTechnicalEvent("accepted");
             setIncomingResource(null);
-            void resource.join({
-              kind: incomingResource.target_type as "channel" | "dm",
-              id: incomingResource.target_id!,
-              name: incomingTarget.name,
-              callId: incomingResource.call_id,
-            });
+            // Registers the new participation only once join() itself
+            // confirms it actually succeeded (issue #570 follow-up) — never
+            // inferred from resource.callId changing, which a rejoin of the
+            // very same call_id would never observably do.
+            void resource
+              .join({
+                kind: incomingResource.target_type as "channel" | "dm",
+                id: incomingResource.target_id!,
+                name: incomingTarget.name,
+                callId: incomingResource.call_id,
+              })
+              .then((joinedCallId) => {
+                if (joinedCallId) void beginResourceParticipation(joinedCallId);
+              });
           }}
           onReject={() => {
             emitCallTechnicalEvent("rejected");

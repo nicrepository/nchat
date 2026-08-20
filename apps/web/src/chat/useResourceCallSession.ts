@@ -28,8 +28,17 @@ export interface ResourceCallController {
    * leave() failure must retry leave(), never re-join.
    */
   errorOperation: ResourceCallErrorOperation;
-  /** Explicit user gesture only — never called on mount/reconnect. */
-  join: (target: ResourceCallTarget) => Promise<void>;
+  /**
+   * Explicit user gesture only — never called on mount/reconnect. Resolves
+   * with the call_id this attempt actually joined once media is connected,
+   * or `undefined` if the attempt failed or was superseded before
+   * finishing — never throws. This is the only reliable signal a caller can
+   * use to register a fresh participation: `callId` above may already equal
+   * this same value from a previous attempt (a legitimate rejoin of the
+   * exact same resource call), so React never produces an observable state
+   * transition on it that an effect could key off.
+   */
+  join: (target: ResourceCallTarget) => Promise<string | undefined>;
   /** Reacquires a token and Room after this tab regains ownership. */
   reconnect: () => Promise<void>;
   /**
@@ -68,7 +77,7 @@ export function useResourceCallSession(
   const joinPromiseRef = useRef<{
     generation: number;
     target: ResourceCallTarget;
-    promise: Promise<void>;
+    promise: Promise<string | undefined>;
   } | null>(null);
   // A rejoin of the exact same target reuses the exact same ResourceCallTarget
   // reference, so object identity can't tell "nothing changed since this
@@ -152,7 +161,7 @@ export function useResourceCallSession(
     );
   }, [callId, stopMedia]);
 
-  const join = useCallback((target: ResourceCallTarget): Promise<void> => {
+  const join = useCallback((target: ResourceCallTarget): Promise<string | undefined> => {
     const pending = joinPromiseRef.current;
     if (
       pending &&
@@ -194,13 +203,15 @@ export function useResourceCallSession(
         result.token,
         result.serverUrl,
       );
-      if (attemptGenerationRef.current !== generation) return;
+      if (attemptGenerationRef.current !== generation) return undefined;
       setStatus("active");
-    })().catch(() => {
-      if (attemptGenerationRef.current !== generation) return;
+      return call.call_id;
+    })().catch((): string | undefined => {
+      if (attemptGenerationRef.current !== generation) return undefined;
       setStatus("error");
       setErrorOperation("join");
       setError("Não foi possível entrar na chamada.");
+      return undefined;
     });
     joinPromiseRef.current = { generation, target, promise: attempt };
     void attempt.finally(() => {

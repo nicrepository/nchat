@@ -140,8 +140,8 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let first!: Promise<void>;
-    let second!: Promise<void>;
+    let first!: Promise<string | undefined>;
+    let second!: Promise<string | undefined>;
     act(() => {
       first = view.result.current.join(channelTarget);
       second = view.result.current.join(channelTarget);
@@ -182,7 +182,7 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let joining!: Promise<void>;
+    let joining!: Promise<string | undefined>;
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
@@ -373,7 +373,7 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let joining!: Promise<void>;
+    let joining!: Promise<string | undefined>;
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
@@ -404,7 +404,7 @@ describe("useResourceCallSession", () => {
     act(() => {
       view.result.current.leave();
     });
-    let rejoining!: Promise<void>;
+    let rejoining!: Promise<string | undefined>;
     act(() => {
       rejoining = view.result.current.join(channelTarget);
     });
@@ -449,7 +449,7 @@ describe("useResourceCallSession", () => {
       ...channelTarget,
       id: "00000000-0000-4000-8000-000000000702",
     };
-    let switching!: Promise<void>;
+    let switching!: Promise<string | undefined>;
     act(() => {
       switching = view.result.current.join(otherTarget);
     });
@@ -477,7 +477,7 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let joining!: Promise<void>;
+    let joining!: Promise<string | undefined>;
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
@@ -519,7 +519,7 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let joining!: Promise<void>;
+    let joining!: Promise<string | undefined>;
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
@@ -554,7 +554,7 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let joining!: Promise<void>;
+    let joining!: Promise<string | undefined>;
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
@@ -604,7 +604,7 @@ describe("useResourceCallSession", () => {
     const view = renderHook(() => useResourceCallSession(media));
     await act(() => view.result.current.reconnect());
 
-    let joining!: Promise<void>;
+    let joining!: Promise<string | undefined>;
     act(() => {
       joining = view.result.current.join(channelTarget);
     });
@@ -702,7 +702,7 @@ describe("useResourceCallSession", () => {
     act(() => {
       leaving = view.result.current.leave().catch(() => undefined);
     });
-    let rejoining!: Promise<void>;
+    let rejoining!: Promise<string | undefined>;
     act(() => {
       rejoining = view.result.current.join(channelTarget);
     });
@@ -738,7 +738,7 @@ describe("useResourceCallSession", () => {
     act(() => {
       void view.result.current.leave();
     });
-    let rejoining!: Promise<void>;
+    let rejoining!: Promise<string | undefined>;
     act(() => {
       rejoining = view.result.current.join(channelTarget);
     });
@@ -770,7 +770,7 @@ describe("useResourceCallSession", () => {
       void view.result.current.leave();
     });
     const sameTargetNewObject: ResourceCallTarget = { ...channelTarget };
-    let rejoining!: Promise<void>;
+    let rejoining!: Promise<string | undefined>;
     act(() => {
       rejoining = view.result.current.join(sameTargetNewObject);
     });
@@ -795,14 +795,14 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    let staleJoin!: Promise<void>;
+    let staleJoin!: Promise<string | undefined>;
     act(() => {
       staleJoin = view.result.current.join(channelTarget);
     });
     act(() => {
       void view.result.current.leave();
     });
-    let latestJoin!: Promise<void>;
+    let latestJoin!: Promise<string | undefined>;
     act(() => {
       latestJoin = view.result.current.join(channelTarget);
     });
