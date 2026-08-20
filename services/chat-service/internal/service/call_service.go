@@ -14,6 +14,7 @@ type callStore interface {
 	CreateResourceCall(context.Context, storage.CreateResourceCallInput) (domain.Call, bool, error)
 	RenewCallPresence(context.Context, storage.RenewCallPresenceInput) error
 	TransitionCall(context.Context, storage.TransitionCallInput) (storage.TransitionCallResult, error)
+	LeaveResourceCall(context.Context, storage.LeaveResourceCallInput) (storage.TransitionCallResult, error)
 	CurrentCallForUser(context.Context, string, string, string) (domain.Call, error)
 	ExpireDueCalls(context.Context, int) ([]domain.Call, error)
 }
@@ -149,6 +150,34 @@ func (s *CallService) Cancel(ctx context.Context, workspaceID, actorID, callID s
 
 func (s *CallService) End(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
 	return s.transition(ctx, workspaceID, actorID, callID, storage.CallActionEnd)
+}
+
+// Leave releases actorID's own participation in a resource call — never the
+// resource call's original caller-only call.end, and never RF-23's direct-call
+// lifecycle (issue #569). The call itself only changes (and is only
+// published) when actorID was its last active participant.
+func (s *CallService) Leave(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
+	workspaceID, err := canonicalUUID(workspaceID)
+	if err != nil {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	actorID, err = canonicalUUID(actorID)
+	if err != nil {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	callID, err = canonicalUUID(callID)
+	if err != nil || s == nil || s.store == nil {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	result, err := s.store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
+		WorkspaceID: workspaceID,
+		CallID:      callID,
+		ActorID:     actorID,
+	})
+	if result.Changed {
+		s.publish(ctx, result.Call)
+	}
+	return result.Call, err
 }
 
 func (s *CallService) Current(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {

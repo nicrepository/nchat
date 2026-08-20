@@ -55,8 +55,10 @@ const MentionList = forwardRef<MentionListRef, MentionListProps>(({ items, comma
             select(index);
           }}
         >
+          {/* Only "user" and "all" candidates ever reach this list — both are
+              typed and inserted as "@", so the sigil no longer varies. */}
           <span className="mention-list__sigil" aria-hidden="true">
-            {item.mentionType === "channel" ? "#" : "@"}
+            @
           </span>
           {item.label}
         </button>

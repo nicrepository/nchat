@@ -24,6 +24,7 @@ type adapterCallStore struct {
 	resourceInput   storage.CreateResourceCallInput
 	presenceInput   storage.RenewCallPresenceInput
 	transitionInput storage.TransitionCallInput
+	leaveInput      storage.LeaveResourceCallInput
 	currentCallID   string
 }
 
@@ -43,6 +44,11 @@ func (s *adapterCallStore) RenewCallPresence(_ context.Context, input storage.Re
 
 func (s *adapterCallStore) TransitionCall(_ context.Context, input storage.TransitionCallInput) (storage.TransitionCallResult, error) {
 	s.transitionInput = input
+	return storage.TransitionCallResult{}, domain.ErrConflict
+}
+
+func (s *adapterCallStore) LeaveResourceCall(_ context.Context, input storage.LeaveResourceCallInput) (storage.TransitionCallResult, error) {
+	s.leaveInput = input
 	return storage.TransitionCallResult{}, domain.ErrConflict
 }
 
@@ -123,6 +129,18 @@ func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
 	)
 	if !errors.Is(err, domain.ErrInvalidInput) {
 		t.Fatalf("invalid transition error = %v", err)
+	}
+
+	_, err = adapter.LeaveCall(
+		context.Background(), adapterWorkspace, adapterActor, adapterCallID,
+	)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("LeaveCall error = %v", err)
+	}
+	if store.leaveInput.WorkspaceID != adapterWorkspace ||
+		store.leaveInput.ActorID != adapterActor ||
+		store.leaveInput.CallID != adapterCallID {
+		t.Fatalf("leave input = %+v", store.leaveInput)
 	}
 
 	_, err = adapter.CurrentCall(

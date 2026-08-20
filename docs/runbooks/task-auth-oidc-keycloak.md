@@ -80,6 +80,65 @@ MVP linking is conservative:
 
 Future admin-controlled account linking is explicitly out of scope for this PR.
 
+### Provisioning model: JIT, not pre-provisioning
+
+Provisioning is **just-in-time**. The NChat account is created during
+`GET /auth/oidc/keycloak/callback`, in the same transaction as the session, on
+the user's **first successful SSO login**.
+
+Creating a user in Keycloak does **not** make that user appear in NChat. There
+is no SCIM endpoint, no Keycloak Admin API sync, no event listener and no
+polling — NChat learns a person exists only from the claims of a login they
+performed themselves. A Keycloak account that has never signed in to NChat has
+no row in `auth.users`.
+
+### Concurrent first login
+
+Two callbacks completing at the same instant for a subject with no account both
+reach the provisioning insert; nothing earlier locks a row that does not exist
+yet. The insert is `ON CONFLICT DO NOTHING`, so the loser gets no row back
+instead of aborting its transaction, and then re-reads by
+`(external_provider, external_subject)`:
+
+- the subject is now present — it lost the race against its own first login, and
+  signs in to the account the winner created;
+- the subject is still absent — the constraint that fired was
+  `users_email_unique`, so the address belongs to an account this subject does
+  not own, and the login is refused with the same conflict as any other manual
+  e-mail collision.
+
+The partial unique index on `(external_provider, external_subject)` is what
+makes a duplicate account impossible; this branch is what keeps the second
+browser from seeing a 500.
+
+### Workspace membership is NOT provisioned
+
+JIT provisioning creates the `auth.users` row and an NChat session. It does
+**not** create a `chat.workspace_members` row, because workspace membership
+lives in the chat schema, behind chat-service, and no login path in the platform
+writes it.
+
+This is not specific to SSO — a manually created user is in exactly the same
+position. At the time of writing, `MemberService.JoinWorkspace` has no HTTP
+caller, so **every** new account (manual or OIDC) needs its workspace membership
+created out of band before the person can use the chat.
+
+Operationally this means an SSO user can authenticate and receive valid NChat
+tokens while still having no channel to open. Do not read a successful SSO login
+as "the user is onboarded". See "Pending decisions" below.
+
+### Pending decisions
+
+Not decided in this task, because each one is a product/RBAC policy choice
+rather than an OIDC detail:
+
+- which workspace a JIT-provisioned user should join, if any;
+- with which role (the safe default is the ordinary `member`; `owner`, `admin`
+  and `moderator` must never be granted implicitly, and no Keycloak role is
+  mapped to an NChat role today);
+- whether joining should happen at provisioning time or stay an explicit admin
+  action.
+
 ## Security Notes
 
 - State, nonce, and exchange codes are stored only as domain-separated HMAC-SHA-256 hashes.
@@ -91,6 +150,48 @@ Future admin-controlled account linking is explicitly out of scope for this PR.
 - `email_verified=false` or absent is rejected.
 - Domain allowlist failures are generic and do not enumerate accounts.
 - SQL uses parameters; OIDC routes reuse the token endpoint rate limiter pattern.
+
+## Keycloak Configuration Required
+
+NChat does not configure Keycloak. An administrator must create the client in
+the **existing corporate realm** — do not create a new realm, and do not modify
+users or clients belonging to oCIS or any other service.
+
+| Setting                     | Required value                                                     |
+| --------------------------- | ------------------------------------------------------------------ |
+| Realm                       | the existing corporate realm (the same one oCIS uses)              |
+| Client ID                   | a new client dedicated to NChat                                    |
+| Client authentication       | ON (confidential client — the code exchange sends `client_secret`) |
+| Standard flow               | ON (Authorization Code)                                            |
+| Direct access grants        | OFF                                                                |
+| Implicit flow               | OFF                                                                |
+| Service accounts            | OFF                                                                |
+| Valid redirect URI          | exactly the value of `OIDC_REDIRECT_URL`, no wildcard              |
+| Web origins                 | the NChat web origin only (`+` or `*` must not be used)            |
+| Client scopes               | `openid`, `email`, `profile` — nothing else is read                |
+| Required claims in ID token | `iss`, `sub`, `aud`, `exp`, `nonce`, `email`, `email_verified`     |
+| Optional claims used        | `name`, `given_name`, `family_name`, `preferred_username`          |
+| ID token signature          | RS256 (the only algorithm accepted)                                |
+
+Users must have a **verified** e-mail: `email_verified=false` or an absent
+`email` is rejected, and no account is provisioned.
+
+`sub` is the identity key. `preferred_username` and `email` are treated as
+mutable profile data and are never used to correlate an account.
+
+### Values the administrator must supply
+
+These cannot be derived from the repository and are environment-specific:
+
+1. `OIDC_ISSUER_URL` — the realm issuer, e.g. `https://<keycloak-host>/realms/<realm>`.
+2. `OIDC_CLIENT_ID` — the client id created above.
+3. `OIDC_CLIENT_SECRET` — the client secret (secrets only; never committed).
+4. `OIDC_REDIRECT_URL` — the public auth-service callback URL, which must match
+   the Valid redirect URI character for character.
+5. `OIDC_ALLOWED_EMAIL_DOMAINS` — the corporate domain(s). Leaving this empty
+   permits every verified address in the realm and logs a startup warning.
+6. Confirmation of whether `OIDC_AUTO_PROVISION_ENABLED` should be `true`
+   (JIT provisioning) or stay `false` (SSO only for accounts that already exist).
 
 ## Out Of Scope
 

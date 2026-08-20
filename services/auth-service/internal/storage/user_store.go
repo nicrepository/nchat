@@ -247,6 +247,36 @@ func (s *PGXUserStore) UpdateProfileFields(ctx context.Context, userID string, j
 	return p, nil
 }
 
+// UpdateDisplayName sets display_name for an active, non-deleted user in a
+// single UPDATE and returns the resulting profile via RETURNING, so the row
+// read back is guaranteed to be the one just persisted — never a stale value
+// from a concurrent writer. Two concurrent calls for the same user simply
+// serialise on Postgres's normal per-row update lock; the last commit wins,
+// same last-write-wins semantics SetAvatarURL already relies on.
+func (s *PGXUserStore) UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error) {
+	var p domain.SelfProfile
+	var avatar *string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE auth.users
+		SET display_name = $2, updated_at = now()
+		WHERE id = $1
+		  AND status = 'active'
+		  AND deleted_at IS NULL
+		RETURNING id, display_name, avatar_url`,
+		userID, displayName,
+	).Scan(&p.ID, &p.DisplayName, &avatar)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.SelfProfile{}, domain.ErrNotFound
+		}
+		return domain.SelfProfile{}, fmt.Errorf("update display name: %w", err)
+	}
+	if avatar != nil {
+		p.AvatarURL = *avatar
+	}
+	return p, nil
+}
+
 func (s *PGXUserStore) GetUserByID(ctx context.Context, id string) (domain.User, error) {
 	var u domain.User
 	err := s.pool.QueryRow(ctx, `

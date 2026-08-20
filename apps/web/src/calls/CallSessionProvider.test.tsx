@@ -7,7 +7,7 @@ import { acquireChatSocket, type ChatSocketListener } from "../chat/chatSocket";
 import { useCallMedia } from "../chat/useCallMedia";
 import { useCallSignaling } from "../chat/useCallSignaling";
 import { useResourceCallSession } from "../chat/useResourceCallSession";
-import { createOwnershipCoordinator } from "./callOwnership";
+import { compareParticipationTokens, createOwnershipCoordinator } from "./callOwnership";
 import CallSessionProvider, { useCallSession } from "./CallSessionProvider";
 
 vi.mock("../chat/useCallMedia", () => ({ useCallMedia: vi.fn() }));
@@ -39,6 +39,27 @@ const lease = {
 let ownershipListener: (message: never) => void;
 let ownershipLost: () => void;
 let socketListener: ChatSocketListener;
+// Stands in for the real coordinator's persisted, PER-WRITER-KEY storage
+// (issue #570 follow-up): production's nchat.call.participation.v2.
+// <callId>.<writerId> scheme, one independent slot per (callId, writerId)
+// pair — never a single shared slot a stale writer could regress. Shape:
+// callId -> writerId -> generation. Deliberately NOT reset by
+// vi.clearAllMocks() — only an explicit `participationStorage = {}` (in
+// each describe's own beforeEach) represents "fresh browser storage";
+// leaving it untouched within a single test is what lets that test simulate
+// a reload, a second freshly-mounted tab, or a genuinely concurrent writer
+// still sharing the same persisted floor.
+let participationStorage: Record<string, Record<string, number>> = {};
+function maxParticipationToken(id: string): { generation: number; writerId: string } | null {
+  const writers = participationStorage[id];
+  if (!writers) return null;
+  let best: { generation: number; writerId: string } | null = null;
+  for (const [writerId, generation] of Object.entries(writers)) {
+    const candidate = { generation, writerId };
+    if (!best || compareParticipationTokens(candidate, best) > 0) best = candidate;
+  }
+  return best;
+}
 const ownership = {
   tabId: "tab-main",
   claim: vi.fn<() => Promise<typeof lease | null>>(async () => lease),
@@ -54,6 +75,17 @@ const ownership = {
     ownershipLost = listener;
     return vi.fn();
   }),
+  // Mirrors production: reads the max across every writer's own key, then
+  // writes ONLY this tab's own key ("tab-main") — never any other writer's.
+  allocateParticipationGeneration: vi.fn((id: string) => {
+    const generation = (maxParticipationToken(id)?.generation ?? 0) + 1;
+    participationStorage = {
+      ...participationStorage,
+      [id]: { ...participationStorage[id], "tab-main": generation },
+    };
+    return { generation, writerId: "tab-main" };
+  }),
+  getParticipationToken: vi.fn((id: string) => maxParticipationToken(id)),
   close: vi.fn(),
 };
 
@@ -99,7 +131,9 @@ const resource = {
   callId: null as string | null,
   status: "idle",
   error: null as string | null,
-  join: vi.fn(async () => undefined),
+  // Mirrors the real hook: resolves with the joined call_id (target.callId
+  // is always supplied by every real call site), never rejects.
+  join: vi.fn(async (target: { callId?: string }) => target.callId),
   leave: vi.fn(async () => undefined),
   reconnect: vi.fn(async () => undefined),
 };
@@ -162,6 +196,12 @@ function Probe() {
       <button type="button" onClick={() => session.releaseDedicated(callId)}>
         Release probe
       </button>
+      <button type="button" onClick={() => void session.leaveDedicated(callId)}>
+        Leave dedicated probe
+      </button>
+      <button type="button" onClick={() => void session.beginResourceParticipation(callId)}>
+        Begin participation probe
+      </button>
       <Outlet />
     </>
   );
@@ -212,6 +252,7 @@ describe("CallSessionProvider", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    participationStorage = {};
     calls.call = null;
     calls.error = null;
     calls.mediaActivationRequired = false;
@@ -647,6 +688,19 @@ describe("CallSessionProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
     await waitFor(() => expect(resource.reconnect).toHaveBeenCalled());
     expect(resource.leave).toHaveBeenCalled();
+    // Issue #570: the main tab's own resource "leave" must announce the
+    // same leaving/left participation signal a dedicated tab's leave does,
+    // so a stale dedicated tab (if one exists) never reconnects this call.
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "leaving", callId }),
+      ),
+    );
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId }),
+      ),
+    );
   });
 
   it("uses the callee peer and empty participant fallback in a dedicated route", async () => {
@@ -679,6 +733,7 @@ describe("dedicated tab reload/reopen recovery (achado #1)", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    participationStorage = {};
     calls.call = null;
     resource.active = null;
     resource.callId = null;
@@ -800,6 +855,7 @@ describe("dedicated tab reload/reopen recovery (achado #1)", () => {
 describe("stale handoff replies never move ownership after HANDOFF_TIMEOUT (achado #3)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    participationStorage = {};
     calls.call = activeDirect();
     resource.active = null;
     resource.callId = null;
@@ -909,6 +965,7 @@ describe("releaseDedicated stops media before releasing ownership (achado #4)", 
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    participationStorage = {};
     calls.call = null;
     resource.active = null;
     resource.callId = null;
@@ -968,6 +1025,1078 @@ describe("releaseDedicated stops media before releasing ownership (achado #4)", 
   });
 });
 
+// Issue #570: a dedicated tab's own "sair" must converge — real participant
+// leave (#569), release ownership, and tell every other tab this
+// participation is over — never just a minimize-style release, and never a
+// resource-call call.end.
+describe("dedicated participant leave converges ownership and main tab state (issue #570)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    participationStorage = {};
+    calls.call = null;
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    ownership.getLease.mockReturnValue(lease);
+    ownership.getOwner.mockReturnValue(null);
+    ownership.claim.mockResolvedValue(lease);
+    vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
+    vi.mocked(useCallMedia).mockReturnValue(media as never);
+    vi.mocked(useCallSignaling).mockReturnValue(calls as never);
+    vi.mocked(useResourceCallSession).mockReturnValue(resource as never);
+    vi.mocked(acquireChatSocket).mockImplementation((listener) => {
+      socketListener = listener;
+      return { send: vi.fn(), isOpen: vi.fn(), generation: vi.fn(), release: vi.fn() };
+    });
+  });
+
+  it("leaveDedicated runs the real participant leave, releases ownership, and broadcasts leaving then left — never a resource call.end", async () => {
+    renderProvider(`/call/${callId}`);
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "leaving", callId }),
+      ),
+    );
+    await waitFor(() => expect(resource.leave).toHaveBeenCalledOnce());
+    expect(calls.end).not.toHaveBeenCalled();
+    expect(ownership.release).toHaveBeenCalledWith(callId);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId }),
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));
+  });
+
+  it("main tab converges once it observes the dedicated tab's 'left' broadcast: stops showing the call as open elsewhere and never reconnects (leave confirmado)", async () => {
+    vi.useFakeTimers();
+    renderProvider();
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    expect(screen.getByTestId("owner")).toHaveTextContent("remote");
+    expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument();
+
+    // The dedicated tab really left: it broadcasts "left", not just a
+    // released lease.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
+
+    // Neither the automatic recovery interval nor an explicit "Abrir aqui"
+    // click may reconnect a resource call whose participation is already
+    // confirmed over.
+    ownership.getOwner.mockReturnValue(null);
+    await act(async () => vi.advanceTimersByTime(1_500));
+    expect(resource.reconnect).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
+    await act(async () => undefined);
+    expect(resource.reconnect).not.toHaveBeenCalled();
+    expect(ownership.claim).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("a plain 'released' message (minimize, not leave) never blocks a legitimate reclaim", async () => {
+    vi.useFakeTimers();
+    renderProvider();
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 2,
+      } as never),
+    );
+    ownership.getOwner.mockReturnValue(null);
+    await act(async () => vi.advanceTimersByTime(1_500));
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(resource.reconnect).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("a leave in flight ('leaving', no ack yet) blocks any tab from reclaiming/reconnecting (corrida leave × Abrir aqui)", async () => {
+    vi.useFakeTimers();
+    renderProvider();
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument();
+
+    // Dedicated started call.leave but the server hasn't confirmed yet.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "leaving",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 2,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+
+    // The indicator itself must stop offering a reclaim while leaving is in
+    // flight — reconnecting now would race the server-side leave and could
+    // resurrect a participation the user is actively ending.
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
+
+    ownership.getOwner.mockReturnValue(null);
+    await act(async () => vi.advanceTimersByTime(1_500));
+    expect(resource.reconnect).not.toHaveBeenCalled();
+    expect(ownership.claim).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
+    await act(async () => undefined);
+    expect(resource.reconnect).not.toHaveBeenCalled();
+    expect(ownership.claim).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("a failed leave ('leave-cancelled') restores this participation to reconnectable everywhere (leave falhou permite recovery)", async () => {
+    vi.useFakeTimers();
+    renderProvider();
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "leaving",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 2,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
+
+    // The leave attempt itself failed server-side; the same participation
+    // is announced as participating/recoverable again.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "leave-cancelled",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 2,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 2,
+      } as never),
+    );
+    expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument();
+
+    ownership.getOwner.mockReturnValue(null);
+    await act(async () => vi.advanceTimersByTime(1_500));
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(resource.reconnect).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("a real join resolving to the same callId after a confirmed leave registers a fresh participation, even though resource.callId never observably changed (rejoin real)", async () => {
+    // Main's own resource.callId is X from the very start and stays X
+    // through the whole handoff -> dedicated-leave -> rejoin flow — the real
+    // production shape: a handoff never nulls it, and useResourceCallSession
+    // .join() resolving to the exact same call_id produces no React state
+    // transition on it (Object.is bails), so nothing watching resource.callId
+    // could ever detect this rejoin.
+    // The original participation's generation (1) was itself allocated from
+    // shared storage when the dedicated tab joined — seeding it here mirrors
+    // that same shared floor a real allocateParticipationGeneration() call
+    // would have produced, so the later real rejoin's own allocation is
+    // exercised against realistic, not merely locally-injected, state.
+    participationStorage = { [callId]: { "tab-dedicated": 1 } };
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    expect(screen.getByTestId("owner")).toHaveTextContent("remote");
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 2,
+      } as never),
+    );
+    // While ownerState stays "remote" (this test never re-establishes local
+    // ownership — a separate concern from participation, already covered
+    // elsewhere), the resource-call indicator is what activeCallId gates.
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
+
+    // Others are still in call X: a fresh "active" event for the very same
+    // call_id arrives. resource.callId is still X — untouched this whole
+    // time — yet the affordance must still offer to join, because THIS
+    // participation already ended.
+    const incoming = {
+      ...activeDirect(),
+      call_id: callId,
+      target_type: "channel",
+      target_id: channelId,
+      status: "active",
+    };
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "resource-rejoin",
+          target_type: "channel",
+          target_id: channelId,
+          call: incoming,
+        },
+        1,
+      ),
+    );
+    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+
+    // The explicit, real join — resource.join() resolves with call_id X,
+    // exactly like the real hook does when target.callId is supplied.
+    fireEvent.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    expect(resource.join).toHaveBeenCalledWith(expect.objectContaining({ callId }));
+
+    // The new participation lands with a fresh generation (2, one past the
+    // old participation's 1) and activeCallId/UI converge back to X.
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument(),
+    );
+
+    // Reconnect/control is genuinely restored, never refusing just because
+    // this exact callId once appeared in a "left" message.
+    ownership.getLease.mockReturnValue(lease);
+    ownership.getOwner.mockReturnValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
+    await waitFor(() => expect(resource.reconnect).toHaveBeenCalled());
+  });
+
+  it("dedicated crashing mid-leave leaves main stuck on 'leaving', but an explicit real join for the same callId still recovers it (dedicated morre durante leave)", async () => {
+    // Mirrors the shared floor a real allocateParticipationGeneration() call
+    // would have produced when the (now-crashed) dedicated tab originally
+    // joined and posted "leaving" at generation 1.
+    participationStorage = { [callId]: { "tab-dedicated": 1 } };
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    // Dedicated starts leaving but crashes before ever confirming — no
+    // "left" or "leave-cancelled" ever arrives.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "leaving",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 2,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+
+    // Automatic recovery stays blocked forever — that's expected, no ack ever
+    // arrives to clear it — but this is NOT the thing under test.
+    ownership.getOwner.mockReturnValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
+    await act(async () => undefined);
+    expect(resource.reconnect).not.toHaveBeenCalled();
+
+    // Other participants are still in call X: a fresh "active" event for the
+    // same call_id arrives. The affordance must reappear even though the
+    // stuck record is "leaving", not merely "left".
+    const incoming = {
+      ...activeDirect(),
+      call_id: callId,
+      target_type: "channel",
+      target_id: channelId,
+      status: "active",
+    };
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "resource-crash-recovery",
+          target_type: "channel",
+          target_id: channelId,
+          call: incoming,
+        },
+        1,
+      ),
+    );
+    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+
+    // No automatic recovery is required for this case — only that the
+    // user's explicit join fully recovers the system.
+    fireEvent.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
+
+    ownership.getLease.mockReturnValue(lease);
+    ownership.getOwner.mockReturnValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
+    await waitFor(() => expect(resource.reconnect).toHaveBeenCalled());
+  });
+});
+
+// Issue #570 follow-up: participation events are ordered by
+// (generation, sequence), never Date.now() — two independent tabs can
+// legitimately collide on the same wall-clock millisecond, and delivery
+// order is not causal order.
+describe("participation ordering is causal, not wall-clock (issue #570 follow-up)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    participationStorage = {};
+    calls.call = null;
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    ownership.getLease.mockReturnValue(lease);
+    ownership.getOwner.mockReturnValue(null);
+    ownership.claim.mockResolvedValue(lease);
+    vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
+    vi.mocked(useCallMedia).mockReturnValue(media as never);
+    vi.mocked(useCallSignaling).mockReturnValue(calls as never);
+    vi.mocked(useResourceCallSession).mockReturnValue(resource as never);
+    vi.mocked(acquireChatSocket).mockImplementation((listener) => {
+      socketListener = listener;
+      return { send: vi.fn(), isOpen: vi.fn(), generation: vi.fn(), release: vi.fn() };
+    });
+  });
+
+  it("a new participation's higher generation always beats an old, delayed 'left' from a superseded participation, even at identical wall-clock time", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-19T12:00:00.000Z"));
+    try {
+      renderProvider();
+
+      // The old participation (generation 1) already ended.
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "left",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 5,
+        } as never),
+      );
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+
+      // A brand-new participation begins (generation 2) — e.g. a fresh
+      // dedicated tab reopening the same call.
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "participating",
+          callId,
+          tabId: "tab-dedicated-2",
+          epoch: 2,
+          generation: 2,
+          writerId: "tab-dedicated-2",
+          sequence: 0,
+        } as never),
+      );
+      // Synchronous: the ownershipListener call above already ran inside
+      // act() and committed the re-render — no async wait needed.
+      expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+
+      // The OLD "left" (generation 1) is redelivered late, at the exact same
+      // system time as everything above — it must never outrank generation 2.
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "left",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 6,
+        } as never),
+      );
+      expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("within one participation, 'left' always wins over a reordered, later-arriving 'leaving' for an earlier step — even at identical wall-clock time", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-19T12:00:00.000Z"));
+    try {
+      renderProvider();
+
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "participating",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 0,
+        } as never),
+      );
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "left",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 2,
+        } as never),
+      );
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+
+      // "leaving" (an earlier step of the SAME participation) is redelivered
+      // late, after "left" already applied — it must not resurrect the call.
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "leaving",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 1,
+        } as never),
+      );
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("participating -> leaving -> leave-cancelled ends recoverable/participating, even at identical wall-clock time", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-19T12:00:00.000Z"));
+    try {
+      renderProvider();
+
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "participating",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 0,
+        } as never),
+      );
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "leaving",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 1,
+        } as never),
+      );
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+
+      act(() =>
+        ownershipListener({
+          v: 1,
+          type: "leave-cancelled",
+          callId,
+          tabId: "tab-dedicated",
+          epoch: 2,
+          generation: 1,
+          writerId: "tab-dedicated",
+          sequence: 2,
+        } as never),
+      );
+      expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Issue #570 follow-up (HIGH): generation computed from this tab's own
+// local participationRecordsRef is only monotonic WITHIN one
+// CallSessionProvider instance. A brand-new tab, or the same tab after a
+// reload, starts with that ref EMPTY and would restart at generation 1 —
+// indistinguishable from, and rejected as older than, a real prior
+// participation any other (or the same, pre-reload) tab still remembers.
+// generation must instead come from the ownership coordinator's shared,
+// persisted storage (allocateParticipationGeneration/
+// getParticipationGeneration) — proven here via the `ownership` mock's
+// `participationStorage`, which stands in for real localStorage: it is
+// deliberately NOT cleared between renders within a single test, exactly
+// like real storage survives a reload or a second tab opening.
+describe("participation generation is cross-tab and reload safe (issue #570 follow-up, HIGH)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    participationStorage = {};
+    calls.call = null;
+    calls.error = null;
+    calls.mediaActivationRequired = false;
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    resource.error = null;
+    media.status = "connected";
+    media.error = null;
+    media.participants = [];
+    ownership.getLease.mockReturnValue(null);
+    ownership.getOwner.mockReturnValue(null);
+    ownership.claim.mockResolvedValue(lease);
+    vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
+    vi.mocked(useCallMedia).mockReturnValue(media as never);
+    vi.mocked(useCallSignaling).mockReturnValue(calls as never);
+    vi.mocked(useResourceCallSession).mockReturnValue(resource as never);
+    vi.mocked(acquireChatSocket).mockImplementation((listener) => {
+      socketListener = listener;
+      return { send: vi.fn(), isOpen: vi.fn(), generation: vi.fn(), release: vi.fn() };
+    });
+  });
+
+  // Drives a real resource.join() through the incoming-call popup — the
+  // same causal path production code uses, never a manual mock mutation.
+  // targetCallId lets a test join a SECOND, distinct resource call (Y)
+  // through the same directory-registered channel, to prove one callId's
+  // activity never disturbs another's own generation history.
+  async function joinViaPopup(targetCallId: string = callId) {
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    const incoming = {
+      ...activeDirect(),
+      call_id: targetCallId,
+      target_type: "channel",
+      target_id: channelId,
+      status: "active",
+    };
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: `join-${Math.random()}`,
+          target_type: "channel",
+          target_id: channelId,
+          call: incoming,
+        },
+        1,
+      ),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Atender com câmera" }));
+  }
+
+  it("cross-tab fresh provider: a brand-new tab's real join allocates strictly past an old participation's generation, never restarting at 1 from its own empty local state", async () => {
+    // This tab's own OLD participation: a real join (generation 1, from
+    // empty shared storage), then a real leave (generation 1 stays, phase
+    // -> left, sequence advances). Also proves "nova saída legítima": the
+    // terminal leaving/left events of a real participation win normally.
+    const first = renderProvider();
+    await joinViaPopup();
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "leaving", callId, generation: 1, sequence: 1 }),
+      ),
+    );
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId, generation: 1, sequence: 2 }),
+      ),
+    );
+    first.unmount();
+
+    // A brand-new tab: fresh CallSessionProvider instance (fresh
+    // participationRecordsRef, empty) — it never saw any of the events
+    // above. Only the shared storage (participationStorage) survives, the
+    // same way real localStorage would survive across a new tab opening.
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    ownership.post.mockClear();
+    renderProvider();
+    await joinViaPopup();
+
+    // The fresh tab's real join must allocate strictly past the OLD
+    // participation's generation (1) — never restart at 1 from its own
+    // empty local knowledge, which is exactly the HIGH finding's bug.
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+  });
+
+  it("reload: this tab's own earlier participation ended, the provider is unmounted and recreated, and a delayed message from before the reload never outranks the post-reload rejoin", async () => {
+    const first = renderProvider();
+    await joinViaPopup();
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId, generation: 1 }),
+      ),
+    );
+    first.unmount();
+
+    // Simulates a reload: same browser, same shared storage, but a
+    // brand-new CallSessionProvider instance with no memory of the above.
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    const second = renderProvider();
+    await joinViaPopup();
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    second.rerender(providerTree());
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+
+    // An old message from before the reload — this tab's own pre-reload
+    // "left" at generation 1 — finally arrives late. It must not undo the
+    // post-reload rejoin.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-pre-reload",
+        epoch: 2,
+        generation: 1,
+        writerId: "tab-main",
+        sequence: 3,
+      } as never),
+    );
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("a tab that took over an existing participation via handoff (never its own join()) still tags its own leaving/left with the shared generation floor, not restarting at 0", async () => {
+    // Someone else (a different tab, or this same tab's earlier life)
+    // already joined X and reached generation 1 — recorded only in shared
+    // storage. This tab's own participationRecordsRef has no entry for X:
+    // it took over via handoff/reconnect, never resource.join().
+    ownership.allocateParticipationGeneration(callId);
+    ownership.post.mockClear();
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    renderProvider(`/call/${callId}`);
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "leaving", callId, generation: 1, sequence: 1 }),
+      ),
+    );
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId, generation: 1, sequence: 2 }),
+      ),
+    );
+  });
+
+  // HIGH finding: PARTICIPATION_KEY used to be a single global slot — a
+  // different call's activity in between silently forgot the first call's
+  // own generation, so a legitimate rejoin of it collided with its own
+  // history instead of outranking it.
+  it("X1 -> Y1 -> X2: another call's real join in between never resets X's own generation history", async () => {
+    const otherCallId = "00000000-0000-4000-8000-000000000999";
+
+    // X1: real join (generation 1), then a real leave — this tab's own
+    // participation in X actually ends before Y ever begins.
+    const first = renderProvider();
+    await joinViaPopup(callId);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    first.rerender(providerTree());
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId, generation: 1 }),
+      ),
+    );
+    ownership.post.mockClear();
+
+    // Y1: a DIFFERENT resource call is joined next, in the SAME tab.
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    first.rerender(providerTree());
+    await joinViaPopup(otherCallId);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "participating",
+          callId: otherCallId,
+          generation: 1,
+          sequence: 0,
+        }),
+      ),
+    );
+    ownership.post.mockClear();
+
+    // X2: X is still active for other participants; this tab rejoins it.
+    // X's own history — untouched by Y's activity — is what decides X2's
+    // generation, strictly past X1's.
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    first.rerender(providerTree());
+    await joinViaPopup(callId);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+  });
+
+  it("X1 termina, Y usa o storage compartilhado, X2 começa, e um left(X1) atrasado nunca afeta X2", async () => {
+    const otherCallId = "00000000-0000-4000-8000-000000000999";
+
+    // X1: real join + real leave (generation 1, phase -> left).
+    const first = renderProvider();
+    await joinViaPopup(callId);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    first.rerender(providerTree());
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId, generation: 1, sequence: 2 }),
+      ),
+    );
+    const x1Left = ownership.post.mock.calls.find(
+      (postCall) => (postCall[0] as { type?: string }).type === "left",
+    )![0] as { generation: number; writerId: string; sequence: number };
+    ownership.post.mockClear();
+
+    // Y: another call's real join and leave uses the SAME shared storage.
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    first.rerender(providerTree());
+    await joinViaPopup(otherCallId);
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = otherCallId;
+    resource.status = "active";
+    first.rerender(providerTree());
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId: otherCallId }),
+      ),
+    );
+
+    // X2: a real rejoin of X begins — its own history (unaffected by Y).
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    first.rerender(providerTree());
+    await joinViaPopup(callId);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+    // leaveDedicated (used to end X1 above) also releases ownership, so this
+    // tab stays "remote" for the rest of the test — a separate concern from
+    // participation, already covered elsewhere. The resource-call indicator
+    // is what activeCallId gates while ownerState === "remote".
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    first.rerender(providerTree());
+    expect(await screen.findByText("Chamada aberta em outra aba")).toBeInTheDocument();
+
+    // The OLD X1 "left" — sent before Y or X2 ever happened — finally
+    // arrives late. It must not undo X2.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-x1",
+        epoch: 1,
+        generation: x1Left.generation,
+        writerId: x1Left.writerId,
+        sequence: x1Left.sequence,
+      } as never),
+    );
+    expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument();
+  });
+
+  it("a tie between two independently-raced tokens for the same callId still converges to one deterministic winner, and a later real join outranks both", async () => {
+    // Two tabs raced to generation 1 for X with no shared-storage
+    // synchronization at all (proven directly in callOwnership.test.ts) —
+    // this tab receives both, in arbitrary order.
+    const tokenA = { generation: 1, writerId: "tab-a" };
+    const tokenB = { generation: 1, writerId: "tab-b" };
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    renderProvider();
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "participating",
+        callId,
+        tabId: "tab-a",
+        epoch: 1,
+        ...tokenA,
+        sequence: 0,
+      } as never),
+    );
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "participating",
+        callId,
+        tabId: "tab-b",
+        epoch: 1,
+        ...tokenB,
+        sequence: 0,
+      } as never),
+    );
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+
+    // Whichever of the two this tab settled on as "current" (deterministic,
+    // same rule everywhere — proven directly in callOwnership.test.ts), the
+    // OTHER one's own terminal message must never undo it: it belongs to a
+    // participation this tab has already decided lost the tie.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-a",
+        epoch: 1,
+        generation: tokenA.generation,
+        writerId: tokenA.writerId,
+        sequence: 1,
+      } as never),
+    );
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-b",
+        epoch: 1,
+        generation: tokenB.generation,
+        writerId: tokenB.writerId,
+        sequence: 1,
+      } as never),
+    );
+    // At most one of the two "left" messages (the one for whichever token
+    // actually won) could have applied; even so, a genuinely newer
+    // participation (generation 2) must still outrank whatever is current.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "participating",
+        callId,
+        tabId: "tab-c",
+        epoch: 1,
+        generation: 2,
+        writerId: "tab-c",
+        sequence: 0,
+      } as never),
+    );
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  // Issue #570 problem 3: DedicatedCallPage's activation effect calls
+  // resource.join() on every successful ownerState -> "local" transition,
+  // including a plain handoff continuation, not only a genuinely fresh
+  // join — see the comment on beginResourceParticipation in
+  // CallSessionProvider.tsx for the chosen, documented semantics.
+  it("problem 3: re-registering an already-active participation (as a handoff continuation's resource.join() would) never posts leaving/left, and reconnect/minimize keep working", async () => {
+    // The popup's own affordance gate (participationRecordsRef.phase !==
+    // "participating") deliberately can't reoffer a call this tab is
+    // already in — so this drives the SAME function
+    // (beginResourceParticipation) DedicatedCallPage's activation effect
+    // calls directly, on every ownerState -> "local" transition, without
+    // going through that gate — exactly how a real handoff continuation's
+    // resource.join() reaches it.
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Begin participation probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+
+    // A handoff continuation's resource.join() resolving again for the
+    // exact same, still-active participation.
+    fireEvent.click(screen.getByRole("button", { name: "Begin participation probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+    expect(ownership.post).not.toHaveBeenCalledWith(expect.objectContaining({ type: "leaving" }));
+    expect(ownership.post).not.toHaveBeenCalledWith(expect.objectContaining({ type: "left" }));
+
+    // Reconnect/minimize continue functioning normally afterward.
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    ownership.getLease.mockReturnValue(lease);
+    ownership.getOwner.mockReturnValue(null);
+    view.rerender(providerTree());
+    fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
+    await waitFor(() => expect(resource.reconnect).toHaveBeenCalled());
+  });
+
+  // HIGH finding (per-writer keys): A and B both raced to generation 4
+  // without Web Locks. Under the OLD single-shared-key design, whichever
+  // wrote last could regress storage back over the other. Under per-writer
+  // keys, both A's and B's own keys persist independently — nothing to
+  // regress — so a fresh/reload tab with no local participationRecordsRef
+  // entry, falling back to getParticipationToken, reads the true causal
+  // winner among BOTH, never "whichever physically wrote last".
+  it("A/B collide at the same generation; a fresh/reload tab's own leave still uses exactly the causal winner among both persisted writer keys", async () => {
+    const tokenA = { generation: 4, writerId: "writer-z" };
+    const tokenB = { generation: 4, writerId: "writer-a" };
+    const winner = compareParticipationTokens(tokenB, tokenA) > 0 ? tokenB : tokenA;
+    const loser = winner === tokenB ? tokenA : tokenB;
+    expect(winner).not.toEqual(loser);
+
+    // Both A's and B's own writer keys are independently persisted — the
+    // real outcome of two tabs racing with zero synchronization, neither
+    // ever overwriting the other's key.
+    participationStorage = {
+      [callId]: { [tokenA.writerId]: tokenA.generation, [tokenB.writerId]: tokenB.generation },
+    };
+    expect(ownership.getParticipationToken(callId)).toEqual(winner);
+
+    // A brand-new/reloaded tab: fresh CallSessionProvider instance, EMPTY
+    // local participationRecordsRef — it never itself observed either
+    // participation being established.
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    renderProvider();
+    ownership.post.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave dedicated probe" }));
+    await waitFor(() => expect(ownership.post).toHaveBeenCalled());
+
+    // The fresh tab's own leaving/left is tagged with EXACTLY the causal
+    // winner — never the loser, and never reset to a fresh generation 1.
+    const leavingCall = ownership.post.mock.calls.find(
+      (postCall) => (postCall[0] as { type?: string }).type === "leaving",
+    );
+    expect(leavingCall?.[0]).toMatchObject({
+      type: "leaving",
+      callId,
+      generation: winner.generation,
+      writerId: winner.writerId,
+    });
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "left",
+          callId,
+          generation: winner.generation,
+          writerId: winner.writerId,
+        }),
+      ),
+    );
+
+    // Every tab that already knows the winner as current accepts these
+    // terminal events: the posted messages carry the SAME winning token
+    // with a strictly increasing sequence, which is exactly what
+    // compareParticipationTokens plus the sequence guard in
+    // commitParticipation accepts (proven directly by the
+    // "left always wins over a reordered leaving" and
+    // "delivers '%s' to listeners unconditionally" tests) — never rejected
+    // as belonging to an unrelated, older participation.
+    const leftCall = ownership.post.mock.calls.find(
+      (postCall) => (postCall[0] as { type?: string }).type === "left",
+    )![0] as { generation: number; writerId: string };
+    expect(compareParticipationTokens(leftCall, loser)).toBeGreaterThan(0);
+    expect(compareParticipationTokens(leftCall, winner)).toBe(0);
+  });
+});
+
 describe("React StrictMode ownership coordinator lifecycle (CALLS-546 regression)", () => {
   // Each call to createOwnershipCoordinator() returns a fresh, independently
   // tracked instance — unlike the single shared `ownership` mock used by
@@ -1019,6 +2148,7 @@ describe("React StrictMode ownership coordinator lifecycle (CALLS-546 regression
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    participationStorage = {};
     calls.call = null;
     resource.active = null;
     resource.callId = null;

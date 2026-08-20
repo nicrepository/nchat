@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ProfilePage from "./ProfilePage";
 import { AvatarUploadError, UpdateDisplayNameError, UpdateProfileFieldsError } from "./profileApi";
 import { _resetSelfProfile, useSelfProfile } from "./selfProfile";
+import { getSoundNotificationMode } from "../chat/soundPreference";
 
 const { mockUpload, mockRemove, mockFetchProfile, mockUpdateDisplayName, mockUpdateProfileFields } =
   vi.hoisted(() => ({
@@ -989,5 +990,187 @@ describe("ProfilePage — shared self-profile", () => {
 
     // One load (the mount), never a second: a failure publishes nothing.
     expect(self()).toBe("/api/auth/avatars/old.png");
+  });
+});
+
+describe("ProfilePage — sound notification mode", () => {
+  const offOption = () => screen.getByLabelText(/desativado/i) as HTMLInputElement;
+  const allOption = () => screen.getByLabelText(/todas as mensagens/i) as HTMLInputElement;
+  const mentionsOption = () => screen.getByLabelText(/somente menções/i) as HTMLInputElement;
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("defaults to 'all' checked when nothing is persisted", async () => {
+    renderPage();
+    await settled();
+    expect(allOption().checked).toBe(true);
+    expect(offOption().checked).toBe(false);
+    expect(mentionsOption().checked).toBe(false);
+  });
+
+  it("reflects a previously persisted 'off' mode on mount", async () => {
+    localStorage.setItem("nchat.notifications.sound.mode", "off");
+    renderPage();
+    await settled();
+    expect(offOption().checked).toBe(true);
+  });
+
+  it("reflects a previously persisted 'mentions' mode on mount", async () => {
+    localStorage.setItem("nchat.notifications.sound.mode", "mentions");
+    renderPage();
+    await settled();
+    expect(mentionsOption().checked).toBe(true);
+  });
+
+  it("migrates the legacy boolean preference (false -> off) when no mode is persisted yet", async () => {
+    localStorage.setItem("nchat.notifications.sound.enabled", "false");
+    renderPage();
+    await settled();
+    expect(offOption().checked).toBe(true);
+  });
+
+  it("selecting 'off' persists the mode", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(offOption());
+
+    expect(offOption().checked).toBe(true);
+    expect(getSoundNotificationMode()).toBe("off");
+  });
+
+  it("selecting 'mentions' persists the mode", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(mentionsOption());
+
+    expect(mentionsOption().checked).toBe(true);
+    expect(getSoundNotificationMode()).toBe("mentions");
+  });
+
+  it("selecting 'all' back persists the mode", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("nchat.notifications.sound.mode", "off");
+    renderPage();
+    await settled();
+
+    await user.click(allOption());
+
+    expect(allOption().checked).toBe(true);
+    expect(getSoundNotificationMode()).toBe("all");
+  });
+
+  it("is reachable and selectable via each option's associated label", async () => {
+    renderPage();
+    await settled();
+
+    // getByLabelText already proves the <label htmlFor> association; this
+    // proves clicking the label text (not just the input) selects the option.
+    await userEvent.click(screen.getByText("Somente menções"));
+
+    expect(mentionsOption().checked).toBe(true);
+    expect(allOption().checked).toBe(false);
+  });
+
+  it("only one option is checked at a time (radio group behaves as a group)", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(offOption());
+    expect(offOption().checked).toBe(true);
+    expect(allOption().checked).toBe(false);
+    expect(mentionsOption().checked).toBe(false);
+
+    await user.click(mentionsOption());
+    expect(offOption().checked).toBe(false);
+    expect(allOption().checked).toBe(false);
+    expect(mentionsOption().checked).toBe(true);
+  });
+});
+
+describe("ProfilePage — 'Menções e mensagens diretas' sound mode", () => {
+  const offOption = () => screen.getByLabelText(/desativado/i) as HTMLInputElement;
+  const allOption = () => screen.getByLabelText(/todas as mensagens/i) as HTMLInputElement;
+  const mentionsOption = () => screen.getByLabelText(/^somente menções$/i) as HTMLInputElement;
+  const mentionsAndDmsOption = () =>
+    screen.getByLabelText(/menções e mensagens diretas/i) as HTMLInputElement;
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("is a normal, equal, non-nested radio option alongside the other three", async () => {
+    renderPage();
+    await settled();
+
+    expect(mentionsAndDmsOption().type).toBe("radio");
+    expect(mentionsAndDmsOption()).not.toBeDisabled();
+    expect(mentionsAndDmsOption().checked).toBe(false);
+  });
+
+  it("selecting it persists the mode", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(mentionsAndDmsOption());
+
+    expect(mentionsAndDmsOption().checked).toBe(true);
+    expect(getSoundNotificationMode()).toBe("mentions_and_dms");
+  });
+
+  it("reflects a previously persisted value on mount", async () => {
+    localStorage.setItem("nchat.notifications.sound.mode", "mentions_and_dms");
+    renderPage();
+    await settled();
+
+    expect(mentionsAndDmsOption().checked).toBe(true);
+  });
+
+  it("migrates the legacy 'mentions' + DM-flag combination to this mode on mount", async () => {
+    localStorage.setItem("nchat.notifications.sound.mode", "mentions");
+    localStorage.setItem("nchat.notifications.sound.dmWithoutMention", "true");
+    renderPage();
+    await settled();
+
+    expect(mentionsAndDmsOption().checked).toBe(true);
+    expect(mentionsOption().checked).toBe(false);
+  });
+
+  it("behaves as part of the same mutually exclusive group as the other three options", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(mentionsAndDmsOption());
+    expect(offOption().checked).toBe(false);
+    expect(allOption().checked).toBe(false);
+    expect(mentionsOption().checked).toBe(false);
+    expect(mentionsAndDmsOption().checked).toBe(true);
+
+    await user.click(mentionsOption());
+    expect(mentionsAndDmsOption().checked).toBe(false);
+    expect(mentionsOption().checked).toBe(true);
+  });
+
+  it("is reachable and selectable via its associated label", async () => {
+    renderPage();
+    await settled();
+
+    await userEvent.click(screen.getByText("Menções e mensagens diretas"));
+
+    expect(mentionsAndDmsOption().checked).toBe(true);
   });
 });

@@ -150,7 +150,29 @@ func resolveOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInp
 	if !input.AutoProvision {
 		return domain.LoginUser{}, domain.ErrOIDCProvisioningDisabled
 	}
-	return insertOIDCUser(ctx, tx, input)
+
+	user, inserted, err := insertOIDCUser(ctx, tx, input)
+	if err != nil {
+		return domain.LoginUser{}, err
+	}
+	if inserted {
+		return user, nil
+	}
+
+	// The insert found a unique constraint already taken. Nothing above locked
+	// the absent row, so the winner of a concurrent first login is the ordinary
+	// outcome here: the ON CONFLICT clause waited for that transaction to
+	// commit, and its account is now visible. Re-reading by subject is what
+	// tells the two cases apart — the same identity means log in, anything else
+	// means the e-mail belongs to an account this subject does not own.
+	user, found, err = selectOIDCUserBySubject(ctx, tx, input.Provider, input.Subject)
+	if err != nil {
+		return domain.LoginUser{}, err
+	}
+	if !found {
+		return domain.LoginUser{}, domain.ErrOIDCAccountConflict
+	}
+	return user, nil
 }
 
 func selectOIDCUserBySubject(ctx context.Context, tx pgx.Tx, provider, subject string) (domain.LoginUser, bool, error) {
@@ -197,7 +219,7 @@ func oidcEmailExists(ctx context.Context, tx pgx.Tx, email string) (bool, error)
 	return true, nil
 }
 
-func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInput) (domain.LoginUser, error) {
+func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInput) (domain.LoginUser, bool, error) {
 	// display_name is NOT NULL, so provisioning is the one place the generic
 	// placeholder applies. full_name and avatar_url stay NULL when unknown.
 	displayName := input.DisplayName
@@ -205,19 +227,29 @@ func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInpu
 		displayName = domain.DefaultDisplayName
 	}
 	var user domain.LoginUser
+	// ON CONFLICT DO NOTHING rather than a bare insert: a raw 23505 would abort
+	// the whole login transaction, leaving no way to tell a lost provisioning
+	// race from a genuine e-mail collision. The clause covers every unique
+	// constraint on the table — users_email_unique and the partial index on
+	// (external_provider, external_subject) alike — and returns no row instead,
+	// which the caller resolves.
 	err := tx.QueryRow(ctx, `
 		INSERT INTO auth.users
 		  (email, display_name, full_name, avatar_url, status, auth_source,
 		   external_provider, external_subject, email_verified_at)
 		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), 'active', 'oidc', $5, $6, now())
+		ON CONFLICT DO NOTHING
 		RETURNING id, email::text, display_name`,
 		input.Email, displayName, input.FullName, input.AvatarURL,
 		input.Provider, input.Subject,
 	).Scan(&user.ID, &user.Email, &user.DisplayName)
-	if err != nil {
-		return domain.LoginUser{}, fmt.Errorf("insert oidc user: %w", err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LoginUser{}, false, nil
 	}
-	return user, nil
+	if err != nil {
+		return domain.LoginUser{}, false, fmt.Errorf("insert oidc user: %w", err)
+	}
+	return user, true, nil
 }
 
 // syncOIDCUserProfile refreshes the profile of a returning OIDC user from the

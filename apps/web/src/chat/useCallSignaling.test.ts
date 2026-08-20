@@ -60,6 +60,38 @@ class FakeWebSocket {
 
   send(data: string) {
     this.sentMessages.push(data);
+    const message = JSON.parse(data) as Record<string, unknown>;
+    // Auto-acks call.leave the way chat-service does: a direct reply to the
+    // sender alone (see call_protocol.go's sendCallToClient), carrying the
+    // resource call's post-leave state. The RF-23 x RF-24 handoff harness
+    // below drives useResourceCallSession.leave() for real (issue #569) and
+    // needs this to settle for the handoff to ever proceed; its exact
+    // status is irrelevant to those tests, only that leave() resolves.
+    if (message.type === "call.leave" && typeof message.call_id === "string") {
+      const callID = message.call_id;
+      queueMicrotask(() => {
+        this.simulateMessage({
+          type: "call.ended",
+          event_id: `call-leave-ack-${callID}`,
+          target_type: "channel",
+          target_id: "00000000-0000-4000-8000-000000000710",
+          call: {
+            call_id: callID,
+            request_id: "00000000-0000-4000-8000-000000000712",
+            caller_id: baseCall.caller_id,
+            callee_id: "",
+            target_type: "channel",
+            target_id: "00000000-0000-4000-8000-000000000710",
+            call_type: "audio",
+            status: "ended",
+            version: 1,
+            created_at: "2026-07-30T12:00:00Z",
+            occurred_at: "2026-07-30T12:00:00Z",
+            expires_at: "2026-07-30T12:00:30Z",
+          },
+        });
+      });
+    }
   }
 
   close() {

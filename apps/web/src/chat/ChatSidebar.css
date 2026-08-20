@@ -476,6 +476,16 @@
   align-items: center;
   justify-content: center;
   padding: 0 5px;
+  gap: 1px;
+}
+
+/* Distinct from a plain unread badge by more than color alone: the "@" mark
+   below is a visible glyph, and the accessible name adds "incluindo menção". */
+.chat-sidebar__unread-badge--mention {
+  background: #f59e0b;
+}
+.chat-sidebar__unread-badge-mention-mark {
+  font-size: 9px;
 }
 
 /* ── Badges (sr-only for type indicators) ────────────────────────────────────── */

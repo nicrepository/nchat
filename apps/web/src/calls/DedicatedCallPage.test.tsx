@@ -15,16 +15,21 @@ const callId = "00000000-0000-4000-8000-000000000546";
 const registerDirectory = vi.fn();
 const announceDedicated = vi.fn();
 const acknowledgeDedicated = vi.fn();
-const join = vi.fn(async () => undefined);
+// Mirrors the real hook: resolves with the joined call_id (every real call
+// site always supplies target.callId), never rejects.
+const join = vi.fn(async () => callId);
 const takeOver = vi.fn(async () => true);
+const beginResourceParticipation = vi.fn();
 
 const session = {
   ownerState: "local",
   registerDirectory,
   announceDedicated,
   acknowledgeDedicated,
+  beginResourceParticipation,
   takeOver,
   releaseDedicated: vi.fn(async () => undefined),
+  leaveDedicated: vi.fn(async () => undefined),
   dedicatedRecoveryFailed: false,
   presentation: { mode: "active_dedicated_tab" },
   enableMedia: vi.fn(),
@@ -109,6 +114,11 @@ describe("DedicatedCallPage", () => {
       }),
     );
     expect(acknowledgeDedicated).toHaveBeenCalledWith(callId, true);
+    // Issue #570 follow-up: registers the new participation only once
+    // join() itself resolves with the callId it actually joined — never
+    // inferred from resource.callId, which a rejoin of this exact tab's own
+    // callId would never observably change.
+    await waitFor(() => expect(beginResourceParticipation).toHaveBeenCalledWith(callId));
   });
 
   it("does not publish while another tab owns media and offers explicit takeover", async () => {
@@ -135,6 +145,11 @@ describe("DedicatedCallPage", () => {
   });
 
   it("opens a group DM, reports failed media only after activation, and leaves explicitly", async () => {
+    // leaveDedicated resolves immediately (the default mock), so the real
+    // window.close() this test doesn't otherwise care about must be
+    // neutralized here too — same as every other test in this file whose
+    // click can reach that convergence path.
+    vi.spyOn(window, "close").mockImplementation(() => undefined);
     vi.mocked(resolveCall).mockResolvedValueOnce({
       ...(await vi.mocked(resolveCall).getMockImplementation()!(callId)),
       target_type: "dm",
@@ -153,7 +168,51 @@ describe("DedicatedCallPage", () => {
     await waitFor(() => expect(join).toHaveBeenCalledWith(expect.objectContaining({ kind: "dm" })));
     expect(acknowledgeDedicated).toHaveBeenCalledWith(callId, false);
     fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
-    expect(session.resource.leave).toHaveBeenCalledOnce();
+    // Issue #570: exiting a resource/group call converges through
+    // leaveDedicated (participant leave + ownership release + "ended"),
+    // never a bare resource.leave() the dedicated tab never follows up on.
+    await waitFor(() => expect(session.leaveDedicated).toHaveBeenCalledWith(callId));
+    expect(session.resource.leave).not.toHaveBeenCalled();
+  });
+
+  it("converges fully on resource/group call exit: leaveDedicated, then window.close, then /chat fallback — never a global call.end (issue #570)", async () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    Object.defineProperty(window, "closed", { configurable: true, value: false });
+    let resolveLeave!: () => void;
+    session.leaveDedicated.mockImplementationOnce(
+      () =>
+        new Promise<undefined>((resolve) => {
+          resolveLeave = () => resolve(undefined);
+        }),
+    );
+    renderPage();
+    await screen.findByRole("main", { name: "Chamada Produto" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
+    expect(session.leaveDedicated).toHaveBeenCalledWith(callId);
+    // window.close() must never be attempted before the participant leave
+    // (and ownership release inside leaveDedicated) has actually resolved.
+    expect(close).not.toHaveBeenCalled();
+    expect(session.calls.end).not.toHaveBeenCalled();
+
+    await act(async () => resolveLeave());
+    expect(close).toHaveBeenCalledOnce();
+    expect(await screen.findByText("Chat")).toBeInTheDocument();
+  });
+
+  it("never closes or navigates away when the participant leave itself fails, leaving the retry state visible (issue #570)", async () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    session.leaveDedicated.mockRejectedValueOnce(new Error("leave failed"));
+    renderPage();
+    await screen.findByRole("main", { name: "Chamada Produto" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
+    await waitFor(() => expect(session.leaveDedicated).toHaveBeenCalledWith(callId));
+    await act(async () => undefined);
+
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.queryByText("Chat")).not.toBeInTheDocument();
+    expect(await screen.findByRole("main", { name: "Chamada Produto" })).toBeInTheDocument();
   });
 
   it("activates an authorized direct call, renders remote screen share, and ends it", async () => {

@@ -43,6 +43,10 @@ func (a *callHandlerAdapter) CurrentCall(ctx context.Context, workspaceID, actor
 	return a.service.Current(ctx, workspaceID, actorID, callID)
 }
 
+func (a *callHandlerAdapter) LeaveCall(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
+	return a.service.Leave(ctx, workspaceID, actorID, callID)
+}
+
 func runCallExpiryWorker(ctx context.Context, calls *service.CallService, logger *slog.Logger) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
