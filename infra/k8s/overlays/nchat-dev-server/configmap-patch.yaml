@@ -82,3 +82,9 @@ data:
   # clamd's own MaxScanTime (420000 ms) and it derives the worker's 330 s claim
   # lease; the ordering 300 < 330 < 420 is asserted in CI.
   FILE_MALWARE_SCAN_TIMEOUT_SECONDS: "300"
+
+  # RF-44: corporate Keycloak SSO enabled only for nchat-dev.
+  # Provider credentials and public callback values remain in nchat-secrets.
+  OIDC_ENABLED: "true"
+  OIDC_AUTO_PROVISION_ENABLED: "true"
+  OIDC_ALLOWED_EMAIL_DOMAINS: "nic-labs.com.br"
