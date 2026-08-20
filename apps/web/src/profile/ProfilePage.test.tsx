@@ -1,18 +1,20 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ProfilePage from "./ProfilePage";
-import { AvatarUploadError, UpdateDisplayNameError } from "./profileApi";
+import { AvatarUploadError, UpdateDisplayNameError, UpdateProfileFieldsError } from "./profileApi";
 import { _resetSelfProfile, useSelfProfile } from "./selfProfile";
 
-const { mockUpload, mockRemove, mockFetchProfile, mockUpdateDisplayName } = vi.hoisted(() => ({
-  mockUpload: vi.fn(),
-  mockRemove: vi.fn(),
-  mockFetchProfile: vi.fn(),
-  mockUpdateDisplayName: vi.fn(),
-}));
+const { mockUpload, mockRemove, mockFetchProfile, mockUpdateDisplayName, mockUpdateProfileFields } =
+  vi.hoisted(() => ({
+    mockUpload: vi.fn(),
+    mockRemove: vi.fn(),
+    mockFetchProfile: vi.fn(),
+    mockUpdateDisplayName: vi.fn(),
+    mockUpdateProfileFields: vi.fn(),
+  }));
 
 vi.mock("./profileApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./profileApi")>();
@@ -23,6 +25,10 @@ vi.mock("./profileApi", async (importOriginal) => {
     fetchMyProfile: (signal?: AbortSignal) => mockFetchProfile(signal),
     updateDisplayName: (displayName: string, signal?: AbortSignal) =>
       mockUpdateDisplayName(displayName, signal),
+    updateProfileFields: (
+      fields: { jobTitle: string; bio: string; timezone: string; customStatus: string },
+      signal?: AbortSignal,
+    ) => mockUpdateProfileFields(fields, signal),
   };
 });
 
@@ -66,10 +72,31 @@ const fileInput = () => screen.getByLabelText(/escolher imagem/i) as HTMLInputEl
 const uploadBtn = () => screen.getByRole("button", { name: /enviar avatar/i });
 const removeBtn = () => screen.getByRole("button", { name: /remover avatar/i });
 
+// Scoped to the name card (aria-label "Nome de exibição") so its "Cancelar"
+// control never collides with the details card's once both can be dirty.
+const nameSection = () => screen.getByRole("region", { name: /^nome de exibição$/i });
 const nameInput = () =>
-  screen.getByRole("textbox", { name: /nome de exibição/i }) as HTMLInputElement;
-const saveNameBtn = () => screen.getByRole("button", { name: /salvar nome/i });
-const cancelNameBtn = () => screen.queryByRole("button", { name: /^cancelar$/i });
+  within(nameSection()).getByRole("textbox", { name: /nome de exibição/i }) as HTMLInputElement;
+const saveNameBtn = () => within(nameSection()).getByRole("button", { name: /salvar nome/i });
+const cancelNameBtn = () => within(nameSection()).queryByRole("button", { name: /^cancelar$/i });
+
+// Scoped to the details card (aria-label "Detalhes do perfil") so its own
+// "Cancelar"/"Salvar alterações" controls never collide with the name card's.
+const detailsSection = () => screen.getByRole("region", { name: /detalhes do perfil/i });
+const jobTitleInput = () =>
+  within(detailsSection()).getByRole("textbox", { name: /cargo/i }) as HTMLInputElement;
+const timezoneSelect = () =>
+  within(detailsSection()).getByRole("combobox", { name: /fuso horário/i }) as HTMLSelectElement;
+const customStatusInput = () =>
+  within(detailsSection()).getByRole("textbox", {
+    name: /status customizado/i,
+  }) as HTMLInputElement;
+const bioInput = () =>
+  within(detailsSection()).getByRole("textbox", { name: /biografia/i }) as HTMLTextAreaElement;
+const saveDetailsBtn = () =>
+  within(detailsSection()).getByRole("button", { name: /salvar alterações/i });
+const cancelDetailsBtn = () =>
+  within(detailsSection()).queryByRole("button", { name: /^cancelar$/i });
 
 // Wait for the initial profile load to settle so the input is enabled.
 async function settled() {
@@ -560,6 +587,270 @@ describe("ProfilePage — display name: save", () => {
     await user.click(saveNameBtn());
 
     expect(await screen.findByText(/não foi possível atualizar o nome/i)).toBeInTheDocument();
+  });
+});
+
+describe("ProfilePage — profile fields: initial state and disabled controls", () => {
+  it("shows the persisted values once loaded", async () => {
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      jobTitle: "Engenheira",
+      bio: "Focada em backend.",
+      timezone: "America/Sao_Paulo",
+      customStatus: "Em reunião",
+    });
+    renderPage();
+    await settled();
+    expect(jobTitleInput().value).toBe("Engenheira");
+    expect(bioInput().value).toBe("Focada em backend.");
+    expect(timezoneSelect().value).toBe("America/Sao_Paulo");
+    expect(customStatusInput().value).toBe("Em reunião");
+  });
+
+  it("disables the fields and Save while the profile is still loading", async () => {
+    mockFetchProfile.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    expect(jobTitleInput()).toBeDisabled();
+    expect(saveDetailsBtn()).toBeDisabled();
+  });
+
+  it("hides Cancel and disables Save when no draft has changed", async () => {
+    renderPage();
+    await settled();
+    expect(cancelDetailsBtn()).not.toBeInTheDocument();
+    expect(saveDetailsBtn()).toBeDisabled();
+  });
+
+  it("gives each new profile control a stable name and valid autocomplete behavior", async () => {
+    renderPage();
+    await settled();
+
+    expect(jobTitleInput()).toHaveAttribute("name", "job_title");
+    expect(jobTitleInput()).toHaveAttribute("autocomplete", "organization-title");
+    expect(timezoneSelect()).toHaveAttribute("name", "timezone");
+    expect(timezoneSelect()).toHaveAttribute("autocomplete", "off");
+    expect(customStatusInput()).toHaveAttribute("name", "custom_status");
+    expect(customStatusInput()).toHaveAttribute("autocomplete", "off");
+    expect(bioInput()).toHaveAttribute("name", "bio");
+    expect(bioInput()).toHaveAttribute("autocomplete", "off");
+  });
+});
+
+describe("ProfilePage — profile fields: editing", () => {
+  it("typing in any field enables Save and reveals Cancel, independently of the name card", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.type(jobTitleInput(), "Engenheira");
+
+    expect(saveDetailsBtn()).toBeEnabled();
+    expect(cancelDetailsBtn()).toBeInTheDocument();
+    // The name card's own Cancel must not appear from an unrelated edit.
+    expect(cancelNameBtn()).not.toBeInTheDocument();
+  });
+
+  it("selecting a timezone enables Save", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.selectOptions(timezoneSelect(), "America/Sao_Paulo");
+
+    expect(timezoneSelect().value).toBe("America/Sao_Paulo");
+    expect(saveDetailsBtn()).toBeEnabled();
+  });
+
+  it("shows a validation error past the limit for a short field and blocks Save", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.type(jobTitleInput(), "a".repeat(81));
+
+    expect(await screen.findByText(/cargo deve ter no máximo 80 caracteres/i)).toBeInTheDocument();
+    expect(jobTitleInput()).toHaveAttribute("aria-invalid", "true");
+    expect(saveDetailsBtn()).toBeDisabled();
+
+    fireEvent.submit(jobTitleInput().closest("form")!);
+    expect(mockUpdateProfileFields).not.toHaveBeenCalled();
+    expect(jobTitleInput()).toHaveFocus();
+  });
+
+  it("shows a validation error past the limit for bio and blocks Save", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(bioInput());
+    await user.paste("a".repeat(501));
+
+    expect(
+      await screen.findByText(/biografia deve ter no máximo 500 caracteres/i),
+    ).toBeInTheDocument();
+    expect(saveDetailsBtn()).toBeDisabled();
+  });
+
+  it("shows a validation error past the limit for custom status and blocks Save", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.type(customStatusInput(), "a".repeat(81));
+
+    expect(await screen.findByText(/status deve ter no máximo 80 caracteres/i)).toBeInTheDocument();
+    expect(saveDetailsBtn()).toBeDisabled();
+  });
+
+  it("focuses the first invalid field in the visual form order on submit", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.type(customStatusInput(), "a".repeat(81));
+    await user.click(bioInput());
+    await user.paste("a".repeat(501));
+
+    fireEvent.submit(customStatusInput().closest("form")!);
+
+    expect(customStatusInput()).toHaveFocus();
+    expect(mockUpdateProfileFields).not.toHaveBeenCalled();
+  });
+
+  it("Cancel resets every draft to the persisted values with no server call", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      jobTitle: "Engenheira",
+      bio: "",
+      timezone: "",
+      customStatus: "",
+    });
+    renderPage();
+    await settled();
+
+    await user.clear(jobTitleInput());
+    await user.type(jobTitleInput(), "Outro cargo");
+    await user.click(cancelDetailsBtn()!);
+
+    expect(jobTitleInput().value).toBe("Engenheira");
+    expect(cancelDetailsBtn()).not.toBeInTheDocument();
+    expect(mockUpdateProfileFields).not.toHaveBeenCalled();
+  });
+});
+
+describe("ProfilePage — profile fields: save", () => {
+  it("saves the trimmed values and never sends display_name", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana" });
+    mockUpdateProfileFields.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      jobTitle: "Engenheira",
+      bio: "Focada em backend.",
+      timezone: "America/Sao_Paulo",
+      customStatus: "Em reunião",
+    });
+    renderPage();
+    await settled();
+
+    await user.type(jobTitleInput(), "  Engenheira  ");
+    await user.type(bioInput(), "Focada em backend.");
+    await user.selectOptions(timezoneSelect(), "America/Sao_Paulo");
+    await user.type(customStatusInput(), "Em reunião");
+    await user.click(saveDetailsBtn());
+
+    await waitFor(() => expect(mockUpdateProfileFields).toHaveBeenCalledTimes(1));
+    expect(mockUpdateProfileFields.mock.calls[0]).toEqual([
+      {
+        jobTitle: "Engenheira",
+        bio: "Focada em backend.",
+        timezone: "America/Sao_Paulo",
+        customStatus: "Em reunião",
+      },
+      undefined,
+    ]);
+  });
+
+  it("reflects exactly what the server returned and clears Cancel", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana" });
+    mockUpdateProfileFields.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      jobTitle: "Engenheira Sênior",
+      bio: "",
+      timezone: "",
+      customStatus: "",
+    });
+    renderPage();
+    await settled();
+
+    await user.type(jobTitleInput(), "Engenheira");
+    await user.click(saveDetailsBtn());
+
+    await waitFor(() => expect(jobTitleInput().value).toBe("Engenheira Sênior"));
+    expect(cancelDetailsBtn()).not.toBeInTheDocument();
+    expect(screen.getByText(/perfil atualizado/i)).toBeInTheDocument();
+  });
+
+  it("a typed failure shows its message and preserves the drafts for retry", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana" });
+    mockUpdateProfileFields.mockRejectedValue(
+      new UpdateProfileFieldsError("invalid", "Dados inválidos."),
+    );
+    renderPage();
+    await settled();
+
+    await user.type(jobTitleInput(), "Engenheira");
+    await user.click(saveDetailsBtn());
+
+    expect(await screen.findByText(/dados inválidos/i)).toBeInTheDocument();
+    expect(jobTitleInput().value).toBe("Engenheira");
+  });
+
+  it("a generic (non-typed) failure still shows a message instead of leaving the screen blank", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana" });
+    mockUpdateProfileFields.mockRejectedValue(new Error("boom"));
+    renderPage();
+    await settled();
+
+    await user.type(jobTitleInput(), "Engenheira");
+    await user.click(saveDetailsBtn());
+
+    expect(await screen.findByText(/não foi possível atualizar o perfil/i)).toBeInTheDocument();
+  });
+
+  // The bug this guards against: saving the name (its own form/button) must
+  // never call updateProfileFields, and saving the details (its own
+  // form/button) must never call updateDisplayName — each screen sends only
+  // the fields it owns.
+  it("saving the name does not call updateProfileFields, and saving details does not call updateDisplayName", async () => {
+    const user = userEvent.setup();
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Ana" });
+    mockUpdateDisplayName.mockResolvedValue({ id: "u1", displayName: "Ana Lima" });
+    mockUpdateProfileFields.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      jobTitle: "Engenheira",
+    });
+    renderPage();
+    await settled();
+
+    await user.clear(nameInput());
+    await user.type(nameInput(), "Ana Lima");
+    await user.click(saveNameBtn());
+    await waitFor(() => expect(mockUpdateDisplayName).toHaveBeenCalledTimes(1));
+    expect(mockUpdateProfileFields).not.toHaveBeenCalled();
+
+    await user.type(jobTitleInput(), "Engenheira");
+    await user.click(saveDetailsBtn());
+    await waitFor(() => expect(mockUpdateProfileFields).toHaveBeenCalledTimes(1));
+    expect(mockUpdateDisplayName).toHaveBeenCalledTimes(1); // still just the one call from before
   });
 });
 
