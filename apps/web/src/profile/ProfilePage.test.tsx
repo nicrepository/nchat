@@ -883,3 +883,211 @@ describe("ProfilePage — 'Menções e mensagens diretas' sound mode", () => {
     expect(mentionsAndDmsOption().checked).toBe(true);
   });
 });
+
+describe("ProfilePage — browser notification permission", () => {
+  /** jsdom does not implement Notification — stub it per test like elsewhere in the suite. */
+  class MockNotification {
+    static permission: NotificationPermission;
+    static requestPermission = vi.fn<() => Promise<NotificationPermission>>();
+  }
+
+  function stubNotification(permission: NotificationPermission, secureContext = true) {
+    MockNotification.permission = permission;
+    MockNotification.requestPermission = vi.fn<() => Promise<NotificationPermission>>();
+    vi.stubGlobal("isSecureContext", secureContext);
+    vi.stubGlobal("Notification", MockNotification);
+    return MockNotification;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const enableBtn = () =>
+    screen.queryByRole("button", { name: /ativar notificações do navegador/i });
+
+  it("shows the enable button and prompt only when permission is 'default'", async () => {
+    stubNotification("default");
+    renderPage();
+    await settled();
+
+    expect(enableBtn()).not.toBeNull();
+    expect(screen.getByText(/ative notificações do navegador/i)).toBeInTheDocument();
+  });
+
+  it("reflects 'granted' with no button", async () => {
+    stubNotification("granted");
+    renderPage();
+    await settled();
+
+    expect(enableBtn()).toBeNull();
+    expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument();
+  });
+
+  it("reflects 'denied' with instructions to change the browser's own setting, no retry/enable button", async () => {
+    stubNotification("denied");
+    renderPage();
+    await settled();
+
+    // Neither the default-state "Ativar..." button nor a "tentar novamente"
+    // retry exists here — requestPermission() cannot reopen a denied prompt.
+    expect(enableBtn()).toBeNull();
+    expect(screen.queryByRole("button", { name: /tentar novamente/i })).toBeNull();
+    expect(screen.getByText(/bloqueadas/i)).toBeInTheDocument();
+    expect(screen.getByText(/configurações do seu navegador/i)).toBeInTheDocument();
+  });
+
+  it("'denied' never calls Notification.requestPermission(), on mount or on opening the help", async () => {
+    const user = userEvent.setup();
+    const mock = stubNotification("denied");
+    renderPage();
+    await settled();
+
+    await user.click(screen.getByRole("button", { name: /como ativar notificações/i }));
+
+    expect(mock.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("'Como ativar notificações' expands step-by-step instructions, and collapses again on a second click", async () => {
+    const user = userEvent.setup();
+    stubNotification("denied");
+    renderPage();
+    await settled();
+
+    const helpBtn = screen.getByRole("button", { name: /como ativar notificações/i });
+    expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/ícone de cadeado/i)).not.toBeInTheDocument();
+
+    await user.click(helpBtn);
+
+    expect(helpBtn).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/ícone de cadeado/i)).toBeInTheDocument();
+    expect(screen.getByText(/localize a permissão/i)).toBeInTheDocument();
+    expect(screen.getByText(/permitir/i)).toBeInTheDocument();
+    expect(screen.getByText(/recarregue a página/i)).toBeInTheDocument();
+
+    await user.click(helpBtn);
+
+    expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/ícone de cadeado/i)).not.toBeInTheDocument();
+  });
+
+  it("re-reads the permission on window focus (denied -> granted)", async () => {
+    const mock = stubNotification("denied");
+    renderPage();
+    await settled();
+    expect(screen.getByText(/bloqueadas/i)).toBeInTheDocument();
+
+    // The user unblocked the site via the browser's own lock-icon UI and came
+    // back to this tab — simulate the window regaining focus.
+    mock.permission = "granted";
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() =>
+      expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("re-reads the permission on window focus (denied -> default) and brings back the enable button", async () => {
+    const mock = stubNotification("denied");
+    renderPage();
+    await settled();
+    expect(enableBtn()).toBeNull();
+
+    // The user reset the site's permission to its unset state.
+    mock.permission = "default";
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() => expect(enableBtn()).not.toBeNull());
+  });
+
+  it("removes the focus and visibilitychange listeners on unmount", async () => {
+    const windowAdd = vi.spyOn(window, "addEventListener");
+    const windowRemove = vi.spyOn(window, "removeEventListener");
+    const documentAdd = vi.spyOn(document, "addEventListener");
+    const documentRemove = vi.spyOn(document, "removeEventListener");
+    stubNotification("denied");
+    const { unmount } = renderPage();
+    await settled();
+
+    const focusHandler = windowAdd.mock.calls.find(([type]) => type === "focus")?.[1];
+    const visibilityHandler = documentAdd.mock.calls.find(
+      ([type]) => type === "visibilitychange",
+    )?.[1];
+    expect(focusHandler).toBeDefined();
+    expect(visibilityHandler).toBeDefined();
+
+    unmount();
+
+    expect(windowRemove).toHaveBeenCalledWith("focus", focusHandler);
+    expect(documentRemove).toHaveBeenCalledWith("visibilitychange", visibilityHandler);
+  });
+
+  it("reflects a genuinely unsupported browser (secure context, no API) with no button", async () => {
+    vi.unstubAllGlobals();
+    vi.stubGlobal("isSecureContext", true);
+    renderPage();
+    await settled();
+
+    expect(enableBtn()).toBeNull();
+    expect(screen.getByText(/não tem suporte a notificações nativas/i)).toBeInTheDocument();
+  });
+
+  it("shows the insecure-origin message — not the blocked/denied UI — when the origin isn't secure", async () => {
+    // Reproduces the confirmed Firefox report: http://nchat.local:8080 reports
+    // Notification.permission === "denied" purely because the origin isn't
+    // HTTPS/localhost, not because the user denied anything. No button of any
+    // kind belongs here — neither "Ativar..." nor "Como ativar...".
+    stubNotification("denied", false);
+    renderPage();
+    await settled();
+
+    expect(
+      screen.getByText(/não estão disponíveis neste endereço.*https ou localhost/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/bloqueadas/i)).not.toBeInTheDocument();
+    expect(enableBtn()).toBeNull();
+    expect(screen.queryByRole("button", { name: /como ativar notificações/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /tentar novamente/i })).toBeNull();
+  });
+
+  it("never calls Notification.requestPermission() on mount", async () => {
+    const mock = stubNotification("default");
+    renderPage();
+    await settled();
+
+    expect(mock.requestPermission).not.toHaveBeenCalled();
+  });
+
+  it("requests permission only on explicit click and updates the UI with the result", async () => {
+    const user = userEvent.setup();
+    const mock = stubNotification("default");
+    mock.requestPermission.mockResolvedValue("granted");
+    renderPage();
+    await settled();
+
+    await user.click(enableBtn()!);
+
+    expect(mock.requestPermission).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument(),
+    );
+    expect(enableBtn()).toBeNull();
+  });
+
+  it("re-reads the permission on visibilitychange without requiring a reload", async () => {
+    const mock = stubNotification("default");
+    renderPage();
+    await settled();
+    expect(enableBtn()).not.toBeNull();
+
+    // The user granted permission via the browser's own UI (e.g. the address
+    // bar), not through our button — simulate the tab regaining visibility.
+    mock.permission = "granted";
+    fireEvent(document, new Event("visibilitychange"));
+
+    await waitFor(() =>
+      expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument(),
+    );
+  });
+});
