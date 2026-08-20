@@ -734,11 +734,8 @@ validate_nchat_dev() {
   grep -q 'name: nchat-default-deny-ingress' "$application"
 
   [[ "$(network_policy_names_by_type "$application" Egress)" == "$(printf '%s\n' \
-<<<<<<< ours
     nchat-allow-admin-postgres-egress \
-=======
     nchat-allow-auth-keycloak-egress \
->>>>>>> theirs
     nchat-allow-auth-postgres-egress \
     nchat-allow-chat-data-egress \
     nchat-allow-dns-egress \
