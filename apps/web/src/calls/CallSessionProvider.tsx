@@ -161,25 +161,37 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // reclaim for a callId whose CURRENT participation attempt is actually
   // leaving/left.
   //
-  // The ref is the single source of truth, mutated synchronously and
-  // immediately by commitParticipation below — never through a setState
-  // updater's "current" argument. That eager-computation path only fires
-  // reliably when this hook has no other update already pending on it, and
-  // beginResourceParticipation/continueResourceParticipation must compute
-  // the next token/sequence from the true latest record even when called
-  // from a plain Promise continuation (resource.join() resolving) that is
-  // not itself inside any React-owned batch — exactly the case a stale read
-  // would silently under-count the next generation. participationVersion
-  // exists purely to force the re-render that makes render-time reads of the
-  // ref (resourceParticipationPhase below, the chat-socket gate) observe the
-  // change.
-  const participationRecordsRef = useRef<
-    Map<
-      string,
-      { phase: "participating" | "leaving" | "left"; token: ParticipationToken; sequence: number }
-    >
-  >(new Map());
-  const [, setParticipationVersion] = useState(0);
+  // Two views of the SAME data, deliberately kept separate (react-hooks/refs
+  // forbids reading a ref during render — see commitParticipation below and
+  // resourceParticipationPhase further down):
+  //
+  // - participationRecordsRef is the synchronous authority the state
+  //   machine itself computes from. commitParticipation, and everything
+  //   that calls it (beginResourceParticipation/continueResourceParticipation),
+  //   must read the true latest record even when invoked from a plain
+  //   Promise continuation (resource.join() resolving) that is not itself
+  //   inside any React-owned batch — a setState updater's "current"
+  //   argument only reflects that latest value reliably when no other
+  //   update on that same state is already pending, which is exactly the
+  //   case a stale read here would silently under-count the next
+  //   generation. Never read during render.
+  // - participationRecords is a plain React state snapshot of the ref,
+  //   updated in lockstep every time the ref changes — this is what render
+  //   (resourceParticipationPhase below) and nothing else may read, and
+  //   what actually triggers the re-render.
+  type ParticipationRecords = Map<
+    string,
+    { phase: "participating" | "leaving" | "left"; token: ParticipationToken; sequence: number }
+  >;
+  const participationRecordsRef = useRef<ParticipationRecords>(new Map());
+  // Independently initialized to an empty Map — never read from the ref
+  // (react-hooks/refs forbids that during render, and this initializer runs
+  // at render time on first mount) — the two simply start in the same
+  // state the ref itself was just initialized to, and commitParticipation
+  // keeps them in lockstep from here on.
+  const [participationRecords, setParticipationRecords] = useState<ParticipationRecords>(
+    () => new Map(),
+  );
   // Applies a participation transition — from an incoming cross-tab message
   // (applyParticipationEvent) or a locally computed one
   // (beginResourceParticipation/continueResourceParticipation) — but only if
@@ -210,9 +222,10 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         if (cmp < 0) return;
         if (cmp === 0 && sequence <= existing.sequence) return;
       }
-      participationRecordsRef.current = new Map(participationRecordsRef.current);
-      participationRecordsRef.current.set(callId, { phase, token, sequence });
-      setParticipationVersion((version) => version + 1);
+      const next = new Map(participationRecordsRef.current);
+      next.set(callId, { phase, token, sequence });
+      participationRecordsRef.current = next;
+      setParticipationRecords(next);
     },
     [],
   );
@@ -435,8 +448,10 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   }, [continueResourceParticipation, resource]);
 
   const directActive = calls.call?.status === "active" ? calls.call : null;
+  // Render-time read: the state snapshot, never the ref — see the
+  // participationRecordsRef/participationRecords comment above.
   const resourceParticipationPhase = resource.callId
-    ? participationRecordsRef.current.get(resource.callId)?.phase
+    ? participationRecords.get(resource.callId)?.phase
     : undefined;
   const resourceCallReconnectable =
     resourceParticipationPhase !== "leaving" && resourceParticipationPhase !== "left";
@@ -659,8 +674,9 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           // a legitimate later reclaim can still reconnect — must not
           // permanently suppress this affordance for a callId this tab's
           // current participation has actually left. What matters is
-          // whether THIS tab is presently participating, which
-          // participationRecords, not raw callId equality, answers.
+          // whether THIS tab is presently participating, which the
+          // synchronous ref (this runs in a socket callback, not render —
+          // see the participationRecordsRef comment above) answers.
           participationRecordsRef.current.get(event.call.call_id)?.phase !== "participating" &&
           event.call.caller_id !== directory.currentUserId &&
           !ignoredResourceCalls.current.has(event.call.call_id)
