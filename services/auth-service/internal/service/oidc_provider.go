@@ -24,9 +24,30 @@ type oidcTokenSet struct {
 	IDToken string
 }
 
+// AuthorizationRequest is everything that varies per sign-in run.
+//
+// RedirectURL is here rather than in provider configuration because one
+// deployment serves two origins — the chat app and the administrative console —
+// and the authorization request and the token exchange must name the *same*
+// redirect URI for the run to complete. The caller resolves it from a
+// server-side allowlist; nothing here derives it from a request.
+//
+// ACRValues asks the provider to run an authentication context strong enough
+// for what follows. It is empty for a run with no such requirement, and the
+// values themselves are whatever the deployment's identity provider defines —
+// this package never invents one.
+type AuthorizationRequest struct {
+	State         string
+	Nonce         string
+	CodeChallenge string
+	RedirectURL   string
+	ACRValues     []string
+}
+
+// OIDCProvider is the identity provider boundary.
 type OIDCProvider interface {
-	AuthorizationURL(state, nonce, codeChallenge string) (string, error)
-	ExchangeCode(ctx context.Context, code, verifier string) (oidcTokenSet, error)
+	AuthorizationURL(req AuthorizationRequest) (string, error)
+	ExchangeCode(ctx context.Context, code, verifier, redirectURL string) (oidcTokenSet, error)
 	ValidateIDToken(ctx context.Context, rawIDToken string) (domain.OIDCClaims, error)
 }
 
@@ -34,7 +55,6 @@ type KeycloakProviderConfig struct {
 	IssuerURL    string
 	ClientID     string
 	ClientSecret string
-	RedirectURL  string
 	Scopes       string
 	HTTPTimeout  time.Duration
 	HTTPClient   *http.Client
@@ -73,15 +93,19 @@ type oidcJWK struct {
 }
 
 type keycloakIDClaims struct {
-	Nonce             string `json:"nonce"`
-	Email             string `json:"email"`
-	EmailVerified     bool   `json:"email_verified"`
-	PreferredUsername string `json:"preferred_username"`
-	Name              string `json:"name"`
-	GivenName         string `json:"given_name"`
-	FamilyName        string `json:"family_name"`
-	Picture           string `json:"picture"`
-	AuthorizedParty   string `json:"azp"`
+	Nonce string `json:"nonce"`
+	// AuthenticationContextClass is the `acr` claim: the authentication context
+	// the provider says it actually ran. It is optional in OIDC and many
+	// providers omit it, so its absence means "unknown", never "strong".
+	AuthenticationContextClass string `json:"acr"`
+	Email                      string `json:"email"`
+	EmailVerified              bool   `json:"email_verified"`
+	PreferredUsername          string `json:"preferred_username"`
+	Name                       string `json:"name"`
+	GivenName                  string `json:"given_name"`
+	FamilyName                 string `json:"family_name"`
+	Picture                    string `json:"picture"`
+	AuthorizedParty            string `json:"azp"`
 	jwt.RegisteredClaims
 }
 
@@ -97,7 +121,10 @@ func NewKeycloakProvider(cfg KeycloakProviderConfig) *KeycloakProvider {
 	return &KeycloakProvider{cfg: cfg, httpClient: client}
 }
 
-func (p *KeycloakProvider) AuthorizationURL(state, nonce, codeChallenge string) (string, error) {
+func (p *KeycloakProvider) AuthorizationURL(req AuthorizationRequest) (string, error) {
+	if err := validateOIDCRedirectURL(req.RedirectURL); err != nil {
+		return "", err
+	}
 	discovery, err := p.getDiscovery(context.Background())
 	if err != nil {
 		return "", err
@@ -108,18 +135,27 @@ func (p *KeycloakProvider) AuthorizationURL(state, nonce, codeChallenge string) 
 	}
 	q := authURL.Query()
 	q.Set("client_id", p.cfg.ClientID)
-	q.Set("redirect_uri", p.cfg.RedirectURL)
+	q.Set("redirect_uri", req.RedirectURL)
 	q.Set("response_type", "code")
 	q.Set("scope", p.cfg.Scopes)
-	q.Set("state", state)
-	q.Set("nonce", nonce)
-	q.Set("code_challenge", codeChallenge)
+	q.Set("state", req.State)
+	q.Set("nonce", req.Nonce)
+	q.Set("code_challenge", req.CodeChallenge)
 	q.Set("code_challenge_method", "S256")
+	if len(req.ACRValues) > 0 {
+		// Space-separated, per OpenID Connect Core: the values are listed in
+		// order of preference and the provider decides which it can satisfy.
+		// Asking is not the control — the control is checking what came back.
+		q.Set("acr_values", strings.Join(req.ACRValues, " "))
+	}
 	authURL.RawQuery = q.Encode()
 	return authURL.String(), nil
 }
 
-func (p *KeycloakProvider) ExchangeCode(ctx context.Context, code, verifier string) (oidcTokenSet, error) {
+func (p *KeycloakProvider) ExchangeCode(ctx context.Context, code, verifier, redirectURL string) (oidcTokenSet, error) {
+	if err := validateOIDCRedirectURL(redirectURL); err != nil {
+		return oidcTokenSet{}, err
+	}
 	discovery, err := p.getDiscovery(ctx)
 	if err != nil {
 		return oidcTokenSet{}, err
@@ -128,7 +164,7 @@ func (p *KeycloakProvider) ExchangeCode(ctx context.Context, code, verifier stri
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", p.cfg.ClientID)
 	form.Set("client_secret", p.cfg.ClientSecret)
-	form.Set("redirect_uri", p.cfg.RedirectURL)
+	form.Set("redirect_uri", redirectURL)
 	form.Set("code", code)
 	form.Set("code_verifier", verifier)
 
@@ -192,15 +228,16 @@ func (p *KeycloakProvider) ValidateIDToken(ctx context.Context, rawIDToken strin
 		return domain.OIDCClaims{}, domain.ErrOIDCInvalidCallback
 	}
 	return domain.OIDCClaims{
-		Subject:           claims.Subject,
-		Email:             claims.Email,
-		EmailVerified:     claims.EmailVerified,
-		PreferredUsername: claims.PreferredUsername,
-		Name:              claims.Name,
-		GivenName:         claims.GivenName,
-		FamilyName:        claims.FamilyName,
-		Picture:           claims.Picture,
-		Nonce:             claims.Nonce,
+		Subject:                    claims.Subject,
+		Email:                      claims.Email,
+		EmailVerified:              claims.EmailVerified,
+		PreferredUsername:          claims.PreferredUsername,
+		Name:                       claims.Name,
+		GivenName:                  claims.GivenName,
+		FamilyName:                 claims.FamilyName,
+		Picture:                    claims.Picture,
+		Nonce:                      claims.Nonce,
+		AuthenticationContextClass: claims.AuthenticationContextClass,
 	}, nil
 }
 
@@ -289,6 +326,33 @@ func validateOIDCEndpointOrigin(issuerURL *url.URL, endpoint string) error {
 		return domain.ErrOIDCMisconfigured
 	}
 	if parsed.Scheme != issuerURL.Scheme || parsed.Host != issuerURL.Host {
+		return domain.ErrOIDCMisconfigured
+	}
+	if !oidcEndpointSchemeAllowed(parsed) {
+		return domain.ErrOIDCMisconfigured
+	}
+	return nil
+}
+
+// ValidateOIDCRedirectURL enforces the shape of a redirect URI this service is
+// willing to send to an identity provider.
+//
+// It is applied to configured values, not to request values — no request value
+// ever reaches here — and it exists so a misconfigured deployment fails at the
+// first login instead of handing the provider something surprising. HTTPS is
+// required except on loopback, which is what makes plain-HTTP local development
+// possible without weakening any real environment.
+func ValidateOIDCRedirectURL(raw string) error {
+	return validateOIDCRedirectURL(raw)
+}
+
+func validateOIDCRedirectURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed != raw || strings.ContainsAny(raw, "\r\n") {
+		return domain.ErrOIDCMisconfigured
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return domain.ErrOIDCMisconfigured
 	}
 	if !oidcEndpointSchemeAllowed(parsed) {
@@ -394,7 +458,6 @@ type AzureADProviderConfig struct {
 	TenantID     string
 	ClientID     string
 	ClientSecret string
-	RedirectURL  string
 	Scopes       string
 	HTTPTimeout  time.Duration
 	HTTPClient   *http.Client
@@ -415,7 +478,6 @@ func NewAzureADProvider(cfg AzureADProviderConfig) (OIDCProvider, error) {
 		IssuerURL:    "https://login.microsoftonline.com/" + strings.TrimSpace(cfg.TenantID) + "/v2.0",
 		ClientID:     cfg.ClientID,
 		ClientSecret: cfg.ClientSecret,
-		RedirectURL:  cfg.RedirectURL,
 		Scopes:       scopes,
 		HTTPTimeout:  cfg.HTTPTimeout,
 		HTTPClient:   cfg.HTTPClient,
@@ -426,7 +488,6 @@ func NewAzureADProvider(cfg AzureADProviderConfig) (OIDCProvider, error) {
 type GoogleWorkspaceProviderConfig struct {
 	ClientID     string
 	ClientSecret string
-	RedirectURL  string
 	Scopes       string
 	HTTPTimeout  time.Duration
 	HTTPClient   *http.Client
@@ -446,7 +507,6 @@ func NewGoogleWorkspaceProvider(cfg GoogleWorkspaceProviderConfig) (OIDCProvider
 		IssuerURL:    "https://accounts.google.com",
 		ClientID:     cfg.ClientID,
 		ClientSecret: cfg.ClientSecret,
-		RedirectURL:  cfg.RedirectURL,
 		Scopes:       scopes,
 		HTTPTimeout:  cfg.HTTPTimeout,
 		HTTPClient:   cfg.HTTPClient,

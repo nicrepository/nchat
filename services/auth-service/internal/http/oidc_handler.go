@@ -20,7 +20,18 @@ const (
 	errCodeOIDCInvalidCallback = "invalid_oidc_callback"
 	errCodeOIDCForbidden       = "oidc_forbidden"
 	errCodeOIDCLinkRequired    = "account_link_required"
+	errCodeOIDCInvalidApp      = "invalid_oidc_app"
+	errCodeOIDCAssurance       = "oidc_insufficient_assurance"
 )
+
+// oidcAppQueryParam names which NChat application a sign-in run belongs to.
+//
+// It is the only client input the login endpoint reads, and it is a label from
+// a closed set — never a URL, never a path, never a hostname. The redirect URI
+// it selects lives in server configuration, so there is no request value here
+// that can be turned into a redirect target. A run that names no application is
+// the chat application, which is what every pre-existing caller means.
+const oidcAppQueryParam = "app"
 
 type oidcExchangeRequest struct {
 	Code string `json:"code"`
@@ -32,12 +43,23 @@ func OIDCLogin(oidc service.OIDCManager) http.Handler {
 			writeOIDCError(w, domain.ErrOIDCDisabled)
 			return
 		}
-		location, err := oidc.Login(r.Context())
+		app, ok := domain.ParseOIDCAppContext(r.URL.Query().Get(oidcAppQueryParam))
+		if !ok {
+			httputil.WriteError(w, http.StatusBadRequest, errCodeOIDCInvalidApp, "unknown application")
+			return
+		}
+		location, err := oidc.Login(r.Context(), app)
 		if err != nil {
 			writeOIDCError(w, err)
 			return
 		}
-		http.Redirect(w, r, location, http.StatusFound)
+		safeLocation, ok := safeOIDCProviderLocation(location)
+		if !ok {
+			writeOIDCError(w, domain.ErrOIDCMisconfigured)
+			return
+		}
+		w.Header().Set("Location", safeLocation)
+		w.WriteHeader(http.StatusFound)
 	})
 }
 
@@ -104,6 +126,30 @@ func OIDCExchange(oidc service.OIDCManager, refreshTTL int) http.Handler {
 	})
 }
 
+// safeOIDCProviderLocation re-validates the authorization URL before the
+// browser is sent to it.
+//
+// The URL is built by the provider from its own discovery document, whose
+// endpoints are already pinned to the issuer origin, and the only client input
+// on this path is a label from a closed set that never reaches a URL. This is
+// therefore defence in depth rather than the primary control: it re-parses the
+// value and hands the browser the reconstruction, so a header-splitting
+// sequence or a non-absolute location cannot leave this handler even if a
+// discovery document were ever served something strange.
+func safeOIDCProviderLocation(location string) (string, bool) {
+	if strings.ContainsAny(location, "\r\n") {
+		return "", false
+	}
+	parsed, err := url.Parse(location)
+	if err != nil || parsed.Host == "" || parsed.User != nil {
+		return "", false
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
 func redirectOIDCCallbackLocation(w http.ResponseWriter, location string) bool {
 	safeLocation, ok := safeOIDCCallbackLocation(location)
 	if !ok {
@@ -153,6 +199,10 @@ func writeOIDCError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeOIDCUnavailable, "oidc unavailable")
 	case errors.Is(err, domain.ErrOIDCAccountConflict):
 		httputil.WriteError(w, http.StatusConflict, errCodeOIDCLinkRequired, "account linking required")
+	case errors.Is(err, domain.ErrOIDCInsufficientAssurance):
+		// Distinct from a plain refusal: retrying the same single-factor login
+		// will not help, and the administrator needs to know that.
+		httputil.WriteError(w, http.StatusForbidden, errCodeOIDCAssurance, "stronger authentication required")
 	case errors.Is(err, domain.ErrOIDCDomainForbidden), errors.Is(err, domain.ErrOIDCProvisioningDisabled):
 		httputil.WriteError(w, http.StatusForbidden, errCodeOIDCForbidden, "oidc login unavailable")
 	case errors.Is(err, domain.ErrOIDCInvalidCallback), errors.Is(err, domain.ErrOIDCEmailUnverified), errors.Is(err, domain.ErrInvalidToken), errors.Is(err, domain.ErrInvalidCredentials):

@@ -26,6 +26,8 @@ spec:
           - livekit
           - coturn
           - media
+          # admin-service resolves postgres for the Admin API (issue #578).
+          - admin
           # file resolves postgres, valkey, seaweedfs and clamav; upload-guard
           # resolves file-service at nginx config load, so without DNS it does
           # not even start. clamav is absent on purpose: freshclam is off and
@@ -56,6 +58,9 @@ spec:
         operator: In
         values:
           - web
+          # The administrative console frontend (issue #578). Served on its own
+          # host, so Traefik must reach it directly; it talks to nothing else.
+          - admin-web
           - auth
           - chat
           - file
@@ -112,6 +117,11 @@ spec:
                   # Attachment metadata, and the advisory locks that upload
                   # admission control reserves one connection at a time from.
                   - file
+                  # Administrative principals, capabilities, sessions and the
+                  # audit trail (issue #578). admin-service is the only writer
+                  # of auth.admin_* and reads auth.user_sessions to
+                  # re-authorize on every request.
+                  - admin
       ports:
         - protocol: TCP
           port: 5432
@@ -218,6 +228,28 @@ spec:
         values:
           - migrations
           - postgres-bootstrap
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# admin-service reaches PostgreSQL and nothing else. It has no object storage,
+# no cache and no outbound internet: the Admin API is a database-backed
+# authorization boundary, not an integration hub.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-admin-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: admin
   policyTypes:
     - Egress
   egress:

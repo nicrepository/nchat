@@ -9,7 +9,9 @@ Browser-callable admin endpoints use `VITE_ADMIN_API_BASE_URL`
 (default: `/api/auth/admin`).
 
 > **Gateway note (issue #425).** `/api/admin` is routed to `admin-service`,
-> which serves no user endpoints — a client aiming there gets `404`. Every
+> which serves no user endpoints — a client aiming there gets `404`. Since
+> issue #578 that prefix carries the Admin Console API (session handshake,
+> bootstrap, audit trail); see `docs/api/admin-endpoints.md`. Every
 > browser-callable route on this service sits under `/auth/*`, and the gateways
 > rewrite `/api/auth/<rest>` to `/auth/<rest>` before the request reaches the
 > pod:
@@ -37,7 +39,7 @@ Browser-callable admin endpoints use `VITE_ADMIN_API_BASE_URL`
 | 4   | POST   | `/auth/password/forgot`          | Public                                 | RF-48        |
 | 5   | POST   | `/auth/password/reset`           | Public (reset token)                   | RF-48        |
 | 6   | POST   | `/auth/invites/accept`           | Public (invite token)                  | RF-46        |
-| 7   | GET    | `/auth/oidc/keycloak/login`      | Public                                 | RF-44        |
+| 7   | GET    | `/auth/oidc/keycloak/login`      | Public (`?app=chat\|admin`)            | RF-44        |
 | 8   | GET    | `/auth/oidc/keycloak/callback`   | Public (OIDC state)                    | RF-44        |
 | 9   | POST   | `/auth/oidc/keycloak/exchange`   | Public (one-time code)                 | RF-44        |
 | 10  | GET    | `/auth/me/login-attempts`        | Bearer JWT + active session            | —            |

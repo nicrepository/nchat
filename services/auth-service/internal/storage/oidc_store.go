@@ -23,9 +23,9 @@ func NewPGXOIDCStore(pool Pool) *PGXOIDCStore {
 func (s *PGXOIDCStore) CreateAuthRequest(ctx context.Context, req domain.OIDCLoginRequest) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO auth.oidc_auth_requests
-		  (id, provider, state_hash, nonce_hash, pkce_verifier_encrypted, redirect_after, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		req.ID, req.Provider, req.StateHash, req.NonceHash, req.PKCEVerifierEncrypted, nullableString(req.RedirectAfter), req.ExpiresAt,
+		  (id, provider, state_hash, nonce_hash, pkce_verifier_encrypted, redirect_after, app_context, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		req.ID, req.Provider, req.StateHash, req.NonceHash, req.PKCEVerifierEncrypted, nullableString(req.RedirectAfter), string(req.AppContext), req.ExpiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert oidc auth request: %w", err)
@@ -35,6 +35,7 @@ func (s *PGXOIDCStore) CreateAuthRequest(ctx context.Context, req domain.OIDCLog
 
 func (s *PGXOIDCStore) ConsumeAuthRequest(ctx context.Context, provider, stateHash string) (domain.OIDCConsumedAuthRequest, error) {
 	var req domain.OIDCConsumedAuthRequest
+	var appContext string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE auth.oidc_auth_requests
 		SET used_at = now()
@@ -42,15 +43,23 @@ func (s *PGXOIDCStore) ConsumeAuthRequest(ctx context.Context, provider, stateHa
 		  AND state_hash = $2
 		  AND used_at IS NULL
 		  AND expires_at > now()
-		RETURNING id, provider, nonce_hash, pkce_verifier_encrypted, COALESCE(redirect_after, '')`,
+		RETURNING id, provider, nonce_hash, pkce_verifier_encrypted, COALESCE(redirect_after, ''), app_context`,
 		provider, stateHash,
-	).Scan(&req.ID, &req.Provider, &req.NonceHash, &req.PKCEVerifierEncrypted, &req.RedirectAfter)
+	).Scan(&req.ID, &req.Provider, &req.NonceHash, &req.PKCEVerifierEncrypted, &req.RedirectAfter, &appContext)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.OIDCConsumedAuthRequest{}, domain.ErrInvalidToken
 	}
 	if err != nil {
 		return domain.OIDCConsumedAuthRequest{}, fmt.Errorf("consume oidc auth request: %w", err)
 	}
+	// The stored label is re-parsed rather than cast: a row written by a future
+	// build, or edited by hand, must not smuggle an unknown context past the
+	// service's allowlist.
+	parsed, ok := domain.ParseOIDCAppContext(appContext)
+	if !ok {
+		return domain.OIDCConsumedAuthRequest{}, domain.ErrInvalidToken
+	}
+	req.AppContext = parsed
 	return req, nil
 }
 

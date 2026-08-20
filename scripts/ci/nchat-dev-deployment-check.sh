@@ -115,13 +115,18 @@ validate_topology_contract() {
   expect_invalid_topology "$variant" "empty host label accepted"
   make_topology_variant "$variant" NCHAT_DEV_HOST REPLACE_ME_HOST
   expect_invalid_topology "$variant" "unresolved REPLACE_ME_HOST accepted as topology host"
+  # The deployment host must leave room for every label derived from it. The
+  # longest is "admin." (issue #578) at six characters, which is now what caps
+  # the host at 247: "turn." only needed five. A host one character longer
+  # would produce an administrative hostname of 254 characters, which is not a
+  # valid DNS name and would render a console nobody can reach.
+  host247="$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..55})"
   host248="$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..56})"
-  host249="$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..57})"
-  [[ "${#host248}" -eq 248 && "${#host249}" -eq 249 ]] || fail "hostname boundary fixture lengths are incorrect"
+  [[ "${#host247}" -eq 247 && "${#host248}" -eq 248 ]] || fail "hostname boundary fixture lengths are incorrect"
+  make_topology_variant "$variant" NCHAT_DEV_HOST "$host247"
+  load_nchat_dev_topology "$variant" || fail "247-character topology host rejected"
   make_topology_variant "$variant" NCHAT_DEV_HOST "$host248"
-  load_nchat_dev_topology "$variant" || fail "248-character topology host rejected"
-  make_topology_variant "$variant" NCHAT_DEV_HOST "$host249"
-  expect_invalid_topology "$variant" "249-character topology host accepted despite derived TURN hostname"
+  expect_invalid_topology "$variant" "248-character topology host accepted despite derived admin hostname"
   cp "$TOPOLOGY_FIXTURE" "$variant"
   printf '%s\n' 'UNKNOWN_KEY=value' >>"$variant"
   expect_invalid_topology "$variant" "unexpected topology key accepted"
@@ -646,7 +651,7 @@ validate_configmap_key_value_assertion_contract() {
 }
 
 assert_rendered_replacements() {
-  local rendered="$1" host="$2" document
+  local rendered="$1" host="$2" document admin_host="admin.$2"
   document="$(yaml_document "$rendered" Certificate nchat-dev-tls)"
   has_exact_certificate_first_dns_name "$document" "$host" || fail "Certificate/nchat-dev-tls hostname replacement failed"
   document="$(yaml_document "$rendered" Ingress nchat-dev)"
@@ -659,7 +664,14 @@ assert_rendered_replacements() {
   has_exact_ingressroute_first_match "$document" "$host" || fail "IngressRoute/nchat-dev-uploads match replacement failed"
   document="$(yaml_document "$rendered" ConfigMap nchat-config)"
   has_exact_key_value "$document" AUTH_PUBLIC_WEB_BASE_URL "https://$host" || fail "ConfigMap/nchat-config public URL replacement failed"
+  # The administrative console host (issue #578). Derived as admin.<host>, so
+  # asserting the derivation here is what catches a topology pipeline that stops
+  # deriving it — at which point the console would render with an unresolved
+  # placeholder and be unreachable.
+  document="$(yaml_document "$rendered" Ingress nchat-dev-admin)"
+  has_exact_ingress_first_rule_host "$document" "$admin_host" && has_exact_ingress_first_tls_host "$document" "$admin_host" || fail "Ingress/nchat-dev-admin hostname targets failed"
   ! grep -q REPLACE_ME_HOST "$rendered" || fail "rendered manifest still contains REPLACE_ME_HOST"
+  ! grep -q REPLACE_ME_ADMIN_HOST "$rendered" || fail "rendered manifest still contains REPLACE_ME_ADMIN_HOST"
 }
 
 # Picks the first installed UTF-8 locale from a preference list, without
@@ -775,6 +787,8 @@ validate_image_inventory() {
   for deployment in "${NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}"; do
     if [[ "$deployment" == nchat-web ]]; then
       service="$ROOT_DIR/infra/k8s/base/web/service.yaml"
+    elif [[ "$deployment" == nchat-admin-web ]]; then
+      service="$ROOT_DIR/infra/k8s/base/admin-web/service.yaml"
     else
       service="$ROOT_DIR/infra/k8s/base/services/$deployment/service.yaml"
     fi
@@ -1034,7 +1048,7 @@ if require_pinned_kustomize; then
   done
   validate_rendered_overlay "$migrations" "$TEMP_DIR/migrations.yaml"
   validate_rendered_overlay "$application" "$TEMP_DIR/application.yaml"
-  [[ "$(grep -Fc "@$DIGEST" "$TEMP_DIR/application.yaml")" -eq 8 ]] || fail "application images are not digest-pinned"
+  [[ "$(grep -Fc "@$DIGEST" "$TEMP_DIR/application.yaml")" -eq 9 ]] || fail "application images are not digest-pinned"
   [[ "$(grep -Fc "@$DIGEST" "$TEMP_DIR/migrations.yaml")" -eq 1 ]] || fail "migration image is not digest-pinned"
 
   fixture_host='nchat-dev.example.invalid'
@@ -1045,7 +1059,7 @@ if require_pinned_kustomize; then
   # exactly one target's selector must leave only that target's placeholder
   # unresolved, proving there is no cross-match either way.
   break_target_and_expect_placeholder() {
-    local label="$1" sed_expr="$2" break_root output image broken expected document target target_kind target_name broken_kind broken_name
+    local label="$1" sed_expr="$2" break_root output image broken expected placeholder document target target_kind target_name broken_kind broken_name
     break_root="$TEMP_DIR/break-$label"
     rm -rf "$break_root"
     prepare_deploy_tree "$ROOT_DIR" "$break_root"
@@ -1058,21 +1072,26 @@ if require_pinned_kustomize; then
     if validate_rendered_overlay "$overlay" "$output" >/dev/null 2>&1; then
       fail "validate_rendered_overlay accepted a broken $label replacement selector"
     fi
+    # placeholder names which token the broken target should be left holding:
+    # the administrative host is substituted from its own topology value, so a
+    # broken admin selector leaves REPLACE_ME_ADMIN_HOST, not REPLACE_ME_HOST.
+    placeholder=REPLACE_ME_HOST
     case "$label" in
       ingress-main) broken='Ingress nchat-dev'; expected=2 ;;
       ingress-http) broken='Ingress nchat-dev-http'; expected=1 ;;
       ingress-livekit) broken='Ingress nchat-dev-livekit'; expected=2 ;;
       certificate) broken='Certificate nchat-dev-tls'; expected=1 ;;
       ingressroute) broken='IngressRoute nchat-dev-uploads'; expected=1 ;;
+      ingress-admin) broken='Ingress nchat-dev-admin'; expected=2; placeholder=REPLACE_ME_ADMIN_HOST ;;
     esac
     broken_kind="${broken% *}"; broken_name="${broken#* }"
     document="$(yaml_document "$output" "$broken_kind" "$broken_name")"
-    [[ "$(grep -Fc REPLACE_ME_HOST <<<"$document")" -eq "$expected" ]] || fail "breaking $label did not leave exactly $expected placeholders in $broken"
-    for target in 'Certificate nchat-dev-tls' 'Ingress nchat-dev' 'Ingress nchat-dev-http' 'Ingress nchat-dev-livekit' 'IngressRoute nchat-dev-uploads'; do
+    [[ "$(grep -Fc "$placeholder" <<<"$document")" -eq "$expected" ]] || fail "breaking $label did not leave exactly $expected $placeholder placeholders in $broken"
+    for target in 'Certificate nchat-dev-tls' 'Ingress nchat-dev' 'Ingress nchat-dev-http' 'Ingress nchat-dev-livekit' 'IngressRoute nchat-dev-uploads' 'Ingress nchat-dev-admin'; do
       [[ "$target" == "$broken" ]] && continue
       target_kind="${target% *}"; target_name="${target#* }"
       document="$(yaml_document "$output" "$target_kind" "$target_name")"
-      ! grep -q REPLACE_ME_HOST <<<"$document" || fail "breaking $label also broke $target"
+      ! grep -q REPLACE_ME <<<"$document" || fail "breaking $label also broke $target"
       grep -Fq "$fixture_host" <<<"$document" || fail "breaking $label did not preserve $target replacement"
     done
   }
@@ -1086,6 +1105,8 @@ if require_pinned_kustomize; then
     's/^          name: nchat-dev-tls$/          name: nchat-dev-tls-broken/'
   break_target_and_expect_placeholder ingressroute \
     's/^          name: nchat-dev-uploads$/          name: nchat-dev-uploads-broken/'
+  break_target_and_expect_placeholder ingress-admin \
+    's/^          name: nchat-dev-admin$/          name: nchat-dev-admin-broken/'
 
   # A placeholder in a brand-new resource that no replacement target names
   # must still be caught by the generic REPLACE_ME_[A-Z0-9_]+ gate.
