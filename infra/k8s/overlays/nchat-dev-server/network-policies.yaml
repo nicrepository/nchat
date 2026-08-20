@@ -536,3 +536,28 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+---
+# Keycloak SSO resolves to the node HTTPS endpoint in nchat-dev, which the CNI
+# HostPort rules DNAT to Traefik's websecure port. Since the namespace uses
+# default-deny egress, auth-service needs an explicit path to that endpoint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-auth-keycloak-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: auth
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 7443

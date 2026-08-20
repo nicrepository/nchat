@@ -29,7 +29,8 @@ patches:
         value: nchat-dev
   - path: configmap-patch.yaml
   - path: quota-patch.yaml
-  - path: delete-permissive-network-policy.yaml
+  - path: delete-same-namespace-network-policy.yaml
+  - path: delete-traefik-network-policy.yaml
   - path: patches/web.yaml
   - path: patches/auth-service.yaml
   - path: patches/chat-service.yaml
