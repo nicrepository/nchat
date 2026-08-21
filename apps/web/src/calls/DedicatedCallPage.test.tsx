@@ -105,6 +105,7 @@ describe("DedicatedCallPage", () => {
     vi.mocked(resolveCall).mockResolvedValue(resolvedCall);
     vi.mocked(fetchSidebarData).mockResolvedValue({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [{ id: "channel-1", name: "Produto", type: "public", canWrite: true }],
       dms: [],
       categories: [],
@@ -170,6 +171,7 @@ describe("DedicatedCallPage", () => {
     });
     vi.mocked(fetchSidebarData).mockResolvedValueOnce({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [{ id: "dm-group", name: "Equipe", type: "group", participants: [] }],
       categories: [],
@@ -245,6 +247,7 @@ describe("DedicatedCallPage", () => {
     vi.mocked(resolveCall).mockResolvedValueOnce(direct);
     vi.mocked(fetchSidebarData).mockResolvedValueOnce({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [
         {
@@ -290,6 +293,7 @@ describe("DedicatedCallPage", () => {
     vi.mocked(resolveCall).mockResolvedValueOnce(direct);
     vi.mocked(fetchSidebarData).mockResolvedValueOnce({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [
         {
@@ -337,6 +341,7 @@ describe("DedicatedCallPage", () => {
   it("keeps unresolved channel and group targets in the preparing state", async () => {
     vi.mocked(fetchSidebarData).mockResolvedValueOnce({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [],
       categories: [],
@@ -353,6 +358,7 @@ describe("DedicatedCallPage", () => {
     });
     vi.mocked(fetchSidebarData).mockResolvedValueOnce({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [],
       categories: [],
@@ -373,6 +379,7 @@ describe("DedicatedCallPage", () => {
     vi.mocked(resolveCall).mockResolvedValueOnce(direct);
     vi.mocked(fetchSidebarData).mockResolvedValueOnce({
       currentUserId: "current-user",
+      workspaceId: "workspace-1",
       channels: [],
       dms: [],
       categories: [],

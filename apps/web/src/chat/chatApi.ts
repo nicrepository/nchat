@@ -57,6 +57,7 @@ interface SidebarChannelResponse {
   created_at?: unknown;
   last_message_at?: unknown;
   pinned_at?: unknown;
+  unread_count?: unknown;
 }
 
 interface SidebarDMCounterpartResponse {
@@ -76,6 +77,7 @@ interface SidebarDMResponse {
   created_at?: unknown;
   last_message_at?: unknown;
   pinned_at?: unknown;
+  unread_count?: unknown;
 }
 
 interface SidebarResponse {
@@ -181,7 +183,12 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
+    ...(isUnreadCount(ch.unread_count) ? { unreadCount: ch.unread_count } : {}),
   };
+}
+
+function isUnreadCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** Guards against a hostile payload turning an attribute into a memory hog. */
@@ -289,6 +296,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
+    ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
   };
 }
 
@@ -336,6 +344,7 @@ export async function fetchDMs(): Promise<DMConversation[]> {
  */
 export async function fetchSidebarData(): Promise<{
   currentUserId: string;
+  workspaceId: string;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -348,18 +357,24 @@ export async function fetchSidebarData(): Promise<{
     kind: group.kind,
   }));
 
+  const flatChannels = (sidebar.channels ?? []).map(mapSidebarChannel);
+  const canonicalChannels = new Map(flatChannels.map((channel) => [channel.id, channel]));
   const channels: Channel[] = [];
   for (const group of categoriesRes.groups ?? []) {
-    const groupChannels = (group.channels ?? []).map((ch) => ({
-      ...mapSidebarChannel(ch),
-      categoryId: group.id,
-      categoryName: group.name,
-    }));
+    const groupChannels = (group.channels ?? []).map((ch) => {
+      const channel = mapSidebarChannel(ch);
+      const authoritative = canonicalChannels.get(channel.id)?.unreadCount;
+      return {
+        ...channel,
+        ...(authoritative !== undefined ? { unreadCount: authoritative } : {}),
+        categoryId: group.id,
+        categoryName: group.name,
+      };
+    });
     channels.push(...groupChannels);
   }
 
   const groupedChannelIds = new Set(channels.map((ch) => ch.id));
-  const flatChannels = (sidebar.channels ?? []).map(mapSidebarChannel);
   for (const ch of flatChannels) {
     if (!groupedChannelIds.has(ch.id)) {
       channels.push({
@@ -371,7 +386,13 @@ export async function fetchSidebarData(): Promise<{
   }
 
   const dms = mapSidebarDMs(sidebar.dm_conversations);
-  return { currentUserId: sidebar.current_user_id ?? "", channels, dms, categories };
+  return {
+    currentUserId: sidebar.current_user_id ?? "",
+    workspaceId: sidebar.workspace?.id ?? "",
+    channels,
+    dms,
+    categories,
+  };
 }
 
 export async function setSidebarConversationPinned(
@@ -384,6 +405,26 @@ export async function setSidebarConversationPinned(
       ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/sidebar-pin`
       : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/sidebar-pin`;
   await authenticatedFetch(target, { method: pinned ? "POST" : "DELETE" });
+}
+
+export async function markConversationRead(
+  targetType: "channel" | "dm",
+  targetId: string,
+  lastReadMessageId?: string,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/read`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/read`;
+  await authenticatedFetch(target, {
+    method: "POST",
+    ...(lastReadMessageId
+      ? {
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ last_read_message_id: lastReadMessageId }),
+        }
+      : {}),
+  });
 }
 
 /**

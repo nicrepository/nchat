@@ -2,11 +2,16 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { showBrowserMessageNotification } from "./browserNotification";
-import { fetchSidebarData, setSidebarConversationPinned } from "./chatApi";
+import { fetchSidebarData, markConversationRead, setSidebarConversationPinned } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
 import { playMessageSound } from "./messageSound";
 import { laterActivity } from "./sidebarOrder";
+import {
+  loadPersistedUnread,
+  savePersistedUnread,
+  type PersistedUnreadEntry,
+} from "./sidebarUnreadPersistence";
 import { getSoundNotificationMode } from "./soundPreference";
 import { classifySoundEvent, shouldPlayMessageSound } from "./soundRules";
 import {
@@ -23,6 +28,7 @@ export type SidebarState =
   | {
       status: "ready";
       currentUserId: string;
+      workspaceId: string;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
@@ -32,9 +38,19 @@ type Action =
   | {
       type: "loaded";
       currentUserId: string;
+      workspaceId: string;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
+      /**
+       * Unread/mention state restored from localStorage for this
+       * (user, workspace) — only consulted when there is no in-memory
+       * `previous` state yet (the very first load of the tab). Required
+       * rather than optional so every dispatch site states its intent
+       * explicitly; refreshSidebar() always passes [] since `previous` is
+       * never undefined there.
+       */
+      persistedUnread: PersistedUnreadEntry[];
     }
   | { type: "error"; error: string }
   | { type: "reload" }
@@ -83,6 +99,37 @@ function mergeActivity<T extends ConversationActivity & { id: string }>(
 }
 
 /**
+ * Restores unread/mention state across a "loaded" dispatch — the reducer's
+ * only reconciliation point, run on mount and on every refreshSidebar().
+ *
+ * The server's unreadCount is authoritative whenever present. In-memory and
+ * persisted values only bridge the first response or a rolling deployment
+ * where an older backend omits that field. Mention state remains client-only.
+ * Membership still comes from `incoming` only, same as mergeActivity — this
+ * never fabricates a row for a conversation the server did not return.
+ */
+function mergeUnread<T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean }>(
+  incoming: T[],
+  previous: T[] | undefined,
+  type: "channel" | "dm",
+  persisted: PersistedUnreadEntry[],
+): T[] {
+  const known = new Map((previous ?? []).map((item) => [item.id, item]));
+  const restored = new Map(
+    persisted.filter((entry) => entry.type === type).map((entry) => [entry.id, entry]),
+  );
+  return incoming.map((item) => {
+    const prev = known.get(item.id);
+    const entry = restored.get(item.id);
+    const unreadCount = item.unreadCount ?? prev?.unreadCount ?? entry?.unreadCount;
+    const hasMentionUnread =
+      prev?.hasMentionUnread ?? entry?.hasMentionUnread ?? item.hasMentionUnread;
+    if (unreadCount === undefined && hasMentionUnread === undefined) return item;
+    return { ...item, unreadCount, hasMentionUnread };
+  });
+}
+
+/**
  * Moves one conversation's activity forward, and never backwards.
  *
  * Only the item the event names is touched, and only when it is already in the
@@ -108,11 +155,14 @@ function reducer(state: SidebarState, action: Action): SidebarState {
   switch (action.type) {
     case "loaded": {
       const previous = state.status === "ready" ? state : undefined;
+      const channels = mergeActivity(action.channels, previous?.channels);
+      const dms = mergeActivity(action.dms, previous?.dms);
       return {
         status: "ready",
         currentUserId: action.currentUserId,
-        channels: mergeActivity(action.channels, previous?.channels),
-        dms: mergeActivity(action.dms, previous?.dms),
+        workspaceId: action.workspaceId,
+        channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
+        dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
         categories: action.categories || [],
       };
     }
@@ -230,9 +280,20 @@ export function useChatSidebar() {
     dispatch({ type: "reload" });
 
     const loading = fetchSidebarData()
-      .then(({ currentUserId, channels, dms, categories }) => {
-        if (mountedRef.current)
-          dispatch({ type: "loaded", currentUserId, channels, dms, categories });
+      .then(({ currentUserId, workspaceId, channels, dms, categories }) => {
+        if (mountedRef.current) {
+          const persistedUnread =
+            currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
+          dispatch({
+            type: "loaded",
+            currentUserId,
+            workspaceId,
+            channels,
+            dms,
+            categories,
+            persistedUnread,
+          });
+        }
       })
       .catch((err: unknown) => {
         if (mountedRef.current) {
@@ -255,6 +316,31 @@ export function useChatSidebar() {
       mountedRef.current = false;
     };
   }, [load]);
+
+  /**
+   * Keeps the unread/mention cache in sync with every state change — new
+   * message, opening a conversation, a reconciling refetch — so it is never
+   * more than one render behind what's on screen. A pure side effect of
+   * `state`: it never decides badge values itself, only mirrors them.
+   */
+  useEffect(() => {
+    if (state.status !== "ready" || !state.currentUserId || !state.workspaceId) return;
+    const entries: PersistedUnreadEntry[] = [
+      ...state.channels.map((c) => ({
+        id: c.id,
+        type: "channel" as const,
+        unreadCount: c.unreadCount ?? 0,
+        hasMentionUnread: !!c.hasMentionUnread,
+      })),
+      ...state.dms.map((d) => ({
+        id: d.id,
+        type: "dm" as const,
+        unreadCount: d.unreadCount ?? 0,
+        hasMentionUnread: !!d.hasMentionUnread,
+      })),
+    ];
+    savePersistedUnread(state.currentUserId, state.workspaceId, entries);
+  }, [state]);
 
   /**
    * Refetches the sidebar in place after a membership change (issue #398).
@@ -284,9 +370,21 @@ export function useChatSidebar() {
     refreshInFlight.current = true;
     const run = () => {
       fetchSidebarData()
-        .then(({ currentUserId, channels, dms, categories }) => {
+        .then(({ currentUserId, workspaceId, channels, dms, categories }) => {
           if (mountedRef.current)
-            dispatch({ type: "loaded", currentUserId, channels, dms, categories });
+            dispatch({
+              type: "loaded",
+              currentUserId,
+              workspaceId,
+              channels,
+              dms,
+              categories,
+              // previous is always defined at this call site (refreshSidebar
+              // only ever runs once the sidebar is already "ready"), so
+              // mergeUnread never consults this — never worth a localStorage
+              // read here.
+              persistedUnread: [],
+            });
         })
         .catch(() => {
           // The sidebar on screen stays valid; the next event or navigation
@@ -412,10 +510,14 @@ export function useChatSidebar() {
   });
 
   useEffect(() => {
-    if (openedTargetKind && openedTargetId) {
+    if (state.status === "ready" && openedTargetKind && openedTargetId) {
       dispatch({
         type: "target_opened",
         target: { kind: openedTargetKind, targetId: openedTargetId },
+      });
+      void Promise.resolve(markConversationRead(openedTargetKind, openedTargetId)).catch(() => {
+        // Local UI remains responsive while a later refresh reconciles with
+        // the server. A failed read receipt must never break chat navigation.
       });
     }
   }, [openedTargetKind, openedTargetId, state.status]);

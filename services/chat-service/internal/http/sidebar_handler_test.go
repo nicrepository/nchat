@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +48,19 @@ type pinningSidebarProvider struct {
 	pinArgs   []string
 	unpinArgs []string
 	err       error
+}
+
+type readingSidebarProvider struct {
+	stubSidebarProvider
+	args    []string
+	message *string
+	err     error
+}
+
+func (s *readingSidebarProvider) MarkConversationRead(_ context.Context, userID, targetType, targetID string, lastReadMessageID *string) error {
+	s.args = []string{userID, targetType, targetID}
+	s.message = lastReadMessageID
+	return s.err
 }
 
 func (s *pinningSidebarProvider) PinConversation(_ context.Context, userID, targetType, targetID string) error {
@@ -140,13 +154,14 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 	svc := &stubSidebarProvider{data: service.SidebarData{
 		Workspace: domain.Workspace{ID: "ws-1", Name: "NIC Labs", Slug: "default", Status: domain.WorkspaceStatusActive},
 		Channels: []service.SidebarChannel{
-			{Channel: domain.Channel{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic, IsGeneral: true, Status: domain.ChannelStatusActive}, CanWrite: true},
+			{Channel: domain.Channel{ID: "ch-1", Slug: "geral", DisplayName: "geral", Type: domain.ChannelTypePublic, IsGeneral: true, Status: domain.ChannelStatusActive}, CanWrite: true, UnreadCount: 3},
 			{Channel: domain.Channel{ID: "ch-2", Slug: "arquivo", DisplayName: "arquivo", Type: domain.ChannelTypePublic, Status: domain.ChannelStatusArchived}, CanWrite: false},
 		},
 		DMs: []domain.DMConversationWithParticipantIDs{
 			{
 				DMConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect},
 				ParticipantIDs: []string{testUserID, "other-user"},
+				UnreadCount:    2,
 			},
 		},
 	}}
@@ -164,15 +179,17 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 				Name string `json:"name"`
 			} `json:"workspace"`
 			Channels []struct {
-				ID        string `json:"id"`
-				Slug      string `json:"slug"`
-				IsGeneral bool   `json:"is_general"`
-				CanWrite  bool   `json:"can_write"`
+				ID          string `json:"id"`
+				Slug        string `json:"slug"`
+				IsGeneral   bool   `json:"is_general"`
+				CanWrite    bool   `json:"can_write"`
+				UnreadCount int    `json:"unread_count"`
 			} `json:"channels"`
 			DMs []struct {
-				ID   string `json:"id"`
-				Type string `json:"type"`
-				Name string `json:"name"`
+				ID          string `json:"id"`
+				Type        string `json:"type"`
+				Name        string `json:"name"`
+				UnreadCount int    `json:"unread_count"`
 			} `json:"dm_conversations"`
 		} `json:"data"`
 	}
@@ -189,6 +206,9 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 	if !envelope.Data.Channels[0].CanWrite {
 		t.Fatal("expected server-derived can_write=true")
 	}
+	if envelope.Data.Channels[0].UnreadCount != 3 || envelope.Data.DMs[0].UnreadCount != 2 {
+		t.Fatalf("unexpected unread counts: %+v", envelope.Data)
+	}
 	if envelope.Data.Channels[1].CanWrite {
 		t.Fatal("expected server-derived can_write=false")
 	}
@@ -198,6 +218,71 @@ func TestSidebarHandler_ValidAuth_ReturnsSidebar(t *testing.T) {
 	if envelope.Data.DMs[0].Type != "direct" {
 		t.Fatalf("expected DM type 'direct', got %q", envelope.Data.DMs[0].Type)
 	}
+}
+
+func TestSidebarHandler_MarkReadUsesAuthenticatedUserAndOptionalMessageID(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &readingSidebarProvider{}
+	router := sidebarRouter(v, svc)
+	channelID := "11111111-1111-4111-8111-111111111111"
+	messageID := "22222222-2222-4222-8222-222222222222"
+	req := authSidebarPinRequest(t, http.MethodPost, "/api/chat/channels/"+channelID+"/read")
+	req.Body = http.NoBody
+	req.ContentLength = 0
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("empty body expected 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	req = authSidebarPinRequest(t, http.MethodPost, "/api/chat/dm/33333333-3333-4333-8333-333333333333/read")
+	req.Body = io.NopCloser(strings.NewReader(`{"last_read_message_id":"` + messageID + `"}`))
+	req.ContentLength = int64(len(`{"last_read_message_id":"` + messageID + `"}`))
+	rr = httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("body expected 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got, want := strings.Join(svc.args, ","), strings.Join([]string{testUserID, service.ReadTargetDM, "33333333-3333-4333-8333-333333333333"}, ","); got != want {
+		t.Fatalf("read args = %q, want %q", got, want)
+	}
+	if svc.message == nil || *svc.message != messageID {
+		t.Fatalf("message = %v, want %q", svc.message, messageID)
+	}
+}
+
+func TestSidebarHandler_MarkReadRejectsUnauthorizedInvalidAndInaccessibleRequests(t *testing.T) {
+	v := makeTestValidator(t)
+	channelID := "11111111-1111-4111-8111-111111111111"
+	path := "/api/chat/channels/" + channelID + "/read"
+
+	t.Run("unauthenticated", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		sidebarRouter(v, &readingSidebarProvider{}).ServeHTTP(rr, httptest.NewRequest(http.MethodPost, path, nil))
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("strict body", func(t *testing.T) {
+		req := authSidebarPinRequest(t, http.MethodPost, path)
+		body := `{"unexpected":true}`
+		req.Body = io.NopCloser(strings.NewReader(body))
+		req.ContentLength = int64(len(body))
+		rr := httptest.NewRecorder()
+		sidebarRouter(v, &readingSidebarProvider{}).ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("inaccessible target", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		sidebarRouter(v, &readingSidebarProvider{err: domain.ErrNotFound}).ServeHTTP(rr, authSidebarPinRequest(t, http.MethodPost, path))
+		if rr.Code != http.StatusNotFound || strings.Contains(strings.ToLower(rr.Body.String()), "access") {
+			t.Fatalf("expected non-enumerating 404, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
 }
 
 // ISSUE #414 — the sidebar publishes two ordering keys per item, and nothing
@@ -764,15 +849,15 @@ func TestSidebarHandler_ResponseContract_NoSensitiveFields(t *testing.T) {
 		// created_at and last_message_at (issue #414) are the two ordering keys;
 		// pinned_at is the caller's private ordering preference; all three say
 		// when, never what, who or which message.
-		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at", "pinned_at"} {
+		for _, key := range []string{"id", "type", "name", "created_at", "last_message_at", "pinned_at", "unread_count"} {
 			if _, ok := dm[key]; !ok {
 				t.Fatalf("missing expected DM field %q in %v", key, dm)
 			}
 		}
 		counterpart, hasCounterpart := dm["counterpart"]
-		wantFields := 6
+		wantFields := 7
 		if hasCounterpart {
-			wantFields = 7
+			wantFields = 8
 		}
 		if len(dm) != wantFields {
 			t.Fatalf("expected exactly %d DM fields, got %d: %v", wantFields, len(dm), dm)

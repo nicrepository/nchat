@@ -312,7 +312,7 @@ func mapChannelCategoryGroups(groups []service.ChannelCategoryGroup) []channelCa
 		item := channelCategoryGroupJSON{
 			Kind:     channelCategoryKindUncategorized,
 			Name:     domain.UncategorizedGroupName,
-			Channels: mapChannels(group.Channels),
+			Channels: mapCategoryChannels(group.Channels),
 		}
 		if group.Category != nil {
 			position := group.Category.Position
@@ -322,6 +322,14 @@ func mapChannelCategoryGroups(groups []service.ChannelCategoryGroup) []channelCa
 			item.Position = &position
 		}
 		out = append(out, item)
+	}
+	return out
+}
+
+func mapCategoryChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
+	out := mapChannels(channels)
+	for i := range out {
+		out[i].UnreadCount = nil
 	}
 	return out
 }

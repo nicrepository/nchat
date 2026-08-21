@@ -1390,6 +1390,24 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   };
   await page.route("**/api/chat/channels/*/sidebar-pin", mutateSidebarPin);
   await page.route("**/api/chat/dm/*/sidebar-pin", mutateSidebarPin);
+
+  const markConversationRead = async (route: Route) => {
+    const request = route.request();
+    const parts = new URL(request.url()).pathname.split("/");
+    const marker = parts.indexOf("channels") >= 0 ? "channels" : "dm";
+    const id = parts[parts.indexOf(marker) + 1];
+    const item =
+      marker === "channels"
+        ? scenario.sidebarChannels.find((channel) => channel.id === id)
+        : scenario.sidebarDMs.find((dm) => dm.id === id);
+    if (request.method() !== "POST" || !item) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    await route.fulfill({ status: 204 });
+  };
+  await page.route("**/api/chat/channels/*/read", markConversationRead);
+  await page.route("**/api/chat/dm/*/read", markConversationRead);
 }
 
 async function installInteractionMocks(

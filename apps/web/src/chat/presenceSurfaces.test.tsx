@@ -145,6 +145,7 @@ function renderSidebar() {
         state={{
           status: "ready",
           currentUserId: "user-self",
+          workspaceId: "workspace-1",
           channels: CHANNELS,
           dms: DMS,
           // These tests are about presence, not grouping: no category means the
@@ -343,6 +344,7 @@ describe("one presence for one person", () => {
           state={{
             status: "ready",
             currentUserId: "user-self",
+            workspaceId: "workspace-1",
             channels: CHANNELS,
             dms: DMS,
             // These tests are about presence, not grouping: no category means the

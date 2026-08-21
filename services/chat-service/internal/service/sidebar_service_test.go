@@ -84,6 +84,24 @@ type sidebarFakeChannelStore struct {
 	listAccessCalls int
 }
 
+type sidebarFakeReadStateStore struct {
+	counts   map[string]int
+	countErr error
+	markErr  error
+	markArgs []string
+	message  *string
+}
+
+func (f *sidebarFakeReadStateStore) MarkRead(_ context.Context, workspaceID, userID, targetType, targetID string, lastReadMessageID *string) error {
+	f.markArgs = []string{workspaceID, userID, targetType, targetID}
+	f.message = lastReadMessageID
+	return f.markErr
+}
+
+func (f *sidebarFakeReadStateStore) UnreadCounts(_ context.Context, _, _ string) (map[string]int, error) {
+	return f.counts, f.countErr
+}
+
 func (f *sidebarFakeChannelStore) CreateCategory(_ context.Context, _ storage.CreateCategoryInput) (domain.ChannelCategory, error) {
 	return domain.ChannelCategory{}, nil
 }
@@ -644,6 +662,50 @@ func TestSidebarService_GetSidebarAppliesOnlyVisiblePins(t *testing.T) {
 	}
 	if len(data.Channels) != 1 || len(data.DMs) != 1 {
 		t.Fatalf("pins must not create sidebar items: %+v", data)
+	}
+}
+
+func TestSidebarService_GetSidebarAppliesAuthoritativeUnreadCountsWithoutCreatingRows(t *testing.T) {
+	readState := &sidebarFakeReadStateStore{counts: map[string]int{
+		storage.ConversationReadTargetChannel + "\x00channel-1": 4,
+		storage.ConversationReadTargetDM + "\x00dm-1":           2,
+		storage.ConversationReadTargetChannel + "\x00removed":   99,
+	}}
+	svc, _, _ := newPinnedSidebarService(nil)
+	svc.WithReadState(readState)
+
+	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+	if err != nil {
+		t.Fatalf("GetSidebar: %v", err)
+	}
+	if data.Channels[0].UnreadCount != 4 || data.DMs[0].UnreadCount != 2 {
+		t.Fatalf("unread counts not applied: %+v", data)
+	}
+	if len(data.Channels) != 1 || len(data.DMs) != 1 {
+		t.Fatalf("read state must not create sidebar rows: %+v", data)
+	}
+}
+
+func TestSidebarService_MarkConversationReadDerivesWorkspaceAndUser(t *testing.T) {
+	readState := &sidebarFakeReadStateStore{}
+	svc, _, _ := newPinnedSidebarService(nil)
+	svc.WithReadState(readState)
+	messageID := "22222222-2222-4222-8222-222222222222"
+
+	if err := svc.MarkConversationRead(context.Background(), sidebarUserID, service.ReadTargetChannel, "channel-1", &messageID); err != nil {
+		t.Fatalf("MarkConversationRead: %v", err)
+	}
+	want := []string{sidebarWsID, sidebarUserID, service.ReadTargetChannel, "channel-1"}
+	if len(readState.markArgs) != len(want) {
+		t.Fatalf("MarkRead arguments = %#v, want %#v", readState.markArgs, want)
+	}
+	for i := range want {
+		if readState.markArgs[i] != want[i] {
+			t.Fatalf("MarkRead argument %d = %q, want %q", i, readState.markArgs[i], want[i])
+		}
+	}
+	if readState.message == nil || *readState.message != messageID {
+		t.Fatalf("last message = %v, want %q", readState.message, messageID)
 	}
 }
 
